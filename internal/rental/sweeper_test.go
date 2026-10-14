@@ -260,3 +260,30 @@ func TestSweepResumesOnlineSuspended(t *testing.T) {
 		t.Fatalf("after sweep = %+v", got)
 	}
 }
+
+// 暂停期间续费：新租期的提醒标记按续费后的剩余时长重算，不能沿用旧租期已发过的标记。
+func TestRenewWhileSuspendedResetsReminders(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(23 * time.Hour)
+	n, err := e.svc.SendReminders(e.ctx)
+	mustCount(t, n, err, 1, "1h reminder")
+	n, err = e.svc.SuspendMachines(e.ctx, e.machines)
+	mustCount(t, n, err, 1, "suspended")
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1m); err != nil {
+		t.Fatal(err)
+	}
+	e.heartbeatAll()
+	n, err = e.svc.ResumeMachine(e.ctx, e.machines[0])
+	mustCount(t, n, err, 1, "resumed")
+	got := e.get(inst.ID)
+	if want := e.clock.Now().Add(30*24*time.Hour + time.Hour); !got.ExpiresAt.Equal(want) {
+		t.Fatalf("expires = %v, want %v", got.ExpiresAt, want)
+	}
+	n, err = e.svc.SendReminders(e.ctx)
+	mustCount(t, n, err, 0, "reminders right after resume")
+	e.clock.Advance(29*24*time.Hour + time.Hour) // 距新到期 24 小时
+	n, err = e.svc.SendReminders(e.ctx)
+	mustCount(t, n, err, 1, "24h reminder for the new term")
+}

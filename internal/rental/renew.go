@@ -2,6 +2,7 @@ package rental
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -37,7 +38,13 @@ func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d 
 		case inst.State == StateCreating:
 			_, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
 		case inst.State == StateRunning && inst.Suspended():
-			_, err = tx.Exec(ctx, `UPDATE instances SET paused_remaining = paused_remaining + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
+			var paused int64
+			if inst.PausedRemaining != nil {
+				paused = *inst.PausedRemaining
+			}
+			r24, r1 := reminderFlags(time.Duration(paused+secs) * time.Second)
+			_, err = tx.Exec(ctx, `UPDATE instances SET paused_remaining = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
+				inst.ID, paused+secs, r24, r1, now)
 		case inst.State == StateRunning:
 			base := *inst.ExpiresAt // 已过期但尚未被清扫的实例从当前时刻起算
 			if base.Before(now) {

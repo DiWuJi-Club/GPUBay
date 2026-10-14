@@ -143,7 +143,7 @@ func (s *Service) SuspendMachines(ctx context.Context, machineIDs []int64) (int,
 	return n, err
 }
 
-// ResumeMachine 机器恢复在线后补回暂停的时长。
+// ResumeMachine 机器恢复在线后补回暂停的时长，并按恢复后的剩余时长重算提醒标记（暂停期间可能已续费）。
 func (s *Service) ResumeMachine(ctx context.Context, machineID int64) (int, error) {
 	now := s.d.Clock.Now()
 	n := 0
@@ -160,7 +160,7 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64) (int, erro
 			}
 			r24, r1 := reminderFlags(remaining)
 			if _, err := tx.Exec(ctx, `UPDATE instances SET expires_at = $2, suspended_at = NULL, paused_remaining = NULL,
-					reminded_24h = reminded_24h OR $3, reminded_1h = reminded_1h OR $4, updated_at = $5 WHERE id = $1`,
+					reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
 				inst.ID, now.Add(remaining), r24, r1, now); err != nil {
 				return err
 			}
