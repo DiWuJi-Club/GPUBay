@@ -3,8 +3,10 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -42,7 +44,7 @@ func (s *Server) Router() http.Handler {
 	if s.TrustProxy {
 		r.Use(middleware.RealIP)
 	}
-	r.Use(middleware.Recoverer, s.requireJSONForWrites)
+	r.Use(s.recoverer, s.requireJSONForWrites)
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/sms-code", s.handleSendCode)
 		r.Post("/auth/login", s.handleLogin)
@@ -67,6 +69,26 @@ func (s *Server) Router() http.Handler {
 		})
 	})
 	return r
+}
+
+// recoverer 捕获处理器中的 panic：记录日志（含堆栈）并按统一错误格式返回 500。
+func (s *Server) recoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			if rec == http.ErrAbortHandler { //nolint:errorlint // 与 net/http 约定一致：继续向上抛出以中断连接
+				panic(rec)
+			}
+			rid := middleware.GetReqID(r.Context())
+			s.Log.Error("panic", "panic", fmt.Sprint(rec), "stack", string(debug.Stack()),
+				"request_id", rid, "method", r.Method, "path", r.URL.Path)
+			writeInternal(w, rid)
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // requireJSONForWrites 要求所有写请求使用 application/json；浏览器跨站表单无法伪造该类型，兼作 CSRF 防护。

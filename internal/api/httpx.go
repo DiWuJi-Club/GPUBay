@@ -40,6 +40,11 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	s.Log.Error("internal error", "err", err, "request_id", rid, "method", r.Method, "path", r.URL.Path)
+	writeInternal(w, rid)
+}
+
+// writeInternal 输出未知错误的统一响应，不暴露内部细节。
+func writeInternal(w http.ResponseWriter, rid string) {
 	writeJSON(w, http.StatusInternalServerError, errorBody{Code: "internal", Message: "服务器内部错误，请稍后重试", RequestID: rid})
 }
 
