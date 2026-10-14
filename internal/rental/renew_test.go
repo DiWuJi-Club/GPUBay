@@ -224,3 +224,44 @@ func TestLeaseExclusionRejectsOverlap(t *testing.T) {
 		t.Fatal("overlapping lease must be rejected")
 	}
 }
+
+func TestRenewAfterFailedStartRequeuesStart(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	expireAndStop(e)
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+		t.Fatal(err)
+	}
+	e.ack(false) // 启动失败，仍为 stopped
+	if got := e.get(inst.ID); got.State != rental.StateStopped || got.PendingSeconds != 86400 {
+		t.Fatalf("after failed start = %+v", got)
+	}
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+		t.Fatal(err)
+	}
+	if n := countPending(e, e.machines[0], fleet.CmdStartInstance); n != 1 {
+		t.Fatalf("start commands = %d, want 1", n)
+	}
+	if got := e.get(inst.ID); got.PendingSeconds != 172800 {
+		t.Fatalf("pending = %d", got.PendingSeconds)
+	}
+	e.ack(true)
+	got := e.get(inst.ID)
+	if got.State != rental.StateRunning || !got.ExpiresAt.Equal(e.clock.Now().Add(48*time.Hour)) {
+		t.Fatalf("after start = %+v", got)
+	}
+}
+
+func TestRenewExpiredButUnsweptExtendsFromNow(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(25 * time.Hour)
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); !got.ExpiresAt.Equal(e.clock.Now().Add(24 * time.Hour)) {
+		t.Fatalf("expires = %v", got.ExpiresAt)
+	}
+}

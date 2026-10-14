@@ -39,7 +39,11 @@ func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d 
 		case inst.State == StateRunning && inst.Suspended():
 			_, err = tx.Exec(ctx, `UPDATE instances SET paused_remaining = paused_remaining + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
 		case inst.State == StateRunning:
-			expires := inst.ExpiresAt.Add(d.Length())
+			base := *inst.ExpiresAt // 已过期但尚未被清扫的实例从当前时刻起算
+			if base.Before(now) {
+				base = now
+			}
+			expires := base.Add(d.Length())
 			r24, r1 := reminderFlags(expires.Sub(now))
 			_, err = tx.Exec(ctx, `UPDATE instances SET expires_at = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
 				inst.ID, expires, r24, r1, now)
@@ -47,7 +51,8 @@ func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d 
 			if _, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now); err != nil {
 				return err
 			}
-			if inst.PendingSeconds == 0 { // 首次续费才下发启动；已有待开始的续费说明启动指令已在队列中
+			var open bool // 已有未完成的启动指令则不重复下发；启动失败后再次续费会重新下发
+			if open, err = s.d.Fleet.HasOpenCommand(ctx, tx, inst.ID, fleet.CmdStartInstance); err == nil && !open {
 				_, err = s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdStartInstance, nil)
 			}
 		}

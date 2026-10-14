@@ -58,3 +58,22 @@ func TestCancelCommands(t *testing.T) {
 		t.Fatal("cancelled command must not be applied")
 	}
 }
+
+func TestHasOpenCommand(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	mid := dbtest.CreateMachine(t, pool, "SN001")
+	id, _ := svc.Enqueue(ctx, pool, mid, "ins-abc", fleet.CmdStartInstance, nil)
+	if ok, err := svc.HasOpenCommand(ctx, pool, "ins-abc", fleet.CmdStartInstance); err != nil || !ok {
+		t.Fatalf("open = %v, %v", ok, err)
+	}
+	if ok, _ := svc.HasOpenCommand(ctx, pool, "ins-abc", fleet.CmdStopInstance); ok {
+		t.Fatal("other type must not match")
+	}
+	if _, _, err := svc.CompleteCommand(ctx, pool, id, false, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := svc.HasOpenCommand(ctx, pool, "ins-abc", fleet.CmdStartInstance); ok {
+		t.Fatal("completed command must not be open")
+	}
+}

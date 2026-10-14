@@ -105,3 +105,11 @@ func (s *Service) CancelCommands(ctx context.Context, q db.Querier, instanceID, 
 		WHERE instance_id = $1 AND status IN ('pending', 'sent')`, instanceID, "cancelled: "+reason, s.clock.Now())
 	return err
 }
+
+// HasOpenCommand 报告某实例是否还有未完成（pending/sent）的指定类型指令。
+func (s *Service) HasOpenCommand(ctx context.Context, q db.Querier, instanceID string, t CommandType) (bool, error) {
+	var ok bool
+	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM agent_commands
+		WHERE instance_id = $1 AND type = $2 AND status IN ('pending', 'sent'))`, instanceID, string(t)).Scan(&ok)
+	return ok, err
+}
