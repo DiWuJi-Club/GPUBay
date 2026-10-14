@@ -51,7 +51,14 @@ func run(log *slog.Logger) error {
 		a.Rental.RunSweeper(ctx, cfg.SweepInterval)
 	}()
 
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: a.Handler, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           a.Handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	serverErr := make(chan error, 1)
 	go func() {
 		log.Info("platform listening", "addr", cfg.HTTPAddr, "env", cfg.Env)
