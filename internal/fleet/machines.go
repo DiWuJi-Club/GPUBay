@@ -171,3 +171,33 @@ func (s *Service) MarkOfflineStale(ctx context.Context, timeout time.Duration) (
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
+
+// OfflineMachineIDs 返回当前 Agent 离线的全部机器 id。
+func (s *Service) OfflineMachineIDs(ctx context.Context) ([]int64, error) {
+	return s.queryIDs(ctx, `SELECT id FROM machines WHERE NOT agent_online ORDER BY id`)
+}
+
+// OnlineAmong 返回 ids 中当前 Agent 在线的子集。
+func (s *Service) OnlineAmong(ctx context.Context, ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.queryIDs(ctx, `SELECT id FROM machines WHERE agent_online AND id = ANY($1) ORDER BY id`, ids)
+}
+
+func (s *Service) queryIDs(ctx context.Context, sql string, args ...any) ([]int64, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}

@@ -229,8 +229,14 @@ func (s *Service) Sweep(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("alert offline: %w", err))
 		}
 	}
-	if _, err := s.SuspendMachines(ctx, offline); err != nil {
+	// 每轮都按当前状态对账，修复上一轮可能漏掉的暂停/恢复。
+	if down, err := s.d.Fleet.OfflineMachineIDs(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("list offline: %w", err))
+	} else if _, err := s.SuspendMachines(ctx, down); err != nil {
 		errs = append(errs, fmt.Errorf("suspend: %w", err))
+	}
+	if err := s.resumeOnline(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("resume: %w", err))
 	}
 	if _, err := s.ExpireDue(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("expire: %w", err))
@@ -247,8 +253,41 @@ func (s *Service) Sweep(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// resumeOnline 恢复所有已在线但仍处于暂停状态的实例所在机器。
+func (s *Service) resumeOnline(ctx context.Context) error {
+	rows, err := s.d.Pool.Query(ctx, `SELECT DISTINCT machine_id FROM instances WHERE state = 'running' AND suspended_at IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	online, err := s.d.Fleet.OnlineAmong(ctx, ids)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, id := range online {
+		if _, err := s.ResumeMachine(ctx, id); err != nil {
+			errs = append(errs, fmt.Errorf("machine %d: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // RunSweeper 每隔 interval 执行一次 Sweep，直到 ctx 结束。
 func (s *Service) RunSweeper(ctx context.Context, interval time.Duration) {
+	s.sweepOnce(ctx)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -269,7 +308,11 @@ func (s *Service) sweepOnce(ctx context.Context) {
 	}
 	defer conn.Release()
 	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, sweeperLockKey).Scan(&locked); err != nil || !locked {
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, sweeperLockKey).Scan(&locked); err != nil {
+		s.d.Log.Error("sweeper advisory lock", "err", err)
+		return
+	}
+	if !locked {
 		return
 	}
 	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, sweeperLockKey) //nolint:errcheck

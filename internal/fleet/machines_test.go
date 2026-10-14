@@ -196,3 +196,30 @@ func TestMarkFaultyAndAlert(t *testing.T) {
 		t.Fatalf("alerts = %d", n)
 	}
 }
+
+func TestOfflineMachineIDsAndOnlineAmong(t *testing.T) {
+	svc, pool, clk := newEnv(t)
+	ctx := context.Background()
+	a := dbtest.CreateMachine(t, pool, "SN001")
+	b := dbtest.CreateMachine(t, pool, "SN002")
+
+	if got, err := svc.OnlineAmong(ctx, nil); err != nil || got != nil {
+		t.Fatalf("empty input = %v, %v", got, err)
+	}
+	if got, _ := svc.OfflineMachineIDs(ctx); len(got) != 0 {
+		t.Fatalf("offline = %v", got)
+	}
+	clk.Advance(6 * time.Minute)
+	if _, err := svc.Heartbeat(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.MarkOfflineStale(ctx, 5*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := svc.OfflineMachineIDs(ctx); err != nil || len(got) != 1 || got[0] != a {
+		t.Fatalf("offline = %v, %v; want [%d]", got, err, a)
+	}
+	if got, err := svc.OnlineAmong(ctx, []int64{a, b}); err != nil || len(got) != 1 || got[0] != b {
+		t.Fatalf("online among = %v, %v; want [%d]", got, err, b)
+	}
+}

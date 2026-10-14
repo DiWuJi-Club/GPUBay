@@ -222,3 +222,41 @@ func TestConcurrentExpireDoesNotDoubleStop(t *testing.T) {
 		t.Fatalf("total stopped = %d", total)
 	}
 }
+
+func TestSweepRepairsMissedSuspend(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(time.Hour)
+	e.heartbeatAll()
+	e.clock.Advance(10 * time.Minute)
+	// 离线转换已被消费，但暂停没有发生
+	if off, err := e.fleet.MarkOfflineStale(e.ctx, rental.OfflineTimeout); err != nil || len(off) != 1 {
+		t.Fatalf("mark offline = %v, %v", off, err)
+	}
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("instance not suspended: %+v", got)
+	}
+}
+
+func TestSweepResumesOnlineSuspended(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(time.Hour)
+	frozen := 23 * time.Hour
+	n, err := e.svc.SuspendMachines(e.ctx, e.machines)
+	mustCount(t, n, err, 1, "suspended")
+	e.clock.Advance(2 * time.Hour)
+	e.heartbeatAll()
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := e.get(inst.ID)
+	if got.Suspended() || got.ExpiresAt == nil || !got.ExpiresAt.Equal(e.clock.Now().Add(frozen)) {
+		t.Fatalf("after sweep = %+v", got)
+	}
+}
