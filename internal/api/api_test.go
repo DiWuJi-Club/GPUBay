@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -204,5 +205,43 @@ func TestOrderAndInstanceEndpoints(t *testing.T) {
 	}
 	if code, out := other.do("GET", "/instances", nil); code != 200 || len(out["items"].([]any)) != 0 {
 		t.Fatalf("other user's list = %d %v (items must be [] not null)", code, out)
+	}
+}
+
+func TestSMSIPLimitIgnoresForwardedForWithoutTrustProxy(t *testing.T) {
+	e := newTestEnv(t)
+	var last int
+	for i := 0; i < 31; i++ {
+		b, _ := json.Marshal(map[string]string{"phone": fmt.Sprintf("1380000%04d", i)})
+		req, _ := http.NewRequest("POST", e.ts.URL+"/api/v1/auth/sms-code", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("10.0.0.%d", i+1))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		last = resp.StatusCode
+		if i < 30 && last != 200 {
+			t.Fatalf("request %d = %d, want 200", i, last)
+		}
+	}
+	if last != 429 {
+		t.Fatalf("31st request = %d, want 429", last)
+	}
+}
+
+func TestAuthenticatedResponsesAreNoStore(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.client()
+	c.login("13800000005")
+	req, _ := http.NewRequest("GET", c.base+"/me", nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("/me = %d, Cache-Control %q", resp.StatusCode, resp.Header.Get("Cache-Control"))
 	}
 }

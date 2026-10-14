@@ -29,6 +29,7 @@ type Server struct {
 	Log          *slog.Logger
 	Domain       string // 用于生成 SSH 命令，例如 spark.example.com
 	SecureCookie bool   // 生产环境为 true：Cookie 仅经 HTTPS 发送
+	TrustProxy   bool   // 仅当部署在会改写转发头的反向代理之后才设为 true
 }
 
 const sessionCookie = "sc_session"
@@ -37,7 +38,11 @@ type userCtxKey struct{}
 
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, s.requireJSONForWrites)
+	r.Use(middleware.RequestID)
+	if s.TrustProxy {
+		r.Use(middleware.RealIP)
+	}
+	r.Use(middleware.Recoverer, s.requireJSONForWrites)
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/sms-code", s.handleSendCode)
 		r.Post("/auth/login", s.handleLogin)
@@ -46,7 +51,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/images", s.handleImages)
 
 		r.Group(func(r chi.Router) {
-			r.Use(s.requireUser)
+			r.Use(noStore, s.requireUser)
 			r.Get("/me", s.handleMe)
 			r.Post("/kyc/personal", s.handleKYCPersonal)
 			r.Post("/kyc/enterprise", s.handleKYCEnterprise)
@@ -93,4 +98,12 @@ func (s *Server) requireUser(next http.Handler) http.Handler {
 
 func currentUser(r *http.Request) identity.User {
 	return r.Context().Value(userCtxKey{}).(identity.User)
+}
+
+// noStore 禁止缓存已登录接口的响应（含密码、余额等敏感数据）。
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }

@@ -43,13 +43,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.setSession(w, "", -1)
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		if err := s.Identity.Logout(r.Context(), c.Value); err != nil {
 			s.writeError(w, r, err)
 			return
 		}
 	}
-	s.setSession(w, "", -1)
 	ok(w)
 }
 
