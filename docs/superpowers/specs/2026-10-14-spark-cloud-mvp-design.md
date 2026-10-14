@@ -19,17 +19,18 @@
 
 1. 整机租赁形态：**用户拿到独占整机 GPU 的容器内 root**，宿主机归平台管理。
 2. 充值：**在线支付（微信/支付宝）+ 后台手动充值**，支付做成插件。
-3. 计费：**只做预付包时长**，规格为 1 小时 / 1 天 / 1 周 / 1 月；下单即扣款，可续费。
+3. 计费：**只做预付包时长**，规格为 1 天 / 1 周 / 1 月（不提供按小时）；下单即扣款，可续费。初始价格参考竞品：¥69/天、¥414/周、¥1599/月，后台可改。
 4. **计时从实例开通成功（进入 running）开始**，开机准备时间不计入。
 5. 到期后**停机并保留数据 6 小时**，6 小时内续费可恢复，超时自动洗机。
 6. 用户主动提前释放：**不退款**，直接洗机。
 7. 机器故障（Agent 失联）：**暂停计时，恢复后补回**；不可恢复时管理员可按剩余时长退款或换机。
 8. 注册：手机号 + 短信验证码；**租用前必须实名**（个人三要素自动核验，企业上传执照人工审核）。短信/实名用**阿里云**，均为插件，开发期用 mock。
 9. PDU：通用 SNMP 驱动 + mock 驱动；**自动断电重启默认关闭**，仅管理员手动触发。
+10. 机器分配：MVP 由系统立即分配空闲机器；但数据库按**机器占用时段**（`machine_leases`，带排他约束防止同一台机器时段重叠）设计，子项目 2 在此基础上加入档期预订、按机组选机、一次租多台、自动续费。
 
 ### 0.2 MVP 不包含
 
-优惠券/返佣、发票、工单、站内信、双机互联、一键部署模型、Token 商城、共享容器（HAMi）、裸机 root、按量计费。
+优惠券/返佣、发票、工单、站内信、档期预订与按机组选机（子项目 2）、自动续费（子项目 2）、双机互联、一键部署模型、Token 商城、共享容器（HAMi）、裸机 root、按量计费。
 
 ## 1. 架构
 
@@ -108,11 +109,12 @@ spark-cloud/
 | `wallet_ledger` | id, user_id, amount(±), balance_after, kind(recharge/admin_adjust/order_pay/refund), ref_type, ref_id, operator_id, remark — **只追加** |
 | `recharges` | id, user_id, channel(wechat/alipay/manual), amount, status, out_trade_no, paid_at |
 | `products` | id, name, spec(json: GB10/128GB/4TB), status |
-| `prices` | product_id, duration(1h/1d/1w/1m), amount, enabled |
+| `prices` | product_id, duration(1d/1w/1m), amount, enabled |
 | `images` | id, name, ref(harbor 地址), description, enabled, sort |
 | `orders` | id, user_id, kind(new/renew), instance_id, product_id, duration, amount, status(paid/refunded/partially_refunded) |
 | `instances` | id(`ins-xxxxxxxx`), user_id, machine_id, product_id, image_id, state, pending_seconds(已付未计时秒数), expires_at, stopped_at, suspended_at, paused_remaining(故障暂停时剩余秒数), ssh_password(加密), reminded_24h/1h |
 | `alerts` | level, kind, machine_id, instance_id, message, resolved_at |
+| `machine_leases` | machine_id, instance_id, period(tstzrange), status(reserved/active/ended/cancelled)；`EXCLUDE USING gist (machine_id WITH =, period WITH &&)` 对 reserved/active 生效。MVP 中每个实例一条 active 记录，上界为预计占用结束时间（到期 + 6 小时保留），随状态变化同步 |
 | `instance_events` | instance_id, from_state, to_state, reason, at — 状态迁移全记录 |
 | `machines` | id, serial(唯一), rack, slot, lan_ip, pdu_id, pdu_outlet, state(idle/allocated/maintenance/faulty), agent_online, last_seen_at, cert_fingerprint |
 | `pdus` | id, name, driver(snmp/mock), address, community(加密) |
@@ -195,7 +197,7 @@ Agent 内部 `Runtime` 接口（Create/Start/Stop/Wipe/Inspect），实现：
 
 ## 6. 计费、支付与插件
 
-- 价格表 `prices` 由后台维护；下单时快照金额写入 order。
+- 价格表 `prices` 由后台维护；下单时快照金额写入 order。租期仅 1d/1w/1m（1m = 30 天）。
 - 续费与新购同一套扣款逻辑。
 - 支付插件接口：`CreatePayment(recharge) → 支付参数/二维码`，`HandleNotify(req) → 结果`，`Query(out_trade_no)`。实现：wechat（Native 扫码）、alipay（当面付/电脑网站）、mock。回调验签后在事务内入账；River 定时任务对未完成订单主动查单。
 - 手动充值/扣款：财务或超级管理员，必须填写原因，写 audit_log。
@@ -243,3 +245,12 @@ Agent 内部 `Runtime` 接口（Create/Start/Stop/Wipe/Inspect），实现：
 2. 应用层：镜像市场扩充、JupyterLab / Web 终端、一键部署模型、双机互联
 3. Token 商城：推理池 + OpenAI 兼容 API（LiteLLM/Higress 改造）+ 统一余额
 4. 共享容器（k3s + HAMi，需 PoC）、AI 管家、ComfyUI 工作流、企业功能（发票、子账号）
+
+## 附录：竞品调研（2026-10-14，器灵算力站公开页面与公开接口）
+
+- 机器 102 台：DGX Spark 56（在租 50）、HAMi 共享 24、整卡 8、入门模块 6、AI Max 395 8。
+- DGX 价格 ¥69/天、¥414/周、¥1599/月，无按小时；AI Max 395 ¥49/天。
+- 档期预订：每台机器展示占用日历，最多提前 60 天、单次最长 90 天、一次最多 8 台；机器按「机组」分组；有自动续费、长期租约、洗机中状态。
+- 充值档位 ¥50/100/500/1000，自定义 ¥1～100 万，支付宝/微信扫码。
+- 账号中心：订单、余额、资金明细、个人/企业认证、账号安全、授权桌面客户端。
+- 其他：HuggingFace 热门模型库 + AI 匹配、藏经阁硬件测算、通天塔模型评测、ComfyUI 视频工作流、Token 商城（86 个模型）、外接显卡坞按天租。
