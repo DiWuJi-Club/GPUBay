@@ -45,11 +45,11 @@
        ▼              ▼                      ▼
   ┌─────────────────────────────────────────────────┐
   │ platform (Go 单体)                               │
-  │  REST API │ gRPC AgentGateway │ River 任务 │ 路由API│
+  │  REST API │ gRPC AgentGateway │ 定时清扫 │ 路由API │
   │  identity wallet catalog order instance fleet   │
   │  access admin plugins(sms/kyc/pay/pdu)          │
   └───────┬──────────────┬──────────────────────────┘
-      PostgreSQL       Redis
+      PostgreSQL
           ▲
           │ gRPC 双向流 + mTLS（Agent 主动外连）
   ┌───────┴───────────────────────────────┐
@@ -67,7 +67,7 @@ spark-cloud/
 ├── api/proto/             # Agent ↔ platform、sshpiper 插件的 protobuf
 ├── api/openapi/           # REST 接口 OpenAPI 描述（前端代码生成）
 ├── internal/
-│   ├── identity/  wallet/  catalog/  order/  instance/
+│   ├── identity/  wallet/  catalog/  rental/（订单+实例状态机）
 │   ├── fleet/  access/  admin/
 │   ├── plugins/{sms,kyc,pay,pdu}/{aliyun|wechat|alipay|snmp, mock}
 │   ├── agent/             # Agent 侧实现（runtime、disk、netfilter、metrics）
@@ -85,11 +85,11 @@ spark-cloud/
 | 用途 | 选型 |
 |---|---|
 | HTTP | chi |
-| DB 访问 | pgx + sqlc（SQL 优先、类型安全） |
+| DB 访问 | pgx 手写 SQL |
 | 迁移 | goose |
-| 后台任务 | River（PostgreSQL 队列，任务与业务同事务入队） |
+| 后台任务 | 进程内定时清扫器（每分钟），用 PostgreSQL advisory lock 保证多副本只有一个在跑；需要投递给机器的动作写入 agent_commands 表，与业务同事务 |
 | Agent 通信 | gRPC 双向流 + mTLS，platform 内置 CA 签发机器证书 |
-| 会话 | 不透明 token 存 Redis，httpOnly Cookie；管理后台单独会话域 |
+| 会话 | 不透明 token（哈希后存 PostgreSQL），httpOnly Cookie；管理后台单独会话域 |
 | 日志 | slog JSON |
 | 前端 | Vue3 + TS + Vite + Element Plus，openapi-typescript 生成类型 |
 | 接入 | sshpiper（自定义 gRPC 插件）、Traefik（HTTP provider） |
@@ -111,7 +111,8 @@ spark-cloud/
 | `prices` | product_id, duration(1h/1d/1w/1m), amount, enabled |
 | `images` | id, name, ref(harbor 地址), description, enabled, sort |
 | `orders` | id, user_id, kind(new/renew), instance_id, product_id, duration, amount, status(paid/refunded/partially_refunded) |
-| `instances` | id(`ins-xxxxxx`), user_id, machine_id, image_id, state, expires_at, paused_remaining(故障暂停时剩余秒数), stopped_at, ssh_password(加密), ports(json) |
+| `instances` | id(`ins-xxxxxxxx`), user_id, machine_id, product_id, image_id, state, pending_seconds(已付未计时秒数), expires_at, stopped_at, suspended_at, paused_remaining(故障暂停时剩余秒数), ssh_password(加密), reminded_24h/1h |
+| `alerts` | level, kind, machine_id, instance_id, message, resolved_at |
 | `instance_events` | instance_id, from_state, to_state, reason, at — 状态迁移全记录 |
 | `machines` | id, serial(唯一), rack, slot, lan_ip, pdu_id, pdu_outlet, state(idle/allocated/maintenance/faulty), agent_online, last_seen_at, cert_fingerprint |
 | `pdus` | id, name, driver(snmp/mock), address, community(加密) |
@@ -144,6 +145,8 @@ spark-cloud/
 **故障暂停**：running 实例的机器 Agent 失联 > 5 分钟 → 实例标记 `suspended`（running 的子状态标志），记录 `paused_remaining = expires_at - now`，到期扫描跳过；Agent 恢复且容器正常 → `expires_at = now + paused_remaining`。管理员可对其执行「按剩余时长退款并释放」或「换机」（换机：新机器上新建容器，数据不迁移）。
 
 **提醒**：到期前 24 小时、1 小时发短信（仅对剩余租期大于该阈值的实例）。
+
+**停机后续费**：stopped 状态续费时，所购时长先记入 `pending_seconds`（已付未计时），StartInstance 成功后才开始计时；有 pending 的 stopped 实例不会被 6 小时清扫洗掉。creating 状态同理。
 
 **幂等**：每条 agent_command 有 uuid，Agent 本地记录已执行 id；状态迁移用 `UPDATE ... WHERE state = <期望旧状态>` 条件更新，保证并发/重试安全。
 
@@ -196,7 +199,7 @@ Agent 内部 `Runtime` 接口（Create/Start/Stop/Wipe/Inspect），实现：
 - 续费与新购同一套扣款逻辑。
 - 支付插件接口：`CreatePayment(recharge) → 支付参数/二维码`，`HandleNotify(req) → 结果`，`Query(out_trade_no)`。实现：wechat（Native 扫码）、alipay（当面付/电脑网站）、mock。回调验签后在事务内入账；River 定时任务对未完成订单主动查单。
 - 手动充值/扣款：财务或超级管理员，必须填写原因，写 audit_log。
-- 短信插件：`Send(phone, template, params)`；实现 aliyun、mock（验证码固定 `000000`，仅非生产环境可用）。验证码 Redis 存 5 分钟，单号 60 秒限 1 次、每日上限 10 次，IP 限频。
+- 短信插件：`Send(phone, template, params)`；实现 aliyun、mock（验证码固定 `000000`，仅非生产环境可用）。验证码哈希后存 PostgreSQL，5 分钟有效、最多试错 5 次，单号 60 秒限 1 次、每日上限 10 次，IP 限频。
 - 实名插件：`VerifyPerson(name, idNumber, phone)`；实现 aliyun（三要素）、mock（总是通过）。身份证号加密存储（AES-GCM，密钥来自配置）。
 - PDU 插件：`PowerCycle(outlet)`、`PowerOff`、`PowerOn`、`Status`；实现 snmp（通用 OID 可配置）、mock。
 
@@ -208,18 +211,18 @@ Agent 内部 `Runtime` 接口（Create/Start/Stop/Wipe/Inspect），实现：
 ### 7.2 管理后台
 仪表盘、机器管理（录入/CSV 批量导入、签发证书、维护上下线、PDU 重启、实时指标）、实例管理（强制停机/洗机、延长时长、按剩余时长退款、换机）、用户管理（查询、封禁、企业认证审核、手动充值/扣款）、订单与流水（查询、导出 CSV）、价格与镜像、管理员与角色（super/ops/finance）、审计日志。
 
-指标小图数据：platform 将每台机器最近 1 小时心跳指标存 Redis 环形缓冲。
+指标小图数据：platform 在内存中保存每台机器最近 1 小时心跳指标（环形缓冲）。
 
 ## 8. 错误处理
 
 - 统一错误码 + 中文消息；API 返回 `{code, message, request_id}`。
-- 涉及钱的操作全部在数据库事务内完成，失败整体回滚；外部调用（支付、短信、Agent）不放在事务内，通过 River 任务异步重试。
+- 涉及钱的操作全部在数据库事务内完成，失败整体回滚；外部调用（支付、短信）不放在事务内；发给 Agent 的指令以 agent_commands 行的形式与业务同事务写入，由 Agent 网关投递。
 - Agent 指令失败：按状态机转换（creating 失败退款、wiping 失败标记 faulty）。
 - 所有状态异常（机器失联、洗机失败、支付回调验签失败）写日志并触发告警（MVP：后台告警列表 + 可选 Webhook 推送到企业微信/飞书）。
 
 ## 9. 部署
 
-- **控制面**：一台（或两台主备）x86/arm 服务器，`docker compose` 部署 platform、PostgreSQL、Redis、sshpiper、Traefik、Harbor。PostgreSQL 每日备份。
+- **控制面**：一台（或两台主备）x86/arm 服务器，`docker compose` 部署 platform、PostgreSQL、sshpiper、Traefik、Harbor。PostgreSQL 每日备份。
 - **Agent**：单个静态二进制（linux/arm64）+ systemd unit；安装脚本负责放置证书、配置、数据分区初始化、iptables 基础规则。
 - 配置：YAML + 环境变量覆盖；环境 `dev/staging/prod`，prod 禁用全部 mock 插件。
 
@@ -233,7 +236,7 @@ Agent 内部 `Runtime` 接口（Create/Start/Stop/Wipe/Inspect），实现：
 | 真机验证 | 用户提供的 DGX Spark：docker runtime 实际开容器、GPU 可见（`nvidia-smi`、PyTorch 跑 CUDA）、128GB 内存可用、数据盘洗净校验、iptables 隔离、sshpiper/Traefik 链路、PDU 断电重启 |
 | 前端 | 关键流程 Playwright 冒烟测试 |
 
-开发环境注意：当前开发机未安装 Go 与 Docker，实施第一步需安装 Go 工具链；PostgreSQL/Redis 可用 Homebrew 或 Docker 运行。
+开发环境：Go 1.27 装在 `~/.local/go`；开发机无 Docker，测试与本地开发使用 embedded-postgres（自动下载并临时启动真实 PostgreSQL）。
 
 ## 11. 后续子项目（不在本文档范围）
 
