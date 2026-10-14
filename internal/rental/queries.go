@@ -2,7 +2,6 @@ package rental
 
 import (
 	"context"
-	"errors"
 
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
@@ -35,9 +34,4 @@ func (s *Service) Password(ctx context.Context, userID int64, id string) (string
 		return "", err
 	}
 	return string(plain), nil
-}
-
-// HandleCommandResult 在 Task 8 实现。
-func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok bool, result string) error {
-	return errors.New("not implemented")
 }
