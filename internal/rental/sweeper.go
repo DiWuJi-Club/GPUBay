@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 )
 
@@ -20,15 +21,8 @@ const (
 // ExpireDue 把已到期、未暂停的运行中实例转为停机并下发停止指令。
 func (s *Service) ExpireDue(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
-	n := 0
-	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		list, err := collectInstances(tx.Query(ctx, `SELECT `+instanceCols+` FROM instances
-			WHERE state = 'running' AND suspended_at IS NULL AND expires_at <= $1
-			ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED`, now, sweepBatch))
-		if err != nil {
-			return err
-		}
-		for _, inst := range list {
+	return s.sweepEach(ctx, `state = 'running' AND suspended_at IS NULL AND expires_at <= $1`, now, "expires_at",
+		func(tx pgx.Tx, inst Instance) error {
 			if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'stopped', stopped_at = $2, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 				return err
 			}
@@ -38,36 +32,62 @@ func (s *Service) ExpireDue(ctx context.Context) (int, error) {
 			if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
 				return err
 			}
-			if _, err := s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdStopInstance, nil); err != nil {
-				return err
-			}
-		}
-		n = len(list)
-		return nil
-	})
-	return n, err
+			_, err := s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdStopInstance, nil)
+			return err
+		})
 }
 
 // WipeStale 洗掉停机超过保留期且没有待开始续费的实例。
 func (s *Service) WipeStale(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
+	return s.sweepEach(ctx, `state = 'stopped' AND pending_seconds = 0 AND stopped_at <= $1`, now.Add(-RetainAfterStop), "stopped_at",
+		func(tx pgx.Tx, inst Instance) error { return s.beginWipe(ctx, tx, inst, "retention expired", now) })
+}
+
+// sweepEach 先不加锁地选出满足 pred（以 $1 引用 arg）的候选实例，再逐个在独立事务内处理：
+// 加锁时用 SKIP LOCKED 并重新校验 pred，已被其他清扫处理或状态已变的行直接跳过；
+// 单行失败只回滚该行，错误汇总返回，其余行继续处理。返回成功处理的行数。
+func (s *Service) sweepEach(ctx context.Context, pred string, arg any, orderBy string, fn func(pgx.Tx, Instance) error) (int, error) {
+	rows, err := s.d.Pool.Query(ctx, `SELECT id FROM instances WHERE `+pred+` ORDER BY `+orderBy+` LIMIT $2`, arg, sweepBatch)
+	if err != nil {
+		return 0, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return 0, err
+	}
 	n := 0
-	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		list, err := collectInstances(tx.Query(ctx, `SELECT `+instanceCols+` FROM instances
-			WHERE state = 'stopped' AND pending_seconds = 0 AND stopped_at <= $1
-			ORDER BY stopped_at LIMIT $2 FOR UPDATE SKIP LOCKED`, now.Add(-RetainAfterStop), sweepBatch))
-		if err != nil {
-			return err
+	var errs []error
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			errs = append(errs, ctx.Err())
+			break
 		}
-		for _, inst := range list {
-			if err := s.beginWipe(ctx, tx, inst, "retention expired", now); err != nil {
+		done := false
+		err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+			inst, err := scanInstance(tx.QueryRow(ctx, `SELECT `+instanceCols+` FROM instances
+				WHERE id = $2 AND `+pred+` FOR UPDATE SKIP LOCKED`, arg, id))
+			if errors.Is(err, apperr.ErrNotFound) {
+				return nil
+			}
+			if err != nil {
 				return err
 			}
+			if err := fn(tx, inst); err != nil {
+				return err
+			}
+			done = true
+			return nil
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("instance %s: %w", id, err))
+			continue
 		}
-		n = len(list)
-		return nil
-	})
-	return n, err
+		if done {
+			n++
+		}
+	}
+	return n, errors.Join(errs...)
 }
 
 // beginWipe 把实例转为 wiping：取消该实例未完成的指令，再下发洗机指令。
@@ -92,23 +112,8 @@ func (s *Service) beginWipe(ctx context.Context, tx pgx.Tx, inst Instance, reaso
 // FailStuckCreating 把开通超时的实例判为失败并全额退款。
 func (s *Service) FailStuckCreating(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
-	n := 0
-	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		list, err := collectInstances(tx.Query(ctx, `SELECT `+instanceCols+` FROM instances
-			WHERE state = 'creating' AND created_at <= $1
-			ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED`, now.Add(-CreateTimeout), sweepBatch))
-		if err != nil {
-			return err
-		}
-		for _, inst := range list {
-			if err := s.failCreating(ctx, tx, inst, "开通超时", now); err != nil {
-				return err
-			}
-		}
-		n = len(list)
-		return nil
-	})
-	return n, err
+	return s.sweepEach(ctx, `state = 'creating' AND created_at <= $1`, now.Add(-CreateTimeout), "created_at",
+		func(tx pgx.Tx, inst Instance) error { return s.failCreating(ctx, tx, inst, "开通超时", now) })
 }
 
 // SuspendMachines 冻结失联机器上运行中实例的剩余时长，暂停期间不计时、不会被判到期。

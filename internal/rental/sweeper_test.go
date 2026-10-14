@@ -287,3 +287,60 @@ func TestRenewWhileSuspendedResetsReminders(t *testing.T) {
 	n, err = e.svc.SendReminders(e.ctx)
 	mustCount(t, n, err, 1, "24h reminder for the new term")
 }
+
+// failEventsFor 让写入某实例状态事件时报错，用来模拟清扫中单行处理失败。
+func failEventsFor(e *env, instanceID string) {
+	e.t.Helper()
+	if _, err := e.pool.Exec(e.ctx, `
+		CREATE FUNCTION fail_events() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.instance_id = '`+instanceID+`' THEN RAISE EXCEPTION 'injected failure'; END IF;
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER fail_events BEFORE INSERT ON instance_events FOR EACH ROW EXECUTE FUNCTION fail_events();`); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// 清扫逐行独立事务：一行失败不影响同批其他行。
+func TestSweepRowFailureDoesNotBlockOthers(t *testing.T) {
+	e := newEnv(t, 2)
+	_, bad := e.place(catalog.D1d)
+	_, good := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(24 * time.Hour)
+	failEventsFor(e, bad.ID)
+
+	n, err := e.svc.ExpireDue(e.ctx)
+	if err == nil || n != 1 {
+		t.Fatalf("ExpireDue = %d, %v; want 1 and an error", n, err)
+	}
+	if got := e.get(good.ID); got.State != rental.StateStopped {
+		t.Fatalf("good instance = %s, want stopped", got.State)
+	}
+	if got := e.get(bad.ID); got.State != rental.StateRunning {
+		t.Fatalf("bad instance = %s, want running (rolled back)", got.State)
+	}
+
+	e.clock.Advance(rental.RetainAfterStop)
+	n, err = e.svc.WipeStale(e.ctx)
+	mustCount(t, n, err, 1, "wipe good despite bad row")
+}
+
+func TestFailStuckCreatingRowFailureDoesNotBlockOthers(t *testing.T) {
+	e := newEnv(t, 2)
+	_, bad := e.place(catalog.D1d)
+	_, good := e.place(catalog.D1d)
+	e.clock.Advance(rental.CreateTimeout)
+	failEventsFor(e, bad.ID)
+	n, err := e.svc.FailStuckCreating(e.ctx)
+	if err == nil || n != 1 {
+		t.Fatalf("FailStuckCreating = %d, %v; want 1 and an error", n, err)
+	}
+	if got := e.get(good.ID); got.State != rental.StateFailed {
+		t.Fatalf("good instance = %s, want failed", got.State)
+	}
+	if got := e.get(bad.ID); got.State != rental.StateCreating {
+		t.Fatalf("bad instance = %s, want creating", got.State)
+	}
+}
