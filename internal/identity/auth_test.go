@@ -204,7 +204,7 @@ func TestCanRentRequiresVerifiedKYC(t *testing.T) {
 func TestConcurrentSendsSameInstantSendOnlyOnce(t *testing.T) {
 	e := newEnv(t, "")
 	ctx := context.Background()
-	const n = 10
+	const n = 50
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	errs := make([]error, n)
