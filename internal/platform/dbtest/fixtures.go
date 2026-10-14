@@ -60,3 +60,17 @@ func ImageID(t *testing.T, pool *pgxpool.Pool) int64 {
 	}
 	return id
 }
+
+// CreateMachine 插入一台属于 spark-1、空闲且在线的机器（last_seen_at = T0）。
+func CreateMachine(t *testing.T, pool *pgxpool.Pool, serial string) int64 {
+	t.Helper()
+	var id int64
+	err := pool.QueryRow(context.Background(), `INSERT INTO machines
+		(serial, lan_ip, product_id, state, agent_online, last_seen_at, created_at, updated_at)
+		VALUES ($1, '10.0.0.10', (SELECT id FROM products WHERE code = 'spark-1'), 'idle', true, $2, $2, $2)
+		RETURNING id`, serial, T0).Scan(&id)
+	if err != nil {
+		t.Fatalf("CreateMachine: %v", err)
+	}
+	return id
+}
