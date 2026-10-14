@@ -150,3 +150,20 @@ func TestAdminAdjustRequiresRemarkAndAudits(t *testing.T) {
 		t.Fatalf("audit rows = %d", n)
 	}
 }
+
+func TestNonAdminEntriesRequireRef(t *testing.T) {
+	svc, pool := newEnv(t)
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13700000007", true)
+	dbtest.Fund(t, pool, uid, 1000)
+
+	for _, kind := range []wallet.Kind{wallet.KindOrderPay, wallet.KindRefund, wallet.KindRecharge} {
+		_, err := apply(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -100, Kind: kind})
+		if e := apperr.As(err); e == nil || e.Code != "bad_request" {
+			t.Fatalf("kind %s with empty ref: want bad_request, got %v", kind, err)
+		}
+	}
+	if bal, _ := svc.Balance(ctx, uid); bal != 1000 {
+		t.Fatalf("balance = %d, want 1000", bal)
+	}
+}

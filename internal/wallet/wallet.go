@@ -62,6 +62,10 @@ func (s *Service) Apply(ctx context.Context, tx pgx.Tx, e Entry) (int64, error) 
 	if e.Amount == 0 {
 		return 0, apperr.BadRequest("金额不能为 0")
 	}
+	// 非管理员调整必须关联单据，否则唯一索引不生效，同一业务可能重复记账。
+	if e.Kind != KindAdminAdjust && (e.RefType == "" || e.RefID == "") {
+		return 0, apperr.BadRequest("缺少关联单据")
+	}
 	now := s.clock.Now()
 	if _, err := tx.Exec(ctx, `INSERT INTO wallet_accounts (user_id, balance, updated_at) VALUES ($1, 0, $2)
 		ON CONFLICT (user_id) DO NOTHING`, e.UserID, now); err != nil {
