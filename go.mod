@@ -4,6 +4,7 @@ go 1.27.2
 
 require (
 	github.com/fergusstrange/embedded-postgres v1.34.0
+	github.com/go-chi/chi/v5 v5.4.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/pressly/goose/v3 v3.29.0
