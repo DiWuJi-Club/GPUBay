@@ -13,6 +13,8 @@ import (
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/platform/secretbox"
+	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/sms"
 )
 
@@ -29,6 +31,8 @@ type Deps struct {
 	Pool      *pgxpool.Pool
 	Clock     clock.Clock
 	SMS       sms.Sender
+	KYC       kyc.Verifier
+	Box       *secretbox.Box
 	FixedCode string // 仅开发环境：非空时验证码固定为该值
 }
 
