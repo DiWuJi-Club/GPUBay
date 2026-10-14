@@ -13,13 +13,27 @@ import (
 )
 
 // Renew 续费：扣款建单后按实例当前状态延长时长。wiping/released/failed 状态不允许续费且不扣款。
-func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d catalog.Duration) (Order, error) {
+// idempotencyKey 非空时，同一用户重复提交同一键只会扣款一次，重试返回首次创建的续费订单。
+func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d catalog.Duration, idempotencyKey string) (Order, error) {
 	if !d.Valid() {
 		return Order{}, apperr.BadRequest("租期不正确")
+	}
+	if err := checkIdempotencyKey(idempotencyKey); err != nil {
+		return Order{}, err
 	}
 	now := s.d.Clock.Now()
 	var ord Order
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		if idempotencyKey != "" {
+			prev, found, err := lockIdempotencyKey(ctx, tx, userID, idempotencyKey)
+			if err != nil {
+				return err
+			}
+			if found {
+				ord, err = replayRenew(prev, instanceID)
+				return err
+			}
+		}
 		inst, err := lockInstance(ctx, tx, instanceID)
 		if err != nil {
 			return err
@@ -30,7 +44,7 @@ func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d 
 		if inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped {
 			return apperr.ErrInvalidState
 		}
-		if ord, err = s.charge(ctx, tx, userID, "renew", inst.ID, inst.ProductID, d, now); err != nil {
+		if ord, err = s.charge(ctx, tx, userID, "renew", inst.ID, inst.ProductID, d, idempotencyKey, now); err != nil {
 			return err
 		}
 		secs := seconds(d)
@@ -71,10 +85,28 @@ func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d 
 		}
 		return s.refreshLease(ctx, tx, inst.ID, now)
 	})
+	if isIdempotencyViolation(err) {
+		// 并发的重复请求已先提交：本事务已回滚，返回先提交的那笔订单。
+		prev, found, ferr := findByIdempotencyKey(ctx, s.d.Pool, userID, idempotencyKey)
+		if ferr != nil {
+			return Order{}, ferr
+		}
+		if found {
+			return replayRenew(prev, instanceID)
+		}
+	}
 	if err != nil {
 		return Order{}, err
 	}
 	return ord, nil
+}
+
+// replayRenew 返回幂等键对应的已有续费订单；键被新购订单或其他实例的续费占用时报冲突。
+func replayRenew(prev Order, instanceID string) (Order, error) {
+	if prev.Kind != "renew" || prev.InstanceID != instanceID {
+		return Order{}, errIdempotencyConflict
+	}
+	return prev, nil
 }
 
 // Release 用户主动释放：立即进入洗机，已付费用不退。

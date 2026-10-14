@@ -11,6 +11,9 @@ import (
 	"spark-cloud/internal/rental"
 )
 
+// idempotencyHeader 是下单与续费可选的幂等键请求头：同一用户重复提交同一键只扣款一次，重试返回首次的结果。
+const idempotencyHeader = "Idempotency-Key"
+
 type instanceView struct {
 	ID               string     `json:"id"`
 	State            string     `json:"state"`
@@ -54,6 +57,7 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	ord, inst, err := s.Rental.Place(r.Context(), rental.PlaceRequest{
 		UserID: currentUser(r).ID, ProductID: req.ProductID, ImageID: req.ImageID, Duration: catalog.Duration(req.Duration),
+		IdempotencyKey: r.Header.Get(idempotencyHeader),
 	})
 	if err != nil {
 		s.writeError(w, r, err)
@@ -110,7 +114,8 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	ord, err := s.Rental.Renew(r.Context(), currentUser(r).ID, chi.URLParam(r, "id"), catalog.Duration(req.Duration))
+	ord, err := s.Rental.Renew(r.Context(), currentUser(r).ID, chi.URLParam(r, "id"), catalog.Duration(req.Duration),
+		r.Header.Get(idempotencyHeader))
 	if err != nil {
 		s.writeError(w, r, err)
 		return

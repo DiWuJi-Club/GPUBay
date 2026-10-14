@@ -271,7 +271,7 @@ func TestRenewWhileSuspendedResetsReminders(t *testing.T) {
 	mustCount(t, n, err, 1, "1h reminder")
 	n, err = e.svc.SuspendMachines(e.ctx, e.machines)
 	mustCount(t, n, err, 1, "suspended")
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1m); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1m, ""); err != nil {
 		t.Fatal(err)
 	}
 	e.heartbeatAll()

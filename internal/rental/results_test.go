@@ -92,7 +92,7 @@ func TestConcurrentAckAndReleaseDoNotDeadlock(t *testing.T) {
 	e.ack(true)
 	expireAndStop(e)
 	for _, id := range ids {
-		if _, err := e.svc.Renew(e.ctx, e.userID, id, catalog.D1d); err != nil {
+		if _, err := e.svc.Renew(e.ctx, e.userID, id, catalog.D1d, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

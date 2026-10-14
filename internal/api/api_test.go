@@ -71,6 +71,11 @@ func (e *testEnv) client() *client {
 
 func (c *client) do(method, path string, body any) (int, map[string]any) {
 	c.t.Helper()
+	return c.doH(method, path, body, nil)
+}
+
+func (c *client) doH(method, path string, body any, headers map[string]string) (int, map[string]any) {
+	c.t.Helper()
 	var rd io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -79,6 +84,9 @@ func (c *client) do(method, path string, body any) (int, map[string]any) {
 	req, _ := http.NewRequest(method, c.base+path, rd)
 	if method != http.MethodGet {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -243,5 +251,42 @@ func TestAuthenticatedResponsesAreNoStore(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 200 || resp.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("/me = %d, Cache-Control %q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+	}
+}
+
+func TestPlaceOrderHonorsIdempotencyKey(t *testing.T) {
+	e := newTestEnv(t)
+	dbtest.CreateMachine(t, e.pool, "SN001")
+	dbtest.CreateMachine(t, e.pool, "SN002")
+	c := e.client()
+	user := c.login("13800000006")
+	if code, out := c.do("POST", "/kyc/personal", map[string]string{"name": "张三", "id_number": "11010119900101123X"}); code != 200 {
+		t.Fatalf("kyc = %d %v", code, out)
+	}
+	uid := int64(user["id"].(float64))
+	if _, err := e.wallet.AdminAdjust(context.Background(), 1, uid, 100000, "测试充值", ""); err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{"product_id": dbtest.ProductID(t, e.pool), "duration": "1d", "image_id": dbtest.ImageID(t, e.pool)}
+	key := map[string]string{"Idempotency-Key": "click-1"}
+	code, first := c.doH("POST", "/orders", body, key)
+	if code != 201 {
+		t.Fatalf("first order = %d %v", code, first)
+	}
+	code, second := c.doH("POST", "/orders", body, key)
+	if code != 201 {
+		t.Fatalf("retried order = %d %v", code, second)
+	}
+	id1 := first["order"].(map[string]any)["id"]
+	if id2 := second["order"].(map[string]any)["id"]; id1 != id2 {
+		t.Fatalf("order ids %v != %v", id1, id2)
+	}
+	if code, out := c.do("GET", "/wallet", nil); code != 200 || out["balance"].(float64) != 100000-6900 {
+		t.Fatalf("wallet = %d %v, want charged once", code, out)
+	}
+	instID := first["instance"].(map[string]any)["id"].(string)
+	if code, out := c.doH("POST", "/instances/"+instID+"/renew", map[string]string{"duration": "1d"}, key); code != 409 ||
+		out["code"] != "idempotency_conflict" {
+		t.Fatalf("renew with order key = %d %v", code, out)
 	}
 }

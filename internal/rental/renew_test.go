@@ -26,7 +26,7 @@ func TestRenewRunningExtendsExpiry(t *testing.T) {
 	e := newEnv(t, 1)
 	_, inst := e.place(catalog.D1d)
 	e.ack(true)
-	ord, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1w)
+	ord, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1w, "")
 	if err != nil || ord.Kind != "renew" || ord.Amount != 41400 {
 		t.Fatalf("renew = %+v, %v", ord, err)
 	}
@@ -46,7 +46,7 @@ func TestRenewRunningExtendsExpiry(t *testing.T) {
 func TestRenewWhileCreatingAddsPendingTime(t *testing.T) {
 	e := newEnv(t, 1)
 	_, inst := e.place(catalog.D1d)
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := e.get(inst.ID); got.PendingSeconds != 2*86400 {
@@ -62,7 +62,7 @@ func TestRenewWhileCreatingAddsPendingTime(t *testing.T) {
 func TestCreateFailureRefundsRenewalsToo(t *testing.T) {
 	e := newEnv(t, 1)
 	_, inst := e.place(catalog.D1d)
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1w); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1w, ""); err != nil {
 		t.Fatal(err)
 	}
 	e.ack(false)
@@ -78,10 +78,10 @@ func TestRenewStoppedRestartsWithFreshLease(t *testing.T) {
 	expireAndStop(e)
 	e.clock.Advance(2 * time.Hour)
 
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
 		t.Fatal(err)
 	}
 	got := e.get(inst.ID)
@@ -113,7 +113,7 @@ func TestRenewAfterWipeStartedIsRejectedWithoutCharge(t *testing.T) {
 	if _, err := e.svc.WipeStale(e.ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); !errors.Is(err, apperr.ErrInvalidState) {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); !errors.Is(err, apperr.ErrInvalidState) {
 		t.Fatalf("want invalid state, got %v", err)
 	}
 	if b := e.balance(e.userID); b != startFunds-6900 {
@@ -128,7 +128,7 @@ func TestRenewWhileSuspendedExtendsFrozenTime(t *testing.T) {
 	if _, err := e.svc.SuspendMachines(e.ctx, e.machines); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := e.get(inst.ID); got.Remaining(e.clock.Now()) != 48*time.Hour {
@@ -141,16 +141,16 @@ func TestRenewValidation(t *testing.T) {
 	_, inst := e.place(catalog.D1d)
 	e.ack(true)
 	other := e.newUser("13600000004", startFunds)
-	if _, err := e.svc.Renew(e.ctx, other, inst.ID, catalog.D1d); !errors.Is(err, apperr.ErrNotFound) {
+	if _, err := e.svc.Renew(e.ctx, other, inst.ID, catalog.D1d, ""); !errors.Is(err, apperr.ErrNotFound) {
 		t.Fatalf("other user want not found, got %v", err)
 	}
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, "1h"); apperr.As(err) == nil || apperr.As(err).Code != "bad_request" {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, "1h", ""); apperr.As(err) == nil || apperr.As(err).Code != "bad_request" {
 		t.Fatalf("bad duration want bad_request, got %v", err)
 	}
 	poor := e.newUser("13600000005", 0)
 	_, _ = e.pool.Exec(e.ctx, `UPDATE instances SET user_id = $1 WHERE id = $2`, poor, inst.ID)
 	before := e.get(inst.ID).ExpiresAt
-	if _, err := e.svc.Renew(e.ctx, poor, inst.ID, catalog.D1d); !errors.Is(err, apperr.ErrInsufficientBalance) {
+	if _, err := e.svc.Renew(e.ctx, poor, inst.ID, catalog.D1d, ""); !errors.Is(err, apperr.ErrInsufficientBalance) {
 		t.Fatalf("want insufficient balance, got %v", err)
 	}
 	if after := e.get(inst.ID).ExpiresAt; !after.Equal(*before) {
@@ -230,14 +230,14 @@ func TestRenewAfterFailedStartRequeuesStart(t *testing.T) {
 	_, inst := e.place(catalog.D1d)
 	e.ack(true)
 	expireAndStop(e)
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
 		t.Fatal(err)
 	}
 	e.ack(false) // 启动失败，仍为 stopped
 	if got := e.get(inst.ID); got.State != rental.StateStopped || got.PendingSeconds != 86400 {
 		t.Fatalf("after failed start = %+v", got)
 	}
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
 		t.Fatal(err)
 	}
 	if n := countPending(e, e.machines[0], fleet.CmdStartInstance); n != 1 {
@@ -258,7 +258,7 @@ func TestRenewExpiredButUnsweptExtendsFromNow(t *testing.T) {
 	_, inst := e.place(catalog.D1d)
 	e.ack(true)
 	e.clock.Advance(25 * time.Hour)
-	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d); err != nil {
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := e.get(inst.ID); !got.ExpiresAt.Equal(e.clock.Now().Add(24 * time.Hour)) {
