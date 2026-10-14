@@ -112,35 +112,43 @@ func TestPlaceRejectsInvalidDurationAndImage(t *testing.T) {
 }
 
 func TestConcurrentPlaceForLastMachines(t *testing.T) {
-	e := newEnv(t, 2)
-	users := make([]int64, 6)
+	const machines, buyers = 10, 100
+	e := newEnv(t, machines)
+	users := make([]int64, buyers)
 	for i := range users {
-		users[i] = e.newUser(fmt.Sprintf("1350000000%d", i), startFunds)
+		users[i] = e.newUser(fmt.Sprintf("135%08d", i), startFunds)
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	won := map[int64]bool{}
+	won := map[int64]int64{} // 用户 → 分到的机器
 	for _, uid := range users {
 		wg.Add(1)
 		go func(uid int64) {
 			defer wg.Done()
-			_, _, err := e.svc.Place(e.ctx, rental.PlaceRequest{UserID: uid, ProductID: e.productID, ImageID: e.imageID, Duration: catalog.D1d})
+			_, inst, err := e.svc.Place(e.ctx, rental.PlaceRequest{UserID: uid, ProductID: e.productID, ImageID: e.imageID, Duration: catalog.D1d})
 			mu.Lock()
 			defer mu.Unlock()
 			if err == nil {
-				won[uid] = true
+				won[uid] = inst.MachineID
 			} else if !errors.Is(err, apperr.ErrNoCapacity) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		}(uid)
 	}
 	wg.Wait()
-	if len(won) != 2 {
-		t.Fatalf("winners = %d, want 2", len(won))
+	if len(won) != machines {
+		t.Fatalf("winners = %d, want %d", len(won), machines)
+	}
+	distinct := map[int64]bool{}
+	for _, mid := range won {
+		distinct[mid] = true
+	}
+	if len(distinct) != machines {
+		t.Fatalf("winners share machines: %v", won)
 	}
 	for _, uid := range users {
 		want := int64(startFunds)
-		if won[uid] {
+		if _, ok := won[uid]; ok {
 			want -= 6900
 		}
 		if got := e.balance(uid); got != want {
