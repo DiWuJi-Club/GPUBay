@@ -78,6 +78,17 @@ func (s *Service) PendingCommands(ctx context.Context, machineID int64) ([]Comma
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Command, error) { return scanCommand(r) })
 }
 
+// CommandInstanceID 不加锁地读取指令所属实例 ID（无实例时为空串），未知指令返回 apperr.ErrNotFound。
+// 调用方据此先锁实例再完成指令，保持「instance → agent_commands」的全局加锁顺序。
+func (s *Service) CommandInstanceID(ctx context.Context, q db.Querier, id string) (string, error) {
+	var instanceID string
+	err := q.QueryRow(ctx, `SELECT instance_id FROM agent_commands WHERE id = $1`, id).Scan(&instanceID)
+	if db.IsNoRows(err) {
+		return "", apperr.ErrNotFound
+	}
+	return instanceID, err
+}
+
 // CompleteCommand 记录指令结果。applied 为 false 表示该指令此前已完成或已取消，调用方应忽略本次回报。
 func (s *Service) CompleteCommand(ctx context.Context, q db.Querier, id string, ok bool, result string) (Command, bool, error) {
 	status := "failed"

@@ -1,3 +1,6 @@
+// 锁顺序：instance → agent_commands → orders → wallet；machine → wallet。
+// 所有事务按此顺序加行锁，避免并发路径之间死锁。
+
 package rental
 
 import (

@@ -14,16 +14,23 @@ import (
 // HandleCommandResult 处理 Agent 对一条指令的回报。重复回报、已取消指令的回报、与当前状态不符的回报都会被忽略。
 func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok bool, result string) error {
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		// 先锁实例、再完成指令：与 Release/WipeStale/FailStuckCreating 的加锁顺序一致，避免死锁。
+		instanceID, err := s.d.Fleet.CommandInstanceID(ctx, tx, commandID)
+		if err != nil {
+			return err
+		}
+		var inst Instance
+		if instanceID != "" {
+			if inst, err = lockInstance(ctx, tx, instanceID); err != nil {
+				return err
+			}
+		}
 		cmd, applied, err := s.d.Fleet.CompleteCommand(ctx, tx, commandID, ok, result)
 		if err != nil {
 			return err
 		}
 		if !applied || cmd.InstanceID == "" {
 			return nil
-		}
-		inst, err := lockInstance(ctx, tx, cmd.InstanceID)
-		if err != nil {
-			return err
 		}
 		now := s.d.Clock.Now()
 		switch cmd.Type {

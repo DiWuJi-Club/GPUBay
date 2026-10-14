@@ -3,9 +3,11 @@ package fleet_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/dbtest"
 )
 
@@ -75,5 +77,18 @@ func TestHasOpenCommand(t *testing.T) {
 	}
 	if ok, _ := svc.HasOpenCommand(ctx, pool, "ins-abc", fleet.CmdStartInstance); ok {
 		t.Fatal("completed command must not be open")
+	}
+}
+
+func TestCommandInstanceID(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	mid := dbtest.CreateMachine(t, pool, "SN001")
+	id, _ := svc.Enqueue(ctx, pool, mid, "ins-abc", fleet.CmdStartInstance, nil)
+	if got, err := svc.CommandInstanceID(ctx, pool, id); err != nil || got != "ins-abc" {
+		t.Fatalf("CommandInstanceID = %q, %v", got, err)
+	}
+	if _, err := svc.CommandInstanceID(ctx, pool, "00000000-0000-0000-0000-000000000000"); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("unknown id = %v, want not found", err)
 	}
 }

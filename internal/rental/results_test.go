@@ -1,6 +1,7 @@
 package rental_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -76,5 +77,51 @@ func TestUnknownCommandID(t *testing.T) {
 	e := newEnv(t, 1)
 	if err := e.svc.HandleCommandResult(e.ctx, "00000000-0000-0000-0000-000000000000", true, ""); err == nil {
 		t.Fatal("unknown command must return error")
+	}
+}
+
+// 并发：Agent 回报启动成功 与 用户释放 同时发生，不能死锁，最终必须处于洗机。
+func TestConcurrentAckAndReleaseDoNotDeadlock(t *testing.T) {
+	const n = 20
+	e := newEnv(t, n)
+	var ids []string
+	for i := 0; i < n; i++ {
+		_, inst := e.place(catalog.D1d)
+		ids = append(ids, inst.ID)
+	}
+	e.ack(true)
+	expireAndStop(e)
+	for _, id := range ids {
+		if _, err := e.svc.Renew(e.ctx, e.userID, id, catalog.D1d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	starts := map[string]string{}
+	for _, mid := range e.machines {
+		cmds, _ := e.fleet.PendingCommands(e.ctx, mid)
+		for _, c := range cmds {
+			if c.Type == fleet.CmdStartInstance {
+				starts[c.InstanceID] = c.ID
+			}
+		}
+	}
+	if len(starts) != n {
+		t.Fatalf("start commands = %d", len(starts))
+	}
+	for _, id := range ids {
+		var wg sync.WaitGroup
+		gate := make(chan struct{})
+		var ackErr, relErr error
+		wg.Add(2)
+		go func() { defer wg.Done(); <-gate; ackErr = e.svc.HandleCommandResult(e.ctx, starts[id], true, "ok") }()
+		go func() { defer wg.Done(); <-gate; relErr = e.svc.Release(e.ctx, e.userID, id) }()
+		close(gate)
+		wg.Wait()
+		if ackErr != nil || relErr != nil {
+			t.Fatalf("instance %s: ack err = %v, release err = %v", id, ackErr, relErr)
+		}
+		if got := e.get(id); got.State != rental.StateWiping {
+			t.Fatalf("instance %s state = %s, want wiping", id, got.State)
+		}
 	}
 }
