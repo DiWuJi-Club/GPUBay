@@ -40,3 +40,23 @@ func Fund(t *testing.T, pool *pgxpool.Pool, userID, amount int64) {
 		t.Fatalf("Fund: %v", err)
 	}
 }
+
+// ProductID 返回种子商品 spark-1 的 ID。
+func ProductID(t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	var id int64
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM products WHERE code = 'spark-1'`).Scan(&id); err != nil {
+		t.Fatalf("ProductID: %v", err)
+	}
+	return id
+}
+
+// ImageID 返回排序最靠前的启用镜像 ID。
+func ImageID(t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	var id int64
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM images WHERE enabled ORDER BY sort, id LIMIT 1`).Scan(&id); err != nil {
+		t.Fatalf("ImageID: %v", err)
+	}
+	return id
+}
