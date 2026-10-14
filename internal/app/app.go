@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -41,6 +42,9 @@ type App struct {
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
+	if cfg.Env == "prod" && ((opt.SMS == nil && cfg.SMSDriver == "mock") || (opt.KYC == nil && cfg.KYCDriver == "mock")) {
+		return nil, errors.New("生产环境禁止使用 mock 插件")
+	}
 	clk := opt.Clock
 	if clk == nil {
 		clk = clock.Real{}

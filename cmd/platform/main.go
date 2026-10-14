@@ -45,18 +45,33 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	go a.Rental.RunSweeper(ctx, cfg.SweepInterval)
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		a.Rental.RunSweeper(ctx, cfg.SweepInterval)
+	}()
 
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: a.Handler, ReadHeaderTimeout: 10 * time.Second}
+	serverErr := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		log.Info("platform listening", "addr", cfg.HTTPAddr, "env", cfg.Env)
+		serverErr <- srv.ListenAndServe()
 	}()
-	log.Info("platform listening", "addr", cfg.HTTPAddr, "env", cfg.Env)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			runErr = err
+		}
 	}
-	return nil
+	stop() // 确保清扫器退出
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
+		runErr = err
+	}
+	<-sweeperDone
+	return runErr
 }

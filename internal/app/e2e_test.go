@@ -154,3 +154,10 @@ func TestFullRentalLifecycle(t *testing.T) {
 		t.Fatalf("ledger rows = %d", len(rows))
 	}
 }
+
+func TestBuildRejectsMockPluginsInProd(t *testing.T) {
+	cfg := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock"}
+	if _, err := app.Build(cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{}); err == nil {
+		t.Fatal("expected error for mock drivers in prod")
+	}
+}
