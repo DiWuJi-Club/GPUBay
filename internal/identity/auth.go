@@ -1,0 +1,139 @@
+package identity
+
+import (
+	"context"
+	"crypto/subtle"
+	"errors"
+	"regexp"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/platform/randx"
+	"spark-cloud/internal/plugins/sms"
+)
+
+const (
+	codeTTL         = 5 * time.Minute
+	codeInterval    = 60 * time.Second
+	codeDailyLimit  = 10
+	codeIPHourLimit = 30
+	codeMaxAttempts = 5
+	sessionTTL      = 30 * 24 * time.Hour
+)
+
+var phoneRe = regexp.MustCompile(`^1[3-9]\d{9}$`)
+
+func (s *Service) SendLoginCode(ctx context.Context, phone, ip string) error {
+	if !phoneRe.MatchString(phone) {
+		return apperr.BadRequest("手机号格式不正确")
+	}
+	now := s.d.Clock.Now()
+	var recent, daily, ipHour int
+	err := s.d.Pool.QueryRow(ctx, `SELECT
+			count(*) FILTER (WHERE phone = $1 AND created_at > $2),
+			count(*) FILTER (WHERE phone = $1),
+			count(*) FILTER (WHERE ip = $4 AND created_at > $5)
+		FROM sms_codes WHERE created_at > $3`,
+		phone, now.Add(-codeInterval), now.Add(-24*time.Hour), ip, now.Add(-time.Hour)).
+		Scan(&recent, &daily, &ipHour)
+	if err != nil {
+		return err
+	}
+	if recent > 0 || daily >= codeDailyLimit || ipHour >= codeIPHourLimit {
+		return apperr.ErrRateLimited
+	}
+	code := s.d.FixedCode
+	if code == "" {
+		code = randx.Digits(6)
+	}
+	if _, err := s.d.Pool.Exec(ctx, `INSERT INTO sms_codes (phone, code_hash, ip, created_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5)`, phone, hashSecret(phone+":"+code), ip, now, now.Add(codeTTL)); err != nil {
+		return err
+	}
+	return s.d.SMS.Send(ctx, phone, sms.TemplateLoginCode, map[string]string{"code": code})
+}
+
+// Login 校验验证码，不存在则创建用户，返回新的会话 token。
+func (s *Service) Login(ctx context.Context, phone, code string) (string, User, error) {
+	now := s.d.Clock.Now()
+	var (
+		bizErr error // 需要提交事务（记录试错次数）后再返回的业务错误
+		user   User
+		token  string
+	)
+	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		var id int64
+		var hash string
+		var attempts int
+		err := tx.QueryRow(ctx, `SELECT id, code_hash, attempts FROM sms_codes
+			WHERE phone = $1 AND used_at IS NULL AND expires_at > $2
+			ORDER BY id DESC LIMIT 1 FOR UPDATE`, phone, now).Scan(&id, &hash, &attempts)
+		if db.IsNoRows(err) {
+			bizErr = apperr.ErrInvalidCode
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if attempts >= codeMaxAttempts {
+			bizErr = apperr.ErrInvalidCode
+			return nil
+		}
+		if subtle.ConstantTimeCompare([]byte(hash), []byte(hashSecret(phone+":"+code))) != 1 {
+			bizErr = apperr.ErrInvalidCode
+			_, err := tx.Exec(ctx, `UPDATE sms_codes SET attempts = attempts + 1 WHERE id = $1`, id)
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE sms_codes SET used_at = $2 WHERE id = $1`, id, now); err != nil {
+			return err
+		}
+		user, err = scanUser(tx.QueryRow(ctx, `INSERT INTO users (phone, created_at, updated_at) VALUES ($1, $2, $2)
+			ON CONFLICT (phone) DO UPDATE SET updated_at = EXCLUDED.updated_at
+			RETURNING `+userCols, phone, now))
+		if err != nil {
+			return err
+		}
+		if user.Status == "banned" {
+			bizErr = apperr.ErrBanned
+			return nil
+		}
+		token = randx.Token()
+		_, err = tx.Exec(ctx, `INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)`,
+			hashSecret(token), user.ID, now, now.Add(sessionTTL))
+		return err
+	})
+	if err != nil {
+		return "", User{}, err
+	}
+	if bizErr != nil {
+		return "", User{}, bizErr
+	}
+	return token, user, nil
+}
+
+func (s *Service) Authenticate(ctx context.Context, token string) (User, error) {
+	if token == "" {
+		return User{}, apperr.ErrUnauthorized
+	}
+	u, err := scanUser(s.d.Pool.QueryRow(ctx, `SELECT u.id, u.phone, u.kind, u.kyc_status, u.status, u.created_at
+		FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token_hash = $1 AND s.expires_at > $2`, hashSecret(token), s.d.Clock.Now()))
+	if errors.Is(err, apperr.ErrNotFound) {
+		return User{}, apperr.ErrUnauthorized
+	}
+	if err != nil {
+		return User{}, err
+	}
+	if u.Status == "banned" {
+		return User{}, apperr.ErrBanned
+	}
+	return u, nil
+}
+
+func (s *Service) Logout(ctx context.Context, token string) error {
+	_, err := s.d.Pool.Exec(ctx, `DELETE FROM sessions WHERE token_hash = $1`, hashSecret(token))
+	return err
+}
