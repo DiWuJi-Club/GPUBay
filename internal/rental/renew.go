@@ -1,0 +1,84 @@
+package rental
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+
+	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/db"
+)
+
+// Renew 续费：扣款建单后按实例当前状态延长时长。wiping/released/failed 状态不允许续费且不扣款。
+func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d catalog.Duration) (Order, error) {
+	if !d.Valid() {
+		return Order{}, apperr.BadRequest("租期不正确")
+	}
+	now := s.d.Clock.Now()
+	var ord Order
+	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		inst, err := lockInstance(ctx, tx, instanceID)
+		if err != nil {
+			return err
+		}
+		if inst.UserID != userID {
+			return apperr.ErrNotFound
+		}
+		if inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped {
+			return apperr.ErrInvalidState
+		}
+		if ord, err = s.charge(ctx, tx, userID, "renew", inst.ID, inst.ProductID, d, now); err != nil {
+			return err
+		}
+		secs := seconds(d)
+		switch {
+		case inst.State == StateCreating:
+			_, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
+		case inst.State == StateRunning && inst.Suspended():
+			_, err = tx.Exec(ctx, `UPDATE instances SET paused_remaining = paused_remaining + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
+		case inst.State == StateRunning:
+			expires := inst.ExpiresAt.Add(d.Length())
+			r24, r1 := reminderFlags(expires.Sub(now))
+			_, err = tx.Exec(ctx, `UPDATE instances SET expires_at = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
+				inst.ID, expires, r24, r1, now)
+		case inst.State == StateStopped:
+			if _, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now); err != nil {
+				return err
+			}
+			if inst.PendingSeconds == 0 { // 首次续费才下发启动；已有待开始的续费说明启动指令已在队列中
+				_, err = s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdStartInstance, nil)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, "renew "+ord.ID, now); err != nil {
+			return err
+		}
+		return s.refreshLease(ctx, tx, inst.ID, now)
+	})
+	if err != nil {
+		return Order{}, err
+	}
+	return ord, nil
+}
+
+// Release 用户主动释放：立即进入洗机，已付费用不退。
+func (s *Service) Release(ctx context.Context, userID int64, instanceID string) error {
+	now := s.d.Clock.Now()
+	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		inst, err := lockInstance(ctx, tx, instanceID)
+		if err != nil {
+			return err
+		}
+		if inst.UserID != userID {
+			return apperr.ErrNotFound
+		}
+		if inst.State != StateRunning && inst.State != StateStopped {
+			return apperr.ErrInvalidState
+		}
+		return s.beginWipe(ctx, tx, inst, "user released", now)
+	})
+}
