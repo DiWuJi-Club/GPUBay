@@ -31,28 +31,40 @@ func (s *Service) SendLoginCode(ctx context.Context, phone, ip string) error {
 		return apperr.BadRequest("手机号格式不正确")
 	}
 	now := s.d.Clock.Now()
-	var recent, daily, ipHour int
-	err := s.d.Pool.QueryRow(ctx, `SELECT
-			count(*) FILTER (WHERE phone = $1 AND created_at > $2),
-			count(*) FILTER (WHERE phone = $1),
-			count(*) FILTER (WHERE ip = $4 AND created_at > $5)
-		FROM sms_codes WHERE created_at > $3`,
-		phone, now.Add(-codeInterval), now.Add(-24*time.Hour), ip, now.Add(-time.Hour)).
-		Scan(&recent, &daily, &ipHour)
-	if err != nil {
-		return err
-	}
-	if recent > 0 || daily >= codeDailyLimit || ipHour >= codeIPHourLimit {
-		return apperr.ErrRateLimited
-	}
 	code := s.d.FixedCode
 	if code == "" {
 		code = randx.Digits(6)
 	}
-	if _, err := s.d.Pool.Exec(ctx, `INSERT INTO sms_codes (phone, code_hash, ip, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5)`, phone, hashSecret(phone+":"+code), ip, now, now.Add(codeTTL)); err != nil {
+	// 计数与插入在同一事务内完成，并用事务级咨询锁串行化同一手机号与同一 IP 的发送，
+	// 避免并发请求都读到旧计数而绕过限流。锁的获取顺序固定（先手机号后 IP）以防死锁。
+	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "sms:phone:"+phone); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "sms:ip:"+ip); err != nil {
+			return err
+		}
+		var recent, daily, ipHour int
+		if err := tx.QueryRow(ctx, `SELECT
+				count(*) FILTER (WHERE phone = $1 AND created_at > $2),
+				count(*) FILTER (WHERE phone = $1),
+				count(*) FILTER (WHERE ip = $4 AND created_at > $5)
+			FROM sms_codes WHERE created_at > $3`,
+			phone, now.Add(-codeInterval), now.Add(-24*time.Hour), ip, now.Add(-time.Hour)).
+			Scan(&recent, &daily, &ipHour); err != nil {
+			return err
+		}
+		if recent > 0 || daily >= codeDailyLimit || ipHour >= codeIPHourLimit {
+			return apperr.ErrRateLimited
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO sms_codes (phone, code_hash, ip, created_at, expires_at)
+			VALUES ($1, $2, $3, $4, $5)`, phone, hashSecret(phone+":"+code), ip, now, now.Add(codeTTL))
+		return err
+	})
+	if err != nil {
 		return err
 	}
+	// 事务提交后再发短信，回滚的请求不会发出验证码。
 	return s.d.SMS.Send(ctx, phone, sms.TemplateLoginCode, map[string]string{"code": code})
 }
 

@@ -3,6 +3,8 @@ package identity_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -196,5 +198,79 @@ func TestCanRentRequiresVerifiedKYC(t *testing.T) {
 	}
 	if err := e.svc.CanRent(ctx, u.ID); !errors.Is(err, apperr.ErrKYCRequired) {
 		t.Fatalf("want kyc required, got %v", err)
+	}
+}
+
+func TestConcurrentSendsSameInstantSendOnlyOnce(t *testing.T) {
+	e := newEnv(t, "")
+	ctx := context.Background()
+	const n = 10
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // 同时放行，尽量让所有请求的计数与插入交错
+			errs[i] = e.svc.SendLoginCode(ctx, "13800000010", "1.1.1.1")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	ok := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, apperr.ErrRateLimited):
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("successful sends = %d, want 1", ok)
+	}
+	if got := len(e.sms.Sent()); got != 1 {
+		t.Fatalf("sms sent = %d, want 1", got)
+	}
+}
+
+func TestIPHourlyLimit(t *testing.T) {
+	e := newEnv(t, "")
+	ctx := context.Background()
+	for i := 0; i < 30; i++ {
+		phone := fmt.Sprintf("1390000%04d", i)
+		if err := e.svc.SendLoginCode(ctx, phone, "2.2.2.2"); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	if err := e.svc.SendLoginCode(ctx, "13900009999", "2.2.2.2"); !errors.Is(err, apperr.ErrRateLimited) {
+		t.Fatalf("31st send from same IP want rate limited, got %v", err)
+	}
+	if err := e.svc.SendLoginCode(ctx, "13900009998", "3.3.3.3"); err != nil {
+		t.Fatalf("other IP want ok, got %v", err)
+	}
+}
+
+func TestFourWrongCodesThenCorrectSucceeds(t *testing.T) {
+	e := newEnv(t, "")
+	ctx := context.Background()
+	if err := e.svc.SendLoginCode(ctx, "13800000011", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	code := lastCode(t, e.sms)
+	wrong := "000000"
+	if code == wrong {
+		wrong = "111111"
+	}
+	for i := 0; i < 4; i++ {
+		if _, _, err := e.svc.Login(ctx, "13800000011", wrong); !errors.Is(err, apperr.ErrInvalidCode) {
+			t.Fatalf("attempt %d want invalid code, got %v", i, err)
+		}
+	}
+	if _, _, err := e.svc.Login(ctx, "13800000011", code); err != nil {
+		t.Fatalf("correct code after 4 failures want ok, got %v", err)
 	}
 }
