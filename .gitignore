@@ -1,0 +1,4 @@
+/bin/
+/.devdata/
+*.test
+coverage.out
