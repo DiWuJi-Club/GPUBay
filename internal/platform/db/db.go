@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // 注册 database/sql 驱动 "pgx"，供 goose 使用
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 
 	"spark-cloud/migrations"
 )
@@ -41,7 +42,12 @@ func Migrate(ctx context.Context, url string) error {
 		return fmt.Errorf("open migrate conn: %w", err)
 	}
 	defer sqlDB.Close()
-	p, err := goose.NewProvider(goose.DialectPostgres, sqlDB, migrations.FS)
+	// 会话级咨询锁：多个副本同时启动时串行执行迁移。
+	locker, err := lock.NewPostgresSessionLocker()
+	if err != nil {
+		return fmt.Errorf("goose locker: %w", err)
+	}
+	p, err := goose.NewProvider(goose.DialectPostgres, sqlDB, migrations.FS, goose.WithSessionLocker(locker))
 	if err != nil {
 		return fmt.Errorf("goose provider: %w", err)
 	}

@@ -68,16 +68,7 @@ func freePort() int {
 func New(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
-	name := fmt.Sprintf("t_%d_%d", os.Getpid(), seq.Add(1))
-	admin, err := pgx.Connect(ctx, adminURL)
-	if err != nil {
-		t.Fatalf("connect admin: %v", err)
-	}
-	defer admin.Close(ctx)
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
-		t.Fatalf("create database: %v", err)
-	}
-	url := strings.Replace(adminURL, "/postgres?", "/"+name+"?", 1)
+	url := EmptyURL(t)
 	if err := db.Migrate(ctx, url); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -87,4 +78,20 @@ func New(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 	return pool
+}
+
+// EmptyURL 创建一个尚未执行迁移的全新数据库并返回其连接串。
+func EmptyURL(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	name := fmt.Sprintf("t_%d_%d", os.Getpid(), seq.Add(1))
+	admin, err := pgx.Connect(ctx, adminURL)
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	defer admin.Close(ctx)
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	return strings.Replace(adminURL, "/postgres?", "/"+name+"?", 1)
 }

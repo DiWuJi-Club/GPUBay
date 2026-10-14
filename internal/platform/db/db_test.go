@@ -45,3 +45,18 @@ func TestWithTxCommitAndRollback(t *testing.T) {
 		t.Fatalf("actions = %v, want [test.commit]", actions)
 	}
 }
+
+// 多个副本同时启动时并发执行迁移，必须全部成功（由会话级咨询锁串行化）。
+func TestConcurrentMigrate(t *testing.T) {
+	url := dbtest.EmptyURL(t)
+	ctx := context.Background()
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func() { errs <- db.Migrate(ctx, url) }()
+	}
+	for i := 0; i < 8; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent migrate: %v", err)
+		}
+	}
+}
