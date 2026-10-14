@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"regexp"
 	"time"
 
@@ -37,6 +38,7 @@ func (s *Service) SendLoginCode(ctx context.Context, phone, ip string) error {
 	}
 	// 计数与插入在同一事务内完成，并用事务级咨询锁串行化同一手机号与同一 IP 的发送，
 	// 避免并发请求都读到旧计数而绕过限流。锁的获取顺序固定（先手机号后 IP）以防死锁。
+	var codeID int64
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "sms:phone:"+phone); err != nil {
 			return err
@@ -57,15 +59,21 @@ func (s *Service) SendLoginCode(ctx context.Context, phone, ip string) error {
 		if recent > 0 || daily >= codeDailyLimit || ipHour >= codeIPHourLimit {
 			return apperr.ErrRateLimited
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO sms_codes (phone, code_hash, ip, created_at, expires_at)
-			VALUES ($1, $2, $3, $4, $5)`, phone, hashSecret(phone+":"+code), ip, now, now.Add(codeTTL))
-		return err
+		return tx.QueryRow(ctx, `INSERT INTO sms_codes (phone, code_hash, ip, created_at, expires_at)
+			VALUES ($1, $2, $3, $4, $5) RETURNING id`, phone, hashSecret(phone+":"+code), ip, now, now.Add(codeTTL)).Scan(&codeID)
 	})
 	if err != nil {
 		return err
 	}
 	// 事务提交后再发短信，回滚的请求不会发出验证码。
-	return s.d.SMS.Send(ctx, phone, sms.TemplateLoginCode, map[string]string{"code": code})
+	if err := s.d.SMS.Send(ctx, phone, sms.TemplateLoginCode, map[string]string{"code": code}); err != nil {
+		// 发送失败则删除记录（尽力而为），用户不会因为没收到的验证码被限流。
+		if _, derr := s.d.Pool.Exec(context.WithoutCancel(ctx), `DELETE FROM sms_codes WHERE id = $1`, codeID); derr != nil {
+			return errors.Join(err, fmt.Errorf("delete unsent sms code: %w", derr))
+		}
+		return err
+	}
+	return nil
 }
 
 // Login 校验验证码，不存在则创建用户，返回新的会话 token。

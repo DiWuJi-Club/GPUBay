@@ -274,3 +274,37 @@ func TestFourWrongCodesThenCorrectSucceeds(t *testing.T) {
 		t.Fatalf("correct code after 4 failures want ok, got %v", err)
 	}
 }
+
+type flakySMS struct {
+	fail bool
+	sms.Mock
+}
+
+func (f *flakySMS) Send(ctx context.Context, phone, template string, params map[string]string) error {
+	if f.fail {
+		return errors.New("sms gateway down")
+	}
+	return f.Mock.Send(ctx, phone, template, params)
+}
+
+// 短信发送失败时删除验证码记录：用户可立即重试，不会因为没收到的验证码被限流。
+func TestSendCodeFailureDoesNotRateLimit(t *testing.T) {
+	pool := dbtest.New(t)
+	sender := &flakySMS{fail: true}
+	svc := identity.NewService(identity.Deps{Pool: pool, Clock: clock.NewFake(dbtest.T0), SMS: sender})
+	ctx := context.Background()
+	if err := svc.SendLoginCode(ctx, "13800000001", "1.1.1.1"); err == nil {
+		t.Fatal("want send error")
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sms_codes`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("sms_codes rows = %d, %v; want 0", n, err)
+	}
+	sender.fail = false
+	if err := svc.SendLoginCode(ctx, "13800000001", "1.1.1.1"); err != nil {
+		t.Fatalf("retry after failed send: %v", err)
+	}
+	if _, _, err := svc.Login(ctx, "13800000001", lastCode(t, &sender.Mock)); err != nil {
+		t.Fatalf("login with resent code: %v", err)
+	}
+}
