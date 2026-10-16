@@ -83,7 +83,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	uploads := storage.NewService(pool, clk, disk)
 
-	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: smsSender, KYC: verifier, Box: box, FixedCode: fixedCode})
+	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: smsSender, KYC: verifier, Box: box, Uploads: uploads, FixedCode: fixedCode})
 	w := wallet.NewService(pool, clk)
 	c := catalog.NewService(pool)
 	f := fleet.NewService(pool, clk)
