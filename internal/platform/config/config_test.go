@@ -117,6 +117,7 @@ func TestLoadPluginErrors(t *testing.T) {
 		{"wechat partial", map[string]string{"SPARK_WECHAT_PRIVATE_KEY_PATH": ""}, "SPARK_WECHAT_PRIVATE_KEY_PATH"},
 		{"wechat bad v3 key", map[string]string{"SPARK_WECHAT_API_V3_KEY": "short"}, "SPARK_WECHAT_API_V3_KEY"},
 		{"alipay partial", map[string]string{"SPARK_ALIPAY_PUBLIC_KEY_PATH": ""}, "SPARK_ALIPAY_PUBLIC_KEY_PATH"},
+		{"alipay sandbox in prod", map[string]string{"SPARK_ALIPAY_SANDBOX": "true"}, "SPARK_ALIPAY_SANDBOX"},
 		{"alipay bad sandbox", map[string]string{"SPARK_ALIPAY_SANDBOX": "maybe"}, "SPARK_ALIPAY_SANDBOX"},
 	}
 	for _, c := range cases {

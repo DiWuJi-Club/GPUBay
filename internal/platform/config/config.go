@@ -204,6 +204,9 @@ func (c Config) checkPlugins() error {
 				"SPARK_ALIPAY_PRIVATE_KEY_PATH", p.PrivateKeyPath, "SPARK_ALIPAY_PUBLIC_KEY_PATH", p.PublicKeyPath); err != nil {
 				return err
 			}
+			if p.Sandbox && c.Env == "prod" {
+				return errors.New("生产环境不能使用支付宝沙箱，请移除 SPARK_ALIPAY_SANDBOX")
+			}
 		}
 	}
 	return nil

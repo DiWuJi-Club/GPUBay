@@ -90,7 +90,13 @@ func (a *Alipay) ParseNotify(req *http.Request) (Notification, error) {
 	if err := req.ParseForm(); err != nil {
 		return Notification{}, fmt.Errorf("alipay notify: %w", err)
 	}
-	n, err := a.api.DecodeNotification(req.Context(), req.PostForm)
+	// 公钥模式不使用 alipay_cert_sn；该字段未签名，交给 SDK 会触发证书下载并切换验签证书，必须丢弃
+	form := url.Values{}
+	for k, v := range req.PostForm {
+		form[k] = append([]string(nil), v...)
+	}
+	form.Del("alipay_cert_sn")
+	n, err := a.api.DecodeNotification(req.Context(), form)
 	if err != nil {
 		return Notification{}, fmt.Errorf("alipay notify: %w", err)
 	}

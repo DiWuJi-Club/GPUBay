@@ -130,6 +130,14 @@ func TestAlipayParseNotify(t *testing.T) {
 	if n, err := a.ParseNotify(signedAlipayNotify(t, signer, notifyValues("WAIT_BUYER_PAY", "50.00"))); err != nil || n.Paid {
 		t.Fatalf("waiting = %+v, %v", n, err)
 	}
+	// alipay_cert_sn 不参与签名，由攻击者附加也不应影响验签，更不能触发证书下载
+	snReq := signedAlipayNotify(t, signer, notifyValues("TRADE_SUCCESS", "50.00"))
+	snBody := mustRead(t, snReq) + "&alipay_cert_sn=deadbeef"
+	snReq = httptest.NewRequest("POST", "/api/v1/pay/notify/alipay", strings.NewReader(snBody))
+	snReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if n, err := a.ParseNotify(snReq); err != nil || !n.Paid || n.Amount != 5000 {
+		t.Fatalf("notify with alipay_cert_sn = %+v, %v", n, err)
+	}
 	other := notifyValues("TRADE_SUCCESS", "50.00")
 	other.Set("app_id", "2021999999999999")
 	if _, err := a.ParseNotify(signedAlipayNotify(t, signer, other)); err == nil {
