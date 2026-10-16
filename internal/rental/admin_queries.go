@@ -165,3 +165,43 @@ func (s *Service) ExportOrders(ctx context.Context, f OrderFilter, fn func(Order
 	}
 	return rows.Err()
 }
+
+// InstanceStateCounts 按状态统计实例数量。
+func (s *Service) InstanceStateCounts(ctx context.Context) (map[string]int, error) {
+	rows, err := s.d.Pool.Query(ctx, `SELECT state, count(*) FROM instances GROUP BY state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var state string
+		var n int
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, err
+		}
+		out[state] = n
+	}
+	return out, rows.Err()
+}
+
+// OrderAmount 返回 [from, to) 内下单金额之和（分，未扣除退款）。
+func (s *Service) OrderAmount(ctx context.Context, from, to time.Time) (int64, error) {
+	var sum int64
+	err := s.d.Pool.QueryRow(ctx, `SELECT COALESCE(sum(amount), 0) FROM orders WHERE created_at >= $1 AND created_at < $2`, from, to).Scan(&sum)
+	return sum, err
+}
+
+// DailyOccupancy 返回从 from 起连续 days 天、每天被租用的机器总秒数（machine_leases 中 active / ended 时段与当天的交集，截止到 now）。
+func (s *Service) DailyOccupancy(ctx context.Context, from time.Time, days int, now time.Time) ([]float64, error) {
+	rows, err := s.d.Pool.Query(ctx, `
+		SELECT COALESCE(sum(GREATEST(EXTRACT(EPOCH FROM
+				LEAST(upper(l.period), d.day + interval '24 hours', $3::timestamptz) - GREATEST(lower(l.period), d.day)), 0)), 0)::float8
+		FROM generate_series($1::timestamptz, $1::timestamptz + ($2::int - 1) * interval '24 hours', interval '24 hours') AS d(day)
+		LEFT JOIN machine_leases l ON l.status IN ('active', 'ended') AND l.period && tstzrange(d.day, d.day + interval '24 hours')
+		GROUP BY d.day ORDER BY d.day`, from, days, now)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[float64])
+}

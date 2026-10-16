@@ -35,3 +35,19 @@ func TestAdminListAndExportRecharges(t *testing.T) {
 		t.Fatalf("export = %v", channels)
 	}
 }
+
+func TestPaidAmount(t *testing.T) {
+	e := newEnv(t)
+	r := e.create(pay.ChannelWechat, 300)
+	if err := e.svc.Settle(e.ctx, pay.ChannelWechat, paid(r)); err != nil {
+		t.Fatal(err)
+	}
+	e.create(pay.ChannelWechat, 999) // 未支付不计入
+	if _, err := e.svc.ManualRecharge(e.ctx, audit.Actor{AdminID: 1}, e.userID, 700, "转账"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.svc.PaidAmount(e.ctx, e.clk.Now().Add(-time.Hour), e.clk.Now().Add(time.Hour))
+	if err != nil || got != 1000 {
+		t.Fatalf("paid = %d, %v", got, err)
+	}
+}

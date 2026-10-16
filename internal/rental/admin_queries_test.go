@@ -108,3 +108,31 @@ func TestExportOrdersTooLarge(t *testing.T) {
 		t.Fatalf("export = %v, called = %v", err, called)
 	}
 }
+
+func TestDashboardStats(t *testing.T) {
+	e := newEnv(t, 2)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true) // 计时从 T0 开始，到期 T0+24h，占用时段上界为 T0+31h（含 6 小时保留与 1 小时洗机缓冲）
+	e.place(catalog.D1w)
+	counts, err := e.svc.InstanceStateCounts(e.ctx)
+	if err != nil || counts[rental.StateRunning] != 1 || counts[rental.StateCreating] != 1 {
+		t.Fatalf("counts = %v, %v", counts, err)
+	}
+	amount, err := e.svc.OrderAmount(e.ctx, dbtest.T0, dbtest.T0.Add(time.Hour))
+	if err != nil || amount != 6900+41400 {
+		t.Fatalf("order amount = %d, %v", amount, err)
+	}
+	if err := e.svc.Release(e.ctx, e.userID, inst.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.ack(true)
+	now := dbtest.T0.Add(36 * time.Hour)
+	occ, err := e.svc.DailyOccupancy(e.ctx, dbtest.T0, 2, now)
+	if err != nil || len(occ) != 2 {
+		t.Fatalf("occupancy = %v, %v", occ, err)
+	}
+	// 第一个实例在 T0 释放（时段为空）；第二个实例（1 周）在 e.ack 后开始运行，两天都被占用，第二天截止到 now
+	if occ[0] != 86400 || occ[1] != 12*3600 {
+		t.Fatalf("occupancy = %v, want [86400 43200]", occ)
+	}
+}

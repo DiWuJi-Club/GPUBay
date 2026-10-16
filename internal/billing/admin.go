@@ -91,3 +91,11 @@ func (s *Service) Export(ctx context.Context, f RechargeFilter, fn func(Recharge
 	}
 	return rows.Err()
 }
+
+// PaidAmount 返回 paid_at 落在 [from, to) 内的充值金额之和（分，含手动入账）。
+func (s *Service) PaidAmount(ctx context.Context, from, to time.Time) (int64, error) {
+	var sum int64
+	err := s.d.Pool.QueryRow(ctx, `SELECT COALESCE(sum(amount), 0) FROM recharges
+		WHERE status = 'paid' AND paid_at >= $1 AND paid_at < $2`, from, to).Scan(&sum)
+	return sum, err
+}

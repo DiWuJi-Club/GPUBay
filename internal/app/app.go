@@ -107,7 +107,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 
 	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: smsSender, KYC: verifier, Box: box, Uploads: uploads, FixedCode: fixedCode})
 	w := wallet.NewService(pool, clk)
-	c := catalog.NewService(pool)
+	c := catalog.NewService(pool).WithClock(clk)
 	f := fleet.NewService(pool, clk)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{

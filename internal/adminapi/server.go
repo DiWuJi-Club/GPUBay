@@ -86,6 +86,7 @@ func (s *Server) Router() http.Handler {
 			s.instanceRoutes(g)
 			s.userRoutes(g)
 			s.financeRoutes(g)
+			s.catalogRoutes(g)
 		})
 	})
 	return r

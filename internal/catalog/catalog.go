@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/db"
 )
 
@@ -60,10 +61,17 @@ type Image struct {
 }
 
 type Service struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	clock clock.Clock
 }
 
-func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool, clock: clock.Real{}} }
+
+// WithClock 替换时钟（测试与 app 组装时注入同一个时钟）。
+func (s *Service) WithClock(c clock.Clock) *Service {
+	s.clock = c
+	return s
+}
 
 func (s *Service) ListProducts(ctx context.Context) ([]ProductWithPrices, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, code, name, spec FROM products WHERE status = 'active' ORDER BY id`)

@@ -79,7 +79,7 @@ func newEnv(t *testing.T) *env {
 	uploads := storage.NewService(pool, clk, disk)
 	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: box, Uploads: uploads})
 	w := wallet.NewService(pool, clk)
-	c := catalog.NewService(pool)
+	c := catalog.NewService(pool).WithClock(clk)
 	f := fleet.NewService(pool, clk)
 	pduMock := &pdu.Mock{}
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, AllowMock: true, Open: func(fleet.PDUConn) (pdu.Driver, error) { return pduMock, nil }})
