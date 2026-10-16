@@ -14,22 +14,23 @@ import (
 )
 
 type Order struct {
-	ID         string           `json:"id"`
-	UserID     int64            `json:"-"`
-	Kind       string           `json:"kind"`
-	InstanceID string           `json:"instance_id"`
-	ProductID  int64            `json:"product_id"`
-	Duration   catalog.Duration `json:"duration"`
-	Amount     int64            `json:"amount"`
-	Status     string           `json:"status"`
-	CreatedAt  time.Time        `json:"created_at"`
+	ID             string           `json:"id"`
+	UserID         int64            `json:"-"`
+	Kind           string           `json:"kind"`
+	InstanceID     string           `json:"instance_id"`
+	ProductID      int64            `json:"product_id"`
+	Duration       catalog.Duration `json:"duration"`
+	Amount         int64            `json:"amount"`
+	Status         string           `json:"status"`
+	RefundedAmount int64            `json:"refunded_amount"`
+	CreatedAt      time.Time        `json:"created_at"`
 }
 
-const orderCols = `id, user_id, kind, instance_id, product_id, duration, amount, status, created_at`
+const orderCols = `id, user_id, kind, instance_id, product_id, duration, amount, status, refunded_amount, created_at`
 
 func scanOrder(row pgx.Row) (Order, error) {
 	var o Order
-	err := row.Scan(&o.ID, &o.UserID, &o.Kind, &o.InstanceID, &o.ProductID, &o.Duration, &o.Amount, &o.Status, &o.CreatedAt)
+	err := row.Scan(&o.ID, &o.UserID, &o.Kind, &o.InstanceID, &o.ProductID, &o.Duration, &o.Amount, &o.Status, &o.RefundedAmount, &o.CreatedAt)
 	if db.IsNoRows(err) {
 		return Order{}, apperr.ErrNotFound
 	}

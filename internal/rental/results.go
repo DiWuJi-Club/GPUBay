@@ -97,8 +97,12 @@ func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from
 	return s.refreshLease(ctx, tx, inst.ID, now)
 }
 
-// failCreating 开通失败：实例失败、全额退款、机器隔离为故障、取消剩余指令并告警。
+// failCreating 开通失败：实例失败、退款、机器隔离为故障、取消剩余指令并告警。
+// 退款按加锁时读到的实例计算（含 pending_seconds），因此须在清零 pending_seconds 之前进行。
 func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, reason string, now time.Time) error {
+	if err := s.refundAll(ctx, tx, inst, now); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'failed', pending_seconds = 0, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 		return err
 	}
@@ -106,9 +110,6 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 		return err
 	}
 	if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
-		return err
-	}
-	if err := s.refundAll(ctx, tx, inst, now); err != nil {
 		return err
 	}
 	if err := s.d.Fleet.MarkFaulty(ctx, tx, inst.MachineID); err != nil {
@@ -121,9 +122,12 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 		MachineID: inst.MachineID, InstanceID: inst.ID, Message: reason})
 }
 
-// refundAll 退还该实例所有已支付订单（新购与续费）。
+// refundAll 开通失败退款。实例有自己的已支付订单（新购与续费）时，退还每笔订单尚未退还的部分；
+// 否则若它是换机得到的新实例，则按转入的剩余时长（pending_seconds × 链路上最近一笔订单单价，不超过可退上限）
+// 从新到旧退还链路上前身实例的订单。inst 须为加锁时读到的状态（state = creating）。
 func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
-	rows, err := tx.Query(ctx, `SELECT id, amount FROM orders WHERE instance_id = $1 AND status = 'paid' FOR UPDATE`, inst.ID)
+	rows, err := tx.Query(ctx, `SELECT id, amount - refunded_amount FROM orders
+		WHERE instance_id = $1 AND status IN ('paid', 'partially_refunded') ORDER BY created_at, id FOR UPDATE`, inst.ID)
 	if err != nil {
 		return err
 	}
@@ -139,16 +143,37 @@ func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now t
 	if err != nil {
 		return err
 	}
+	if len(orders) == 0 {
+		return s.refundTransferred(ctx, tx, inst, now)
+	}
 	for _, o := range orders {
-		if _, err := s.d.Wallet.Apply(ctx, tx, wallet.Entry{
-			UserID: inst.UserID, Amount: o.amount, Kind: wallet.KindRefund, RefType: "order", RefID: o.id,
-			Remark: "开通失败退款 " + inst.ID,
-		}); err != nil {
-			return err
+		if o.amount > 0 {
+			if _, err := s.d.Wallet.Apply(ctx, tx, wallet.Entry{
+				UserID: inst.UserID, Amount: o.amount, Kind: wallet.KindRefund, RefType: "order", RefID: o.id,
+				Remark: "开通失败退款 " + inst.ID,
+			}); err != nil {
+				return err
+			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE orders SET status = 'refunded', updated_at = $2 WHERE id = $1`, o.id, now); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE orders SET status = 'refunded', refunded_amount = amount, refund_count = refund_count + 1,
+			updated_at = $2 WHERE id = $1`, o.id, now); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// refundTransferred 换机得到的新实例开通失败：退还转入的剩余时长对应的金额，记到链路上前身实例的订单。
+func (s *Service) refundTransferred(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
+	chain, err := instanceChain(ctx, tx, inst.ID)
+	if err != nil || len(chain) < 2 {
+		return err
+	}
+	orders, err := refundableOrders(ctx, tx, chain, true)
+	if err != nil {
+		return err
+	}
+	q := quote(inst, orders, now)
+	_, err = s.refundAcross(ctx, tx, inst.UserID, orders, q.Suggested, 0, "开通失败退款 "+inst.ID, now)
+	return err
 }
