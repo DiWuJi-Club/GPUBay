@@ -557,7 +557,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 | `POST /hooks/clock/advance` | `{seconds}` | `{now}` | 推进假时钟（只能向前） |
 | `POST /hooks/sweep` | `{heartbeat?: bool}`（缺省 `true`） | `{ok}` | 先对全部机器 `Fleet.Heartbeat`（除非 `heartbeat: false`），再执行一次 `Rental.Sweep` + `Billing.Sweep`（到期停机、超时洗机、失联暂停、开通超时、充值关单…）。必须先心跳：`Rental.Sweep` 先做离线检测与暂停、再做到期停机，而到期停机只处理未暂停的实例；推进 24 小时后不心跳直接清扫，机器会被判失联、实例被暂停而不会停机（`internal/app/e2e_test.go` 的 `sweep` helper 就是这样写的）。只有「计时已暂停 / 机器失联」场景传 `heartbeat: false` |
 | `POST /hooks/agent` | `{machine_id?, fail?: bool, result?: string}` | `{completed: n}` | 模拟 Agent：对指定机器（缺省全部）心跳，并把全部待处理指令按成功 / 失败回报（计划 2 未做，这是让实例进入 running / stopped / released / failed 的唯一手段） |
-| `POST /hooks/machines` | `{count, serial_prefix?}` | `{ids: number[]}` | 通过 `Fleet.Register` 登记 `count` 台 `spark-1` 机器并心跳使其在线 |
+| `POST /hooks/machines` | `{count, serial_prefix?}` | `{ids: number[]}` | 通过 `Fleet.Register` 登记 `count` 台 `spark-1` 机器，结束维护（Register 默认处于 maintenance）并心跳使其空闲在线 |
 | `POST /hooks/users` | `{phone?, verified?: bool, balance?: cents, ledger_rows?: n}` | `{id, phone}` | 创建用户（可直接实名、预置余额、追加 n 条小额调账流水用于分页测试）；登录仍走界面。`ledger_rows` 通过 `Wallet.AdminAdjust` 写入，每条用不同备注 `e2e-seed-<i>`——该方法拒绝 60 秒内完全相同的调账，而假时钟下这 60 秒永远不会过去 |
 | `POST /hooks/admins` | `{username, role, bind_totp: bool}` | `{id, password, totp_secret?, recovery_codes?}` | 创建管理员（`Admins.Create`），密码固定 `e2e-password-123456`；`bind_totp` 为真时走命令行同款路径 `Admins.EnrollTOTP` → 按假时钟算码 → `Admins.ConfirmEnrollment`，返回密钥与恢复码 |
 | `POST /hooks/kyc` | `{reject: bool}` | `{ok}` | 切换 mock 实名核验为全部不通过 / 通过。`kyc.Mock` 是值类型、`Reject` 是普通字段，不能在运行中改字段（数据竞争）；`e2ehooks` 自带一个 `atomic.Bool` 驱动的 `switchableKYC` 实现 `kyc.Verifier`，通过 `Options.KYC` 注入 |
