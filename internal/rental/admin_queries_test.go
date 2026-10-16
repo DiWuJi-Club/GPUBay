@@ -1,9 +1,13 @@
 package rental_test
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/platform/csvx"
+	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/paging"
 	"spark-cloud/internal/rental"
 )
@@ -56,5 +60,51 @@ func TestInstanceEventsAndOrdersFollowMigration(t *testing.T) {
 	cmds, err := e.fleet.CommandsForInstance(e.ctx, old.ID, 10)
 	if err != nil || len(cmds) != 2 || cmds[0].Type != "wipe_instance" {
 		t.Fatalf("commands = %+v, %v", cmds, err)
+	}
+}
+
+func TestAdminListOrdersAndExport(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(48 * time.Hour)
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1w, ""); err != nil {
+		t.Fatal(err)
+	}
+	list, total, err := e.svc.AdminListOrders(e.ctx, rental.OrderFilter{}, paging.Page{})
+	if err != nil || total != 2 || list[0].Kind != "renew" || list[0].UserID != e.userID {
+		t.Fatalf("all = %+v, %d, %v", list, total, err)
+	}
+	from := e.clock.Now().Add(-time.Hour)
+	if _, total, _ := e.svc.AdminListOrders(e.ctx, rental.OrderFilter{From: &from}, paging.Page{}); total != 1 {
+		t.Fatalf("from filter = %d", total)
+	}
+	if _, total, _ := e.svc.AdminListOrders(e.ctx, rental.OrderFilter{To: &from, Kind: "new", Status: "paid"}, paging.Page{}); total != 1 {
+		t.Fatalf("to+kind+status filter = %d", total)
+	}
+	if _, _, err := e.svc.AdminListOrders(e.ctx, rental.OrderFilter{Kind: "gift"}, paging.Page{}); codeOf(err) != "bad_request" {
+		t.Fatalf("bad kind = %v", err)
+	}
+	var kinds []string
+	if err := e.svc.ExportOrders(e.ctx, rental.OrderFilter{}, func(o rental.Order) error { kinds = append(kinds, o.Kind); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(kinds) != 2 || kinds[0] != "new" {
+		t.Fatalf("export order = %v (must be oldest first)", kinds)
+	}
+}
+
+func TestExportOrdersTooLarge(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	if _, err := e.pool.Exec(e.ctx, `INSERT INTO orders (id, user_id, kind, instance_id, product_id, duration, amount, status, created_at, updated_at)
+		SELECT 'ord-bulk-' || g, $1, 'renew', $2, $3, '1d', 1, 'paid', $4, $4 FROM generate_series(1, $5::int) g`,
+		e.userID, inst.ID, e.productID, dbtest.T0, csvx.MaxRows); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := e.svc.ExportOrders(e.ctx, rental.OrderFilter{}, func(rental.Order) error { called = true; return nil })
+	if !errors.Is(err, csvx.ErrTooLarge) || called {
+		t.Fatalf("export = %v, called = %v", err, called)
 	}
 }
