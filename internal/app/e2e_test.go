@@ -258,3 +258,11 @@ func TestBuildWiresRealPayProviders(t *testing.T) {
 		t.Fatal("missing key file must fail")
 	}
 }
+
+func TestBuildRejectsMockPDUInProd(t *testing.T) {
+	cfg := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "aliyun", KYCDriver: "aliyun",
+		PayDriver: "real", PDUDriver: "mock", UploadDir: t.TempDir()}
+	if _, err := app.Build(cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{}); err == nil {
+		t.Fatal("expected error for mock PDU in prod")
+	}
+}

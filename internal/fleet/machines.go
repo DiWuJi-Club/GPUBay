@@ -33,6 +33,8 @@ type Machine struct {
 	State       string     `json:"state"`
 	AgentOnline bool       `json:"agent_online"`
 	LastSeenAt  *time.Time `json:"last_seen_at"`
+	PDUID       *int64     `json:"pdu_id"`
+	PDUOutlet   *int       `json:"pdu_outlet"`
 	CreatedAt   time.Time  `json:"created_at"`
 }
 
@@ -42,22 +44,26 @@ type NewMachine struct {
 	Slot      string
 	LanIP     string
 	ProductID int64
+	PDUID     *int64
+	PDUOutlet *int
 }
 
 type Service struct {
 	pool  *pgxpool.Pool
 	clock clock.Clock
+	pdu   PDUConfig
 }
 
 func NewService(pool *pgxpool.Pool, clk clock.Clock) *Service {
 	return &Service{pool: pool, clock: clk}
 }
 
-const machineCols = `id, serial, rack, slot, lan_ip, product_id, state, agent_online, last_seen_at, created_at`
+const machineCols = `id, serial, rack, slot, lan_ip, product_id, state, agent_online, last_seen_at, pdu_id, pdu_outlet, created_at`
 
 func scanMachine(row pgx.Row) (Machine, error) {
 	var m Machine
-	err := row.Scan(&m.ID, &m.Serial, &m.Rack, &m.Slot, &m.LanIP, &m.ProductID, &m.State, &m.AgentOnline, &m.LastSeenAt, &m.CreatedAt)
+	err := row.Scan(&m.ID, &m.Serial, &m.Rack, &m.Slot, &m.LanIP, &m.ProductID, &m.State, &m.AgentOnline, &m.LastSeenAt,
+		&m.PDUID, &m.PDUOutlet, &m.CreatedAt)
 	if db.IsNoRows(err) {
 		return Machine{}, apperr.ErrNotFound
 	}
@@ -66,6 +72,11 @@ func scanMachine(row pgx.Row) (Machine, error) {
 
 // Register 登记一台新机器，初始状态为维护中，需管理员确认后上线。
 func (s *Service) Register(ctx context.Context, nm NewMachine) (Machine, error) {
+	return s.register(ctx, s.pool, nm)
+}
+
+// register 校验并插入一台机器；q 可以是事务（批量导入时整批在一个事务内）。
+func (s *Service) register(ctx context.Context, q db.Querier, nm NewMachine) (Machine, error) {
 	nm.Serial = strings.TrimSpace(nm.Serial)
 	if nm.Serial == "" {
 		return Machine{}, apperr.BadRequest("请填写序列号")
@@ -73,14 +84,24 @@ func (s *Service) Register(ctx context.Context, nm NewMachine) (Machine, error) 
 	if net.ParseIP(nm.LanIP) == nil {
 		return Machine{}, apperr.BadRequest("内网 IP 格式不正确")
 	}
-	now := s.clock.Now()
-	m, err := scanMachine(s.pool.QueryRow(ctx, `INSERT INTO machines (serial, rack, slot, lan_ip, product_id, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING `+machineCols,
-		nm.Serial, nm.Rack, nm.Slot, nm.LanIP, nm.ProductID, now))
-	if db.IsUniqueViolation(err) {
-		return Machine{}, apperr.New("duplicate_serial", "序列号已存在", 409)
+	if (nm.PDUID == nil) != (nm.PDUOutlet == nil) {
+		return Machine{}, apperr.BadRequest("PDU 与插座号需同时填写")
 	}
-	if db.IsForeignKeyViolation(err) {
+	if nm.PDUOutlet != nil && (*nm.PDUOutlet < 1 || *nm.PDUOutlet > 256) {
+		return Machine{}, apperr.BadRequest("PDU 插座号需在 1～256 之间")
+	}
+	now := s.clock.Now()
+	m, err := scanMachine(q.QueryRow(ctx, `INSERT INTO machines (serial, rack, slot, lan_ip, product_id, pdu_id, pdu_outlet, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) RETURNING `+machineCols,
+		nm.Serial, nm.Rack, nm.Slot, nm.LanIP, nm.ProductID, nm.PDUID, nm.PDUOutlet, now))
+	switch {
+	case db.IsUniqueViolation(err) && db.ConstraintName(err) == "machines_pdu_outlet_uniq":
+		return Machine{}, apperr.New("pdu_outlet_taken", "该 PDU 插座已被其他机器使用", 409)
+	case db.IsUniqueViolation(err):
+		return Machine{}, apperr.New("duplicate_serial", "序列号已存在", 409)
+	case db.IsForeignKeyViolation(err) && db.ConstraintName(err) == "machines_pdu_id_fkey":
+		return Machine{}, apperr.BadRequest("PDU 不存在")
+	case db.IsForeignKeyViolation(err):
 		return Machine{}, apperr.BadRequest("商品不存在")
 	}
 	return m, err

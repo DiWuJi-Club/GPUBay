@@ -26,6 +26,7 @@ import (
 	"spark-cloud/internal/plugins/aliyun"
 	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/pay"
+	"spark-cloud/internal/plugins/pdu"
 	"spark-cloud/internal/plugins/sms"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
@@ -38,6 +39,7 @@ type Options struct {
 	SMS   sms.Sender
 	KYC   kyc.Verifier
 	Pay   map[string]pay.Provider // 测试注入的支付渠道
+	PDU   pdu.Driver              // 测试注入：所有 PDU 都使用该驱动
 }
 
 type App struct {
@@ -53,7 +55,7 @@ type App struct {
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
 	if cfg.Env == "prod" && ((opt.SMS == nil && cfg.SMSDriver == "mock") || (opt.KYC == nil && cfg.KYCDriver == "mock") ||
-		(opt.Pay == nil && cfg.PayDriver != "real")) {
+		(opt.Pay == nil && cfg.PayDriver != "real") || (opt.PDU == nil && cfg.PDUDriver != "snmp")) {
 		return nil, errors.New("生产环境禁止使用 mock 插件")
 	}
 	clk := opt.Clock
@@ -107,6 +109,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	w := wallet.NewService(pool, clk)
 	c := catalog.NewService(pool)
 	f := fleet.NewService(pool, clk)
+	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f,
 		Notifier: expiryNotifier{ids: ids, sms: smsSender},
@@ -200,4 +203,25 @@ func realProviders(cfg config.Config) (map[string]pay.Provider, error) {
 		out[pay.ChannelAlipay] = p
 	}
 	return out, nil
+}
+
+// pduOpener 按配置选择 PDU 驱动：mock 模式下所有 PDU 共用一个 mock；snmp 模式下按每台 PDU 记录的驱动选择。
+func pduOpener(cfg config.Config, override pdu.Driver) fleet.PDUOpener {
+	if override != nil {
+		return func(fleet.PDUConn) (pdu.Driver, error) { return override, nil }
+	}
+	shared := &pdu.Mock{}
+	if cfg.PDUDriver == "" || cfg.PDUDriver == "mock" {
+		return func(fleet.PDUConn) (pdu.Driver, error) { return shared, nil }
+	}
+	return func(c fleet.PDUConn) (pdu.Driver, error) {
+		switch c.Driver {
+		case "snmp":
+			return pdu.NewSNMP(pdu.SNMPConfig{Address: c.Address, Community: c.Community, OIDPrefix: c.OIDPrefix,
+				CycleValue: c.CycleValue, OnValue: c.OnValue}), nil
+		case "mock":
+			return shared, nil
+		}
+		return nil, fmt.Errorf("未知的 PDU 驱动 %q", c.Driver)
+	}
 }

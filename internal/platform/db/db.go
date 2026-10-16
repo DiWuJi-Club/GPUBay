@@ -88,3 +88,12 @@ func IsExclusionViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23P01"
 }
+
+// ConstraintName 返回违反的约束名（非数据库错误返回空串），用于区分同一张表上的多个约束。
+func ConstraintName(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.ConstraintName
+	}
+	return ""
+}
