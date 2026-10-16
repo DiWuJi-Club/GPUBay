@@ -1,0 +1,114 @@
+package adminapi_test
+
+import (
+	"fmt"
+	"slices"
+	"sort"
+	"strings"
+	"testing"
+
+	"spark-cloud/internal/admin"
+)
+
+var (
+	all     = []admin.Role{admin.RoleSuper, admin.RoleOps, admin.RoleFinance}
+	ops     = []admin.Role{admin.RoleSuper, admin.RoleOps}
+	finance = []admin.Role{admin.RoleSuper, admin.RoleFinance}
+	super   = []admin.Role{admin.RoleSuper}
+)
+
+// expectedRoutes 是规格 §2 权限矩阵展开到每个接口后的期望（不从实现读取，防止实现改错而测试跟着错）。
+var expectedRoutes = []struct {
+	method, path string
+	roles        []admin.Role
+}{
+	{"GET", "/me", all}, {"POST", "/me/password", all},
+	{"GET", "/admins", super}, {"POST", "/admins", super}, {"PUT", "/admins/{id}", super}, {"POST", "/admins/{id}/reset-totp", super},
+
+	{"GET", "/machines", ops}, {"POST", "/machines", ops}, {"POST", "/machines/import", ops}, {"GET", "/machines/{id}", ops},
+	{"POST", "/machines/{id}/maintenance", ops}, {"POST", "/machines/{id}/power-cycle", ops},
+	{"GET", "/pdus", ops}, {"POST", "/pdus", ops}, {"PUT", "/pdus/{id}", ops},
+	{"GET", "/alerts", all}, {"POST", "/alerts/{id}/resolve", all},
+
+	{"GET", "/instances", all}, {"GET", "/instances/{id}", all}, {"GET", "/instances/{id}/refund-quote", all},
+	{"POST", "/instances/{id}/extend", ops}, {"POST", "/instances/{id}/migrate", ops}, {"POST", "/instances/{id}/rewipe", ops},
+	{"POST", "/instances/{id}/refund-release", finance},
+
+	{"GET", "/users", all}, {"GET", "/users/{id}", all},
+	{"POST", "/users/{id}/ban", ops}, {"POST", "/users/{id}/unban", ops},
+	{"GET", "/kyc/pending", ops}, {"GET", "/kyc/{id}", ops}, {"POST", "/kyc/{id}/review", ops}, {"GET", "/files/*", ops},
+	{"POST", "/users/{id}/adjust", finance}, {"POST", "/users/{id}/manual-recharge", finance},
+
+	{"GET", "/orders", finance}, {"GET", "/orders/export", finance}, {"GET", "/ledger", finance}, {"GET", "/ledger/export", finance},
+	{"GET", "/recharges", finance}, {"GET", "/recharges/export", finance},
+
+	{"GET", "/products", super}, {"PUT", "/products/{id}/prices/{duration}", super},
+	{"GET", "/images", super}, {"POST", "/images", super}, {"PUT", "/images/{id}", super},
+	{"GET", "/audit", all}, {"GET", "/dashboard", all},
+}
+
+func roleKey(roles []admin.Role) string {
+	s := make([]string, len(roles))
+	for i, r := range roles {
+		s[i] = string(r)
+	}
+	sort.Strings(s)
+	return strings.Join(s, "+")
+}
+
+func TestRouteTableMatchesPermissionMatrix(t *testing.T) {
+	e := newEnv(t)
+	got := map[string]string{}
+	for _, r := range e.srv.Routes() {
+		got[r.Method+" "+r.Pattern] = roleKey(r.Roles)
+	}
+	want := map[string]string{}
+	for _, r := range expectedRoutes {
+		want[r.method+" /admin/api/v1"+r.path] = roleKey(r.roles)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: roles = %q, want %q", k, got[k], v)
+		}
+	}
+	for k := range got {
+		if _, ok := want[k]; !ok {
+			t.Errorf("unexpected protected route %s (add it to the permission matrix)", k)
+		}
+	}
+}
+
+// TestPermissionMatrix 用三个角色逐个请求每个接口：无权限必须是 403 forbidden，有权限则不能是 forbidden
+// （参数不全导致的 400 / 404、需要二次验证的 403 totp_required 都算放行）。
+func TestPermissionMatrix(t *testing.T) {
+	e := newEnv(t)
+	clients := map[admin.Role]*client{
+		admin.RoleSuper:   e.loginAs("root", admin.RoleSuper),
+		admin.RoleOps:     e.loginAs("ops", admin.RoleOps),
+		admin.RoleFinance: e.loginAs("fin", admin.RoleFinance),
+	}
+	fill := strings.NewReplacer("{id}", "999999", "{duration}", "1d", "*", "2026/01/abcdefghijklmnopqrstuvwxyz012345.png")
+	for _, r := range expectedRoutes {
+		path := fill.Replace(r.path)
+		for role, c := range clients {
+			var body any
+			if r.method != "GET" {
+				body = map[string]any{}
+			}
+			code, out := c.do(r.method, path, body)
+			allowed := slices.Contains(r.roles, role)
+			name := fmt.Sprintf("%s %s as %s", r.method, path, role)
+			switch {
+			case allowed && codeOf(out) == "forbidden":
+				t.Errorf("%s: allowed role got forbidden", name)
+			case !allowed && (code != 403 || codeOf(out) != "forbidden"):
+				t.Errorf("%s: want 403 forbidden, got %d %v", name, code, out)
+			case code == 401 || code >= 500:
+				t.Errorf("%s: unexpected %d %v", name, code, out)
+			}
+		}
+	}
+	if code, _ := e.anon().do("GET", "/dashboard", nil); code != 401 {
+		t.Fatalf("anonymous dashboard = %d", code)
+	}
+}

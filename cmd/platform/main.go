@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -93,10 +94,25 @@ func run(log *slog.Logger) error {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	serverErr := make(chan error, 1)
+	adminSrv := &http.Server{
+		Addr:              cfg.AdminAddr,
+		Handler:           a.AdminHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second, // CSV 导出最多 10 万行
+		IdleTimeout:       120 * time.Second,
+	}
+	if listensOnAllInterfaces(cfg.AdminAddr) {
+		log.Warn("后台 API 监听在所有网卡上，请确认防火墙只对内网开放该端口", "addr", cfg.AdminAddr)
+	}
+	serverErr := make(chan error, 2)
 	go func() {
 		log.Info("platform listening", "addr", cfg.HTTPAddr, "env", cfg.Env)
 		serverErr <- srv.ListenAndServe()
+	}()
+	go func() {
+		log.Info("admin api listening", "addr", cfg.AdminAddr)
+		serverErr <- adminSrv.ListenAndServe()
 	}()
 
 	var runErr error
@@ -110,9 +126,17 @@ func run(log *slog.Logger) error {
 	stop() // 确保清扫器退出
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
-		runErr = err
+	for _, s := range []*http.Server{srv, adminSrv} {
+		if err := s.Shutdown(shutdownCtx); err != nil && runErr == nil {
+			runErr = err
+		}
 	}
 	<-sweeperDone
 	return runErr
+}
+
+// listensOnAllInterfaces 报告监听地址是否绑定了所有网卡（:8081、0.0.0.0:8081、[::]:8081）。
+func listensOnAllInterfaces(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	return err == nil && (host == "" || host == "0.0.0.0" || host == "::")
 }

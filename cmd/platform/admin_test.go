@@ -102,3 +102,11 @@ func TestAdminCreateErrors(t *testing.T) {
 		t.Fatal("reset-totp for unknown admin must fail")
 	}
 }
+
+func TestListensOnAllInterfaces(t *testing.T) {
+	for addr, want := range map[string]bool{":8081": true, "0.0.0.0:8081": true, "[::]:8081": true, "127.0.0.1:8081": false, "10.0.0.5:8081": false} {
+		if got := listensOnAllInterfaces(addr); got != want {
+			t.Fatalf("%s = %v, want %v", addr, got, want)
+		}
+	}
+}

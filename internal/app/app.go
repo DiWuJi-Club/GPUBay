@@ -14,6 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wechatpay-apiv3/wechatpay-go/utils"
 
+	"spark-cloud/internal/admin"
+	"spark-cloud/internal/adminapi"
 	"spark-cloud/internal/api"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
@@ -51,6 +53,9 @@ type App struct {
 	Billing  *billing.Service
 	Uploads  *storage.Service
 	Handler  http.Handler
+
+	Admins       *admin.Service
+	AdminHandler http.Handler // 后台 API，只应监听内网地址
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
@@ -140,7 +145,12 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SecureCookie: cfg.Env == "prod", TrustProxy: cfg.TrustProxy,
 	}
-	return &App{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router()}, nil
+	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
+	adminSrv := &adminapi.Server{
+		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads,
+		Clock: clk, Log: log, SecureCookie: cfg.Env == "prod", TrustProxy: cfg.TrustProxy,
+	}
+	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router()}, nil
 }
 
 func aliyunClient(cfg config.Config, endpoint string) *aliyun.Client {
