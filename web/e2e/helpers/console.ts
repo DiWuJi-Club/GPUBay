@@ -42,12 +42,21 @@ export async function userApi(phone: string): Promise<APIRequestContext> {
   return ctx
 }
 
+async function getJSON<T>(api: APIRequestContext, path: string): Promise<T> {
+  const r = await api.get(path)
+  if (!r.ok()) throw new Error(`GET ${path} ${r.status()} ${await r.text()}`)
+  return (await r.json()) as T
+}
+
 /** 通过 API 下单（商品固定 spark-1），返回实例 ID；默认 1 天、第一个镜像。 */
 export async function placeOrder(api: APIRequestContext, opts: { duration?: '1d' | '1w' | '1m'; imageIndex?: number } = {}): Promise<string> {
-  const products = ((await (await api.get('/api/v1/products')).json()) as { items: { id: number }[] }).items
-  const images = ((await (await api.get('/api/v1/images')).json()) as { items: { id: number }[] }).items
+  const products = (await getJSON<{ items: { id: number }[] }>(api, '/api/v1/products')).items
+  const images = (await getJSON<{ items: { id: number }[] }>(api, '/api/v1/images')).items
+  if (!products.length) throw new Error('placeOrder: /api/v1/products 为空')
+  const image = images[opts.imageIndex ?? 0]
+  if (!image) throw new Error(`placeOrder: 镜像下标 ${opts.imageIndex ?? 0} 超出范围（共 ${images.length} 个）`)
   const r = await api.post('/api/v1/orders', {
-    data: { product_id: products[0].id, duration: opts.duration ?? '1d', image_id: images[opts.imageIndex ?? 0].id },
+    data: { product_id: products[0].id, duration: opts.duration ?? '1d', image_id: image.id },
     headers: { 'Idempotency-Key': crypto.randomUUID() },
   })
   if (r.status() !== 201) throw new Error(`order ${r.status()} ${await r.text()}`)

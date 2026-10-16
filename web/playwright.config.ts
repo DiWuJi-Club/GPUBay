@@ -8,7 +8,7 @@ export const ADMIN_URL = 'http://127.0.0.1:18081'
 
 export default defineConfig({
   testDir: 'e2e',
-  testMatch: /(console|admin)\/.*\.spec\.ts$/,
+  testMatch: /e2e\/(console|admin)\/.*\.spec\.ts$/,
   outputDir: 'test-results',
   // 假时钟全局共享：串行执行，每个测试自行登录、自行造数据
   workers: 1,
@@ -41,17 +41,17 @@ export default defineConfig({
   projects: [
     {
       name: 'console-desktop',
-      testMatch: /console\/.*\.spec\.ts$/,
+      testMatch: /e2e\/console\/.*\.spec\.ts$/,
       use: { ...devices['Desktop Chrome'], ...browser, baseURL: CONSOLE_URL, viewport: { width: 1280, height: 720 } },
     },
     {
       name: 'console-mobile',
-      testMatch: /console\/.*\.spec\.ts$/,
+      testMatch: /e2e\/console\/.*\.spec\.ts$/,
       use: { ...devices['iPhone 13'], defaultBrowserType: 'chromium', ...browser, baseURL: CONSOLE_URL },
     },
     {
       name: 'admin',
-      testMatch: /admin\/.*\.spec\.ts$/,
+      testMatch: /e2e\/admin\/.*\.spec\.ts$/,
       use: { ...devices['Desktop Chrome'], ...browser, baseURL: ADMIN_URL, viewport: { width: 1440, height: 900 } },
     },
   ],

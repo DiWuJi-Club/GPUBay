@@ -21,6 +21,7 @@ export type Role = 'super' | 'ops' | 'finance'
 export const hooks = {
   async clock(): Promise<Date> {
     const r = await (await api()).get('/hooks/clock')
+    if (!r.ok()) throw new Error(`hook /hooks/clock -> ${r.status()} ${await r.text()}`)
     return new Date(((await r.json()) as { now: string }).now)
   },
   async advance(seconds: number): Promise<Date> {
