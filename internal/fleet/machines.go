@@ -113,17 +113,22 @@ func (s *Service) Get(ctx context.Context, q db.Querier, id int64) (Machine, err
 
 // SetMaintenance 进入维护（仅空闲或故障机器）或结束维护回到空闲（仅维护中或故障机器）。
 func (s *Service) SetMaintenance(ctx context.Context, id int64, on bool) error {
+	return s.SetMaintenanceIn(ctx, s.pool, id, on)
+}
+
+// SetMaintenanceIn 与 SetMaintenance 相同，但在调用方给定的连接或事务内执行。
+func (s *Service) SetMaintenanceIn(ctx context.Context, q db.Querier, id int64, on bool) error {
 	from, to := []string{StateIdle, StateFaulty}, StateMaintenance
 	if !on {
 		from, to = []string{StateMaintenance, StateFaulty}, StateIdle
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE machines SET state = $2, updated_at = $3 WHERE id = $1 AND state = ANY($4)`,
+	tag, err := q.Exec(ctx, `UPDATE machines SET state = $2, updated_at = $3 WHERE id = $1 AND state = ANY($4)`,
 		id, to, s.clock.Now(), from)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err := s.Get(ctx, s.pool, id); err != nil {
+		if _, err := s.Get(ctx, q, id); err != nil {
 			return err
 		}
 		return apperr.ErrInvalidState
