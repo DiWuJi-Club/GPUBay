@@ -1,7 +1,8 @@
 import { expect, test } from '@playwright/test'
 import { loginConsole, nav, placeOrder, seedUser, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
-import { instanceRow, stateLabels } from '../helpers/instances'
+import { instanceOf, instanceRow, runningInstance, stateLabels } from '../helpers/instances'
+import { cstTime } from '../helpers/time'
 
 test('C-INS-01 六种状态同时展示，标签文案与颜色正确，按创建时间倒序', async ({ page }, info) => {
   const u = await seedUser({ balance: 1_000_000 })
@@ -72,4 +73,45 @@ test('C-INS-02 开通中实例每 10 秒自动刷新为运行中', async ({ page
   await page.clock.runFor(10_000)
   await expect(row.getByTestId('instance-state')).toHaveText('运行中')
   await expect(row.getByTestId('instance-time')).toHaveText(/^剩余 /)
+})
+
+test('C-INS-03 机器失联后列表与详情显示计时已暂停', async ({ page }, info) => {
+  const u = await seedUser()
+  const { id } = await runningInstance(u.phone)
+  await hooks.advance(360)
+  await hooks.sweep({ heartbeat: false })
+  await loginConsole(page, u.phone)
+  await nav(page, info, 'instances')
+  await expect(instanceRow(page, info, id).getByTestId('instance-suspended')).toHaveText('计时已暂停（机器维护中）')
+  await page.goto(`/instances/${id}`)
+  await expect(page.getByTestId('detail-suspended')).toBeVisible()
+  await hooks.sweep() // 心跳恢复，避免影响后续用例
+})
+
+test('C-INS-04 运行中倒计时每秒递减；停机显示北京时间的数据保留截止', async ({ page }, info) => {
+  const u = await seedUser({ balance: 200000 })
+  const { api, id: stoppedId } = await runningInstance(u.phone)
+  await hooks.advance(86400)
+  await hooks.sweep()
+  await hooks.agent()
+  await hooks.machines(1)
+  const runningId = await placeOrder(api)
+  await hooks.agent()
+  const stopped = await instanceOf(api, stoppedId)
+  expect(stopped.retain_until).not.toBeNull()
+
+  await loginConsole(page, u.phone)
+  await nav(page, info, 'instances')
+  const runningRow = instanceRow(page, info, runningId)
+  // 下单后 loginConsole 已把假时钟推进了 61 秒（发码限流），所以此时是「23 小时 58 分」量级，不是整整 1 天
+  await expect(runningRow.getByTestId('instance-time')).toHaveText(/^剩余 23 小时 5\d 分$/)
+  const first = Number(await runningRow.getByTestId('instance-time').getAttribute('data-remaining'))
+  await expect.poll(async () => Number(await runningRow.getByTestId('instance-time').getAttribute('data-remaining')), { timeout: 5000 }).toBeLessThan(first)
+  await expect(instanceRow(page, info, stoppedId).getByTestId('instance-time')).toHaveText(`数据保留至 ${cstTime(stopped.retain_until!)}`)
+
+  await page.goto(`/instances/${runningId}`)
+  const d1 = Number(await page.getByTestId('detail-remaining').getAttribute('data-remaining'))
+  await expect.poll(async () => Number(await page.getByTestId('detail-remaining').getAttribute('data-remaining')), { timeout: 5000 }).toBeLessThan(d1)
+  await page.goto(`/instances/${stoppedId}`)
+  await expect(page.getByTestId('detail-retain')).toHaveText(cstTime(stopped.retain_until!))
 })
