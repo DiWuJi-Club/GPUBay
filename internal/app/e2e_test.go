@@ -96,10 +96,11 @@ func TestFullRentalLifecycle(t *testing.T) {
 	}
 
 	c.do("POST", "/auth/sms-code", map[string]string{"phone": "13800001234"})
-	user := c.do("POST", "/auth/login", map[string]string{"phone": "13800001234", "code": "000000"})
+	c.do("POST", "/auth/login", map[string]string{"phone": "13800001234", "code": "000000"})
 	c.do("POST", "/kyc/personal", map[string]string{"name": "李四", "id_number": "110101199001011234"})
-	if _, err := a.Wallet.AdminAdjust(ctx, 1, int64(user["id"].(float64)), 100000, "线下转账", ""); err != nil {
-		t.Fatal(err)
+	rch := c.do("POST", "/recharges", map[string]any{"amount": 100000, "channel": "wechat"})
+	if paid := c.do("POST", "/dev/recharges/"+rch["id"].(string)+"/pay", map[string]any{}); paid["status"] != "paid" {
+		t.Fatalf("recharge = %v", paid)
 	}
 
 	products := c.do("GET", "/products", nil)["items"].([]any)
@@ -200,5 +201,13 @@ func TestBuildWiresAliyunPlugins(t *testing.T) {
 	defer mu.Unlock()
 	if len(actions) != 2 || actions[0] != "SendSms:ak" || actions[1] != "ThreeElementsVerification:ak" {
 		t.Fatalf("actions = %v", actions)
+	}
+}
+
+func TestBuildRejectsMockPayInProd(t *testing.T) {
+	cfg := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "aliyun", KYCDriver: "aliyun",
+		PayDriver: "mock", UploadDir: t.TempDir()}
+	if _, err := app.Build(cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{}); err == nil {
+		t.Fatal("expected error for mock pay in prod")
 	}
 }

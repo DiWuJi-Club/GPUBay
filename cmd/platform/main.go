@@ -82,7 +82,7 @@ func run(log *slog.Logger) error {
 	sweeperDone := make(chan struct{})
 	go func() {
 		defer close(sweeperDone)
-		a.Rental.RunSweeper(ctx, cfg.SweepInterval)
+		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep)
 	}()
 
 	srv := &http.Server{

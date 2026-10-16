@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
@@ -29,6 +30,8 @@ type Server struct {
 	Fleet        *fleet.Service
 	Rental       *rental.Service
 	Uploads      *storage.Service
+	Billing      *billing.Service
+	DevPay       bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
 	Clock        clock.Clock
 	Log          *slog.Logger
 	Domain       string // 用于生成 SSH 命令，例如 spark.example.com
@@ -53,6 +56,8 @@ func (s *Server) Router() http.Handler {
 		r.Post("/auth/logout", s.handleLogout)
 		r.Get("/products", s.handleProducts)
 		r.Get("/images", s.handleImages)
+		r.Get("/pay/channels", s.handlePayChannels)
+		r.Post("/pay/notify/{channel}", s.handlePayNotify)
 
 		r.Group(func(r chi.Router) {
 			r.Use(noStore, s.requireUser)
@@ -69,6 +74,12 @@ func (s *Server) Router() http.Handler {
 			r.Get("/instances/{id}/password", s.handlePassword)
 			r.Post("/instances/{id}/renew", s.handleRenew)
 			r.Post("/instances/{id}/release", s.handleRelease)
+			r.Get("/recharges", s.handleRecharges)
+			r.Post("/recharges", s.handleCreateRecharge)
+			r.Get("/recharges/{id}", s.handleRecharge)
+			if s.DevPay {
+				r.Post("/dev/recharges/{id}/pay", s.handleDevPay)
+			}
 		})
 	})
 	return r
@@ -99,6 +110,10 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, notifyPathPrefix) { // 支付回调的格式由渠道决定，由插件自行验签解析
 			next.ServeHTTP(w, r)
 			return
 		}

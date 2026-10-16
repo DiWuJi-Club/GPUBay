@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/api"
+	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
@@ -23,6 +24,7 @@ import (
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/secretbox"
 	"spark-cloud/internal/plugins/kyc"
+	"spark-cloud/internal/plugins/pay"
 	"spark-cloud/internal/plugins/sms"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
@@ -40,6 +42,7 @@ type testEnv struct {
 	pool   *pgxpool.Pool
 	ts     *httptest.Server
 	wallet *wallet.Service
+	pay    *pay.Mock
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -57,11 +60,18 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 	uploads := storage.NewService(pool, clk, disk)
+	payMock := pay.NewMock("test-secret")
+	bill := billing.NewService(billing.Deps{
+		Pool: pool, Clock: clk, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Wallet: w, Users: ids, Alerts: f,
+		Providers:     map[string]pay.Provider{pay.ChannelWechat: payMock, pay.ChannelAlipay: payMock},
+		NotifyBaseURL: "https://spark.test",
+	})
 	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test"}
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test",
+		Billing: bill, DevPay: true}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
-	return &testEnv{t: t, pool: pool, ts: ts, wallet: w}
+	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock}
 }
 
 type client struct {

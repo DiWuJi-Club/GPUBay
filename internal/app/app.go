@@ -13,14 +13,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/api"
+	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
+	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/platform/secretbox"
 	"spark-cloud/internal/plugins/aliyun"
 	"spark-cloud/internal/plugins/kyc"
+	"spark-cloud/internal/plugins/pay"
 	"spark-cloud/internal/plugins/sms"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
@@ -32,6 +35,7 @@ type Options struct {
 	Clock clock.Clock
 	SMS   sms.Sender
 	KYC   kyc.Verifier
+	Pay   map[string]pay.Provider // 测试注入的支付渠道
 }
 
 type App struct {
@@ -40,12 +44,14 @@ type App struct {
 	Catalog  *catalog.Service
 	Fleet    *fleet.Service
 	Rental   *rental.Service
+	Billing  *billing.Service
 	Uploads  *storage.Service
 	Handler  http.Handler
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
-	if cfg.Env == "prod" && ((opt.SMS == nil && cfg.SMSDriver == "mock") || (opt.KYC == nil && cfg.KYCDriver == "mock")) {
+	if cfg.Env == "prod" && ((opt.SMS == nil && cfg.SMSDriver == "mock") || (opt.KYC == nil && cfg.KYCDriver == "mock") ||
+		(opt.Pay == nil && cfg.PayDriver != "real")) {
 		return nil, errors.New("生产环境禁止使用 mock 插件")
 	}
 	clk := opt.Clock
@@ -103,11 +109,30 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f,
 		Notifier: expiryNotifier{ids: ids, sms: smsSender},
 	})
+	providers := opt.Pay
+	devPay := false
+	if providers == nil {
+		switch cfg.PayDriver {
+		case "", "mock":
+			// mock 回调密钥随机生成，外部无法伪造；开发环境通过 /api/v1/dev/recharges/{id}/pay 模拟支付
+			m := pay.NewMock(randx.Token())
+			providers = map[string]pay.Provider{pay.ChannelWechat: m, pay.ChannelAlipay: m}
+			devPay = cfg.Env != "prod"
+		case "real":
+			return nil, errors.New("真实支付渠道尚未接入")
+		default:
+			return nil, fmt.Errorf("未知的支付驱动 %q", cfg.PayDriver)
+		}
+	}
+	bill := billing.NewService(billing.Deps{
+		Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Alerts: f,
+		Providers: providers, NotifyBaseURL: cfg.PublicBaseURL,
+	})
 	srv := &api.Server{
-		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk, Log: log,
+		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SecureCookie: cfg.Env == "prod", TrustProxy: cfg.TrustProxy,
 	}
-	return &App{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Handler: srv.Router()}, nil
+	return &App{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router()}, nil
 }
 
 func aliyunClient(cfg config.Config, endpoint string) *aliyun.Client {
