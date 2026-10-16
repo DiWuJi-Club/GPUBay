@@ -3,6 +3,8 @@ package adminapi
 import (
 	"time"
 
+	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/rental"
 )
 
@@ -32,6 +34,52 @@ func (s *Server) instanceViews(list []rental.Instance) []instanceView {
 	out := make([]instanceView, 0, len(list))
 	for _, i := range list {
 		out = append(out, s.instanceView(i))
+	}
+	return out
+}
+
+// orderView 是后台展示的订单（比用户端多 user_id）。
+type orderView struct {
+	ID             string           `json:"id"`
+	UserID         int64            `json:"user_id"`
+	Kind           string           `json:"kind"`
+	InstanceID     string           `json:"instance_id"`
+	ProductID      int64            `json:"product_id"`
+	Duration       catalog.Duration `json:"duration"`
+	Amount         int64            `json:"amount"`
+	RefundedAmount int64            `json:"refunded_amount"`
+	Status         string           `json:"status"`
+	CreatedAt      time.Time        `json:"created_at"`
+}
+
+func toOrderView(o rental.Order) orderView {
+	return orderView{ID: o.ID, UserID: o.UserID, Kind: o.Kind, InstanceID: o.InstanceID, ProductID: o.ProductID, Duration: o.Duration,
+		Amount: o.Amount, RefundedAmount: o.RefundedAmount, Status: o.Status, CreatedAt: o.CreatedAt}
+}
+
+func orderViews(list []rental.Order) []orderView {
+	out := make([]orderView, 0, len(list))
+	for _, o := range list {
+		out = append(out, toOrderView(o))
+	}
+	return out
+}
+
+type commandView struct {
+	ID        string    `json:"id"`
+	MachineID int64     `json:"machine_id"`
+	Type      string    `json:"type"`
+	Status    string    `json:"status"`
+	Result    string    `json:"result"`
+	Attempts  int       `json:"attempts"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func commandViews(list []fleet.Command) []commandView {
+	out := make([]commandView, 0, len(list))
+	for _, c := range list {
+		out = append(out, commandView{ID: c.ID, MachineID: c.MachineID, Type: string(c.Type), Status: c.Status, Result: c.Result,
+			Attempts: c.Attempts, CreatedAt: c.CreatedAt})
 	}
 	return out
 }

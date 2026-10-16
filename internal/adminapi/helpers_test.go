@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
@@ -227,3 +228,5 @@ func (e *env) ack() {
 		}
 	}
 }
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }

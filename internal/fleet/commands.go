@@ -127,3 +127,13 @@ func (s *Service) HasOpenCommand(ctx context.Context, q db.Querier, instanceID s
 		WHERE instance_id = $1 AND type = $2 AND status IN ('pending', 'sent'))`, instanceID, string(t)).Scan(&ok)
 	return ok, err
 }
+
+// CommandsForInstance 返回实例的指令记录（新到旧，含已完成与失败的）。
+func (s *Service) CommandsForInstance(ctx context.Context, instanceID string, limit int) ([]Command, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+commandCols+` FROM agent_commands
+		WHERE instance_id = $1 ORDER BY created_at DESC, id LIMIT $2`, instanceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Command, error) { return scanCommand(r) })
+}

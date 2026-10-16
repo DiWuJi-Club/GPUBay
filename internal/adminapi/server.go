@@ -83,6 +83,7 @@ func (s *Server) Router() http.Handler {
 			g.Use(s.requireAdmin)
 			s.accountRoutes(g)
 			s.machineRoutes(g)
+			s.instanceRoutes(g)
 		})
 	})
 	return r
