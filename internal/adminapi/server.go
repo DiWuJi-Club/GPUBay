@@ -26,6 +26,7 @@ import (
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
+	"spark-cloud/internal/web"
 )
 
 const (
@@ -44,8 +45,9 @@ type Server struct {
 	Uploads      *storage.Service
 	Clock        clock.Clock
 	Log          *slog.Logger
-	SecureCookie bool // 生产环境为 true：Cookie 仅经 HTTPS 发送
-	LoginLimit   int  // 同一 IP 每分钟登录相关请求上限；零值表示默认 20。只有端到端测试服务会调大它
+	SecureCookie bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送
+	Static       http.Handler // 后台静态文件；nil 时使用 web.Admin()
+	LoginLimit   int          // 同一 IP 每分钟登录相关请求上限；零值表示默认 20。只有端到端测试服务会调大它
 
 	limiter *ipLimiter
 	routes  []Route
@@ -76,8 +78,11 @@ func (s *Server) Router() http.Handler {
 	r.Use(middleware.RequestID)
 	// 后台只在内网监听，不使用 RealIP：任何内网客户端都能伪造 X-Forwarded-For，
 	// 会绕过按 IP 的登录限流并伪造审计日志里的 IP。始终以连接的 RemoteAddr 为准。
-	r.Use(httpx.Recoverer(s.Log), httpx.NoStore, s.requireJSONForWrites)
+	r.Use(httpx.Recoverer(s.Log), s.requireJSONForWrites)
+	jsonNotFound := func(w http.ResponseWriter, req *http.Request) { s.writeError(w, req, apperr.ErrNotFound) }
+	r.NotFound(jsonNotFound)
 	r.Route(prefix, func(r chi.Router) {
+		r.Use(httpx.NoStore) // API 响应一律不缓存；静态文件由 web 处理器自行设置 Cache-Control
 		r.With(s.rateLimit).Post("/auth/login", s.handleLogin)
 		r.With(s.rateLimit).Post("/auth/totp/setup", s.handleTOTPSetup)
 		r.With(s.rateLimit).Post("/auth/totp", s.handleTOTP)
@@ -92,6 +97,16 @@ func (s *Server) Router() http.Handler {
 			s.catalogRoutes(g)
 		})
 	})
+	static := s.Static
+	if static == nil {
+		static = web.Admin()
+	}
+	redirectAdmin := func(w http.ResponseWriter, req *http.Request) { http.Redirect(w, req, "/admin/", http.StatusFound) }
+	r.Get("/", redirectAdmin)
+	r.Get("/admin", redirectAdmin)
+	r.HandleFunc("/admin/api/*", jsonNotFound) // /admin/api/ 下非 v1 的路径不回退页面
+	r.Get("/admin/", static.ServeHTTP)
+	r.Get("/admin/*", static.ServeHTTP)
 	return r
 }
 

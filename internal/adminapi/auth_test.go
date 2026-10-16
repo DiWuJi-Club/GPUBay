@@ -3,15 +3,18 @@ package adminapi_test
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/adminapi"
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/web"
 )
 
 func TestLoginAndTOTPSetupOverHTTP(t *testing.T) {
@@ -197,5 +200,41 @@ func TestLoginLimitConfigurable(t *testing.T) {
 	}
 	if code, out := c.do("POST", "/auth/login", map[string]string{"username": "nobody", "password": "wrong-password-123"}); code != 429 || codeOf(out) != "rate_limited" {
 		t.Fatalf("third attempt = %d %v, want 429 rate_limited", code, out)
+	}
+}
+
+func TestAdminRouterServesSPAAndJSON404(t *testing.T) {
+	index := fstest.MapFS{"index.html": {Data: []byte("<!doctype html><title>admin</title>")}}
+	e := newEnvWith(t, func(s *adminapi.Server) { s.Static = web.NewHandler(index, "/admin/") })
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	get := func(path string) (*http.Response, string) {
+		resp, err := noRedirect.Get(e.ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, string(body)
+	}
+	for _, p := range []string{"/", "/admin"} {
+		if resp, _ := get(p); resp.StatusCode != 302 || resp.Header.Get("Location") != "/admin/" {
+			t.Fatalf("%s: %d -> %q, want 302 /admin/", p, resp.StatusCode, resp.Header.Get("Location"))
+		}
+	}
+	for _, p := range []string{"/admin/", "/admin/machines/12", "/admin/login"} {
+		resp, body := get(p)
+		if resp.StatusCode != 200 || !strings.Contains(body, "admin") || resp.Header.Get("Cache-Control") != "no-cache" ||
+			resp.Header.Get("Content-Security-Policy") == "" {
+			t.Fatalf("%s: %d %q cache=%q", p, resp.StatusCode, body, resp.Header.Get("Cache-Control"))
+		}
+	}
+	for _, p := range []string{"/admin/api/v1/nope", "/admin/api/", "/nope", "/api/v1/products"} {
+		resp, body := get(p)
+		if resp.StatusCode != 404 || !strings.Contains(body, `"not_found"`) {
+			t.Fatalf("%s: %d %q, want JSON 404", p, resp.StatusCode, body)
+		}
+	}
+	if resp, _ := get("/admin/api/v1/dashboard"); resp.StatusCode != 401 || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("anonymous dashboard = %d cache=%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
 	}
 }
