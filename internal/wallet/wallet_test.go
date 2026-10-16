@@ -167,3 +167,18 @@ func TestNonAdminEntriesRequireRef(t *testing.T) {
 		t.Fatalf("balance = %d, want 1000", bal)
 	}
 }
+
+func TestAdminAdjustLimitsAndUnknownUser(t *testing.T) {
+	pool := dbtest.New(t)
+	svc := wallet.NewService(pool, clock.NewFake(dbtest.T0))
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13700000001", false)
+	for _, amount := range []int64{0, wallet.MaxAdjust + 1, -wallet.MaxAdjust - 1} {
+		if _, err := svc.AdminAdjust(ctx, 1, uid, amount, "x", ""); apperr.As(err) == nil || apperr.As(err).Code != "bad_request" {
+			t.Fatalf("amount %d = %v", amount, err)
+		}
+	}
+	if _, err := svc.AdminAdjust(ctx, 1, 9999, 100, "x", ""); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("unknown user = %v", err)
+	}
+}

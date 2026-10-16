@@ -25,6 +25,8 @@ const (
 	KindRefund      Kind = "refund"
 )
 
+const MaxAdjust = 100_000_000 // 单次调账上限（分）
+
 type Entry struct {
 	UserID     int64
 	Amount     int64 // 分；正数入账，负数扣款
@@ -132,6 +134,9 @@ func (s *Service) AdminAdjust(ctx context.Context, operatorID, userID, amount in
 	if remark == "" {
 		return 0, apperr.BadRequest("请填写调整原因")
 	}
+	if amount == 0 || amount > MaxAdjust || amount < -MaxAdjust {
+		return 0, apperr.BadRequest("调整金额需在 ±100 万元之间且不能为 0")
+	}
 	var after int64
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var err error
@@ -145,5 +150,8 @@ func (s *Service) AdminAdjust(ctx context.Context, operatorID, userID, amount in
 			Diff: map[string]any{"amount": amount, "balance_after": after, "remark": remark}, IP: ip,
 		})
 	})
+	if db.IsForeignKeyViolation(err) {
+		return 0, apperr.ErrNotFound
+	}
 	return after, err
 }
