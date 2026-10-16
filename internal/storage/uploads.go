@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/platform/apperr"
@@ -58,14 +60,6 @@ func (s *Service) Save(ctx context.Context, userID int64, purpose string, r io.R
 		return Upload{}, apperr.BadRequest("不支持的上传用途")
 	}
 	now := s.clock.Now()
-	var recent int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM uploads WHERE user_id = $1 AND created_at > $2`,
-		userID, now.Add(-24*time.Hour)).Scan(&recent); err != nil {
-		return Upload{}, err
-	}
-	if recent >= maxUploadsPerDay {
-		return Upload{}, apperr.ErrRateLimited
-	}
 	data, err := io.ReadAll(io.LimitReader(r, MaxUploadSize+1))
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) || len(data) > MaxUploadSize {
@@ -86,12 +80,31 @@ func (s *Service) Save(ctx context.Context, userID int64, purpose string, r io.R
 		Key:    fmt.Sprintf("%04d/%02d/%s.%s", now.Year(), int(now.Month()), randx.ID("", 32), ext),
 		UserID: userID, Size: int64(len(data)), ContentType: contentType, Purpose: purpose, CreatedAt: now,
 	}
-	if _, err := s.store.Put(ctx, up.Key, bytes.NewReader(data)); err != nil {
-		return Upload{}, fmt.Errorf("store upload: %w", err)
-	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)`, up.Key, userID, up.Size, contentType, purpose, now); err != nil {
-		_ = s.store.Delete(context.WithoutCancel(ctx), up.Key)
+	stored := false
+	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "upload:"+strconv.FormatInt(userID, 10)); err != nil {
+			return err
+		}
+		var recent int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM uploads WHERE user_id = $1 AND created_at > $2`,
+			userID, now.Add(-24*time.Hour)).Scan(&recent); err != nil {
+			return err
+		}
+		if recent >= maxUploadsPerDay {
+			return apperr.ErrRateLimited
+		}
+		if _, err := s.store.Put(ctx, up.Key, bytes.NewReader(data)); err != nil {
+			return fmt.Errorf("store upload: %w", err)
+		}
+		stored = true
+		_, err := tx.Exec(ctx, `INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6)`, up.Key, userID, up.Size, contentType, purpose, now)
+		return err
+	})
+	if err != nil {
+		if stored {
+			_ = s.store.Delete(context.WithoutCancel(ctx), up.Key)
+		}
 		return Upload{}, err
 	}
 	return up, nil

@@ -144,3 +144,41 @@ func TestSaveDailyLimit(t *testing.T) {
 		t.Fatalf("next day: %v", err)
 	}
 }
+
+func TestSaveDailyLimitConcurrent(t *testing.T) {
+	svc, pool, _ := newUploads(t)
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13900000001", true)
+	for i := 0; i < 19; i++ {
+		if _, err := svc.Save(ctx, uid, storage.PurposeLicense, bytes.NewReader(pngHeader)); err != nil {
+			t.Fatalf("upload %d: %v", i+1, err)
+		}
+	}
+	const n = 5
+	codes := make(chan string, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			_, err := svc.Save(ctx, uid, storage.PurposeLicense, bytes.NewReader(pngHeader))
+			codes <- code(err)
+		}()
+	}
+	ok, limited := 0, 0
+	for i := 0; i < n; i++ {
+		switch c := <-codes; c {
+		case "":
+			ok++
+		case "rate_limited":
+			limited++
+		default:
+			t.Fatalf("unexpected result %q", c)
+		}
+	}
+	if ok != 1 || limited != n-1 {
+		t.Fatalf("ok = %d, limited = %d", ok, limited)
+	}
+	var cnt int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM uploads`).Scan(&cnt)
+	if cnt != 20 {
+		t.Fatalf("uploads rows = %d, want 20", cnt)
+	}
+}
