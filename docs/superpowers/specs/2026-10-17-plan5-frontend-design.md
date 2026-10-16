@@ -1,7 +1,7 @@
 # Spark Cloud — 子项目：前端（用户控制台与管理后台，计划 5）设计文档
 
 - 日期：2026-10-17
-- 状态：待评审
+- 状态：已评审，修改后通过（裁定见 §12）
 - 依赖：计划 1（后端核心闭环）、计划 4（管理后台 API 与外部插件）；分支 `feat/plan5-frontend` 基于计划 4 分支，所有后端 API 已就绪
 - 总设计：`docs/superpowers/specs/2026-10-14-spark-cloud-mvp-design.md`
 - 架构验证：一次性 spike（scratchpad `spike5/`，不进仓库），结论已并入本文 §1.4
@@ -125,13 +125,13 @@ Vite 配置要点（来自 spike）：
 
 ```ts
 export interface ApiError { status: number; code: string; message: string; requestId: string }
-export interface HttpOptions { idempotencyKey?: string; signal?: AbortSignal; raw?: boolean }
+export interface HttpOptions { idempotencyKey?: string; signal?: AbortSignal; quiet?: boolean /* 401 时不触发 onUnauthorized，仅用于会话探测 */ }
 export function createHttp(cfg: {
   base: string                                  // '/api/v1' 或 '/admin/api/v1'
   onUnauthorized: () => void                    // 401：清会话并跳登录
   promptTotp?: () => Promise<string | null>     // 后台：弹出动态码输入框，取消返回 null
 }): {
-  get<T>(path: string, query?: Record<string, unknown>): Promise<T>
+  get<T>(path: string, query?: Record<string, unknown>, opt?: HttpOptions): Promise<T>
   post<T>(path: string, body?: unknown, opt?: HttpOptions): Promise<T>
   put<T>(path: string, body?: unknown, opt?: HttpOptions): Promise<T>
   upload<T>(path: string, file: File): Promise<T>   // multipart，字段名 file
@@ -142,8 +142,8 @@ export function createHttp(cfg: {
 规则：
 - 所有请求 `credentials: 'same-origin'`；写请求 `Content-Type: application/json`（后端对非 JSON 写请求返回 400，兼作 CSRF 防护）；`upload` 不手动设 Content-Type，由浏览器生成 multipart 边界。
 - 查询参数值为 `undefined`、`null`、`''` 时不拼入 URL（后台列表筛选留空即「不筛选」）。
-- 响应非 2xx：解析 `{code, message, request_id}` 抛出 `ApiError`；解析失败（网关 HTML、网络中断）抛 `ApiError{status, code: 'network', message: '网络异常，请稍后重试', requestId: ''}`。`download` 用于 CSV 导出：先 `fetch`，若响应 `Content-Type` 是 `application/json` 则按错误处理（例如超过 10 万行的 `bad_request`），否则从 `Content-Disposition` 取文件名并返回 Blob，由调用方用 `URL.createObjectURL` 触发下载。
-- **401** `unauthorized`：调用 `onUnauthorized()` 后仍把错误抛给调用方（调用方通常不再处理）。
+- 响应非 2xx：解析 `{code, message, request_id}` 抛出 `ApiError`；解析失败（网关 HTML、网络中断）抛 `ApiError{status, code: 'network', message: '网络异常，请稍后重试', requestId: ''}`。`download` 用于 CSV 导出：先 `fetch`，若响应 `Content-Type` 是 `application/json` 则按错误处理（例如超过 10 万行时后端返回 400 `export_too_large`，见 `internal/platform/csvx`），否则从 `Content-Disposition` 取文件名并返回 Blob，由调用方用 `URL.createObjectURL` 触发下载。
+- **401** `unauthorized`：调用 `onUnauthorized()` 后仍把错误抛给调用方（调用方通常不再处理）。`quiet: true` 的请求不调用 `onUnauthorized`，只用于启动时的会话探测 `GET /me`（市场、帮助等公开页面的匿名访客会收到 401，不能因此跳登录页）。
 - **403 `totp_required`**（仅后台）：调用 `promptTotp()`；用户输入后把 `totp` 字段合并进原请求体重发一次（后端在请求体 `totp` 字段里接收动态码）；再次 `invalid_totp` 则再弹一次（最多 3 次）；用户取消则抛出 `ApiError{code: 'cancelled'}`，调用方静默处理。多个并发请求同时收到 `totp_required` 时只弹一个框，共用一次输入。后端在 5 分钟窗口内不再返回 `totp_required`，所以前端不维护窗口状态。
 - **403 `totp_setup_required`**（仅后台）：跳到登录页的绑定步骤。
 - 其他错误原样抛出，由页面按错误码处理（§2.2）。
@@ -157,13 +157,13 @@ export function createHttp(cfg: {
   - 表单字段校验错误在字段下方显示（Element Plus 表单规则），不发请求。
   - 请求失败用 `ElMessage.error(messageOf(err))`；成功用 `ElMessage.success`。
   - 需要引导的错误码在控制台统一处理：`kyc_required` → 对话「请先完成实名认证」+「去实名」按钮（跳 `/kyc?redirect=当前路径`）；`insufficient_balance` → 「余额不足」+「去充值」（跳 `/wallet/recharge?redirect=当前路径`）；`banned` → 清会话、跳登录页并显示「账号已被封禁」；`no_capacity` → 「暂无空闲机器」并刷新市场数据；`rate_limited` → 原文提示。
-  - 后台 `forbidden` → 「无权执行该操作」；`duplicate`（60 秒内重复资金操作）→ 原文提示。
+  - 后台 `forbidden` → 「无权执行该操作」；`duplicate`（60 秒内重复资金操作）、`export_too_large`（导出超过 10 万行）→ 原文提示。
 
 ### 2.3 幂等键 `idempotency.ts`
 
 - 下单与续费必须带 `Idempotency-Key` 请求头（认领计划 1 遗留）。
 - `useIdempotencyKey()`：打开确认框时生成 `crypto.randomUUID()`；同一次确认的重复点击、网络错误后的再次点击都复用该键；请求成功或用户修改了参数（租期、镜像、实例）后重新生成。键长 36 ≤ 后端上限 64。
-- 后端对同用户同键的重放返回首次结果（HTTP 201 / 200 同样处理），所以双击只扣一次款。
+- 后端对同用户同键的重放返回首次结果（HTTP 201 / 200 同样处理；并发的两份请求由后端咨询锁串行化，后到的一份同样拿到首次结果），所以双击只扣一次款。确认按钮在请求进行中仍置为 loading 禁用，幂等键是对网络错误后重试的兜底，不是替代。
 
 ### 2.4 金额与时间 `format.ts`
 
@@ -213,7 +213,7 @@ func Admin() http.Handler    // fs.Sub(dist, "dist/admin")，内部路径前缀 
 - 所有响应加安全头：`Content-Security-Policy`（§8）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: same-origin`。
 
 挂载方式：
-- 用户端 `api.Server.Router()`：`/api/*` 走现有 API 子路由（未知 `/api/*` 由 chi 的 `NotFound` 返回 JSON 404 `{code: "not_found"}`）；其余路径交给 `web.Console()`。静态文件不经过 `requireJSONForWrites`（只接受 GET / HEAD），也不加 `NoStore`。
+- 用户端 `api.Server.Router()`：`/api/*` 走现有 API 子路由（未知 `/api/*` 由 chi 的 `NotFound` 返回 JSON 404 `{code: "not_found"}`）；其余路径交给 `web.Console()`。路由级中间件 `requireJSONForWrites` 对 GET / HEAD 直接放行，静态文件不受影响；静态文件不加 `NoStore`（`NoStore` 只在需登录的 API 分组上）。
 - 后台 `adminapi.Server.Router()`：`/admin/api/*` 走现有子路由（保留 `NoStore`、`requireJSONForWrites`）；`/admin/` 与 `/admin/*` 非 API 路径交给 `web.Admin()`；`/` 重定向到 `/admin/`；其他路径 JSON 404。
 - 开发时 `make run` 的后端也会托管已构建的产物；前端开发用 Vite 开发服务器 + 代理（§9）。
 
@@ -223,12 +223,12 @@ func Admin() http.Handler    // fs.Sub(dist, "dist/admin")，内部路径前缀 
 web-install:  cd web && npm ci
 web:          cd web && npm run build            # 产物到 internal/web/dist/{console,admin}
 web-test:     cd web && npm test
-e2e:          cd web && npx playwright test      # 自动拉起 cmd/e2e-server（§7.2）
+e2e:          $(MAKE) web && cd web && npm run e2e:coverage && npx playwright test   # 自动拉起 cmd/e2e-server（§7.2）
 test:         go vet ./... && go test ./... && $(MAKE) web-test
 build:        $(MAKE) web && GOOS=linux GOARCH=amd64 go build ... && GOOS=linux GOARCH=arm64 go build ...
 check:        $(MAKE) test && $(MAKE) e2e
 ```
-`build` 先构建前端再编译后端，保证二进制里是最新产物。`.gitignore` 增加 `internal/web/dist/console/`、`internal/web/dist/admin/`、`web/node_modules/`、`web/test-results/`、`web/playwright-report/`。
+`build` 先构建前端再编译后端，保证二进制里是最新产物。`e2e` 同样先 `web`：端到端测试访问的是 `cmd/e2e-server` embed 进去的产物，不先构建就会测到上一次的前端（或 503）。`.gitignore` 增加 `internal/web/dist/console/`、`internal/web/dist/admin/`、`web/node_modules/`、`web/test-results/`、`web/playwright-report/`。
 
 ### 3.3 部署说明
 
@@ -255,7 +255,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 | `/` | 重定向到 `/market` | |
 | 其他 | 404 页 | |
 
-- `router.beforeEach`：需登录的路由在会话未知时先 `GET /api/v1/me`（应用启动只请求一次，结果缓存在 `store/session.ts`）；未登录跳 `/login?redirect=<原路径>`；`redirect` 只接受站内相对路径（以 `/` 开头且不以 `//` 开头），否则忽略。
+- `router.beforeEach`：会话未知时先 `GET /api/v1/me`（`quiet: true`，应用启动只请求一次，结果缓存在 `store/session.ts`；公开页面也探测，用于顶栏手机号与「立即租用」的分支）；未登录跳 `/login?redirect=<原路径>`；`redirect` 只接受站内相对路径（以 `/` 开头且不以 `//` 开头），否则忽略。
 - 电脑端左侧菜单：算力市场、我的实例、钱包、我的；顶部右侧显示手机号（中间四位打码）与「使用帮助」。手机端底部四个标签，帮助入口在「我的」页内。
 - 页面标题 `document.title = 页面名 + ' - ' + brand.name`。
 
@@ -287,13 +287,13 @@ check:        $(MAKE) test && $(MAKE) e2e
 
 ### 4.4 我的实例 `/instances` 与实例详情 `/instances/:id`
 
-实例视图（`GET /api/v1/instances`、`GET /api/v1/instances/{id}`）字段：`id, state, product_id, image_id, product_name, image_name（§6 B5 新增）, suspended, expires_at, remaining_seconds, pending_seconds, retain_until, ssh_command, created_at`。状态值与中文：`creating` 开通中、`running` 运行中、`stopped` 已到期停机、`wiping` 洗机中、`released` 已释放、`failed` 开通失败。列表最多返回最近 100 条（后端上限，不分页）。
+实例视图（`GET /api/v1/instances`、`GET /api/v1/instances/{id}`）字段：`id（形如 ins-xxxxxxxx）, state, product_id, image_id, product_name, image_name（§6 B5 新增）, suspended, expires_at, remaining_seconds, pending_seconds, retain_until, ssh_command, created_at`。状态值与中文：`creating` 开通中、`running` 运行中、`stopped` 已到期停机、`wiping` 洗机中、`released` 已释放、`failed` 开通失败。`retain_until` 只在 `stopped && pending_seconds == 0` 时非空（停机后有待开始的续费时数据不会被清除）。列表最多返回最近 100 条（后端上限，不分页）。
 
 列表行为：
 - 每个实例一张卡片（电脑端为表格行）：ID、镜像名、状态标签（颜色：开通中蓝、运行中绿、停机橙、洗机中灰、已释放灰、失败红）、剩余时长倒计时（running）或「数据保留至 时间」（stopped 且 `retain_until` 非空）或「已付 X 待开始」（`pending_seconds > 0`）。
 - `suspended === true` 时额外显示「计时已暂停（机器维护中）」。
 - 有 `creating` 或 `wiping` 实例时每 10 秒刷新（`setInterval`，页面不可见时暂停）。
-- 默认按创建时间倒序；提供「隐藏已释放 / 失败」开关（默认开，本地 `localStorage` 记忆，不含敏感信息）。
+- 按创建时间倒序显示全部实例（含已释放 / 失败），不提供筛选开关（见评审裁定 1）。
 
 详情页接口：
 - `GET /api/v1/instances/{id}/password` → `{password}`。
@@ -304,7 +304,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 - 基本信息：ID、商品名、镜像名、状态、创建时间、到期时间（`expires_at`）、剩余时长倒计时、`pending_seconds` 换算的「已付待开始时长」。
 - SSH：`ssh_command` 非空（running）时显示命令和「复制」按钮；密码默认隐藏为「••••••••」，点「显示」才请求 `/password`（每次点击都重新请求，不缓存到任何存储），可复制；离开页面即丢弃。非 running 状态显示「实例运行中才能连接」。
 - 续费：按钮在 `creating / running / stopped` 显示。弹出表单（手机全屏）：选择租期，显示价格（来自 `/products` 中该 `product_id` 的当前价格）、余额、扣后余额；余额不足改为「去充值」。成功后提示「续费成功」并刷新详情；停机实例提示「正在重新启动」。
-- 释放：按钮在 `running / stopped` 显示。确认框固定文案「释放后数据将被清除，已付费用不退，确定释放吗？」；当 `state === 'stopped' && pending_seconds > 0` 时追加一行红字「该实例有已付费但尚未开始计时的 X（时长），释放后这部分时长也会作废」（认领计划 1 遗留）。确认按钮需二次点击（按钮文案「确定释放」，首次点击后变为「再次点击确认」，3 秒内再点才执行）。成功后状态变为洗机中。
+- 释放：按钮在 `running / stopped` 显示。确认框固定文案「释放后数据将被清除，已付费用不退，确定释放吗？」；当 `state === 'stopped' && pending_seconds > 0` 时追加一行红字「该实例有已付费但尚未开始计时的 X（时长），释放后这部分时长也会作废」（认领计划 1 遗留）。确认框的确认按钮文案「确定释放」（红色），点击即执行，不再叠加第二层点击确认（评审裁定 2）。成功后状态变为洗机中。
 - 开通失败：显示「开通失败，费用已原路退回余额」。
 - 换机：用户端接口不暴露换机来源，换机后的新实例按普通实例展示；「SSH 密码已变化」由后台换机成功提示运营通知用户（§5.6），帮助页说明「如遇换机，SSH 密码会变化，请在详情页重新查看」。
 
@@ -396,14 +396,14 @@ check:        $(MAKE) test && $(MAKE) e2e
 
 行为：
 - 步骤一：账号、密码。`next === 'totp_setup'` 进入步骤二，否则步骤三。
-- 步骤二（首次绑定）：用 `qrcode` 把 `otpauth_uri` 画成二维码，并显示可复制的密钥（URI 中 `secret` 参数）；输入 6 位动态码；成功后展示 8 个恢复码（等宽字体、可复制全部、可下载为 txt），复选框「我已妥善保存这些恢复码」勾选后「进入后台」按钮才可用；进入后台后不再显示。
+- 步骤二（首次绑定）：用 `qrcode` 把 `otpauth_uri` 画成二维码，并显示可复制的密钥（URI 中 `secret` 参数）；输入 6 位动态码；成功后展示 8 个恢复码（格式 `xxxxx-xxxxx`，等宽字体、可一键复制全部），复选框「我已妥善保存这些恢复码」勾选后「进入后台」按钮才可用；进入后台后不再显示。
 - 步骤三：动态码输入（自动去空格）；「改用恢复码」切换为恢复码输入（格式 `xxxxx-xxxxx`）。
 - 任一步骤收到 401 显示「登录已超时，请重新输入密码」并回到步骤一。
 - 注意：同一动态码 30 秒内不能重复使用（后端防重放），文案提示「如刚用过该动态码，请等待下一个」。
 
 ### 5.3 仪表盘 `/`
 
-`GET /dashboard` → `{machines: {by_state: {idle, allocated, maintenance, faulty}, online, total}, instances: {creating, running, stopped, wiping, released, failed}, recharge_today, recharge_month, order_today, order_month, utilization: {date, rate}[30]}`。
+`GET /dashboard` → `{machines: {by_state: {idle, allocated, maintenance, faulty}, online, total}, instances: {creating, running, stopped, wiping, released, failed}, recharge_today, recharge_month, order_today, order_month, utilization: {date, rate}[30]}`。`by_state` 与 `instances` 都是「状态 → 数量」的 map，后端只输出数据库里出现过的状态，缺省键前端按 0 显示。
 
 - 四组卡片：机器（总数、在线、各状态台数）、实例（各状态数量）、今日 / 本月充值金额、今日 / 本月下单金额（`fmtYuan`）。
 - 近 30 天出租率柱状图：自绘 SVG，30 根柱，高度 = `rate × 100%`，悬停显示日期与百分比（保留 1 位小数），最后一根为今天（截至当前）。
@@ -425,7 +425,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 - 机器列表：筛选栏（状态下拉、在线 是 / 否、机柜文本）、分页（每页 20，可选 50 / 100）；列：ID、序列号、机柜 / 槽位、内网 IP、商品、状态标签、在线（绿点 / 灰点 + 最后心跳时间）、PDU（名称 + 插座）；行点击进详情。
 - 「登记机器」表单弹窗：序列号、机柜、槽位、内网 IP、商品（下拉）、PDU（下拉，可空）+ 插座号。
 - 「CSV 导入」：选择文件后前端读取文本（限制 1MB）直接提交；成功提示导入台数并刷新；`import_invalid` 时弹窗按行列出错误（行号、原因），并提供下载模板按钮（生成表头 CSV）。
-- 详情：机器信息、当前实例（链接到实例详情）、历史实例表格；操作：「进入维护」/「结束维护」（确认框）、「断电重启」（确认框文案「将通过 PDU 对该机器断电重启，机器上的实例会中断，确定执行？」，需二次点击）。
+- 详情：机器信息、当前实例（链接到实例详情）、历史实例表格；操作：「进入维护」/「结束维护」（确认框）、「断电重启」（确认框文案「将通过 PDU 对该机器断电重启，机器上的实例会中断，确定执行？」，确认即执行）。
 - PDU 页：表格 + 新增 / 编辑弹窗。`community` 字段用密码框；编辑时占位文字「留空表示不修改；修改了地址必须重新填写」，`has_community` 为真时显示「已设置」标记。驱动为 mock 时隐藏 SNMP 相关字段。
 
 ### 5.5 告警 `/alerts`（全部角色）
@@ -439,7 +439,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 接口：
 - `GET /instances?state=&user_id=&machine_id=&page=` → `{items: AdminInstance[], total}`；`AdminInstance{id, user_id, machine_id, product_id, image_id, state, suspended, pending_seconds, remaining_seconds, expires_at, stopped_at, created_at}`。
 - `GET /instances/{id}` → `{instance, events: {id, from_state, to_state, reason, at}[], orders: AdminOrder[], commands: {id, machine_id, type, status, result, attempts, created_at}[]}`。
-- `GET /instances/{id}/refund-quote` → `{instance_id, remaining_seconds, unit_order_id, suggested, max}`（分）。
+- `GET /instances/{id}/refund-quote` → `{instance_id, remaining_seconds, unit_order_id, suggested, max}`（分；后端对全部角色开放，前端只在退款表单里用）。
 - `POST /instances/{id}/extend {seconds, reason}` → `AdminInstance`（ops；60 秒～30 天；`creating / running / stopped`）。
 - `POST /instances/{id}/migrate {reason}` → `{instance: AdminInstance}`（ops；仅 running；错误 `no_capacity`、`invalid_state`（无剩余时长））。
 - `POST /instances/{id}/rewipe {}` → `{ok}`（ops；仅 wiping）。
@@ -458,19 +458,19 @@ check:        $(MAKE) test && $(MAKE) e2e
 
 接口：
 - `GET /users?q=&kyc_status=&status=&page=` → `{items: User[], total}`；`q` 为 11 位数字按完整手机号匹配，其他纯数字按用户 ID 或手机尾号匹配，非数字后端返回 `bad_request`（前端只允许数字输入）。
-- `GET /users/{id}` → `{user, balance, instances: AdminInstance[]（最近 20）, orders: AdminOrder[]（最近 20）, ledger: AdminLedgerRow[]（最近 20）, kyc: KYCRecord[]}`；`KYCRecord{id, user_id, kind, real_name, id_number_masked（前 3 后 4）, license_no, license_file, result, reason, reviewer_id, created_at, updated_at}`。
+- `GET /users/{id}` → `{user, balance, instances: AdminInstance[]（最近 20）, orders: AdminOrder[]（最近 20）, ledger: LedgerRow[]（最近 20，与用户端同构，**不含** `operator_id`）, kyc: KYCRecord[]}`；`KYCRecord{id, user_id, kind, real_name, id_number_masked（前 3 后 4，仅个人）, license_no, license_file, result, reason, reviewer_id, created_at, updated_at}`，企业记录的 `real_name` 存的是企业名称。
 - `POST /users/{id}/ban {reason}`（ops，原因必填）、`POST /users/{id}/unban {}`。错误：`invalid_state`。
 - `POST /users/{id}/adjust {amount, remark, totp}` → `{balance}`（finance；`amount` 正负皆可，分）；`POST /users/{id}/manual-recharge {amount, remark, totp}` → `Recharge`（finance；1 元～100 万元；备注必填，例如转账流水号）。错误：`duplicate`（60 秒内相同操作）、`bad_request`。
 
 行为：
 - 列表：搜索框（手机号 / 尾号 / ID）、实名状态、账号状态筛选；列：ID、手机号、类型、实名状态、账号状态、注册时间。
-- 详情：用户卡（含余额）、四个标签（实例、订单、流水、实名记录，流水表显示操作人 ID 与备注，身份证号用 `id_number_masked`）。更多数据链接到对应列表页并带 `user_id` 筛选（实例对全部角色；订单 / 流水 / 充值仅 finance / super 可见该链接）。
+- 详情：用户卡（含余额）、四个标签（实例、订单、流水、实名记录；流水表显示类型、金额、变动后余额、备注，操作人只在 §5.9 的流水页显示；身份证号用 `id_number_masked`）。更多数据链接到对应列表页并带 `user_id` 筛选（实例对全部角色；订单 / 流水 / 充值仅 finance / super 可见该链接）。
 - 操作：ops / super「封禁」（原因必填）/「解封」；finance / super「调账」（金额元、可负、备注必填、提交前确认框显示「将把余额从 ¥a 调整为 ¥b」）与「手动入账」（金额元、备注必填）。两者提交后由请求层弹动态码。
 
 ### 5.8 企业认证审核 `/kyc`（super / ops）
 
 - `GET /kyc/pending?page=` → `{items: KYCRecord[], total}`；`GET /kyc/{id}` → `KYCRecord`；`POST /kyc/{id}/review {approve, reason}` → `{ok}`（驳回时 `reason` 必填，后端 `bad_request`）；`GET /files/{key}` 返回文件（需后台会话，`Content-Disposition: inline`）。
-- 列表：企业名称、信用代码、用户 ID（链接）、提交时间、「审核」按钮。
+- 列表：企业名称（`real_name`）、信用代码（`license_no`）、用户 ID（链接）、提交时间、「审核」按钮。
 - 审核弹窗：左侧资料，右侧执照预览：`content_type` 未知时先用 `<img src="/admin/api/v1/files/<key>">`，`onerror` 时改为按钮「在新窗口打开」；`key` 以 `.pdf` 结尾时直接显示「在新窗口打开 PDF」按钮（`window.open`）。按钮「通过」（确认框）、「驳回」（原因必填）。处理后从列表移除。
 
 ### 5.9 订单 / 流水 / 充值单 `/orders`、`/ledger`、`/recharges`（super / finance）
@@ -479,7 +479,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 - `GET /orders?user_id=&kind=&status=&from=&to=&page=`；`AdminOrder{id, user_id, kind, instance_id, product_id, duration, amount, refunded_amount, status, created_at}`；`kind`：`new` / `renew`；`status`：`paid` / `refunded` / `partially_refunded`。
 - `GET /ledger?user_id=&kind=&from=&to=&page=`；`AdminLedgerRow{id, user_id, amount, balance_after, kind, ref_type, ref_id, operator_id, remark, created_at}`。
 - `GET /recharges?user_id=&channel=&status=&from=&to=&page=`；`AdminRecharge{id, user_id, channel, amount, status, channel_trade_no, operator_id, remark, expires_at, paid_at, closed_at, created_at}`。
-- `GET /orders/export`、`/ledger/export`、`/recharges/export`：同筛选参数，返回 `text/csv`（UTF-8 BOM）附件，文件名 `orders-20261017-140501.csv` 形式；超过 10 万行返回 JSON `bad_request`。
+- `GET /orders/export`、`/ledger/export`、`/recharges/export`：同筛选参数，返回 `text/csv`（UTF-8 BOM）附件，文件名 `orders-20261017-140501.csv` 形式；超过 10 万行返回 JSON 400 `export_too_large`。
 - 日期 `from` / `to` 为 `YYYY-MM-DD`（北京时间，`to` 含当天）；`from` 必须早于 `to`（前端日期范围控件保证）。
 
 行为：三页共用一个「筛选 + 表格 + 分页 + 导出」组件；筛选：用户 ID、类型 / 渠道、状态、日期范围；「导出 CSV」用 `http.download` 按当前筛选条件下载，错误用消息提示；订单 / 充值金额与已退金额 `fmtYuan`；实例 ID、用户 ID 可点击跳转。
@@ -494,7 +494,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 
 ### 5.11 管理员 `/admins`（super）与个人设置 `/settings`
 
-- `GET /admins` → `{items: Admin[]}`；`POST /admins {username, password, role, totp}` → 201（用户名 3～32 位小写字母 / 数字 / `_ . -` 且字母开头；密码 ≥ 12 位；错误 `duplicate_username`）；`PUT /admins/{id} {role?, status?, totp}`（错误 `last_super`）；`POST /admins/{id}/reset-totp {totp}` → `{ok}`。
+- `GET /admins` → `{items: Admin[]}`；`POST /admins {username, password, role, totp}` → 201（用户名 3～32 位小写字母 / 数字 / `_ . -` 且字母开头；密码 ≥ 12 位；错误 `duplicate_username`）；`PUT /admins/{id} {role?: 'super' | 'ops' | 'finance', status?: 'active' | 'disabled', totp}`（错误 `last_super`，前端只显示后端原文，不做专门处理）；`POST /admins/{id}/reset-totp {totp}` → `{ok}`。
 - `POST /me/password {old, new}` → `{ok}`（错误 `wrong_password`、`bad_request` 新密码 < 12 位）。
 - 列表：用户名、角色、状态、动态码（已绑定 / 未绑定）、最后登录时间与 IP；操作「修改角色 / 状态」「重置动态码」（确认框说明「该管理员将被强制下线并在下次登录时重新绑定」）；「新增管理员」弹窗（用户名、密码、角色）。所有写操作由请求层弹动态码。
 - 个人设置：修改密码（原密码、新密码、确认）、退出登录。
@@ -521,7 +521,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 - **B5 用户端视图补字段**：(a) `api.instanceView` 增加 `product_name`、`image_name`（镜像停用后仍能显示名称）。实现：`catalog` 新增 `ProductName(ctx, id)` 与 `ImageName(ctx, id)`（不受 `enabled` 过滤），处理器内用一个小 map 去重查询。现状：只有 `product_id` / `image_id`，而 `GET /images` 不返回已停用镜像。(b) `api.rechargeView` 增加 `remaining_seconds`（待支付时为 `expires_at − 服务器当前时间`，向下取整且不小于 0；其他状态为 0），由 `s.Clock` 计算。原因：§2.4 规定前端不拿设备时钟与服务器时间戳相减，充值倒计时需要服务器给出的剩余秒数（实例视图已有同类字段）。
 - **B6 后台商品 / 镜像读接口放开角色**：`GET /admin/api/v1/products` 与 `GET /admin/api/v1/images` 由 `superOnly` 改为 `allRoles`；写接口（`PUT prices`、`POST/PUT images`）仍 `superOnly`。原因：ops 登记机器需要选商品，所有角色的实例页需要显示镜像 / 商品名。同步更新 `permissions_test.go` 的矩阵。
 - **B7 审计日志操作人名称**：`adminapi.handleAudit` 在返回前用 `Admins.List()` 建立 `id → username` 映射，为每条记录补 `actor_name`（`actor_type != 'admin'` 或找不到时为空串）。响应类型为 `adminapi` 内的视图结构，不改 `audit` 包。
-- **B8 速率限制可关闭（仅测试）**：`app.Options.DisableRateLimits bool`；为真时 `identity.Deps.CodeIPHourLimit = 1_000_000`（新增字段，零值表示默认 30）、`adminapi.Server.LoginLimit = 1_000_000`（新增字段，零值表示默认 20）。只有 `cmd/e2e-server` 设置该选项，`cmd/platform` 不读取任何相关配置，生产环境无法开启。原因：端到端测试从 127.0.0.1 连续登录会在几分钟内触发「同 IP 每小时 30 次验证码」「每分钟 20 次后台登录」限制。
+- **B8 速率限制可关闭（仅测试）**：`app.Options.DisableRateLimits bool`；为真时 `identity.Deps.CodeIPHourLimit = 1_000_000`（新增字段，零值表示默认 30）、`adminapi.Server.LoginLimit = 1_000_000`（新增字段，零值表示默认 20，覆盖 `/auth/login`、`/auth/totp`、`/auth/totp/setup` 三个接口共用的限流器）。`Options` 是 Go 结构体字段而不是配置项：只有 `cmd/e2e-server` 设置它，`cmd/platform` 传 `app.Options{}`，没有任何环境变量能打开；再加一道保险：`app.Build` 在 `DisableRateLimits && cfg.Env == "prod"` 时返回错误（与「生产环境禁止 mock 插件」同一处检查，Go 单测覆盖）。原因：两个限流器的时间窗都按注入的时钟计算，端到端环境用的是假时钟，窗口永远不会自然滑过——不是「几分钟内触发」，而是累计 30 次验证码 / 20 次后台登录请求后必然全部 429。
 - **B9 端到端测试服务 `cmd/e2e-server`**：见 §7.2。独立 `main` 包，不在 `make build` 产物中，钩子监听 127.0.0.1。
 - **B10 staging 开启 Secure Cookie**（认领计划 1 遗留）：`api.Server.SecureCookie` 与 `adminapi.Server.SecureCookie` 由 `cfg.Env == "prod"` 改为 `cfg.Env != "dev"`；staging 必须走 HTTPS（部署说明里写明）。
 - **B11 计划 4 文档脚注**：`/products`、`/images` 读权限变化记入 `docs/superpowers/specs/2026-10-15-plan4-admin-payments-design.md` 的权限矩阵（一行脚注，不改其他内容）。
@@ -554,20 +554,21 @@ check:        $(MAKE) test && $(MAKE) e2e
 | `GET /healthz` | | `{ok}` | 就绪探测 |
 | `GET /hooks/clock` | | `{now}` | 测试计算动态码用的服务器时间 |
 | `POST /hooks/clock/advance` | `{seconds}` | `{now}` | 推进假时钟（只能向前） |
-| `POST /hooks/sweep` | `{}` | `{ok}` | 执行一次 `Rental.Sweep` + `Billing.Sweep`（到期停机、超时洗机、失联暂停、开通超时、充值关单…） |
+| `POST /hooks/sweep` | `{heartbeat?: bool}`（缺省 `true`） | `{ok}` | 先对全部机器 `Fleet.Heartbeat`（除非 `heartbeat: false`），再执行一次 `Rental.Sweep` + `Billing.Sweep`（到期停机、超时洗机、失联暂停、开通超时、充值关单…）。必须先心跳：`Rental.Sweep` 先做离线检测与暂停、再做到期停机，而到期停机只处理未暂停的实例；推进 24 小时后不心跳直接清扫，机器会被判失联、实例被暂停而不会停机（`internal/app/e2e_test.go` 的 `sweep` helper 就是这样写的）。只有「计时已暂停 / 机器失联」场景传 `heartbeat: false` |
 | `POST /hooks/agent` | `{machine_id?, fail?: bool, result?: string}` | `{completed: n}` | 模拟 Agent：对指定机器（缺省全部）心跳，并把全部待处理指令按成功 / 失败回报（计划 2 未做，这是让实例进入 running / stopped / released / failed 的唯一手段） |
 | `POST /hooks/machines` | `{count, serial_prefix?}` | `{ids: number[]}` | 通过 `Fleet.Register` 登记 `count` 台 `spark-1` 机器并心跳使其在线 |
-| `POST /hooks/users` | `{phone?, verified?: bool, balance?: cents, ledger_rows?: n}` | `{id, phone}` | 创建用户（可直接实名、预置余额、追加 n 条小额调账流水用于分页测试）；登录仍走界面 |
-| `POST /hooks/admins` | `{username, role, bind_totp: bool}` | `{id, password, totp_secret?, recovery_codes?}` | 创建管理员，密码固定 `e2e-password-123456`；`bind_totp` 为真时服务端完成绑定并返回密钥与恢复码 |
-| `POST /hooks/kyc` | `{reject: bool}` | `{ok}` | 切换 mock 实名核验为全部不通过 / 通过 |
+| `POST /hooks/users` | `{phone?, verified?: bool, balance?: cents, ledger_rows?: n}` | `{id, phone}` | 创建用户（可直接实名、预置余额、追加 n 条小额调账流水用于分页测试）；登录仍走界面。`ledger_rows` 通过 `Wallet.AdminAdjust` 写入，每条用不同备注 `e2e-seed-<i>`——该方法拒绝 60 秒内完全相同的调账，而假时钟下这 60 秒永远不会过去 |
+| `POST /hooks/admins` | `{username, role, bind_totp: bool}` | `{id, password, totp_secret?, recovery_codes?}` | 创建管理员（`Admins.Create`），密码固定 `e2e-password-123456`；`bind_totp` 为真时走命令行同款路径 `Admins.EnrollTOTP` → 按假时钟算码 → `Admins.ConfirmEnrollment`，返回密钥与恢复码 |
+| `POST /hooks/kyc` | `{reject: bool}` | `{ok}` | 切换 mock 实名核验为全部不通过 / 通过。`kyc.Mock` 是值类型、`Reject` 是普通字段，不能在运行中改字段（数据竞争）；`e2ehooks` 自带一个 `atomic.Bool` 驱动的 `switchableKYC` 实现 `kyc.Verifier`，通过 `Options.KYC` 注入 |
 
-钩子处理器放在 `internal/e2ehooks`（只被 `cmd/e2e-server` 引用），用 `app.App` 暴露的服务与 `pgxpool` 实现；不复制业务逻辑。
+钩子处理器放在 `internal/e2ehooks`（只被 `cmd/e2e-server` 引用），用 `app.App` 暴露的服务与 `pgxpool` 实现；不复制业务逻辑。`hooks/agent` 用 `Fleet.Heartbeat` + `Fleet.PendingCommands` + `Rental.HandleCommandResult`，与 `internal/app/e2e_test.go` 的 `agent` helper 相同。
 
 **假时钟的影响与规则**：
 - 服务端所有「现在」来自假时钟（会话过期、TOTP 时间片、充值单过期、到期判断）；浏览器时间是真实时间，Cookie `Max-Age` 用的是浏览器时间，不受影响。
 - TOTP 防重放：同一管理员 30 秒时间片内同一动态码只能用一次。测试里**任何**需要输入动态码的地方（登录、绑定、高风险操作的二次验证）都由 helper `enterTotp()` 先 `clock/advance 30` 再按 `GET /hooks/clock` 的时间计算。
 - 时钟全局共享，因此 **Playwright `workers: 1`，`fullyParallel: false`**；每个测试自行登录、自行造数据，不依赖前一个测试留下的状态；测试只假设时间单调向前，不假设绝对时间。
-- 需要大幅推进时间的用例（到期 24 小时、关单 2 小时、会话过期 13 小时）之后，其他测试重新登录即可（helper 每个测试都登录）。
+- 需要大幅推进时间的用例（到期 24 小时、关单 2 小时、会话过期 13 小时）之后，其他测试重新登录即可（helper 每个测试都登录）。同一个测试内也要注意：后台会话空闲 2 小时失效（`admin.IdleTimeout`），推进 ≥ 2 小时后后台界面或 `adminApi()` 必须重新登录；用户会话是 30 天绝对有效期，不受这些推进影响。
+- 推进 ≥ 5 分钟后，所有没再心跳的机器在下一次清扫时都会被判失联（`OfflineTimeout`）。每个测试只用自己新登记的机器，且 `hooks/sweep` 默认先心跳，所以互不影响；只有失联场景显式传 `heartbeat: false`。
 
 ### 7.3 测试规范
 
@@ -592,13 +593,13 @@ check:        $(MAKE) test && $(MAKE) e2e
 | 未实名用户 | `hooks/users {verified: false}` |
 | 空闲机器 | `hooks/machines {count: 1}` |
 | 运行中实例 | 界面下单（或 API `POST /orders`）→ `hooks/agent` |
-| 已到期停机 | 运行中 → `clock/advance 86400` → `hooks/sweep`（清扫即置为 stopped 并下发停机指令；再 `hooks/agent` 可把停机指令标为完成，非必需） |
+| 已到期停机 | 运行中 → `clock/advance 86400` → `hooks/sweep`（默认先心跳；清扫即置为 stopped 并下发停机指令；再 `hooks/agent` 可把停机指令标为完成，非必需） |
 | 停机且有待开始续费 | 停机 → 界面续费（不执行 `hooks/agent`，启动指令待处理，`pending_seconds > 0`） |
 | 洗机中 | 运行中 → 释放（不执行 `hooks/agent`） |
 | 已释放 | 洗机中 → `hooks/agent` |
 | 开通失败（并产生 `create_failed` 告警） | 下单 → `hooks/agent {fail: true}` |
 | 洗机失败（机器 faulty、实例停在 wiping，产生 `wipe_failed` 告警） | 洗机中 → `hooks/agent {fail: true}` |
-| 计时已暂停 | 运行中 → `clock/advance 360`（> 5 分钟且不心跳）→ `hooks/sweep` |
+| 计时已暂停 | 运行中 → `clock/advance 360`（> 5 分钟且不心跳）→ `hooks/sweep {heartbeat: false}` |
 | 机器失联告警 | 同上 |
 | 充值到账 | 界面发起 → 点「模拟支付成功」（或 API `POST /dev/recharges/{id}/pay`） |
 | 充值关单 | 发起 → `clock/advance 7200` → `hooks/sweep` |
@@ -639,16 +640,16 @@ check:        $(MAKE) test && $(MAKE) e2e
 | C-MKT-06 | 无空闲机器 | 不登记机器 → 按钮禁用「暂无空闲」；登记后 30 秒刷新（`page.clock`）按钮可用 |
 | C-MKT-07 | 幂等 | 确认按钮连点两次 → 只有 1 个实例、余额只扣一次 |
 | C-MKT-08 | 租期 / 镜像选择 | 选 1 周 + 第二个镜像 → 确认框价格 ¥414.00、镜像名正确；下单后详情页镜像名一致 |
-| C-INS-01 | 六种状态展示 | 构造 creating / running / stopped / wiping / released / failed 各一个 → 标签文案与颜色类正确；默认隐藏已释放 / 失败，关闭开关后显示 |
+| C-INS-01 | 六种状态展示 | 构造 creating / running / stopped / wiping / released / failed 各一个 → 六个都显示，标签文案与颜色类正确，按创建时间倒序 |
 | C-INS-02 | 自动刷新 | 开通中实例 → `hooks/agent` → `page.clock.runFor(10000)` → 无需刷新变为「运行中」 |
 | C-INS-03 | 计时已暂停 | 失联暂停后列表与详情显示「计时已暂停」 |
-| C-INS-04 | 倒计时与保留时间 | 运行中显示「剩余 23 小时 59 分」量级并每秒递减；停机显示「数据保留至」北京时间 |
+| C-INS-04 | 倒计时与保留时间 | 列表与详情：运行中显示「剩余 23 小时 59 分」量级并每秒递减；停机显示「数据保留至 yyyy-MM-dd HH:mm」且与 `retain_until` 换算成北京时间一致 |
 | C-DET-01 | SSH 命令复制 | 显示 `ssh ins-…@ssh.spark.test`，点复制后剪贴板一致；非运行中显示提示 |
 | C-DET-02 | 密码查看 | 默认 `••••••••`；点显示后发出 `/password` 请求并显示 16 位密码；复制一致；再次进入页面仍默认隐藏 |
 | C-DET-03 | 续费成功 | 运行中选 1 周 → 价格 ¥414.00 → 确认 → 剩余时长约 8 天、余额减少、订单 tab 出现续费订单 |
 | C-DET-04 | 停机续费 | 停机实例续费 → 提示「正在重新启动」→ `hooks/agent` 后变运行中 |
 | C-DET-05 | 续费余额不足 | 按钮变「去充值」 |
-| C-DET-06 | 释放确认 | 文案含「数据将被清除，已付费用不退」；取消不变；确认（二次点击）后状态洗机中；洗机中无续费 / 释放按钮 |
+| C-DET-06 | 释放确认 | 文案含「数据将被清除，已付费用不退」；取消后状态不变且无请求发出；确认后状态洗机中；洗机中无续费 / 释放按钮 |
 | C-DET-07 | 释放作废待开始时长 | 停机 + 待开始续费 → 确认框额外显示「这部分时长也会作废」及时长 |
 | C-DET-08 | 开通失败展示 | 失败实例显示「费用已原路退回余额」，余额恢复，无操作按钮 |
 | C-DET-09 | 按钮与状态匹配 | creating 有续费无释放；running / stopped 两者都有；wiping / released / failed 都无 |
@@ -657,9 +658,9 @@ check:        $(MAKE) test && $(MAKE) e2e
 | C-WAL-03 | 充值记录 tab | 待支付 / 已支付 / 已关闭状态；待支付可点进继续支付；`?tab=recharges` 刷新保持 |
 | C-WAL-04 | 未实名充值 | 点充值 → 引导实名 |
 | C-RCH-01 | 发起页校验 | 档位选择；自定义 `0.5`、`1000001`、`1.234` 报错；`88.5` 通过 |
-| C-RCH-02 | 渠道按设备 | 电脑：微信 + 支付宝；手机：只有支付宝 |
-| C-RCH-03 | 电脑扫码到账 | 二维码画布可见、倒计时 15:00 递减、3 秒轮询（`page.clock`）；点「模拟支付成功」→ 「充值成功」→ 余额更新 |
-| C-RCH-04 | 手机拉起支付宝 | 按钮 `href` 以 `alipays://platformapi/startapp?saId=10000007&qrcode=` 开头并含编码后的 `qr_code`；用 API 模拟支付后触发 `visibilitychange` → 显示成功 |
+| C-RCH-02 | 渠道按设备 | 电脑 project：微信 + 支付宝，且把视口缩到 390 宽后仍是两个渠道（证明按 UA 不按宽度）；手机 project：只有支付宝 |
+| C-RCH-03 | 支付态与模拟到账 | 两个 project 都执行：倒计时从 15:00 递减、3 秒轮询（`page.clock`）、「开发环境模拟支付」与「模拟支付成功」按钮可见；点按钮 → 「充值成功」→ 余额更新。电脑 project 另断言二维码画布可见、无 `alipays://` 按钮；手机 project 断言无二维码画布 |
+| C-RCH-04 | 手机拉起支付宝 | 手机 project：按钮 `href` 以 `alipays://platformapi/startapp?saId=10000007&qrcode=` 开头并含编码后的 `qr_code`，「在浏览器中打开」链接指向 `qr_code` 原文；用 API 模拟支付后触发 `visibilitychange` → 立即查询并显示成功。电脑 project：页面不可见时轮询暂停、恢复可见时立即查一次（同一 `visibilitychange` 逻辑） |
 | C-RCH-05 | 关单 | 推进 2 小时 + 清扫 → 页面显示「已关闭，请重新发起」 |
 | C-RCH-06 | 待支付过多 | 第 6 张提示「待支付的充值单过多…」 |
 | C-RCH-07 | 已支付单重进 | 访问已支付的 `/wallet/recharge/:id` 直接显示成功页 |
@@ -678,7 +679,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 
 | ID | 功能 | 断言要点 |
 |---|---|---|
-| A-AUTH-01 | 首次登录绑定动态码 | 密码 → 二维码与密钥 → 用密钥算码 → 8 个恢复码 → 未勾选时按钮禁用 → 勾选进入仪表盘 |
+| A-AUTH-01 | 首次登录绑定动态码 | 密码 → 二维码与密钥 → 用密钥算码 → 8 个 `xxxxx-xxxxx` 恢复码、「复制全部」后剪贴板一致 → 未勾选时按钮禁用 → 勾选进入仪表盘；刷新后不再显示恢复码 |
 | A-AUTH-02 | 动态码登录 | 密码 → 动态码 → 仪表盘；刷新仍登录 |
 | A-AUTH-03 | 恢复码登录 | 切换恢复码 → 成功；同一恢复码再次使用失败 |
 | A-AUTH-04 | 错误提示 | 密码错误「用户名或密码错误」；动态码错误「动态码错误或已使用过」 |
@@ -693,10 +694,10 @@ check:        $(MAKE) test && $(MAKE) e2e
 | A-MCH-02 | 单台登记 | 成功出现在列表；重复序列号提示「序列号已存在」；PDU 与插座只填一个提示 |
 | A-MCH-03 | CSV 导入 | `machines-ok.csv` 导入 3 台；`machines-bad.csv` 弹出逐行错误且列表无新增；模板下载表头正确 |
 | A-MCH-04 | 维护 | 进入维护 → 状态「维护中」，市场空闲数减 1；有实例时结束维护提示错误；无实例时结束成功 |
-| A-MCH-05 | 断电重启 | 需确认；无 PDU 机器提示错误；有 mock PDU 机器成功并出现审计 `machine.power_cycle` |
+| A-MCH-05 | 断电重启 | 确认框文案正确，取消不发请求；无 PDU 机器提示错误；有 mock PDU 机器成功并出现审计 `machine.power_cycle` |
 | A-MCH-06 | 机器详情 | 当前实例与历史实例显示 |
 | A-PDU-01 | 新增 PDU | mock 成功；snmp 缺 community 报错 |
-| A-PDU-02 | 编辑 PDU | 留空 community 保存成功（`has_community` 仍为真）；改地址不填 community 报错 |
+| A-PDU-02 | 编辑 PDU | community 为密码框且显示提示「留空表示不修改；修改了地址必须重新填写」与「已设置」标记；留空保存成功（`has_community` 仍为真）；改地址不填 community 报错 |
 | A-ALT-01 | 告警 | 开通失败产生告警显示在未处理；标记已处理后消失；「全部」可见；菜单角标数字 |
 | A-INS-01 | 实例列表筛选 | 状态 / 用户 ID / 机器 ID |
 | A-INS-02 | 实例详情 | 基本信息、时间线含 `creating → running`、订单、指令 |
@@ -723,7 +724,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 | A-CAT-02 | 下架档位 | 关闭 1 周 → 市场不再显示周价 |
 | A-CAT-03 | 镜像管理 | 新增、编辑、停用、上移 / 下移 → 市场镜像列表与顺序一致；非法 `ref` 报错 |
 | A-ADM-01 | 新增管理员 | 需动态码；重复用户名提示；新管理员可登录并进入绑定流程 |
-| A-ADM-02 | 修改角色 / 停用 | 改为 finance 后其菜单变化；停用后其登录失败；最后一个 super 降级提示 `last_super` |
+| A-ADM-02 | 修改角色 / 停用 | 改为 finance 后其菜单变化；停用后其登录失败（`last_super` 由后端单测覆盖，界面只显示原文，见评审裁定 4） |
 | A-ADM-03 | 重置他人动态码 | 目标管理员下次登录进入绑定步骤 |
 | A-SET-01 | 修改密码 | 原密码错误提示；成功后用新密码登录 |
 | A-AUD-01 | 审计日志 | 按操作人 / 动作 / 对象 / 时间筛选；操作人显示用户名；展开 diff 为格式化 JSON |
@@ -757,7 +758,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 
 ## 8. 安全
 
-- **会话**：只用后端下发的 HttpOnly Cookie；前端不保存任何 token。`localStorage` 只存界面偏好（隐藏已释放开关、后台侧边栏折叠），不存手机号、余额、密码、动态码、恢复码。
+- **会话**：只用后端下发的 HttpOnly Cookie；前端不保存任何 token。`localStorage` 只存界面偏好（后台侧边栏折叠），不存手机号、余额、密码、动态码、恢复码。
 - **敏感数据**：SSH 密码只在用户点击时请求并显示在内存中，离开页面即丢弃；恢复码只展示一次；身份证号输入框 `autocomplete="off"`；后台所有 API 响应本身就是 `no-store`。
 - **CSP**（静态托管响应头，B1）：`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'`。`style-src 'unsafe-inline'` 是 Element Plus 行内样式所需；不引入任何第三方 CDN、字体或统计脚本；二维码本地生成。
 - **CSRF**：后端已要求写请求 `Content-Type: application/json` 且 Cookie `SameSite=Lax`（用户）/ `Strict`（后台）；前端不使用表单提交。
@@ -790,6 +791,25 @@ check:        $(MAKE) test && $(MAKE) e2e
 - `go vet ./...` 会遍历 `web/` 目录；`node_modules` 中极少数包可能带 `.go` 文件导致编译错误。若发生，在 `web/` 放一个空的 `go.mod`（`module spark-cloud/web`）把它从主模块排除。
 - 端到端串行执行（`workers: 1`）是假时钟共享的代价；用例总数约 52 × 2（控制台两种尺寸）+ 50（后台）≈ 155，目标 15 分钟内。若超时，优先把「造数据」从界面改为 API 调用，而不是并行化。
 - 手机端 `alipays://` 链接的实际拉起只能在真机验证；自动化只断言链接格式与回页查询逻辑。上线前用真机走一次支付宝沙箱。
-- 后台 `GET /files/{key}` 不返回 `content_type` 给列表，PNG / JPG 用 `<img>` 预览、失败回退到新窗口打开；PDF 按 key 后缀判断。
+- 后台 `GET /files/{key}` 不返回 `content_type` 给列表，PNG / JPG 用 `<img>` 预览、失败回退到新窗口打开；PDF 按 key 后缀判断（上传时后端按文件内容生成 `.jpg / .png / .pdf` 后缀，所以后缀可信）。
+- 后台 `GET /users/{id}` 的流水不含操作人；需要看操作人时去流水页按用户 ID 筛选（finance / super）。
 - 用户实例列表上限 100 条、订单上限 50 条不分页，个人用户在 MVP 阶段足够；企业大客户前需要后端加分页。
 - `make e2e` 依赖本机已安装 Chrome；CI 机器需预装 Chrome 或改 `channel` 为 Playwright 自带 chromium（配置项 `E2E_BROWSER_CHANNEL`，默认 `chrome`）。
+
+## 12. 评审裁定
+
+独立评审逐条对照 `internal/api`、`internal/adminapi`、`internal/app`、`internal/admin`、`internal/rental`、`internal/billing`、`internal/wallet`、`internal/fleet`、`internal/identity`、`internal/storage` 与 `migrations/` 核对后的结论。小修（错误码、字段、钩子语义）已直接改入正文；以下是涉及取舍的裁定。
+
+1. **去掉实例列表的「隐藏已释放 / 失败」开关** — 用户确认的设计是「每个实例一张卡片，显示状态标签（…已释放 / 开通失败）」，默认隐藏会让刚释放的用户找不到实例；列表上限 100 条，MVP 不需要筛选。少一个 `localStorage` 偏好、少一条断言分支。
+2. **释放与断电重启只保留一层确认框，去掉「按钮二次点击、3 秒内有效」机制** — 用户确认的是「要二次确认」（即确认框），原文已叠加成按钮 → 确认框 → 再点一次的三层确认，属于过度设计且 3 秒窗口会让端到端用例变脆。确认框文案和「停机且有待开始续费」的额外警告原样保留（C-DET-06 / C-DET-07）。
+3. **`hooks/sweep` 改为默认先对全部机器心跳** — 对照 `rental.Sweep` 的顺序（离线检测 → 暂停 → 到期停机，且到期停机只处理未暂停实例）与 `internal/app/e2e_test.go` 的 `sweep` helper：原文「推进 24 小时 → 清扫」在不心跳的情况下根本到不了 stopped 状态，C-DET-04 / C-DET-07 / C-INS-04 等用例会全部失败。失联场景显式传 `heartbeat: false`。
+4. **A-ADM-02 不再在界面上验证 `last_super`** — 端到端数据库在整轮测试里共享，之前用例创建的 super 都还在，「最后一个 super」条件根本不成立；要成立得先停用其他所有 super，副作用波及后续用例。该规则已有 `internal/admin` 单测，界面只显示后端原文。
+5. **B8 保留，并加 `app.Build` 的生产保护** — 评审确认两个限流器（`identity` 的验证码按 IP 每小时 30 次、`adminapi` 的登录每分钟 20 次）都按注入的时钟计窗口，假时钟下窗口永不滑过，所以不是「可有可无的加速」而是端到端跑通的前提。`Options` 字段无法由配置或环境变量打开，再加 `DisableRateLimits && Env == "prod"` 直接拒绝启动，与现有「生产禁止 mock 插件」检查同一处。
+6. **B6（`GET /products`、`GET /images` 对全部后台角色开放）合理** — 后台 SPA 在 `:8081`，无法同源访问 `:8080` 的公开商品接口；两个接口只读、不含敏感数据（`ref` 是内网仓库地址）；写接口仍 `superOnly`，`permissions_test.go` 矩阵同步。
+7. **`hooks/users.ledger_rows`、`hooks/kyc`、`hooks/admins` 的实现约束写死在钩子表里** — 分别因为 `AdminAdjust` 的 60 秒重复检查在假时钟下永不过期、`kyc.Mock` 是值类型无法运行中切换、服务端绑定动态码必须走 `EnrollTOTP` / `ConfirmEnrollment`。不写清楚实施时一定会踩到。
+8. **C-RCH-02 在电脑 project 增加「缩窄视口仍显示两个渠道」断言** — 用户明确要求「是不是手机按设备类型判断，不看屏幕宽度」，而两个 project 同时改变了 UA 和宽度，原覆盖表区分不出来是哪个在起作用；加一行断言即可直接验证这条要求。
+9. **C-RCH-03 / C-RCH-04 重写为两个 project 都有明确断言** — 原文标题带「电脑」「手机」，与 §7.6「每个用例在两种尺寸都通过」自相矛盾；现在手机 project 也验证「模拟支付成功」按钮（用户确认稿第二段第 6 条），电脑 project 也验证页面可见性暂停 / 恢复轮询。
+10. **`Makefile` 的 `e2e` 目标先执行 `web`** — `cmd/e2e-server` 与生产一样从 embed 读前端产物，不先构建就是在测上一次的前端；同时把 `e2e:coverage` 核对放进该目标。
+11. **去掉恢复码「下载为 txt」** — 用户确认稿只要求展示并勾选「已保存」；复制全部已够用，少一个文件下载路径和一条断言。
+12. **纠正与代码不符的细节（已改正文）**：CSV 导出超限错误码是 `export_too_large` 不是 `bad_request`；后台用户详情的 `ledger` 是 `wallet.LedgerRow`（无 `operator_id`）；`retain_until` 仅在 `pending_seconds == 0` 时返回；`by_state` / `instances` 是只含出现过状态的 map；企业实名记录的企业名称在 `real_name`；`PUT /admins/{id}` 的 `status` 取值 `active | disabled`；`/me` 探测必须 `quiet` 否则匿名访客打开市场页会被弹到登录页；后台会话有 2 小时空闲失效，推进时钟超过 2 小时的用例要重新登录。
+13. **未改动但确认过的点**：`vue-router 5.4.0`、`vite 8.3.4`、`element-plus 2.14.7`、`@playwright/test 1.64.1` 等版本与 spike 实际安装的 `package.json` 一致；本机已装 Chrome（`/Applications/Google Chrome.app`）、Node 22、embedded-postgres 二进制已缓存，`make e2e` 不需要 Docker；用户端订单 50 条 / 实例 100 条上限、`invalid_code` 400、`banned` 403、`insufficient_balance` 402、`no_capacity` 409、`too_many_pending` 409、`pay_unavailable` 502、`file_too_large` 413、`unsupported_file_type` 415、`kyc_rejected` 400、`account_locked` 423、全部审计动作名与告警 `kind` 均与代码一致。
