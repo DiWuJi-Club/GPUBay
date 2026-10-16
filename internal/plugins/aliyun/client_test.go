@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,5 +70,23 @@ func TestCallMapsHTTPErrors(t *testing.T) {
 	var ae *aliyun.Error
 	if !errors.As(err, &ae) || ae.Status != 404 || ae.Code != "InvalidAccessKeyId.NotFound" || ae.RequestID != "r1" {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// 传输层失败时，错误信息不得包含请求 URL 中的敏感参数（手机号、身份证号、短信验证码、签名与 AccessKeyId）。
+func TestCallTransportErrorDoesNotLeakRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	endpoint := srv.URL
+	srv.Close()
+	c := &aliyun.Client{Endpoint: endpoint, AccessKeyID: "LTAIsecretak-test", AccessKeySecret: "sk"}
+	err := c.Call(context.Background(), "ThreeElementsVerification", "2020-02-17",
+		map[string]string{"IdentifyNum": "110101199001011234", "TemplateParam": `{"code":"654321"}`}, &struct{}{})
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	for _, secret := range []string{"110101199001011234", "654321", "Signature", "LTAIsecretak-test"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error leaks %q: %v", secret, err)
+		}
 	}
 }

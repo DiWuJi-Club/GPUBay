@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,6 +77,11 @@ func (c *Client) Call(ctx context.Context, action, version string, params map[st
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		// *url.Error 内含完整请求 URL（手机号、身份证号、验证码、签名），不能进入错误信息。
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
 		return fmt.Errorf("aliyun %s: %w", action, err)
 	}
 	defer resp.Body.Close()
@@ -86,6 +92,9 @@ func (c *Client) Call(ctx context.Context, action, version string, params map[st
 	if resp.StatusCode != http.StatusOK {
 		var e struct{ Code, Message, RequestId string }
 		_ = json.Unmarshal(body, &e)
+		if e.Message == "" {
+			e.Message = string(body[:min(len(body), 200)])
+		}
 		return &Error{Status: resp.StatusCode, Code: e.Code, Message: e.Message, RequestID: e.RequestId}
 	}
 	if err := json.Unmarshal(body, out); err != nil {
