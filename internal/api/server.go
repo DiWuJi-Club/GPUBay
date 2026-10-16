@@ -3,10 +3,8 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"runtime/debug"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -18,6 +16,7 @@ import (
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
+	"spark-cloud/internal/platform/httpx"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
@@ -49,7 +48,7 @@ func (s *Server) Router() http.Handler {
 	if s.TrustProxy {
 		r.Use(middleware.RealIP)
 	}
-	r.Use(s.recoverer, s.requireJSONForWrites)
+	r.Use(httpx.Recoverer(s.Log), s.requireJSONForWrites)
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/sms-code", s.handleSendCode)
 		r.Post("/auth/login", s.handleLogin)
@@ -60,7 +59,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
 
 		r.Group(func(r chi.Router) {
-			r.Use(noStore, s.requireUser)
+			r.Use(httpx.NoStore, s.requireUser)
 			r.Get("/me", s.handleMe)
 			r.Post("/uploads", s.handleUpload)
 			r.Post("/kyc/personal", s.handleKYCPersonal)
@@ -83,26 +82,6 @@ func (s *Server) Router() http.Handler {
 		})
 	})
 	return r
-}
-
-// recoverer 捕获处理器中的 panic：记录日志（含堆栈）并按统一错误格式返回 500。
-func (s *Server) recoverer(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			rec := recover()
-			if rec == nil {
-				return
-			}
-			if rec == http.ErrAbortHandler { //nolint:errorlint // 与 net/http 约定一致：继续向上抛出以中断连接
-				panic(rec)
-			}
-			rid := middleware.GetReqID(r.Context())
-			s.Log.Error("panic", "panic", fmt.Sprint(rec), "stack", string(debug.Stack()),
-				"request_id", rid, "method", r.Method, "path", r.URL.Path)
-			writeInternal(w, rid)
-		}()
-		next.ServeHTTP(w, r)
-	})
 }
 
 // requireJSONForWrites 要求写请求使用 application/json（上传接口要求 multipart/form-data）。
@@ -146,12 +125,4 @@ func (s *Server) requireUser(next http.Handler) http.Handler {
 
 func currentUser(r *http.Request) identity.User {
 	return r.Context().Value(userCtxKey{}).(identity.User)
-}
-
-// noStore 禁止缓存已登录接口的响应（含密码、余额等敏感数据）。
-func noStore(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		next.ServeHTTP(w, r)
-	})
 }
