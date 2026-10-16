@@ -29,6 +29,8 @@
 - `app.Options.DisableRateLimits` 只有 `cmd/e2e-server` 设置，没有任何环境变量能打开；`cmd/platform` 不包含钩子代码；钩子只监听 `127.0.0.1`。
 - 端到端测试规范（设计 §7.3）：用例标题以覆盖表 ID 开头；`data-testid` 命名 `页面-元素`；不用 CSS 类名定位业务元素（`.el-dialog`、`.is-fullscreen`、`.sheet` 只用于响应式断言）；禁止 `waitForTimeout`（截图前除外）；轮询逻辑用 `page.clock`；`workers: 1`、`fullyParallel: false`；每个测试自行登录、自行造数据；`web/e2e/coverage.json` 与设计 §7.5 一一对应，`npm run e2e:coverage` 核对无缺失、无多余、无 `skip / fixme / only`。
 - 控制台每个 C- 用例在 `console-desktop` 与 `console-mobile` 两个 project 都执行并通过；后台 A- 用例在 `admin` project 通过。
+- 控制台视图里请求失败的提示一律走 `notifyError(e)`（Task 8 `src/logic/notify.ts`，对 `unauthorized` / `cancelled` 静默），不直接 `ElMessage.error(messageOf(e))`；后台视图同理用各自的 `report(e)`（对 `cancelled` 静默）或 `notifyError`。
+- 端到端断言不得落在 Element Plus 的包装元素上：`getByRole('dialog')` 命中的是 `.el-overlay-dialog` 包装层（只用于可见 / 隐藏判断），`is-fullscreen`、`sheet` 等类与 `data-testid` 都在内层 `.el-dialog` 上——响应式与类名断言必须用传给 `AppDialog` 的 `data-testid` 定位。
 - 每个任务结束前必须实际运行并通过：`go vet ./... && go test ./...`；从 Task 5 起再加 `cd web && npm test`（Vitest）与 `npm run build`（`vue-tsc --noEmit && vite build`）；页面任务再加该任务列出的 Playwright 用例。任务完成的证据是命令输出，不是「看起来能用」。
 - 提交信息结尾空一行加 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`。
 
@@ -54,11 +56,11 @@
 - **`hooks/users` 的实现**：用户行直接 `INSERT INTO users`（与 `dbtest.CreateUser` 同一条 SQL，`verified` 时 `kyc_status='verified', kind='personal'`）；余额与分页流水都走 `Wallet.AdminAdjust(operatorID=0, remark='e2e-seed-balance' / 'e2e-seed-<i>', ip='127.0.0.1')`，因此 C-WAL-01 看到的第一条流水是「调账 +¥1,000.00」。
 - **`useCountdown` 的形态**：`useCountdown({ now?, onZero? })` 返回 `{ remaining, start(seconds), stop() }`，剩余值 = `start 时的秒数 − floor((now() − start 时刻) / 1000)`，每秒重算，不做「每 tick 减 1」。
 - **`createHttp` 多两个可选回调**：`onTotpSetupRequired`（后台收到 403 `totp_setup_required` 时跳登录页绑定步骤）与 `promptTotp(message?)` 的可选参数（`invalid_totp` 重弹时把错误文案带给弹框）；其余签名与设计 §2.1 一致。
-- **`ApiError` 是 `class`**（`extends Error`，字段与设计接口一致），方便 `instanceof` 与 Vitest 断言。
+- **`ApiError` 是 `class`**（`extends Error`，字段与设计接口一致，另加 `details: Record<string, unknown>` 保存完整错误响应体），方便 `instanceof` 与 Vitest 断言；带明细的错误（机器 CSV 导入的 `import_invalid.errors`）从 `details` 读取，不重放请求。
 - **后台 TOTP 弹框是单例组件**：`admin/src/store/totp.ts` 导出 `promptTotp(message?)`，`App.vue` 挂一个 `TotpDialog`，并发请求共用同一个 Promise。
 - **仪表盘柱状图的悬停提示**用 SVG `<title>`（原生提示，无额外组件），测试断言 `title` 文本。
 - **企业执照预览**：`<img src="/admin/api/v1/files/<key>">`，`key` 以 `.pdf` 结尾直接显示「在新窗口打开 PDF」按钮；`onerror` 回退到「在新窗口打开」按钮（设计 §5.8）。
-- **A-ERR-01 的改写方式**：`page.route` 把 `**/admin/api/v1/alerts**` 的请求改为向 `/admin/api/v1/orders` 发起（`route.continue({ url })`），ops 收到 403 `forbidden` → 页面显示「无权执行该操作」。
+- **A-ERR-01 用真实角色变更触发 403，不用 `page.route` 改写请求**：super 打开机器页后，另一个 super 通过 API 把它降为 finance（`PUT /admins/{id}`；后端每次请求都从 `admins` 表重新读角色，降级不删会话），再点「查询」→ 真实的 403 `forbidden` → 页面提示「无权执行该操作」且不白屏。这是生产里会发生的路径（角色被改时会话仍在），比篡改请求 URL 可信。
 
 ## 文件结构
 
@@ -979,7 +981,7 @@ func TestAdminRouterServesSPAAndJSON404(t *testing.T) {
 }
 ```
 
-（import 增加 `"io"`、`"net/http"`、`"strings"`、`"testing/fstest"`、`"spark-cloud/internal/web"`。）
+（`auth_test.go` 的 import 增加 `"io"`、`"testing/fstest"`、`"spark-cloud/internal/web"`；`"net/http"`、`"strings"` 该文件已引入。）
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -1160,7 +1162,7 @@ func NewHandler(fsys fs.FS, prefix string) http.Handler {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `go vet ./... && go test ./...`
-Expected: 全部 PASS（含 `TestSPAHandler`、`TestSPAHandlerWithoutBuild`、`TestConsoleAndAdminHandlers`、`TestRouterServesConsoleAndJSON404`、`TestAdminRouterServesSPAAndJSON404`、`TestAuthenticatedResponsesAreNoStore`、`TestPermissionMatrix`）。再手工确认一次：
+Expected: 全部 PASS（含 `TestSPAHandler`、`TestSPAHandlerWithoutBuild`、`TestConsoleAndAdminHandlers`、`TestRouterServesConsoleAndJSON404`、`TestAdminRouterServesSPAAndJSON404`、`TestLoginAndTOTPSetupOverHTTP`（其中有后台 API 响应 `no-store` 的断言，`NoStore` 下沉后必须仍然通过）、`TestPermissionMatrix`）。再手工确认一次：
 
 ```bash
 SPARK_DATABASE_URL=postgres://postgres:postgres@localhost:5433/spark?sslmode=disable SPARK_SECRET_KEY=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE= go run ./cmd/platform &
@@ -2018,7 +2020,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Consumes: 无。
 - Produces（后续所有前端任务依赖，从 `@spark/shared` 导入）:
   - `brand = { name: 'Spark Cloud', shortName: 'Spark', logoUrl: 'brand/logo.svg', primaryColor: '#2563eb', supportText: '如需帮助请联系客服' }`（`logoUrl` 不带前导 `/`，各应用用 `import.meta.env.BASE_URL + brand.logoUrl`，后台挂在 `/admin/` 才能找到图片）。
-  - `class ApiError extends Error { status: number; code: string; message: string; requestId: string }`、`isApiError(e): e is ApiError`、`messageOf(err: unknown): string`。
+  - `class ApiError extends Error { status: number; code: string; message: string; requestId: string; details: Record<string, unknown> }`（`details` 是后端错误响应体的完整对象，供 `import_invalid` 这类带 `errors` 明细的错误使用；网络错误为 `{}`）、`isApiError(e): e is ApiError`、`messageOf(err: unknown): string`。
   - `fmtYuan(cents: number): string`、`yuanToCents(input: string): number | null`、`fmtTime(iso?: string | Date | null): string`（`yyyy-MM-dd HH:mm`）、`fmtTimeSec`（到秒）、`fmtDate`（`yyyy-MM-dd`）、`fmtDuration(seconds: number): string`、`useCountdown(opts?: { now?: () => number; onZero?: () => void }): { remaining: Ref<number>; start(seconds: number): void; stop(): void }`。
   - `isMobileUA(ua?: string): boolean`、`useMobile(): Ref<boolean>`（断点 767px）。
   - `createIdempotencyKey(): { current(): string; rotate(): void }`、`useIdempotencyKey(deps: () => unknown)`（`deps` 变化自动 `rotate`）。
@@ -2389,13 +2391,16 @@ export class ApiError extends Error {
   readonly status: number
   readonly code: string
   readonly requestId: string
+  /** 后端错误响应体的完整对象（例如 import_invalid 的 errors 明细）；网络错误为 {} */
+  readonly details: Record<string, unknown>
 
-  constructor(status: number, code: string, message: string, requestId = '') {
+  constructor(status: number, code: string, message: string, requestId = '', details: Record<string, unknown> = {}) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
     this.requestId = requestId
+    this.details = details
   }
 }
 
@@ -2722,7 +2727,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Consumes: Task 5 的 `ApiError`。
 - Produces:
   - `createHttp(cfg: { base: string; onUnauthorized: () => void; promptTotp?: (message?: string) => Promise<string | null>; onTotpSetupRequired?: () => void; fetch?: typeof fetch }): Http`，`Http = { get<T>(path, query?, opt?), post<T>(path, body?, opt?), put<T>(path, body?, opt?), upload<T>(path, file: File), download(path, query?): Promise<{ blob: Blob; filename: string }> }`，`HttpOptions = { idempotencyKey?: string; signal?: AbortSignal; quiet?: boolean }`。
-  - 行为：`credentials: 'same-origin'`；写请求 `Content-Type: application/json`；查询参数 `undefined / null / ''` 不拼入；非 2xx 解析 `{code, message, request_id}` 抛 `ApiError`，解析失败抛 `ApiError{status, code: 'network', message: '网络异常，请稍后重试'}`，`fetch` 抛错（断网、超时）同样抛 `network`（`status 0`）；401 `unauthorized` 且非 `quiet` → `onUnauthorized()` 后仍抛出；403 `totp_setup_required` → `onTotpSetupRequired?.()` 后抛出；403 `totp_required` 且配置了 `promptTotp` → 弹框、把 `totp` 合并进原请求体重发，`invalid_totp` 最多 3 次，取消抛 `ApiError{code: 'cancelled'}`；并发收到 `totp_required` 只弹一次：后到的请求等首个请求完成二次验证后直接重发原请求（后端 5 分钟窗口内不再要求）；请求超时 30 秒，上传 / 下载 120 秒；不自动重试。
+  - 行为：`credentials: 'same-origin'`；写请求 `Content-Type: application/json`；查询参数 `undefined / null / ''` 不拼入；非 2xx 解析 `{code, message, request_id}` 抛 `ApiError`（整个响应体对象放进 `details`，`import_invalid` 的逐行 `errors` 从 `err.details.errors` 取），解析失败抛 `ApiError{status, code: 'network', message: '网络异常，请稍后重试'}`，`fetch` 抛错（断网、超时）同样抛 `network`（`status 0`）；401 `unauthorized` 且非 `quiet` → `onUnauthorized()` 后仍抛出；403 `totp_setup_required` → `onTotpSetupRequired?.()` 后抛出；403 `totp_required` 且配置了 `promptTotp` → 弹框、把 `totp` 合并进原请求体重发，`invalid_totp` 最多 3 次，取消抛 `ApiError{code: 'cancelled'}`；并发收到 `totp_required` 只弹一次：后到的请求等首个请求完成二次验证后直接重发原请求（后端 5 分钟窗口内不再要求）；请求超时 30 秒，上传 / 下载 120 秒；不自动重试。
   - `buildQuery(query?): string`、`filenameOf(contentDisposition: string | null, fallback = 'export.csv'): string`（支持 `filename="x.csv"` 与 `filename*=UTF-8''...`）。
   - 类型（`@spark/shared` 导出）：`User`、`KycStatus`、`Duration`、`Price`、`Product`、`Image`、`InstanceState`、`Instance`、`Order`、`LedgerRow`、`Recharge`、`RechargeStatus`、`KYCRecord`、`Upload`、`Role`、`Admin`、`AdminLoginResult`、`Machine`、`MachineDetail`、`PDU`、`PDUInput`、`Alert`、`AdminInstance`、`InstanceEvent`、`CommandRow`、`AdminInstanceDetail`、`AdminOrder`、`AdminLedgerRow`、`AdminRecharge`、`AdminKYCRecord`、`UserDetail`、`AdminProduct`、`AdminPrice`、`AdminImage`、`ImageInput`、`AuditEntry`、`Dashboard`、`RefundQuote`、`Paged<T> = { items: T[]; total: number }`、`Listed<T> = { items: T[] }`、`ImportError = { line: number; message: string }`。
 
@@ -2785,12 +2790,19 @@ describe('http 基本行为 (U-06)', () => {
     expect(f.calls[0].body).toEqual({ product_id: 1 })
   })
 
-  it('错误体解析为 ApiError', async () => {
-    const f = fakeFetch(json(402, { code: 'insufficient_balance', message: '余额不足，请先充值', request_id: 'r1' }))
+  it('错误体解析为 ApiError，并保留完整响应体 details', async () => {
+    const f = fakeFetch(
+      json(402, { code: 'insufficient_balance', message: '余额不足，请先充值', request_id: 'r1' }),
+      json(400, { code: 'import_invalid', message: '导入数据有误，未导入任何机器', request_id: 'r2', errors: [{ line: 2, message: '内网 IP 格式不正确' }] }),
+    )
     const http = createHttp({ base: '/api/v1', onUnauthorized: vi.fn(), fetch: f.fn })
     const err = await http.post('/orders', {}).catch((e) => e)
     expect(err).toBeInstanceOf(ApiError)
     expect(err).toMatchObject({ status: 402, code: 'insufficient_balance', message: '余额不足，请先充值', requestId: 'r1' })
+    expect(err.details).toEqual({ code: 'insufficient_balance', message: '余额不足，请先充值', request_id: 'r1' })
+    const imp = await http.post('/machines/import', { csv: 'x' }).catch((e) => e)
+    expect(imp).toMatchObject({ status: 400, code: 'import_invalid' })
+    expect(imp.details.errors).toEqual([{ line: 2, message: '内网 IP 格式不正确' }])
   })
 
   it('非 JSON 响应与网络异常映射为 network', async () => {
@@ -3000,7 +3012,8 @@ async function errorOf(resp: Response): Promise<ApiError> {
   try {
     const body = (await resp.json()) as { code?: unknown; message?: unknown; request_id?: unknown }
     if (typeof body?.code === 'string' && typeof body.message === 'string') {
-      return new ApiError(resp.status, body.code, body.message, typeof body.request_id === 'string' ? body.request_id : '')
+      // 整个响应体放进 details：import_invalid 的逐行 errors 等明细由页面从 err.details 读取，不必重放请求
+      return new ApiError(resp.status, body.code, body.message, typeof body.request_id === 'string' ? body.request_id : '', body as Record<string, unknown>)
     }
   } catch {
     /* 网关 HTML、空响应 */
@@ -3595,7 +3608,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
   - `uniquePhone()`（`helpers/phone.ts`）、`nextUsername()`、`nextSerial()`（`helpers/admin.ts`）、`yuan(cents): string`（`helpers/money.ts`）。
   - `totp(secretBase32, unixSeconds): string`、`base32Decode`、`hotp`（`helpers/totp.ts`）。
   - 控制台 helpers（`helpers/console.ts`）：`isMobile(info: TestInfo)`、`seedUser({ verified = true, balance = 100000, ledger_rows? })`、`loginConsole(page, phone, expectPath = '/market')`（先 `hooks.advance(61)` 再发码、填 `000000`）、`nav(page, info, 'market' | 'instances' | 'wallet' | 'account')`、`userApi(phone): Promise<APIRequestContext>`（API 登录到 `:18080`）、`placeOrder(api, { duration?, imageIndex? }): Promise<string>`（返回实例 ID）、`toast(page, text)`（`getByRole('alert')` 含文案）、`dialog(page)`（`getByRole('dialog')`）。
-  - 后台 helpers（`helpers/admin.ts`）：`createAdmin(role, bindTotp = true): Promise<SeededAdmin>`（`{ id, username, password, role, totp_secret?, recovery_codes? }`）、`totpNow(secret)`（先 `advance(30)`）、`loginAdmin(page, admin)`、`enterTotpDialog(page, secret)`（全局动态码弹框 `totp-dialog` / `totp-input` / `totp-ok`）、`adminApi(admin): Promise<APIRequestContext>`、`adminPost(ctx, admin, path, data)`（收到 `totp_required` 自动补 `totp` 重发）。
+  - 后台 helpers（`helpers/admin.ts`）：`createAdmin(role, bindTotp = true): Promise<SeededAdmin>`（`{ id, username, password, role, totp_secret?, recovery_codes? }`）、`totpNow(secret)`（先 `advance(30)`）、`loginAdmin(page, admin)`、`enterTotpDialog(page, secret)`（全局动态码弹框 `totp-dialog` / `totp-input` / `totp-ok`）、`adminApi(admin): Promise<APIRequestContext>`、`adminSend(ctx, admin, 'post' | 'put', path, data)` 及其包装 `adminPost` / `adminPut`（收到 `totp_required` 自动补 `totp` 重发）。
   - 登录页 testid 约定（Task 8 / 15 实现）：控制台 `login-phone`、`login-send`、`login-code`、`login-submit`；后台 `login-username`、`login-password`、`login-submit`、`login-totp-code`、`login-totp-submit`；后台布局 `layout-username`。
   - `npm run e2e:coverage`：读取 `e2e/coverage.json`（`{ console: string[], admin: string[] }`）与 `e2e/console/*.spec.ts`、`e2e/admin/*.spec.ts`，核对每个 ID 恰好出现一次、无未登记 ID、无 `test.skip / fixme / only`、无 `describe.skip / only`、每个 `test(` 标题以 ID 开头；失败非零退出并逐条打印。
   - Playwright project：`console-desktop`（Desktop Chrome 1280×720，`baseURL` 控制台）、`console-mobile`（`devices['iPhone 13']` + chromium/chrome）、`admin`（1440×900，`baseURL` 后台）；`workers: 1`、`fullyParallel: false`、`forbidOnly: true`、`trace: 'retain-on-failure'`、剪贴板权限、`webServer` 自动 `go run ./cmd/e2e-server`、`E2E_BROWSER_CHANNEL`（默认 `chrome`）。
@@ -3639,7 +3652,9 @@ export default defineConfig({
     cwd: '..',
     url: 'http://127.0.0.1:18090/healthz',
     timeout: 180_000,
-    reuseExistingServer: !process.env.CI,
+    // 永远由 Playwright 自己拉起：e2e-server 里 embed 的是启动那一刻的前端产物，复用手工起的旧进程会悄悄测到上一次的页面；
+    // 端口被占用时直接报错，比「看似通过」好
+    reuseExistingServer: false,
     stdout: 'pipe',
     stderr: 'pipe',
   },
@@ -3932,14 +3947,16 @@ export async function adminApi(admin: SeededAdmin): Promise<APIRequestContext> {
 }
 
 /** 后台写接口；收到 totp_required 时自动补 totp 重发一次。 */
-export async function adminPost<T = Record<string, unknown>>(ctx: APIRequestContext, admin: SeededAdmin, path: string, data: Record<string, unknown> = {}): Promise<T> {
-  let r = await ctx.post(path, { data })
+export async function adminSend<T = Record<string, unknown>>(ctx: APIRequestContext, admin: SeededAdmin, method: 'post' | 'put', path: string, data: Record<string, unknown> = {}): Promise<T> {
+  let r = await ctx[method](path, { data })
   if (r.status() === 403 && ((await r.json()) as { code: string }).code === 'totp_required') {
-    r = await ctx.post(path, { data: { ...data, totp: await totpNow(admin.totp_secret!) } })
+    r = await ctx[method](path, { data: { ...data, totp: await totpNow(admin.totp_secret!) } })
   }
-  if (!r.ok()) throw new Error(`${path} ${r.status()} ${await r.text()}`)
+  if (!r.ok()) throw new Error(`${method.toUpperCase()} ${path} ${r.status()} ${await r.text()}`)
   return (await r.json()) as T
 }
+export const adminPost = <T = Record<string, unknown>>(ctx: APIRequestContext, admin: SeededAdmin, path: string, data: Record<string, unknown> = {}) => adminSend<T>(ctx, admin, 'post', path, data)
+export const adminPut = <T = Record<string, unknown>>(ctx: APIRequestContext, admin: SeededAdmin, path: string, data: Record<string, unknown> = {}) => adminSend<T>(ctx, admin, 'put', path, data)
 ```
 
 - [ ] **Step 3: fixtures**
@@ -4198,6 +4215,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
   - `router`（`src/router.ts`）：路由表（设计 §4.1，`meta: { title, auth? }`）、`safeRedirect(v): string | null`；`beforeEach` 先 `probeSession()`；`afterEach` 设 `document.title = '<页面名> - Spark Cloud'`。
   - `AppDialog`（`src/components/AppDialog.vue`）：`v-model` 显隐，props `kind: 'confirm' | 'form'`（默认 `confirm`）、`title`、`width?`；手机：confirm 加类 `sheet`（底部弹出，不全屏），form `fullscreen`；电脑：居中，宽 420 / 560；插槽 `default`、`footer`。
   - `src/logic/login.ts`：`normalizePhone(s)`（去空白 / 连字符、全角转半角）、`normalizeCode(s)`（只留数字、最多 6 位）、`isValidPhone(s)`、`maskPhone(p)`（`138****1234`）。
+  - `src/logic/notify.ts`：`notifyError(e: unknown)`——页面里「请求失败就弹错误」的统一出口：`unauthorized`（已由 `handleUnauthorized` 提示并跳转）与 `cancelled` 静默，其余 `ElMessage.error(messageOf(e))`。控制台所有视图的 catch 分支一律用它，不直接写 `ElMessage.error(messageOf(e))`；否则会话失效时同一页面的多个请求会叠出多条「请先登录」（C-AUTH-06 断言只有一条）。
   - 布局 testid：`layout-side`、`menu-market|instances|wallet|account`、`layout-tabbar`、`tabbar-market|instances|wallet|account`、`layout-phone`（中间四位打码）、`layout-help`（电脑）、`layout-login`（电脑未登录）。
   - 登录页 testid：`login-phone`、`login-send`、`login-code`、`login-submit`；我的页：`account-phone`、`account-kyc`（链接到 `/kyc`）、`account-created`、`account-help`、`account-logout`；帮助页：`help-page`、`help-ssh`、`help-retention`、`help-billing`；404：`notfound-page`、`notfound-home`。
   - 覆盖：C-NAV-01、C-NAV-03、C-AUTH-01～05、C-ACC-01、C-ACC-02。
@@ -4807,6 +4825,22 @@ export function isValidPhone(s: string): boolean {
 
 export function maskPhone(p: string): string {
   return p.length === 11 ? `${p.slice(0, 3)}****${p.slice(7)}` : p
+}
+```
+
+`web/console/src/logic/notify.ts`：
+
+```ts
+import { isApiError, messageOf } from '@spark/shared'
+import { ElMessage } from 'element-plus'
+
+/**
+ * 页面请求失败的统一提示：unauthorized 已由 handleUnauthorized 提示一次并跳登录，cancelled 是用户主动取消，两者静默；
+ * 其余按 messageOf 显示（5xx 带请求号）。控制台视图的 catch 分支一律用它。
+ */
+export function notifyError(e: unknown): void {
+  if (isApiError(e) && (e.code === 'unauthorized' || e.code === 'cancelled')) return
+  ElMessage.error(messageOf(e))
 }
 ```
 
@@ -6157,7 +6191,8 @@ test('C-INS-04 运行中倒计时每秒递减；停机显示北京时间的数�
   await loginConsole(page, u.phone)
   await nav(page, info, 'instances')
   const runningRow = instanceRow(page, info, runningId)
-  await expect(runningRow.getByTestId('instance-time')).toHaveText(/^剩余 (1 天|23 小时 59 分)$/)
+  // 下单后 loginConsole 已把假时钟推进了 61 秒（发码限流），所以此时是「23 小时 58 分」量级，不是整整 1 天
+  await expect(runningRow.getByTestId('instance-time')).toHaveText(/^剩余 23 小时 5\d 分$/)
   const first = Number(await runningRow.getByTestId('instance-time').getAttribute('data-remaining'))
   await expect.poll(async () => Number(await runningRow.getByTestId('instance-time').getAttribute('data-remaining')), { timeout: 5000 }).toBeLessThan(first)
   await expect(instanceRow(page, info, stoppedId).getByTestId('instance-time')).toHaveText(`数据保留至 ${cstTime(stopped.retain_until!)}`)
@@ -6181,25 +6216,42 @@ test('C-NAV-02 手机：确认框底部弹出不全屏、表单弹窗全屏；�
   await loginConsole(page, u.phone)
   await page.goto(`/instances/${id}`)
   await page.getByTestId('detail-release-btn').click()
-  const dlg = page.getByRole('dialog')
+  // Element Plus 的 role="dialog" 在 .el-overlay-dialog 包装层上；sheet / is-fullscreen 类与 data-testid 都在内层 .el-dialog 上，
+  // 所以类名与位置断言必须用 AppDialog 的 testid 定位，用 getByRole('dialog') 断言类名会在错误的元素上「通过」
+  const dlg = page.getByTestId('detail-release-dialog')
   await expect(dlg).toBeVisible()
+  await expect(dlg).toHaveClass(/\bel-dialog\b/) // 确认定位到的确是 .el-dialog 本体
   if (isMobile(info)) {
     await expect(dlg).toHaveClass(/\bsheet\b/)
     await expect(dlg).not.toHaveClass(/is-fullscreen/)
     const box = await dlg.boundingBox()
     const viewport = page.viewportSize()!
     expect(Math.round(box!.y + box!.height)).toBeGreaterThanOrEqual(viewport.height - 1) // 贴底
+    expect(Math.round(box!.width)).toBe(viewport.width) // 通栏
+    expect(box!.height).toBeLessThan(viewport.height * 0.8) // 不是全屏
   } else {
     await expect(dlg).not.toHaveClass(/\bsheet\b/)
     await expect(dlg).not.toHaveClass(/is-fullscreen/)
+    const box = await dlg.boundingBox()
+    const viewport = page.viewportSize()!
+    expect(Math.abs(box!.x + box!.width / 2 - viewport.width / 2)).toBeLessThan(4) // 水平居中
+    expect(Math.round(box!.width)).toBe(420)
   }
   await page.getByTestId('detail-release-cancel').click()
   await expect(dlg).toBeHidden()
   await page.getByTestId('detail-renew-btn').click()
-  const form = page.getByRole('dialog')
+  const form = page.getByTestId('detail-renew-dialog')
   await expect(form).toBeVisible()
-  if (isMobile(info)) await expect(form).toHaveClass(/is-fullscreen/)
-  else await expect(form).not.toHaveClass(/is-fullscreen/)
+  if (isMobile(info)) {
+    await expect(form).toHaveClass(/is-fullscreen/)
+    const box = await form.boundingBox()
+    const viewport = page.viewportSize()!
+    expect(Math.round(box!.width)).toBe(viewport.width)
+    expect(Math.round(box!.height)).toBe(viewport.height)
+  } else {
+    await expect(form).not.toHaveClass(/is-fullscreen/)
+    expect(Math.round((await form.boundingBox())!.width)).toBe(560)
+  }
 })
 ```
 
@@ -6643,7 +6695,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Consumes: Task 8～10 的 `api`、`session`、`useGuide` / `GuideDialog`、`useMobile`；shared 的 `fmtYuan`、`fmtTime`、`labels`。
 - Produces:
   - 钱包 testid：`wallet-balance`、`wallet-recharge-btn`（未实名 → 引导实名）、`wallet-refresh`、`wallet-error`；标签页用 `el-tabs`（`role="tab"`，名称「流水」「订单」「充值记录」），选择写在 `?tab=ledger|orders|recharges`；流水：`ledger-row`、`ledger-kind`、`ledger-amount`（正数 `+¥100.00` 带类 `money-plus`，负数 `-¥69.00` 带类 `money-minus`）、`ledger-after`、`ledger-remark`、`ledger-time`、`ledger-sentinel`（`IntersectionObserver` 哨兵，每页 20，游标 `before_id`）、`ledger-end`；订单：`order-row`、`order-kind`、`order-instance`（链接 `/instances/<id>`）、`order-duration`、`order-amount`、`order-status`；充值记录：`recharge-row`、`recharge-channel`、`recharge-amount`、`recharge-status`、`recharge-time`、`recharge-continue`（待支付时链接到 `/wallet/recharge/<id>`）、`wallet-recharges-pager`（每页 10）。
-  - 余额请求失败：`ElMessage.error(messageOf(err))` + 页内 `wallet-error`。
+  - 余额请求失败：`notifyError(err)`（Task 8；401 静默，避免与 `handleUnauthorized` 的「请先登录」叠成两条）+ 页内 `wallet-error`。
   - 覆盖：C-WAL-01～04、C-AUTH-06、C-ERR-01、C-ERR-02。
 
 - [ ] **Step 1: 钱包页**
@@ -6656,12 +6708,12 @@ import {
   durationLabel, fmtTime, fmtYuan, labelOf, ledgerKindLabel, messageOf, orderKindLabel, orderStatusLabel, rechargeChannelLabel, rechargeStatusLabel, useMobile,
   type LedgerRow, type Listed, type Order, type Paged, type Recharge,
 } from '@spark/shared'
-import { ElMessage } from 'element-plus'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import GuideDialog from '../components/GuideDialog.vue'
 import { useGuide } from '../composables/useGuide'
+import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
 
 const route = useRoute()
@@ -6685,7 +6737,7 @@ async function loadBalance() {
     balanceError.value = ''
   } catch (e) {
     balanceError.value = messageOf(e)
-    ElMessage.error(balanceError.value)
+    notifyError(e) // 401 时静默：handleUnauthorized 已提示「请先登录」并跳转（C-AUTH-06 要求只有一条提示）
   }
 }
 function goRecharge() {
@@ -6713,7 +6765,7 @@ async function loadLedger(reset = false) {
     ledger.value.push(...items)
     ledgerHasMore.value = items.length === PAGE
   } catch (e) {
-    ElMessage.error(messageOf(e))
+    notifyError(e)
   } finally {
     ledgerLoading.value = false
   }
@@ -6736,7 +6788,7 @@ async function loadOrders() {
   try {
     orders.value = (await api.get<Listed<Order>>('/orders')).items
   } catch (e) {
-    ElMessage.error(messageOf(e))
+    notifyError(e)
   }
 }
 
@@ -6750,7 +6802,7 @@ async function loadRecharges() {
     recharges.value = out.items
     rechargeTotal.value = out.total
   } catch (e) {
-    ElMessage.error(messageOf(e))
+    notifyError(e)
   }
 }
 watch(rechargePage, loadRecharges)
@@ -7446,10 +7498,11 @@ test('C-RCH-03 支付态：倒计时、3 秒轮询、模拟支付成功、余额
   expect(polls).toBe(afterLeave) // 离开页面后定时器已清理
 })
 
-test('C-RCH-04 手机拉起支付宝链接与回页查询；电脑不可见时暂停轮询', async ({ page }, info) => {
+test('C-RCH-04 手机拉起支付宝链接与回页立即查询；电脑不可见时暂停轮询、恢复时立即查一次', async ({ page }, info) => {
   const u = await seedUser({ balance: 100000 })
   const { api, id, qr } = await createRecharge(u.phone)
-  if (!isMobile(info)) await page.clock.install()
+  // 两个 project 都接管浏览器定时器：否则 3 秒轮询自己就能查到已支付，「回到页面立即查询」这条逻辑有没有都会通过
+  await page.clock.install()
   await loginConsole(page, u.phone)
   let polls = 0
   page.on('request', (r) => {
@@ -7461,19 +7514,23 @@ test('C-RCH-04 手机拉起支付宝链接与回页查询；电脑不可见时�
     const href = await page.getByTestId('rchorder-alipay-link').getAttribute('href')
     expect(href).toBe(`alipays://platformapi/startapp?saId=10000007&qrcode=${encodeURIComponent(qr)}`)
     await expect(page.getByTestId('rchorder-open-browser')).toHaveAttribute('href', qr)
-    await api.post(`/api/v1/dev/recharges/${id}/pay`, { data: {} })
-    await setVisibility(page, 'visible') // 用户从支付宝回到页面
-    await expect(page.getByTestId('rchorder-paid')).toBeVisible()
-  } else {
-    await setVisibility(page, 'hidden')
-    const paused = polls
-    await page.clock.runFor(9000)
-    expect(polls).toBe(paused)
-    await setVisibility(page, 'visible')
-    await expect.poll(() => polls).toBe(paused + 1)
-    await page.clock.runFor(3000)
-    await expect.poll(() => polls).toBe(paused + 2)
   }
+  // 用户切到支付宝（页面不可见）：轮询暂停
+  await setVisibility(page, 'hidden')
+  const paused = polls
+  await page.clock.runFor(9000)
+  expect(polls).toBe(paused)
+  // 支付宝侧完成支付
+  await api.post(`/api/v1/dev/recharges/${id}/pay`, { data: {} })
+  await expect(page.getByTestId('rchorder-pending')).toBeVisible() // 页面不可见期间没有自己查到
+  // 回到页面：不等下一个 3 秒，立即查询一次并显示成功
+  await setVisibility(page, 'visible')
+  await expect.poll(() => polls).toBe(paused + 1)
+  await expect(page.getByTestId('rchorder-paid')).toBeVisible()
+  await toast(page, '充值成功')
+  // 已支付后不再轮询
+  await page.clock.runFor(9000)
+  expect(polls).toBe(paused + 1)
 })
 
 test('C-RCH-05 关单后显示已关闭', async ({ page }) => {
@@ -9363,49 +9420,57 @@ test('A-ALT-01 开通失败告警：未处理列表、角标、标记已处理�
 ```ts
 import { expect, test } from '@playwright/test'
 import { adminApi, adminPost, createAdmin, loginAdmin } from '../helpers/admin'
-import { placeOrder, seedUser, userApi } from '../helpers/console'
+import { seedUser } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { cstDate } from '../helpers/time'
 
-test('A-AUD-01 审计日志按操作人 / 动作 / 对象 / 时间筛选，操作人显示用户名，展开 diff', async ({ page }) => {
+test('A-AUD-01 审计日志按操作人 / 动作 / 对象 / 时间筛选，操作人显示用户名，对象可点击，展开 diff', async ({ page }) => {
+  // 用 user.ban 造记录：它的 diff 非空（{reason}），对象类型 user 可跳转；alert.resolve 的 diff 是 null，格式化后只有「{}」，测不出两空格缩进
   const u = await seedUser()
-  const api = await userApi(u.phone)
-  await hooks.machines(1)
-  const instanceId = await placeOrder(api)
-  await hooks.agent({ fail: true })
   const admin = await createAdmin('super')
   const ctx = await adminApi(admin)
-  const alerts = ((await (await ctx.get('/admin/api/v1/alerts?resolved=false&page_size=100')).json()) as { items: { id: number; instance_id: string }[] }).items
-  const alert = alerts.find((a) => a.instance_id === instanceId)!
-  await adminPost(ctx, admin, `/admin/api/v1/alerts/${alert.id}/resolve`)
+  await adminPost(ctx, admin, `/admin/api/v1/users/${u.id}/ban`, { reason: 'e2e 审计用例' })
   const today = cstDate(await hooks.clock())
 
   await loginAdmin(page, admin)
   await page.getByTestId('menu-audit').click()
   await page.getByTestId('audit-actor').fill(String(admin.id))
   await page.getByTestId('audit-action').click()
-  await page.getByRole('option', { name: 'alert.resolve' }).click()
-  await page.getByTestId('audit-target-type').fill('alert')
-  await page.getByTestId('audit-target-id').fill(String(alert.id))
+  await page.getByRole('option', { name: 'user.ban' }).click()
+  await page.getByTestId('audit-target-type').fill('user')
+  await page.getByTestId('audit-target-id').fill(String(u.id))
   await page.getByTestId('audit-from').fill(today)
   await page.getByTestId('audit-to').fill(today)
   await page.getByTestId('audit-search').click()
   const rows = page.getByRole('row').filter({ has: page.getByTestId('audit-action-cell') })
   await expect(rows).toHaveCount(1)
   await expect(rows.first().getByTestId('audit-actor-cell')).toHaveText(admin.username)
-  await expect(rows.first().getByTestId('audit-action-cell')).toHaveText('alert.resolve')
-  await expect(rows.first().getByTestId('audit-target')).toContainText(`alert ${alert.id}`)
+  await expect(rows.first().getByTestId('audit-action-cell')).toHaveText('user.ban')
+  await expect(rows.first().getByTestId('audit-target')).toContainText(`user ${u.id}`)
+  await expect(rows.first().getByTestId('audit-target').locator('a')).toHaveAttribute('href', `/admin/users/${u.id}`)
   await rows.first().locator('.el-table__expand-icon').click() // Element Plus 的展开控件（UI 控件，不是业务元素）
   const diff = page.getByTestId('audit-diff')
   await expect(diff).toBeVisible()
-  expect(JSON.parse((await diff.textContent())!)).toBeTypeOf('object')
-  expect((await diff.textContent())!).toMatch(/^\{\n  /) // 两空格缩进
+  const text = (await diff.textContent())!
+  expect(JSON.parse(text)).toEqual({ reason: 'e2e 审计用例' })
+  expect(text).toBe('{\n  "reason": "e2e 审计用例"\n}') // 两空格缩进的格式化 JSON
 
-  // 换一个不存在的日期范围 → 空
+  // 操作人筛选换成另一个管理员 → 空；日期范围换成 2000 年 → 空
+  const other = await createAdmin('ops')
+  await page.getByTestId('audit-actor').fill(String(other.id))
+  await page.getByTestId('audit-search').click()
+  await expect(rows).toHaveCount(0)
+  await page.getByTestId('audit-actor').fill(String(admin.id))
   await page.getByTestId('audit-from').fill('2000-01-01')
   await page.getByTestId('audit-to').fill('2000-01-02')
   await page.getByTestId('audit-search').click()
   await expect(rows).toHaveCount(0)
+  // 对象链接真的能跳到用户详情
+  await page.getByTestId('audit-reset').click()
+  await page.getByTestId('audit-target-id').fill(String(u.id))
+  await page.getByTestId('audit-search').click()
+  await rows.first().getByTestId('audit-target').locator('a').click()
+  await expect(page).toHaveURL(new RegExp(`/admin/users/${u.id}$`))
 })
 ```
 
@@ -9581,19 +9646,13 @@ async function doImport() {
     list.reset()
   } catch (e) {
     if (isApiError(e) && e.code === 'import_invalid') {
-      // 请求层只保留 code / message；逐行错误需要原始响应体，因此这里再读一次
-      importErrors.value = await fetchImportErrors()
+      // 逐行错误在错误响应体的 errors 字段里，ApiError.details 保留了完整响应体
+      importErrors.value = Array.isArray(e.details.errors) ? (e.details.errors as ImportError[]) : []
       ElMessage.error(e.message)
     } else ElMessage.error(messageOf(e))
   } finally {
     importing.value = false
   }
-}
-/** import_invalid 的响应体含 errors 数组；用 fetch 重放同一请求拿到它（后端整批不导入，重放无副作用）。 */
-async function fetchImportErrors(): Promise<ImportError[]> {
-  const resp = await fetch('/admin/api/v1/machines/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ csv: importText.value }) })
-  const body = (await resp.json()) as { errors?: ImportError[] }
-  return body.errors ?? []
 }
 </script>
 
@@ -9694,7 +9753,7 @@ async function fetchImportErrors(): Promise<ImportError[]> {
 </style>
 ```
 
-（`import_invalid` 的逐行错误在 `errors` 字段里，而 `createHttp` 的错误对象只带 `code / message / request_id`。为了不改共用层的错误模型，这里在收到 `import_invalid` 后用 `fetch` 重放同一请求读取 `errors`；后端整批校验不写库，重放没有副作用。）
+（`import_invalid` 的逐行错误在响应体 `errors` 字段里；`ApiError.details`（Task 5 / 6）保留了完整响应体，页面直接读取，不重放请求——重放会绕过请求层的 401 处理、把同一份 CSV 再发一次，而且一旦后端把「整批校验」改成「部分成功」就会产生副作用。）
 
 `web/admin/src/views/MachineDetailView.vue`：
 
@@ -9960,33 +10019,62 @@ async function idleCount(): Promise<number> {
 }
 
 test('A-MCH-01 机器列表筛选与分页', async ({ page }) => {
+  // 列表按 rack, slot, id 排序且整轮测试共享数据库：不带机柜筛选去找某一台会落到第 N 页。
+  // 所以本用例的两台机器都登记在唯一机柜 R<戳> 下，每次都叠加机柜筛选，再分别验证状态 / 在线两个筛选。
   const admin = await createAdmin('ops')
   const ctx = await adminApi(admin)
   const rack = `R${runStamp}`
   const offline = await registerMachine(ctx, admin, { rack }) // API 登记，不心跳 → 离线
   await adminPost(ctx, admin, `/admin/api/v1/machines/${offline.id}/maintenance`, { on: true })
-  const [onlineId] = await hooks.machines(1, `MCH-${runStamp}-`)
+  const online = await registerMachine(ctx, admin, { rack })
+  await hooks.agent({ machine_id: online.id }) // 只对这台心跳 → 在线、空闲
+  const search = async (opts: { state?: string; online?: string }) => {
+    await page.getByTestId('machines-reset').click()
+    await page.getByTestId('machines-filter-rack').fill(rack)
+    if (opts.state) {
+      await page.getByTestId('machines-filter-state').click()
+      await page.getByRole('option', { name: opts.state, exact: true }).click()
+    }
+    if (opts.online) {
+      await page.getByTestId('machines-filter-online').click()
+      await page.getByRole('option', { name: opts.online, exact: true }).click()
+    }
+    await page.getByTestId('machines-search').click()
+  }
   await loginAdmin(page, admin)
   await page.getByTestId('menu-machines').click()
-  await page.getByTestId('machines-filter-rack').fill(rack)
-  await page.getByTestId('machines-search').click()
-  await expect(page.getByTestId('machines-total')).toHaveText('共 1 台')
+
+  await search({})
+  await expect(page.getByTestId('machines-total')).toHaveText('共 2 台')
   await expect(rowBySerial(page, offline.serial).getByTestId('machine-state')).toHaveText('维护中')
   await expect(rowBySerial(page, offline.serial).getByTestId('machine-online')).toContainText('离线')
-  await page.getByTestId('machines-filter-state').click()
-  await page.getByRole('option', { name: '空闲' }).click()
-  await page.getByTestId('machines-search').click()
+  await expect(rowBySerial(page, online.serial).getByTestId('machine-state')).toHaveText('空闲')
+  await expect(rowBySerial(page, online.serial).getByTestId('machine-online')).toContainText('在线')
+  await expect(rowBySerial(page, online.serial).getByTestId('machine-product')).toHaveText('DGX Spark 整机')
+
+  await search({ state: '空闲' })
+  await expect(page.getByTestId('machines-total')).toHaveText('共 1 台')
+  await expect(rowBySerial(page, online.serial)).toHaveCount(1)
+  await expect(rowBySerial(page, offline.serial)).toHaveCount(0)
+
+  await search({ online: '否' })
+  await expect(page.getByTestId('machines-total')).toHaveText('共 1 台')
+  await expect(rowBySerial(page, offline.serial)).toHaveCount(1)
+
+  await search({ state: '维护中', online: '是' })
   await expect(page.getByTestId('machines-total')).toHaveText('共 0 台')
+
+  // 分页 total 与接口一致（不带机柜筛选）；先取接口值再断言，避免读到重置前的旧文案
+  const apiTotal = ((await (await ctx.get('/admin/api/v1/machines?page_size=1')).json()) as { total: number }).total
+  expect(apiTotal).toBeGreaterThanOrEqual(2)
   await page.getByTestId('machines-reset').click()
-  await page.getByTestId('machines-filter-online').click()
-  await page.getByRole('option', { name: '是' }).click()
-  await page.getByTestId('machines-search').click()
-  await expect(rowBySerial(page, `MCH-${runStamp}-1`).getByTestId('machine-online')).toContainText('在线')
-  const total = Number((await page.getByTestId('machines-total').textContent())!.replace(/\D/g, ''))
-  const apiTotal = ((await (await ctx.get('/admin/api/v1/machines?online=true&page_size=1')).json()) as { total: number }).total
-  expect(total).toBe(apiTotal)
-  await rowBySerial(page, `MCH-${runStamp}-1`).getByTestId('machine-id').click()
-  await expect(page).toHaveURL(new RegExp(`/admin/machines/${onlineId}$`))
+  await expect(page.getByTestId('machines-total')).toHaveText(`共 ${apiTotal} 台`)
+  await expect(page.getByRole('row').filter({ has: page.getByTestId('machine-id') })).toHaveCount(Math.min(20, apiTotal))
+
+  // 行点击进详情
+  await search({})
+  await rowBySerial(page, online.serial).getByTestId('machine-id').click()
+  await expect(page).toHaveURL(new RegExp(`/admin/machines/${online.id}$`))
 })
 
 test('A-MCH-02 单台登记：成功、重复序列号、PDU 与插座只填一个', async ({ page }) => {
@@ -10842,18 +10930,30 @@ test('A-INS-09 操作按钮按角色', async ({ page }) => {
 
 ```ts
 import { expect, test } from '@playwright/test'
-import { createAdmin, loginAdmin } from '../helpers/admin'
+import { adminApi, adminPut, createAdmin, loginAdmin } from '../helpers/admin'
 import { toast } from '../helpers/console'
 
-test('A-ERR-01 无权限的接口错误以提示显示而不是白屏', async ({ page }) => {
-  const admin = await createAdmin('ops')
-  await loginAdmin(page, admin)
-  // 把告警列表请求改写到 ops 无权访问的 /orders
-  await page.route('**/admin/api/v1/alerts?**', (route) => route.continue({ url: route.request().url().replace('/admin/api/v1/alerts', '/admin/api/v1/orders') }))
-  await page.getByTestId('menu-alerts').click()
+test('A-ERR-01 会话中途被降权：接口 403 以提示显示而不是白屏', async ({ page }) => {
+  // 真实路径：super 正在看机器页，另一位 super 把他降为 finance。后端每次请求都从 admins 表重读角色（降级不删会话），
+  // 页面里缓存的角色仍是 super，所以下一次 GET /machines 得到真实的 403 forbidden。不用 page.route 篡改请求。
+  const root = await createAdmin('super')
+  const victim = await createAdmin('super')
+  await loginAdmin(page, victim)
+  await page.getByTestId('menu-machines').click()
+  await expect(page.getByTestId('machines-total')).toHaveText(/共 \d+ 台/)
+  await adminPut(await adminApi(root), root, `/admin/api/v1/admins/${victim.id}`, { role: 'finance' })
+  await page.getByTestId('machines-search').click()
   await toast(page, '无权执行该操作')
-  await expect(page.getByTestId('alerts-filter-all')).toBeVisible()
-  await expect(page.getByTestId('layout-username')).toHaveText(admin.username)
+  // 不白屏：筛选栏、布局、用户名都还在，没有被踢到登录页
+  await expect(page.getByTestId('machines-search')).toBeVisible()
+  await expect(page.getByTestId('layout-username')).toHaveText(victim.username)
+  await expect(page).toHaveURL(/\/admin\/machines$/)
+  // 刷新后前端拿到新角色：机器页变成 403 页，菜单里不再有「机器」
+  await page.reload()
+  await expect(page.getByTestId('forbidden-page')).toBeVisible()
+  await page.getByTestId('forbidden-home').click()
+  await expect(page.getByTestId('menu-machines')).toHaveCount(0)
+  await expect(page.getByTestId('layout-role')).toHaveText('财务')
 })
 ```
 
@@ -12483,7 +12583,6 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - CI 机器需预装 Chrome，或设 `E2E_BROWSER_CHANNEL=chromium`。
 
 ## 可以继续延后
-- `createHttp` 的 `ApiError` 只带 `code / message / request_id`；机器 CSV 导入为拿到逐行 `errors` 重放了一次请求。若后续有更多带明细的错误，给 `ApiError` 加 `details` 字段。
 - 后台收到 `403 totp_setup_required` 时回到登录页重新输入密码，而不是直接进入绑定步骤（临时会话由密码步骤签发）。
 - 用户实例列表上限 100 条、订单 50 条不分页；企业大客户前需要后端分页。
 - 后台用户详情的流水不含操作人；需要看操作人时到流水页按用户 ID 筛选。
@@ -12542,3 +12641,29 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 **类型一致性：** `createHttp` / `HttpOptions` / `ApiError`（Task 6）在 Task 8、15 的 `api.ts` 与各页面中按同一签名使用；`useCountdown({ now?, onZero? })` 返回 `{ remaining, start, stop }`（Task 5）在 Task 10、13 中一致；`useIdempotencyKey(deps)` 返回 `{ current(), rotate() }`（Task 5）在 Task 10、11 一致；`usePolling(fn, ms, { enabled, immediateOnVisible })`（Task 9）在 Task 11、13 一致；`usePaged` 返回 `{ items, total, page, size, loading, load, reset }`（Task 16）在 Task 17～20 一致；helpers：`hooks.*`、`seedUser`、`loginConsole`、`nav`、`userApi`、`placeOrder`、`toast`、`dialog`（Task 7）、`runningInstance` / `instanceRow` / `instanceOf`（Task 9）、`cstTime` / `cstDate`（Task 10 / 16）、`createAdmin` / `loginAdmin` / `enterTotpDialog` / `totpNow` / `adminApi` / `adminPost`（Task 7）、`drainIdleMachines`（Task 11）、`createPDU` / `registerMachine`（Task 17）、`uploadLicense` / `submitEnterpriseKyc`（Task 19）在后续任务中按定义签名调用；testid 以各任务 Interfaces 为准，后续任务引用的名称均在定义任务中出现。
 
 **Review Focus：** 5 条各有测试归属：1 → Task 8 `login.spec.ts`；2 → Task 8 `session.spec.ts`；3 → Task 5 `format.spec.ts`「边缘写法」；4 → Task 5 `useCountdown 按时间源`；5 → Task 10 C-DET-06 双击断言。
+
+---
+
+## 计划评审裁定（2026-10-17，独立评审）
+
+评审方式：逐任务对照设计 `2026-10-17-plan5-frontend-design.md` 与真实代码（`internal/app`、`api`、`adminapi`、`admin`、`identity`、`fleet`、`rental`、`billing`、`wallet`、`catalog`、`storage`、`audit`、`platform/*`、`migrations/`、chi v5.4.0 源码、spike 里的 element-plus 2.14.7 产物）核对；以下「裁定 — 理由」已直接改入正文。
+
+1. **`ApiError` 增加 `details`（完整错误响应体），机器 CSV 导入从 `err.details.errors` 读逐行错误，删掉 `fetch` 重放** — 重放绕过请求层的 401 / 超时处理、把同一份 CSV 再发一次，而且依赖「后端整批不导入」这个可变前提；`errorOf` 本来就解析了整个响应体，保留它是零成本。Task 5 / 6 / 17 与 Task 22 遗留清单同步，`http.spec.ts` 增加 `details` 断言。
+2. **A-ERR-01 改为真实降权触发 403，不再用 `page.route` 改写请求路径** — 原写法证明的是「页面能处理一个被篡改的请求返回的 403」，不是任何真实路径。后端 `admin.Authenticate` 每次请求都 `JOIN admins` 重读角色，`Update` 只在停用时删会话，所以「super 看机器页时被另一位 super 降为 finance，再点查询」会得到真实的 403 `forbidden`；用例顺带验证刷新后进入 403 页、菜单按新角色过滤。为此 Task 7 helper 增加 `adminSend` / `adminPut`。
+3. **C-NAV-02 的类名与位置断言改用 `AppDialog` 的 `data-testid` 定位** — 实测 element-plus 2.14.7：`role="dialog"` 在 `.el-overlay-dialog` 包装层，`is-fullscreen`、自定义 `class="sheet"` 与 `$attrs` 都落在内层 `.el-dialog`。原用例的 `not.toHaveClass(/is-fullscreen/)` 与贴底 `boundingBox` 断言都会在包装层上「通过」，是典型的看似通过实则没测到；现在还追加了宽度 420 / 560、居中、通栏、全屏尺寸等几何断言。Global Constraints 补充了这条规则。
+4. **C-RCH-04 两个 project 都接管浏览器定时器，手机分支改为「不可见 → 支付 → 推进 9 秒无轮询 → 可见 → 恰好多一次查询并显示成功」** — 原手机分支没有 `page.clock`，3 秒真实轮询自己就会查到已支付，`visibilitychange` 的逻辑有没有都通过。
+5. **新增 `notifyError`（Task 8），控制台视图的请求失败提示一律经它，`unauthorized` / `cancelled` 静默；Task 12 `WalletView` 已改** — 原 `WalletView` 在 401 时既由 `handleUnauthorized` 弹「请先登录」，又在 catch 里 `ElMessage.error('请先登录')`，C-AUTH-06「只提示一次」必然失败（并发三个 401 会叠出四条）。
+6. **C-INS-04 的剩余时长正则由 `(1 天|23 小时 59 分)` 改为 `23 小时 5\d 分`** — `loginConsole` 为绕过发码限流每次推进假时钟 61 秒，下单后再登录看到的是 23 小时 58 分；原正则必失败。
+7. **A-AUD-01 改用 `user.ban` 造审计记录，并断言对象链接可点击跳转** — `alert.resolve` 的 `Entry(..., nil)` diff 为 `null`，格式化后只有 `{}`，原「两空格缩进」正则必失败；`user.ban` 的 diff 是 `{reason}`，可以精确断言格式化结果，且 `target_type=user` 能验证「对象可点击」。
+8. **A-MCH-01 两台机器都登记在唯一机柜下，所有筛选叠加机柜条件；分页 total 先取接口值再断言** — `ListMachines` 按 `rack, slot, id` 排序，整轮测试共享数据库，不带机柜筛选去找 `hooks/machines` 登记的那台（rack 固定 `E2E`、slot 1）会落到后面几页；`hooks/agent {machine_id}` 可以只让目标机器上线，无需再用 `serial_prefix`。
+9. **`playwright.config.ts` 的 `reuseExistingServer` 固定为 `false`** — `cmd/e2e-server` embed 的是进程启动那一刻的前端产物，复用手工起的旧进程等于测上一次的页面，恰恰违反「不能假设」；端口被占用时报错更好。副作用是每轮都是全新数据库，A-CAT 改价 / 下架即使中途失败也不会污染下一轮。设计 §7.2 原文写的是 `!process.env.CI`，需同步（见下）。
+10. **Task 3 预期通过的测试名修正** — 仓库里没有 `TestAuthenticatedResponsesAreNoStore`，后台 API `no-store` 的断言在 `TestLoginAndTOTPSetupOverHTTP` 里；`auth_test.go` 已引入 `net/http`、`strings`，import 说明相应改正。
+
+**核查结论（未改动，已逐项确认）：**
+- 设计覆盖：§6 B1～B11 → Task 3 / 1 / 5 / 2 / 2 / 2 / 2 / 1 / 4 / 1 / 2；§7.2 钩子 9 条全部在 Task 4 实现且有 Go 单测；§7.5 控制台 52 + 后台 50 个 ID 在 Task 8～21 各出现一次且每条都有具体断言，`coverage.json` 与 `coverage.mjs` 校验数量；U-01～U-14 分布在 Task 5 / 6 / 7 / 9 / 15；§12 评审裁定 1～13 均已落实。没有「只能假设通过」的功能。
+- 代码一致性：Task 1～4 引用的 `identity.Deps`、`adminapi.Server` / `newIPLimiter` / `loginLimit`、`config.Config` 字段、`dbtest.Key / T0 / CreateUser`、`fleet.NewMachine / Register / Heartbeat / PendingCommands / ListAlerts / Get / Pool`、`rental.Place / PlaceRequest / HandleCommandResult / Sweep / State*`、`billing.Sweep`、`wallet.AdminAdjust / Balance / ListLedger`、`admin.Create / EnrollTOTP / ConfirmEnrollment / FindByUsername / Login / TOTPCode / TOTPStep`、`identity.UserKYCRecords / SubmitPersonalKYC / GetUser`、`catalog.ProductIDByCode`、`randx.Digits`、`apperr.As`、`audit.Log`、`paging.Page`、`db.IsNoRows` 全部存在且签名一致；chi v5.4.0 的 `NotFound` 会向已挂载 / 后挂载的子路由传播；`http.FileServerFS` 可用（Go 1.27）。Task 6 全部 TypeScript 类型字段与 Go JSON 标签逐个对照一致（含 `AdminLedgerRow.operator_id`、`Recharge.qr_code` omitempty、`Image` 不含 `ref`、`Order` 不含 `user_id`、`Dashboard.machines.by_state` 为 map）。前端用到的全部错误文案（`验证码错误或已过期`、`用户名或密码错误`、`登录失败次数过多`、`动态码错误或已使用过`、`序列号已存在`、`PDU 与插座号需同时填写`、`该机器未配置 PDU`、`请填写 SNMP community`、`修改 PDU 地址时请重新填写 SNMP community`、`该机器上还有未结束的实例，不能结束维护`、`暂无空闲机器`、`待支付的充值单过多`、`60 秒内已提交过相同的操作`、`用户名已存在`、`原密码不正确`、`无权执行该操作`、`仅支持 JPG、PNG、PDF 文件`、`实名核验未通过：`）与 26 个审计动作名、CSV 中文表头与 `name-20060102-150405.csv` 文件名、恢复码 `xxxxx-xxxxx`、身份证 `前 3 后 4` 脱敏、`CloseAfter = 2h`、`QRTTL = 15min`、`retain_until` 仅 `pending_seconds == 0`、种子商品 / 价格 / 三个镜像名均与代码一致。任务顺序可执行：Task 1～4 每步只依赖前一任务产出；Task 5 起的 `web/go.mod` 保证 `go vet ./...` 不进 `node_modules`。
+- 安全：`DisableRateLimits` 只是 `app.Options` 字段，`cmd/platform` 传零值、无配置或环境变量入口，`Build` 在 `Env == "prod"` 时拒绝启动并有单测；`internal/e2ehooks` 只被 `cmd/e2e-server` 引用，`make build` 只编译 `cmd/platform`，钩子监听 `127.0.0.1` 且处理器再校验回环地址（有单测）。CSP：Vite 产物只有外链 `<script type="module">` 与 `<link rel="stylesheet">`，无内联脚本；Element Plus 的行内 `style` 属性由 `style-src 'unsafe-inline'` 覆盖；二维码走 `canvas`、执照缩略图走 `blob:`、后台执照预览走同源 `/admin/api/v1/files/`，均在 `img-src 'self' data: blob:` 内；无字体文件、无第三方源；`alipays://` 是导航不受 CSP 约束；`form-action` 不影响 `@submit.prevent` 的表单。
+- 占位 / YAGNI：全文无 TBD；`downloadText`、`IdLink.disabled`、`commandTypeLabel`、`kycResultLabel` 等都有调用方；未发现多余抽象。
+
+**本轮未改、留给主控的事项：**
+- 设计文档同步（评审只改计划）：§7.2 `reuseExistingServer: !process.env.CI` → `false`；§2.1 `ApiError` 增 `details`；§2.2 增「控制台页面经 `notifyError` 提示，`unauthorized` / `cancelled` 静默」一句；§7.5 A-ERR-01 的断言要点改为「会话中途被降权 → 真实 403 → 提示而不是白屏」。
