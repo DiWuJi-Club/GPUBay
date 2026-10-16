@@ -241,3 +241,26 @@ func TestCreateFailureAfterMigrationWithRenewalRefundsBoth(t *testing.T) {
 		t.Fatalf("renewal order = %s %d", s, r)
 	}
 }
+
+func TestCreateFailureAfterMigrationDoesNotRefundFreeExtension(t *testing.T) {
+	e := newEnv(t, 2)
+	ord, old := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(12 * time.Hour)
+	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "换机")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.AdminExtend(e.ctx, opsActor, moved.ID, 30*86400, "补偿"); err != nil {
+		t.Fatal(err)
+	}
+	before := e.balance(e.userID)
+	e.ack(false)
+	// 赠送的 30 天不能按钱退，只退转入的 12 小时
+	if got := e.balance(e.userID); got != before+3450 {
+		t.Fatalf("balance = %d, want %d", got, before+3450)
+	}
+	if s, r := e.orderState(ord.ID); s != "partially_refunded" || r != 3450 {
+		t.Fatalf("original order = %s %d", s, r)
+	}
+}

@@ -2,6 +2,7 @@ package rental
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"time"
 
@@ -124,7 +125,7 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 }
 
 // refundAll 开通失败退款：退还该实例自己所有已支付订单（新购与续费）尚未退还的部分；
-// 若它是换机得到的新实例，再退还转入的剩余时长（见 refundTransferred）。
+// 若它是换机得到的新实例，再退还转入的剩余时长（以换机记录的秒数为上限，见 refundTransferred）。
 // inst 须为加锁时读到的实例快照（state = creating，含 pending_seconds）。
 func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
 	rows, err := tx.Query(ctx, `SELECT id, amount - refunded_amount, duration FROM orders
@@ -161,7 +162,14 @@ func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now t
 			return err
 		}
 	}
-	return s.refundTransferred(ctx, tx, inst, max(inst.PendingSeconds-ownSecs, 0), now)
+	// pending_seconds 里还可能有管理员赠送的时长（AdminExtend），这部分不能按钱退：
+	// 转入时长以换机时记录的秒数为上限；不是换机得到的实例则没有转入时长。
+	var transferSecs int64
+	err = tx.QueryRow(ctx, `SELECT seconds FROM instance_transfers WHERE to_instance_id = $1`, inst.ID).Scan(&transferSecs)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	return s.refundTransferred(ctx, tx, inst, min(max(inst.PendingSeconds-ownSecs, 0), transferSecs), now)
 }
 
 // refundTransferred 换机得到的新实例开通失败：按转入的剩余时长 secs × 前身实例最近一笔可退订单的单价
