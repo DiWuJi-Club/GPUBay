@@ -80,6 +80,9 @@ func (s *Service) Register(ctx context.Context, nm NewMachine) (Machine, error) 
 	if db.IsUniqueViolation(err) {
 		return Machine{}, apperr.New("duplicate_serial", "序列号已存在", 409)
 	}
+	if db.IsForeignKeyViolation(err) {
+		return Machine{}, apperr.BadRequest("商品不存在")
+	}
 	return m, err
 }
 

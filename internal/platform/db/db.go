@@ -75,6 +75,12 @@ func IsUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// IsForeignKeyViolation 判断是否违反外键约束（引用了不存在的记录）。
+func IsForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
+
 func IsNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
 
 // IsExclusionViolation 判断是否违反排他约束（例如同一台机器的占用时段重叠）。

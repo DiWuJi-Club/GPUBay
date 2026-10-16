@@ -65,6 +65,9 @@ func (s *Service) Enqueue(ctx context.Context, q db.Querier, machineID int64, in
 	now := s.clock.Now()
 	_, err := q.Exec(ctx, `INSERT INTO agent_commands (id, machine_id, instance_id, type, payload, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $6)`, id, machineID, instanceID, string(t), body, now)
+	if db.IsForeignKeyViolation(err) {
+		return "", apperr.BadRequest("机器不存在")
+	}
 	return id, err
 }
 
