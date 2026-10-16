@@ -19,6 +19,7 @@ import (
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/secretbox"
+	"spark-cloud/internal/plugins/aliyun"
 	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/sms"
 	"spark-cloud/internal/rental"
@@ -60,8 +61,17 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		switch cfg.SMSDriver {
 		case "mock":
 			smsSender = &sms.Mock{}
+		case "aliyun":
+			smsSender = &sms.Aliyun{
+				Client:   aliyunClient(cfg, cfg.Aliyun.SMSEndpoint),
+				SignName: cfg.Aliyun.SMSSign,
+				Templates: map[string]string{
+					sms.TemplateLoginCode:      cfg.Aliyun.SMSTplLogin,
+					sms.TemplateExpiryReminder: cfg.Aliyun.SMSTplExpiry,
+				},
+			}
 		default:
-			return nil, fmt.Errorf("短信驱动 %q 尚未实现（计划 4 接入阿里云）", cfg.SMSDriver)
+			return nil, fmt.Errorf("未知的短信驱动 %q", cfg.SMSDriver)
 		}
 	}
 	verifier := opt.KYC
@@ -69,8 +79,10 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		switch cfg.KYCDriver {
 		case "mock":
 			verifier = kyc.Mock{}
+		case "aliyun":
+			verifier = &kyc.Aliyun{Client: aliyunClient(cfg, cfg.Aliyun.KYCEndpoint), AuthCode: cfg.Aliyun.KYCAuthCode}
 		default:
-			return nil, fmt.Errorf("实名驱动 %q 尚未实现（计划 4 接入阿里云）", cfg.KYCDriver)
+			return nil, fmt.Errorf("未知的实名驱动 %q", cfg.KYCDriver)
 		}
 	}
 	fixedCode := ""
@@ -96,6 +108,13 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Domain: cfg.Domain, SecureCookie: cfg.Env == "prod", TrustProxy: cfg.TrustProxy,
 	}
 	return &App{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Handler: srv.Router()}, nil
+}
+
+func aliyunClient(cfg config.Config, endpoint string) *aliyun.Client {
+	return &aliyun.Client{
+		Endpoint: endpoint, AccessKeyID: cfg.Aliyun.AccessKeyID, AccessKeySecret: cfg.Aliyun.AccessKeySecret,
+		HTTP: &http.Client{Timeout: 10 * time.Second},
+	}
 }
 
 // expiryNotifier 通过短信发送到期提醒。

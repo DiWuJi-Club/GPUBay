@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -159,5 +160,45 @@ func TestBuildRejectsMockPluginsInProd(t *testing.T) {
 	cfg := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock"}
 	if _, err := app.Build(cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{}); err == nil {
 		t.Fatal("expected error for mock drivers in prod")
+	}
+}
+
+// TestBuildWiresAliyunPlugins 验证 aliyun 驱动按配置的 endpoint 与凭证发出请求。
+func TestBuildWiresAliyunPlugins(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.New(t)
+	var mu sync.Mutex
+	var actions []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		mu.Lock()
+		actions = append(actions, q.Get("Action")+":"+q.Get("AccessKeyId"))
+		mu.Unlock()
+		switch q.Get("Action") {
+		case "SendSms":
+			_, _ = w.Write([]byte(`{"Code":"OK"}`))
+		case "ThreeElementsVerification":
+			_, _ = w.Write([]byte(`{"Code":"OK","Data":{"IsConsistent":1}}`))
+		}
+	}))
+	defer srv.Close()
+	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "aliyun", KYCDriver: "aliyun",
+		UploadDir: t.TempDir(), Aliyun: config.AliyunConfig{AccessKeyID: "ak", AccessKeySecret: "sk", SMSSign: "Spark",
+			SMSTplLogin: "SMS_1", SMSTplExpiry: "SMS_2", KYCAuthCode: "auth", SMSEndpoint: srv.URL, KYCEndpoint: srv.URL}}
+	a, err := app.Build(cfg, pool, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{Clock: clock.NewFake(dbtest.T0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Identity.SendLoginCode(ctx, "13800001234", "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	uid := dbtest.CreateUser(t, pool, "13800009999", false)
+	if u, err := a.Identity.SubmitPersonalKYC(ctx, uid, "张三", "11010119900101123X"); err != nil || u.KYCStatus != "verified" {
+		t.Fatalf("kyc = %+v, %v", u, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(actions) != 2 || actions[0] != "SendSms:ak" || actions[1] != "ThreeElementsVerification:ak" {
+		t.Fatalf("actions = %v", actions)
 	}
 }
