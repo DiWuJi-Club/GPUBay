@@ -124,7 +124,7 @@ Vite 配置要点（来自 spike）：
 ### 2.1 请求封装 `http.ts`
 
 ```ts
-export interface ApiError { status: number; code: string; message: string; requestId: string }
+export interface ApiError { status: number; code: string; message: string; requestId: string; details?: unknown /* 完整错误响应体，例如机器 CSV 导入的逐行 errors */ }
 export interface HttpOptions { idempotencyKey?: string; signal?: AbortSignal; quiet?: boolean /* 401 时不触发 onUnauthorized，仅用于会话探测 */ }
 export function createHttp(cfg: {
   base: string                                  // '/api/v1' 或 '/admin/api/v1'
@@ -152,6 +152,7 @@ export function createHttp(cfg: {
 
 ### 2.2 错误处理 `errors.ts`
 
+- 控制台页面统一经 `notifyError(err)` 提示，`unauthorized` / `cancelled` 静默不提示。
 - `messageOf(err)`：`ApiError` 取 `message`；`status >= 500` 时追加「（请求号 xxx）」便于排查；非 `ApiError` 显示「操作失败，请稍后重试」。
 - 页面级约定：
   - 表单字段校验错误在字段下方显示（Element Plus 表单规则），不发请求。
@@ -540,7 +541,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 
 ### 7.2 端到端环境：`cmd/e2e-server`
 
-**启动**（Playwright `webServer` 自动执行 `go run ./cmd/e2e-server`，就绪探测 `GET http://127.0.0.1:18090/healthz`，超时 180 秒，`reuseExistingServer: !process.env.CI`）：
+**启动**（Playwright `webServer` 自动执行 `go run ./cmd/e2e-server`，就绪探测 `GET http://127.0.0.1:18090/healthz`，超时 180 秒，`reuseExistingServer: false`，因为 e2e-server embed 的是启动时的前端产物）：
 1. 用 `embedded-postgres` 在临时目录启动 PostgreSQL（随机端口，二进制缓存在 `~/.embedded-postgres-go`，与 `dbtest` 相同），执行迁移。
 2. `app.Build` 配置：`Env=dev`、`Domain=spark.test`、`SecretKey` 固定测试密钥、`UploadDir` 临时目录、`SMSDriver=mock`（固定验证码 `000000`）、`PayDriver=mock`（`DevPay` 为真，`qr_code` 为 `mock://pay/<单号>`）、`PDUDriver=mock`；`Options{Clock: clock.NewFake(time.Now()), KYC: &kycMock, DisableRateLimits: true}`。
 3. `a.Servers(cfg)` 得到与生产相同的两个服务器，地址改为 `127.0.0.1:18080`（控制台 + 用户 API）与 `127.0.0.1:18081`（后台 + 后台 API）；**不启动**定时清扫器（清扫由钩子触发，避免与假时钟赛跑）。
@@ -728,7 +729,7 @@ check:        $(MAKE) test && $(MAKE) e2e
 | A-ADM-03 | 重置他人动态码 | 目标管理员下次登录进入绑定步骤 |
 | A-SET-01 | 修改密码 | 原密码错误提示；成功后用新密码登录 |
 | A-AUD-01 | 审计日志 | 按操作人 / 动作 / 对象 / 时间筛选；操作人显示用户名；展开 diff 为格式化 JSON |
-| A-ERR-01 | 权限错误提示 | ops 会话下用 `page.route` 把一次列表请求改写到 `/admin/api/v1/orders`（ops 无权）→ 页面提示「无权执行该操作」而不是白屏 |
+| A-ERR-01 | 权限错误提示 | super 会话打开机器页时被另一位 super 降为 finance → 点查询得到真实 403 → 页面提示「无权执行该操作」而不是白屏；刷新后进入 403 页，菜单按新角色过滤 |
 
 **单元测试（Vitest）**
 
