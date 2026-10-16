@@ -223,7 +223,11 @@ func TestPersonalKYCConcurrentSubmitCallsVerifierOnce(t *testing.T) {
 		_, err := svc.SubmitPersonalKYC(ctx, uid, "张三", validID)
 		first <- err
 	}()
-	<-v.entered // 第一次提交已登记并正在调用核验接口
+	select { // 第一次提交已登记并正在调用核验接口
+	case <-v.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("verifier not entered")
+	}
 	for i := 0; i < 3; i++ {
 		if _, err := svc.SubmitPersonalKYC(ctx, uid, "张三", validID); apperr.As(err) == nil || apperr.As(err).Code != "kyc_in_progress" {
 			t.Fatalf("concurrent submit %d = %v", i, err)
@@ -294,5 +298,44 @@ func TestPersonalKYCStalePendingIsReleased(t *testing.T) {
 	_ = pool.QueryRow(ctx, `SELECT result FROM kyc_records WHERE id = $1`, recordID).Scan(&result)
 	if result != "error" {
 		t.Fatalf("stale record result = %s, want error", result)
+	}
+}
+
+func TestPersonalKYCLateResultAfterStaleReleaseIsDiscarded(t *testing.T) {
+	v := &blockingVerifier{entered: make(chan struct{}, 10), release: make(chan struct{})}
+	svc, pool, _ := newKYCEnv(t, v)
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13900000013", false)
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := svc.SubmitPersonalKYC(ctx, uid, "张三", validID)
+		first <- err
+	}()
+	select {
+	case <-v.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("verifier not entered")
+	}
+	// 模拟超时清理已把该记录释放为 error
+	if _, err := pool.Exec(ctx, `UPDATE kyc_records SET result = 'error', reason = '核验超时未完成' WHERE user_id = $1`, uid); err != nil {
+		t.Fatal(err)
+	}
+	close(v.release)
+	select {
+	case err := <-first:
+		if ae := apperr.As(err); ae == nil || ae.Code != "kyc_unavailable" {
+			t.Fatalf("late result = %v, want kyc_unavailable", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("first submit hung")
+	}
+	var result string
+	_ = pool.QueryRow(ctx, `SELECT result FROM kyc_records WHERE user_id = $1`, uid).Scan(&result)
+	if result != "error" {
+		t.Fatalf("record result = %s, want error", result)
+	}
+	if u, _ := svc.GetUser(ctx, uid); u.KYCStatus != "none" {
+		t.Fatalf("status = %s, want none", u.KYCStatus)
 	}
 }

@@ -90,20 +90,33 @@ func (s *Service) SubmitPersonalKYC(ctx context.Context, userID int64, name, idN
 	}
 	done := s.d.Clock.Now()
 	wctx := context.WithoutCancel(ctx) // 已调用付费接口，结果必须落库，即使客户端已断开
+	released := false
 	err = db.WithTx(wctx, s.d.Pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(wctx, `UPDATE kyc_records SET result = $2, reason = $3, updated_at = $4 WHERE id = $1`,
-			recordID, result, reason, done); err != nil {
+		// 与提交路径保持相同加锁顺序：先 users 再 kyc_records，避免死锁
+		if _, err := tx.Exec(wctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, userID); err != nil {
 			return err
+		}
+		tag, err := tx.Exec(wctx, `UPDATE kyc_records SET result = $2, reason = $3, updated_at = $4
+			WHERE id = $1 AND result = 'pending'`, recordID, result, reason, done)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			released = true // 记录已被超时清理，迟到的结果不再生效
+			return nil
 		}
 		if result == "error" {
 			return nil
 		}
-		_, err := tx.Exec(wctx, `UPDATE users SET kyc_status = $2, kind = 'personal', updated_at = $3
+		_, err = tx.Exec(wctx, `UPDATE users SET kyc_status = $2, kind = 'personal', updated_at = $3
 			WHERE id = $1 AND kyc_status <> 'verified'`, userID, result, done)
 		return err
 	})
 	if err != nil {
 		return User{}, err
+	}
+	if released {
+		return User{}, errKYCUnavailable
 	}
 	switch result {
 	case "error":
