@@ -45,6 +45,8 @@ func TestInstanceEventsAndOrdersFollowMigration(t *testing.T) {
 	e := newEnv(t, 2)
 	ord, old := e.place(catalog.D1d)
 	e.ack(true)
+	// 让洗机指令的 created_at 晚于开通指令，否则两条指令同一时刻创建，按随机 UUID 排序不稳定
+	e.clock.Advance(time.Minute)
 	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "换机")
 	if err != nil {
 		t.Fatal(err)

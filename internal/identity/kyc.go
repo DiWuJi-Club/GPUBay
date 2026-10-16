@@ -202,9 +202,10 @@ func (s *Service) ReviewEnterpriseKYC(ctx context.Context, actor audit.Actor, re
 			recordID, newResult, reason, actor.AdminID, now); err != nil {
 			return err
 		}
+		// 驳回企业认证不能把已通过个人实名的用户降级
 		if _, err := tx.Exec(ctx, `UPDATE users SET kyc_status = $2,
 				kind = CASE WHEN $2 = 'verified' THEN 'enterprise' ELSE kind END, updated_at = $3
-			WHERE id = $1`, userID, newResult, now); err != nil {
+			WHERE id = $1 AND ($2 = 'verified' OR kyc_status <> 'verified')`, userID, newResult, now); err != nil {
 			return err
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("kyc.review", "kyc_record", strconv.FormatInt(recordID, 10),

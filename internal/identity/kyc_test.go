@@ -339,3 +339,26 @@ func TestPersonalKYCLateResultAfterStaleReleaseIsDiscarded(t *testing.T) {
 		t.Fatalf("status = %s, want none", u.KYCStatus)
 	}
 }
+
+func TestRejectEnterpriseKYCKeepsPersonalVerification(t *testing.T) {
+	svc, pool, _ := newKYCEnv(t, kyc.Mock{})
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13900000016", true)
+	var recordID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, license_no, license_file, result, created_at, updated_at)
+		VALUES ($1, 'enterprise', '某某科技有限公司', '91420100MA4KXXXX1X', 'f', 'pending', $2, $2) RETURNING id`, uid, dbtest.T0).Scan(&recordID); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ReviewEnterpriseKYC(ctx, audit.Actor{AdminID: 99}, recordID, false, "执照不清晰"); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := svc.GetUser(ctx, uid)
+	if u.KYCStatus != "verified" || u.Kind == "enterprise" {
+		t.Fatalf("user after rejected enterprise review = %+v, want still personally verified", u)
+	}
+	var result string
+	_ = pool.QueryRow(ctx, `SELECT result FROM kyc_records WHERE id = $1`, recordID).Scan(&result)
+	if result != "rejected" {
+		t.Fatalf("record result = %s", result)
+	}
+}
