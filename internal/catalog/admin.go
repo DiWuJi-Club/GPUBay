@@ -129,6 +129,10 @@ func normalizeImage(in ImageInput) (ImageInput, error) {
 	if in.Ref == "" || len(in.Ref) > 256 || strings.IndexFunc(in.Ref, unicode.IsSpace) >= 0 {
 		return in, apperr.BadRequest("镜像地址不能为空且不能包含空白字符")
 	}
+	// 镜像地址会作为参数传给 docker，首字符必须是小写字母或数字，防止 "--privileged" 之类的选项注入
+	if c := in.Ref[0]; !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
+		return in, apperr.BadRequest("镜像地址必须以小写字母或数字开头")
+	}
 	if utf8.RuneCountInString(in.Description) > 500 {
 		return in, apperr.BadRequest("镜像说明最多 500 个字符")
 	}

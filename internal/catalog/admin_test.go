@@ -60,6 +60,7 @@ func TestImagesAdmin(t *testing.T) {
 	ctx := context.Background()
 	for _, in := range []catalog.ImageInput{
 		{Name: "", Ref: "registry/x:1"}, {Name: "x", Ref: ""}, {Name: "x", Ref: "has space:1"},
+		{Name: "x", Ref: "--privileged"}, {Name: "x", Ref: "-v/:/host"}, {Name: "x", Ref: "Registry/x:1"}, {Name: "x", Ref: "/abs:1"},
 	} {
 		if _, err := svc.CreateImage(ctx, superActor, in); apperr.As(err) == nil || apperr.As(err).Code != "bad_request" {
 			t.Fatalf("CreateImage(%+v) = %v", in, err)
