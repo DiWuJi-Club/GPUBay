@@ -22,6 +22,8 @@ const (
 
 	MinPasswordLen = 12
 	maxPasswordLen = 128
+
+	maxVerifyMemory = 1 << 20 // KiB（1 GiB），校验时允许的内存参数上限
 )
 
 // HashPassword 用 argon2id 生成 PHC 格式字符串：$argon2id$v=19$m=65536,t=3,p=2$<salt>$<hash>（base64 无填充）。
@@ -49,6 +51,10 @@ func VerifyPassword(encoded, password string) bool {
 	var memory, iterations uint32
 	var threads uint8
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &iterations, &threads); err != nil {
+		return false
+	}
+	// argon2.IDKey 对非法参数会 panic，且内存参数来自不可信输入，需先做范围校验。
+	if iterations < 1 || threads < 1 || memory < 8*uint32(threads) || memory > maxVerifyMemory {
 		return false
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])

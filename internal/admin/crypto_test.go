@@ -26,7 +26,12 @@ func TestHashAndVerifyPassword(t *testing.T) {
 	if admin.VerifyPassword(h1, "correct horse batterY") {
 		t.Fatal("wrong password accepted")
 	}
-	for _, bad := range []string{"", "plain", "$argon2i$v=19$m=65536,t=3,p=2$c2FsdA$aGFzaA", "$argon2id$v=19$m=x,t=3,p=2$c2FsdA$aGFzaA"} {
+	for _, bad := range []string{
+		"", "plain", "$argon2i$v=19$m=65536,t=3,p=2$c2FsdA$aGFzaA", "$argon2id$v=19$m=x,t=3,p=2$c2FsdA$aGFzaA",
+		"$argon2id$v=19$m=65536,t=0,p=2$c2FsdHNhbHRzYWx0c2FsdA$aGFzaGhhc2hoYXNoaGFzaA",
+		"$argon2id$v=19$m=65536,t=3,p=0$c2FsdHNhbHRzYWx0c2FsdA$aGFzaGhhc2hoYXNoaGFzaA",
+		"$argon2id$v=19$m=4294967295,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aGFzaGhhc2hoYXNoaGFzaA",
+	} {
 		if admin.VerifyPassword(bad, "x") {
 			t.Fatalf("malformed hash %q accepted", bad)
 		}
