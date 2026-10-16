@@ -272,3 +272,24 @@ func TestListAndGetForUser(t *testing.T) {
 		t.Fatalf("get other's recharge = %v", err)
 	}
 }
+
+func TestManualRechargeRejectsIdenticalRepeat(t *testing.T) {
+	e := newEnv(t)
+	actor := audit.Actor{AdminID: 7}
+	if _, err := e.svc.ManualRecharge(e.ctx, actor, e.userID, 10000, "对公转账 123"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.ManualRecharge(e.ctx, actor, e.userID, 10000, " 对公转账 123 "); codeOf(err) != "duplicate" {
+		t.Fatalf("identical repeat = %v, want duplicate", err)
+	}
+	if _, err := e.svc.ManualRecharge(e.ctx, actor, e.userID, 20000, "对公转账 123"); err != nil {
+		t.Fatalf("different amount = %v", err)
+	}
+	e.clk.Advance(61 * time.Second)
+	if _, err := e.svc.ManualRecharge(e.ctx, actor, e.userID, 10000, "对公转账 123"); err != nil {
+		t.Fatalf("repeat after 61s = %v", err)
+	}
+	if got := e.balance(); got != 40000 {
+		t.Fatalf("balance = %d, want 40000", got)
+	}
+}

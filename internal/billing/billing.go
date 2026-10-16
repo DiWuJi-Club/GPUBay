@@ -205,6 +205,9 @@ func (s *Service) ListForUser(ctx context.Context, userID int64, p paging.Page) 
 	return items, total, err
 }
 
+// RepeatWindow 内同一管理员对同一用户提交金额、说明完全相同的手动入账视为重复提交。
+const RepeatWindow = 60 * time.Second
+
 // ManualRecharge 后台手动入账（线下转账等），记为充值流水，渠道为 manual。
 func (s *Service) ManualRecharge(ctx context.Context, actor audit.Actor, userID, amount int64, remark string) (Recharge, error) {
 	remark = strings.TrimSpace(remark)
@@ -217,6 +220,19 @@ func (s *Service) ManualRecharge(ctx context.Context, actor audit.Actor, userID,
 	now := s.d.Clock.Now()
 	var r Recharge
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		// 按用户串行化管理员资金操作，再拒绝 60 秒内完全相同的重复提交（双击、重试）
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "wallet-admin:"+strconv.FormatInt(userID, 10)); err != nil {
+			return err
+		}
+		var dup bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM recharges WHERE channel = 'manual' AND operator_id = $1
+			AND user_id = $2 AND amount = $3 AND remark = $4 AND created_at > $5)`,
+			actor.AdminID, userID, amount, remark, now.Add(-RepeatWindow)).Scan(&dup); err != nil {
+			return err
+		}
+		if dup {
+			return apperr.ErrRepeatedSubmit
+		}
 		var err error
 		r, err = scanRecharge(tx.QueryRow(ctx, `INSERT INTO recharges (id, user_id, channel, amount, status, operator_id, remark,
 				expires_at, paid_at, created_at, updated_at)

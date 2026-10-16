@@ -128,6 +128,9 @@ func (s *Service) ListLedger(ctx context.Context, userID, beforeID int64, limit 
 	})
 }
 
+// AdjustRepeatWindow 内同一管理员对同一用户提交金额、原因完全相同的调整视为重复提交。
+const AdjustRepeatWindow = 60 * time.Second
+
 // AdminAdjust 管理员手动加减余额（线下转账入账、补偿、纠错），必须填写原因并写审计日志。
 func (s *Service) AdminAdjust(ctx context.Context, operatorID, userID, amount int64, remark, ip string) (int64, error) {
 	remark = strings.TrimSpace(remark)
@@ -139,6 +142,19 @@ func (s *Service) AdminAdjust(ctx context.Context, operatorID, userID, amount in
 	}
 	var after int64
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		// 按用户串行化管理员资金操作，再拒绝 60 秒内完全相同的重复提交（双击、重试）
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "wallet-admin:"+strconv.FormatInt(userID, 10)); err != nil {
+			return err
+		}
+		var dup bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wallet_ledger WHERE kind = 'admin_adjust' AND operator_id = $1
+			AND user_id = $2 AND amount = $3 AND remark = $4 AND created_at > $5)`,
+			operatorID, userID, amount, remark, s.clock.Now().Add(-AdjustRepeatWindow)).Scan(&dup); err != nil {
+			return err
+		}
+		if dup {
+			return apperr.ErrRepeatedSubmit
+		}
 		var err error
 		after, err = s.Apply(ctx, tx, Entry{UserID: userID, Amount: amount, Kind: KindAdminAdjust, OperatorID: operatorID, Remark: remark})
 		if err != nil {
