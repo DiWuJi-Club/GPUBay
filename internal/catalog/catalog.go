@@ -132,3 +132,13 @@ func (s *Service) ListImages(ctx context.Context) ([]Image, error) {
 		return img, err
 	})
 }
+
+// ImageRef 返回镜像地址，不要求镜像仍在售（换机时沿用用户原来的镜像）。
+func (s *Service) ImageRef(ctx context.Context, q db.Querier, id int64) (string, error) {
+	var ref string
+	err := q.QueryRow(ctx, `SELECT ref FROM images WHERE id = $1`, id).Scan(&ref)
+	if db.IsNoRows(err) {
+		return "", apperr.ErrNotFound
+	}
+	return ref, err
+}
