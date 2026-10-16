@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -174,4 +175,55 @@ func (c *client) do(method, path string, body any) (int, map[string]any) {
 func codeOf(out map[string]any) string {
 	s, _ := out["code"].(string)
 	return s
+}
+
+// renter 创建一个已实名、余额 100 万分的用户。
+func (e *env) renter(phone string) int64 {
+	e.t.Helper()
+	uid := dbtest.CreateUser(e.t, e.pool, phone, true)
+	dbtest.Fund(e.t, e.pool, uid, 1_000_000)
+	return uid
+}
+
+// machine 创建一台空闲、在线的机器。
+func (e *env) machine(serial string) int64 {
+	e.t.Helper()
+	return dbtest.CreateMachine(e.t, e.pool, serial)
+}
+
+func (e *env) place(uid int64) rental.Instance {
+	e.t.Helper()
+	_, inst, err := e.rental.Place(e.ctx, rental.PlaceRequest{UserID: uid, ProductID: dbtest.ProductID(e.t, e.pool),
+		ImageID: dbtest.ImageID(e.t, e.pool), Duration: catalog.D1d})
+	if err != nil {
+		e.t.Fatalf("place: %v", err)
+	}
+	return inst
+}
+
+// ack 模拟 Agent：成功执行所有机器上待处理的指令。
+func (e *env) ack() {
+	e.t.Helper()
+	rows, err := e.pool.Query(e.ctx, `SELECT id FROM machines ORDER BY id`)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		_ = rows.Scan(&id)
+		ids = append(ids, id)
+	}
+	rows.Close()
+	for _, mid := range ids {
+		cmds, err := e.fleet.PendingCommands(e.ctx, mid)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		for _, c := range cmds {
+			if err := e.rental.HandleCommandResult(e.ctx, c.ID, true, "ok"); err != nil {
+				e.t.Fatal(fmt.Errorf("ack %s: %w", c.Type, err))
+			}
+		}
+	}
 }

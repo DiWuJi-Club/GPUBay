@@ -60,3 +60,15 @@ func TestConcurrentMigrate(t *testing.T) {
 		}
 	}
 }
+
+func TestWhere(t *testing.T) {
+	var w db.Where
+	if w.SQL() != "TRUE" || len(w.Args) != 0 {
+		t.Fatalf("empty = %q %v", w.SQL(), w.Args)
+	}
+	w.Add("state = ?", "idle")
+	w.Add("created_at >= ? AND created_at < ?", 1, 2)
+	if got := w.SQL(); got != "state = $1 AND created_at >= $2 AND created_at < $3" || len(w.Args) != 3 {
+		t.Fatalf("sql = %q args = %v", got, w.Args)
+	}
+}

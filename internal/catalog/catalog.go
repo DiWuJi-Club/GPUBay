@@ -142,3 +142,13 @@ func (s *Service) ImageRef(ctx context.Context, q db.Querier, id int64) (string,
 	}
 	return ref, err
 }
+
+// ProductIDByCode 按商品编码查 ID（批量导入机器时使用）。
+func (s *Service) ProductIDByCode(ctx context.Context, code string) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx, `SELECT id FROM products WHERE code = $1`, code).Scan(&id)
+	if db.IsNoRows(err) {
+		return 0, apperr.ErrNotFound
+	}
+	return id, err
+}

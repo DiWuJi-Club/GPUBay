@@ -35,3 +35,9 @@ func (s *Service) Password(ctx context.Context, userID int64, id string) (string
 	}
 	return string(plain), nil
 }
+
+// ListInstancesByMachine 返回某台机器上最近的实例（新到旧）。
+func (s *Service) ListInstancesByMachine(ctx context.Context, machineID int64, limit int) ([]Instance, error) {
+	return collectInstances(s.d.Pool.Query(ctx, `SELECT `+instanceCols+` FROM instances
+		WHERE machine_id = $1 ORDER BY created_at DESC, id LIMIT $2`, machineID, limit))
+}

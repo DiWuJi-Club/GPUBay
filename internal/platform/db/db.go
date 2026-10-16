@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -96,4 +98,32 @@ func ConstraintName(err error) string {
 		return pgErr.ConstraintName
 	}
 	return ""
+}
+
+// Where 拼接带参数的 AND 条件；条件中的 ? 依次替换为 $1、$2……，用于后台列表的可选筛选。
+type Where struct {
+	conds []string
+	Args  []any
+}
+
+func (w *Where) Add(cond string, args ...any) {
+	var b strings.Builder
+	i := 0
+	for _, r := range cond {
+		if r == '?' && i < len(args) {
+			w.Args = append(w.Args, args[i])
+			b.WriteString("$" + strconv.Itoa(len(w.Args)))
+			i++
+			continue
+		}
+		b.WriteRune(r)
+	}
+	w.conds = append(w.conds, b.String())
+}
+
+func (w *Where) SQL() string {
+	if len(w.conds) == 0 {
+		return "TRUE"
+	}
+	return strings.Join(w.conds, " AND ")
 }

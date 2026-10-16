@@ -82,6 +82,7 @@ func (s *Server) Router() http.Handler {
 		r.Group(func(g chi.Router) {
 			g.Use(s.requireAdmin)
 			s.accountRoutes(g)
+			s.machineRoutes(g)
 		})
 	})
 	return r

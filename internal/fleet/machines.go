@@ -230,3 +230,6 @@ func (s *Service) queryIDs(ctx context.Context, sql string, args ...any) ([]int6
 	}
 	return out, rows.Err()
 }
+
+// Pool 返回连接池，供需要传入 db.Querier 的只读调用使用。
+func (s *Service) Pool() *pgxpool.Pool { return s.pool }
