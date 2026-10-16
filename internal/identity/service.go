@@ -33,13 +33,15 @@ type UploadChecker interface {
 }
 
 type Deps struct {
-	Pool      *pgxpool.Pool
-	Clock     clock.Clock
-	SMS       sms.Sender
-	KYC       kyc.Verifier
-	Box       *secretbox.Box
-	Uploads   UploadChecker // 校验营业执照文件归属（storage 模块实现）
-	FixedCode string        // 仅开发环境：非空时验证码固定为该值
+	// CodeIPHourLimit 同一 IP 每小时验证码上限；零值表示默认 30。只有端到端测试服务会调大它。
+	CodeIPHourLimit int
+	Pool            *pgxpool.Pool
+	Clock           clock.Clock
+	SMS             sms.Sender
+	KYC             kyc.Verifier
+	Box             *secretbox.Box
+	Uploads         UploadChecker // 校验营业执照文件归属（storage 模块实现）
+	FixedCode       string        // 仅开发环境：非空时验证码固定为该值
 }
 
 type Service struct {

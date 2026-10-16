@@ -32,6 +32,10 @@ func (s *Service) SendLoginCode(ctx context.Context, phone, ip string) error {
 		return apperr.BadRequest("手机号格式不正确")
 	}
 	now := s.d.Clock.Now()
+	ipLimit := s.d.CodeIPHourLimit
+	if ipLimit <= 0 {
+		ipLimit = codeIPHourLimit
+	}
 	code := s.d.FixedCode
 	if code == "" {
 		code = randx.Digits(6)
@@ -56,7 +60,7 @@ func (s *Service) SendLoginCode(ctx context.Context, phone, ip string) error {
 			Scan(&recent, &daily, &ipHour); err != nil {
 			return err
 		}
-		if recent > 0 || daily >= codeDailyLimit || ipHour >= codeIPHourLimit {
+		if recent > 0 || daily >= codeDailyLimit || ipHour >= ipLimit {
 			return apperr.ErrRateLimited
 		}
 		return tx.QueryRow(ctx, `INSERT INTO sms_codes (phone, code_hash, ip, created_at, expires_at)

@@ -308,3 +308,26 @@ func TestSendCodeFailureDoesNotRateLimit(t *testing.T) {
 		t.Fatalf("login with resent code: %v", err)
 	}
 }
+
+func TestSendCodeIPHourLimitConfigurable(t *testing.T) {
+	ctx := context.Background()
+	svc := identity.NewService(identity.Deps{Pool: dbtest.New(t), Clock: clock.NewFake(dbtest.T0), SMS: &sms.Mock{}, CodeIPHourLimit: 2})
+	for i, phone := range []string{"13800000001", "13800000002"} {
+		if err := svc.SendLoginCode(ctx, phone, "10.0.0.9"); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	if err := svc.SendLoginCode(ctx, "13800000003", "10.0.0.9"); !errors.Is(err, apperr.ErrRateLimited) {
+		t.Fatalf("third send from same ip = %v, want rate_limited", err)
+	}
+	// 零值保持默认 30 次
+	def := identity.NewService(identity.Deps{Pool: dbtest.New(t), Clock: clock.NewFake(dbtest.T0), SMS: &sms.Mock{}})
+	for i := 0; i < 30; i++ {
+		if err := def.SendLoginCode(ctx, fmt.Sprintf("138000%05d", i), "10.0.0.8"); err != nil {
+			t.Fatalf("default send %d: %v", i, err)
+		}
+	}
+	if err := def.SendLoginCode(ctx, "13999999999", "10.0.0.8"); !errors.Is(err, apperr.ErrRateLimited) {
+		t.Fatalf("31st send = %v, want rate_limited", err)
+	}
+}

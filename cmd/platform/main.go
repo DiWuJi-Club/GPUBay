@@ -86,22 +86,7 @@ func run(log *slog.Logger) error {
 		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep)
 	}()
 
-	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           a.Handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
-	adminSrv := &http.Server{
-		Addr:              cfg.AdminAddr,
-		Handler:           a.AdminHandler,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      120 * time.Second, // CSV 导出最多 10 万行
-		IdleTimeout:       120 * time.Second,
-	}
+	srv, adminSrv := a.Servers(cfg)
 	if listensOnAllInterfaces(cfg.AdminAddr) {
 		log.Warn("后台 API 监听在所有网卡上，请确认防火墙只对内网开放该端口", "addr", cfg.AdminAddr)
 	}

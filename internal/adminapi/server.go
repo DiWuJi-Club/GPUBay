@@ -45,6 +45,7 @@ type Server struct {
 	Clock        clock.Clock
 	Log          *slog.Logger
 	SecureCookie bool // 生产环境为 true：Cookie 仅经 HTTPS 发送
+	LoginLimit   int  // 同一 IP 每分钟登录相关请求上限；零值表示默认 20。只有端到端测试服务会调大它
 
 	limiter *ipLimiter
 	routes  []Route
@@ -65,7 +66,11 @@ var (
 )
 
 func (s *Server) Router() http.Handler {
-	s.limiter = newIPLimiter(loginLimit, time.Minute, s.Clock)
+	limit := s.LoginLimit
+	if limit <= 0 {
+		limit = loginLimit
+	}
+	s.limiter = newIPLimiter(limit, time.Minute, s.Clock)
 	s.routes = nil
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)

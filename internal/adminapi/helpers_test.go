@@ -63,7 +63,10 @@ type env struct {
 	pay      *pay.Mock
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWith(t, nil) }
+
+// newEnvWith 在构建路由前允许调整 Server 字段（例如 LoginLimit）。
+func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
@@ -91,6 +94,9 @@ func newEnv(t *testing.T) *env {
 	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
 	srv := &adminapi.Server{Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: b,
 		Uploads: uploads, Clock: clk, Log: log}
+	if tweak != nil {
+		tweak(srv)
+	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, srv: srv, ts: ts, admins: admins, identity: ids,

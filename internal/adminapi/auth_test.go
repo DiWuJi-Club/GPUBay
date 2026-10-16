@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/adminapi"
 	"spark-cloud/internal/audit"
 )
 
@@ -183,5 +184,18 @@ func TestLoginRateLimitIgnoresForwardedFor(t *testing.T) {
 	}
 	if code := login(20); code != 429 {
 		t.Fatalf("21st attempt with a new X-Forwarded-For = %d, want 429", code)
+	}
+}
+
+func TestLoginLimitConfigurable(t *testing.T) {
+	e := newEnvWith(t, func(s *adminapi.Server) { s.LoginLimit = 2 })
+	c := e.anon()
+	for i := 0; i < 2; i++ {
+		if code, _ := c.do("POST", "/auth/login", map[string]string{"username": "nobody", "password": "wrong-password-123"}); code != 401 {
+			t.Fatalf("attempt %d = %d, want 401", i, code)
+		}
+	}
+	if code, out := c.do("POST", "/auth/login", map[string]string{"username": "nobody", "password": "wrong-password-123"}); code != 429 || codeOf(out) != "rate_limited" {
+		t.Fatalf("third attempt = %d %v, want 429 rate_limited", code, out)
 	}
 }
