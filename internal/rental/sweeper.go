@@ -18,6 +18,9 @@ const (
 	sweeperLockKey = 7301001 // pg_try_advisory_lock 的键，保证多个 platform 副本只有一个在清扫
 )
 
+// extraTaskTimeout 限制每个附加任务的执行时间，避免外部调用卡住后一直占着清扫咨询锁（测试可调小）。
+var extraTaskTimeout = 2 * time.Minute
+
 // ExpireDue 把已到期、未暂停的运行中实例转为停机并下发停止指令。
 func (s *Service) ExpireDue(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
@@ -326,7 +329,10 @@ func (s *Service) sweepOnce(ctx context.Context, extra []func(context.Context) e
 		s.d.Log.Error("sweep failed", "err", err)
 	}
 	for i, task := range extra {
-		if err := task(ctx); err != nil {
+		tctx, cancel := context.WithTimeout(ctx, extraTaskTimeout)
+		err := task(tctx)
+		cancel()
+		if err != nil {
 			s.d.Log.Error("sweep task failed", "task", i, "err", err)
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -105,6 +106,9 @@ func (s *Service) pending(ctx context.Context, pred string, args ...any) ([]pend
 	})
 }
 
+// providerCallTimeout 限制清扫时单次渠道查询 / 关单调用的时长。
+const providerCallTimeout = 15 * time.Second
+
 // Sweep 主动查询创建 1 分钟～2 小时仍未支付的单（回调可能丢失），关闭创建超过 2 小时的单。
 func (s *Service) Sweep(ctx context.Context) error {
 	now := s.d.Clock.Now()
@@ -133,7 +137,10 @@ func (s *Service) Sweep(ctx context.Context) error {
 			continue
 		}
 		if p := s.d.Providers[r.channel]; p != nil {
-			if err := p.Close(ctx, r.id); err != nil {
+			cctx, cancel := context.WithTimeout(ctx, providerCallTimeout)
+			err := p.Close(cctx, r.id)
+			cancel()
+			if err != nil {
 				s.d.Log.Warn("pay close failed", "recharge", r.id, "channel", r.channel, "err", err)
 			}
 		}
@@ -151,7 +158,9 @@ func (s *Service) queryAndSettle(ctx context.Context, r pendingRef) (bool, error
 	if p == nil {
 		return false, nil
 	}
-	n, err := p.Query(ctx, r.id)
+	qctx, cancel := context.WithTimeout(ctx, providerCallTimeout)
+	n, err := p.Query(qctx, r.id)
+	cancel()
 	if err != nil {
 		return false, fmt.Errorf("query %s: %w", r.id, err)
 	}

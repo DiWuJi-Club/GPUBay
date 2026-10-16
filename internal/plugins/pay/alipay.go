@@ -37,7 +37,8 @@ type Alipay struct {
 var beijing = time.FixedZone("CST", 8*3600)
 
 func NewAlipay(cfg AlipayConfig) (*Alipay, error) {
-	c, err := alipay.New(cfg.AppID, cfg.PrivateKeyPEM, cfg.Production)
+	c, err := alipay.New(cfg.AppID, cfg.PrivateKeyPEM, cfg.Production,
+		alipay.WithHTTPClient(&http.Client{Timeout: 10 * time.Second}))
 	if err != nil {
 		return nil, fmt.Errorf("alipay client: %w", err)
 	}
