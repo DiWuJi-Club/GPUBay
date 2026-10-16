@@ -11,8 +11,9 @@ import (
 )
 
 // dist/console 与 dist/admin 由前端构建生成（gitignore）；dist/README.md 入库保证 embed 始终有文件。
+// all: 前缀让 Vite 产出的 _ 开头文件（如 _plugin-vue_export-helper-*.js）也被嵌入；点文件由 NewHandler 拒绝。
 //
-//go:embed dist
+//go:embed all:dist
 var dist embed.FS
 
 // CSP 是静态页面的内容安全策略：只允许同源脚本与请求；style-src 'unsafe-inline' 是 Element Plus 行内样式所需。
@@ -48,7 +49,7 @@ func NewHandler(fsys fs.FS, prefix string) http.Handler {
 			return
 		}
 		rel := strings.TrimPrefix(path.Clean("/"+strings.TrimPrefix(r.URL.Path, trim)), "/")
-		if rel != "" && rel != "index.html" {
+		if rel != "" && rel != "index.html" && !hasDotSegment(rel) {
 			if st, err := fs.Stat(fsys, rel); err == nil && !st.IsDir() {
 				if strings.HasPrefix(rel, "assets/") {
 					h.Set("Cache-Control", "public, max-age=31536000, immutable") // 文件名带内容哈希
@@ -74,4 +75,14 @@ func NewHandler(fsys fs.FS, prefix string) http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(index)
 	})
+}
+
+// hasDotSegment 报告路径中是否有以 . 开头的段（.env、.git/ 等），这类文件永不对外提供。
+func hasDotSegment(rel string) bool {
+	for _, seg := range strings.Split(rel, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return true
+		}
+	}
+	return false
 }
