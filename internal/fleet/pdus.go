@@ -166,7 +166,7 @@ func (s *Service) CreatePDU(ctx context.Context, actor audit.Actor, in PDUInput)
 	return p, err
 }
 
-// UpdatePDU 修改 PDU；Community 为空表示保持原值。
+// UpdatePDU 修改 PDU；Community 为空表示保持原值（修改地址时必须重新填写）。
 func (s *Service) UpdatePDU(ctx context.Context, actor audit.Actor, id int64, in PDUInput) (PDU, error) {
 	if s.pdu.Box == nil {
 		return PDU{}, errPDUSetup
@@ -179,13 +179,18 @@ func (s *Service) UpdatePDU(ctx context.Context, actor audit.Actor, id int64, in
 	var p PDU
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var stored []byte
-		if err := tx.QueryRow(ctx, `SELECT community_enc FROM pdus WHERE id = $1 FOR UPDATE`, id).Scan(&stored); db.IsNoRows(err) {
+		var oldAddr string
+		if err := tx.QueryRow(ctx, `SELECT community_enc, address FROM pdus WHERE id = $1 FOR UPDATE`, id).Scan(&stored, &oldAddr); db.IsNoRows(err) {
 			return apperr.ErrNotFound
 		} else if err != nil {
 			return err
 		}
 		if in.Driver == "snmp" && in.Community == "" && stored == nil {
 			return apperr.BadRequest("请填写 SNMP community")
+		}
+		// 改地址时必须重新填写 community，避免把已存的密钥发给新主机
+		if in.Community == "" && stored != nil && in.Address != oldAddr {
+			return apperr.BadRequest("修改 PDU 地址时请重新填写 SNMP community")
 		}
 		var err error
 		p, err = scanPDU(tx.QueryRow(ctx, `UPDATE pdus SET name = $2, driver = $3, address = $4,

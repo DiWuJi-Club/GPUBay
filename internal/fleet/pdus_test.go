@@ -215,3 +215,30 @@ func TestUpdatePDUMockToSNMPNeedsCommunity(t *testing.T) {
 		t.Fatalf("update = %+v, %v", got, err)
 	}
 }
+
+func TestUpdatePDUAddressChangeNeedsCommunity(t *testing.T) {
+	svc, _, _ := newEnv(t)
+	configurePDU(t, svc, true)
+	ctx := context.Background()
+	p, err := svc.CreatePDU(ctx, ops, snmpInput("PDU-B01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := snmpInput("PDU-B01")
+	in.Address = "10.0.200.99"
+	in.Community = ""
+	// 不能把已存的 community 发给新地址
+	if _, err := svc.UpdatePDU(ctx, ops, p.ID, in); codeOf(err) != "bad_request" {
+		t.Fatalf("address change without community = %v", err)
+	}
+	in.Community = "for-new-host"
+	got, err := svc.UpdatePDU(ctx, ops, p.ID, in)
+	if err != nil || got.Address != "10.0.200.99" {
+		t.Fatalf("address change with community = %+v, %v", got, err)
+	}
+	in.Community = ""
+	in.CycleValue = 7
+	if _, err := svc.UpdatePDU(ctx, ops, p.ID, in); err != nil {
+		t.Fatalf("same address without community = %v", err)
+	}
+}
