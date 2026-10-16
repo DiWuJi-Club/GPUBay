@@ -1,0 +1,4 @@
+serial,rack,slot,lan_ip,product_code,pdu_name,pdu_outlet
+E2E-CSV-{{N}}-1,B01,01,10.98.0.1,spark-1,,
+E2E-CSV-{{N}}-2,B01,02,10.98.0.2,spark-1,,
+E2E-CSV-{{N}}-3,B01,03,10.98.0.3,spark-1,,
