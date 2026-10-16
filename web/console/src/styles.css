@@ -1,0 +1,42 @@
+:root {
+  --sc-tabbar-height: 56px;
+}
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: #f5f7fa;
+  color: #303133;
+}
+a {
+  color: var(--el-color-primary);
+}
+.money-plus {
+  color: var(--el-color-success);
+}
+.money-minus {
+  color: #303133;
+}
+@media (max-width: 767px) {
+  /* 输入框 16px 避免 iOS 聚焦放大；可点元素 ≥ 44px */
+  .el-input__inner,
+  .el-textarea__inner {
+    font-size: 16px;
+  }
+  .el-button {
+    min-height: 44px;
+  }
+  /* 一句话确认框：底部弹出 */
+  .el-dialog.sheet {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: 100%;
+    border-radius: 16px 16px 0 0;
+  }
+  .el-dialog.sheet .el-dialog__body {
+    padding-bottom: calc(16px + env(safe-area-inset-bottom));
+  }
+}
