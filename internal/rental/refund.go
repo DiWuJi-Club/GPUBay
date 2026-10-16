@@ -44,10 +44,10 @@ func instanceChain(ctx context.Context, q db.Querier, id string) ([]string, erro
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// refundableOrders 返回链路上仍可退的订单，从新到旧；lock 为 true 时加行锁（调用方须已锁实例）。
+// refundableOrders 返回链路上仍可退的订单，从新到旧（同一时刻创建时续费单排在新购单之前）；lock 为 true 时加行锁（调用方须已锁实例）。
 func refundableOrders(ctx context.Context, q db.Querier, chain []string, lock bool) ([]refundable, error) {
 	sql := `SELECT id, amount, refunded_amount, refund_count, duration FROM orders
-		WHERE instance_id = ANY($1) AND status IN ('paid', 'partially_refunded') ORDER BY created_at DESC, id DESC`
+		WHERE instance_id = ANY($1) AND status IN ('paid', 'partially_refunded') ORDER BY created_at DESC, (kind = 'renew') DESC, id DESC`
 	if lock {
 		sql += ` FOR UPDATE`
 	}

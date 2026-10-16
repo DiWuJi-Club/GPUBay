@@ -2,10 +2,12 @@ package rental
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/wallet"
@@ -98,11 +100,7 @@ func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from
 }
 
 // failCreating 开通失败：实例失败、退款、机器隔离为故障、取消剩余指令并告警。
-// 退款按加锁时读到的实例计算（含 pending_seconds），因此须在清零 pending_seconds 之前进行。
 func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, reason string, now time.Time) error {
-	if err := s.refundAll(ctx, tx, inst, now); err != nil {
-		return err
-	}
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'failed', pending_seconds = 0, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 		return err
 	}
@@ -110,6 +108,9 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 		return err
 	}
 	if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
+		return err
+	}
+	if err := s.refundAll(ctx, tx, inst, now); err != nil {
 		return err
 	}
 	if err := s.d.Fleet.MarkFaulty(ctx, tx, inst.MachineID); err != nil {
@@ -122,31 +123,31 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 		MachineID: inst.MachineID, InstanceID: inst.ID, Message: reason})
 }
 
-// refundAll 开通失败退款。实例有自己的已支付订单（新购与续费）时，退还每笔订单尚未退还的部分；
-// 否则若它是换机得到的新实例，则按转入的剩余时长（pending_seconds × 链路上最近一笔订单单价，不超过可退上限）
-// 从新到旧退还链路上前身实例的订单。inst 须为加锁时读到的状态（state = creating）。
+// refundAll 开通失败退款：退还该实例自己所有已支付订单（新购与续费）尚未退还的部分；
+// 若它是换机得到的新实例，再退还转入的剩余时长（见 refundTransferred）。
+// inst 须为加锁时读到的实例快照（state = creating，含 pending_seconds）。
 func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
-	rows, err := tx.Query(ctx, `SELECT id, amount - refunded_amount FROM orders
+	rows, err := tx.Query(ctx, `SELECT id, amount - refunded_amount, duration FROM orders
 		WHERE instance_id = $1 AND status IN ('paid', 'partially_refunded') ORDER BY created_at, id FOR UPDATE`, inst.ID)
 	if err != nil {
 		return err
 	}
 	type paid struct {
-		id     string
-		amount int64
+		id       string
+		amount   int64
+		duration catalog.Duration
 	}
 	orders, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (paid, error) {
 		var p paid
-		err := r.Scan(&p.id, &p.amount)
+		err := r.Scan(&p.id, &p.amount, &p.duration)
 		return p, err
 	})
 	if err != nil {
 		return err
 	}
-	if len(orders) == 0 {
-		return s.refundTransferred(ctx, tx, inst, now)
-	}
+	var ownSecs int64
 	for _, o := range orders {
+		ownSecs += seconds(o.duration)
 		if o.amount > 0 {
 			if _, err := s.d.Wallet.Apply(ctx, tx, wallet.Entry{
 				UserID: inst.UserID, Amount: o.amount, Kind: wallet.KindRefund, RefType: "order", RefID: o.id,
@@ -160,20 +161,28 @@ func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now t
 			return err
 		}
 	}
-	return nil
+	return s.refundTransferred(ctx, tx, inst, max(inst.PendingSeconds-ownSecs, 0), now)
 }
 
-// refundTransferred 换机得到的新实例开通失败：退还转入的剩余时长对应的金额，记到链路上前身实例的订单。
-func (s *Service) refundTransferred(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
+// refundTransferred 换机得到的新实例开通失败：按转入的剩余时长 secs × 前身实例最近一笔可退订单的单价
+// （不超过前身订单的可退上限）从新到旧退还前身实例的订单。非换机实例不做任何事。
+// 前身实例的订单在最新实例（inst，调用方已加锁）的行锁保护下加锁修改。
+func (s *Service) refundTransferred(ctx context.Context, tx pgx.Tx, inst Instance, secs int64, now time.Time) error {
 	chain, err := instanceChain(ctx, tx, inst.ID)
-	if err != nil || len(chain) < 2 {
-		return err
-	}
-	orders, err := refundableOrders(ctx, tx, chain, true)
 	if err != nil {
 		return err
 	}
-	q := quote(inst, orders, now)
+	preds := slices.DeleteFunc(chain, func(id string) bool { return id == inst.ID })
+	if len(preds) == 0 {
+		return nil
+	}
+	orders, err := refundableOrders(ctx, tx, preds, true)
+	if err != nil {
+		return err
+	}
+	snap := inst
+	snap.PendingSeconds = secs
+	q := quote(snap, orders, now)
 	_, err = s.refundAcross(ctx, tx, inst.UserID, orders, q.Suggested, 0, "开通失败退款 "+inst.ID, now)
 	return err
 }

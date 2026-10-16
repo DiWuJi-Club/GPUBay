@@ -200,4 +200,44 @@ func TestCreateFailureAfterMigrationRefundsTransferredTime(t *testing.T) {
 	if e.get(moved.ID).State != rental.StateFailed {
 		t.Fatalf("migrated instance state = %s", e.get(moved.ID).State)
 	}
+	var ref, remark string
+	if err := e.pool.QueryRow(e.ctx, `SELECT ref_id, remark FROM wallet_ledger WHERE kind = 'refund'`).Scan(&ref, &remark); err != nil {
+		t.Fatal(err)
+	}
+	if ref != ord.ID+"-r1" || remark != "开通失败退款 "+moved.ID {
+		t.Fatalf("refund ledger = %q %q", ref, remark)
+	}
+	var alerts int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM alerts WHERE kind = 'create_failed' AND instance_id = $1`, moved.ID).Scan(&alerts); err != nil {
+		t.Fatal(err)
+	}
+	if alerts != 1 {
+		t.Fatalf("create_failed alerts = %d", alerts)
+	}
+}
+
+func TestCreateFailureAfterMigrationWithRenewalRefundsBoth(t *testing.T) {
+	e := newEnv(t, 2)
+	ord, old := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(12 * time.Hour)
+	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "换机")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renew, err := e.svc.Renew(e.ctx, e.userID, moved.ID, catalog.D1d, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.ack(false)
+	// 续费全额退回，转入的 12 小时退 3450 分
+	if got, want := e.balance(e.userID), int64(startFunds-6900-6900+6900+3450); got != want {
+		t.Fatalf("balance = %d, want %d", got, want)
+	}
+	if s, r := e.orderState(ord.ID); s != "partially_refunded" || r != 3450 {
+		t.Fatalf("original order = %s %d", s, r)
+	}
+	if s, r := e.orderState(renew.ID); s != "refunded" || r != 6900 {
+		t.Fatalf("renewal order = %s %d", s, r)
+	}
 }
