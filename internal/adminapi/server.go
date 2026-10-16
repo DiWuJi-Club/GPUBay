@@ -45,7 +45,6 @@ type Server struct {
 	Clock        clock.Clock
 	Log          *slog.Logger
 	SecureCookie bool // 生产环境为 true：Cookie 仅经 HTTPS 发送
-	TrustProxy   bool // 仅当部署在会改写转发头的反向代理之后才设为 true
 
 	limiter *ipLimiter
 	routes  []Route
@@ -70,9 +69,8 @@ func (s *Server) Router() http.Handler {
 	s.routes = nil
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	if s.TrustProxy {
-		r.Use(middleware.RealIP)
-	}
+	// 后台只在内网监听，不使用 RealIP：任何内网客户端都能伪造 X-Forwarded-For，
+	// 会绕过按 IP 的登录限流并伪造审计日志里的 IP。始终以连接的 RemoteAddr 为准。
 	r.Use(httpx.Recoverer(s.Log), httpx.NoStore, s.requireJSONForWrites)
 	r.Route(prefix, func(r chi.Router) {
 		r.With(s.rateLimit).Post("/auth/login", s.handleLogin)

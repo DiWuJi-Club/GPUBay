@@ -1,6 +1,7 @@
 package adminapi_test
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -157,5 +158,30 @@ func TestAdminWritesRequireJSON(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("text/plain login = %d", resp.StatusCode)
+	}
+}
+
+// 后台端口不信任 X-Forwarded-For：轮换转发头也不能绕过按 IP 的登录限流。
+func TestLoginRateLimitIgnoresForwardedFor(t *testing.T) {
+	e := newEnv(t)
+	body := []byte(`{"username":"nobody","password":"whatever password"}`)
+	login := func(i int) int {
+		req, _ := http.NewRequest("POST", e.ts.URL+"/admin/api/v1/auth/login", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("10.9.%d.%d", i/250, i%250+1))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for i := 0; i < 20; i++ {
+		if code := login(i); code != 401 {
+			t.Fatalf("attempt %d = %d", i+1, code)
+		}
+	}
+	if code := login(20); code != 429 {
+		t.Fatalf("21st attempt with a new X-Forwarded-For = %d, want 429", code)
 	}
 }

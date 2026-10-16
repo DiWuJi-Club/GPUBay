@@ -148,7 +148,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
 	adminSrv := &adminapi.Server{
 		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads,
-		Clock: clk, Log: log, SecureCookie: cfg.Env == "prod", TrustProxy: cfg.TrustProxy,
+		Clock: clk, Log: log, SecureCookie: cfg.Env == "prod",
 	}
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router()}, nil
 }
