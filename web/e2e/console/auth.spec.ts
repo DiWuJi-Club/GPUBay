@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
-import { loginConsole, nav, seedUser } from '../helpers/console'
+import { adminApi, adminPost, createAdmin } from '../helpers/admin'
+import { loginConsole, nav, seedUser, toast } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { uniquePhone } from '../helpers/phone'
 
@@ -77,4 +78,22 @@ test('C-AUTH-05 退出登录后回到登录页，再访问受保护页被重定�
   await expect(page).toHaveURL(/\/login$/)
   await page.goto('/wallet')
   await expect(page).toHaveURL(/\/login\?redirect=(%2F|\/)wallet$/)
+})
+
+test('C-AUTH-07 封禁：已登录用户下一次请求跳登录；封禁用户登录提示账号已被封禁', async ({ page }, info) => {
+  const u = await seedUser()
+  await loginConsole(page, u.phone)
+  const admin = await createAdmin('ops')
+  await adminPost(await adminApi(admin), admin, `/admin/api/v1/users/${u.id}/ban`, { reason: 'e2e 测试封禁' })
+  await nav(page, info, 'instances') // 后端已删除会话 → 401 → 跳登录并提示
+  await expect(page).toHaveURL(/\/login\?redirect=(%2F|\/)instances$/)
+  await toast(page, '请先登录')
+  await hooks.advance(61)
+  await page.getByTestId('login-phone').fill(u.phone)
+  await page.getByTestId('login-send').click()
+  await page.getByTestId('login-code').fill('000000')
+  await page.getByTestId('login-submit').click()
+  await toast(page, '账号已被封禁')
+  await expect(page).toHaveURL(/\/login\?redirect=(%2F|\/)instances$/) // 登录被拒，停留在登录页
+  await expect(page.getByTestId('login-submit')).toBeVisible()
 })

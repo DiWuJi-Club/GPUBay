@@ -82,3 +82,15 @@ export async function adminSend<T = Record<string, unknown>>(ctx: APIRequestCont
 }
 export const adminPost = <T = Record<string, unknown>>(ctx: APIRequestContext, admin: SeededAdmin, path: string, data: Record<string, unknown> = {}) => adminSend<T>(ctx, admin, 'post', path, data)
 export const adminPut = <T = Record<string, unknown>>(ctx: APIRequestContext, admin: SeededAdmin, path: string, data: Record<string, unknown> = {}) => adminSend<T>(ctx, admin, 'put', path, data)
+
+/** 把当前全部空闲机器置为维护中：数据库整轮共享，「没有空闲机器」只能这样构造。 */
+export async function drainIdleMachines(ctx: APIRequestContext, admin: SeededAdmin) {
+  for (let round = 0; round < 10; round++) {
+    const r = await ctx.get('/admin/api/v1/machines?state=idle&page_size=100')
+    if (!r.ok()) throw new Error(`GET machines ${r.status()} ${await r.text()}`)
+    const { items } = (await r.json()) as { items: { id: number }[] }
+    if (items.length === 0) return
+    for (const m of items) await adminPost(ctx, admin, `/admin/api/v1/machines/${m.id}/maintenance`, { on: true })
+  }
+  throw new Error('drainIdleMachines: 10 轮后仍有空闲机器')
+}
