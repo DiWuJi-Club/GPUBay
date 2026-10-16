@@ -114,3 +114,25 @@ func TestImageRefIgnoresEnabledFlag(t *testing.T) {
 		t.Fatalf("missing image = %v", err)
 	}
 }
+
+func TestNamesIgnoreStatusAndEnabled(t *testing.T) {
+	pool := dbtest.New(t)
+	svc := catalog.NewService(pool)
+	ctx := context.Background()
+	pid, iid := dbtest.ProductID(t, pool), dbtest.ImageID(t, pool)
+	if _, err := pool.Exec(ctx, `UPDATE images SET enabled = false WHERE id = $1`, iid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE products SET status = 'inactive' WHERE id = $1`, pid); err != nil {
+		t.Fatal(err)
+	}
+	if name, err := svc.ProductName(ctx, pid); err != nil || name != "DGX Spark 整机" {
+		t.Fatalf("ProductName = %q, %v", name, err)
+	}
+	if name, err := svc.ImageName(ctx, iid); err != nil || name != "Ubuntu 24.04 + CUDA" {
+		t.Fatalf("ImageName = %q, %v", name, err)
+	}
+	if _, err := svc.ImageName(ctx, 999999); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("missing image = %v, want not_found", err)
+	}
+}

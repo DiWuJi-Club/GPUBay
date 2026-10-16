@@ -160,3 +160,23 @@ func (s *Service) ProductIDByCode(ctx context.Context, code string) (int64, erro
 	}
 	return id, err
 }
+
+// ProductName 返回商品名称，不受上下架状态影响（用户端展示历史实例用）。
+func (s *Service) ProductName(ctx context.Context, id int64) (string, error) {
+	var name string
+	err := s.pool.QueryRow(ctx, `SELECT name FROM products WHERE id = $1`, id).Scan(&name)
+	if db.IsNoRows(err) {
+		return "", apperr.ErrNotFound
+	}
+	return name, err
+}
+
+// ImageName 返回镜像名称，不受启用状态影响（镜像停用后用户仍能看到自己实例的镜像名）。
+func (s *Service) ImageName(ctx context.Context, id int64) (string, error) {
+	var name string
+	err := s.pool.QueryRow(ctx, `SELECT name FROM images WHERE id = $1`, id).Scan(&name)
+	if db.IsNoRows(err) {
+		return "", apperr.ErrNotFound
+	}
+	return name, err
+}

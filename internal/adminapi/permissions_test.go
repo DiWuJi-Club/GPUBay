@@ -42,8 +42,8 @@ var expectedRoutes = []struct {
 	{"GET", "/orders", finance}, {"GET", "/orders/export", finance}, {"GET", "/ledger", finance}, {"GET", "/ledger/export", finance},
 	{"GET", "/recharges", finance}, {"GET", "/recharges/export", finance},
 
-	{"GET", "/products", super}, {"PUT", "/products/{id}/prices/{duration}", super},
-	{"GET", "/images", super}, {"POST", "/images", super}, {"PUT", "/images/{id}", super},
+	{"GET", "/products", all}, {"PUT", "/products/{id}/prices/{duration}", super},
+	{"GET", "/images", all}, {"POST", "/images", super}, {"PUT", "/images/{id}", super},
 	{"GET", "/audit", all}, {"GET", "/dashboard", all},
 }
 

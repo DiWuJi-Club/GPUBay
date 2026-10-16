@@ -62,6 +62,7 @@ func (s *Server) Router() http.Handler {
 			r.Use(httpx.NoStore, s.requireUser)
 			r.Get("/me", s.handleMe)
 			r.Post("/uploads", s.handleUpload)
+			r.Get("/kyc", s.handleMyKYC)
 			r.Post("/kyc/personal", s.handleKYCPersonal)
 			r.Post("/kyc/enterprise", s.handleKYCEnterprise)
 			r.Get("/wallet", s.handleWallet)

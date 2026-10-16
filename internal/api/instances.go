@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -8,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/rental"
 )
 
@@ -19,6 +22,8 @@ type instanceView struct {
 	State            string     `json:"state"`
 	ProductID        int64      `json:"product_id"`
 	ImageID          int64      `json:"image_id"`
+	ProductName      string     `json:"product_name"`
+	ImageName        string     `json:"image_name"`
 	Suspended        bool       `json:"suspended"`
 	ExpiresAt        *time.Time `json:"expires_at"`
 	RemainingSeconds int64      `json:"remaining_seconds"`
@@ -45,6 +50,60 @@ func (s *Server) view(i rental.Instance) instanceView {
 	return v
 }
 
+// nameCache 在一次请求内去重商品 / 镜像名称查询（列表最多 100 条，通常只有 1 个商品、几个镜像）。
+type nameCache struct {
+	products, images map[int64]string
+}
+
+func newNameCache() *nameCache {
+	return &nameCache{products: map[int64]string{}, images: map[int64]string{}}
+}
+
+func (c *nameCache) lookup(cache map[int64]string, id int64, fetch func() (string, error)) (string, error) {
+	if n, ok := cache[id]; ok {
+		return n, nil
+	}
+	n, err := fetch()
+	if errors.Is(err, apperr.ErrNotFound) { // 商品与镜像没有删除接口；兜底显示空名称而不是报错
+		n, err = "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	cache[id] = n
+	return n, nil
+}
+
+// viewNamed 在基础视图上补上商品名与镜像名。
+func (s *Server) viewNamed(ctx context.Context, i rental.Instance, nc *nameCache) (instanceView, error) {
+	v := s.view(i)
+	var err error
+	if v.ProductName, err = nc.lookup(nc.products, i.ProductID, func() (string, error) { return s.Catalog.ProductName(ctx, i.ProductID) }); err != nil {
+		return v, err
+	}
+	if v.ImageName, err = nc.lookup(nc.images, i.ImageID, func() (string, error) { return s.Catalog.ImageName(ctx, i.ImageID) }); err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
+func (s *Server) viewOne(ctx context.Context, i rental.Instance) (instanceView, error) {
+	return s.viewNamed(ctx, i, newNameCache())
+}
+
+func (s *Server) views(ctx context.Context, insts []rental.Instance) ([]instanceView, error) {
+	nc := newNameCache()
+	out := make([]instanceView, 0, len(insts))
+	for _, i := range insts {
+		v, err := s.viewNamed(ctx, i, nc)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProductID int64  `json:"product_id"`
@@ -63,7 +122,12 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"order": ord, "instance": s.view(inst)})
+	v, err := s.viewOne(r.Context(), inst)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"order": ord, "instance": v})
 }
 
 func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
@@ -81,9 +145,10 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	views := make([]instanceView, 0, len(insts))
-	for _, i := range insts {
-		views = append(views, s.view(i))
+	views, err := s.views(r.Context(), insts)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, list(views))
 }
@@ -94,7 +159,12 @@ func (s *Server) handleInstance(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.view(inst))
+	v, err := s.viewOne(r.Context(), inst)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
 }
 
 func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
