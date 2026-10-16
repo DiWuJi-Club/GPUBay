@@ -30,8 +30,18 @@ test('C-INS-01 六种状态同时展示，标签文案与颜色正确，按创�
   await api.post(`/api/v1/instances/${wiping}/release`, { data: {} })
   const creating = await next()
 
+  // 首次加载失败：显示重试（无轮询兜底）；连续失败只弹一次错误提示；故障恢复后点重试出现列表
+  let fail = true
+  await page.route('**/api/v1/instances', (route) => (fail ? route.fulfill({ status: 500, contentType: 'application/json', body: '{"code":"internal","message":"boom"}' }) : route.fallback()))
   await loginConsole(page, u.phone)
   await nav(page, info, 'instances')
+  await expect(page.getByTestId('instances-error')).toBeVisible()
+  await page.getByTestId('instances-retry').click()
+  await expect(page.getByTestId('instances-error')).toBeVisible()
+  await expect(page.locator('.el-message--error')).toHaveCount(1)
+  fail = false
+  await page.getByTestId('instances-retry').click()
+  await expect(page.getByTestId('instances-error')).toHaveCount(0)
   const expectedOrder = [creating, wiping, running, failed, released, stopped]
   await expect(page.getByTestId('instance-id')).toHaveText(expectedOrder)
   const states = { creating, wiping, running, failed, released, stopped }
@@ -58,6 +68,7 @@ test('C-INS-02 开通中实例每 10 秒自动刷新为运行中', async ({ page
   const row = instanceRow(page, info, id)
   await expect(row.getByTestId('instance-state')).toHaveText('开通中')
   await hooks.agent()
+  await expect(row.getByTestId('instance-state')).toHaveText('开通中') // 后端已开通但页面尚未轮询，证明下面的变化来自 10 秒轮询
   await page.clock.runFor(10_000)
   await expect(row.getByTestId('instance-state')).toHaveText('运行中')
   await expect(row.getByTestId('instance-time')).toHaveText(/^剩余 /)

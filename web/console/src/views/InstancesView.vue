@@ -13,18 +13,27 @@ const fetchedAt = ref(0)
 const loading = ref(true)
 const loadError = ref('')
 const now = useTicker()
+let failing = false
 
 async function load() {
   try {
     items.value = (await api.get<Listed<Instance>>('/instances')).items // 后端已按创建时间倒序、最多 100 条
     fetchedAt.value = Date.now()
     loadError.value = ''
+    failing = false
   } catch (e) {
-    notifyError(e)
+    if (!failing) notifyError(e) // 持续故障只提示一次，成功后复位
+    failing = true
     if (fetchedAt.value === 0) loadError.value = messageOf(e) // 首次加载失败才占位；轮询失败只提示
   } finally {
     loading.value = false
   }
+}
+
+async function retry() {
+  loading.value = true
+  loadError.value = ''
+  await load()
 }
 
 const busy = computed(() => items.value.some((i) => i.state === 'creating' || i.state === 'wiping'))
@@ -41,7 +50,9 @@ const rows = computed(() =>
 
 <template>
   <div class="instances">
-    <el-alert v-if="loadError" type="error" :title="loadError" show-icon :closable="false" />
+    <el-alert v-if="loadError" type="error" :title="loadError" show-icon :closable="false" data-testid="instances-error">
+      <el-button size="small" data-testid="instances-retry" @click="retry">重试</el-button>
+    </el-alert>
     <el-skeleton v-else-if="loading" :rows="4" animated />
     <el-empty v-else-if="rows.length === 0" description="还没有实例，去算力市场租一台吧" data-testid="instances-empty">
       <router-link to="/market"><el-button type="primary">去算力市场</el-button></router-link>
