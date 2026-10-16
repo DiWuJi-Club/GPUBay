@@ -427,3 +427,40 @@ func TestSecureCookieOutsideDev(t *testing.T) {
 		ts.Close()
 	}
 }
+
+// TestDisableRateLimitsLiftsBothLimits 核对 DisableRateLimits 确实放开了验证码按 IP 每小时上限（默认 30）
+// 与后台登录按 IP 每分钟上限（默认 20）；未设置时同样的请求序列会在第 31 / 21 次被限流。
+func TestDisableRateLimitsLiftsBothLimits(t *testing.T) {
+	const smsTries, loginTries = 31, 21
+	for _, disabled := range []bool{false, true} {
+		cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+		a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0), DisableRateLimits: disabled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		post := func(h http.Handler, path, body string) int {
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.RemoteAddr = "192.0.2.7:4000"
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		smsLast := 0
+		for i := 0; i < smsTries; i++ { // 不同手机号、同一 IP，避开按手机号的间隔与日上限
+			smsLast = post(a.Handler, "/api/v1/auth/sms-code", fmt.Sprintf(`{"phone":"1380000%04d"}`, i))
+		}
+		loginLast := 0
+		for i := 0; i < loginTries; i++ {
+			loginLast = post(a.AdminHandler, "/admin/api/v1/auth/login", `{"username":"nobody","password":"wrong-password"}`)
+		}
+		wantSMS, wantLogin := http.StatusTooManyRequests, http.StatusTooManyRequests
+		if disabled {
+			wantSMS, wantLogin = http.StatusOK, http.StatusUnauthorized
+		}
+		if smsLast != wantSMS || loginLast != wantLogin {
+			t.Fatalf("disabled=%v: sms #%d = %d (want %d), admin login #%d = %d (want %d)",
+				disabled, smsTries, smsLast, wantSMS, loginTries, loginLast, wantLogin)
+		}
+	}
+}
