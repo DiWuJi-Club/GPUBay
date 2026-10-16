@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { brand, isApiError, messageOf, type User } from '@spark/shared'
-import { ElMessage } from 'element-plus'
-import { computed, onUnmounted, ref } from 'vue'
+import { brand, isApiError, useCountdown, type User } from '@spark/shared'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { isValidPhone, normalizeCode, normalizePhone } from '../logic/login'
+import { notifyError } from '../logic/notify'
 import { safeRedirect } from '../router'
 import { setUser } from '../store/session'
 
@@ -16,18 +16,10 @@ const phoneError = ref('')
 const codeError = ref('')
 const sending = ref(false)
 const submitting = ref(false)
-const countdown = ref(0) // 只在内存，刷新即重置；服务端仍有 60 秒限制
-let timer: ReturnType<typeof setInterval> | undefined
+// 只在内存，刷新即重置；服务端仍有 60 秒限制。按真实流逝时间计算，后台标签页定时器被节流也不会多等
+const { remaining: countdown, start: startCountdown } = useCountdown()
 const sendLabel = computed(() => (countdown.value > 0 ? `${countdown.value} 秒后重发` : '发送验证码'))
 const logo = import.meta.env.BASE_URL + brand.logoUrl
-
-function startCountdown() {
-  countdown.value = 60
-  timer = setInterval(() => {
-    countdown.value -= 1
-    if (countdown.value <= 0) clearInterval(timer)
-  }, 1000)
-}
 
 async function send() {
   const p = normalizePhone(phone.value)
@@ -39,9 +31,9 @@ async function send() {
   sending.value = true
   try {
     await api.post('/auth/sms-code', { phone: p })
-    startCountdown()
+    startCountdown(60)
   } catch (e) {
-    ElMessage.error(messageOf(e)) // rate_limited 等原文提示
+    notifyError(e) // rate_limited 等原文提示
   } finally {
     sending.value = false
   }
@@ -60,13 +52,11 @@ async function submit() {
     await router.replace(safeRedirect(route.query.redirect) ?? '/market')
   } catch (e) {
     if (isApiError(e) && e.code === 'invalid_code') codeError.value = e.message
-    else ElMessage.error(messageOf(e)) // banned → 「账号已被封禁」
+    else notifyError(e) // banned → 「账号已被封禁」
   } finally {
     submitting.value = false
   }
 }
-
-onUnmounted(() => clearInterval(timer))
 </script>
 
 <template>
@@ -74,12 +64,12 @@ onUnmounted(() => clearInterval(timer))
     <el-card class="login-card" data-testid="login-card">
       <h1 class="brand"><img :src="logo" alt="" width="32" height="32" /> {{ brand.name }}</h1>
       <el-form label-position="top" @submit.prevent="submit">
-        <el-form-item label="手机号" :error="phoneError">
+        <el-form-item label="手机号" :error="phoneError" data-testid="login-phone-item">
           <el-input v-model="phone" data-testid="login-phone" inputmode="tel" autocomplete="tel" maxlength="13" placeholder="请输入手机号" />
         </el-form-item>
-        <el-form-item label="验证码" :error="codeError">
+        <el-form-item label="验证码" :error="codeError" data-testid="login-code-item">
           <div class="code-row">
-            <el-input v-model="code" data-testid="login-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6 位验证码" />
+            <el-input v-model="code" data-testid="login-code" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码" />
             <el-button data-testid="login-send" :disabled="countdown > 0 || sending" :loading="sending" @click="send">{{ sendLabel }}</el-button>
           </div>
         </el-form-item>

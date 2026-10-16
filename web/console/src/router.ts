@@ -9,9 +9,9 @@ declare module 'vue-router' {
   }
 }
 
-/** redirect 参数只接受站内相对路径（以 / 开头且不以 // 开头）。 */
+/** redirect 参数只接受站内相对路径：以 / 开头、不以 // 开头、不含反斜杠（浏览器把 /\evil.com 当作 //evil.com）。 */
 export function safeRedirect(v: unknown): string | null {
-  return typeof v === 'string' && v.startsWith('/') && !v.startsWith('//') ? v : null
+  return typeof v === 'string' && v.startsWith('/') && !v.startsWith('//') && !v.includes('\\') ? v : null
 }
 
 export const router = createRouter({

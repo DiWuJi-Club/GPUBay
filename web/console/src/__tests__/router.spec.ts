@@ -8,6 +8,8 @@ describe('safeRedirect', () => {
     expect(safeRedirect('//evil.com')).toBeNull()
     expect(safeRedirect('https://evil.com')).toBeNull()
     expect(safeRedirect(['/a'])).toBeNull()
+    expect(safeRedirect('/\\evil.com')).toBeNull()
+    expect(safeRedirect('/a\\b')).toBeNull()
     expect(safeRedirect(undefined)).toBeNull()
   })
 })

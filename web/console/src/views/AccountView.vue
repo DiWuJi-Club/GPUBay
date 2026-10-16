@@ -3,6 +3,7 @@ import { fmtTime, kycStatusLabel, labelOf } from '@spark/shared'
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '../api'
+import { notifyError } from '../logic/notify'
 import { clearSession, session } from '../store/session'
 
 const router = useRouter()
@@ -12,6 +13,8 @@ async function logout() {
   loggingOut.value = true
   try {
     await api.post('/auth/logout')
+  } catch (e) {
+    notifyError(e) // 失败也在本地清会话并回登录页
   } finally {
     clearSession()
     loggingOut.value = false
