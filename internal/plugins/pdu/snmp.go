@@ -54,7 +54,7 @@ func (s *SNMP) connect(ctx context.Context) (*gosnmp.GoSNMP, error) {
 		host, port = h, uint16(n)
 	}
 	g := &gosnmp.GoSNMP{Target: host, Port: port, Community: s.cfg.Community, Version: gosnmp.Version2c,
-		Timeout: s.cfg.Timeout, Retries: 1, Context: ctx}
+		Timeout: s.cfg.Timeout, Retries: 0, Context: ctx}
 	if err := g.Connect(); err != nil {
 		return nil, fmt.Errorf("pdu: 连接 %s: %w", s.cfg.Address, err)
 	}

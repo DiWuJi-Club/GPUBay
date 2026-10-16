@@ -178,6 +178,15 @@ func (s *Service) UpdatePDU(ctx context.Context, actor audit.Actor, id int64, in
 	now := s.clock.Now()
 	var p PDU
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		var stored []byte
+		if err := tx.QueryRow(ctx, `SELECT community_enc FROM pdus WHERE id = $1 FOR UPDATE`, id).Scan(&stored); db.IsNoRows(err) {
+			return apperr.ErrNotFound
+		} else if err != nil {
+			return err
+		}
+		if in.Driver == "snmp" && in.Community == "" && stored == nil {
+			return apperr.BadRequest("请填写 SNMP community")
+		}
 		var err error
 		p, err = scanPDU(tx.QueryRow(ctx, `UPDATE pdus SET name = $2, driver = $3, address = $4,
 				community_enc = COALESCE($5, community_enc), oid_prefix = $6, cycle_value = $7, on_value = $8, updated_at = $9

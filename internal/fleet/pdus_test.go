@@ -195,3 +195,23 @@ func TestPowerCycleRejectsMockPDUWhenNotAllowed(t *testing.T) {
 		t.Fatalf("mock pdu in prod = %v", err)
 	}
 }
+
+func TestUpdatePDUMockToSNMPNeedsCommunity(t *testing.T) {
+	svc, _, _ := newEnv(t)
+	configurePDU(t, svc, true)
+	ctx := context.Background()
+	p, err := svc.CreatePDU(ctx, ops, fleet.PDUInput{Name: "dev", Driver: "mock", Address: "127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := snmpInput("dev")
+	in.Community = ""
+	if _, err := svc.UpdatePDU(ctx, ops, p.ID, in); codeOf(err) != "bad_request" {
+		t.Fatalf("mock->snmp without community = %v", err)
+	}
+	in.Community = "now-set"
+	got, err := svc.UpdatePDU(ctx, ops, p.ID, in)
+	if err != nil || !got.HasCommunity || got.Driver != "snmp" {
+		t.Fatalf("update = %+v, %v", got, err)
+	}
+}
