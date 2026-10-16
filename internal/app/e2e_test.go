@@ -3,12 +3,18 @@ package app_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -209,5 +215,46 @@ func TestBuildRejectsMockPayInProd(t *testing.T) {
 		PayDriver: "mock", UploadDir: t.TempDir()}
 	if _, err := app.Build(cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{}); err == nil {
 		t.Fatal("expected error for mock pay in prod")
+	}
+}
+
+// writeKeys 生成一对测试 RSA 密钥，按 PKCS#8 私钥与 PKIX 公钥写入 PEM 文件。
+func writeKeys(t *testing.T, dir, name string) (string, string) {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privDER, _ := x509.MarshalPKCS8PrivateKey(k)
+	pubDER, _ := x509.MarshalPKIXPublicKey(&k.PublicKey)
+	priv, pub := filepath.Join(dir, name+".pem"), filepath.Join(dir, name+"_pub.pem")
+	if err := os.WriteFile(priv, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pub, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return priv, pub
+}
+
+func TestBuildWiresRealPayProviders(t *testing.T) {
+	dir := t.TempDir()
+	wxPriv, wxPub := writeKeys(t, dir, "wechat")
+	aliPriv, aliPub := writeKeys(t, dir, "alipay")
+	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock",
+		PayDriver: "real", PublicBaseURL: "https://spark.test", UploadDir: t.TempDir(),
+		Wechat: config.WechatConfig{MchID: "1900000001", AppID: "wx123", APIv3Key: "0123456789abcdef0123456789abcdef",
+			CertSerial: "SERIAL", PrivateKeyPath: wxPriv, PublicKeyID: "PUB_KEY_ID_1", PublicKeyPath: wxPub},
+		Alipay: config.AlipayConfig{AppID: "2021000000000001", PrivateKeyPath: aliPriv, PublicKeyPath: aliPub, Sandbox: true}}
+	a, err := app.Build(cfg, dbtest.New(t), slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Billing.Channels(); len(got) != 2 || got[0] != "alipay" || got[1] != "wechat" {
+		t.Fatalf("channels = %v", got)
+	}
+	cfg.Wechat.PrivateKeyPath = filepath.Join(dir, "missing.pem")
+	if _, err := app.Build(cfg, dbtest.New(t), slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{}); err == nil {
+		t.Fatal("missing key file must fail")
 	}
 }

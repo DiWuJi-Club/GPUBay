@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/wechatpay-apiv3/wechatpay-go/utils"
 
 	"spark-cloud/internal/api"
 	"spark-cloud/internal/billing"
@@ -119,7 +121,10 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 			providers = map[string]pay.Provider{pay.ChannelWechat: m, pay.ChannelAlipay: m}
 			devPay = cfg.Env != "prod"
 		case "real":
-			return nil, errors.New("真实支付渠道尚未接入")
+			var err error
+			if providers, err = realProviders(cfg); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, fmt.Errorf("未知的支付驱动 %q", cfg.PayDriver)
 		}
@@ -158,4 +163,41 @@ func (n expiryNotifier) NotifyExpiry(ctx context.Context, userID int64, instance
 		hours = 1
 	}
 	return n.sms.Send(ctx, u.Phone, sms.TemplateExpiryReminder, map[string]string{"instance": instanceID, "hours": strconv.Itoa(hours)})
+}
+
+// realProviders 按配置读取密钥文件，创建已启用的真实支付渠道。
+func realProviders(cfg config.Config) (map[string]pay.Provider, error) {
+	out := map[string]pay.Provider{}
+	if w := cfg.Wechat; w.Enabled() {
+		priv, err := utils.LoadPrivateKeyWithPath(w.PrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("读取微信支付商户私钥: %w", err)
+		}
+		pub, err := utils.LoadPublicKeyWithPath(w.PublicKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("读取微信支付公钥: %w", err)
+		}
+		p, err := pay.NewWechat(context.Background(), pay.WechatConfig{MchID: w.MchID, AppID: w.AppID, APIv3Key: w.APIv3Key,
+			CertSerial: w.CertSerial, PrivateKey: priv, PublicKeyID: w.PublicKeyID, PublicKey: pub})
+		if err != nil {
+			return nil, err
+		}
+		out[pay.ChannelWechat] = p
+	}
+	if a := cfg.Alipay; a.Enabled() {
+		priv, err := os.ReadFile(a.PrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("读取支付宝应用私钥: %w", err)
+		}
+		pub, err := os.ReadFile(a.PublicKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("读取支付宝公钥: %w", err)
+		}
+		p, err := pay.NewAlipay(pay.AlipayConfig{AppID: a.AppID, PrivateKeyPEM: string(priv), AlipayPublicKeyPEM: string(pub), Production: !a.Sandbox})
+		if err != nil {
+			return nil, err
+		}
+		out[pay.ChannelAlipay] = p
+	}
+	return out, nil
 }
