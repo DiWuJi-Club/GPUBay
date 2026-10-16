@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,17 +12,50 @@ import (
 	"syscall"
 	"time"
 
+	"spark-cloud/internal/admin"
 	"spark-cloud/internal/app"
+	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/platform/secretbox"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "admin" {
+		if err := adminMain(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(log); err != nil {
 		log.Error("platform exited", "err", err)
 		os.Exit(1)
 	}
+}
+
+// adminMain 执行 `platform admin ...`：使用与服务相同的配置连接数据库（会先执行迁移）。
+func adminMain(args []string) error {
+	cfg, err := config.Load(os.Getenv)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	if err := db.Migrate(ctx, cfg.DatabaseURL); err != nil {
+		return err
+	}
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	box, err := secretbox.New(cfg.SecretKey)
+	if err != nil {
+		return err
+	}
+	svc := admin.NewService(admin.Deps{Pool: pool, Clock: clock.Real{}, Box: box})
+	return runAdmin(ctx, svc, args, os.Stdout, terminalPrompter(os.Stdin, os.Stdout))
 }
 
 func run(log *slog.Logger) error {

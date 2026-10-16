@@ -105,3 +105,12 @@ func codeOf(err error) string {
 	}
 	return "raw: " + err.Error()
 }
+
+func secretFromURI(t *testing.T, uri string) string {
+	t.Helper()
+	u, err := url.Parse(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Query().Get("secret")
+}
