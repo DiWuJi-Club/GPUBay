@@ -25,6 +25,7 @@ import (
 	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/sms"
 	"spark-cloud/internal/rental"
+	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
 )
 
@@ -51,7 +52,12 @@ func newTestEnv(t *testing.T) *testEnv {
 	c := catalog.NewService(pool)
 	f := fleet.NewService(pool, clk)
 	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: w, Catalog: c, Fleet: f, Notifier: rentalNoop{}})
-	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Clock: clk,
+	disk, err := storage.NewLocalDisk(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploads := storage.NewService(pool, clk, disk)
+	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test"}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)

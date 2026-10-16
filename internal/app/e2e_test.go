@@ -57,7 +57,7 @@ func TestFullRentalLifecycle(t *testing.T) {
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
 	smsMock := &sms.Mock{}
-	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock"}
+	cfg := config.Config{Env: "dev", UploadDir: t.TempDir(), Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock"}
 	a, err := app.Build(cfg, pool, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{Clock: clk, SMS: smsMock})
 	if err != nil {
 		t.Fatal(err)

@@ -22,6 +22,7 @@ import (
 	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/sms"
 	"spark-cloud/internal/rental"
+	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
 )
 
@@ -38,6 +39,7 @@ type App struct {
 	Catalog  *catalog.Service
 	Fleet    *fleet.Service
 	Rental   *rental.Service
+	Uploads  *storage.Service
 	Handler  http.Handler
 }
 
@@ -75,6 +77,11 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	if cfg.SMSDriver == "mock" && cfg.Env != "prod" {
 		fixedCode = "000000"
 	}
+	disk, err := storage.NewLocalDisk(cfg.UploadDir)
+	if err != nil {
+		return nil, err
+	}
+	uploads := storage.NewService(pool, clk, disk)
 
 	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: smsSender, KYC: verifier, Box: box, FixedCode: fixedCode})
 	w := wallet.NewService(pool, clk)
@@ -85,10 +92,10 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Notifier: expiryNotifier{ids: ids, sms: smsSender},
 	})
 	srv := &api.Server{
-		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Clock: clk, Log: log,
+		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk, Log: log,
 		Domain: cfg.Domain, SecureCookie: cfg.Env == "prod", TrustProxy: cfg.TrustProxy,
 	}
-	return &App{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Handler: srv.Router()}, nil
+	return &App{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Handler: srv.Router()}, nil
 }
 
 // expiryNotifier 通过短信发送到期提醒。

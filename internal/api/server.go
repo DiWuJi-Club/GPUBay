@@ -18,6 +18,7 @@ import (
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/rental"
+	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
 )
 
@@ -27,6 +28,7 @@ type Server struct {
 	Catalog      *catalog.Service
 	Fleet        *fleet.Service
 	Rental       *rental.Service
+	Uploads      *storage.Service
 	Clock        clock.Clock
 	Log          *slog.Logger
 	Domain       string // 用于生成 SSH 命令，例如 spark.example.com
@@ -55,6 +57,7 @@ func (s *Server) Router() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(noStore, s.requireUser)
 			r.Get("/me", s.handleMe)
+			r.Post("/uploads", s.handleUpload)
 			r.Post("/kyc/personal", s.handleKYCPersonal)
 			r.Post("/kyc/enterprise", s.handleKYCEnterprise)
 			r.Get("/wallet", s.handleWallet)
@@ -91,12 +94,20 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 	})
 }
 
-// requireJSONForWrites 要求所有写请求使用 application/json；浏览器跨站表单无法伪造该类型，兼作 CSRF 防护。
+// requireJSONForWrites 要求写请求使用 application/json（上传接口要求 multipart/form-data）。
+// 浏览器跨站表单无法伪造 JSON 类型，兼作 CSRF 防护；上传接口依赖 SameSite=Lax 会话 Cookie 防跨站提交。
 func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions &&
-			!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-			s.writeError(w, r, apperr.BadRequest("请求格式必须为 JSON"))
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		want, msg := "application/json", "请求格式必须为 JSON"
+		if r.URL.Path == uploadPath {
+			want, msg = "multipart/form-data", "请使用 multipart/form-data 上传文件"
+		}
+		if !strings.HasPrefix(r.Header.Get("Content-Type"), want) {
+			s.writeError(w, r, apperr.BadRequest(msg))
 			return
 		}
 		next.ServeHTTP(w, r)
