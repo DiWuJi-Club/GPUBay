@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { alertKindLabel, auditActions, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel } from '../labels'
+import { alertKindLabel, auditActions, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel } from '../labels'
 
 describe('labels', () => {
   it('实例状态中文与颜色', () => {
@@ -7,6 +7,9 @@ describe('labels', () => {
     expect(labelOf(instanceStateLabel, 'stopped')).toBe('已到期停机')
     expect(labelOf(instanceStateType, 'running')).toBe('success')
     expect(labelOf(instanceStateType, 'failed')).toBe('danger')
+  })
+  it('指令状态中文', () => {
+    expect(commandStatusLabel).toEqual({ pending: '待执行', sent: '已下发', done: '已完成', failed: '失败' })
   })
   it('未知值原样显示', () => {
     expect(labelOf(ledgerKindLabel, 'mystery')).toBe('mystery')

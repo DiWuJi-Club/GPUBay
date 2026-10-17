@@ -34,6 +34,7 @@ export const durationLabel: LabelMap = { '1d': '1 天', '1w': '1 周', '1m': '1 
 export const commandTypeLabel: LabelMap = {
   create_instance: '开通实例', start_instance: '启动实例', stop_instance: '停止实例', wipe_instance: '洗机',
 }
+export const commandStatusLabel: LabelMap = { pending: '待执行', sent: '已下发', done: '已完成', failed: '失败' }
 
 /** 后台审计动作（与后端写入值一致，顺序按模块）。 */
 export const auditActions: readonly string[] = [
