@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { brand, labelOf, roleLabel, type Paged } from '@spark/shared'
+import { brand, isApiError, labelOf, messageOf, roleLabel, type Paged } from '@spark/shared'
+import { ElMessage } from 'element-plus'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
@@ -48,15 +49,23 @@ onMounted(() => {
 })
 onUnmounted(() => clearInterval(timer))
 
+// 退出请求失败（网络 / 5xx）时服务器上的会话仍然有效：保持登录状态并提示重试，
+// 而不是只清本地状态——那样界面显示已退出，刷新一下又自动登录回来。401 说明会话已失效，照常回登录页。
+const loggingOut = ref(false)
 async function logout() {
+  if (loggingOut.value) return
+  loggingOut.value = true
   try {
     await api.post('/auth/logout')
-  } catch {
-    /* 退出请求失败也在本地清掉会话 */
-  } finally {
-    clearSession()
-    await router.replace('/login')
+  } catch (e) {
+    if (!(isApiError(e) && e.code === 'unauthorized')) {
+      ElMessage.error(`退出失败：${messageOf(e)}。服务器上的登录可能仍然有效，请重试退出；如仍失败请关闭浏览器`)
+      loggingOut.value = false
+      return
+    }
   }
+  clearSession()
+  await router.replace('/login')
 }
 </script>
 
@@ -79,7 +88,7 @@ async function logout() {
           <span data-testid="layout-username">{{ session.admin?.username }}</span>
           <el-tag size="small" data-testid="layout-role">{{ labelOf(roleLabel, session.admin?.role) }}</el-tag>
           <router-link to="/settings" data-testid="layout-settings">个人设置</router-link>
-          <el-button link data-testid="layout-logout" @click="logout">退出</el-button>
+          <el-button link :loading="loggingOut" data-testid="layout-logout" @click="logout">退出</el-button>
         </span>
       </header>
       <main class="content"><slot /></main>

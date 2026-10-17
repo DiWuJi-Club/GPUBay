@@ -1,4 +1,4 @@
-import { expect, request, type APIRequestContext, type Page } from '@playwright/test'
+import { expect, request, type APIRequestContext, type Locator, type Page } from '@playwright/test'
 import { ADMIN_URL, hooks, type Role } from './hooks'
 import { runStamp } from './phone'
 import { totp } from './totp'
@@ -131,4 +131,15 @@ export function drainTasks(page: Page, n = 20) {
         ch.port2.postMessage(0)
       })
   }, n)
+}
+
+/**
+ * 同一个任务里连点两次（中间没有渲染机会，按钮来不及变成 loading 禁用）：
+ * 模拟极快的双击 / 重复提交，专门验证「请求进行中不再提交」的同步守卫。
+ */
+export async function clickTwiceSync(locator: Locator) {
+  await locator.evaluate((el) => {
+    ;(el as HTMLElement).click()
+    ;(el as HTMLElement).click()
+  })
 }

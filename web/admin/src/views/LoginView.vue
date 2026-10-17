@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { brand, isApiError, messageOf, type Admin, type AdminLoginResult } from '@spark/shared'
+import { brand, isApiError, type Admin, type AdminLoginResult } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import QRCode from 'qrcode'
 import { nextTick, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
+import { notifyError } from '../logic/notify'
 import { safeRedirect } from '../router'
 import { setAdmin } from '../store/session'
 
@@ -37,7 +38,7 @@ function fail(e: unknown) {
     password.value = ''
     return
   }
-  ElMessage.error(messageOf(e))
+  notifyError(e)
 }
 
 const target = () => safeRedirect(route.query.redirect) ?? '/'
@@ -59,7 +60,7 @@ async function submitPassword() {
       step.value = 'setup'
     } else step.value = 'totp'
   } catch (e) {
-    ElMessage.error(messageOf(e)) // invalid_credentials / account_locked / rate_limited 原文
+    notifyError(e) // invalid_credentials / account_locked / rate_limited 原文
   } finally {
     busy.value = false
   }

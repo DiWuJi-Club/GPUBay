@@ -98,6 +98,27 @@ test('A-SET-01 修改密码：原密码错误提示；成功后用新密码登�
     await page.unrouteAll()
   })
 
+  await test.step('二次验证弹框：回车在不足 6 位时不提交，满 6 位时提交', async () => {
+    await expect(page.locator('.el-message')).toHaveCount(0, { timeout: 15_000 })
+    await fillPasswords(page, admin.password, newPassword)
+    await scripted(page, '/me/password', [totpRequired, ok])
+    const before = changes.length
+    await page.getByTestId('settings-submit').click()
+    await expect(page.getByTestId('totp-dialog')).toBeVisible()
+    await page.getByTestId('totp-input').fill('12345')
+    await page.getByTestId('totp-input').press('Enter')
+    await settle(page)
+    await expect(page.getByTestId('totp-dialog')).toBeVisible()
+    await expect(page.getByTestId('totp-input')).toHaveValue('12345')
+    expect(changes.length - before).toBe(1) // 没有带 totp 的重发
+    await page.getByTestId('totp-input').fill('123456')
+    await page.getByTestId('totp-input').press('Enter')
+    await toast(page, '密码已修改')
+    await expect(page.getByTestId('totp-dialog')).toBeHidden()
+    expect(changes.slice(before).map((c) => c.body?.totp)).toEqual([undefined, '123456'])
+    await page.unrouteAll()
+  })
+
   await test.step('二次验证弹框是单例：两个请求同时要求动态码只弹一次，输入后都完成', async () => {
     await expect(page.locator('.el-message')).toHaveCount(0, { timeout: 15_000 })
     await fillPasswords(page, admin.password, newPassword)
@@ -108,10 +129,14 @@ test('A-SET-01 修改密码：原密码错误提示；成功后用新密码登�
     await pauseClock(page)
     await page.getByTestId('settings-submit').click()
     await expect(page.getByTestId('totp-dialog')).toBeVisible()
+    await page.getByTestId('totp-input').fill('333')
     await page.clock.runFor(60_000) // 角标刷新也收到 totp_required
     await expect.poll(() => badgeRequests.length).toBe(1)
     await page.clock.resume()
-    await expect(page.getByTestId('totp-dialog')).toHaveCount(1)
+    await settle(page)
+    // 没有第二次弹框：再弹一次会清空输入（promptTotp 重置 code）
+    await expect(page.getByTestId('totp-dialog')).toBeVisible()
+    await expect(page.getByTestId('totp-input')).toHaveValue('333')
     await page.getByTestId('totp-input').fill('333333')
     await page.getByTestId('totp-ok').click()
     await toast(page, '密码已修改')

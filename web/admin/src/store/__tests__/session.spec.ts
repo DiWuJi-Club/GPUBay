@@ -7,6 +7,7 @@ vi.mock('element-plus', () => ({ ElMessage: { warning, error: vi.fn(), success: 
 vi.mock('../../api', () => ({ api: { get: vi.fn() }, onUnauthorized: vi.fn(), onTotpSetupRequired: vi.fn() }))
 
 import { bindRouter, clearSession, handleUnauthorized, hasRole, session, setAdmin } from '../session'
+import { promptTotp, totpState } from '../totp'
 
 const admin = (role: Admin['role']): Admin => ({
   id: 1,
@@ -70,6 +71,20 @@ describe('handleUnauthorized', () => {
     handleUnauthorized()
     expect(warning).not.toHaveBeenCalled()
     expect(router.replace).toHaveBeenCalledWith({ path: '/login', query: { redirect: '/users' } })
+  })
+})
+
+describe('clearSession', () => {
+  it('取消正在等待的动态码弹框：等待者得到 null，弹框关闭', async () => {
+    setAdmin(admin('super'))
+    const p = promptTotp()
+    expect(totpState.visible).toBe(true)
+    const { router } = fakeRouter('/settings')
+    bindRouter(router as never)
+    handleUnauthorized()
+    expect(await p).toBeNull()
+    expect(totpState.visible).toBe(false)
+    expect(session.status).toBe('anon')
   })
 })
 

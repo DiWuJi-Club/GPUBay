@@ -3,6 +3,7 @@ import { ElMessage } from 'element-plus'
 import { reactive } from 'vue'
 import type { Router } from 'vue-router'
 import { api, onTotpSetupRequired, onUnauthorized } from '../api'
+import { cancelTotp } from './totp'
 
 export type SessionStatus = 'unknown' | 'anon' | 'authed'
 
@@ -33,9 +34,11 @@ export function setAdmin(a: Admin) {
   session.status = 'authed'
 }
 
+/** 清会话；正在等待输入的动态码弹框一并取消（等待的请求以 cancelled 结束），不留在登录页上。 */
 export function clearSession() {
   session.admin = null
   session.status = 'anon'
+  cancelTotp()
 }
 
 /** 未指定 roles 视为所有已登录管理员可用。 */

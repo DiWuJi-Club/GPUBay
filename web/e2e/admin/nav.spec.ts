@@ -39,6 +39,39 @@ test('A-NAV-01 菜单按角色过滤', async ({ page }) => {
     await page.getByTestId('layout-collapse').click()
     await expect(page.getByTestId('menu-catalog')).toHaveText('价格与镜像')
     expect(await storage()).toEqual({ local: [['sc_admin_sidebar_collapsed', '0']], session: [] })
+
+    // localStorage 不可用（隐私模式 / 被禁用）：读写都抛错时布局照常渲染、折叠照常切换
+    const p2 = await page.context().newPage()
+    await p2.addInitScript(() => {
+      const w = window as unknown as { __lsThrows: { get: number; set: number } }
+      w.__lsThrows = { get: 0, set: 0 }
+      Storage.prototype.getItem = function () {
+        w.__lsThrows.get++
+        throw new DOMException('denied', 'SecurityError')
+      }
+      Storage.prototype.setItem = function () {
+        w.__lsThrows.set++
+        throw new DOMException('denied', 'SecurityError')
+      }
+    })
+    const pageErrors: string[] = []
+    p2.on('pageerror', (e) => pageErrors.push(e.message))
+    p2.on('console', (m) => {
+      if (m.type() === 'error') pageErrors.push(m.text()) // Vue 捕获事件处理器里的异常后只打到 console.error
+    })
+    await p2.goto('/admin/')
+    await expect(p2.getByTestId('layout-username')).toHaveText(admin.username)
+    await expect(p2.getByTestId('menu-catalog')).toHaveText('价格与镜像')
+    await p2.getByTestId('layout-collapse').click()
+    await expect(p2.getByTestId('menu-catalog')).toHaveText('价格')
+    await p2.getByTestId('layout-collapse').click()
+    await expect(p2.getByTestId('menu-catalog')).toHaveText('价格与镜像')
+    const throws = await p2.evaluate(() => (window as unknown as { __lsThrows: { get: number; set: number } }).__lsThrows)
+    expect(throws.get).toBeGreaterThan(0)
+    expect(throws.set).toBe(2)
+    expect(pageErrors).toEqual([])
+    await p2.close()
+
     await page.getByTestId('layout-logout').click()
     await expectAdminUrl(page, '/login')
   })
