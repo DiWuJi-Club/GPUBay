@@ -23,6 +23,7 @@ const paying = ref(false)
 const canvas = ref<HTMLCanvasElement | null>(null)
 let announcedPaid = false
 let failing = false
+let seq = 0 // 查询序号：只采用最后发出的那次查询的结果
 
 const countdown = useCountdown({
   onZero: async () => {
@@ -33,8 +34,10 @@ const countdown = useCountdown({
 })
 
 async function load() {
+  const mine = ++seq
   try {
     const r = await api.get<Recharge>(`/recharges/${id.value}`)
+    if (mine !== seq) return // 之后又发出过查询：丢弃这次迟到的响应，避免旧的「待支付」覆盖「已支付」
     const wasPending = rch.value?.status === 'pending'
     rch.value = r
     loadError.value = ''
@@ -49,14 +52,16 @@ async function load() {
       // 只在本页看到「待支付 → 已支付」时提示；直接打开已支付的单只显示成功页
       announcedPaid = true
       ElMessage.success('充值成功')
-      void refreshBalance()
+      // 余额刷新失败不影响到账结果（钱包页会自己重新加载），不能变成未处理的 Promise 拒绝
+      refreshBalance().catch(() => {})
     }
   } catch (e) {
+    if (mine !== seq) return
     if (!rch.value) loadError.value = messageOf(e) // 首次加载失败：占位 + 重试
     else if (!failing) notifyError(e) // 轮询失败：同一次故障只提示一次，成功后复位
     failing = true
   } finally {
-    loading.value = false
+    if (mine === seq) loading.value = false
   }
 }
 
@@ -95,8 +100,10 @@ async function mockPay() {
   }
 }
 
+const redirectTo = computed(() => safeRedirect(route.query.redirect))
+const backLabel = computed(() => (redirectTo.value ? '返回' : '返回钱包'))
 function back() {
-  void router.replace(safeRedirect(route.query.redirect) ?? '/wallet')
+  void router.replace(redirectTo.value ?? '/wallet')
 }
 function again() {
   void router.replace('/wallet/recharge')
@@ -116,7 +123,7 @@ function again() {
             <p>到账 {{ fmtYuan(rch.amount) }}</p>
             <p data-testid="rchorder-paid-at">到账时间 {{ fmtTime(rch.paid_at) }}</p>
           </template>
-          <template #extra><el-button type="primary" data-testid="rchorder-back" @click="back">返回</el-button></template>
+          <template #extra><el-button type="primary" data-testid="rchorder-back" @click="back">{{ backLabel }}</el-button></template>
         </el-result>
       </template>
 
