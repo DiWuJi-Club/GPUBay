@@ -7,9 +7,13 @@ DGX Spark 算力租赁平台控制面。设计文档见 `docs/superpowers/specs/
 需要 Go 1.27（本机安装在 `~/.local/go`）。不需要 Docker：测试和本地开发使用嵌入式 PostgreSQL。
 
 ```bash
-make test     # 运行全部测试（首次会下载 PostgreSQL 二进制）
-make devdb    # 终端 1：启动本地数据库（端口 5433）
-make run      # 终端 2：启动 platform（http://localhost:8080）
+make test         # Go 测试 + 前端单测（首次会下载 PostgreSQL 二进制）
+make devdb        # 终端 1：启动本地数据库（端口 5433）
+make run          # 终端 2：启动 platform（控制台 http://localhost:8080 ，后台 http://127.0.0.1:8081/admin/ ，托管上次 make web 的产物）
+make web-install  # 首次：安装前端依赖（Node 22 / npm 10，本机在 ~/.local/bin）
+make web          # 构建前端到 internal/web/dist/{console,admin}（Go embed）
+make e2e          # 端到端：构建前端 → 核对覆盖表 → Playwright（自动拉起 cmd/e2e-server，需要本机 Chrome）
+make check        # test + e2e
 ```
 
 开发环境短信为 mock，验证码固定为 `000000`；实名核验 mock 全部通过。
@@ -26,6 +30,18 @@ SPARK_DATABASE_URL=... SPARK_SECRET_KEY=... go run ./cmd/platform admin create -
 
 按提示输入两次密码（至少 12 位），用验证器 App 扫描终端里的二维码并输入一次动态码完成绑定，然后离线保存打印出的 8 个恢复码。
 管理员丢失手机时用 `platform admin reset-totp --username <名称>` 重置，下次登录重新绑定。
+
+### 前端开发
+
+```bash
+cd web && npm run dev:console   # http://127.0.0.1:5173 ，/api 代理到 8080
+cd web && npm run dev:admin     # http://127.0.0.1:5174/admin/ ，/admin/api 代理到 8081
+```
+
+控制台登录：任意手机号 + 验证码 `000000`；后台管理员用 `platform admin create` 创建。
+端到端测试全量约 10～15 分钟；只跑子集：`cd web && npx playwright test --project=admin` 或 `-g 'C-RCH'`；调试：`npx playwright test --headed --project=console-mobile -g 'C-RCH-04'`，失败的 trace 用 `cd web && npx playwright show-trace test-results/<目录>/trace.zip`（目录在 `web/test-results/` 下）。
+直接运行 `npx playwright test` 不会先构建前端（e2e-server 托管的是 embed 进去的产物），改了页面后先 `make web`。
+CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright install chromium`。
 
 ## 配置（环境变量）
 
@@ -60,9 +76,15 @@ SPARK_DATABASE_URL=... SPARK_SECRET_KEY=... go run ./cmd/platform admin create -
 - 后台端口不要暴露到公网；如必须经过反向代理，请限制来源 IP。
 - `SPARK_UPLOAD_DIR` 存放用户上传的营业执照，需要纳入备份。
 - 支付回调地址需在微信支付商户平台、支付宝开放平台中配置为 `SPARK_PUBLIC_BASE_URL` 下的对应路径。
+- 用户控制台与用户 API 同在 `:8080`（`/` 为页面，`/api/*` 为接口），前面的反向代理不需要额外路由规则；管理后台与后台 API 同在 `:8081`（`/admin/`），仍只监听内网地址。
+- `make build` 会先构建前端再编译后端，二进制内含页面；`index.html` 不缓存，发布后刷新即生效，`assets/` 带内容哈希长缓存。
+- `SPARK_ENV=staging` 与 `prod` 都会给 Cookie 加 `Secure`，所以 staging 必须走 HTTPS。
 
 ## API 约定
 
 - `POST /api/v1/orders` 与 `POST /api/v1/instances/{id}/renew` 支持可选请求头 `Idempotency-Key`（最长 64 字符）。
   同一用户用同一个键重复提交（双击、超时重试）只会扣款一次，并返回首次创建的订单（下单还会返回该实例的当前状态）；
   同一个键被用于不同类型的请求或续费不同实例时返回 409 `idempotency_conflict`。客户端应为每次「新操作」生成新的键（如 UUID）。
+- `GET /api/v1/kyc` 返回用户最近一条实名记录（含驳回原因），没有记录时 `record` 为 `null`；个人姓名只保留首字。
+- 实例视图含 `product_name`、`image_name`（镜像停用后仍返回名称）；充值单视图含 `remaining_seconds`（服务器计算的剩余支付秒数）。
+- 后台 `GET /admin/api/v1/products`、`GET /admin/api/v1/images` 对全部角色可读；`GET /admin/api/v1/audit` 每条含 `actor_name`。
