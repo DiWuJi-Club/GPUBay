@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -25,6 +26,9 @@ import (
 
 // SeedPassword 是钩子创建的管理员的固定密码。
 const SeedPassword = "e2e-password-123456"
+
+// machineBatch 为未指定前缀的 /hooks/machines 调用编号。
+var machineBatch atomic.Int64
 
 type Server struct {
 	App   *app.App
@@ -229,7 +233,8 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 	}
 	prefix := req.SerialPrefix
 	if prefix == "" {
-		prefix = "E2E-" + randx.Digits(6) + "-"
+		// 随机 6 位在一次全量运行的几百次调用里会生日碰撞（duplicate_serial）；加进程内递增序号保证唯一
+		prefix = fmt.Sprintf("E2E-%s-%d-", randx.Digits(6), machineBatch.Add(1))
 	}
 	pid, err := s.App.Catalog.ProductIDByCode(ctx, "spark-1")
 	if err != nil {

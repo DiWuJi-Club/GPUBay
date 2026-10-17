@@ -106,6 +106,16 @@ func TestMachinesUsersAgentAndSweep(t *testing.T) {
 	if m, err := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), mid); err != nil || !m.AgentOnline || m.State != "idle" || m.Serial != "T-1" {
 		t.Fatalf("machine = %+v, %v", m, err)
 	}
+	// 未指定前缀时多次调用不能撞序列号（随机 6 位曾在全量 e2e 中生日碰撞出 duplicate_serial）
+	serials := map[string]bool{}
+	for i := 0; i < 300; i++ {
+		got := e.must("POST", "/hooks/machines", map[string]any{"count": 1})["ids"].([]any)
+		m, err := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), int64(got[0].(float64)))
+		if err != nil || serials[m.Serial] {
+			t.Fatalf("default serial #%d = %q, %v", i, m.Serial, err)
+		}
+		serials[m.Serial] = true
+	}
 	u := e.must("POST", "/hooks/users", map[string]any{"phone": "13900000001", "verified": true, "balance": 100000, "ledger_rows": 3})
 	uid := int64(u["id"].(float64))
 	if user, err := e.a.Identity.GetUser(ctx, uid); err != nil || user.KYCStatus != "verified" || user.Phone != "13900000001" {
