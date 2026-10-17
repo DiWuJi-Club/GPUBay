@@ -71,6 +71,12 @@ test('A-INS-01 实例列表：状态 / 用户 / 机器筛选作为查询参数�
   for (let i = 0; i < 20; i++) await placeOrder(aApi)
   await hooks.agent() // a 的 21 个实例全部开通成功
   const ib = await runningInstance(b.phone)
+  // c：一个真实洗机中（释放后不让 Agent 完成）、一个真实开通中（下单后不让 Agent 完成）；此后本用例不再调用 hooks.agent
+  const c = await seedUser()
+  const wipingC = await runningInstance(c.phone)
+  await wipingC.api.post(`/api/v1/instances/${wipingC.id}/release`, { data: {} })
+  await hooks.machines(1)
+  const creatingId = await placeOrder(wipingC.api)
   const admin = await createAdmin('finance')
   const ctx = await adminApi(admin)
   const aList = await getJSON<{ items: AdminInst[]; total: number }>(ctx, `/admin/api/v1/instances?user_id=${a.id}&page_size=100`)
@@ -189,24 +195,45 @@ test('A-INS-01 实例列表：状态 / 用户 / 机器筛选作为查询参数�
     expect(listRequests).toHaveLength(before + 1)
   })
 
-  await test.step('暂停计时标签、待开始时长与无剩余显示（改写本用例实例的列表响应）', async () => {
+  await test.step('真实开通中实例显示「待开始」时长、无到期时间；真实洗机中实例剩余显示 —', async () => {
+    const cList = (await getJSON<{ items: AdminInst[] }>(ctx, `/admin/api/v1/instances?user_id=${c.id}`)).items
+    const creating = cList.find((i) => i.id === creatingId)!
+    expect(creating.state).toBe('creating')
+    expect(creating.pending_seconds).toBeGreaterThan(0)
+    expect(cList.find((i) => i.id === wipingC.id)!.state).toBe('wiping')
+    await page.goto(`/admin/instances?user_id=${c.id}`)
+    await expect(rows(page)).toHaveCount(2)
+    await expect(rowOf(page, creatingId).getByTestId('ainst-state')).toHaveText('开通中')
+    await expect(rowOf(page, creatingId).getByTestId('ainst-time')).toHaveText(`待开始 ${duration(creating.pending_seconds)}`)
+    await expect(rowOf(page, creatingId).getByTestId('ainst-expires')).toHaveText('—')
+    await expect(rowOf(page, wipingC.id).getByTestId('ainst-state')).toHaveText('洗机中')
+    await expect(rowOf(page, wipingC.id).getByTestId('ainst-time')).toHaveText('—')
+  })
+
+  await test.step('暂停计时标签（真实暂停需要全局离线巡检，改写本用例实例的列表响应）', async () => {
     await page.route(isList, async (r) => {
       const resp = await r.fetch()
       const body = (await resp.json()) as { items: AdminInst[] }
-      body.items = body.items.map((i) =>
-        i.id === ib.id ? { ...i, suspended: true } : i.id === aList.items[0].id ? { ...i, state: 'creating', pending_seconds: 90000, expires_at: null } : i.id === aList.items[1].id ? { ...i, state: 'wiping', pending_seconds: 0 } : i,
-      )
+      body.items = body.items.map((i) => (i.id === ib.id ? { ...i, suspended: true } : i))
       await r.fulfill({ response: resp, json: body })
     })
-    await page.goto(`/admin/instances?user_id=${b.id}`)
+    await page.goto(`/admin/instances?machine_id=${bDetail.machine_id}`)
     await expect(rowOf(page, ib.id).getByTestId('ainst-suspended')).toHaveText('计时已暂停')
-    await page.goto(`/admin/instances?user_id=${a.id}`)
-    await expect(rowOf(page, aList.items[0].id).getByTestId('ainst-time')).toHaveText('待开始 1 天 1 小时')
-    await expect(rowOf(page, aList.items[0].id).getByTestId('ainst-expires')).toHaveText('—')
-    await expect(rowOf(page, aList.items[0].id).getByTestId('ainst-state')).toHaveText('开通中')
-    await expect(rowOf(page, aList.items[1].id).getByTestId('ainst-time')).toHaveText('—')
-    await expect(rowOf(page, aList.items[0].id).getByTestId('ainst-suspended')).toHaveCount(0)
+    await expect(page.getByTestId('ainst-suspended')).toHaveCount(1)
     await page.unroute(isList)
+  })
+
+  await test.step('镜像名称加载失败：只提示一次，列表照常显示，镜像列退回镜像 ID', async () => {
+    const isImages = isPath('/images')
+    await page.route(isImages, fail500('req-ins-limg'))
+    const toasts = await trackToasts(page)
+    await page.goto(`/admin/instances?user_id=${b.id}`)
+    await expect(rowOf(page, ib.id).getByTestId('ainst-image')).toHaveText(String(bDetail.image_id))
+    await expect(rowOf(page, ib.id).getByTestId('ainst-state')).toHaveText('运行中')
+    await expect(page.getByTestId('ainst-error')).toHaveCount(0)
+    await drainTasks(page)
+    expect(await toasts()).toEqual(['服务器内部错误（请求号 req-ins-limg）'])
+    await page.unroute(isImages)
   })
 
   await test.step('运维看机器是链接；点实例 ID 进详情', async () => {
@@ -291,6 +318,18 @@ test('A-INS-02 实例详情：基本信息、时间线、订单、指令按接�
     await expect(cmd.getByTestId('adetail-cmd-attempts')).toHaveText(String(d.commands[0].attempts))
     await expect(cmd.getByTestId('adetail-cmd-result')).toHaveText(d.commands[0].result)
     expect(d.commands[0].status).toBe('done')
+  })
+
+  await test.step('暂停计时标签（真实暂停需要全局离线巡检，改写本实例的详情响应）', async () => {
+    await expect(page.getByTestId('adetail-suspended')).toHaveCount(0)
+    await page.route(isDetail, async (r) => {
+      const resp = await r.fetch()
+      const body = (await resp.json()) as Detail
+      await r.fulfill({ response: resp, json: { ...body, instance: { ...body.instance, suspended: true } } })
+    })
+    await page.reload()
+    await expect(page.getByTestId('adetail-suspended')).toHaveText('计时已暂停')
+    await page.unroute(isDetail)
   })
 
   await test.step('镜像 / 商品名称加载失败：只提示一次，详情照常显示（名称退回 ID）', async () => {
@@ -383,6 +422,27 @@ test('A-INS-03 免费延长：范围与原因前端拦截、小时 / 天换算�
     expect(audit.total).toBe(2)
     expect(posts).toHaveLength(3)
   })
+
+  await test.step('延长成功但随后的详情刷新失败：仍提示成功，失败只提示一次，详情保留不变成错误页', async () => {
+    const shown = (await detailOf(ctx, id)).instance.remaining_seconds
+    await page.getByTestId('adetail-extend-btn').click()
+    await pick(page, 'extend-unit', '小时')
+    await page.getByTestId('extend-reason').fill('刷新失败测试')
+    await failOnce(page, `/instances/${id}`, 'req-ext-refresh')
+    const n = (await toasts()).length
+    await page.getByTestId('extend-submit').click()
+    await toast(page, '服务器内部错误（请求号 req-ext-refresh）')
+    await drainTasks(page)
+    expect((await toasts()).slice(n)).toEqual(['已延长 1 小时', '服务器内部错误（请求号 req-ext-refresh）'])
+    expect(posts.at(-1)!.body).toEqual({ seconds: 3600, reason: '刷新失败测试' })
+    await expect(page.getByTestId('extend-dialog')).toBeHidden()
+    await expect(page.getByTestId('adetail-error')).toHaveCount(0)
+    await expect(page.getByTestId('adetail-id')).toHaveText(id)
+    await expect(page.getByTestId('adetail-remaining')).toHaveAttribute('data-remaining', String(shown)) // 保留刷新前的数据
+    expect((await detailOf(ctx, id)).instance.remaining_seconds).toBe(shown + 3600) // 服务器确已延长
+    await page.reload()
+    await expect(page.getByTestId('adetail-remaining')).toHaveAttribute('data-remaining', String(shown + 3600))
+  })
 })
 
 test('A-INS-04 换机：缺原因与无空闲机器提示且保留输入；成功提示新实例与新机器、密码变化，点新实例进入其详情', async ({ page }) => {
@@ -447,6 +507,10 @@ test('A-INS-04 换机：缺原因与无空闲机器提示且保留输入；成�
     await expect(page.getByTestId('adetail-id')).toHaveText(newId)
     await expect(page.getByTestId('adetail-state')).toHaveText('开通中')
     await expect(page.getByTestId('adetail-machine')).toHaveText(String(newMachine))
+    const fresh = (await detailOf(ctx, newId)).instance
+    expect(fresh.pending_seconds).toBeGreaterThan(0) // 剩余时长转移到新实例，开通完成前记为待开始
+    await expect(page.getByTestId('adetail-pending')).toHaveText(duration(fresh.pending_seconds))
+    await expect(page.getByTestId('adetail-remaining')).toHaveText('—')
     await expect(page.getByTestId('migrate-result')).toHaveCount(0)
     await expect(page.getByTestId('adetail-event').filter({ hasText: new RegExp(`^— → creating · migrated from ${id}: 硬件告警 · `) })).toHaveCount(1)
     await drainTasks(page)
@@ -589,13 +653,28 @@ test('A-INS-06 退款并释放：建议金额与上限来自后端、金额校�
     expect(posts).toHaveLength(1)
   })
 
+  await test.step('服务器以超上限拒绝（400）：原文提示一次，弹窗不关、金额与原因保留', async () => {
+    const isRefund = isPath(`/instances/${id}/refund-release`)
+    await page.route(isRefund, (r) => r.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ code: 'bad_request', message: '退款金额不能超过可退金额 0.50 元' }) }), { times: 1 })
+    const n = (await toasts()).length
+    await page.getByTestId('refund-submit').click()
+    await toast(page, '退款金额不能超过可退金额 0.50 元')
+    await drainTasks(page)
+    expect((await toasts()).slice(n)).toEqual(['退款金额不能超过可退金额 0.50 元'])
+    await expectStillOpen(page, 'refund-dialog', '退款金额不能超过可退金额 0.50 元')
+    await expect(page.getByTestId('refund-amount')).toHaveValue(amount)
+    await expect(page.getByTestId('refund-reason')).toHaveValue('机器故障')
+    await expect(page.getByTestId('totp-dialog')).toBeHidden()
+    expect(posts).toHaveLength(2)
+  })
+
   await test.step('连点提交：弹动态码，原请求带 totp 只重发一次；提示已退款', async () => {
     await clickTwiceSync(page.getByTestId('refund-submit'))
     await enterTotpDialog(page, admin.totp_secret!)
     await toast(page, `已退款 ${yuan(cents)}，实例进入洗机`)
     await expect(page.getByTestId('refund-dialog')).toBeHidden()
     await drainTasks(page)
-    const bodies = posts.slice(1).map((p) => p.body)
+    const bodies = posts.slice(2).map((p) => p.body)
     expect(bodies).toHaveLength(2)
     expect(bodies[0]).toEqual({ amount: cents, reason: '机器故障' })
     expect(bodies[1]).toEqual({ amount: cents, reason: '机器故障', totp: expect.stringMatching(/^\d{6}$/) })
