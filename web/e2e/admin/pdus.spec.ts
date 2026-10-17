@@ -10,15 +10,17 @@ const rowByName = (page: Page, name: string) => page.getByRole('row').filter({ h
 const fail500 = (id: string) => (r: Route) =>
   r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: id }) })
 
-/** 记录页面收到的每个后台 GET 响应体与每个请求地址，用于断言 community 从不下发、从不进 URL。 */
+/** 记录页面收到的每个后台响应体（GET 以及新增 / 修改 PDU 的 POST / PUT）与每个请求地址，用于断言 community 从不下发、从不进 URL。 */
 function recordTraffic(page: Page) {
-  const bodies: { url: string; text: string }[] = []
+  const bodies: { url: string; method: string; text: string }[] = []
   const urls: string[] = []
   page.on('request', (r) => urls.push(r.url()))
   page.on('response', async (r) => {
-    if (r.request().method() !== 'GET' || !new URL(r.url()).pathname.startsWith('/admin/api/v1/')) return
+    const method = r.request().method()
+    const path = new URL(r.url()).pathname
+    if (!path.startsWith('/admin/api/v1/') || !(method === 'GET' || ((method === 'POST' || method === 'PUT') && path.startsWith('/admin/api/v1/pdus')))) return
     try {
-      bodies.push({ url: r.url(), text: await r.text() })
+      bodies.push({ url: r.url(), method, text: await r.text() })
     } catch {
       /* 页面跳走后响应体可能已释放 */
     }
@@ -103,7 +105,7 @@ test('A-PDU-01 新增 PDU：mock 隐藏 SNMP 字段并成功；snmp 缺 communit
     await expect(row.getByTestId('pdu-driver')).toHaveText('snmp')
   })
 
-  await test.step('安全：community 不出现在任何 GET 响应、请求地址、页面内容与浏览器存储中', async () => {
+  await test.step('安全：community 不出现在任何 GET / POST 响应、请求地址、页面内容与浏览器存储中', async () => {
     await page.reload()
     await expect(rowByName(page, snmpName).getByTestId('pdu-has-community')).toHaveText('已设置')
     await rowByName(page, snmpName).getByTestId('pdu-edit').click()
@@ -112,6 +114,7 @@ test('A-PDU-01 新增 PDU：mock 隐藏 SNMP 字段并成功；snmp 缺 communit
     const pduBodies = traffic.bodies.filter((b) => isPdus(new URL(b.url)))
     expect(pduBodies.length).toBeGreaterThanOrEqual(2)
     expect(pduBodies.some((b) => b.text.includes(snmpName))).toBe(true)
+    expect(traffic.bodies.some((b) => b.method === 'POST' && isPdus(new URL(b.url)) && b.text.includes(snmpName))).toBe(true) // 新增成功的响应也检查了
     for (const b of traffic.bodies) expect(b.text).not.toContain(secret)
     for (const u of traffic.urls) expect(u).not.toContain(secret)
     expect(await page.content()).not.toContain(secret)
@@ -191,7 +194,7 @@ test('A-PDU-02 编辑 PDU：community 密码框、提示与「已设置」；留
     await expect(row.getByTestId('pdu-has-community')).toHaveText('已设置')
   })
 
-  await test.step('安全：PDU 列表、机器列表的 GET 响应与地址、页面、存储都不含 community', async () => {
+  await test.step('安全：PDU 列表、机器列表的 GET 响应、PDU 的 PUT 响应与地址、页面、存储都不含 community', async () => {
     await page.getByTestId('menu-machines').click()
     await expect(page.getByTestId('machine-id').first()).toBeVisible()
     await page.getByTestId('menu-pdus').click()
@@ -199,6 +202,7 @@ test('A-PDU-02 编辑 PDU：community 密码框、提示与「已设置」；留
     await drainTasks(page)
     expect(traffic.bodies.some((b) => isPdus(new URL(b.url)) && b.text.includes(pdu.name))).toBe(true)
     expect(traffic.bodies.some((b) => new URL(b.url).pathname === '/admin/api/v1/machines')).toBe(true)
+    expect(traffic.bodies.filter((b) => b.method === 'PUT' && new URL(b.url).pathname === `/admin/api/v1/pdus/${pdu.id}`).length).toBeGreaterThanOrEqual(3) // 成功与失败的 PUT 响应都检查了
     for (const b of traffic.bodies) {
       expect(b.text).not.toContain(secret)
       expect(b.text).not.toContain('"community"') // 只有 has_community，没有 community 字段

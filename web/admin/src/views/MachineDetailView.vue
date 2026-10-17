@@ -2,7 +2,7 @@
 import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type MachineDetail } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
 import { notifyError } from '../logic/notify'
@@ -17,20 +17,38 @@ const powerVisible = ref(false)
 const busy = ref(false)
 const inMaintenance = computed(() => data.value?.machine.state === 'maintenance' || data.value?.machine.state === 'faulty')
 
-/** 首次加载失败：页内错误 + 重试按钮（不自动重试）；操作后的刷新失败只提示，保留已显示的数据。 */
-async function load() {
+let seq = 0
+/**
+ * 首次加载失败：页内错误 + 重试按钮（不自动重试）；操作后的刷新失败只提示，保留已显示的数据。
+ * 只采用最后一次请求的结果：从一台机器的详情切到另一台时，先发后到的旧响应被丢弃。
+ */
+async function load(target = id.value) {
+  const mine = ++seq
   loading.value = true
   try {
-    data.value = await api.get<MachineDetail>(`/machines/${id.value}`)
+    const d = await api.get<MachineDetail>(`/machines/${target}`)
+    if (mine !== seq) return
+    data.value = d
     error.value = ''
   } catch (e) {
+    if (mine !== seq) return
     notifyError(e)
     if (!data.value) error.value = messageOf(e)
   } finally {
-    loading.value = false
+    if (mine === seq) loading.value = false
   }
 }
-onMounted(load)
+onMounted(() => void load())
+// 同一组件换了机器（/machines/1 → /machines/2）：清掉旧机器的数据与弹窗，按新 ID 重新加载。
+// 用 onBeforeRouteUpdate 而不是 watch(route.params.id)：离开到实例详情时 params.id 也会变，watch 会拿实例 ID 去请求机器
+onBeforeRouteUpdate((to) => {
+  if (to.params.id === route.params.id) return
+  data.value = null
+  error.value = ''
+  maintenanceVisible.value = false
+  powerVisible.value = false
+  void load(String(to.params.id))
+})
 
 async function toggleMaintenance() {
   if (busy.value) return // 同步守卫：连点只发一次
@@ -67,7 +85,7 @@ async function powerCycle() {
 <template>
   <div>
     <el-alert v-if="error && !data" type="error" :title="error" show-icon :closable="false" data-testid="mdetail-error">
-      <el-button size="small" :loading="loading" data-testid="mdetail-retry" @click="load">重试</el-button>
+      <el-button size="small" :loading="loading" data-testid="mdetail-retry" @click="load()">重试</el-button>
     </el-alert>
     <div v-if="data" class="detail">
       <el-card>

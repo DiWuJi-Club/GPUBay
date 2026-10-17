@@ -5,7 +5,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '../api'
 import { usePaged } from '../composables/usePaged'
-import { downloadText, readCSVFile, templateCSV } from '../logic/csv'
+import { downloadText, importBody, readCSVFile, templateCSV } from '../logic/csv'
 import { notifyError } from '../logic/notify'
 
 const router = useRouter()
@@ -89,10 +89,14 @@ async function pickFile(ev: Event) {
   importErrors.value = []
   if (!file) return
   try {
-    importText.value = await readCSVFile(file)
+    const text = await readCSVFile(file)
+    importBody(text) // 提交前就按实际请求体大小校验
+    importText.value = text
     importName.value = file.name
   } catch (e) {
     fileError.value = e instanceof Error ? e.message : '读取文件失败'
+  } finally {
+    // 读完即清空：管理员按逐行错误改好后重新选择同一个文件时，浏览器才会再次触发 change，读到新内容
     input.value = ''
   }
 }
@@ -100,7 +104,7 @@ async function doImport() {
   if (importing.value || !importText.value) return
   importing.value = true
   try {
-    const out = await api.post<Listed<Machine>>('/machines/import', { csv: importText.value })
+    const out = await api.post<Listed<Machine>>('/machines/import', importBody(importText.value))
     ElMessage.success(`成功导入 ${out.items.length} 台机器`)
     importVisible.value = false
     list.reset()

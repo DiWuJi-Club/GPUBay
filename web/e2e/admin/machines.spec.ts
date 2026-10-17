@@ -1,5 +1,5 @@
 import { expect, request, test, type Page, type Route } from '@playwright/test'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
   adminApi, adminPost, clickTwiceSync, createAdmin, createPDU, drainIdleMachines, drainTasks, expectAdminUrl, loginAdmin, nextSerial, recordRequests, registerMachine, trackToasts,
@@ -262,7 +262,9 @@ test('A-MCH-02 单台登记：成功出现在列表；校验错误、重复序�
     await page.getByTestId('register-ip').fill('10.95.0.8')
     await submitAndExpect('序列号已存在')
     expect(posts.at(-1)!.body).toEqual({ serial, rack, slot: '08', lan_ip: '10.95.0.8', product_id: products[0].id })
-    expect(taken.serial).not.toBe(serial)
+    // 被占用的插座仍归原机器（失败的登记没有改动它）
+    const holder = (await (await ctx.get(`/admin/api/v1/machines/${taken.id}`)).json()) as { machine: { pdu_id: number; pdu_outlet: number } }
+    expect(holder.machine).toMatchObject({ pdu_id: pdu.id, pdu_outlet: 5 })
   })
 
   await test.step('每次失败只提示一次（notifyError，原文）', async () => {
@@ -284,7 +286,7 @@ test('A-MCH-02 单台登记：成功出现在列表；校验错误、重复序�
   })
 })
 
-test('A-MCH-03 CSV 导入：超过 1MB 本地拒绝；成功 3 台并刷新列表；逐行错误整批不导入；模板带 BOM 与固定表头', async ({ page }) => {
+test('A-MCH-03 CSV 导入：超过 1MB 本地拒绝；成功 3 台并刷新列表；逐行错误整批不导入；改好后重选同一文件发送新内容；带 BOM 文件可导入；模板带 BOM 与固定表头', async ({ page }, testInfo) => {
   const admin = await createAdmin('ops')
   const ctx = await adminApi(admin)
   const countRack = async (rack: string) => ((await (await ctx.get(`/admin/api/v1/machines?rack=${rack}&page_size=1`)).json()) as Paged).total
@@ -327,21 +329,73 @@ test('A-MCH-03 CSV 导入：超过 1MB 本地拒绝；成功 3 台并刷新列�
     expect(await countRack('B01')).toBe(before + 3)
   })
 
-  await test.step('逐行错误：列出行号与原因，整批不导入；重新选择文件清空错误', async () => {
-    const before = await countRack('B02')
+  const errorRows = page.getByTestId('import-errors').getByRole('row').filter({ has: page.getByTestId('import-error-line') })
+  const csvPath = testInfo.outputPath('machines-import.csv') // 磁盘上的同一个文件：模拟管理员改好后重新选择
+  const errorsBefore = { b02: 0 }
+
+  await test.step('逐行错误：列出行号与原因，整批不导入；读完后清空文件框（重选同一文件才会再触发 change）', async () => {
+    errorsBefore.b02 = await countRack('B02')
     await page.getByTestId('machines-import-btn').click()
     await expect(page.getByTestId('import-file-name')).toHaveCount(0) // 重新打开是空的
-    await page.getByTestId('import-file').setInputFiles({ name: 'machines-bad.csv', mimeType: 'text/csv', buffer: Buffer.from(fixtureText('machines-bad.csv')) })
+    writeFileSync(csvPath, fixtureText('machines-bad.csv'))
+    await page.getByTestId('import-file').setInputFiles(csvPath)
+    await expect(page.getByTestId('import-file-name')).toHaveText('已选择：machines-import.csv')
+    await expect(page.getByTestId('import-file')).toHaveValue('')
     await page.getByTestId('import-submit').click()
     await toast(page, '导入数据有误，未导入任何机器')
-    const rows = page.getByTestId('import-errors').getByRole('row').filter({ has: page.getByTestId('import-error-line') })
-    await expect(rows.getByTestId('import-error-line')).toHaveText(['2', '3', '4'])
-    await expect(rows.getByTestId('import-error-message')).toHaveText(['内网 IP 格式不正确', '商品 no-such-product 不存在', 'PDU ghost-pdu 不存在'])
+    await expect(errorRows.getByTestId('import-error-line')).toHaveText(['2', '3', '4'])
+    await expect(errorRows.getByTestId('import-error-message')).toHaveText(['内网 IP 格式不正确', '商品 no-such-product 不存在', 'PDU ghost-pdu 不存在'])
     await expect(dlg).toBeVisible()
     expect(imports).toHaveLength(2)
-    expect(await countRack('B02')).toBe(before)
-    await page.getByTestId('import-file').setInputFiles({ name: 'machines-ok.csv', mimeType: 'text/csv', buffer: Buffer.from(fixtureText('machines-ok.csv')) })
+    expect(imports[1].body).toEqual({ csv: fixtureText('machines-bad.csv') })
+    expect(await countRack('B02')).toBe(errorsBefore.b02)
+  })
+
+  await test.step('改好第 2 行后重新选择同一文件：清空旧错误，发送的是新内容，只剩第 3、4 行错误', async () => {
+    const fixed = fixtureText('machines-bad.csv').replace(',10.98.1,', ',10.98.1.1,')
+    expect(fixed).not.toBe(fixtureText('machines-bad.csv'))
+    writeFileSync(csvPath, fixed)
+    await page.getByTestId('import-file').setInputFiles(csvPath)
     await expect(page.getByTestId('import-errors')).toHaveCount(0)
+    await page.getByTestId('import-submit').click()
+    await expect.poll(() => imports.length).toBe(3)
+    expect(imports[2].body).toEqual({ csv: fixed })
+    await expect(errorRows.getByTestId('import-error-line')).toHaveText(['3', '4'])
+    expect(await countRack('B02')).toBe(errorsBefore.b02)
+  })
+
+  await test.step('请求体上限（后端 1MB，含 JSON 包装与转义）：恰好上限照常提交；多 1 字节页内提示且不发请求', async () => {
+    const head = 'serial,rack,slot,lan_ip,product_code,pdu_name,pdu_outlet\n'
+    const wrap = JSON.stringify({ csv: head }).length // 表头里的换行在 JSON 里占 2 字节
+    const exact = head + 'x'.repeat((1 << 20) - wrap)
+    expect(Buffer.byteLength(JSON.stringify({ csv: exact }))).toBe(1 << 20)
+    await page.getByTestId('import-file').setInputFiles({ name: 'exact.csv', mimeType: 'text/csv', buffer: Buffer.from(exact) })
+    await expect(page.getByTestId('import-file-error')).toHaveCount(0)
+    await page.getByTestId('import-submit').click()
+    // 后端完整读到了请求体并逐行校验（而不是「请求参数格式不正确」）
+    await expect(errorRows.getByTestId('import-error-message')).toHaveText(['列数不正确或格式错误'])
+    expect(imports).toHaveLength(4)
+    await page.getByTestId('import-file').setInputFiles({ name: 'over.csv', mimeType: 'text/csv', buffer: Buffer.from(exact + 'x') })
+    await expect(page.getByTestId('import-file-error')).toContainText('文件内容过大：提交时超过 1MB，请分批导入')
+    await expect(page.getByTestId('import-submit')).toBeDisabled()
+    await page.getByTestId('import-submit').click({ force: true })
+    await drainTasks(page)
+    expect(imports).toHaveLength(4)
+  })
+
+  await test.step('带 BOM 的文件（Excel 另存 / 模板填写）可以导入', async () => {
+    const plain = fixtureText('machines-ok.csv').replaceAll('E2E-CSV-', 'E2E-BOM-')
+    writeFileSync(csvPath, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(plain)]))
+    const before = await countRack('B01')
+    await page.getByTestId('import-file').setInputFiles(csvPath)
+    await expect(page.getByTestId('import-file-error')).toHaveCount(0)
+    await page.getByTestId('import-submit').click()
+    await toast(page, '成功导入 3 台机器')
+    await expect(dlg).toBeHidden()
+    expect(String(imports.at(-1)!.body!.csv).replace(/^\uFEFF/, '')).toBe(plain)
+    for (let i = 1; i <= 3; i++) await expect(rowBySerial(page, `E2E-BOM-${runStamp}-${i}`)).toHaveCount(1)
+    expect(await countRack('B01')).toBe(before + 3)
+    await page.getByTestId('machines-import-btn').click() // 模板下载在弹窗里
   })
 
   await test.step('模板下载：文件名、UTF-8 BOM 与固定表头', async () => {
@@ -454,9 +508,10 @@ test('A-MCH-05 断电重启：确认文案、取消不发请求、无 PDU 报错
   })
 })
 
-test('A-MCH-06 机器详情：当前实例与历史实例（可点击），首次加载失败可重试', async ({ page }) => {
+test('A-MCH-06 机器详情：当前实例与历史实例（可点击），首次加载失败可重试，同页切换机器重新加载且忽略旧响应', async ({ page }) => {
   const admin = await createAdmin('ops')
-  await drainIdleMachines(await adminApi(admin), admin)
+  const ctx = await adminApi(admin)
+  await drainIdleMachines(ctx, admin)
   const [mid] = await hooks.machines(1)
   const u = await seedUser({ balance: 100000 })
   const api = await userApi(u.phone)
@@ -492,5 +547,51 @@ test('A-MCH-06 机器详情：当前实例与历史实例（可点击），首�
     await expect(page.getByTestId('mdetail-history-id').locator('a')).toHaveAttribute('href', `/admin/instances/${released}`)
     await page.getByTestId('mdetail-current').locator('a').click()
     await expectAdminUrl(page, `/instances/${running}`)
+  })
+
+  await test.step('同一页面从一台机器切到另一台（路由参数变化，组件复用）：按新 ID 重新加载；先发后到的旧响应被丢弃', async () => {
+    const other = await registerMachine(ctx, admin)
+    const mine = ((await (await ctx.get(`/admin/api/v1/machines/${mid}`)).json()) as { machine: { serial: string } }).machine.serial
+    await page.goto(`/admin/machines/${mid}`)
+    await expect(page.getByTestId('mdetail-serial')).toHaveText(mine)
+    await expect(page.getByTestId('mdetail-current')).toHaveText(running)
+    // 在同一文档里造出 [mid, other, mid] 三个历史记录，再后退：popstate 由 vue-router 处理，不整页刷新
+    const marker = await page.evaluate(([a, b]) => {
+      ;(window as unknown as { __sameDoc: boolean }).__sameDoc = true
+      history.pushState(null, '', `/admin/machines/${b}`)
+      history.pushState(null, '', `/admin/machines/${a}`)
+      history.back()
+      return true
+    }, [mid, other.id])
+    expect(marker).toBe(true)
+    await expectAdminUrl(page, `/machines/${other.id}`)
+    await expect(page.getByTestId('mdetail-serial')).toHaveText(other.serial)
+    await expect(page.getByTestId('mdetail-state')).toHaveText('维护中')
+    await expect(page.getByTestId('mdetail-none')).toHaveText('无')
+    await expect(page.getByTestId('mdetail-history-id')).toHaveCount(0)
+    expect(await page.evaluate(() => (window as unknown as { __sameDoc?: boolean }).__sameDoc)).toBe(true) // 没有整页刷新
+
+    // 旧响应：后退到 mid 时把它的请求扣住，再前进到 other；other 显示后才放行 mid 的响应
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    let held = 0
+    await page.route(isDetail, async (route) => {
+      held += 1
+      await gate
+      await route.continue()
+    })
+    await page.evaluate(() => history.back())
+    await expect.poll(() => held).toBe(1)
+    await expectAdminUrl(page, `/machines/${mid}`)
+    await page.evaluate(() => history.forward())
+    await expectAdminUrl(page, `/machines/${other.id}`)
+    await expect(page.getByTestId('mdetail-serial')).toHaveText(other.serial)
+    const late = page.waitForResponse((r) => isDetail(new URL(r.url())))
+    release()
+    await late
+    await drainTasks(page)
+    await expect(page.getByTestId('mdetail-serial')).toHaveText(other.serial)
+    await expect(page.getByTestId('mdetail-current')).toHaveCount(0)
+    await page.unroute(isDetail)
   })
 })

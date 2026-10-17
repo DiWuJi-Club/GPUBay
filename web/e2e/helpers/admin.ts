@@ -3,6 +3,8 @@ import { ADMIN_URL, hooks, type Role } from './hooks'
 import { runStamp } from './phone'
 import { totp } from './totp'
 
+export { pauseClock } from './clock'
+
 let adminSeq = 0
 let serialSeq = 0
 
@@ -113,20 +115,6 @@ export function recordRequests(page: Page, method: string, path: string) {
     seen.push({ body: raw ? (JSON.parse(raw) as Record<string, unknown>) : null, search: u.search })
   })
   return seen
-}
-
-/** 冻结页面时间（page.clock.install 之后时间仍按真实流逝）：此后只有 runFor 会触发页面定时器。 */
-export async function pauseClock(page: Page) {
-  // 读时间与 pauseAt 之间页面时间仍在走：往返超过 1ms 时 pauseAt 会报「Cannot fast-forward to the past」，重读后再试
-  for (let attempt = 0; ; attempt++) {
-    const now = await page.evaluate(() => Date.now())
-    try {
-      await page.clock.pauseAt(now + 1)
-      return
-    } catch (e) {
-      if (attempt >= 4 || !String(e).includes('fast-forward to the past')) throw e
-    }
-  }
 }
 
 /** 让页面跑完若干轮宏任务（MessageChannel 不受 page.clock 接管）：时钟冻结时 settle 依赖的 requestAnimationFrame 不会触发，用它代替。 */

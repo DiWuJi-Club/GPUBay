@@ -1,5 +1,6 @@
 import { expect, test, type Page, type Request } from '@playwright/test'
 import { isMobile, loginConsole, nav, seedUser, settle, toast, userApi } from '../helpers/console'
+import { pauseClock } from '../helpers/clock'
 import { hooks } from '../helpers/hooks'
 
 async function createRecharge(phone: string, amount = 5000) {
@@ -15,12 +16,6 @@ function setVisibility(page: Page, state: 'visible' | 'hidden') {
     Object.defineProperty(document, 'visibilityState', { value: s, configurable: true })
     document.dispatchEvent(new Event('visibilitychange'))
   }, state)
-}
-
-/** 冻结页面时间（clock.install 之后时间仍按真实流逝）：此后只有 runFor 会触发页面定时器。 */
-async function pauseClock(page: Page) {
-  const now = await page.evaluate(() => Date.now())
-  await page.clock.pauseAt(now + 1)
 }
 
 /** 让页面跑完若干轮宏任务（MessageChannel 不受 page.clock 接管），用于时钟冻结时的「之后不应发生」断言前。 */
