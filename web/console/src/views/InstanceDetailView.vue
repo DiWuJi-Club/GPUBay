@@ -47,8 +47,10 @@ async function load() {
   }
 }
 onMounted(load)
-// 开通中 / 洗机中每 10 秒刷新一次（页面不可见时暂停，卸载自动停止）
-usePolling(load, 10_000, { enabled: () => inst.value?.state === 'creating' || inst.value?.state === 'wiping' })
+// 开通中 / 洗机中每 10 秒刷新一次（页面不可见时暂停，卸载自动停止）。
+// 运行中且服务器已报剩余 0 秒：到期停机由后端每分钟的清扫执行，归零那次刷新多半还是「运行中」，同样每 10 秒再查，状态变了就停
+const awaitingExpiry = () => inst.value?.state === 'running' && !inst.value.suspended && inst.value.remaining_seconds === 0
+usePolling(load, 10_000, { enabled: () => inst.value?.state === 'creating' || inst.value?.state === 'wiping' || awaitingExpiry() })
 
 // ---- SSH 密码：只在点击时请求，只放内存，离开页面即丢弃 ----
 const password = ref('')

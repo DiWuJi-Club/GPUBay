@@ -299,4 +299,47 @@ test('C-DET-10 详情页自动刷新：开通中 / 洗机中 10 秒轮询，倒�
     expect(getsOf(running)).toBe(base + 1)
     expect(navigations).toBe(navBase)
   })
+
+  await test.step('归零时服务器尚未清扫（仍是运行中、剩余 0 秒）：每 10 秒再查，清扫停机后显示已到期停机并停止轮询', async () => {
+    await hooks.machines(1)
+    const late = await placeOrder(api)
+    await hooks.agent()
+    const left = (await instanceOf(api, late)).remaining_seconds
+    await hooks.advance(left - 20)
+    await page.clock.resume()
+    await page.goto(`/instances/${late}`)
+    await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+    await expect(page.getByTestId('detail-remaining')).toHaveAttribute('data-remaining', /^(20|19|18)$/)
+    await pauseClock(page)
+    const shown = Number(await page.getByTestId('detail-remaining').getAttribute('data-remaining'))
+    const navBase = navigations
+    await hooks.advance(20) // 到期但不清扫：后端仍报 running、remaining_seconds 0
+    const atZero = await instanceOf(api, late)
+    expect([atZero.state, atZero.remaining_seconds]).toEqual(['running', 0])
+    const base = getsOf(late)
+    await page.clock.runFor(shown * 1000)
+    await expect.poll(() => getsOf(late)).toBeGreaterThanOrEqual(base + 1) // 归零刷新一次
+    await drainTasks(page)
+    await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+    await expect(page.getByTestId('detail-remaining')).toHaveAttribute('data-remaining', '0')
+    // 轮询定时器从进入页面起每 10 秒一跳，归零后同一次 runFor 的零头里可能已经跳过一次：以此刻为基准
+    const c0 = getsOf(late)
+    expect(c0 - base).toBeLessThanOrEqual(2)
+    await page.clock.runFor(10_000) // 仍是运行中 + 0 秒：任意 10 秒内恰好再查一次（不会更快）
+    await expect.poll(() => getsOf(late)).toBe(c0 + 1)
+    await drainTasks(page)
+    expect(getsOf(late)).toBe(c0 + 1)
+    await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+    await hooks.sweep()
+    await hooks.agent()
+    expect((await instanceOf(api, late)).state).toBe('stopped')
+    await page.clock.runFor(10_000)
+    await expect(page.getByTestId('detail-state')).toHaveText('已到期停机')
+    await expect(page.getByTestId('detail-ssh-hint')).toHaveText('实例运行中才能连接')
+    expect(getsOf(late)).toBe(c0 + 2)
+    await page.clock.runFor(30_000) // 停机后不再轮询
+    await drainTasks(page)
+    expect(getsOf(late)).toBe(c0 + 2)
+    expect(navigations).toBe(navBase)
+  })
 })
