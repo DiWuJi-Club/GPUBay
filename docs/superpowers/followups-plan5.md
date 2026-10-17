@@ -6,6 +6,7 @@
 - 手机端 `alipays://` 拉起只能真机验证；上线前用真机走一次支付宝沙箱（自动化只断言链接格式与回页查询）。
 - 品牌占位 `Spark Cloud`：替换 `web/shared/src/brand.ts` 与两个应用 `public/brand/logo.svg`。
 - CI 机器需预装 Chrome，或设 `E2E_BROWSER_CHANNEL=chromium`。
+- 静态处理器拒绝任何以 `.` 开头的路径段（连 `/.well-known/` 也回退 index.html）：ACME HTTP-01 等需要 `/.well-known/` 时在反向代理处理（当前 TLS 在代理终止，无影响）。
 - 待负责人决定：模拟支付成功接口 `POST /api/v1/dev/recharges/{id}/pay` 在 `SPARK_PAY_DRIVER=mock` 且非 prod 的所有环境都会注册（`internal/app/app.go:143` `devPay = cfg.Env != "prod"`，路由见 `internal/api/server.go:94`），因此 staging 用 mock 支付时同样对外暴露；是否收紧为仅 dev 尚未决定。
 
 ## 可以继续延后
@@ -29,15 +30,24 @@
 
 ## 评审中延后的小问题
 
+### 共用层（web/shared）
+- 二次验证完成、`stepUp` 清空后，并发请求里迟到的 `totp_required` 会再弹一次动态码框（输入后也能成功）。
+- 首个二次验证失败（非取消）后，等待中的请求拿到的是原始 `totp_required` 而不是首个请求的错误。
+- `upload()` 对非 JSON 的 2xx 响应抛 `SyntaxError`（不是 `ApiError`，提示为「操作失败，请稍后重试」）；后端永远返回 JSON。
+- 调用方主动 abort 的请求被映射为「网络异常」。
+- 缺少的单测：首个被取消时等待者一起取消、`upload()` 401 经 `handleAuth`。
+- `useCountdown` 在系统时钟回拨时不做钳制；`fmtYuan(-0.5)` 显示为 `-¥0.00`。
+- 单测卫生：`vi.useRealTimers` 没放进 `afterEach`；`useMobile` 无单测；`idempotency.spec` 末行是同义反复（计划原文）。
+
 ### 控制台
-- 启动时探测会话把 5xx / 网络错误当作未登录，已登录用户会被送到 `/login`。
-- 实例列表加载没有在途请求保护，慢的旧轮询结果可能覆盖新结果；`usePolling` / `useTicker` 没有单测。
+- 启动时探测会话把 5xx / 网络错误当作未登录，已登录用户会被送到 `/login`，且本页会话状态固定为未登录直到整页刷新。
+- 实例详情首次加载遇到 401 时，页内错误条会一闪显示「请先登录」（随即跳转登录页）。
+- 实例列表加载没有在途请求保护，慢的旧轮询结果可能覆盖新结果；`usePolling` / `useTicker` 没有单测；已释放实例的时间列为空未断言。
 - 市场页与实例页首次加载失败时 toast 与页内提示条同时出现；刷新后已失效的镜像选择不会被清除。
 - 钱包流水在静默错误（401 / 取消）时也会显示页内重试提示条。
 - 手机端回到前台后恢复 3 秒轮询、充值起始页防重复提交只由代码结构保证，没有自动化断言。
 - 实名提交的 `kyc_in_progress` / `kyc_unavailable` / `rate_limited` / `invalid_state` 专属文案未单独测试（走通用 `notifyError`）；上传途中离开页面只做了代码审查。
-- `useCountdown` 在系统时钟回拨时不做钳制；`fmtYuan(-0.5)` 显示为 `-¥0.00`。
-- 共用请求层在 `totp_required` 重试时即使是 GET 也会附带请求体（目前后台没有需要动态码的 GET）。
+- 手机底部弹出确认框没有高度上限。
 
 ### 后台
 - 审计接口每次请求全量读取管理员列表来填 `actor_name`；若管理员列表改为分页，名字会变空。
@@ -49,10 +59,17 @@
 - 商品价格排序失败时的回滚是尽力而为。
 - 实例 `suspended` 状态只用模拟响应测试（真实路径需要全局离线清扫）；A-INS-09 端到端只覆盖 running / wiping，其余状态由单测矩阵覆盖。
 
+### 后端（Go）
+- `internal/api/instances.go` 的 `nameCache.lookup` 接收者未使用。
+- 静态处理器对 `/admin/api/v1` 以外的 404 / 415 没有 `no-store`；嵌套目录的 `index.html` 会 301；`internal/web` 测试里对控制台处理器请求了 `/admin/x`。
+
 ### 测试基础设施
-- `DisableRateLimits` 没有正向测试证明两种限流都被关闭（Playwright 依赖它，否则会 429）。
+- e2e project 顺序依赖：全量用例共享一个嵌入式数据库和一个假时钟，只在 console-desktop → console-mobile → admin 的顺序下验证过。会改全局状态且不恢复的用例：A-INS-07 推进 301 秒、A-FIN-04 推进接近 24 小时、A-AUTH / A-DASH 会话过期用例推进 13 小时、A-ALT-01 让全部机器失联一轮、C-MKT-06 / A-INS-04 把当时所有空闲机器置为维护。说明写在 `web/playwright.config.ts` 的 `projects` 上方；调整顺序或新增此类用例时要跑完整 `make check`。
 - e2e-server 的 `waitListening` 可能把占着端口的旧进程当成已就绪（应先 `net.Listen`）。
-- e2e 钩子：`/hooks/users` 非原子；钩子服务错误一律 500；重复 `serial_prefix` 会部分插入。
+- e2e 钩子：`/hooks/users` 非原子；钩子服务错误一律 500；重复 `serial_prefix` 会部分插入；分块传输的空请求体返回 400；钩子单测对 `totp_secret` 只做了弱断言。
 - 覆盖表核对器识别不了 `test['skip']` 或 `const t = test` 这类别名写法。
-- 全量用例共享一个假时钟：A-INS-07 推进 301 秒、A-FIN-04 最多推进约 24 小时；新增依赖相对时间的用例时要注意。
-- 静态处理器对 `/admin/api/v1` 以外的 404 / 415 没有 `no-store`；嵌套目录的 `index.html` 会 301。
+- 时钟冻结后的用例依赖 `MessageChannel` 不被 `page.clock` 接管（`drainTasks`）；Playwright 若改变这一点需要换实现。
+- C-INS-04 用真实时间的 `expect.poll`（计划原文）而不是 `page.clock`；C-INS-03 的清扫恢复不在 `finally` 里、详情页只断言可见。
+- C-MKT-07 区分不出第二次点击是被哪一道防重复守卫拦下的。
+- A-MCH-04 按全站空闲台数的差值断言，依赖同一时刻没有其他用例改动空闲机器（串行执行下成立）。
+- 后台财务日期筛选的「from > to」端到端用例实际是同一时刻（真正的 from > to 由 Go 单测 `TestParseRange` 覆盖）；每页条数切换只有单测。

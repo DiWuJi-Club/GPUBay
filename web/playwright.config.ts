@@ -41,6 +41,12 @@ export default defineConfig({
     stdout: 'pipe',
     stderr: 'pipe',
   },
+  // project 顺序依赖：只在 console-desktop → console-mobile → admin 这个顺序下验证过（workers: 1 时按声明顺序执行），不要调换。
+  // 整个运行共享一个嵌入式数据库和一个假时钟，以下用例会改全局状态且不恢复：A-INS-07 推进 301 秒、A-FIN-04 推进接近 24 小时、
+  // A-AUTH / A-DASH 的会话过期用例推进 13 小时、A-ALT-01 让全部机器失联一轮；C-MKT-06 / A-INS-04 的 drainIdleMachines
+  // 把当时所有空闲机器置为维护。admin 用例推进后都会重新登录（后台会话 2 小时空闲失效），控制台用例只用自己新登记的机器、
+  // 按自己实例的剩余时间断言。新增依赖全局时间或空闲机器的用例、或调整 project 顺序时，要跑完整 make check 并同步更新
+  // 这里与 docs/superpowers/followups-plan5.md。
   projects: [
     {
       name: 'console-desktop',
