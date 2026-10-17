@@ -30,3 +30,12 @@ export function duration(seconds: number): string {
   if (m) parts.push(`${m} 分`)
   return parts.join(' ')
 }
+
+const secFmt = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+
+/** 与后端 csvx.Time 同格式：北京时间 yyyy-MM-dd HH:mm:ss（后台导出 CSV 的时间列）。 */
+export function cstTimeSec(iso: string): string {
+  const p: Record<string, string> = {}
+  for (const x of secFmt.formatToParts(new Date(iso))) p[x.type] = x.value
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`
+}

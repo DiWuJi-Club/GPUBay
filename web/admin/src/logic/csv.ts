@@ -25,7 +25,12 @@ export function importBody(csv: string): { csv: string } {
 }
 
 export function downloadText(filename: string, text: string, type = 'text/csv;charset=utf-8') {
-  const url = URL.createObjectURL(new Blob([text], { type }))
+  downloadBlob(filename, new Blob([text], { type }))
+}
+
+/** 用临时 object URL 触发浏览器下载（后台导出 CSV、导入模板共用）。 */
+export function downloadBlob(filename: string, blob: Blob) {
+  const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
   a.download = filename

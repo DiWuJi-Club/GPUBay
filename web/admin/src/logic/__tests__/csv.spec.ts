@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { IMPORT_HEADER, importBody, MAX_BODY_BYTES, MAX_IMPORT_BYTES, readCSVFile, templateCSV } from '../csv'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { downloadBlob, IMPORT_HEADER, importBody, MAX_BODY_BYTES, MAX_IMPORT_BYTES, readCSVFile, templateCSV } from '../csv'
 
 describe('csv', () => {
   it('模板带 BOM 与固定表头', () => {
@@ -35,5 +35,31 @@ describe('csv', () => {
     const n = Math.floor((MAX_BODY_BYTES - wrap) / 3)
     expect(() => importBody('机'.repeat(n))).not.toThrow()
     expect(() => importBody('机'.repeat(n + 1))).toThrow('文件内容过大')
+  })
+
+  describe('downloadBlob', () => {
+    const { createObjectURL, revokeObjectURL } = URL
+    afterEach(() => {
+      Object.assign(URL, { createObjectURL, revokeObjectURL })
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    })
+    it('用 object URL 触发下载（文件名来自参数），下一个任务里释放同一个 URL', () => {
+      vi.useFakeTimers()
+      const blob = new Blob(['x'], { type: 'text/csv' })
+      const create = vi.fn(() => 'blob:fake-1')
+      const revoke = vi.fn()
+      Object.assign(URL, { createObjectURL: create, revokeObjectURL: revoke })
+      const clicked: { href: string; download: string }[] = []
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+        clicked.push({ href: this.href, download: this.download })
+      })
+      downloadBlob('orders-20261017-140501.csv', blob)
+      expect(create).toHaveBeenCalledWith(blob)
+      expect(clicked).toEqual([{ href: 'blob:fake-1', download: 'orders-20261017-140501.csv' }])
+      expect(revoke).not.toHaveBeenCalled() // 同步 revoke 会让部分浏览器的下载拿到失效 URL
+      vi.runAllTimers()
+      expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:fake-1')
+    })
   })
 })
