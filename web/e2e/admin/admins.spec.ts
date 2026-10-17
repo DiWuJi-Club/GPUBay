@@ -90,6 +90,7 @@ test('A-ADM-01 新增管理员：本地校验、动态码后原请求带 totp �
   await test.step('取消动态码：只发出不带 totp 的一次，无提示，弹窗与输入保留，未创建', async () => {
     await page.getByTestId('adm-create-password').fill(password)
     await pick(page, 'adm-create-role', '运维')
+    const before = (await toasts()).length
     await page.getByTestId('adm-create-submit').click()
     await expect(page.getByTestId('adm-create-error')).toHaveCount(0)
     await expect(page.getByTestId('totp-dialog')).toBeVisible()
@@ -100,7 +101,7 @@ test('A-ADM-01 新增管理员：本地校验、动态码后原请求带 totp �
     await expect(page.getByTestId('adm-create-password')).toHaveValue(password)
     await drainTasks(page)
     expect(posts.map((p) => p.body)).toEqual([body])
-    expect(await toasts()).toHaveLength(1)
+    expect((await toasts()).slice(before)).toEqual([])
     expect((await listAdmins(ctx)).some((a) => a.username === username)).toBe(false)
   })
 
@@ -122,6 +123,7 @@ test('A-ADM-01 新增管理员：本地校验、动态码后原请求带 totp �
   await test.step('重复用户名（5 分钟内免动态码）：只提示一次，弹窗与输入保留', async () => {
     await page.getByTestId('admins-create-btn').click()
     await expect(page.getByTestId('adm-create-username')).toHaveValue('')
+    await expect(page.getByTestId('adm-create-password')).toHaveValue('') // 创建成功后初始密码已清空
     await page.getByTestId('adm-create-username').fill(username)
     await page.getByTestId('adm-create-password').fill(password)
     const before = (await toasts()).length
@@ -132,6 +134,10 @@ test('A-ADM-01 新增管理员：本地校验、动态码后原请求带 totp �
     expect((await toasts()).slice(before)).toEqual(['用户名已存在'])
     expect(posts).toHaveLength(4)
     await expect(page.getByTestId('totp-dialog')).toBeHidden()
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('adm-create-dialog')).toBeHidden()
+    await page.getByTestId('admins-create-btn').click()
+    await expect(page.getByTestId('adm-create-password')).toHaveValue('') // 关闭弹窗即清空初始密码
     await page.keyboard.press('Escape')
     await expect(page.getByTestId('adm-create-dialog')).toBeHidden()
   })
@@ -174,6 +180,7 @@ test('A-ADM-02 修改角色后对方下次加载菜单变化；停用后对方�
   await test.step('改为财务：连点保存，动态码后原请求带 totp 只重发一次；对方刷新后菜单变为财务', async () => {
     await row.getByTestId('adm-edit').click()
     await pick(page, 'adm-form-role', '财务')
+    await expect(page.getByTestId('adm-self-warning')).toHaveCount(0) // 不是自己：没有额外警告
     await clickTwiceSync(page.getByTestId('adm-form-submit'))
     await enterTotpDialog(page, root.totp_secret!)
     await toast(page, '已保存')
@@ -195,6 +202,15 @@ test('A-ADM-02 修改角色后对方下次加载菜单变化；停用后对方�
     await page.route(isSelf, (r) => r.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ code: 'last_super', message: LAST_SUPER }) }), { times: 1 })
     const selfPuts = recordRequests(page, 'PUT', `/admins/${root.id}`)
     await adminRow(page, root.username).getByTestId('adm-edit').click()
+    await expect(page.getByTestId('adm-edit-dialog')).toBeVisible()
+    await expect(page.getByTestId('adm-self-warning')).toHaveCount(0) // 未降级 / 停用时不提示
+    await pick(page, 'adm-form-status', '已停用')
+    await expect(page.getByTestId('adm-self-warning')).toHaveText('这是你自己的账号：保存后你将立即失去超级管理员权限或被强制下线。')
+    await pick(page, 'adm-form-status', '正常')
+    await pick(page, 'adm-form-role', '运维')
+    await expect(page.getByTestId('adm-self-warning')).toBeVisible()
+    await pick(page, 'adm-form-role', '超级管理员')
+    await expect(page.getByTestId('adm-self-warning')).toHaveCount(0)
     await pick(page, 'adm-form-status', '已停用')
     const before = (await toasts()).length
     await page.getByTestId('adm-form-submit').click()
@@ -246,10 +262,21 @@ test('A-ADM-03 重置他人动态码：确认文案、取消不发请求、失�
   await test.step('确认框文案；取消不发请求', async () => {
     await row.getByTestId('adm-reset-totp').click()
     await expect(page.getByTestId('adm-reset-text')).toHaveText('该管理员将被强制下线并在下次登录时重新绑定。')
+    await expect(page.getByTestId('adm-self-warning')).toHaveCount(0) // 不是自己：没有额外警告
     await page.getByTestId('adm-reset-cancel').click()
     await expect(page.getByTestId('adm-reset-dialog')).toBeHidden()
     await drainTasks(page)
     expect(posts).toHaveLength(0)
+  })
+
+  await test.step('重置自己的动态码：确认框额外警告会被立即下线；取消不发请求', async () => {
+    const selfPosts = recordRequests(page, 'POST', `/admins/${root.id}/reset-totp`)
+    await adminRow(page, root.username).getByTestId('adm-reset-totp').click()
+    await expect(page.getByTestId('adm-self-warning')).toHaveText('这是你自己的账号：重置后你将立即被下线，需要重新登录并绑定动态码。')
+    await page.getByTestId('adm-reset-cancel').click()
+    await expect(page.getByTestId('adm-reset-dialog')).toBeHidden()
+    await drainTasks(page)
+    expect(selfPosts).toHaveLength(0)
   })
 
   await test.step('失败（500）：只提示一次，确认框保留，对方仍已绑定', async () => {

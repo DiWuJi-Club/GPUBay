@@ -33,7 +33,8 @@ async function restorePrices(ctx: APIRequestContext, admin: SeededAdmin, origina
     if (cur?.amount === p.amount && cur.enabled === p.enabled) continue
     await adminPut(ctx, admin, `/admin/api/v1/products/${original.id}/prices/${p.duration}`, { amount: p.amount, enabled: p.enabled })
   }
-  expect((await firstProduct(ctx)).prices.map(({ duration, amount, enabled }) => ({ duration, amount, enabled }))).toEqual(
+  // soft：在 finally 里执行，核对失败不能掩盖用例本身的错误
+  expect.soft((await firstProduct(ctx)).prices.map(({ duration, amount, enabled }) => ({ duration, amount, enabled }))).toEqual(
     original.prices.map(({ duration, amount, enabled }) => ({ duration, amount, enabled })),
   )
 }
@@ -44,7 +45,7 @@ async function consoleMarket(browser: Browser) {
   const page = await ctx.newPage()
   await page.goto('/market')
   const card = page.getByTestId('market-card').first()
-  await expect(card.getByTestId('market-price-1d')).toBeVisible()
+  await expect(card.getByTestId('market-name')).toBeVisible()
   return { page, card, close: () => ctx.close() }
 }
 
@@ -146,6 +147,41 @@ test('A-CAT-01 修改 1 天价格：元精确转分、非法 / 0 / 负数本地�
       expect(puts.slice(3).map((p) => p.body)).toEqual([{ amount: 6900, enabled: true }, { amount: 6900, enabled: true }])
       expect((await publicCatalog(original.id)).product?.prices.find((p) => p.duration === '1d')?.amount).toBe(6900)
     })
+
+    await test.step('弹窗里关闭「启用」：请求 enabled=false，控制台不再有 1 天；再打开并启用后恢复', async () => {
+      const durations = async () => (await publicCatalog(original.id)).product?.prices.map((p) => p.duration)
+      const dialogSwitch = page.getByTestId('price-enabled')
+      const rowSwitch = product.getByTestId('cat-price-enabled-1d').getByRole('switch')
+      await product.getByTestId('cat-price-edit-1d').click()
+      await expect(dialogSwitch.getByRole('switch')).toBeChecked()
+      await dialogSwitch.click()
+      await expect(dialogSwitch.getByRole('switch')).not.toBeChecked()
+      await page.getByTestId('price-submit').click()
+      await expect(page.getByTestId('price-dialog')).toBeHidden()
+      await expect(rowSwitch).not.toBeChecked()
+      await expect(page.getByTestId('totp-dialog')).toBeHidden()
+      await drainTasks(page)
+      expect(puts.slice(5).map((p) => p.body)).toEqual([{ amount: 6900, enabled: false }])
+      expect(await durations()).toEqual(['1w', '1m'])
+      let market = await consoleMarket(page.context().browser()!)
+      await expect(market.card.getByTestId('market-price-1w')).toBeVisible()
+      await expect(market.card.getByTestId('market-price-1d')).toHaveCount(0)
+      await market.close()
+
+      await product.getByTestId('cat-price-edit-1d').click()
+      await expect(dialogSwitch.getByRole('switch')).not.toBeChecked()
+      await expect(amount).toHaveValue('69.00')
+      await dialogSwitch.click()
+      await page.getByTestId('price-submit').click()
+      await expect(page.getByTestId('price-dialog')).toBeHidden()
+      await expect(rowSwitch).toBeChecked()
+      await drainTasks(page)
+      expect(puts.slice(6).map((p) => p.body)).toEqual([{ amount: 6900, enabled: true }])
+      expect(await durations()).toEqual(['1d', '1w', '1m'])
+      market = await consoleMarket(page.context().browser()!)
+      await expect(market.card.getByTestId('market-price-1d')).toHaveText('1 天 ¥69.00')
+      await market.close()
+    })
   } finally {
     await restorePrices(ctx, admin, original)
   }
@@ -246,6 +282,7 @@ test('A-CAT-03 镜像新增、编辑、上移 / 下移（按显示顺序交换�
   const nameA = `${base} A`
   const nameA2 = `${base} A v2`
   const nameB = `${base} B`
+  const nameC = `${base} C`
   const toasts = await trackToasts(page)
   const imageGets = recordRequests(page, 'GET', '/images')
   const posts = recordRequests(page, 'POST', '/images')
@@ -376,6 +413,126 @@ test('A-CAT-03 镜像新增、编辑、上移 / 下移（按显示顺序交换�
       await expect(page.getByTestId('img-disable-dialog')).toBeHidden()
       expect(puts.slice(1).map((p) => p.body)).toEqual([{ name: nameB, ref: b.ref, description: '', enabled: true, sort: b.sort }])
       expect((await publicNames()).at(-1)).toBe(nameB)
+    })
+
+    const sw = (name: string) => imageRow(page, name).getByTestId('img-enabled')
+    const sortInput = page.getByTestId('img-dialog').getByRole('spinbutton', { name: '排序值' })
+    const adminOrder = async (n: number) => (await page.getByTestId('img-name').allTextContents()).map((t) => t.trim()).slice(-n)
+
+    await test.step('启用 / 停用失败：只提示一次；停用确认框保留、开关回到原状态', async () => {
+      const b = await byName(nameB)
+      const puts = recordRequests(page, 'PUT', `/images/${b.id}`)
+      await failOnce(page, `/images/${b.id}`, 'req-img-off')
+      let before = (await toasts()).length
+      await sw(nameB).click()
+      await page.getByTestId('img-disable-ok').click()
+      await toast(page, '服务器内部错误（请求号 req-img-off）')
+      await expectStillOpen(page, 'img-disable-dialog', '服务器内部错误（请求号 req-img-off）')
+      await expect(sw(nameB).getByRole('switch')).toBeChecked()
+      expect((await toasts()).slice(before)).toEqual(['服务器内部错误（请求号 req-img-off）'])
+      expect(await publicNames()).toContain(nameB)
+      await page.getByTestId('img-disable-ok').click()
+      await toast(page, '镜像已停用')
+      await expect(page.getByTestId('img-disable-dialog')).toBeHidden()
+      await expect(sw(nameB).getByRole('switch')).not.toBeChecked()
+
+      await failOnce(page, `/images/${b.id}`, 'req-img-on')
+      before = (await toasts()).length
+      await sw(nameB).click()
+      await toast(page, '服务器内部错误（请求号 req-img-on）')
+      await expect(page.getByTestId('img-disable-dialog')).toBeHidden()
+      await expect(sw(nameB).getByRole('switch')).not.toBeChecked()
+      await drainTasks(page)
+      expect((await toasts()).slice(before)).toEqual(['服务器内部错误（请求号 req-img-on）'])
+      expect(puts.map((p) => p.body?.enabled)).toEqual([false, false, true])
+      expect(await publicNames()).not.toContain(nameB)
+      await sw(nameB).click()
+      await toast(page, '镜像已启用')
+      await expect(sw(nameB).getByRole('switch')).toBeChecked()
+      expect((await publicNames()).at(-1)).toBe(nameB)
+    })
+
+    await test.step('新增时关闭「启用」并手填排序值：请求体一致、控制台不显示；已停用的行不能移动，上移 / 下移跳过它', async () => {
+      const a = await byName(nameA2)
+      const b = await byName(nameB)
+      const mid = a.sort + 5 // 夹在 A 与 B 之间
+      await page.getByTestId('images-create-btn').click()
+      await page.getByTestId('img-form-name').fill(nameC)
+      await page.getByTestId('img-form-ref').fill(`registry.spark.internal/e2e/${runStamp}-c:1`)
+      await expect(sortInput).toHaveValue(String(b.sort + 10))
+      await page.getByTestId('img-form-enabled').click()
+      await expect(page.getByTestId('img-form-enabled').getByRole('switch')).not.toBeChecked()
+      await sortInput.fill(String(mid))
+      await page.getByTestId('img-form-submit').click()
+      await toast(page, '镜像已新增')
+      await expect(page.getByTestId('img-dialog')).toBeHidden()
+      await drainTasks(page)
+      expect(posts.at(-1)?.body).toEqual({ name: nameC, ref: `registry.spark.internal/e2e/${runStamp}-c:1`, description: '', enabled: false, sort: mid })
+      expect(await adminOrder(3)).toEqual([nameA2, nameC, nameB])
+      await expect(sw(nameC).getByRole('switch')).not.toBeChecked()
+      await expect(imageRow(page, nameC).getByTestId('img-up')).toBeDisabled()
+      await expect(imageRow(page, nameC).getByTestId('img-down')).toBeDisabled()
+      expect(await publicNames()).not.toContain(nameC)
+      expect((await publicNames()).slice(-2)).toEqual([nameA2, nameB])
+
+      const c = await byName(nameC)
+      const putsA = recordRequests(page, 'PUT', `/images/${a.id}`)
+      const putsB = recordRequests(page, 'PUT', `/images/${b.id}`)
+      const putsC = recordRequests(page, 'PUT', `/images/${c.id}`)
+      await imageRow(page, nameB).getByTestId('img-up').click()
+      await toast(page, '顺序已调整')
+      await expect.poll(() => adminOrder(3)).toEqual([nameB, nameC, nameA2])
+      await drainTasks(page)
+      expect(putsB.map((p) => p.body?.sort)).toEqual([a.sort])
+      expect(putsA.map((p) => p.body?.sort)).toEqual([b.sort])
+      expect(putsC).toHaveLength(0)
+      expect((await publicNames()).slice(-2)).toEqual([nameB, nameA2])
+      await imageRow(page, nameB).getByTestId('img-down').click()
+      await expect.poll(() => adminOrder(3)).toEqual([nameA2, nameC, nameB])
+      await drainTasks(page)
+      expect(putsB.map((p) => p.body?.sort)).toEqual([a.sort, b.sort])
+      expect(putsA.map((p) => p.body?.sort)).toEqual([b.sort, a.sort])
+      expect(putsC).toHaveLength(0)
+      expect((await publicNames()).slice(-2)).toEqual([nameA2, nameB])
+    })
+
+    await test.step('编辑时打开「启用」并把排序值改到最前：请求体一致，后台与控制台顺序一致', async () => {
+      const a = await byName(nameA2)
+      const c = await byName(nameC)
+      const puts = recordRequests(page, 'PUT', `/images/${c.id}`)
+      await imageRow(page, nameC).getByTestId('img-edit').click()
+      await expect(page.getByTestId('img-form-enabled').getByRole('switch')).not.toBeChecked()
+      await expect(sortInput).toHaveValue(String(c.sort))
+      await page.getByTestId('img-form-enabled').click()
+      await sortInput.fill(String(a.sort - 5))
+      await page.getByTestId('img-form-submit').click()
+      await toast(page, '镜像已更新')
+      await expect(page.getByTestId('img-dialog')).toBeHidden()
+      await drainTasks(page)
+      expect(puts.map((p) => p.body)).toEqual([{ name: nameC, ref: c.ref, description: '', enabled: true, sort: a.sort - 5 }])
+      await expect.poll(() => adminOrder(3)).toEqual([nameC, nameA2, nameB])
+      await expect(sw(nameC).getByRole('switch')).toBeChecked()
+      expect((await publicNames()).slice(-3)).toEqual([nameC, nameA2, nameB])
+    })
+
+    await test.step('交换时第二个 PUT 失败：第一个改回原排序值，只提示一次，顺序不变', async () => {
+      const a = await byName(nameA2)
+      const b = await byName(nameB)
+      const putsA = recordRequests(page, 'PUT', `/images/${a.id}`)
+      const putsB = recordRequests(page, 'PUT', `/images/${b.id}`)
+      await failOnce(page, `/images/${a.id}`, 'req-move')
+      const before = (await toasts()).length
+      await imageRow(page, nameB).getByTestId('img-up').click()
+      await toast(page, '服务器内部错误（请求号 req-move）')
+      await expect(imageRow(page, nameB).getByTestId('img-up')).toBeEnabled()
+      await drainTasks(page)
+      expect(putsB.map((p) => p.body?.sort)).toEqual([a.sort, b.sort]) // 交换 + 回滚
+      expect(putsA.map((p) => p.body?.sort)).toEqual([b.sort]) // 失败的那一个
+      expect((await toasts()).slice(before)).toEqual(['服务器内部错误（请求号 req-move）'])
+      expect(await adminOrder(3)).toEqual([nameC, nameA2, nameB])
+      expect((await byName(nameA2)).sort).toBe(a.sort)
+      expect((await byName(nameB)).sort).toBe(b.sort)
+      expect((await publicNames()).slice(-3)).toEqual([nameC, nameA2, nameB])
     })
   } finally {
     // 没有删除接口：本用例造的镜像一律停用，控制台市场恢复为原来的镜像列表

@@ -4,6 +4,7 @@ import { ElMessage } from 'element-plus'
 import { onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
 import { notifyError } from '../logic/notify'
+import { session } from '../store/session'
 
 const items = ref<Admin[]>([])
 const loading = ref(false)
@@ -25,11 +26,13 @@ async function load() {
 }
 onMounted(load)
 const roles: Role[] = ['super', 'ops', 'finance']
+/** 操作对象是当前登录的管理员自己（后端允许，但降级 / 停用 / 重置后自己会立即失去权限或被下线）。 */
+const isSelf = (a: Admin | null) => a != null && a.id === session.admin?.id
 
 // 以下写操作后端都要求动态码：请求层弹出全局动态码框，带 totp 重发一次；取消（cancelled）静默，弹窗与输入保留
 const create = reactive({ visible: false, username: '', password: '', role: 'ops' as Role, error: '', busy: false })
 function openCreate() {
-  Object.assign(create, { visible: true, username: '', password: '', role: 'ops', error: '' })
+  Object.assign(create, { visible: true, username: '', role: 'ops', error: '' }) // 密码在成功 / 关闭弹窗时已清空
 }
 async function submitCreate() {
   if (create.busy) return // 同步守卫：连点只发一次
@@ -44,6 +47,7 @@ async function submitCreate() {
   try {
     await api.post('/admins', { username, password: create.password, role: create.role })
     ElMessage.success('管理员已创建，首次登录时绑定动态码')
+    create.password = '' // 初始密码不在内存里多留
     create.visible = false
     await load()
   } catch (e) {
@@ -51,6 +55,11 @@ async function submitCreate() {
   } finally {
     create.busy = false
   }
+}
+
+/** 弹窗关闭（取消 / Esc / 成功）即清掉初始密码。 */
+function onCreateClosed() {
+  create.password = ''
 }
 
 const edit = reactive({ visible: false, target: null as Admin | null, role: 'ops' as Role, status: 'active' as Admin['status'], busy: false })
@@ -113,7 +122,7 @@ async function submitReset() {
       </el-table-column>
     </el-table>
 
-    <el-dialog v-model="create.visible" title="新增管理员" width="460" align-center destroy-on-close data-testid="adm-create-dialog">
+    <el-dialog v-model="create.visible" title="新增管理员" width="460" align-center destroy-on-close data-testid="adm-create-dialog" @closed="onCreateClosed">
       <el-form label-position="top" @submit.prevent="submitCreate">
         <el-form-item label="用户名"><el-input v-model="create.username" data-testid="adm-create-username" autocomplete="off" /></el-form-item>
         <el-form-item label="初始密码（12～128 位）"><el-input v-model="create.password" type="password" show-password data-testid="adm-create-password" autocomplete="new-password" /></el-form-item>
@@ -127,12 +136,14 @@ async function submitReset() {
       <el-form label-position="top" @submit.prevent="submitEdit">
         <el-form-item label="角色"><el-select v-model="edit.role" data-testid="adm-form-role"><el-option v-for="r in roles" :key="r" :label="labelOf(roleLabel, r)" :value="r" /></el-select></el-form-item>
         <el-form-item label="状态"><el-select v-model="edit.status" data-testid="adm-form-status"><el-option label="正常" value="active" /><el-option label="已停用" value="disabled" /></el-select></el-form-item>
+        <p v-if="isSelf(edit.target) && (edit.role !== 'super' || edit.status === 'disabled')" class="error" data-testid="adm-self-warning">这是你自己的账号：保存后你将立即失去超级管理员权限或被强制下线。</p>
         <el-button type="primary" native-type="submit" :loading="edit.busy" data-testid="adm-form-submit">保存</el-button>
       </el-form>
     </el-dialog>
 
     <el-dialog v-model="reset.visible" title="重置动态码" width="420" align-center data-testid="adm-reset-dialog">
       <p data-testid="adm-reset-text">该管理员将被强制下线并在下次登录时重新绑定。</p>
+      <p v-if="isSelf(reset.target)" class="error" data-testid="adm-self-warning">这是你自己的账号：重置后你将立即被下线，需要重新登录并绑定动态码。</p>
       <template #footer><el-button data-testid="adm-reset-cancel" @click="reset.visible = false">取消</el-button><el-button type="danger" :loading="reset.busy" data-testid="adm-reset-ok" @click="submitReset">确定重置</el-button></template>
     </el-dialog>
   </el-card>

@@ -133,22 +133,35 @@ async function confirmDisable() {
   if (await setImageEnabled(disable.target, false)) disable.visible = false
 }
 
-/** 与相邻项交换 sort 值（各发一次 PUT）；两项 sort 相同时先把本项 ±1 保证顺序变化。 */
+/**
+ * 排序只在「启用」的镜像之间进行（控制台市场只显示启用的镜像）：上移 / 下移跳过已停用的行，
+ * 与该方向上最近的启用镜像交换 sort 值；已停用的行不能移动（先启用再排序）。
+ */
+function neighbour(i: AdminImage, dir: -1 | 1): AdminImage | undefined {
+  const idx = images.value.findIndex((x) => x.id === i.id)
+  for (let k = idx + dir; k >= 0 && k < images.value.length; k += dir) if (images.value[k].enabled) return images.value[k]
+  return undefined
+}
+const canMove = (i: AdminImage, dir: -1 | 1) => i.enabled && neighbour(i, dir) != null
+
+/** 与相邻启用项交换 sort 值（各发一次 PUT）；两项 sort 相同时先把本项 ±1 保证顺序变化。第二个 PUT 失败时把第一个改回原值。 */
 async function move(i: AdminImage, dir: -1 | 1) {
   if (imgBusy.value) return
-  const idx = images.value.findIndex((x) => x.id === i.id)
-  const other = images.value[idx + dir]
+  const other = canMove(i, dir) ? neighbour(i, dir) : undefined
   if (!other) return
   imgBusy.value = true
   let a = other.sort
   const b = i.sort
   if (a === b) a += dir
+  let firstDone = false
   try {
     await put(i, { sort: a })
+    firstDone = true
     await put(other, { sort: b })
     ElMessage.success('顺序已调整')
   } catch (e) {
     notifyError(e)
+    if (firstDone) await put(i, { sort: b }).catch(() => {}) // 回滚：本项恢复原排序值（失败也只提示一次，随后按服务端状态刷新）
   } finally {
     imgBusy.value = false
   }
@@ -186,9 +199,9 @@ async function move(i: AdminImage, dir: -1 | 1) {
         </el-table-column>
         <el-table-column label="排序" width="80"><template #default="{ row }"><span data-testid="img-sort">{{ row.sort }}</span></template></el-table-column>
         <el-table-column label="操作" width="220">
-          <template #default="{ row, $index }">
-            <el-button size="small" :disabled="$index === 0" data-testid="img-up" @click="move(row as AdminImage, -1)">上移</el-button>
-            <el-button size="small" :disabled="$index === images.length - 1" data-testid="img-down" @click="move(row as AdminImage, 1)">下移</el-button>
+          <template #default="{ row }">
+            <el-button size="small" :disabled="!canMove(row as AdminImage, -1)" data-testid="img-up" @click="move(row as AdminImage, -1)">上移</el-button>
+            <el-button size="small" :disabled="!canMove(row as AdminImage, 1)" data-testid="img-down" @click="move(row as AdminImage, 1)">下移</el-button>
             <el-button size="small" data-testid="img-edit" @click="openImage(row as AdminImage)">编辑</el-button>
           </template>
         </el-table-column>
