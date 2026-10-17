@@ -63,9 +63,26 @@ export async function placeOrder(api: APIRequestContext, opts: { duration?: '1d'
   return ((await r.json()) as { instance: { id: string } }).instance.id
 }
 
-/** ElMessage 渲染为 role="alert"。 */
+/** ElMessage 提示（.el-message）。不用 role="alert"：页内 el-alert 也是 role="alert"，会让断言在没有提示时也通过。 */
+export function toastLocator(page: Page, text: string | RegExp): Locator {
+  return page.locator('.el-message').filter({ hasText: text })
+}
+
 export async function toast(page: Page, text: string | RegExp) {
-  await expect(page.getByRole('alert').filter({ hasText: text }).first()).toBeVisible()
+  await expect(toastLocator(page, text).first()).toBeVisible()
+}
+
+/** 等页面跑完若干动画帧（IntersectionObserver 回调、Vue 更新都在其内），用于「之后不应再发请求」这类否定断言前。 */
+export async function settle(page: Page, frames = 10) {
+  await page.evaluate(
+    (n) =>
+      new Promise<void>((resolve) => {
+        let i = 0
+        const tick = () => (++i >= n ? setTimeout(resolve, 0) : requestAnimationFrame(tick))
+        requestAnimationFrame(tick)
+      }),
+    frames,
+  )
 }
 
 export function dialog(page: Page): Locator {

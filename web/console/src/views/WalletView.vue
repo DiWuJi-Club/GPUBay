@@ -3,7 +3,7 @@ import {
   durationLabel, fmtTime, fmtYuan, labelOf, ledgerKindLabel, messageOf, orderKindLabel, orderStatusLabel, rechargeChannelLabel, rechargeStatusLabel, useMobile,
   type LedgerRow, type Listed, type Order, type Paged, type Recharge,
 } from '@spark/shared'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import GuideDialog from '../components/GuideDialog.vue'
@@ -45,30 +45,46 @@ const PAGE = 20
 const ledger = ref<LedgerRow[]>([])
 const ledgerHasMore = ref(true)
 const ledgerLoading = ref(false)
+const ledgerError = ref('')
 const sentinel = ref<HTMLElement | null>(null)
+// 每次重置加一代：刷新时还在路上的旧请求回来后直接丢弃，不会把旧数据拼进新列表
+let ledgerGen = 0
 async function loadLedger(reset = false) {
-  if (ledgerLoading.value) return
   if (reset) {
+    ledgerGen++
     ledger.value = []
     ledgerHasMore.value = true
+    ledgerError.value = ''
+    ledgerLoading.value = false
   }
-  if (!ledgerHasMore.value) return
+  // 出错后停止自动加载，直到用户点「重试」，避免哨兵反复触发请求和提示
+  if (ledgerLoading.value || !ledgerHasMore.value || ledgerError.value) return
+  const gen = ledgerGen
   ledgerLoading.value = true
   try {
     const before = ledger.value.length ? ledger.value[ledger.value.length - 1].id : undefined
     const { items } = await api.get<Listed<LedgerRow>>('/wallet/ledger', { before_id: before, limit: PAGE })
+    if (gen !== ledgerGen) return
     ledger.value.push(...items)
     ledgerHasMore.value = items.length === PAGE
   } catch (e) {
+    if (gen !== ledgerGen) return
+    ledgerError.value = messageOf(e)
     notifyError(e)
+    return
   } finally {
-    ledgerLoading.value = false
+    if (gen === ledgerGen) ledgerLoading.value = false
   }
-  // 屏幕很高时第一页加载完哨兵可能仍在视口内，IntersectionObserver 不会再触发：重新观察一次，让它按当前位置再判断
+  // 只在成功后：屏幕很高时第一页加载完哨兵可能仍在视口内，IntersectionObserver 不会再触发，重新观察一次让它按当前位置再判断
+  await nextTick()
   if (sentinel.value && io) {
     io.unobserve(sentinel.value)
     io.observe(sentinel.value)
   }
+}
+function retryLedger() {
+  ledgerError.value = ''
+  void loadLedger()
 }
 let io: IntersectionObserver | undefined
 onMounted(() => {
@@ -170,7 +186,10 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
             <el-table-column label="备注" min-width="160"><template #default="{ row }"><span data-testid="ledger-remark">{{ row.remark }}</span></template></el-table-column>
             <el-table-column label="时间" width="160"><template #default="{ row }"><span data-testid="ledger-time">{{ fmtTime(row.created_at) }}</span></template></el-table-column>
           </el-table>
-          <div v-if="ledgerHasMore" ref="sentinel" class="sentinel" data-testid="ledger-sentinel">{{ ledgerLoading ? '加载中…' : '' }}</div>
+          <el-alert v-if="ledgerError" type="error" :title="ledgerError" :closable="false" show-icon data-testid="wallet-ledger-error">
+            <el-button size="small" data-testid="wallet-ledger-retry" @click="retryLedger">重试</el-button>
+          </el-alert>
+          <div v-else-if="ledgerHasMore" ref="sentinel" class="sentinel" data-testid="ledger-sentinel">{{ ledgerLoading ? '加载中…' : '' }}</div>
           <div v-else-if="ledger.length" class="muted end" data-testid="ledger-end">没有更多了</div>
           <el-empty v-else description="暂无流水" />
         </el-tab-pane>
