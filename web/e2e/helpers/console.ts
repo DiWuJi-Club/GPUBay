@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { expect, request, type APIRequestContext, type Locator, type Page, type TestInfo } from '@playwright/test'
 import { CONSOLE_URL, hooks } from './hooks'
 import { uniquePhone } from './phone'
@@ -87,4 +89,20 @@ export async function settle(page: Page, frames = 10) {
 
 export function dialog(page: Page): Locator {
   return page.getByRole('dialog')
+}
+
+/** 用户上传营业执照（multipart 字段 file），返回文件 key。 */
+export async function uploadLicense(api: APIRequestContext, name: 'license.png' | 'license.pdf'): Promise<string> {
+  const buffer = readFileSync(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url)))
+  const r = await api.post('/api/v1/uploads', { multipart: { file: { name, mimeType: name.endsWith('.pdf') ? 'application/pdf' : 'image/png', buffer } } })
+  if (r.status() !== 201) throw new Error(`upload ${r.status()} ${await r.text()}`)
+  return ((await r.json()) as { key: string }).key
+}
+
+/** 用户提交企业认证（先上传营业执照），返回营业执照文件 key。 */
+export async function submitEnterpriseKyc(api: APIRequestContext, opts: { company: string; licenseNo: string; file: 'license.png' | 'license.pdf' }): Promise<string> {
+  const key = await uploadLicense(api, opts.file)
+  const r = await api.post('/api/v1/kyc/enterprise', { data: { company_name: opts.company, license_no: opts.licenseNo, license_file: key } })
+  if (!r.ok()) throw new Error(`kyc/enterprise ${r.status()} ${await r.text()}`)
+  return key
 }
