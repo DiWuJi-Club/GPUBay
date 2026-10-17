@@ -124,6 +124,21 @@ describe('usePaged', () => {
     await vi.waitFor(() => expect(list.items.value).toEqual(['p1s50']))
   })
 
+  it('不在第一页时改 page_size：回到第一页，只发一次 page=1 的请求（不请求超出范围的旧页码）', async () => {
+    const fetcher = vi.fn(async (page: number, size: number) => ({ items: [`p${page}s${size}`], total: 21 }))
+    const list = usePaged(fetcher)
+    await list.load()
+    list.page.value = 2
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2))
+    list.size.value = 50
+    await vi.waitFor(() => expect(list.items.value).toEqual(['p1s50']))
+    await nextTick()
+    await nextTick()
+    expect(list.page.value).toBe(1)
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    expect(fetcher).toHaveBeenLastCalledWith(1, 50)
+  })
+
   it('先发后到的旧响应不覆盖新结果（快速翻页 / 改筛选）', async () => {
     const { fetcher, calls } = deferredFetcher<string>()
     const list = usePaged(fetcher)

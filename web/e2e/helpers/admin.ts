@@ -168,3 +168,31 @@ export async function trackToasts(page: Page): Promise<() => Promise<string[]>> 
   })
   return () => page.evaluate(() => (window as unknown as { __toasts: string[] }).__toasts.slice())
 }
+
+let pduSeq = 0
+/** 通过 API 新增 PDU（缺省 mock）；snmp 时 community 缺省为 public，可传入专门的值用于「不泄露」断言。 */
+export async function createPDU(ctx: APIRequestContext, admin: SeededAdmin, opts: { name?: string; driver?: 'mock' | 'snmp'; community?: string } = {}) {
+  pduSeq += 1
+  const name = opts.name ?? `pdu-${runStamp}-${pduSeq}`
+  const driver = opts.driver ?? 'mock'
+  const body = { name, driver, address: `10.97.0.${(pduSeq % 250) + 1}`, community: driver === 'snmp' ? (opts.community ?? 'public') : '', oid_prefix: '1.3.6.1.4.1.318.1.1.4.4.2.1.3', cycle_value: 3, on_value: 1 }
+  const out = await adminPost<{ id: number; name: string }>(ctx, admin, '/admin/api/v1/pdus', body)
+  return { id: out.id, name }
+}
+
+let ipSeq = 0
+/** 通过 API 登记一台机器（商品取第一个）：登记后处于维护中，且从未心跳 → 离线。 */
+export async function registerMachine(ctx: APIRequestContext, admin: SeededAdmin, opts: { rack?: string; pdu_id?: number; pdu_outlet?: number } = {}) {
+  ipSeq += 1
+  const r = await ctx.get('/admin/api/v1/products')
+  if (!r.ok()) throw new Error(`GET products ${r.status()} ${await r.text()}`)
+  const products = ((await r.json()) as { items: { id: number }[] }).items
+  const serial = nextSerial()
+  const body: Record<string, unknown> = { serial, rack: opts.rack ?? 'E2E', slot: String(ipSeq).padStart(3, '0'), lan_ip: `10.96.${Math.floor(ipSeq / 250)}.${(ipSeq % 250) + 1}`, product_id: products[0].id }
+  if (opts.pdu_id != null) {
+    body.pdu_id = opts.pdu_id
+    body.pdu_outlet = opts.pdu_outlet
+  }
+  const out = await adminPost<{ id: number }>(ctx, admin, '/admin/api/v1/machines', body)
+  return { id: out.id, serial }
+}

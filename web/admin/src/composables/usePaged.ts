@@ -3,7 +3,7 @@ import { ref, watch, type Ref } from 'vue'
 import { notifyError } from '../logic/notify'
 
 /**
- * 后台列表通用分页：page / page_size 变化自动加载。
+ * 后台列表通用分页：page / page_size 变化自动加载（改 page_size 回到第一页）。
  * 失败用 notifyError 提示（forbidden → 无权执行该操作；401 / 取消静默）；每次加载都是用户操作触发，不自动重试。
  * 任何一次加载失败都清空表格并给出 error（页面显示占位与重试按钮）：失败往往发生在改筛选 / 翻页之后，
  * 留着上一次的行会让表格内容与当前筛选条件、页码对不上；total 保留，分页器停在用户请求的那一页，重试即重新请求这一页。
@@ -36,7 +36,12 @@ export function usePaged<T>(fetcher: (page: number, pageSize: number) => Promise
       if (mine === seq) loading.value = false
     }
   }
-  watch([page, size], () => void load())
+  watch(page, () => void load())
+  // 改每页条数：回到第一页再加载（旧页码可能已超出范围）；不在第一页时由翻页触发，只发一次请求
+  watch(size, () => {
+    if (page.value === 1) void load()
+    else page.value = 1
+  })
   /** 筛选条件变化：回到第一页并重新加载 */
   function reset() {
     if (page.value === 1) void load()
