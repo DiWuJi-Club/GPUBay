@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Request } from '@playwright/test'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { adminApi, adminPost, createAdmin } from '../helpers/admin'
 import { loginConsole, seedUser, settle, toast, toastLocator } from '../helpers/console'
@@ -73,6 +74,24 @@ test('C-KYC-01 个人实名成功并按 redirect 回到市场', async ({ page })
   await expect(page.getByTestId('kyc-status')).toHaveText('已认证')
   await expect(page.getByTestId('kyc-verified-name')).toContainText('个人：张*')
   await expect(page.getByTestId('kyc-name')).toHaveCount(0)
+
+  await test.step('没有 redirect：认证成功后原地刷新为已认证并显示姓名，不重新加载页面', async () => {
+    await page.context().clearCookies()
+    const u2 = await seedUser({ verified: false })
+    await loginConsole(page, u2.phone)
+    await page.goto('/kyc')
+    await expect(page.getByTestId('kyc-status')).toHaveText('未认证')
+    await page.evaluate(() => ((window as unknown as { __noReload: boolean }).__noReload = true))
+    await page.getByTestId('kyc-name').fill('赵六')
+    await page.getByTestId('kyc-idno').fill('110101199001011234')
+    await page.getByTestId('kyc-personal-submit').click()
+    await toast(page, '实名认证成功')
+    await expect(page.getByTestId('kyc-status')).toHaveText('已认证')
+    await expect(page.getByTestId('kyc-verified-name')).toContainText('个人：赵*')
+    await expect(page.getByTestId('kyc-name')).toHaveCount(0)
+    expect(new URL(page.url()).pathname).toBe('/kyc')
+    expect(await page.evaluate(() => (window as unknown as { __noReload?: boolean }).__noReload)).toBe(true) // 同一个文档，没有 reload / goto
+  })
 })
 
 test('C-KYC-02 个人实名失败：红框原因与未通过状态', async ({ page }) => {
@@ -243,14 +262,51 @@ test('C-KYC-06 上传限制：GIF 被拒绝，PDF 显示图标', async ({ page }
   await input.setInputFiles(fixture('bad.gif'))
   await expect(page.getByTestId('kyc-upload-error')).toHaveText('仅支持 JPG、PNG、PDF 文件')
   await expect(page.getByTestId('kyc-enterprise-submit')).toBeDisabled()
+  await settle(page)
+  expect(uploads).toHaveLength(0) // 本地预检拦下，不发请求
   await input.setInputFiles(fixture('license.pdf'))
   await expect(page.getByTestId('kyc-file-pdf')).toBeVisible()
   await expect(page.getByTestId('kyc-file-preview')).toHaveCount(0)
   await expect(page.getByTestId('kyc-file-name')).toHaveText('license.pdf')
   await expect(page.getByTestId('kyc-upload-error')).toHaveCount(0)
   await expect(page.getByTestId('kyc-enterprise-submit')).toBeEnabled()
+  expect(uploads).toHaveLength(1)
+
+  await test.step('本地预检：超过 10MB、.txt 文件都不发请求，并清掉已选文件', async () => {
+    uploads.length = 0
+    await input.setInputFiles({ name: 'big.png', mimeType: 'image/png', buffer: Buffer.alloc(11 * 1024 * 1024, 1) })
+    await expect(page.getByTestId('kyc-upload-error')).toHaveText('文件不能超过 10MB')
+    await expect(page.getByTestId('kyc-file-name')).toHaveCount(0)
+    await expect(page.getByTestId('kyc-enterprise-submit')).toBeDisabled()
+    await input.setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hello') })
+    await expect(page.getByTestId('kyc-upload-error')).toHaveText('仅支持 JPG、PNG、PDF 文件')
+    await settle(page)
+    expect(uploads).toHaveLength(0)
+  })
+
+  await test.step('服务端拒绝：伪装成 PNG 的 GIF 返回 415、413 file_too_large 原文显示，只提示一次', async () => {
+    uploads.length = 0
+    await input.setInputFiles({ name: 'fake.png', mimeType: 'image/png', buffer: readFileSync(fixture('bad.gif')) })
+    await expect(page.getByTestId('kyc-upload-error')).toHaveText('仅支持 JPG、PNG、PDF 文件')
+    await toast(page, '仅支持 JPG、PNG、PDF 文件')
+    expect(uploads).toHaveLength(1)
+    await page.route('**/api/v1/uploads', (route) =>
+      route.fulfill({ status: 413, contentType: 'application/json', body: JSON.stringify({ code: 'file_too_large', message: '文件不能超过 10MB', request_id: 'req-413' }) }),
+    )
+    await input.setInputFiles(fixture('license.png'))
+    await expect(page.getByTestId('kyc-upload-error')).toHaveText('文件不能超过 10MB')
+    await toast(page, '文件不能超过 10MB')
+    await settle(page, 30)
+    expect(uploads).toHaveLength(2)
+    await expect(toastLocator(page, '文件不能超过 10MB')).toHaveCount(1)
+    await expect(page.getByTestId('kyc-file-name')).toHaveCount(0)
+    await expect(page.getByTestId('kyc-enterprise-submit')).toBeDisabled()
+    await page.unroute('**/api/v1/uploads')
+  })
 
   await test.step('上传请求失败（500）：清掉已选文件、只提示一次、不重试；重新选择即可恢复', async () => {
+    await input.setInputFiles(fixture('license.pdf'))
+    await expect(page.getByTestId('kyc-file-name')).toHaveText('license.pdf')
     uploads.length = 0
     await page.route('**/api/v1/uploads', (route) => route.fulfill(fail500('req-upload-500')))
     await input.setInputFiles(fixture('license.png'))
@@ -267,5 +323,65 @@ test('C-KYC-06 上传限制：GIF 被拒绝，PDF 显示图标', async ({ page }
     await expect(page.getByTestId('kyc-upload-error')).toHaveCount(0)
     await expect(page.getByTestId('kyc-enterprise-submit')).toBeEnabled()
     expect(uploads).toHaveLength(2)
+  })
+
+  await test.step('连续选择文件：只有最后一次选择生效，旧上传的结果被丢弃，提交用最新文件的 key', async () => {
+    const held = new Set([0, 2, 3]) // 按请求序号挂起，直到测试放行
+    const gates: Record<number, () => void> = {}
+    const reqs: Request[] = []
+    let n = 0
+    // 挂起的请求在放行后才真正发出（route.fetch 会破坏 multipart 请求体，所以用 continue）
+    await page.route('**/api/v1/uploads', async (route) => {
+      const i = n++
+      reqs[i] = route.request()
+      if (held.has(i)) await new Promise<void>((r) => (gates[i] = r))
+      await route.continue()
+    })
+    const pickButton = page.getByTestId('kyc-upload').locator('button') // 上传中为 loading（禁用）
+    const gate = async (i: number) => {
+      await expect.poll(() => typeof gates[i]).toBe('function')
+      gates[i]()
+    }
+
+    // 场景 A：旧上传（0 号 PNG）比新上传（1 号 PDF）晚返回
+    await input.setInputFiles(fixture('license.png'))
+    await expect.poll(() => typeof gates[0]).toBe('function')
+    await expect(page.getByTestId('kyc-enterprise-submit')).toBeDisabled() // 上传中
+    await input.setInputFiles(fixture('license.pdf'))
+    await expect(page.getByTestId('kyc-file-name')).toHaveText('license.pdf')
+    await expect(page.getByTestId('kyc-enterprise-submit')).toBeEnabled()
+    await gate(0)
+    await reqs[0].response() // 等旧请求真正返回
+    await settle(page, 30)
+    await expect(page.getByTestId('kyc-file-name')).toHaveText('license.pdf') // 迟到的旧结果没有覆盖
+    await expect(page.getByTestId('kyc-file-pdf')).toBeVisible()
+    await expect(page.getByTestId('kyc-file-preview')).toHaveCount(0)
+
+    // 场景 B：旧上传（2 号 PNG）先返回，新上传（3 号 second.pdf）仍在进行
+    await input.setInputFiles(fixture('license.png'))
+    await expect(page.getByTestId('kyc-file-name')).toHaveCount(0) // 换文件时旧文件立即作废
+    await input.setInputFiles({ name: 'second.pdf', mimeType: 'application/pdf', buffer: readFileSync(fixture('license.pdf')) })
+    await gate(2)
+    await reqs[2].response()
+    await settle(page, 30)
+    await expect(page.getByTestId('kyc-file-name')).toHaveCount(0) // 不显示被取代的文件
+    await expect(page.getByTestId('kyc-enterprise-submit')).toBeDisabled()
+    await expect(pickButton).toBeDisabled() // 旧结果不能提前结束 uploading
+    await gate(3)
+    await expect(page.getByTestId('kyc-file-name')).toHaveText('second.pdf')
+    await expect(pickButton).toBeEnabled()
+    await expect(page.getByTestId('kyc-enterprise-submit')).toBeEnabled()
+    await page.unroute('**/api/v1/uploads')
+
+    const posts = track(page, 'POST', '/api/v1/kyc/enterprise')
+    await page.getByTestId('kyc-company').fill('测试科技有限公司')
+    await page.getByTestId('kyc-license-no').fill(LICENSE_NO)
+    await page.getByTestId('kyc-enterprise-submit').click()
+    await expect(page.getByTestId('kyc-status')).toHaveText('审核中，通常 1 个工作日内完成')
+    expect(posts).toHaveLength(1)
+    const latestKey = ((await (await reqs[3].response())!.json()) as { key: string }).key
+    const staleKey = ((await (await reqs[2].response())!.json()) as { key: string }).key
+    expect(latestKey).not.toBe(staleKey)
+    expect((posts[0].postDataJSON() as { license_file: string }).license_file).toBe(latestKey)
   })
 })

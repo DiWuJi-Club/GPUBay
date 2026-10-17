@@ -4,7 +4,7 @@ import { ElMessage, type UploadRequestOptions } from 'element-plus'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
-import { validateEnterprise, validatePersonal, type EnterpriseErrors, type PersonalErrors } from '../logic/kyc'
+import { checkLicenseFile, validateEnterprise, validatePersonal, type EnterpriseErrors, type PersonalErrors } from '../logic/kyc'
 import { notifyError } from '../logic/notify'
 import { safeRedirect } from '../router'
 import { session, setUser } from '../store/session'
@@ -105,25 +105,45 @@ function clearFile() {
   enterprise.previewUrl = ''
   enterprise.isPdf = false
 }
-onBeforeUnmount(clearFile)
+
+// 上传序号：只有最新一次选择的上传结果能写入文件、结束 uploading；卸载后到达的结果一律丢弃。
+let uploadSeq = 0
+let unmounted = false
+onBeforeUnmount(() => {
+  unmounted = true
+  uploadSeq += 1
+  clearFile()
+})
+
+/** 选择文件后的本地预检（类型 / 10MB），不通过则不发上传请求，并作废进行中的上传。 */
+function beforeUpload(file: File): boolean {
+  const err = checkLicenseFile(file)
+  if (!err) return true
+  uploadSeq += 1
+  uploading.value = false
+  clearFile()
+  uploadError.value = err
+  return false
+}
 
 async function doUpload(opt: UploadRequestOptions) {
+  const my = ++uploadSeq
   uploading.value = true
   uploadError.value = ''
+  clearFile() // 换文件：旧的 key 与预览立即作废（释放 blob URL）
   try {
     const up = await api.upload<Upload>('/uploads', opt.file)
-    clearFile()
+    if (my !== uploadSeq || unmounted) return // 已被更新的选择取代
     enterprise.fileKey = up.key
     enterprise.fileName = opt.file.name
     enterprise.isPdf = up.content_type === 'application/pdf'
     enterprise.previewUrl = enterprise.isPdf ? '' : URL.createObjectURL(opt.file)
-    enterpriseErrors.value.fileKey = undefined
   } catch (e) {
-    clearFile()
+    if (my !== uploadSeq || unmounted) return
     uploadError.value = messageOf(e) // file_too_large / unsupported_file_type 原文；重新选择文件即可重试
     notifyError(e)
   } finally {
-    uploading.value = false
+    if (my === uploadSeq) uploading.value = false
   }
 }
 
@@ -187,7 +207,7 @@ async function submitEnterprise() {
             </el-form-item>
             <el-form-item label="营业执照（JPG / PNG / PDF，10MB 以内）" data-testid="kyc-file-item">
               <div class="upload-box">
-                <el-upload data-testid="kyc-upload" :http-request="doUpload" :show-file-list="false" accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf">
+                <el-upload data-testid="kyc-upload" :before-upload="beforeUpload" :http-request="doUpload" :show-file-list="false" accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf">
                   <el-button :loading="uploading">{{ enterprise.fileKey ? '重新选择' : '选择文件' }}</el-button>
                 </el-upload>
                 <div v-if="enterprise.fileKey" class="file">
@@ -196,7 +216,6 @@ async function submitEnterprise() {
                   <span data-testid="kyc-file-name">{{ enterprise.fileName }}</span>
                 </div>
                 <span v-if="uploadError" class="field-error" data-testid="kyc-upload-error">{{ uploadError }}</span>
-                <span v-else-if="enterpriseErrors.fileKey" class="field-error">{{ enterpriseErrors.fileKey }}</span>
               </div>
             </el-form-item>
             <el-button type="primary" native-type="submit" :disabled="!enterprise.fileKey || uploading" :loading="submittingEnterprise" data-testid="kyc-enterprise-submit">提交审核</el-button>
