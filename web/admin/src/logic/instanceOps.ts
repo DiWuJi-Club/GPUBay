@@ -1,4 +1,4 @@
-import { validateYuanRange, type InstanceState, type Role } from '@spark/shared'
+import { validateYuanRange, yuanToCents, type InstanceState, type Role } from '@spark/shared'
 
 /** 与后端 rental.MinExtendSeconds / MaxExtendSeconds 一致 */
 export const MIN_EXTEND = 60
@@ -13,10 +13,16 @@ export function validateExtend(seconds: number): string | null {
   return Number.isFinite(seconds) && seconds >= MIN_EXTEND && seconds <= MAX_EXTEND ? null : '补偿时长需在 1 分钟到 30 天之间'
 }
 
-/** 退款金额（元，最多两位小数）→ 分；负数、多于两位小数、科学计数等一律「金额格式不正确」；0 不是退款。 */
+/**
+ * 退款金额（元，最多两位小数）→ 分，范围 0～可退上限；负数、多于两位小数、科学计数等一律「金额格式不正确」。
+ * 0 合法：表示只释放、不退款（后端允许；可退上限为 0 时这是唯一的释放方式）。
+ */
 export function validateRefund(yuan: string, maxCents: number): { cents: number } | { error: string } {
-  return validateYuanRange(yuan, 1, maxCents, { min: '退款金额需大于 0', max: '退款金额不能超过可退上限' })
+  return validateYuanRange(yuan, 0, maxCents, { max: '退款金额不能超过可退上限' })
 }
+
+/** 金额输入恰好是 0（含 0.00）：提示「只释放、不退款」 */
+export const isZeroRefund = (yuan: string) => yuanToCents(yuan) === 0
 
 const opsRole = (r: Role) => r === 'ops' || r === 'super'
 const finRole = (r: Role) => r === 'finance' || r === 'super'

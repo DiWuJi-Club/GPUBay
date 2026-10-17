@@ -8,7 +8,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
-import { extendSeconds, showExtend, showMigrate, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
+import { extendSeconds, isZeroRefund, showExtend, showMigrate, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
 
@@ -163,7 +163,7 @@ async function submitRefund() {
   refund.busy = true
   try {
     const out = await api.post<{ refunded: number }>(`/instances/${id.value}/refund-release`, { amount: v.cents, reason: refund.reason.trim() })
-    ElMessage.success(`已退款 ${fmtYuan(out.refunded)}，实例进入洗机`)
+    ElMessage.success(out.refunded > 0 ? `已退款 ${fmtYuan(out.refunded)}，实例进入洗机` : '已释放（未退款），实例进入洗机')
     refund.visible = false
     await load()
   } catch (e) {
@@ -293,6 +293,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
           <el-form-item label="退款金额（元）"><el-input v-model="refund.amount" inputmode="decimal" data-testid="refund-amount" /></el-form-item>
           <p class="muted" data-testid="refund-hint">建议 {{ fmtYuan(refund.quote.suggested) }}（按剩余时长 {{ fmtDuration(refund.quote.remaining_seconds) }} 折算），最多可退 {{ fmtYuan(refund.quote.max) }}</p>
           <el-form-item label="原因（必填）"><el-input v-model="refund.reason" data-testid="refund-reason" /></el-form-item>
+          <p v-if="isZeroRefund(refund.amount)" class="zero-hint" data-testid="refund-zero-hint">金额为 0 表示只释放、不退款</p>
           <p v-if="refund.error" class="error" data-testid="refund-error">{{ refund.error }}</p>
           <el-button type="danger" native-type="submit" :loading="refund.busy" data-testid="refund-submit">退款并释放</el-button>
         </el-form>
@@ -307,6 +308,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; font-size: 13px; }
 .error { color: var(--el-color-danger); font-size: 13px; }
+.zero-hint { color: var(--el-color-warning); font-size: 13px; }
 .actions { display: flex; gap: 12px; margin-top: 16px; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .grid { width: 100%; border-collapse: collapse; font-size: 13px; }

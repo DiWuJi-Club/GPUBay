@@ -1,6 +1,6 @@
 import type { InstanceState, Role } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { extendSeconds, showExtend, showMigrate, showRefund, showRewipe, validateExtend, validateRefund } from '../instanceOps'
+import { extendSeconds, isZeroRefund, showExtend, showMigrate, showRefund, showRewipe, validateExtend, validateRefund } from '../instanceOps'
 
 const RANGE = '补偿时长需在 1 分钟到 30 天之间'
 
@@ -25,9 +25,16 @@ describe('instance ops', () => {
   it('退款金额：0 ≤ 金额 ≤ 上限', () => {
     expect(validateRefund('69', 6900)).toEqual({ cents: 6900 })
     expect(validateRefund(' 12.5 ', 6900)).toEqual({ cents: 1250 })
-    expect(validateRefund('0', 6900)).toEqual({ error: '退款金额需大于 0' })
-    expect(validateRefund('0.00', 6900)).toEqual({ error: '退款金额需大于 0' })
+    expect(validateRefund('0', 6900)).toEqual({ cents: 0 }) // 只释放、不退款
+    expect(validateRefund('0.00', 6900)).toEqual({ cents: 0 })
+    expect(validateRefund('0', 0)).toEqual({ cents: 0 }) // 可退上限为 0 时仍可释放
+    expect(validateRefund('0.01', 0)).toEqual({ error: '退款金额不能超过可退上限' })
     expect(validateRefund('0.01', 6900)).toEqual({ cents: 1 })
+    expect(isZeroRefund('0')).toBe(true)
+    expect(isZeroRefund(' 0.00 ')).toBe(true)
+    expect(isZeroRefund('0.01')).toBe(false)
+    expect(isZeroRefund('')).toBe(false)
+    expect(isZeroRefund('abc')).toBe(false)
     expect(validateRefund('69.01', 6900)).toEqual({ error: '退款金额不能超过可退上限' })
     expect(validateRefund('-1', 6900)).toEqual({ error: '金额格式不正确' })
     expect(validateRefund('abc', 6900)).toEqual({ error: '金额格式不正确' })
