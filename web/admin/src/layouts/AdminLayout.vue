@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { brand, isApiError, labelOf, messageOf, roleLabel, type Paged } from '@spark/shared'
+import { brand, isApiError, labelOf, messageOf, roleLabel } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { menuFor } from '../menu'
+import { refreshUnresolved, unresolvedAlerts } from '../store/alerts'
 import { clearSession, session } from '../store/session'
 
 const route = useRoute()
@@ -33,19 +34,11 @@ const items = computed(() => (session.admin ? menuFor(session.admin.role) : []))
 const active = computed(() => items.value.find((m) => (m.path === '/' ? route.path === '/' : route.path === m.path || route.path.startsWith(m.path + '/')))?.key ?? '')
 const logo = import.meta.env.BASE_URL + brand.logoUrl
 
-// 未处理告警角标：进入时取一次，之后 60 秒刷新一次 total；失败保留上次的数、不提示、不立即重试，等下一个周期
-const unresolved = ref(0)
+// 未处理告警角标（store/alerts.ts）：进入时取一次，之后 60 秒刷新一次 total；失败保留上次的数、不提示、不立即重试，等下一个周期
 let timer: ReturnType<typeof setInterval> | undefined
-async function loadBadge() {
-  try {
-    unresolved.value = (await api.get<Paged<unknown>>('/alerts', { resolved: 'false', page_size: 1 })).total
-  } catch {
-    /* 角标失败不打扰用户；401 已由 handleUnauthorized 统一处理 */
-  }
-}
 onMounted(() => {
-  void loadBadge()
-  timer = setInterval(loadBadge, 60_000)
+  void refreshUnresolved()
+  timer = setInterval(refreshUnresolved, 60_000)
 })
 onUnmounted(() => clearInterval(timer))
 
@@ -76,7 +69,7 @@ async function logout() {
       <nav>
         <router-link v-for="m in items" :key="m.key" :to="m.path" class="menu-item" :class="{ active: active === m.key }" :title="m.label" :data-testid="`menu-${m.key}`">
           <span class="label">{{ collapsed ? m.label.slice(0, 2) : m.label }}</span>
-          <el-badge v-if="m.key === 'alerts' && unresolved > 0" :value="unresolved" :max="99" class="badge" data-testid="menu-alerts-badge" />
+          <el-badge v-if="m.key === 'alerts' && unresolvedAlerts > 0" :value="unresolvedAlerts" :max="99" class="badge" data-testid="menu-alerts-badge" />
         </router-link>
       </nav>
       <button class="collapse" type="button" :title="collapsed ? '展开菜单' : '收起菜单'" data-testid="layout-collapse" @click="toggle">{{ collapsed ? '»' : '«' }}</button>

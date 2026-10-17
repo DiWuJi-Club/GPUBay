@@ -117,8 +117,16 @@ export function recordRequests(page: Page, method: string, path: string) {
 
 /** 冻结页面时间（page.clock.install 之后时间仍按真实流逝）：此后只有 runFor 会触发页面定时器。 */
 export async function pauseClock(page: Page) {
-  const now = await page.evaluate(() => Date.now())
-  await page.clock.pauseAt(now + 1)
+  // 读时间与 pauseAt 之间页面时间仍在走：往返超过 1ms 时 pauseAt 会报「Cannot fast-forward to the past」，重读后再试
+  for (let attempt = 0; ; attempt++) {
+    const now = await page.evaluate(() => Date.now())
+    try {
+      await page.clock.pauseAt(now + 1)
+      return
+    } catch (e) {
+      if (attempt >= 4 || !String(e).includes('fast-forward to the past')) throw e
+    }
+  }
 }
 
 /** 让页面跑完若干轮宏任务（MessageChannel 不受 page.clock 接管）：时钟冻结时 settle 依赖的 requestAnimationFrame 不会触发，用它代替。 */
@@ -142,4 +150,21 @@ export async function clickTwiceSync(locator: Locator) {
     ;(el as HTMLElement).click()
     ;(el as HTMLElement).click()
   })
+}
+
+/**
+ * 记录页面上出现过的每一条 ElMessage 提示（MutationObserver，提示自动关闭后仍计入），返回读取函数。
+ * 用于「同一次故障只提示一次」这类断言：数当前可见的 .el-message 会因为提示 3 秒后自动关闭而漏数。
+ * 在 page.goto 之前调用；每次整页加载（reload / goto）记录从零开始。
+ */
+export async function trackToasts(page: Page): Promise<() => Promise<string[]>> {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __toasts: string[] }
+    w.__toasts = []
+    new MutationObserver((records) => {
+      for (const r of records)
+        for (const n of Array.from(r.addedNodes)) if (n instanceof HTMLElement && n.classList.contains('el-message')) w.__toasts.push(n.textContent?.trim() ?? '')
+    }).observe(document, { childList: true, subtree: true })
+  })
+  return () => page.evaluate(() => (window as unknown as { __toasts: string[] }).__toasts.slice())
 }
