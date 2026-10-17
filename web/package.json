@@ -2,7 +2,7 @@
   "name": "spark-cloud-web",
   "private": true,
   "type": "module",
-  "workspaces": ["shared", "console"],
+  "workspaces": ["shared", "console", "admin"],
   "overrides": { "typescript": "~5.9.3" },
   "scripts": {
     "dev:console": "npm run dev -w console",

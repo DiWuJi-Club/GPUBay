@@ -94,3 +94,41 @@ export async function drainIdleMachines(ctx: APIRequestContext, admin: SeededAdm
   }
   throw new Error('drainIdleMachines: 10 轮后仍有空闲机器')
 }
+
+/** 精确断言后台地址：路径与查询参数都必须完全一致（不用后缀正则，避免 ?redirect=/machines 这类误配）。 */
+export async function expectAdminUrl(page: Page, path: string, query: Record<string, string> = {}) {
+  await expect(page).toHaveURL((u) => {
+    const actual = Object.fromEntries(u.searchParams)
+    return u.origin === ADMIN_URL && u.pathname === `/admin${path}` && JSON.stringify(actual) === JSON.stringify(query)
+  })
+}
+
+/** 记录某个后台接口的请求（方法 + 路径精确匹配，查询串不参与匹配）；body 为解析后的 JSON。 */
+export function recordRequests(page: Page, method: string, path: string) {
+  const seen: { body: Record<string, unknown> | null; search: string }[] = []
+  page.on('request', (r) => {
+    const u = new URL(r.url())
+    if (r.method() !== method || u.pathname !== `/admin/api/v1${path}`) return
+    const raw = r.postData()
+    seen.push({ body: raw ? (JSON.parse(raw) as Record<string, unknown>) : null, search: u.search })
+  })
+  return seen
+}
+
+/** 冻结页面时间（page.clock.install 之后时间仍按真实流逝）：此后只有 runFor 会触发页面定时器。 */
+export async function pauseClock(page: Page) {
+  const now = await page.evaluate(() => Date.now())
+  await page.clock.pauseAt(now + 1)
+}
+
+/** 让页面跑完若干轮宏任务（MessageChannel 不受 page.clock 接管）：时钟冻结时 settle 依赖的 requestAnimationFrame 不会触发，用它代替。 */
+export function drainTasks(page: Page, n = 20) {
+  return page.evaluate(async (count) => {
+    for (let i = 0; i < count; i++)
+      await new Promise<void>((resolve) => {
+        const ch = new MessageChannel()
+        ch.port1.onmessage = () => resolve()
+        ch.port2.postMessage(0)
+      })
+  }, n)
+}
