@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { digitsOnly, type Paged } from '@spark/shared'
 import { onMounted, reactive, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import { usePaged } from '../composables/usePaged'
 import { downloadBlob } from '../logic/csv'
@@ -18,22 +18,36 @@ const props = defineProps<{
 }>()
 
 const route = useRoute()
-const filter = reactive({ user_id: digitsOnly(String(route.query.user_id ?? '')), kind: '', status: '', range: { from: '', to: '' } })
+const emptyFilter = (userId: unknown = '') => ({ user_id: digitsOnly(String(userId ?? '')), kind: '', status: '', range: { from: '', to: '' } })
+const filter = reactive(emptyFilter(route.query.user_id))
 // 空值由 buildQuery 省略；日期按 YYYY-MM-DD 原样发出（后端按北京时间解释，to 含当天）
 const query = () => ({ user_id: filter.user_id, [props.kindParam]: filter.kind, status: filter.status, from: filter.range.from, to: filter.range.to })
-const list = usePaged<Record<string, unknown>>((page, size) => api.get<Paged<Record<string, unknown>>>(`/${props.endpoint}`, { ...query(), page, page_size: size }))
+// 已生效的筛选：只在查询 / 重置 / 打开页面（含 ?user_id= 预填）时取表单快照。
+// 翻页与导出都用它：表单改了但没点「查询」时，第 2 页和导出的 CSV 仍与屏幕上的表格一致。
+let applied = query()
+const list = usePaged<Record<string, unknown>>((page, size) => api.get<Paged<Record<string, unknown>>>(`/${props.endpoint}`, { ...applied, page, page_size: size }))
 onMounted(list.load)
-function resetFilter() {
-  Object.assign(filter, { user_id: '', kind: '', status: '', range: { from: '', to: '' } })
+function search() {
+  applied = query()
   list.reset()
 }
+function resetFilter() {
+  Object.assign(filter, emptyFilter())
+  search()
+}
+// 同一路由只换查询串（/orders?user_id=X → /orders 或 ?user_id=Y，含浏览器前进后退）：组件复用，按新地址重新预填并加载
+onBeforeRouteUpdate((to) => {
+  if (String(to.query.user_id ?? '') === String(route.query.user_id ?? '')) return
+  Object.assign(filter, emptyFilter(to.query.user_id))
+  search()
+})
 
 const exporting = ref(false)
 async function exportCSV() {
   if (exporting.value) return // 同步守卫：连点两次只导出一次
   exporting.value = true
   try {
-    const { blob, filename } = await api.download(`/${props.endpoint}/export`, query())
+    const { blob, filename } = await api.download(`/${props.endpoint}/export`, applied)
     downloadBlob(filename, blob)
   } catch (e) {
     notifyError(e) // export_too_large 等按原文提示
@@ -45,7 +59,7 @@ async function exportCSV() {
 
 <template>
   <el-card>
-    <el-form inline class="filters" @submit.prevent="list.reset()">
+    <el-form inline class="filters" @submit.prevent="search">
       <el-form-item label="用户 ID">
         <el-input :model-value="filter.user_id" clearable data-testid="fin-filter-user" style="width: 120px" @update:model-value="(v: string) => (filter.user_id = digitsOnly(v))" />
       </el-form-item>

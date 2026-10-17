@@ -88,12 +88,20 @@ async function trackBlobUrls(page: Page): Promise<() => Promise<{ created: strin
   })
 }
 
+/** 应用内导航（与点击站内链接相同，组件复用）：同一路由只换查询串时用。 */
+function routerPush(page: Page, path: string) {
+  return page.evaluate(async (to) => {
+    const app = (document.querySelector('#app') as unknown as { __vue_app__: { config: { globalProperties: { $router: { push(p: string): Promise<unknown> } } } } }).__vue_app__
+    await app.config.globalProperties.$router.push(to)
+  }, path)
+}
+
 async function renew(api: Awaited<ReturnType<typeof userApi>>, id: string, duration: '1d' | '1w') {
   const r = await api.post(`/api/v1/instances/${id}/renew`, { data: { duration }, headers: { 'Idempotency-Key': crypto.randomUUID() } })
   if (!r.ok()) throw new Error(`renew ${r.status()} ${await r.text()}`)
 }
 
-test('A-FIN-01 订单表：仅超管 / 财务可见；首次加载失败可重试；?user_id= 预填；筛选用户 / 类型 / 状态 / 日期原样发出；行内容；重置；分页', async ({ page }) => {
+test('A-FIN-01 订单表：仅超管 / 财务可见；首次加载失败可重试；?user_id= 预填（同一路由换查询串重新预填）；筛选用户 / 类型 / 状态 / 日期原样发出；行内容；重置；分页与导出按已查询的条件', async ({ page }) => {
   // 用户 U：实例 1 新购 1 天（已支付）+ 续费 1 周（退 ¥10 → 部分退款）；实例 2 新购后开通失败（全额退款）
   const u = await seedUser({ balance: 300000 })
   const api = await userApi(u.phone)
@@ -232,23 +240,53 @@ test('A-FIN-01 订单表：仅超管 / 财务可见；首次加载失败可重�
     await expectAdminUrl(page, `/instances/${inst1}`)
   })
 
-  await test.step('分页：22 笔订单的用户，第 1 页 20 条，翻到第 2 页带 page=2；换条件查询回到第 1 页且只发一次请求', async () => {
-    const p = await seedUser({ balance: 160000 })
-    const papi = await userApi(p.phone)
-    await hooks.machines(1)
-    const pinst = await placeOrder(papi)
-    for (let i = 0; i < 21; i++) await renew(papi, pinst, '1d')
-    const page2 = await getJSON<PagedOf<Order>>(ctx, `/admin/api/v1/orders?user_id=${p.id}&page=2&page_size=20`)
-    expect(page2.total).toBe(22)
-    await page.getByTestId('menu-orders').click()
-    await page.getByTestId('fin-filter-user').fill(String(p.id))
-    await page.getByTestId('fin-search').click()
+  // 22 笔订单的用户 P：新购 1 天 + 续费 21 次
+  const p = await seedUser({ balance: 160000 })
+  const papi = await userApi(p.phone)
+  await hooks.machines(1)
+  const pinst = await placeOrder(papi)
+  for (let i = 0; i < 21; i++) await renew(papi, pinst, '1d')
+  const page2 = await getJSON<PagedOf<Order>>(ctx, `/admin/api/v1/orders?user_id=${p.id}&page=2&page_size=20`)
+  expect(page2.total).toBe(22)
+
+  await test.step('同一路由只换查询串：?user_id=U → ?user_id=P、→ 无参数（菜单）、浏览器后退回 ?user_id=P，都重新预填并加载', async () => {
+    await page.goto(`/admin/orders?user_id=${u.id}`)
+    await expect(rows(page, 'ord-id')).toHaveCount(3)
+    await routerPush(page, `/orders?user_id=${p.id}`)
+    await expectAdminUrl(page, '/orders', { user_id: String(p.id) })
+    await expect(page.getByTestId('fin-filter-user')).toHaveValue(String(p.id))
     await expect.poll(() => searches().at(-1)).toBe(`?user_id=${p.id}&page=1&page_size=20`)
-    await expect(rows(page, 'ord-id')).toHaveCount(20)
     await expect(page.getByTestId('fin-total')).toHaveText('共 22 条')
+    await page.getByTestId('menu-orders').click()
+    await expectAdminUrl(page, '/orders')
+    await expect(page.getByTestId('fin-filter-user')).toHaveValue('')
+    await expect.poll(() => searches().at(-1)).toBe('?page=1&page_size=20')
+    await page.goBack()
+    await expectAdminUrl(page, '/orders', { user_id: String(p.id) })
+    await expect(page.getByTestId('fin-filter-user')).toHaveValue(String(p.id))
+    await expect.poll(() => searches().at(-1)).toBe(`?user_id=${p.id}&page=1&page_size=20`)
+    await expect(page.getByTestId('fin-total')).toHaveText('共 22 条')
+  })
+
+  await test.step('分页：第 1 页 20 条；改了筛选但没点「查询」时翻到第 2 页、导出仍按已查询的条件；换条件查询回到第 1 页且只发一次请求', async () => {
+    await expect(rows(page, 'ord-id')).toHaveCount(20)
+    // 未提交的修改：用户换成 U、开始日期改成 2000 年
+    await page.getByTestId('fin-filter-user').fill(String(u.id))
+    await page.getByTestId('fin-from').fill('2000-01-01')
     await page.getByTestId('fin-pager').getByText('2', { exact: true }).click()
     await expect.poll(() => searches().at(-1)).toBe(`?user_id=${p.id}&page=2&page_size=20`)
     await expect(page.getByTestId('ord-id')).toHaveText(page2.items.map((o) => o.id))
+    const exports = recordRequests(page, 'GET', '/orders/export')
+    const pending = page.waitForEvent('download')
+    await page.getByTestId('fin-export').click()
+    const file = await pending
+    expect(exports.map((x) => x.search)).toEqual([`?user_id=${p.id}`])
+    const table = readDownload(await file.path()).table
+    expect(table.slice(1)).toHaveLength(22)
+    expect(new Set(table.slice(1).map((c) => c[1]))).toEqual(new Set([String(p.id)]))
+
+    await page.getByTestId('fin-filter-user').fill(String(p.id))
+    await page.getByTestId('fin-from').fill('')
     await pick(page, 'fin-filter-kind', '新购')
     const n = listReqs.length
     await page.getByTestId('fin-search').click()
@@ -452,7 +490,28 @@ test('A-FIN-03 充值表：筛选用户 / 渠道 / 状态 / 日期原样发出�
   })
 })
 
-test('A-FIN-04 三张表导出 CSV：与列表同筛选参数、文件名、BOM、中文表头、行内容（元两位小数、防公式注入）、释放 URL；失败只提示一次；连点只导出一次', async ({ page }) => {
+test('A-FIN-04 三张表导出 CSV：与列表同筛选参数（含状态、跨北京时间午夜的日期、未提交的修改不生效）、文件名、BOM、中文表头、行内容（元两位小数、防公式注入）、释放 URL；失败只提示一次；连点只导出一次；超管可导出', async ({ page }) => {
+  // 用户 B：北京时间午夜前 1 分钟、后 1 分钟各一张支付宝待支付单（推进共享假时钟到下一个北京时间午夜附近；之后才建管理员会话）
+  const b = await seedUser()
+  const bapi = await userApi(b.phone)
+  const bCreate = async () => {
+    const res = await bapi.post('/api/v1/recharges', { data: { amount: 5000, channel: 'alipay' } })
+    if (!res.ok()) throw new Error(`recharge ${res.status()} ${await res.text()}`)
+    return ((await res.json()) as { id: string }).id
+  }
+  const DAY = 86_400_000
+  const CST = 8 * 3_600_000
+  const now = (await hooks.clock()).getTime()
+  const midnight = (Math.floor((now + CST) / DAY) + 1) * DAY - CST
+  let wait = Math.ceil((midnight - now) / 1000) - 60
+  if (wait < 1) wait += 86_400
+  await hooks.advance(wait)
+  const bBefore = await bCreate()
+  await hooks.advance(120)
+  const bAfter = await bCreate()
+  const bPaid = await bCreate() // 午夜后、同渠道但已支付：只被状态筛选排除
+  expect((await bapi.post(`/api/v1/dev/recharges/${bPaid}/pay`, { data: {} })).ok()).toBe(true)
+
   // 用户 E：一笔订单；调账备注以 = + @ - 开头（需转义）与一笔负数调账（金额不转义）；手动充值备注以 = 开头且带引号；一张支付宝待支付单（被渠道筛选排除）
   const e = await seedUser({ balance: 100000 })
   const api = await userApi(e.phone)
@@ -480,6 +539,13 @@ test('A-FIN-04 三张表导出 CSV：与列表同筛选参数、文件名、BOM�
   expect(orders).toHaveLength(1)
   expect(adjustRows).toHaveLength(6) // 种子 + 5 笔
   expect(manualRows).toHaveLength(1)
+  const bRows = Object.fromEntries((await getJSON<PagedOf<Recharge>>(ctx, `/admin/api/v1/recharges?user_id=${b.id}`)).items.map((x) => [x.id, x]))
+  const d1 = cstDate(bRows[bBefore].created_at)
+  const d2 = cstDate(bRows[bAfter].created_at)
+  expect(d2).not.toBe(d1) // 两张单跨过北京时间午夜
+  expect([bRows[bPaid].status, cstDate(bRows[bPaid].created_at)]).toEqual(['paid', d2])
+  expect(prevDay(bRows[bAfter].created_at)).toBe(d1)
+  expect(Date.parse(bRows[bAfter].created_at) - Date.parse(bRows[bBefore].created_at)).toBeLessThanOrEqual(200_000)
 
   const toasts = await trackToasts(page)
   const blobs = await trackBlobUrls(page)
@@ -487,15 +553,9 @@ test('A-FIN-04 三张表导出 CSV：与列表同筛选参数、文件名、BOM�
   page.on('download', (d) => downloads.push(d))
   await loginAdmin(page, admin)
 
-  /** 设好筛选后导出：导出请求的查询串 = 列表请求去掉分页参数；返回解析后的文件。 */
-  async function exportWith(endpoint: string, setFilter: () => Promise<void>, expectSearch: string) {
-    const lists = recordRequests(page, 'GET', `/${endpoint}`)
+  /** 点「导出 CSV」：导出请求只有一个且查询串为 expectSearch；核对文件名、URL 释放、BOM；返回解析后的表格。 */
+  async function exportNow(endpoint: string, expectSearch: string) {
     const exports = recordRequests(page, 'GET', `/${endpoint}/export`)
-    await page.getByTestId(`menu-${endpoint}`).click()
-    await expectAdminUrl(page, `/${endpoint}`)
-    await setFilter()
-    await page.getByTestId('fin-search').click()
-    await expect.poll(() => lists.at(-1)?.search).toBe(`?${expectSearch}&page=1&page_size=20`)
     const before = (await blobs()).created.length
     const pending = page.waitForEvent('download')
     await page.getByTestId('fin-export').click()
@@ -513,11 +573,26 @@ test('A-FIN-04 三张表导出 CSV：与列表同筛选参数、文件名、BOM�
     return out.table
   }
 
-  await test.step('订单：按用户导出，一行，金额元两位小数', async () => {
+  /** 设好筛选后查询再导出：导出请求的查询串 = 列表请求去掉分页参数。 */
+  async function exportWith(endpoint: string, setFilter: () => Promise<void>, expectSearch: string) {
+    const lists = recordRequests(page, 'GET', `/${endpoint}`)
+    await page.getByTestId(`menu-${endpoint}`).click()
+    await expectAdminUrl(page, `/${endpoint}`)
+    await setFilter()
+    await page.getByTestId('fin-search').click()
+    await expect.poll(() => lists.at(-1)?.search).toBe(`?${expectSearch}&page=1&page_size=20`)
+    return exportNow(endpoint, expectSearch)
+  }
+
+  await test.step('订单：按用户 + 状态 + 日期导出，一行，金额元两位小数', async () => {
+    const o = orders[0]
+    const day = cstDate(o.created_at)
     const table = await exportWith('orders', async () => {
       await page.getByTestId('fin-filter-user').fill(String(e.id))
-    }, `user_id=${e.id}`)
-    const o = orders[0]
+      await pick(page, 'fin-filter-status', '已支付')
+      await page.getByTestId('fin-from').fill(day)
+      await page.getByTestId('fin-to').fill(day)
+    }, `user_id=${e.id}&status=paid&from=${day}&to=${day}`)
     expect(table).toEqual([
       ['订单号', '用户ID', '类型', '实例', '租期', '金额(元)', '已退(元)', '状态', '下单时间'],
       [o.id, String(e.id), 'new', o.instance_id, '1d', '69.00', '0.00', 'paid', cstTimeSec(o.created_at)],
@@ -554,6 +629,38 @@ test('A-FIN-04 三张表导出 CSV：与列表同筛选参数、文件名、BOM�
     ])
   })
 
+  await test.step('充值单跨北京时间午夜：按渠道 + 状态 + 日期导出；to = 前一天只含午夜前的单（含当天），from = to = 后一天只含午夜后的单', async () => {
+    const ids = (t: string[][]) => t.slice(1).map((c) => c[0])
+    const t1 = await exportWith('recharges', async () => {
+      await page.getByTestId('fin-filter-user').fill(String(b.id))
+      await pick(page, 'fin-filter-kind', '支付宝')
+      await pick(page, 'fin-filter-status', '待支付')
+      await page.getByTestId('fin-from').fill(d1)
+      await page.getByTestId('fin-to').fill(d1)
+    }, `user_id=${b.id}&channel=alipay&status=pending&from=${d1}&to=${d1}`)
+    await expect(page.getByTestId('rch-id')).toHaveText([bBefore])
+    expect(ids(t1)).toEqual([bBefore])
+    expect(t1[1].slice(0, 5)).toEqual([bBefore, String(b.id), 'alipay', '50.00', 'pending'])
+
+    const lists = recordRequests(page, 'GET', '/recharges')
+    await page.getByTestId('fin-from').fill(d2)
+    await page.getByTestId('fin-to').fill(d2)
+    await page.getByTestId('fin-search').click()
+    await expect.poll(() => lists.at(-1)?.search).toBe(`?user_id=${b.id}&channel=alipay&status=pending&from=${d2}&to=${d2}&page=1&page_size=20`)
+    await expect(page.getByTestId('rch-id')).toHaveText([bAfter])
+    expect(ids(await exportNow('recharges', `user_id=${b.id}&channel=alipay&status=pending&from=${d2}&to=${d2}`))).toEqual([bAfter])
+  })
+
+  await test.step('改了筛选但没点「查询」：导出仍按已查询的条件（与屏幕上的表格一致）', async () => {
+    await page.getByTestId('fin-filter-user').fill(String(e.id))
+    await pick(page, 'fin-filter-status', '已关闭')
+    await page.getByTestId('fin-from').fill(d1)
+    await page.getByTestId('fin-to').fill(d1)
+    const t = await exportNow('recharges', `user_id=${b.id}&channel=alipay&status=pending&from=${d2}&to=${d2}`)
+    expect(t.slice(1).map((c) => c[0])).toEqual([bAfter])
+    await expect(page.getByTestId('rch-id')).toHaveText([bAfter])
+  })
+
   await test.step('导出失败（超过 10 万行）：原文提示一次、不下载、按钮恢复可用，再点可以导出', async () => {
     const exportPath = isPath('/recharges/export')
     const exports = recordRequests(page, 'GET', '/recharges/export')
@@ -584,5 +691,19 @@ test('A-FIN-04 三张表导出 CSV：与列表同筛选参数、文件名、BOM�
     await drainTasks(page)
     expect(exports).toHaveLength(1)
     expect(downloads).toHaveLength(downloadsBefore + 1)
+  })
+
+  await test.step('超级管理员：三个财务菜单可见，列表可加载，可导出', async () => {
+    await logout(page)
+    const sup = await createAdmin('super')
+    await loginAdmin(page, sup)
+    for (const endpoint of ['orders', 'ledger', 'recharges']) {
+      const table = await exportWith(endpoint, async () => {
+        await page.getByTestId('fin-filter-user').fill(String(e.id))
+      }, `user_id=${e.id}`)
+      const api = (await getJSON<PagedOf<{ id: string | number }>>(ctx, `/admin/api/v1/${endpoint}?user_id=${e.id}&page_size=100`)).items
+      await expect(page.getByTestId('fin-total')).toHaveText(`共 ${api.length} 条`)
+      expect(table.slice(1).map((c) => c[0]).sort()).toEqual(api.map((x) => String(x.id)).sort())
+    }
   })
 })
