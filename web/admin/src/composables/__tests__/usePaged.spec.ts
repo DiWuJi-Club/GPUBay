@@ -84,7 +84,7 @@ describe('usePaged', () => {
     expect(error).toHaveBeenCalledWith('服务器内部错误（请求号 req-1）')
   })
 
-  it('首次加载失败给出 error（页面显示占位与重试）；成功后清空；已有数据后的失败只提示、保留数据', async () => {
+  it('任何一次失败都清空表格并给出 error（含改筛选 / 翻页之后）；total 保留、页码停在请求的那一页；成功后清除 error', async () => {
     let fail = true
     const fetcher = vi.fn(async (page: number) => {
       if (fail) throw new ApiError(500, 'internal', '服务器内部错误', 'req-2')
@@ -102,9 +102,26 @@ describe('usePaged', () => {
     list.page.value = 2
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(3))
     await vi.waitFor(() => expect(list.loading.value).toBe(false))
-    expect(list.error.value).toBe('')
-    expect(list.items.value).toEqual(['p1'])
+    expect(list.items.value).toEqual([]) // 不保留第 1 页的行
+    expect(list.error.value).toBe('服务器内部错误（请求号 req-2）')
+    expect(list.total.value).toBe(30)
+    expect(list.page.value).toBe(2)
     expect(error).toHaveBeenCalledTimes(2)
+    fail = false
+    await list.load() // 重试：仍请求第 2 页
+    expect(fetcher).toHaveBeenLastCalledWith(2, 20)
+    expect(list.items.value).toEqual(['p2'])
+    expect(list.error.value).toBe('')
+  })
+
+  it('page_size 变化同样自动加载', async () => {
+    const fetcher = vi.fn(async (page: number, size: number) => ({ items: [`p${page}s${size}`], total: 100 }))
+    const list = usePaged(fetcher)
+    await list.load()
+    list.size.value = 50
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2))
+    expect(fetcher).toHaveBeenLastCalledWith(1, 50)
+    await vi.waitFor(() => expect(list.items.value).toEqual(['p1s50']))
   })
 
   it('先发后到的旧响应不覆盖新结果（快速翻页 / 改筛选）', async () => {

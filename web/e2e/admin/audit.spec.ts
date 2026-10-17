@@ -17,6 +17,7 @@ test('A-AUD-01 审计日志按操作人 / 动作 / 对象 / 时间筛选，操�
   const auditRequests = recordRequests(page, 'GET', '/audit')
   const searches = () => auditRequests.map((r) => r.search)
   const rows = page.getByRole('row').filter({ has: page.getByTestId('audit-action-cell') })
+  let v: { id: number; phone: string } // 翻页用的第二个用户（22+ 条审计）
 
   await test.step('按操作人 / 动作 / 对象 / 时间筛选：条件原样作为查询参数发出，结果只有这一条', async () => {
     await loginAdmin(page, admin)
@@ -74,6 +75,16 @@ test('A-AUD-01 审计日志按操作人 / 动作 / 对象 / 时间筛选，操�
     await expect(rows).toHaveCount(0)
   })
 
+  await test.step('动作可以输入列表外的值（allow-create）：原样作为 action 查询参数发出', async () => {
+    await page.getByTestId('audit-action').click()
+    await page.keyboard.type('custom.e2e_only')
+    await page.keyboard.press('Enter')
+    await expect(page.getByTestId('audit-action')).toContainText('custom.e2e_only')
+    await page.getByTestId('audit-search').click()
+    await expect.poll(() => searches().at(-1)).toBe(`?actor_id=${admin.id}&action=custom.e2e_only&target_type=user&target_id=${u.id}&from=2000-01-01&to=2000-01-02&page=1&page_size=20`)
+    await expect(rows).toHaveCount(0)
+  })
+
   await test.step('重置：清空全部条件，只发一次不带筛选的请求', async () => {
     const before = auditRequests.length
     await page.getByTestId('audit-reset').click()
@@ -96,7 +107,7 @@ test('A-AUD-01 审计日志按操作人 / 动作 / 对象 / 时间筛选，操�
   })
 
   await test.step('超过一页：翻到第 2 页带 page=2，换条件查询回到第 1 页', async () => {
-    const v = await seedUser()
+    v = await seedUser()
     for (let i = 0; i < 11; i++) {
       await adminPost(ctx, admin, `/admin/api/v1/users/${v.id}/ban`, { reason: `翻页 ${i}` })
       await adminPost(ctx, admin, `/admin/api/v1/users/${v.id}/unban`, {})
@@ -123,6 +134,25 @@ test('A-AUD-01 审计日志按操作人 / 动作 / 对象 / 时间筛选，操�
     await expect(rows).toHaveCount(11)
     await drainTasks(page)
     expect(auditRequests).toHaveLength(before + 1) // 回到第 1 页只发一次请求
+  })
+
+  await test.step('改条件后查询失败：清空表格（不留与新条件不符的旧行），显示占位与重试；重试按新条件请求', async () => {
+    // 此时表格显示 user.unban 的 11 行
+    await expect(rows).toHaveCount(11)
+    const toastsBefore = (await toasts()).length
+    await page.route(isAudit, (r: Route) => r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: 'req-audit-2' }) }))
+    await page.getByTestId('audit-action').click()
+    await page.getByRole('option', { name: 'user.ban', exact: true }).click()
+    await page.getByTestId('audit-search').click()
+    await expect(page.getByTestId('audit-error')).toContainText('服务器内部错误（请求号 req-audit-2）')
+    await expect(rows).toHaveCount(0)
+    expect((await toasts()).slice(toastsBefore)).toEqual(['服务器内部错误（请求号 req-audit-2）'])
+    await page.unroute(isAudit)
+    await page.getByTestId('audit-retry').click()
+    await expect.poll(() => searches().at(-1)).toBe(`?action=user.ban&target_type=user&target_id=${v.id}&page=1&page_size=20`)
+    await expect(rows).toHaveCount(11)
+    await expect(rows.getByTestId('audit-action-cell')).toHaveText(Array(11).fill('user.ban'))
+    await expect(page.getByTestId('audit-error')).toHaveCount(0)
   })
 
   await test.step('操作人：系统显示「系统」，用户名为空显示 #ID；对象类型不可跳转的只显示 ID', async () => {

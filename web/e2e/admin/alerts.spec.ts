@@ -4,7 +4,7 @@ import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { cstTime } from '../helpers/time'
 
-type AlertRow = { id: number; machine_id: number | null; instance_id: string; message: string; created_at: string; resolved_at: string | null }
+type AlertRow = { id: number; kind: string; machine_id: number | null; instance_id: string; message: string; created_at: string; resolved_at: string | null }
 type Page_ = { items: AlertRow[]; total: number }
 
 const fail500 = (id: string) => (r: Route) =>
@@ -59,6 +59,12 @@ test('A-ALT-01 开通失败告警：未处理列表、角标、标记已处理�
     await expect.poll(listSearches).toEqual(['?resolved=false&page=1&page_size=20', '?resolved=false&page=2&page_size=20'])
     await expect(rows).toHaveCount(page2.items.length)
     await expect(rows.first().getByTestId('alert-message')).toHaveText(page2.items[0].message)
+    // 第 2 页第一条是本用例造的机器失联告警：没有实例，实例列显示「—」且不是链接
+    expect(page2.items[0]).toMatchObject({ instance_id: '' })
+    expect(page2.items[0].machine_id).not.toBeNull()
+    await expect(rows.first().getByTestId('alert-instance')).toHaveText('—')
+    await expect(rows.first().getByTestId('alert-instance')).not.toHaveAttribute('href')
+    await expect(rows.first().getByTestId('alert-machine')).toHaveAttribute('href', `/admin/machines/${page2.items[0].machine_id}`)
     await expect(row).toHaveCount(0)
     await page.getByTestId('alerts-pager').getByText('1', { exact: true }).click()
     await expect(row).toHaveCount(1)

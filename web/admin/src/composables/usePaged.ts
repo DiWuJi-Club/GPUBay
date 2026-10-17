@@ -5,7 +5,8 @@ import { notifyError } from '../logic/notify'
 /**
  * 后台列表通用分页：page / page_size 变化自动加载。
  * 失败用 notifyError 提示（forbidden → 无权执行该操作；401 / 取消静默）；每次加载都是用户操作触发，不自动重试。
- * 还没成功加载过时失败，error 给出原文，页面据此显示占位与重试按钮；已有数据时失败只提示、保留原数据。
+ * 任何一次加载失败都清空表格并给出 error（页面显示占位与重试按钮）：失败往往发生在改筛选 / 翻页之后，
+ * 留着上一次的行会让表格内容与当前筛选条件、页码对不上；total 保留，分页器停在用户请求的那一页，重试即重新请求这一页。
  * 只采用最后一次请求的结果：快速翻页 / 改筛选时先发后到的旧响应（含旧请求的失败）被丢弃。
  */
 export function usePaged<T>(fetcher: (page: number, pageSize: number) => Promise<Paged<T>>, pageSize = 20) {
@@ -15,7 +16,6 @@ export function usePaged<T>(fetcher: (page: number, pageSize: number) => Promise
   const size = ref(pageSize)
   const loading = ref(false)
   const error = ref('')
-  let loaded = false
   let seq = 0
 
   async function load() {
@@ -27,11 +27,11 @@ export function usePaged<T>(fetcher: (page: number, pageSize: number) => Promise
       items.value = out.items
       total.value = out.total
       error.value = ''
-      loaded = true
     } catch (e) {
       if (mine !== seq) return
       notifyError(e)
-      if (!loaded) error.value = messageOf(e)
+      items.value = []
+      error.value = messageOf(e)
     } finally {
       if (mine === seq) loading.value = false
     }

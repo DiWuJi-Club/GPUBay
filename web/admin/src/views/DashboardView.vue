@@ -2,6 +2,7 @@
 import { fmtYuan, instanceStateLabel, machineStateLabel, messageOf, type Dashboard } from '@spark/shared'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
+import { barsOf, CHART } from '../logic/chart'
 import { notifyError } from '../logic/notify'
 
 const data = ref<Dashboard | null>(null)
@@ -12,13 +13,19 @@ const instanceStates = ['creating', 'running', 'stopped', 'wiping', 'released', 
 
 // 60 秒定时刷新。故障期间定时器照常每 60 秒取一次（恢复后自动显示），但同一次故障只提示一次，成功后复位；
 // 首次就失败（还没有数据）显示占位与重试按钮；已有数据时刷新失败保留旧数据。
+// 定时刷新与手动重试可能同时在途：只采用最后发出的那次，先发后到的旧结果（成功或失败）一律丢弃。
 let failing = false
+let seq = 0
 async function load() {
+  const mine = ++seq
   try {
-    data.value = await api.get<Dashboard>('/dashboard')
+    const out = await api.get<Dashboard>('/dashboard')
+    if (mine !== seq) return
+    data.value = out
     loadError.value = ''
     failing = false
   } catch (e) {
+    if (mine !== seq) return
     if (!failing) notifyError(e)
     failing = true
     if (!data.value) loadError.value = messageOf(e)
@@ -38,15 +45,10 @@ onMounted(() => {
 })
 onUnmounted(() => clearInterval(timer))
 
-// 近 30 天出租率柱状图：自绘 SVG，宽 600 高 160，每根柱宽 14 间距 6
-const W = 600
-const H = 160
-const bars = computed(() =>
-  (data.value?.utilization ?? []).map((u, i) => {
-    const h = Math.round(u.rate * (H - 20))
-    return { x: i * 20 + 4, y: H - h, h, date: u.date, pct: (u.rate * 100).toFixed(1) }
-  }),
-)
+// 近 30 天出租率柱状图：自绘 SVG，几何见 logic/chart.ts
+const W = CHART.width
+const H = CHART.height
+const bars = computed(() => barsOf(data.value?.utilization ?? []))
 </script>
 
 <template>
@@ -77,9 +79,10 @@ const bars = computed(() =>
       </el-card>
     </div>
     <el-card header="近 30 天出租率（最后一根为今天，截至当前）">
-      <svg :viewBox="`0 0 ${W} ${H}`" class="chart" data-testid="dash-chart" role="img" aria-label="近 30 天出租率">
+      <el-empty v-if="bars.length === 0" description="暂无出租率数据" :image-size="60" data-testid="dash-chart-empty" />
+      <svg v-else :viewBox="`0 0 ${W} ${H}`" class="chart" data-testid="dash-chart" role="img" aria-label="近 30 天出租率">
         <line x1="0" :y1="H - 0.5" :x2="W" :y2="H - 0.5" stroke="#dcdfe6" />
-        <rect v-for="b in bars" :key="b.date" :x="b.x" :y="b.y" width="14" :height="b.h" fill="var(--el-color-primary)" data-testid="dash-bar" :data-date="b.date" :data-pct="b.pct">
+        <rect v-for="b in bars" :key="b.date" :x="b.x" :y="b.y" :width="CHART.barWidth" :height="b.h" fill="var(--el-color-primary)" data-testid="dash-bar" :data-date="b.date" :data-pct="b.pct">
           <title>{{ b.date }} 出租率 {{ b.pct }}%</title>
         </rect>
       </svg>
