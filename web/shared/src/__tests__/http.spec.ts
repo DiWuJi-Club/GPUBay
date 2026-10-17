@@ -200,6 +200,30 @@ describe('http 动态码重发 (U-07)', () => {
     expect(f.calls).toHaveLength(1)
   })
 
+  it('GET 在别的请求二次验证进行中收到 totp_required：等其完成后不带请求体原样重发', async () => {
+    let stepped = false
+    const serve = (c: Call) => {
+      if ((c.body as { totp?: string } | undefined)?.totp === '123456') stepped = true
+      if (!stepped && !(c.body as { totp?: string } | undefined)?.totp) return totpRequired()
+      return json(200, { ok: c.url })
+    }
+    let release!: (v: string) => void
+    const promptTotp = vi.fn(() => new Promise<string | null>((resolve) => (release = resolve)))
+    const f = fakeFetch(serve, serve, serve, serve)
+    const http = createHttp({ base: '/admin/api/v1', onUnauthorized: vi.fn(), promptTotp, fetch: f.fn })
+    const post = http.post('/me/password', { password: 'x' })
+    await vi.waitFor(() => expect(promptTotp).toHaveBeenCalledTimes(1))
+    const get = http.get('/alerts')
+    await vi.waitFor(() => expect(f.calls).toHaveLength(2))
+    release('123456')
+    await expect(post).resolves.toEqual({ ok: '/admin/api/v1/me/password' })
+    await expect(get).resolves.toEqual({ ok: '/admin/api/v1/alerts' })
+    expect(promptTotp).toHaveBeenCalledTimes(1)
+    const resend = f.calls.filter((c) => c.url.endsWith('/alerts'))
+    expect(resend).toHaveLength(2)
+    expect(resend.map((c) => c.init.body)).toEqual([undefined, undefined])
+  })
+
   it('没有配置 promptTotp（控制台）时 totp_required 原样抛出', async () => {
     const f = fakeFetch(totpRequired())
     const http = createHttp({ base: '/api/v1', onUnauthorized: vi.fn(), fetch: f.fn })

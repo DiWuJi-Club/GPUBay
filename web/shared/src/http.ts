@@ -166,8 +166,12 @@ export function createHttp(cfg: HttpConfig): Http {
     } catch (e) {
       if (!(e instanceof ApiError)) throw e
       handleAuth(e, opt)
-      // 动态码随请求体重发：GET / HEAD 不能带请求体，若将来有读接口要求动态码，原样抛出 totp_required 而不是伪装成网络错误
-      if (e.status === 403 && e.code === 'totp_required' && cfg.promptTotp && method !== 'GET' && method !== 'HEAD') return retryWithTotp<T>(method, path, body, opt)
+      if (e.status === 403 && e.code === 'totp_required' && cfg.promptTotp) {
+        // 动态码随请求体发送，GET / HEAD 不能带请求体：不能由它发起二次验证，原样抛出 totp_required（而不是伪装成网络错误）；
+        // 别的请求的二次验证进行中时可以等它完成后原样（不带体）重发
+        if ((method === 'GET' || method === 'HEAD') && !stepUp) throw e
+        return retryWithTotp<T>(method, path, body, opt)
+      }
       throw e
     }
   }
