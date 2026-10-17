@@ -117,6 +117,16 @@ export function createHttp(cfg: HttpConfig): Http {
     if (err.status === 403 && err.code === 'totp_setup_required') cfg.onTotpSetupRequired?.()
   }
 
+  /** 二次验证路径里的请求（重发 / 等待者重发）：错误同样经 handleAuth，弹框期间会话失效也会被带去登录页。 */
+  async function rawAuthed<T>(method: string, path: string, body: unknown, opt: HttpOptions): Promise<T> {
+    try {
+      return await raw<T>(method, path, body, opt)
+    } catch (e) {
+      if (e instanceof ApiError) handleAuth(e, opt)
+      throw e
+    }
+  }
+
   async function retryWithTotp<T>(method: string, path: string, body: unknown, opt: HttpOptions): Promise<T> {
     if (stepUp) {
       try {
@@ -124,7 +134,7 @@ export function createHttp(cfg: HttpConfig): Http {
       } catch (e) {
         if (e instanceof ApiError && e.code === 'cancelled') throw e // 首个被取消则一起取消
       }
-      return raw<T>(method, path, body, opt) // 后端 5 分钟窗口已打开，不再需要 totp
+      return rawAuthed<T>(method, path, body, opt) // 后端 5 分钟窗口已打开，不再需要 totp
     }
     const run = (async () => {
       let message: string | undefined
@@ -133,7 +143,7 @@ export function createHttp(cfg: HttpConfig): Http {
         if (code === null) throw cancelledError()
         const base = body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
         try {
-          return await raw<T>(method, path, { ...base, totp: code }, opt)
+          return await rawAuthed<T>(method, path, { ...base, totp: code }, opt)
         } catch (e) {
           if (e instanceof ApiError && e.code === 'invalid_totp' && attempt < TOTP_MAX_ATTEMPTS) {
             message = e.message
@@ -156,7 +166,8 @@ export function createHttp(cfg: HttpConfig): Http {
     } catch (e) {
       if (!(e instanceof ApiError)) throw e
       handleAuth(e, opt)
-      if (e.status === 403 && e.code === 'totp_required' && cfg.promptTotp) return retryWithTotp<T>(method, path, body, opt)
+      // 动态码随请求体重发：GET / HEAD 不能带请求体，若将来有读接口要求动态码，原样抛出 totp_required 而不是伪装成网络错误
+      if (e.status === 403 && e.code === 'totp_required' && cfg.promptTotp && method !== 'GET' && method !== 'HEAD') return retryWithTotp<T>(method, path, body, opt)
       throw e
     }
   }

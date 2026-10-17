@@ -158,6 +158,48 @@ describe('http 动态码重发 (U-07)', () => {
     expect(f.calls).toHaveLength(4)
   })
 
+  it('重发得到 401：调 onUnauthorized（弹框期间会话失效也要带去登录页）', async () => {
+    const onUnauthorized = vi.fn()
+    const f = fakeFetch(totpRequired(), json(401, { code: 'unauthorized', message: '请先登录' }))
+    const http = createHttp({ base: '/admin/api/v1', onUnauthorized, promptTotp: async () => '123456', fetch: f.fn })
+    await expect(http.post('/users/1/adjust', { amount: 1 })).rejects.toMatchObject({ code: 'unauthorized' })
+    expect(onUnauthorized).toHaveBeenCalledTimes(1)
+  })
+
+  it('等待者重发得到 401：同样调 onUnauthorized；quiet 不调', async () => {
+    const onUnauthorized = vi.fn()
+    const seen = new Map<string, number>()
+    const serve = (c: Call) => {
+      const n = (seen.get(c.url) ?? 0) + 1
+      seen.set(c.url, n)
+      if ((c.body as { totp?: string } | undefined)?.totp) return json(200, { ok: true }) // 首个请求带码重发成功
+      if (n === 1) return totpRequired()
+      return json(401, { code: 'unauthorized', message: '请先登录' }) // 等待者重发时会话已失效
+    }
+    const promptTotp = vi.fn(() => new Promise<string | null>((resolve) => setTimeout(() => resolve('123456'), 10)))
+    const http = createHttp({ base: '/admin/api/v1', onUnauthorized, promptTotp, fetch: fakeFetch(...Array.from({ length: 8 }, () => serve)).fn })
+    const [a, b] = await Promise.allSettled([http.post('/users/1/adjust', { amount: 1 }), http.post('/users/2/adjust', { amount: 2 })])
+    expect(a).toMatchObject({ status: 'fulfilled' })
+    expect(b).toMatchObject({ status: 'rejected', reason: { code: 'unauthorized' } })
+    expect(promptTotp).toHaveBeenCalledTimes(1)
+    expect(onUnauthorized).toHaveBeenCalledTimes(1)
+
+    seen.clear()
+    const [c, d] = await Promise.allSettled([http.post('/users/1/adjust', { amount: 1 }), http.post('/users/2/adjust', { amount: 2 }, { quiet: true })])
+    expect(c).toMatchObject({ status: 'fulfilled' })
+    expect(d).toMatchObject({ status: 'rejected', reason: { code: 'unauthorized' } })
+    expect(onUnauthorized).toHaveBeenCalledTimes(1)
+  })
+
+  it('GET 收到 totp_required 原样抛出，不弹框、不带请求体重发', async () => {
+    const promptTotp = vi.fn(async () => '123456')
+    const f = fakeFetch(totpRequired())
+    const http = createHttp({ base: '/admin/api/v1', onUnauthorized: vi.fn(), promptTotp, fetch: f.fn })
+    await expect(http.get('/secret')).rejects.toMatchObject({ code: 'totp_required', status: 403 })
+    expect(promptTotp).not.toHaveBeenCalled()
+    expect(f.calls).toHaveLength(1)
+  })
+
   it('没有配置 promptTotp（控制台）时 totp_required 原样抛出', async () => {
     const f = fakeFetch(totpRequired())
     const http = createHttp({ base: '/api/v1', onUnauthorized: vi.fn(), fetch: f.fn })
