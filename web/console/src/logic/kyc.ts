@@ -24,7 +24,8 @@ export function validateEnterprise(v: { company: string; licenseNo: string; file
 /** 营业执照上传限制，与后端 storage.MaxUploadSize / 允许类型一致（后端按内容嗅探，仍以后端为准）。 */
 export const MAX_LICENSE_BYTES = 10 << 20
 const LICENSE_EXTS = ['jpg', 'jpeg', 'png', 'pdf']
-const LICENSE_MIMES = ['image/jpeg', 'image/png', 'application/pdf']
+// 含部分 Windows / 旧浏览器上报的别名；真正的把关是扩展名 + 后端内容嗅探
+const LICENSE_MIMES = ['image/jpeg', 'image/pjpeg', 'image/png', 'image/x-png', 'application/pdf', 'application/x-pdf']
 
 /**
  * 选择文件后的本地预检：扩展名必须是 JPG / PNG / PDF；浏览器给出了 MIME 时也必须是这三种（部分系统 MIME 为空，此时只看扩展名）；

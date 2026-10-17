@@ -34,4 +34,12 @@ describe('kyc validation', () => {
     expect(checkLicenseFile({ name: 'png', type: 'image/png', size: 1 })).toBe('仅支持 JPG、PNG、PDF 文件')
     expect(checkLicenseFile({ name: 'a.png', type: 'image/png', size: MAX_LICENSE_BYTES + 1 })).toBe('文件不能超过 10MB')
   })
+  it('执照文件预检：接受旧浏览器的 MIME 别名，但扩展名不符仍拒绝', () => {
+    expect(checkLicenseFile({ name: 'a.pdf', type: 'application/x-pdf', size: 1 })).toBe('')
+    expect(checkLicenseFile({ name: 'a.jpg', type: 'image/pjpeg', size: 1 })).toBe('')
+    expect(checkLicenseFile({ name: 'a.png', type: 'image/x-png', size: 1 })).toBe('')
+    expect(checkLicenseFile({ name: 'a.gif', type: 'application/x-pdf', size: 1 })).toBe('仅支持 JPG、PNG、PDF 文件')
+    expect(checkLicenseFile({ name: 'a.txt', type: 'image/pjpeg', size: 1 })).toBe('仅支持 JPG、PNG、PDF 文件')
+    expect(checkLicenseFile({ name: 'a.exe', type: 'image/x-png', size: 1 })).toBe('仅支持 JPG、PNG、PDF 文件')
+  })
 })
