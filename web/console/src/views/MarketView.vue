@@ -73,6 +73,7 @@ const submitting = ref(false)
 const key = useIdempotencyKey(() => [confirm.product?.id, confirmSel.value?.duration, confirmSel.value?.imageId])
 
 async function rent(p: Product) {
+  if (p.prices.length === 0) return // 全部档位已下架：按钮已禁用，这里再兜一层，不会发出没有价格的订单
   if (session.status !== 'authed') {
     await router.push({ path: '/login', query: { redirect: route.fullPath } })
     return
@@ -150,8 +151,9 @@ async function submit() {
               <el-option v-for="img in images" :key="img.id" :label="img.name" :value="img.id" />
             </el-select>
           </el-form-item>
-          <el-button type="primary" class="rent" data-testid="market-rent-btn" :disabled="p.idle_count === 0" @click="rent(p)">
-            {{ p.idle_count === 0 ? '暂无空闲' : '立即租用' }}
+          <p v-if="p.prices.length === 0" class="muted" data-testid="market-no-price">该商品暂无可租的租期，暂不能下单</p>
+          <el-button type="primary" class="rent" data-testid="market-rent-btn" :disabled="p.prices.length === 0 || p.idle_count === 0" @click="rent(p)">
+            {{ p.prices.length === 0 ? '暂未开放' : p.idle_count === 0 ? '暂无空闲' : '立即租用' }}
           </el-button>
         </el-form>
       </el-card>
@@ -187,4 +189,5 @@ async function submit() {
 .prices { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; font-weight: 600; }
 .rent { width: 100%; }
 .warn { color: var(--el-color-warning); }
+.muted { color: #909399; font-size: 13px; margin: 0 0 8px; }
 </style>

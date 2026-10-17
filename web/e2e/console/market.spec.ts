@@ -44,6 +44,22 @@ test('C-MKT-01 市场未登录可见：规格、空闲台数、三档价格', as
   await expect(card(page).getByTestId('market-price-1m')).toHaveText('1 月 ¥1,599.00')
   await expect(card(page).getByTestId('market-rent-btn')).toHaveText('立即租用')
   await expect(card(page).getByTestId('market-rent-btn')).toBeEnabled()
+  await expect(card(page).getByTestId('market-no-price')).toHaveCount(0)
+
+  await test.step('商品全部档位下架（有空闲机器）：按钮禁用并提示暂未开放，点击不弹确认框', async () => {
+    const real = (await (await api.get('/api/v1/products')).json()) as { items: Record<string, unknown>[] }
+    const noPrices = { items: [{ ...real.items[0], idle_count: 3, prices: [] }] }
+    await page.route('**/api/v1/products', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(noPrices) }))
+    await page.reload()
+    await expect(card(page).getByTestId('market-idle')).toHaveText('3')
+    await expect(card(page).getByTestId('market-price-1d')).toHaveCount(0)
+    await expect(card(page).getByTestId('market-no-price')).toHaveText('该商品暂无可租的租期，暂不能下单')
+    await expect(card(page).getByTestId('market-rent-btn')).toHaveText('暂未开放')
+    await expect(card(page).getByTestId('market-rent-btn')).toBeDisabled()
+    await card(page).getByTestId('market-rent-btn').click({ force: true })
+    await expect(page).toHaveURL(`${CONSOLE_URL}/market`) // 未登录也不会被带去登录页
+    await expect(page.getByTestId('market-confirm-dialog')).toBeHidden()
+  })
 })
 
 test('C-MKT-02 未登录点立即租用跳登录，登录后回到市场', async ({ page }) => {
