@@ -97,3 +97,33 @@ test('C-AUTH-07 封禁：已登录用户下一次请求跳登录；封禁用户�
   await expect(page).toHaveURL(/\/login\?redirect=(%2F|\/)instances$/) // 登录被拒，停留在登录页
   await expect(page.getByTestId('login-submit')).toBeVisible()
 })
+
+test('C-AUTH-06 会话失效：清 Cookie 后在钱包页刷新，并发的多个 401 只提示一次「请先登录」、只跳一次登录', async ({ page, context }, info) => {
+  const u = await seedUser()
+  await loginConsole(page, u.phone)
+  await nav(page, info, 'wallet')
+  await expect(page.getByTestId('wallet-balance')).toHaveText('¥1,000.00')
+  await expect(page.getByTestId('ledger-amount').first()).toHaveText('+¥1,000.00') // 流水已加载，刷新时余额与流水并发请求
+  const unauthorized: string[] = []
+  page.on('response', (r) => {
+    if (r.status() === 401) unauthorized.push(new URL(r.url()).pathname)
+  })
+  const loginNavs: string[] = []
+  page.on('framenavigated', (f) => {
+    if (f === page.mainFrame() && new URL(f.url()).pathname === '/login') loginNavs.push(f.url())
+  })
+  await context.clearCookies()
+  // 刷新按钮并发请求余额与流水：两个都会 401
+  const walletResp = page.waitForResponse((r) => new URL(r.url()).pathname === '/api/v1/wallet' && r.status() === 401)
+  const ledgerResp = page.waitForResponse((r) => new URL(r.url()).pathname === '/api/v1/wallet/ledger' && r.status() === 401)
+  await page.getByTestId('wallet-refresh').click()
+  await Promise.all([walletResp, ledgerResp])
+  await expect(page).toHaveURL(/\/login\?redirect=(%2F|\/)wallet/)
+  await toast(page, '请先登录')
+  await expect(page.getByTestId('login-phone')).toBeVisible()
+  expect(unauthorized).toEqual(expect.arrayContaining(['/api/v1/wallet', '/api/v1/wallet/ledger']))
+  await expect(page.getByRole('alert').filter({ hasText: '请先登录' })).toHaveCount(1) // 多个 401 只提示一次
+  await expect(page.getByRole('alert')).toHaveCount(1) // 也没有其它错误提示（notifyError 对 401 静默）
+  await expect(page.getByTestId('wallet-error')).toHaveCount(0)
+  expect(loginNavs).toHaveLength(1) // 只跳一次登录
+})

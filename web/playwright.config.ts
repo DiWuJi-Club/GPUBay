@@ -35,6 +35,9 @@ export default defineConfig({
     // 永远由 Playwright 自己拉起：e2e-server 里 embed 的是启动那一刻的前端产物，复用手工起的旧进程会悄悄测到上一次的页面；
     // 端口被占用时直接报错，比「看似通过」好
     reuseExistingServer: false,
+    // 默认是 SIGKILL 整个进程组：e2e-server 来不及执行 pg.Stop()，而 pg_ctl 拉起的 postgres 已脱离进程组，
+    // 会变成孤儿进程长期占用 SysV 共享内存（macOS 只有 32 段），积累后新的嵌入式数据库无法启动
+    gracefulShutdown: { signal: 'SIGTERM', timeout: 20_000 },
     stdout: 'pipe',
     stderr: 'pipe',
   },
