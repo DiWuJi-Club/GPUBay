@@ -10,6 +10,7 @@ import { api } from '../api'
 import AppDialog from '../components/AppDialog.vue'
 import GuideDialog from '../components/GuideDialog.vue'
 import { useGuide } from '../composables/useGuide'
+import { usePolling } from '../composables/usePolling'
 import { canRelease, canRenew, releaseWarning } from '../logic/instance'
 import { notifyError } from '../logic/notify'
 import { refreshBalance, session } from '../store/session'
@@ -20,22 +21,34 @@ const guide = useGuide()
 const id = computed(() => String(route.params.id))
 const inst = ref<Instance | null>(null)
 const loadError = ref('')
-const countdown = useCountdown()
+// 运行中倒计时归零：后端此时已（或即将）停机，刷新一次显示新状态
+const countdown = useCountdown({ onZero: () => void load() })
+let seq = 0 // 查询序号：只采用最后发出的那次查询的结果
+let failing = false
 
 async function load() {
+  const mine = ++seq
   try {
-    inst.value = await api.get<Instance>(`/instances/${id.value}`)
+    const next = await api.get<Instance>(`/instances/${id.value}`)
+    if (mine !== seq) return // 之后又发出过查询（轮询 / 操作后刷新 / 换实例）：丢弃迟到的旧响应
+    inst.value = next
     loadError.value = ''
-    if (inst.value.state === 'running' && !inst.value.suspended) countdown.start(inst.value.remaining_seconds)
+    failing = false
+    if (next.state === 'running' && !next.suspended) countdown.start(next.remaining_seconds)
     else {
       countdown.stop()
-      countdown.remaining.value = inst.value.remaining_seconds
+      countdown.remaining.value = next.remaining_seconds
     }
   } catch (e) {
-    loadError.value = messageOf(e)
+    if (mine !== seq) return
+    if (!inst.value) loadError.value = messageOf(e) // 首次加载失败：页内错误
+    else if (!failing) notifyError(e) // 刷新失败：保留已显示的数据，同一次故障只提示一次
+    failing = true
   }
 }
 onMounted(load)
+// 开通中 / 洗机中每 10 秒刷新一次（页面不可见时暂停，卸载自动停止）
+usePolling(load, 10_000, { enabled: () => inst.value?.state === 'creating' || inst.value?.state === 'wiping' })
 
 // ---- SSH 密码：只在点击时请求，只放内存，离开页面即丢弃 ----
 const password = ref('')
@@ -125,6 +138,10 @@ async function confirmRelease() {
 
 watch(id, () => {
   password.value = ''
+  inst.value = null
+  loadError.value = ''
+  failing = false
+  countdown.stop()
   void load()
 })
 </script>

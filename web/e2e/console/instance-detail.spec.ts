@@ -1,4 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
+import { drainTasks, fail500, trackToasts } from '../helpers/admin'
+import { pauseClock } from '../helpers/clock'
 import { dialog, loginConsole, placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { instanceOf, runningInstance } from '../helpers/instances'
@@ -190,4 +192,111 @@ test('C-DET-09 按钮与状态匹配', async ({ page }) => {
     await expect(page.getByTestId('detail-renew-btn')).toHaveCount(renew ? 1 : 0)
     await expect(page.getByTestId('detail-release-btn')).toHaveCount(release ? 1 : 0)
   }
+})
+
+test('C-DET-10 详情页自动刷新：开通中 / 洗机中 10 秒轮询，倒计时归零刷新一次', async ({ page }) => {
+  const u = await seedUser({ balance: 1_000_000 })
+  const api = await userApi(u.phone)
+  await hooks.machines(2)
+  const creating = await placeOrder(api)
+  const toasts = await trackToasts(page)
+  await page.clock.install()
+  await loginConsole(page, u.phone)
+
+  // 记录本页对某个实例详情接口的 GET 次数，以及主文档导航次数（证明变化不是整页刷新带来的）
+  const gets = new Map<string, number>()
+  page.on('request', (r) => {
+    const path = new URL(r.url()).pathname
+    if (r.method() === 'GET' && path.startsWith('/api/v1/instances/')) gets.set(path, (gets.get(path) ?? 0) + 1)
+  })
+  const getsOf = (id: string) => gets.get(`/api/v1/instances/${id}`) ?? 0
+  let navigations = 0
+  page.on('framenavigated', (f) => {
+    if (f === page.mainFrame()) navigations += 1
+  })
+
+  await test.step('开通中每 10 秒轮询，Agent 开通后不刷新页面即变为运行中，之后停止轮询', async () => {
+    await page.goto(`/instances/${creating}`)
+    await expect(page.getByTestId('detail-state')).toHaveText('开通中')
+    await expect(page.getByTestId('detail-ssh-hint')).toBeVisible()
+    await pauseClock(page)
+    const navBase = navigations
+    await hooks.agent()
+    await drainTasks(page)
+    await expect(page.getByTestId('detail-state')).toHaveText('开通中') // 后端已开通但页面尚未轮询：下面的变化只能来自 10 秒轮询
+    const base = getsOf(creating)
+    await page.clock.runFor(9_000)
+    await drainTasks(page)
+    expect(getsOf(creating)).toBe(base)
+    await page.clock.runFor(1_000)
+    await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+    await expect(page.getByTestId('detail-ssh-command')).toHaveText(`ssh ${creating}@ssh.spark.test`)
+    expect(getsOf(creating)).toBe(base + 1)
+    await page.clock.runFor(30_000) // 运行中不再轮询
+    await drainTasks(page)
+    expect(getsOf(creating)).toBe(base + 1)
+    expect(navigations).toBe(navBase)
+  })
+
+  await test.step('洗机中同样轮询：刷新失败只提示一次且保留数据，Agent 洗完后变为已释放并停止轮询', async () => {
+    await page.clock.resume() // 确认框的打开 / 关闭动画依赖页面定时器
+    await page.getByTestId('detail-release-btn').click()
+    await page.getByTestId('detail-release-ok').click()
+    await expect(page.getByTestId('detail-state')).toHaveText('洗机中')
+    await pauseClock(page)
+    const navBase = navigations
+    const detail = (url: URL) => url.pathname === `/api/v1/instances/${creating}`
+    await page.route(detail, fail500('rid-det-10'), { times: 2 })
+    const base = getsOf(creating)
+    const failToasts = async () => (await toasts()).filter((t) => t.includes('服务器内部错误（请求号 rid-det-10）'))
+    await page.clock.runFor(10_000)
+    await expect.poll(failToasts).toHaveLength(1)
+    await page.clock.runFor(10_000) // 同一次故障第二次失败不再提示
+    await expect.poll(() => getsOf(creating)).toBe(base + 2)
+    await drainTasks(page)
+    expect(await failToasts()).toHaveLength(1)
+    await expect(page.getByTestId('detail-id')).toHaveText(creating)
+    await expect(page.getByTestId('detail-state')).toHaveText('洗机中') // 已显示的数据保留
+    await hooks.agent()
+    await page.clock.runFor(10_000)
+    await expect(page.getByTestId('detail-state')).toHaveText('已释放')
+    expect(getsOf(creating)).toBe(base + 3)
+    await page.clock.runFor(30_000) // 已释放不再轮询
+    await drainTasks(page)
+    expect(getsOf(creating)).toBe(base + 3)
+    expect(navigations).toBe(navBase)
+  })
+
+  await test.step('运行中倒计时归零只刷新一次，不刷新页面即显示已到期停机', async () => {
+    const running = await placeOrder(api)
+    await hooks.agent()
+    const left = (await instanceOf(api, running)).remaining_seconds
+    await hooks.advance(left - 20) // 只剩 20 秒
+    await page.clock.resume() // 上一步冻结了页面时间：恢复后再进入新页面，避免启动阶段的定时器被卡住
+    await page.goto(`/instances/${running}`)
+    await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+    await expect(page.getByTestId('detail-remaining')).toHaveAttribute('data-remaining', /^(20|19|18)$/)
+    await pauseClock(page)
+    const shown = Number(await page.getByTestId('detail-remaining').getAttribute('data-remaining')) // 冻结前可能已自然走了一两秒
+    const navBase = navigations
+    await hooks.advance(20)
+    await hooks.sweep()
+    await hooks.agent()
+    expect((await instanceOf(api, running)).state).toBe('stopped')
+    const base = getsOf(running)
+    await page.clock.runFor((shown - 1) * 1000)
+    await drainTasks(page)
+    await expect(page.getByTestId('detail-remaining')).toHaveAttribute('data-remaining', '1')
+    await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+    expect(getsOf(running)).toBe(base)
+    await page.clock.runFor(1_000)
+    await expect(page.getByTestId('detail-state')).toHaveText('已到期停机')
+    await expect(page.getByTestId('detail-ssh-hint')).toHaveText('实例运行中才能连接')
+    await expect(page.getByTestId('detail-retain')).toBeVisible()
+    expect(getsOf(running)).toBe(base + 1)
+    await page.clock.runFor(30_000) // 停机不轮询，归零只触发一次
+    await drainTasks(page)
+    expect(getsOf(running)).toBe(base + 1)
+    expect(navigations).toBe(navBase)
+  })
 })

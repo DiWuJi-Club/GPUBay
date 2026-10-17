@@ -7,9 +7,9 @@ const table = JSON.parse(readFileSync(join(__dirname, '..', 'coverage.json'), 'u
 
 describe('coverage.json', () => {
   it('与设计 §7.5 的数量一致且无重复', () => {
-    expect(table.console).toHaveLength(52)
+    expect(table.console).toHaveLength(53)
     expect(table.admin).toHaveLength(50)
-    expect(new Set([...table.console, ...table.admin]).size).toBe(102)
+    expect(new Set([...table.console, ...table.admin]).size).toBe(103)
   })
 })
 
