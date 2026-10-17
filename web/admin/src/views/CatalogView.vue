@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { durationLabel, fmtYuan, labelOf, messageOf, validateYuanRange, type AdminImage, type AdminProduct, type Duration, type ImageInput, type Listed } from '@spark/shared'
+import { centsToYuanInput, durationLabel, fmtYuan, labelOf, messageOf, validateYuanRange, type AdminImage, type AdminProduct, type Duration, type ImageInput, type Listed } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
@@ -37,7 +37,7 @@ onMounted(load)
 const price = reactive({ visible: false, productId: 0, duration: '1d' as Duration, amount: '', enabled: true, error: '', busy: false })
 function openPrice(p: AdminProduct, d: Duration) {
   const cur = p.prices.find((x) => x.duration === d)
-  Object.assign(price, { visible: true, productId: p.id, duration: d, amount: cur ? (cur.amount / 100).toFixed(2) : '', enabled: cur?.enabled ?? true, error: '' })
+  Object.assign(price, { visible: true, productId: p.id, duration: d, amount: cur ? centsToYuanInput(cur.amount) : '', enabled: cur?.enabled ?? true, error: '' })
 }
 async function savePrice(productId: number, d: Duration, amount: number, enabled: boolean) {
   await api.put(`/products/${productId}/prices/${d}`, { amount, enabled })

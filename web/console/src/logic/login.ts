@@ -2,7 +2,6 @@ import { toHalfWidthDigits } from '@spark/shared'
 
 export const PHONE_RE = /^1[3-9]\d{9}$/
 
-
 /** 去空白与连字符、全角数字转半角（从微信复制的「138 0000 1234」）。 */
 export function normalizePhone(s: string): string {
   return toHalfWidthDigits(s).replace(/[\s-]/g, '')

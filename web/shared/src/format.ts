@@ -8,6 +8,12 @@ export function fmtYuan(cents: number): string {
   return `${cents < 0 ? '-' : ''}¥${yuan}.${fen}`
 }
 
+/** 分 → 输入框用的元字符串（`1234.50`，无 ¥、无千分位）；整数运算，不做浮点除法。与 yuanToCents 互逆。 */
+export function centsToYuanInput(cents: number): string {
+  const abs = Math.abs(Math.trunc(cents))
+  return `${cents < 0 ? '-' : ''}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`
+}
+
 const yuanRe = /^(\d+)(?:\.(\d{1,2}))?$/
 
 /** 元（字符串）→ 分；非法（负数、超过两位小数、科学计数、全角、空）返回 null。 */

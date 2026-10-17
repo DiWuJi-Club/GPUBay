@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  commandStatusLabel, commandTypeLabel, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
+  centsToYuanInput, commandStatusLabel, commandTypeLabel, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
   orderKindLabel, orderStatusLabel, type AdminImage, type AdminInstance, type AdminInstanceDetail, type AdminProduct, type Listed, type RefundQuote,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
@@ -141,7 +141,7 @@ async function openRefund() {
   refund.quoting = true
   try {
     const q = await api.get<RefundQuote>(`/instances/${id.value}/refund-quote`)
-    Object.assign(refund, { quote: q, amount: (q.suggested / 100).toFixed(2), reason: '', error: '', visible: true })
+    Object.assign(refund, { quote: q, amount: centsToYuanInput(q.suggested), reason: '', error: '', visible: true })
   } catch (e) {
     notifyError(e)
   } finally {

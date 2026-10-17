@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-  digitsOnly, fmtDate, fmtDuration, fmtTime, fmtTimeSec, fmtYuan, RECHARGE_MAX_CENTS, RECHARGE_MIN_CENTS, toHalfWidthDigits, useCountdown, validateYuanRange, yuanToCents,
+  centsToYuanInput, digitsOnly, fmtDate, fmtDuration, fmtTime, fmtTimeSec, fmtYuan, RECHARGE_MAX_CENTS, RECHARGE_MIN_CENTS, toHalfWidthDigits, useCountdown, validateYuanRange, yuanToCents,
 } from '../format'
 
 describe('fmtYuan (U-01)', () => {
@@ -13,6 +13,24 @@ describe('fmtYuan (U-01)', () => {
     [123456789, '¥1,234,567.89'],
   ])('%d -> %s', (cents, want) => {
     expect(fmtYuan(cents)).toBe(want)
+  })
+})
+
+describe('centsToYuanInput', () => {
+  it.each([
+    [0, '0.00'],
+    [1, '0.01'],
+    [10, '0.10'],
+    [29, '0.29'],
+    [105, '1.05'],
+    [6900, '69.00'],
+    [123456789, '1234567.89'],
+    [-435, '-4.35'],
+  ])('%i 分 → %s（整数运算，无千分位，可直接放进输入框）', (cents, out) => {
+    expect(centsToYuanInput(cents)).toBe(out)
+  })
+  it('与 yuanToCents 往返一致', () => {
+    for (const c of [0, 1, 29, 435, 8850, 100_000_000, Number.MAX_SAFE_INTEGER]) expect(yuanToCents(centsToYuanInput(c))).toBe(c)
   })
 })
 
