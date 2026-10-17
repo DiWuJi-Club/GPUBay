@@ -6,6 +6,7 @@
 - 手机端 `alipays://` 拉起只能真机验证；上线前用真机走一次支付宝沙箱（自动化只断言链接格式与回页查询）。
 - 品牌占位 `Spark Cloud`：替换 `web/shared/src/brand.ts` 与两个应用 `public/brand/logo.svg`。
 - CI 机器需预装 Chrome，或设 `E2E_BROWSER_CHANNEL=chromium`。
+- 待负责人决定：模拟支付成功接口 `POST /api/v1/dev/recharges/{id}/pay` 在 `SPARK_PAY_DRIVER=mock` 且非 prod 的所有环境都会注册（`internal/app/app.go:143` `devPay = cfg.Env != "prod"`，路由见 `internal/api/server.go:94`），因此 staging 用 mock 支付时同样对外暴露；是否收紧为仅 dev 尚未决定。
 
 ## 可以继续延后
 - 后台收到 `403 totp_setup_required` 时回到登录页重新输入密码，而不是直接进入绑定步骤（临时会话由密码步骤签发）。
@@ -21,6 +22,9 @@
 - 后台告警角标刷新失败时静默，不打扰用户（401 仍按会话过期统一处理）。
 - 调账：扣减后余额会变负时前端直接拦截、不进入确认步骤；若后端因余额已变化仍拒绝，提示并刷新余额。
 - 手动入账提交前多一步确认（用户、金额、入账前后余额），再由请求层要求动态码。
+- A-AUTH-08（后台会话过期）改为覆盖真实的 401 路径：设置页提交与告警角标定时刷新；原「点菜单触发 401」因骨架页不发请求而删去。
+- 前端产物用 `//go:embed all:dist` 嵌入（否则 Vite 以 `_` 开头的分包会被丢掉），静态处理器拒绝任何以 `.` 开头的路径段（回退到 index.html）。
+- 控制台登录验证码输入框不设 `maxlength`，粘贴「000 000」这类带空格或全角的验证码也能用；控制台请求失败提示统一经 `notifyError`，`unauthorized`（401）与 `cancelled` 静默。
 - Playwright `webServer` 配置了 `gracefulShutdown`（SIGTERM，20 秒），让 e2e-server 有时间停掉嵌入式 PostgreSQL；改回默认（SIGKILL）会留下孤儿 postgres 占用 SysV 共享内存（macOS 只有 32 段），积累后新的嵌入式数据库无法启动。
 
 ## 评审中延后的小问题
