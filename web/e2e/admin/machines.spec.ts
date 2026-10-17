@@ -1,8 +1,8 @@
-import { expect, request, test, type Page, type Route } from '@playwright/test'
+import { expect, request, test, type Page } from '@playwright/test'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
-  adminApi, adminPost, clickTwiceSync, createAdmin, createPDU, drainIdleMachines, drainTasks, expectAdminUrl, loginAdmin, nextSerial, recordRequests, registerMachine, trackToasts,
+  adminApi, adminPost, clickTwiceSync, createAdmin, createPDU, drainIdleMachines, drainTasks, expectAdminUrl, fail500, loginAdmin, nextSerial, pick, recordRequests, registerMachine, trackToasts,
 } from '../helpers/admin'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { CONSOLE_URL, hooks } from '../helpers/hooks'
@@ -15,18 +15,11 @@ type Paged = { items: MachineRow[]; total: number }
 const fixtureText = (name: string) => readFileSync(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url)), 'utf8').replaceAll('{{N}}', runStamp)
 const rowBySerial = (page: Page, serial: string) => page.getByRole('row').filter({ has: page.getByTestId('machine-serial').filter({ hasText: serial }) })
 const machineRows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestId('machine-id') })
-const fail500 = (id: string) => (r: Route) =>
-  r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: id }) })
 const isMachines = (u: URL) => u.pathname === '/admin/api/v1/machines'
 
 async function idleCount(): Promise<number> {
   const ctx = await request.newContext({ baseURL: CONSOLE_URL })
   return ((await (await ctx.get('/api/v1/products')).json()) as { items: { idle_count: number }[] }).items[0].idle_count
-}
-
-async function pick(page: Page, testid: string, option: string) {
-  await page.getByTestId(testid).click()
-  await page.getByRole('option', { name: option, exact: true }).click()
 }
 
 test('A-MCH-01 机器列表：状态 / 在线 / 机柜筛选作为查询参数、重置、分页与每页条数、首次加载失败可重试', async ({ page }) => {

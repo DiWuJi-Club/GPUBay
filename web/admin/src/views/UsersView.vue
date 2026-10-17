@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { fmtTime, kycStatusLabel, labelOf, userKindLabel, userStatusLabel, type Paged, type User } from '@spark/shared'
+import { digitsOnly, fmtTime, kycStatusLabel, labelOf, userKindLabel, userStatusLabel, type Paged, type User } from '@spark/shared'
 import { onMounted, reactive } from 'vue'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
 import { usePaged } from '../composables/usePaged'
 
-/** q：完整手机号、手机尾号或用户 ID，后端只接受数字，输入时就把非数字去掉 */
+/** q：完整手机号、手机尾号或用户 ID，后端只接受数字：输入时全角数字转半角，其余非数字去掉 */
 const filter = reactive({ q: '', kyc_status: '', status: '' })
 const list = usePaged<User>((page, size) => api.get<Paged<User>>('/users', { q: filter.q, kyc_status: filter.kyc_status, status: filter.status, page, page_size: size }))
 onMounted(list.load)
@@ -19,7 +19,7 @@ function resetFilter() {
   <el-card>
     <el-form inline class="filters" @submit.prevent="list.reset()">
       <el-form-item label="手机号 / 尾号 / ID">
-        <el-input :model-value="filter.q" clearable placeholder="只能输入数字" data-testid="users-q" style="width: 200px" @update:model-value="(v: string) => (filter.q = v.replace(/\D/g, ''))" />
+        <el-input :model-value="filter.q" clearable placeholder="只能输入数字" data-testid="users-q" style="width: 200px" @update:model-value="(v: string) => (filter.q = digitsOnly(v))" />
       </el-form-item>
       <el-form-item label="实名">
         <el-select v-model="filter.kyc_status" clearable placeholder="全部" data-testid="users-filter-kyc" style="width: 120px">

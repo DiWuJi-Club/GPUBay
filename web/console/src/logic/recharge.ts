@@ -1,8 +1,8 @@
-import { yuanToCents } from '@spark/shared'
+import { RECHARGE_MAX_CENTS, RECHARGE_MIN_CENTS, validateYuanRange } from '@spark/shared'
 
 export const PRESETS = [50, 100, 500, 1000] as const
-export const MIN_CENTS = 100
-export const MAX_CENTS = 100_000_000
+export const MIN_CENTS = RECHARGE_MIN_CENTS
+export const MAX_CENTS = RECHARGE_MAX_CENTS
 
 /** 手机端拉起支付宝扫一扫：把二维码内容整体编码后放进 qrcode 参数。 */
 export function alipayLink(qr: string): string {
@@ -18,8 +18,5 @@ export function mmss(seconds: number): string {
 }
 
 export function validateAmount(input: string): { cents: number } | { error: string } {
-  const cents = yuanToCents(input)
-  if (cents == null) return { error: '金额格式不正确' }
-  if (cents < MIN_CENTS || cents > MAX_CENTS) return { error: '充值金额需在 1 元到 100 万元之间' }
-  return { cents }
+  return validateYuanRange(input, MIN_CENTS, MAX_CENTS, { range: '充值金额需在 1 元到 100 万元之间' })
 }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  durationLabel, fmtTime, fmtYuan, instanceStateLabel, kycResultLabel, kycStatusLabel, labelOf, ledgerKindLabel, messageOf, orderKindLabel, orderStatusLabel,
+  durationLabel, fmtTime, fmtYuan, instanceStateLabel, isApiError, kycResultLabel, kycStatusLabel, labelOf, ledgerKindLabel, messageOf, orderKindLabel, orderStatusLabel,
   userKindLabel, userStatusLabel, type Recharge, type UserDetail,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
@@ -56,6 +56,7 @@ onBeforeRouteUpdate((to) => {
   adjust.visible = false
   adjust.confirm = false
   mrecharge.visible = false
+  mrecharge.confirm = false
   void load(String(to.params.id))
 })
 
@@ -108,6 +109,12 @@ function openAdjustConfirm() {
     adjust.error = v.error
     return
   }
+  const balance = data.value?.balance ?? 0
+  if (balance + v.cents < 0) {
+    // 扣减后为负：后端一定拒绝，不进确认（确认框里不出现负余额）
+    adjust.error = `扣减金额超过当前余额 ${fmtYuan(balance)}`
+    return
+  }
   Object.assign(adjust, { error: '', cents: v.cents, sendRemark: v.remark, confirm: true })
 }
 async function submitAdjust() {
@@ -122,33 +129,41 @@ async function submitAdjust() {
   } catch (e) {
     // 余额不足、60 秒内重复提交等：回到填写弹窗，输入保留；动态码取消静默
     adjust.confirm = false
-    notifyError(e)
+    if (isApiError(e) && e.code === 'cancelled') return
+    // 本地已按显示的余额拦截过扣成负数；仍被拒说明余额在别处变了（如用户刚下单）
+    if (isApiError(e) && e.code === 'insufficient_balance') ElMessage.error('扣减后余额将为负，已拒绝；余额可能已变化，已刷新')
+    else notifyError(e)
+    await load() // 失败后余额可能已变化：刷新，下一次确认按最新余额计算
   } finally {
     adjust.busy = false
   }
 }
 
-// ---- 手动入账（finance；动态码由请求层弹出）----
-const mrecharge = reactive({ visible: false, amount: '', remark: '', error: '', busy: false })
+// ---- 手动入账（finance）：提交前确认「为用户 手机号（ID）入账 ¥x，余额 ¥a → ¥b」，动态码由请求层弹出 ----
+const mrecharge = reactive({ visible: false, confirm: false, amount: '', remark: '', error: '', busy: false, cents: 0, sendRemark: '' })
 function openManualRecharge() {
-  Object.assign(mrecharge, { visible: true, amount: '', remark: '', error: '' })
+  Object.assign(mrecharge, { visible: true, confirm: false, amount: '', remark: '', error: '' })
 }
-async function submitManualRecharge() {
-  if (mrecharge.busy) return // 同步守卫：入账不是幂等操作
+function openManualRechargeConfirm() {
   const v = validateManualRecharge(mrecharge.amount, mrecharge.remark)
   if ('error' in v) {
     mrecharge.error = v.error
     return
   }
-  mrecharge.error = ''
+  Object.assign(mrecharge, { error: '', cents: v.cents, sendRemark: v.remark, confirm: true })
+}
+async function submitManualRecharge() {
+  if (mrecharge.busy) return // 同步守卫：入账不是幂等操作
   mrecharge.busy = true
   try {
-    const out = await api.post<Recharge>(`/users/${id.value}/manual-recharge`, { amount: v.cents, remark: v.remark })
+    const out = await api.post<Recharge>(`/users/${id.value}/manual-recharge`, { amount: mrecharge.cents, remark: mrecharge.sendRemark })
     ElMessage.success(`已入账 ${fmtYuan(out.amount)}`)
+    mrecharge.confirm = false
     mrecharge.visible = false
     await load()
   } catch (e) {
-    notifyError(e) // 弹窗保留，输入不丢
+    mrecharge.confirm = false // 回到填写弹窗，输入不丢
+    notifyError(e)
   } finally {
     mrecharge.busy = false
   }
@@ -290,12 +305,19 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
       </el-dialog>
 
       <el-dialog v-model="mrecharge.visible" title="手动入账" width="460" align-center data-testid="mrecharge-dialog">
-        <el-form label-position="top" @submit.prevent="submitManualRecharge">
+        <el-form label-position="top" @submit.prevent="openManualRechargeConfirm">
           <el-form-item label="金额（元，1～1,000,000）"><el-input v-model="mrecharge.amount" inputmode="decimal" data-testid="mrecharge-amount" /></el-form-item>
           <el-form-item label="备注（必填，例如转账流水号）"><el-input v-model="mrecharge.remark" data-testid="mrecharge-remark" /></el-form-item>
           <p v-if="mrecharge.error" class="error" data-testid="mrecharge-error">{{ mrecharge.error }}</p>
-          <el-button type="primary" native-type="submit" :loading="mrecharge.busy" data-testid="mrecharge-submit">入账</el-button>
+          <el-button type="primary" native-type="submit" data-testid="mrecharge-submit">下一步</el-button>
         </el-form>
+      </el-dialog>
+      <el-dialog v-model="mrecharge.confirm" title="确认入账" width="420" align-center data-testid="mrecharge-confirm-dialog">
+        <p data-testid="mrecharge-confirm-text">将为用户 {{ data.user.phone }}（ID {{ data.user.id }}）入账 {{ fmtYuan(mrecharge.cents) }}，余额 {{ fmtYuan(data.balance) }} → {{ fmtYuan(data.balance + mrecharge.cents) }}</p>
+        <template #footer>
+          <el-button data-testid="mrecharge-confirm-cancel" @click="mrecharge.confirm = false">取消</el-button>
+          <el-button type="primary" :loading="mrecharge.busy" data-testid="mrecharge-confirm-ok" @click="submitManualRecharge">确定入账</el-button>
+        </template>
       </el-dialog>
     </div>
   </div>

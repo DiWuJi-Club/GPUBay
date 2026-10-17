@@ -1,14 +1,13 @@
-import { expect, test, type Route } from '@playwright/test'
-import { adminApi, clickTwiceSync, createAdmin, drainTasks, expectAdminUrl, loginAdmin, pauseClock, recordRequests, trackToasts } from '../helpers/admin'
+import { expect, test } from '@playwright/test'
+import {
+  adminApi, clickTwiceSync, createAdmin, drainTasks, expectAdminUrl, fail500, loginAdmin, pauseClock, recordRequests, trackToasts,
+} from '../helpers/admin'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { cstTime } from '../helpers/time'
 
 type AlertRow = { id: number; kind: string; machine_id: number | null; instance_id: string; message: string; created_at: string; resolved_at: string | null }
 type Page_ = { items: AlertRow[]; total: number }
-
-const fail500 = (id: string) => (r: Route) =>
-  r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: id }) })
 
 test('A-ALT-01 开通失败告警：未处理列表、角标、标记已处理、全部可见', async ({ page }) => {
   // 先造一批机器失联告警（> 每页 20 条，测翻页），再造开通失败告警：列表按时间倒序，它在第一页最上面

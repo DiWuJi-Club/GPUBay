@@ -1,8 +1,8 @@
-import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test'
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 import {
-  adminApi, adminPost, clickTwiceSync, createAdmin, drainTasks, enterTotpDialog, expectAdminUrl, loginAdmin, recordRequests, trackToasts,
+  adminApi, adminPost, clickTwiceSync, createAdmin, drainTasks, enterTotpDialog, expectAdminUrl, expectStillOpen, fail500, failOnce, getJSON, isPath, loginAdmin, logout, pick, recordRequests, trackToasts,
 } from '../helpers/admin'
-import { seedUser, toast, toastLocator, userApi } from '../helpers/console'
+import { seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
 import { cstTime } from '../helpers/time'
@@ -21,34 +21,10 @@ type Detail = {
 const FULL_ID = '110101199001011234'
 const MASKED_ID = '110***********1234'
 
-async function getJSON<T>(ctx: APIRequestContext, path: string): Promise<T> {
-  const r = await ctx.get(path)
-  if (!r.ok()) throw new Error(`GET ${path} ${r.status()} ${await r.text()}`)
-  return (await r.json()) as T
-}
 const detailOf = (ctx: APIRequestContext, id: number) => getJSON<Detail>(ctx, `/admin/api/v1/users/${id}`)
 
 const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestId('user-id') })
 const rowOf = (page: Page, id: number) => rows(page).filter({ has: page.getByTestId('user-id').getByText(String(id), { exact: true }) })
-const fail500 = (id: string) => (r: Route) =>
-  r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: id }) })
-/** 路由匹配函数：page.unroute 按函数引用匹配，所以同一个匹配器要先存成变量再 route / unroute */
-const isPath = (path: string) => (u: URL) => u.pathname === `/admin/api/v1${path}`
-async function failOnce(page: Page, path: string, requestId: string) {
-  await page.route(isPath(path), fail500(requestId), { times: 1 })
-}
-async function pick(page: Page, testid: string, option: string) {
-  await page.getByTestId(testid).click()
-  await page.getByRole('option', { name: option, exact: true }).click()
-}
-/** 失败后弹窗仍然打开：先等失败提示自动关闭（远长于弹窗关闭动画），再断言弹窗可见；直接断言会在淡出动画期间通过。 */
-async function expectStillOpen(page: Page, dialogId: string, message: string) {
-  await expect(toastLocator(page, message)).toHaveCount(0)
-  await expect(page.getByTestId(dialogId)).toBeVisible()
-}
-async function logout(page: Page) {
-  await page.context().clearCookies()
-}
 
 test('A-USR-01 用户搜索：手机号、尾号、ID 都命中；字母被拦截；实名 / 账号筛选与重置；超过一页翻页；首次加载失败可重试', async ({ page }) => {
   // 21 个填充用户 + u + v：同一假时钟时刻创建，列表按 created_at DESC, id DESC，本用例造的 23 人就是最新的 23 人
@@ -129,6 +105,18 @@ test('A-USR-01 用户搜索：手机号、尾号、ID 都命中；字母被拦�
     await expect(page.getByTestId('users-q')).toHaveValue('1234')
     await page.getByTestId('users-search').click()
     await expect.poll(() => searches().at(-1)).toBe('?q=1234&page=1&page_size=20')
+  })
+
+  await test.step('全角数字转半角而不是丢掉：输入法打出的「１２ａｂ３４」→ 1234；全角手机号照样命中', async () => {
+    await page.getByTestId('users-q').fill('１２ａｂ３４')
+    await expect(page.getByTestId('users-q')).toHaveValue('1234')
+    const fullWidth = u.phone.replace(/\d/g, (d) => String.fromCharCode(d.charCodeAt(0) + 0xfee0))
+    await page.getByTestId('users-q').fill(fullWidth)
+    await expect(page.getByTestId('users-q')).toHaveValue(u.phone)
+    await page.getByTestId('users-search').click()
+    await expect.poll(() => searches().at(-1)).toBe(`?q=${u.phone}&page=1&page_size=20`)
+    await expect(rows(page)).toHaveCount(1)
+    await expect(rows(page).first().getByTestId('user-id')).toHaveText(String(u.id))
   })
 
   await test.step('实名 / 账号筛选作为查询参数：v 未认证；封禁后按「已封禁」命中', async () => {
@@ -437,7 +425,7 @@ test('A-USR-03 封禁需原因；封禁后状态已封禁、用户会话失效�
   })
 })
 
-test('A-USR-04 调账 +¥10 与 −¥5（动态码）→ 余额与流水；金额按整数分提交；取消动态码保留输入；余额不足被拒只提示一次', async ({ page }) => {
+test('A-USR-04 调账 +¥10 与 −¥5（动态码）→ 余额与流水；金额按整数分提交；取消动态码保留输入；扣成负数本地拦截，并发导致的余额不足用后台措辞提示一次并刷新', async ({ page }) => {
   const u = await seedUser({ balance: 100000 })
   const admin = await createAdmin('finance')
   const ctx = await adminApi(admin)
@@ -536,27 +524,46 @@ test('A-USR-04 调账 +¥10 与 −¥5（动态码）→ 余额与流水；金�
     expect(d.ledger.slice(0, 2).map((l) => [l.kind, l.amount, l.balance_after])).toEqual([['admin_adjust', -500, 100500], ['admin_adjust', 1000, 101000]])
   })
 
-  await test.step('扣减超过余额：确认里显示负余额，后端拒绝只提示一次；回到填写弹窗、输入保留，余额不变', async () => {
+  await test.step('扣减超过当前余额：本地拦截（页内提示），不进确认、不发请求', async () => {
     await page.getByTestId('udetail-adjust-btn').click()
     await amount.fill('-1005.01')
     await remark.fill('超额扣减')
     await page.getByTestId('adjust-submit').click()
-    await expect(page.getByTestId('adjust-confirm-text')).toHaveText('将把余额从 ¥1,005.00 调整为 -¥0.01')
-    await page.getByTestId('adjust-confirm-ok').click()
-    await toast(page, '余额不足，请先充值')
+    await expect(page.getByTestId('adjust-error')).toHaveText('扣减金额超过当前余额 ¥1,005.00')
     await expect(page.getByTestId('adjust-confirm-dialog')).toBeHidden()
-    await expectStillOpen(page, 'adjust-dialog', '余额不足，请先充值')
-    await expect(amount).toHaveValue('-1005.01')
-    await expect(remark).toHaveValue('超额扣减')
-    await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,005.00')
     await drainTasks(page)
-    expect(posts.slice(4).map((p) => p.body)).toEqual([{ amount: -100501, remark: '超额扣减' }])
-    expect(await toasts()).toEqual(['余额已调整为 ¥1,010.00', '余额已调整为 ¥1,005.00', '余额不足，请先充值'])
-    expect((await detailOf(ctx, u.id)).balance).toBe(100500)
+    expect(posts).toHaveLength(4)
+  })
+
+  await test.step('余额在别处变了（真实并发）：后端拒绝，用后台措辞只提示一次并刷新余额；回到填写弹窗、输入保留', async () => {
+    // 另一个会话先扣掉 ¥5：服务器余额 ¥1,000.00，页面仍显示 ¥1,005.00
+    await adminPost(ctx, admin, `/admin/api/v1/users/${u.id}/adjust`, { amount: -500, remark: '外部扣款' })
+    expect((await detailOf(ctx, u.id)).balance).toBe(100000)
+    await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,005.00')
+    await amount.fill('-1005')
+    await page.getByTestId('adjust-submit').click()
+    await expect(page.getByTestId('adjust-confirm-text')).toHaveText('将把余额从 ¥1,005.00 调整为 ¥0.00')
+    await page.getByTestId('adjust-confirm-ok').click()
+    const message = '扣减后余额将为负，已拒绝；余额可能已变化，已刷新'
+    await toast(page, message)
+    await expect(page.getByTestId('adjust-confirm-dialog')).toBeHidden()
+    await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,000.00')
+    await expectStillOpen(page, 'adjust-dialog', message)
+    await expect(amount).toHaveValue('-1005')
+    await expect(remark).toHaveValue('超额扣减')
+    await drainTasks(page)
+    expect(posts.slice(4).map((p) => p.body)).toEqual([{ amount: -100500, remark: '超额扣减' }])
+    expect(await toasts()).toEqual(['余额已调整为 ¥1,010.00', '余额已调整为 ¥1,005.00', message])
+    expect((await detailOf(ctx, u.id)).balance).toBe(100000)
+    // 刷新后的余额参与下一次本地校验
+    await page.getByTestId('adjust-submit').click()
+    await expect(page.getByTestId('adjust-error')).toHaveText('扣减金额超过当前余额 ¥1,000.00')
+    await expect(page.getByTestId('adjust-confirm-dialog')).toBeHidden()
+    expect(posts).toHaveLength(5)
   })
 })
 
-test('A-USR-05 手动入账 ¥100：充值单渠道「手动」、余额增加；金额与备注本地校验；失败保留输入；动态码后带 totp 只重发一次', async ({ page }) => {
+test('A-USR-05 手动入账 ¥100：充值单渠道「手动」、余额增加；金额与备注本地校验；确认步骤显示金额与用户；失败保留输入；动态码后带 totp 只重发一次', async ({ page }) => {
   const u = await seedUser({ balance: 100000 })
   const admin = await createAdmin('finance')
   const ctx = await adminApi(admin)
@@ -590,23 +597,43 @@ test('A-USR-05 手动入账 ¥100：充值单渠道「手动」、余额增加�
     expect(posts).toHaveLength(0)
   })
 
-  await test.step('接口失败：只提示一次，弹窗不关、输入保留', async () => {
+  const confirmText = () => `将为用户 ${u.phone}（ID ${u.id}）入账 ¥100.00，余额 ¥1,000.00 → ¥1,100.00`
+
+  await test.step('确认步骤：显示金额与用户；取消回到填写弹窗、不发请求', async () => {
     await remark.fill('对公转账 20261017-001')
-    await failOnce(page, `/users/${u.id}/manual-recharge`, 'req-mr-1')
     await page.getByTestId('mrecharge-submit').click()
+    await expect(page.getByTestId('mrecharge-error')).toHaveCount(0)
+    await expect(page.getByTestId('mrecharge-confirm-text')).toHaveText(confirmText())
+    await page.getByTestId('mrecharge-confirm-cancel').click()
+    await expect(page.getByTestId('mrecharge-confirm-dialog')).toBeHidden()
+    await expect(page.getByTestId('mrecharge-dialog')).toBeVisible()
+    await expect(amount).toHaveValue('100')
+    await drainTasks(page)
+    expect(posts).toHaveLength(0)
+  })
+
+  await test.step('接口失败：只提示一次，回到填写弹窗、输入保留', async () => {
+    await page.getByTestId('mrecharge-submit').click()
+    await failOnce(page, `/users/${u.id}/manual-recharge`, 'req-mr-1')
+    await page.getByTestId('mrecharge-confirm-ok').click()
     await toast(page, '服务器内部错误（请求号 req-mr-1）')
+    await expect(page.getByTestId('mrecharge-confirm-dialog')).toBeHidden()
     await expectStillOpen(page, 'mrecharge-dialog', '服务器内部错误（请求号 req-mr-1）')
     await expect(amount).toHaveValue('100')
     await expect(remark).toHaveValue('对公转账 20261017-001')
     await expect(page.getByTestId('mrecharge-error')).toHaveCount(0)
     expect(await toasts()).toEqual(['服务器内部错误（请求号 req-mr-1）'])
+    expect(posts).toHaveLength(1)
   })
 
-  await test.step('连点入账：弹动态码，原请求带 totp 只重发一次；余额 ¥1,100.00，流水与充值单', async () => {
-    await clickTwiceSync(page.getByTestId('mrecharge-submit'))
+  await test.step('连点确定入账：只提交一次，弹动态码，原请求带 totp 只重发一次；余额 ¥1,100.00，流水与充值单', async () => {
+    await page.getByTestId('mrecharge-submit').click()
+    await expect(page.getByTestId('mrecharge-confirm-text')).toHaveText(confirmText())
+    await clickTwiceSync(page.getByTestId('mrecharge-confirm-ok'))
     await enterTotpDialog(page, admin.totp_secret!)
     await toast(page, '已入账 ¥100.00')
     await expect(page.getByTestId('mrecharge-dialog')).toBeHidden()
+    await expect(page.getByTestId('mrecharge-confirm-dialog')).toBeHidden()
     await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,100.00')
     await drainTasks(page)
     const body = { amount: 10000, remark: '对公转账 20261017-001' }
@@ -623,7 +650,7 @@ test('A-USR-05 手动入账 ¥100：充值单渠道「手动」、余额增加�
   })
 })
 
-test('A-USR-06 60 秒内相同调账被拦截：只提示一次、保留输入、余额不变；超过 60 秒可再次提交', async ({ page }) => {
+test('A-USR-06 60 秒内相同调账被拦截：只提示一次、保留输入、刷新余额；超过 60 秒可再次提交', async ({ page }) => {
   const u = await seedUser({ balance: 100000 })
   const admin = await createAdmin('finance')
   const ctx = await adminApi(admin)
@@ -646,15 +673,18 @@ test('A-USR-06 60 秒内相同调账被拦截：只提示一次、保留输入�
     await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,010.00')
   })
 
-  await test.step('60 秒内相同金额与备注：后端拒绝，只提示一次，回到填写弹窗、输入保留，余额不变', async () => {
+  await test.step('60 秒内相同金额与备注：后端拒绝，只提示一次，回到填写弹窗、输入保留；失败后刷新出别处改过的余额', async () => {
+    // 另一个会话加 ¥1：服务器余额 ¥1,011.00，页面仍显示 ¥1,010.00；失败后页面应刷新成最新余额
+    await adminPost(ctx, admin, `/admin/api/v1/users/${u.id}/adjust`, { amount: 100, remark: '外部调整' })
+    await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,010.00')
     await adjustOnce()
     await toast(page, '60 秒内已提交过相同的操作，请勿重复提交')
     await expect(page.getByTestId('adjust-confirm-dialog')).toBeHidden()
     await expectStillOpen(page, 'adjust-dialog', '60 秒内已提交过相同的操作，请勿重复提交')
     await expect(page.getByTestId('adjust-amount')).toHaveValue('10')
     await expect(page.getByTestId('adjust-remark')).toHaveValue('重复提交测试')
-    await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,010.00')
-    expect((await detailOf(ctx, u.id)).balance).toBe(101000)
+    await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,011.00')
+    expect((await detailOf(ctx, u.id)).balance).toBe(101100)
     expect(await toasts()).toEqual(['余额已调整为 ¥1,010.00', '60 秒内已提交过相同的操作，请勿重复提交'])
   })
 
@@ -662,8 +692,8 @@ test('A-USR-06 60 秒内相同调账被拦截：只提示一次、保留输入�
     await hooks.advance(61)
     await page.getByTestId('adjust-submit').click()
     await page.getByTestId('adjust-confirm-ok').click()
-    await toast(page, '余额已调整为 ¥1,020.00')
-    await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,020.00')
+    await toast(page, '余额已调整为 ¥1,021.00')
+    await expect(page.getByTestId('udetail-balance')).toHaveText('¥1,021.00')
     await drainTasks(page)
     expect(posts.filter((p) => !('totp' in (p.body ?? {}))).map((p) => p.body)).toEqual(Array(3).fill({ amount: 1000, remark: '重复提交测试' }))
   })

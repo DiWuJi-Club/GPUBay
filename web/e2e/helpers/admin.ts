@@ -1,4 +1,5 @@
-import { expect, request, type APIRequestContext, type Locator, type Page } from '@playwright/test'
+import { expect, request, type APIRequestContext, type Locator, type Page, type Route } from '@playwright/test'
+import { toastLocator } from './console'
 import { ADMIN_URL, hooks, type Role } from './hooks'
 import { runStamp } from './phone'
 import { totp } from './totp'
@@ -183,4 +184,43 @@ export async function registerMachine(ctx: APIRequestContext, admin: SeededAdmin
   }
   const out = await adminPost<{ id: number }>(ctx, admin, '/admin/api/v1/machines', body)
   return { id: out.id, serial }
+}
+
+/** 后台接口 GET，非 2xx 直接抛错（带响应体，便于排查）。 */
+export async function getJSON<T>(ctx: APIRequestContext, path: string): Promise<T> {
+  const r = await ctx.get(path)
+  if (!r.ok()) throw new Error(`GET ${path} ${r.status()} ${await r.text()}`)
+  return (await r.json()) as T
+}
+
+/** page.route 处理函数：返回 500 + 指定请求号（界面应显示「服务器内部错误（请求号 …）」）。 */
+export const fail500 = (id: string) => (r: Route) =>
+  r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: id }) })
+
+/** 路由匹配函数（后台接口路径精确匹配，查询串不参与）。page.unroute 按函数引用匹配，所以同一个匹配器要先存成变量再 route / unroute。 */
+export const isPath = (path: string) => (u: URL) => u.pathname === `/admin/api/v1${path}`
+
+/** 下一次请求返回 500（只拦一次）。 */
+export async function failOnce(page: Page, path: string, requestId: string) {
+  await page.route(isPath(path), fail500(requestId), { times: 1 })
+}
+
+/** el-select 选择一项（按选项文字精确匹配）。 */
+export async function pick(page: Page, testid: string, option: string) {
+  await page.getByTestId(testid).click()
+  await page.getByRole('option', { name: option, exact: true }).click()
+}
+
+/**
+ * 失败后弹窗仍然打开：先等失败提示自动关闭（约 3 秒，远长于弹窗关闭动画），再断言弹窗可见；
+ * 直接断言可见会在弹窗淡出动画期间通过。
+ */
+export async function expectStillOpen(page: Page, dialogId: string, message: string) {
+  await expect(toastLocator(page, message)).toHaveCount(0)
+  await expect(page.getByTestId(dialogId)).toBeVisible()
+}
+
+/** 退出后台登录（清掉会话 Cookie），之后可用 loginAdmin 换一个管理员登录。 */
+export async function logout(page: Page) {
+  await page.context().clearCookies()
 }

@@ -1,8 +1,8 @@
-import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test'
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 import {
-  adminApi, clickTwiceSync, createAdmin, drainIdleMachines, drainTasks, enterTotpDialog, expectAdminUrl, loginAdmin, recordRequests, totpNow, trackToasts, type SeededAdmin,
+  adminApi, clickTwiceSync, createAdmin, drainIdleMachines, drainTasks, enterTotpDialog, expectAdminUrl, expectStillOpen, fail500, failOnce, getJSON, isPath, loginAdmin, logout, pick, recordRequests, type SeededAdmin, totpNow, trackToasts,
 } from '../helpers/admin'
-import { placeOrder, seedUser, toast, toastLocator } from '../helpers/console'
+import { placeOrder, seedUser, toast } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
 import { yuan } from '../helpers/money'
@@ -25,42 +25,12 @@ const cmdType: Record<string, string> = { create_instance: '开通实例', start
 const cmdStatus: Record<string, string> = { pending: '待执行', sent: '已下发', done: '已完成', failed: '失败' }
 const orderStatus: Record<string, string> = { paid: '已支付', refunded: '已退款', partially_refunded: '部分退款' }
 
-async function getJSON<T>(ctx: APIRequestContext, path: string): Promise<T> {
-  const r = await ctx.get(path)
-  if (!r.ok()) throw new Error(`GET ${path} ${r.status()} ${await r.text()}`)
-  return (await r.json()) as T
-}
 const detailOf = (ctx: APIRequestContext, id: string) => getJSON<Detail>(ctx, `/admin/api/v1/instances/${id}`)
 const eventText = (e: Detail['events'][number]) => `${e.from_state || '—'} → ${e.to_state} · ${e.reason} · ${cstTime(e.at)}`
 const balanceOf = async (api: APIRequestContext) => ((await (await api.get('/api/v1/wallet')).json()) as { balance: number }).balance
 
 const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestId('ainst-id') })
 const rowOf = (page: Page, id: string) => rows(page).filter({ has: page.getByTestId('ainst-id').getByText(id, { exact: true }) })
-const fail500 = (id: string) => (r: Route) =>
-  r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: id }) })
-/** 路由匹配函数：page.unroute 按函数引用匹配，所以同一个匹配器要先存成变量再 route / unroute */
-const isPath = (path: string) => (u: URL) => u.pathname === `/admin/api/v1${path}`
-async function pick(page: Page, testid: string, option: string) {
-  await page.getByTestId(testid).click()
-  await page.getByRole('option', { name: option, exact: true }).click()
-}
-/** 下一次请求返回 500（只拦一次；操作接口路径只有 POST） */
-async function failOnce(page: Page, path: string, requestId: string) {
-  await page.route(isPath(path), fail500(requestId), { times: 1 })
-}
-
-/**
- * 失败后弹窗仍然打开：先等失败提示自动关闭（约 3 秒，远长于弹窗关闭动画），再断言弹窗可见；
- * 直接断言可见会在弹窗淡出动画期间通过。
- */
-async function expectStillOpen(page: Page, dialogId: string, message: string) {
-  await expect(toastLocator(page, message)).toHaveCount(0)
-  await expect(page.getByTestId(dialogId)).toBeVisible()
-}
-
-async function logout(page: Page) {
-  await page.context().clearCookies()
-}
 
 test('A-INS-01 实例列表：状态 / 用户 / 机器筛选作为查询参数、地址栏预填、重置、超过一页翻页、首次加载失败可重试', async ({ page }) => {
   // 数据库整轮共享：断言只针对本用例造的用户与实例
@@ -628,6 +598,7 @@ test('A-INS-06 退款并释放：建议金额与上限来自后端、金额校�
     await page.getByTestId('refund-reason').fill('机器故障')
     await submitExpect('abc', '金额格式不正确')
     await submitExpect('-1', '金额格式不正确')
+    await submitExpect('0', '退款金额需大于 0')
     await submitExpect('1.234', '金额格式不正确')
     await submitExpect('69.01', '退款金额不能超过可退上限')
     await page.getByTestId('refund-reason').fill('')

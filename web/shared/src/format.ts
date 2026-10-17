@@ -19,6 +19,37 @@ export function yuanToCents(input: string): number | null {
   return yuan * 100 + Number((m[2] ?? '').padEnd(2, '0'))
 }
 
+/** 充值 / 手动入账的金额范围（分）：1 元～100 万元，与后端 billing.MinAmount / MaxAmount 一致。只在这里定义。 */
+export const RECHARGE_MIN_CENTS = 100
+export const RECHARGE_MAX_CENTS = 100_000_000
+
+/**
+ * 元（字符串）→ 分，并检查范围 [minCents, maxCents]。
+ * 格式不对一律「金额格式不正确」；低于下限 / 高于上限分别用 messages.min / messages.max（缺省用 messages.range）。
+ */
+export function validateYuanRange(
+  input: string,
+  minCents: number,
+  maxCents: number,
+  messages: { range?: string; min?: string; max?: string },
+): { cents: number } | { error: string } {
+  const cents = yuanToCents(input)
+  if (cents == null) return { error: '金额格式不正确' }
+  if (cents < minCents) return { error: messages.min ?? messages.range ?? '金额超出范围' }
+  if (cents > maxCents) return { error: messages.max ?? messages.range ?? '金额超出范围' }
+  return { cents }
+}
+
+/** 全角数字转半角（输入法打出的「１３８」）。 */
+export function toHalfWidthDigits(s: string): string {
+  return s.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+}
+
+/** 只留数字：先把全角数字转成半角，再去掉其余字符（粘贴来的「138 0000 1234」「１３８」）。 */
+export function digitsOnly(s: string): string {
+  return toHalfWidthDigits(s).replace(/\D/g, '')
+}
+
 const cst = new Intl.DateTimeFormat('en-US', {
   timeZone: 'Asia/Shanghai',
   hourCycle: 'h23',

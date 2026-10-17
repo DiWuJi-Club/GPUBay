@@ -1,5 +1,7 @@
-import { expect, request, test, type APIRequestContext, type Page, type Route } from '@playwright/test'
-import { adminApi, clickTwiceSync, createAdmin, drainTasks, expectAdminUrl, loginAdmin, recordRequests, trackToasts } from '../helpers/admin'
+import { expect, request, test, type APIRequestContext, type Page } from '@playwright/test'
+import {
+  adminApi, clickTwiceSync, createAdmin, drainTasks, expectAdminUrl, fail500, isPath, loginAdmin, recordRequests, trackToasts,
+} from '../helpers/admin'
 import { seedUser, submitEnterpriseKyc, toast, toastLocator, userApi } from '../helpers/console'
 import { ADMIN_URL, CONSOLE_URL } from '../helpers/hooks'
 import { runStamp } from '../helpers/phone'
@@ -27,9 +29,6 @@ const recordOf = (list: Pending[], company: string) => {
 
 const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestId('kyc-company') })
 const rowOf = (page: Page, company: string) => rows(page).filter({ has: page.getByTestId('kyc-company').getByText(company, { exact: true }) })
-const fail500 = (id: string) => (r: Route) =>
-  r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: id }) })
-const isPath = (path: string) => (u: URL) => u.pathname === `/admin/api/v1${path}`
 
 /** 打开待审核页并翻到第 n 页（每页 20 条） */
 async function openKycPage(page: Page, n: number) {
@@ -122,6 +121,7 @@ test('A-KYC-01 待审核列表（超过一页翻页）、PNG 预览、PDF 与预
     await page.getByTestId('kyc-open-pdf').click()
     const opened = await popup
     expect(opened.url()).toBe(`${ADMIN_URL}/admin/api/v1/files/${pdfKey}`)
+    expect(await opened.evaluate(() => window.opener)).toBeNull() // noopener：新窗口拿不到后台页面
     await opened.close()
     // 新窗口带的是本页的后台会话：同一个地址能读到 PDF
     const r = await page.request.get(`/admin/api/v1/files/${pdfKey}`)
@@ -142,13 +142,22 @@ test('A-KYC-01 待审核列表（超过一页翻页）、PNG 预览、PDF 与预
     await page.getByTestId('kyc-open-file').click()
     const opened = await popup
     expect(opened.url()).toBe(`${ADMIN_URL}/admin/api/v1/files/${pngKey}`)
+    expect(await opened.evaluate(() => window.opener)).toBeNull() // noopener：新窗口拿不到后台页面
     await opened.close()
   })
 
   await test.step('营业执照只有运维 / 超管能读取：控制台用户会话、未登录都是 401，财务 403；控制台没有读取接口', async () => {
-    // 控制台与后台同主机不同端口，Cookie 按主机共享：用户会话的 Cookie 会被带到后台地址上
+    // 控制台与后台同主机不同端口，Cookie 按主机共享（不区分端口）：用户会话 Cookie（Path=/、仅主机）会被带到后台地址上
+    const session = (await pngApi.storageState()).cookies.find((c) => c.name === 'sc_session')
+    expect(session).toMatchObject({ domain: '127.0.0.1', path: '/' })
+    expect(new URL(ADMIN_URL).hostname).toBe(session!.domain)
+    expect((await pngApi.get(`${CONSOLE_URL}/api/v1/wallet`)).status()).toBe(200) // 会话本身有效
     const asUser = await pngApi.get(`${ADMIN_URL}/admin/api/v1/files/${pngKey}`)
     expect(asUser.status()).toBe(401)
+    // 显式带上这个 Cookie 头再请求一次，排除「Cookie 根本没发出去」的可能
+    const anonWithCookie = await request.newContext({ baseURL: ADMIN_URL })
+    const explicit = await anonWithCookie.get(`/admin/api/v1/files/${pngKey}`, { headers: { cookie: `sc_session=${session!.value}` } })
+    expect(explicit.status()).toBe(401)
     expect((await pngApi.get(`${CONSOLE_URL}/api/v1/files/${pngKey}`)).status()).toBe(404)
     // 控制台端口上的 /admin/... 只是前端路由回退（index.html），不是文件
     const viaConsole = await pngApi.get(`${CONSOLE_URL}/admin/api/v1/files/${pngKey}`)

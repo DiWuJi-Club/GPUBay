@@ -25,7 +25,9 @@ describe('instance ops', () => {
   it('退款金额：0 ≤ 金额 ≤ 上限', () => {
     expect(validateRefund('69', 6900)).toEqual({ cents: 6900 })
     expect(validateRefund(' 12.5 ', 6900)).toEqual({ cents: 1250 })
-    expect(validateRefund('0', 6900)).toEqual({ cents: 0 })
+    expect(validateRefund('0', 6900)).toEqual({ error: '退款金额需大于 0' })
+    expect(validateRefund('0.00', 6900)).toEqual({ error: '退款金额需大于 0' })
+    expect(validateRefund('0.01', 6900)).toEqual({ cents: 1 })
     expect(validateRefund('69.01', 6900)).toEqual({ error: '退款金额不能超过可退上限' })
     expect(validateRefund('-1', 6900)).toEqual({ error: '金额格式不正确' })
     expect(validateRefund('abc', 6900)).toEqual({ error: '金额格式不正确' })

@@ -1,10 +1,7 @@
-import { yuanToCents } from '@spark/shared'
+import { RECHARGE_MAX_CENTS, RECHARGE_MIN_CENTS, validateYuanRange, yuanToCents } from '@spark/shared'
 
 /** 与后端 wallet.MaxAdjust 一致：单次调账 ±100 万元（分） */
 export const MAX_ADJUST = 100_000_000
-/** 与后端 billing.MinAmount / MaxAmount 一致：手动入账 1 元～100 万元（分） */
-export const MIN_MANUAL_RECHARGE = 100
-export const MAX_MANUAL_RECHARGE = 100_000_000
 
 /**
  * 调账金额：元，允许一个前导 `-`（负号与数字之间不能有空格），不允许 0；返回整数分。
@@ -33,9 +30,9 @@ export function validateAdjust(amount: string, remark: string): MoneyInput {
 
 /** 手动入账：金额 1 元～100 万元（不接受负数）与备注（必填，例如转账流水号）。 */
 export function validateManualRecharge(amount: string, remark: string): MoneyInput {
-  const cents = yuanToCents(amount)
-  if (cents == null) return { error: '金额格式不正确' }
-  if (cents < MIN_MANUAL_RECHARGE || cents > MAX_MANUAL_RECHARGE) return { error: '入账金额需在 1 元到 100 万元之间' }
+  // 范围与控制台充值相同（RECHARGE_MIN_CENTS / RECHARGE_MAX_CENTS，与后端 billing.MinAmount / MaxAmount 一致）
+  const v = validateYuanRange(amount, RECHARGE_MIN_CENTS, RECHARGE_MAX_CENTS, { range: '入账金额需在 1 元到 100 万元之间' })
+  if ('error' in v) return v
   if (!remark.trim()) return { error: '请填写备注（例如转账流水号）' }
-  return { cents, remark: remark.trim() }
+  return { cents: v.cents, remark: remark.trim() }
 }

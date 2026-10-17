@@ -1,5 +1,7 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
-import { adminApi, clickTwiceSync, createAdmin, createPDU, drainTasks, expectAdminUrl, loginAdmin, recordRequests, registerMachine, trackToasts } from '../helpers/admin'
+import { expect, test, type Page } from '@playwright/test'
+import {
+  adminApi, clickTwiceSync, createAdmin, createPDU, drainTasks, expectAdminUrl, fail500, loginAdmin, recordRequests, registerMachine, trackToasts,
+} from '../helpers/admin'
 import { toast } from '../helpers/console'
 import { runStamp } from '../helpers/phone'
 
@@ -7,8 +9,6 @@ type PduRow = { id: number; name: string; driver: string; address: string; has_c
 
 const isPdus = (u: URL) => u.pathname === '/admin/api/v1/pdus'
 const rowByName = (page: Page, name: string) => page.getByRole('row').filter({ has: page.getByTestId('pdu-name').filter({ hasText: name }) })
-const fail500 = (id: string) => (r: Route) =>
-  r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'internal', message: '服务器内部错误', request_id: id }) })
 
 /** 记录页面收到的每个后台响应体（GET 以及新增 / 修改 PDU 的 POST / PUT）与每个请求地址，用于断言 community 从不下发、从不进 URL。 */
 function recordTraffic(page: Page) {

@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import { fmtDate, fmtDuration, fmtTime, fmtTimeSec, fmtYuan, useCountdown, yuanToCents } from '../format'
+import {
+  digitsOnly, fmtDate, fmtDuration, fmtTime, fmtTimeSec, fmtYuan, RECHARGE_MAX_CENTS, RECHARGE_MIN_CENTS, toHalfWidthDigits, useCountdown, validateYuanRange, yuanToCents,
+} from '../format'
 
 describe('fmtYuan (U-01)', () => {
   it.each([
@@ -115,5 +117,38 @@ describe('useCountdown (U-05)', () => {
     expect(cd.remaining.value).toBe(99)
     cd.stop()
     vi.useRealTimers()
+  })
+})
+
+describe('validateYuanRange', () => {
+  const msgs = { range: '需在 1 元到 100 万元之间' }
+  it('范围内返回分（按字符串换算，无浮点误差）', () => {
+    expect(validateYuanRange('0.29', 1, 100, msgs)).toEqual({ cents: 29 })
+    expect(validateYuanRange('1', RECHARGE_MIN_CENTS, RECHARGE_MAX_CENTS, msgs)).toEqual({ cents: 100 })
+    expect(validateYuanRange('1000000', RECHARGE_MIN_CENTS, RECHARGE_MAX_CENTS, msgs)).toEqual({ cents: 100_000_000 })
+  })
+  it('格式不正确', () => {
+    for (const s of ['', '-1', '1.234', '1e3', '１００', 'abc']) expect(validateYuanRange(s, 1, 100, msgs)).toEqual({ error: '金额格式不正确' })
+  })
+  it('上下限：range 兜底，min / max 优先', () => {
+    expect(validateYuanRange('0.99', RECHARGE_MIN_CENTS, RECHARGE_MAX_CENTS, msgs)).toEqual({ error: msgs.range })
+    expect(validateYuanRange('1000000.01', RECHARGE_MIN_CENTS, RECHARGE_MAX_CENTS, msgs)).toEqual({ error: msgs.range })
+    expect(validateYuanRange('0', 1, 100, { min: '太小', max: '太大' })).toEqual({ error: '太小' })
+    expect(validateYuanRange('1.01', 1, 100, { min: '太小', max: '太大' })).toEqual({ error: '太大' })
+  })
+  it('充值范围常量与后端一致：1 元～100 万元', () => {
+    expect([RECHARGE_MIN_CENTS, RECHARGE_MAX_CENTS]).toEqual([100, 100_000_000])
+  })
+})
+
+describe('toHalfWidthDigits / digitsOnly', () => {
+  it('全角数字转半角，其余字符不动', () => {
+    expect(toHalfWidthDigits('１３８ａ0')).toBe('138ａ0')
+  })
+  it('digitsOnly：全角转半角后只留数字', () => {
+    expect(digitsOnly('１３８ ００００ 1234')).toBe('13800001234')
+    expect(digitsOnly('12ab34')).toBe('1234')
+    expect(digitsOnly('abc')).toBe('')
+    expect(digitsOnly('０')).toBe('0')
   })
 })
