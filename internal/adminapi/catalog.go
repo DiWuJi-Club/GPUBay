@@ -88,7 +88,20 @@ func (s *Server) handleCreateImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	s.broadcastPull(r, img)
 	httpx.WriteJSON(w, http.StatusCreated, img)
+}
+
+// broadcastPull 镜像上架或启用时向所有在线机器预拉取；失败不阻塞上架。
+func (s *Server) broadcastPull(r *http.Request, img catalog.AdminImage) {
+	if !img.Enabled {
+		return
+	}
+	if n, err := s.Fleet.BroadcastPullImage(r.Context(), img.Ref); err != nil {
+		s.Log.Warn("broadcast pull_image failed", "image", img.ID, "err", err)
+	} else {
+		s.Log.Info("pull_image broadcast", "image", img.ID, "machines", n)
+	}
 }
 
 func (s *Server) handleUpdateImage(w http.ResponseWriter, r *http.Request) {
@@ -107,6 +120,7 @@ func (s *Server) handleUpdateImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	s.broadcastPull(r, img)
 	httpx.WriteJSON(w, http.StatusOK, img)
 }
 

@@ -47,7 +47,12 @@ func (s *Service) IssueEnrollToken(ctx context.Context, actor audit.Actor, machi
 	plain := EnrollTokenPrefix + randx.Token()
 	var out EnrollToken
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := s.Get(ctx, tx, machineID); err != nil {
+		// 锁机器行：并发签发串行化，保证同机任一时刻最多一枚有效令牌。
+		var locked int64
+		if err := tx.QueryRow(ctx, `SELECT id FROM machines WHERE id = $1 FOR UPDATE`, machineID).Scan(&locked); err != nil {
+			if db.IsNoRows(err) {
+				return apperr.ErrNotFound
+			}
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE machine_enroll_tokens SET expires_at = $2
@@ -112,6 +117,11 @@ func (s *Service) RevokeEnrollment(ctx context.Context, actor audit.Actor, machi
 			return apperr.ErrInvalidState
 		}
 		if err := s.SetCertFingerprint(ctx, tx, machineID, ""); err != nil {
+			return err
+		}
+		// 撤销前签发、尚未使用的令牌一并作废，避免撤销后仍能用旧令牌重新接入。
+		if _, err := tx.Exec(ctx, `UPDATE machine_enroll_tokens SET expires_at = $2
+			WHERE machine_id = $1 AND used_at IS NULL AND expires_at > $2`, machineID, now); err != nil {
 			return err
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("machine.revoke_enrollment", "machine", strconv.FormatInt(machineID, 10),

@@ -25,6 +25,8 @@ func (s *Server) machineRoutes(g chi.Router) {
 	s.handle(g, http.MethodGet, "/machines/{id}", opsRoles, s.handleMachine)
 	s.handle(g, http.MethodPost, "/machines/{id}/maintenance", opsRoles, s.handleMaintenance)
 	s.handle(g, http.MethodPost, "/machines/{id}/power-cycle", opsRoles, s.handlePowerCycle)
+	s.handle(g, http.MethodPost, "/machines/{id}/enroll-command", opsRoles, s.handleEnrollCommand)
+	s.handle(g, http.MethodPost, "/machines/{id}/revoke-enrollment", opsRoles, s.handleRevokeEnrollment)
 	s.handle(g, http.MethodGet, "/pdus", opsRoles, s.handleListPDUs)
 	s.handle(g, http.MethodPost, "/pdus", opsRoles, s.handleCreatePDU)
 	s.handle(g, http.MethodPut, "/pdus/{id}", opsRoles, s.handleUpdatePDU)
@@ -259,6 +261,65 @@ func (s *Server) handlePowerCycle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.OK(w)
+}
+
+// handleEnrollCommand 签发一次性接入令牌并返回安装命令（只显示一次；令牌明文不进日志与审计）。
+func (s *Server) handleEnrollCommand(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	var req struct {
+		TOTP string `json:"totp"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	if err := s.stepUp(r, req.TOTP); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	if s.Gateway == nil {
+		s.writeError(w, r, errors.New("未配置 Agent 网关"))
+		return
+	}
+	tok, err := s.Fleet.IssueEnrollToken(r.Context(), s.actor(r), id)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"command": s.Gateway.InstallCommand(tok.Plain), "token_id": tok.ID, "expires_at": tok.ExpiresAt})
+}
+
+func (s *Server) handleRevokeEnrollment(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	var req struct {
+		TOTP string `json:"totp"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	if err := s.stepUp(r, req.TOTP); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	if err := s.Fleet.RevokeEnrollment(r.Context(), s.actor(r), id); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	m, err := s.Fleet.Get(r.Context(), s.Fleet.Pool(), id)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, m)
 }
 
 type pduRequest struct {

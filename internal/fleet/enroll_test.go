@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -119,5 +120,55 @@ func TestSetFingerprintAndRevoke(t *testing.T) {
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action = 'machine.revoke_enrollment' AND diff->>'fingerprint' = $1`, fp).Scan(&n)
 	if n != 1 {
 		t.Fatalf("revoke audit = %d", n)
+	}
+}
+
+func TestRevokeEnrollmentInvalidatesUnusedTokens(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	id := dbtest.CreateMachine(t, pool, "SN-R")
+	tok, err := svc.IssueEnrollToken(ctx, audit.Actor{AdminID: 1}, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithTx(ctx, pool, func(tx pgx.Tx) error { return svc.SetCertFingerprint(ctx, tx, id, strings.Repeat("ab", 32)) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RevokeEnrollment(ctx, audit.Actor{AdminID: 1}, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := consume(t, svc, pool, tok.Plain); !errors.Is(err, fleet.ErrEnrollToken) {
+		t.Fatalf("token issued before revoke still works: %v", err)
+	}
+	// 撤销后新签发的令牌可用
+	tok2, _ := svc.IssueEnrollToken(ctx, audit.Actor{AdminID: 1}, id)
+	if _, err := consume(t, svc, pool, tok2.Plain); err != nil {
+		t.Fatalf("new token = %v", err)
+	}
+}
+
+func TestConcurrentIssueLeavesOneValidToken(t *testing.T) {
+	svc, pool, clk := newEnv(t)
+	ctx := context.Background()
+	id := dbtest.CreateMachine(t, pool, "SN-C")
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := svc.IssueEnrollToken(ctx, audit.Actor{AdminID: 1}, id); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	var valid int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM machine_enroll_tokens WHERE machine_id = $1 AND used_at IS NULL AND expires_at > $2`,
+		id, clk.Now()).Scan(&valid); err != nil {
+		t.Fatal(err)
+	}
+	if valid != 1 {
+		t.Fatalf("valid tokens = %d, want 1", valid)
 	}
 }

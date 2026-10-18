@@ -19,11 +19,13 @@ import (
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/adminapi"
+	"spark-cloud/internal/agentgw"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/secretbox"
@@ -61,6 +63,7 @@ type env struct {
 	uploads  *storage.Service
 	pdu      *pdu.Mock
 	pay      *pay.Mock
+	gw       *agentgw.Server
 }
 
 func newEnv(t *testing.T) *env { return newEnvWith(t, nil) }
@@ -92,15 +95,24 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	b := billing.NewService(billing.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Alerts: f,
 		Providers: map[string]pay.Provider{pay.ChannelWechat: payMock}, NotifyBaseURL: "https://spark.test"})
 	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
+	ca, err := pki.EnsureCA(context.Background(), pool, box, clk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := agentgw.New(agentgw.Config{AdvertiseAddr: "agent.test:9443", Hosts: []string{"127.0.0.1"}, DownloadURL: "http://files.test/agent", BinarySHA256: "beef"},
+		agentgw.Deps{Pool: pool, Fleet: f, Rental: r, CA: ca, Clock: clk, Log: log})
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := &adminapi.Server{Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: b,
-		Uploads: uploads, Clock: clk, Log: log}
+		Uploads: uploads, Gateway: gw, Clock: clk, Log: log}
 	if tweak != nil {
 		tweak(srv)
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, srv: srv, ts: ts, admins: admins, identity: ids,
-		wallet: w, catalog: c, fleet: f, rental: r, billing: b, uploads: uploads, pdu: pduMock, pay: payMock}
+		wallet: w, catalog: c, fleet: f, rental: r, billing: b, uploads: uploads, pdu: pduMock, pay: payMock, gw: gw}
 }
 
 type client struct {
