@@ -90,7 +90,8 @@ func syncedChains(r *cmdrun.Recorder) {
 	r.Stub("iptables -w -S SPARK-IN", strings.Join(iptables.ExpectedInRules(), "\n")+"\n", nil)
 }
 
-// 别的工具把规则插到了我们的跳转前面：删掉原跳转，重新插到第 1 位（否则 SPARK-FWD 会被绕过）。
+// 别的工具把规则插到了我们的跳转前面：先在第 1 位插入新跳转，再按序号删掉旧的那条（否则 SPARK-FWD 会被绕过）。
+// 先插后删：任何时刻链里都至少有一条位于第 1 位或原位置的跳转，不留无隔离的窗口。
 func TestJumpNotFirstIsMovedToFirst(t *testing.T) {
 	r := &cmdrun.Recorder{}
 	nf := &iptables.Netfilter{Run: r}
@@ -104,11 +105,11 @@ func TestJumpNotFirstIsMovedToFirst(t *testing.T) {
 		"iptables -w -S SPARK-IN",
 		"iptables -w -S SPARK-FWD",
 		"iptables -w -S INPUT",
-		"iptables -w -D INPUT -i spark0 -j SPARK-IN",
 		"iptables -w -I INPUT 1 -i spark0 -j SPARK-IN",
+		"iptables -w -D INPUT 3",
 		"iptables -w -S DOCKER-USER",
-		"iptables -w -D DOCKER-USER -i spark0 -j SPARK-FWD",
 		"iptables -w -I DOCKER-USER 1 -i spark0 -j SPARK-FWD",
+		"iptables -w -D DOCKER-USER 3",
 		"sysctl -q -w net.ipv6.conf.spark0.disable_ipv6=1",
 	}, "\n")
 	if r.Lines() != want {

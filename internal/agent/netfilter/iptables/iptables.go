@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"spark-cloud/internal/agent/cmdrun"
@@ -103,32 +104,38 @@ func (n *Netfilter) ensureFirstJump(ctx context.Context, j []string) error {
 		return fmt.Errorf("iptables: 无法列出链 %s：%w", chain, err)
 	}
 	rule := "-A " + strings.Join(j, " ")
-	first, present := "", 0
+	first, pos := "", 0
+	var stale []int // 已有跳转在链中的序号（从 1 开始，按 -A 规则计数）
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "-A ") {
 			continue
 		}
+		pos++
 		if first == "" {
 			first = line
 		}
 		if line == rule {
-			present++
+			stale = append(stale, pos)
 		}
 	}
 	if first == rule {
 		return nil
 	}
-	if present > 0 {
+	if len(stale) > 0 {
 		n.log().Warn("iptables jump not first in chain, moving it to position 1", "chain", chain, "first_rule", first)
 	}
-	for range present {
-		if _, err := n.ipt(ctx, append([]string{"-D"}, j...)...); err != nil {
+	// 先插到第 1 位再删旧的：插入失败时旧跳转仍在，删除期间新跳转已在最前，任何时刻都不会没有隔离。
+	if _, err := n.ipt(ctx, append([]string{"-I", chain, "1"}, j[1:]...)...); err != nil {
+		return err
+	}
+	// 插入后旧跳转的序号都加 1；从大到小按序号删，前面的删除不影响后面要删的序号。
+	for i := len(stale) - 1; i >= 0; i-- {
+		if _, err := n.ipt(ctx, "-D", chain, strconv.Itoa(stale[i]+1)); err != nil {
 			return err
 		}
 	}
-	_, err = n.ipt(ctx, append([]string{"-I", chain, "1"}, j[1:]...)...)
-	return err
+	return nil
 }
 
 func (n *Netfilter) chainMatches(ctx context.Context, chain string, want []string) bool {
