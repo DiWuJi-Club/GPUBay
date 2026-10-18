@@ -50,6 +50,7 @@ type fakeGateway struct {
 	ca       *pki.CA
 	drop     chan struct{} // 关闭当前流
 	refuse   bool          // 为真时拒绝新流（模拟平台不可达）
+	reject   bool          // 为真时立即返回 Unauthenticated（模拟证书被撤销）
 }
 
 func (g *fakeGateway) Enroll(_ context.Context, req *agentpb.EnrollRequest) (*agentpb.EnrollResponse, error) {
@@ -73,6 +74,10 @@ func (g *fakeGateway) Connect(stream agentpb.AgentGateway_ConnectServer) error {
 	if g.refuse {
 		g.mu.Unlock()
 		return status.Error(codes.Unavailable, "refused")
+	}
+	if g.reject {
+		g.mu.Unlock()
+		return status.Error(codes.Unauthenticated, "certificate not recognised")
 	}
 	g.streams = append(g.streams, stream)
 	g.drop = make(chan struct{})
@@ -129,13 +134,14 @@ func (g *fakeGateway) setRefuse(v bool) {
 }
 
 type harness struct {
-	t       *testing.T
-	gw      *fakeGateway
-	addr    string
-	ca      *pki.CA
-	key     *ecdsa.PrivateKey
-	dir     string // 最近一个 agent 的状态目录
-	collect func(context.Context) metrics.Metrics
+	t          *testing.T
+	gw         *fakeGateway
+	addr       string
+	ca         *pki.CA
+	key        *ecdsa.PrivateKey
+	dir        string // 最近一个 agent 的状态目录
+	collect    func(context.Context) metrics.Metrics
+	helloDelay time.Duration // 构造 Hello 前的停顿（LocalIPs 在建流之后、发送 Hello 之前被调用）
 }
 
 func newHarness(t *testing.T) *harness {
@@ -180,7 +186,7 @@ func (h *harness) agentWith(stepped, noReconnect bool) (*client.Client, *executo
 	ex := executor.New(executor.Deps{Runtime: rt, Disk: diskfake.New(4000 << 30), Net: netfake.New(), State: st, StateDir: dir,
 		LocalIPs: func() []string { return []string{"10.0.0.10"} }, MemTotal: func() uint64 { return 128 << 30 },
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, stepped)
-	c := client.New(client.Config{Addr: h.addr, TLS: tc, Version: "test", Hostname: "h", LocalIPs: func() []string { return []string{"10.0.0.10"} },
+	c := client.New(client.Config{Addr: h.addr, TLS: tc, Version: "test", Hostname: "h", LocalIPs: func() []string { time.Sleep(h.helloDelay); return []string{"10.0.0.10"} },
 		Stepped: stepped, HeartbeatInterval: 50 * time.Millisecond, ReportInterval: 80 * time.Millisecond, Backoff: client.Backoff{Min: 10 * time.Millisecond, Max: 50 * time.Millisecond},
 		NoReconnect: noReconnect},
 		ex, h.collect, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -566,6 +572,20 @@ func TestNoReconnectReturnsAfterSession(t *testing.T) {
 	}
 	if c.Connected() || c.ConfigReceived() {
 		t.Fatal("still marked connected")
+	}
+}
+
+// 网关立即以 Unauthenticated 终止流时，session 的错误要是真实状态，而不是初始发送返回的 EOF。
+func TestSessionSurfacesGatewayRejection(t *testing.T) {
+	h := newHarness(t)
+	c, _, _ := h.agentWith(true, true)
+	h.gw.mu.Lock()
+	h.gw.reject = true
+	h.gw.mu.Unlock()
+	h.helloDelay = 200 * time.Millisecond // 等流被服务端终止后再发 Hello，Send 必然返回 EOF
+	err := c.Run(context.Background())
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("err = %v (code %v), want Unauthenticated", err, status.Code(err))
 	}
 }
 

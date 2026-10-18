@@ -5,14 +5,17 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 
 	"spark-cloud/internal/agent/executor"
 	"spark-cloud/internal/agent/metrics"
@@ -121,7 +124,12 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 		d := c.cfg.Backoff.Next(attempt)
 		attempt++
-		c.log.Warn("agent session ended, reconnecting", "err", err, "after", d)
+		if status.Code(err) == codes.Unauthenticated {
+			// 证书被撤销或未被识别：仍按退避重连，管理员重新接入后能自动恢复
+			c.log.Error("platform rejected agent certificate; re-enroll this machine", "err", err, "after", d)
+		} else {
+			c.log.Warn("agent session ended, reconnecting", "err", err, "after", d)
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -147,10 +155,10 @@ func (c *Client) session(ctx context.Context) error {
 	// 网关要求第一条消息是 Hello，并且处理完第一份 StateReport 之后才开始投递指令。
 	// 先在本地流上发完这两条再公开 c.stream，避免并发的 Step / SendHeartbeat 抢在 Hello 之前发出。
 	if err := c.sendOn(stream, &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Hello{Hello: &agentpb.Hello{AgentVersion: c.cfg.Version, Hostname: c.cfg.Hostname, Ips: c.cfg.LocalIPs()}}}); err != nil {
-		return err
+		return streamErr(stream, err)
 	}
 	if err := c.sendOn(stream, c.stateReport(ctx)); err != nil {
-		return err
+		return streamErr(stream, err)
 	}
 	c.mu.Lock()
 	c.stream = stream
@@ -249,6 +257,16 @@ func (c *Client) session(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// streamErr：流被服务端终止时 SendMsg 只返回 io.EOF，真实状态要用 Recv 取；Recv 意外无错时仍返回原错误。
+func streamErr(s agentpb.AgentGateway_ConnectClient, err error) error {
+	if errors.Is(err, io.EOF) {
+		if _, rerr := s.Recv(); rerr != nil {
+			return rerr
+		}
+	}
+	return err
 }
 
 // resendUnsent 发送 state.json 里所有未标记已发送的结果（发送成功才标记），有补发时再跟一份 StateReport。
