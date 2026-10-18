@@ -408,9 +408,17 @@ func (c *Config) loadAccess(getenv func(string) string, or func(key, def string)
 	if c.IngressDomain != strings.ToLower(c.Domain) && strings.HasSuffix(c.IngressDomain, "."+strings.ToLower(c.Domain)) {
 		return fmt.Errorf("SPARK_INGRESS_DOMAIN %q 不能是 SPARK_DOMAIN 的子域（请用不同的注册域，例如 sparkapp.example）", c.IngressDomain)
 	}
+	c.TLSCertFile, c.TLSKeyFile = strings.TrimSpace(getenv("SPARK_TLS_CERT_FILE")), strings.TrimSpace(getenv("SPARK_TLS_KEY_FILE"))
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		return errors.New("SPARK_TLS_CERT_FILE 与 SPARK_TLS_KEY_FILE 必须同时设置")
+	}
 	if c.PublicBaseURL == "" {
+		scheme := "http"
+		if c.TLSEnabled() {
+			scheme = "https"
+		}
 		_, port, _ := net.SplitHostPort(c.HTTPAddr)
-		c.PublicBaseURL = "http://" + net.JoinHostPort(c.Domain, port)
+		c.PublicBaseURL = scheme + "://" + net.JoinHostPort(c.Domain, port)
 	}
 	u, err := url.Parse(c.PublicBaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.Path != "" || u.RawQuery != "" || u.User != nil {
@@ -422,16 +430,12 @@ func (c *Config) loadAccess(getenv func(string) string, or func(key, def string)
 	if c.Env == "prod" && u.Scheme != "https" {
 		return errors.New("生产环境的 SPARK_PUBLIC_BASE_URL 必须以 https:// 开头")
 	}
-	c.AdminPublicBaseURL = strings.TrimRight(getenv("SPARK_ADMIN_PUBLIC_BASE_URL"), "/")
+	c.AdminPublicBaseURL = strings.TrimRight(strings.TrimSpace(getenv("SPARK_ADMIN_PUBLIC_BASE_URL")), "/")
 	if c.AdminPublicBaseURL != "" {
 		au, err := url.Parse(c.AdminPublicBaseURL)
-		if err != nil || (au.Scheme != "http" && au.Scheme != "https") || au.Hostname() == "" {
+		if err != nil || (au.Scheme != "http" && au.Scheme != "https") || au.Hostname() == "" || au.Path != "" || au.RawQuery != "" || au.User != nil {
 			return fmt.Errorf("SPARK_ADMIN_PUBLIC_BASE_URL 必须形如 https://域名[:端口]，当前为 %q", c.AdminPublicBaseURL)
 		}
-	}
-	c.TLSCertFile, c.TLSKeyFile = getenv("SPARK_TLS_CERT_FILE"), getenv("SPARK_TLS_KEY_FILE")
-	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
-		return errors.New("SPARK_TLS_CERT_FILE 与 SPARK_TLS_KEY_FILE 必须同时设置")
 	}
 	c.HTTPRedirectAddr = getenv("SPARK_HTTP_REDIRECT_ADDR")
 	if c.HTTPRedirectAddr != "" {
@@ -440,6 +444,11 @@ func (c *Config) loadAccess(getenv func(string) string, or func(key, def string)
 		}
 		if _, _, err := net.SplitHostPort(c.HTTPRedirectAddr); err != nil {
 			return fmt.Errorf("SPARK_HTTP_REDIRECT_ADDR 必须是 host:port 形式，当前为 %q", c.HTTPRedirectAddr)
+		}
+		for _, other := range []string{c.HTTPAddr, c.SSHAddr, c.AdminAddr, c.AgentAddr} {
+			if samePort(c.HTTPRedirectAddr, other) {
+				return fmt.Errorf("SPARK_HTTP_REDIRECT_ADDR %q 与其它监听地址冲突", c.HTTPRedirectAddr)
+			}
 		}
 	}
 	if c.Env == "prod" && !c.TLSEnabled() && !c.TrustProxy {
@@ -476,7 +485,11 @@ func (c Config) FillAccessDefaults() Config {
 		if port == "" {
 			port = "8080"
 		}
-		c.PublicBaseURL = "http://" + net.JoinHostPort(c.Domain, port)
+		scheme := "http"
+		if c.TLSEnabled() {
+			scheme = "https"
+		}
+		c.PublicBaseURL = scheme + "://" + net.JoinHostPort(c.Domain, port)
 	}
 	return c
 }

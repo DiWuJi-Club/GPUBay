@@ -251,13 +251,13 @@ func TestLoadAccessValues(t *testing.T) {
 		"SPARK_DOMAIN": "spark.example", "SPARK_PUBLIC_BASE_URL": "https://spark.example/", "SPARK_INGRESS_DOMAIN": "sparkapp.example",
 		"SPARK_SSH_ADDR": "0.0.0.0:2200", "SPARK_SSH_PUBLIC_PORT": "2200", "SPARK_SSH_MAX_SESSIONS_PER_INSTANCE": "4", "SPARK_SSH_DRAIN_TIMEOUT": "5s",
 		"SPARK_UPSTREAM_SSH_PORT": "2223", "SPARK_ADMIN_PUBLIC_BASE_URL": "https://admin.spark.example/", "SPARK_TLS_CERT_FILE": "/etc/spark/tls.crt",
-		"SPARK_TLS_KEY_FILE": "/etc/spark/tls.key", "SPARK_HTTP_REDIRECT_ADDR": ":8080"}))
+		"SPARK_TLS_KEY_FILE": "/etc/spark/tls.key", "SPARK_HTTP_REDIRECT_ADDR": ":8088"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.SSHAddr != "0.0.0.0:2200" || c.SSHPublicPort != 2200 || c.SSHMaxSessions != 4 || c.SSHDrainTimeout != 5*time.Second || c.UpstreamSSHPort != 2223 ||
 		c.IngressDomain != "sparkapp.example" || c.AdminPublicBaseURL != "https://admin.spark.example" || c.PublicBaseURL != "https://spark.example" ||
-		!c.TLSEnabled() || c.HTTPRedirectAddr != ":8080" {
+		!c.TLSEnabled() || c.HTTPRedirectAddr != ":8088" {
 		t.Fatalf("access values = %+v", c)
 	}
 }
@@ -283,6 +283,13 @@ func TestLoadAccessErrors(t *testing.T) {
 		{"base url no scheme", map[string]string{"SPARK_PUBLIC_BASE_URL": "spark.local"}, "SPARK_PUBLIC_BASE_URL"},
 		{"admin url bad", map[string]string{"SPARK_ADMIN_PUBLIC_BASE_URL": "admin.local"}, "SPARK_ADMIN_PUBLIC_BASE_URL"},
 		{"tls half", map[string]string{"SPARK_TLS_CERT_FILE": "/a.crt"}, "SPARK_TLS_KEY_FILE"},
+		{"admin url path", map[string]string{"SPARK_ADMIN_PUBLIC_BASE_URL": "https://a.example/x"}, "SPARK_ADMIN_PUBLIC_BASE_URL"},
+		{"admin url query", map[string]string{"SPARK_ADMIN_PUBLIC_BASE_URL": "https://a.example?x=1"}, "SPARK_ADMIN_PUBLIC_BASE_URL"},
+		{"admin url userinfo", map[string]string{"SPARK_ADMIN_PUBLIC_BASE_URL": "https://u:p@a.example"}, "SPARK_ADMIN_PUBLIC_BASE_URL"},
+		{"tls key only", map[string]string{"SPARK_TLS_KEY_FILE": "/a.key"}, "SPARK_TLS_CERT_FILE"},
+		{"tls whitespace cert", map[string]string{"SPARK_TLS_CERT_FILE": "  ", "SPARK_TLS_KEY_FILE": "/a.key"}, "SPARK_TLS_CERT_FILE"},
+		{"redirect equals http", map[string]string{"SPARK_TLS_CERT_FILE": "/a.crt", "SPARK_TLS_KEY_FILE": "/a.key", "SPARK_HTTP_REDIRECT_ADDR": ":8080"}, "SPARK_HTTP_REDIRECT_ADDR"},
+		{"redirect equals ssh", map[string]string{"SPARK_TLS_CERT_FILE": "/a.crt", "SPARK_TLS_KEY_FILE": "/a.key", "SPARK_HTTP_REDIRECT_ADDR": ":2222"}, "SPARK_HTTP_REDIRECT_ADDR"},
 		{"redirect without tls", map[string]string{"SPARK_HTTP_REDIRECT_ADDR": ":80"}, "SPARK_HTTP_REDIRECT_ADDR"},
 	}
 	for _, c := range cases {
@@ -305,7 +312,45 @@ func TestLoadAccessErrors(t *testing.T) {
 		t.Fatalf("prod behind proxy = %v", err)
 	}
 	p["SPARK_PUBLIC_BASE_URL"] = "http://spark.example.com"
-	if _, err := config.Load(env(p)); err == nil || !strings.Contains(err.Error(), "https") {
+	if _, err := config.Load(env(p)); err == nil || !strings.Contains(err.Error(), "生产环境的 SPARK_PUBLIC_BASE_URL 必须以 https://") {
 		t.Fatalf("prod http base = %v", err)
+	}
+	p = prodEnv()
+	delete(p, "SPARK_PUBLIC_BASE_URL")
+	if _, err := config.Load(env(p)); err == nil || !strings.Contains(err.Error(), "生产环境的 SPARK_PUBLIC_BASE_URL 必须以 https://") {
+		t.Fatalf("prod without base url = %v", err)
+	}
+}
+
+func TestLoadIngressDefaultsToDomain(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey,
+		"SPARK_DOMAIN": "spark.example", "SPARK_PUBLIC_BASE_URL": "https://spark.example"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.IngressDomain != "spark.example" {
+		t.Fatalf("IngressDomain = %q", c.IngressDomain)
+	}
+}
+
+func TestLoadTLSDefaultsToHTTPSBaseURL(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey,
+		"SPARK_TLS_CERT_FILE": " /a.crt ", "SPARK_TLS_KEY_FILE": "/a.key"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PublicBaseURL != "https://spark.local:8080" || c.TLSCertFile != "/a.crt" {
+		t.Fatalf("config = %q cert %q", c.PublicBaseURL, c.TLSCertFile)
+	}
+	if lit := (config.Config{Domain: "spark.test", TLSCertFile: "/a", TLSKeyFile: "/b"}).FillAccessDefaults(); lit.PublicBaseURL != "https://spark.test:8080" {
+		t.Fatalf("literal = %q", lit.PublicBaseURL)
+	}
+}
+
+func TestLoadAdminBaseURLTrimmed(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey,
+		"SPARK_ADMIN_PUBLIC_BASE_URL": "  https://admin.spark.example/  "}))
+	if err != nil || c.AdminPublicBaseURL != "https://admin.spark.example" {
+		t.Fatalf("admin url = %q err %v", c.AdminPublicBaseURL, err)
 	}
 }
