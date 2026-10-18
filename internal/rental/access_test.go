@@ -167,6 +167,12 @@ func TestAccessInfoAndTOFU(t *testing.T) {
 	if e.get(inst.ID).SSHHostPubkey != "ssh-ed25519 AAAAfirst" {
 		t.Fatal("tofu overwritten")
 	}
+	if pub, err := e.svc.SSHHostPubkey(e.ctx, inst.ID); err != nil || pub != "ssh-ed25519 AAAAfirst" {
+		t.Fatalf("SSHHostPubkey = %q %v", pub, err)
+	}
+	if _, err := e.svc.SSHHostPubkey(e.ctx, "ins-nonexist"); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("SSHHostPubkey missing = %v", err)
+	}
 	// 到期停机后 RetainUntil 有值
 	e.clock.Advance(25 * time.Hour)
 	if _, err := e.svc.ExpireDue(e.ctx); err != nil {

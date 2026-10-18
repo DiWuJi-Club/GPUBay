@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -42,6 +43,10 @@ func (m *memStore) SetSSHHostPubkeyIfEmpty(_ context.Context, id, pub string) (b
 	}
 	m.pubs[id] = pub
 	return true, nil
+}
+
+func (m *memStore) SSHHostPubkey(_ context.Context, id string) (string, error) {
+	return m.get(id), nil
 }
 
 func (m *memStore) get(id string) string {
@@ -146,9 +151,9 @@ func TestPoolSharesClientAndVerifiesHostKey(t *testing.T) {
 	if _, err := httpGet(t, p, upstream.Target{InstanceID: "ins-aaaaaaaa", LanIP: "127.000.000.001", HostPubkey: good.HostPubkey}, 8888); err == nil {
 		t.Fatal("unparseable lan ip accepted")
 	}
-	// 未带写回的公钥再拨（路由表还没刷新）：不再首连信任，拒绝
-	if _, err := httpGet(t, p, legacy, 8888); !errors.As(err, &de) {
-		t.Fatalf("second tofu = %v", err)
+	// 未带写回的公钥再拨（路由表还没刷新）：写回失败后复读登记值，与上游一致 → 接受
+	if body, err := httpGet(t, p, legacy, 8888); err != nil || body != "ok" {
+		t.Fatalf("second tofu = %q %v", body, err)
 	}
 	// 路由表带上写回的公钥后按固定公钥校验
 	legacy.HostPubkey = store.get("ins-cccccccc")
@@ -201,5 +206,213 @@ func TestPoolUnreachableAndNotRunningTargets(t *testing.T) {
 	}
 	if p.Len() != 0 {
 		t.Fatalf("len=%d", p.Len())
+	}
+}
+
+// 只 accept 不说 SSH 的监听：握手永远不完成。
+func silentListener(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		for _, c := range held {
+			c.Close()
+		}
+		mu.Unlock()
+	})
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func TestPoolHandshakeDeadlineAndCtx(t *testing.T) {
+	port := silentListener(t)
+	p := upstream.New(upstream.Config{Signer: signer(t), Port: port, DialTimeout: 300 * time.Millisecond}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-gggggggg", LanIP: "127.0.0.1", HostPubkey: "x"}
+	start := time.Now()
+	type res struct {
+		err     error
+		elapsed time.Duration
+	}
+	first, second := make(chan res, 1), make(chan res, 1)
+	go func() {
+		_, err := p.Dial(context.Background(), tg, 80)
+		first <- res{err, time.Since(start)}
+	}()
+	time.Sleep(50 * time.Millisecond) // 第一个已持有该实例的锁、卡在握手
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_, err := p.Dial(ctx, tg, 80)
+		second <- res{err, time.Since(start)}
+	}()
+	for name, ch := range map[string]chan res{"first": first, "second": second} {
+		select {
+		case r := <-ch:
+			if r.err == nil || r.elapsed > 2*time.Second {
+				t.Fatalf("%s dial = %v after %v", name, r.err, r.elapsed)
+			}
+			if name == "first" {
+				var de *upstream.DialError
+				if !errors.As(r.err, &de) {
+					t.Fatalf("handshake timeout not a DialError: %v", r.err)
+				}
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s dial hung", name)
+		}
+	}
+	// 握手超时很长时，ctx 取消也能打断握手
+	p2 := upstream.New(upstream.Config{Signer: signer(t), Port: port, DialTimeout: time.Minute}, &memStore{pubs: map[string]string{}})
+	defer p2.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start = time.Now()
+	if _, err := p2.Dial(ctx, tg, 80); err == nil || time.Since(start) > 2*time.Second {
+		t.Fatalf("ctx-cancelled handshake = %v after %v", err, time.Since(start))
+	}
+	if p.Len() != 0 || p2.Len() != 0 {
+		t.Fatalf("len = %d %d", p.Len(), p2.Len())
+	}
+}
+
+func TestPoolConcurrentFirstDialSingleConn(t *testing.T) {
+	up := signer(t)
+	srv, _ := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	defer srv.Close()
+	stop := srv.ServeHTTP(8888, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") }))
+	defer stop()
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: 2 * time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-hhhhhhhh", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	var wg sync.WaitGroup
+	errs := make(chan error, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := p.Dial(context.Background(), tg, 8888)
+			if err == nil {
+				c.Close()
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if srv.ConnCount() != 1 || p.Len() != 1 {
+		t.Fatalf("upstream conns=%d pool=%d, want exactly 1", srv.ConnCount(), p.Len())
+	}
+}
+
+func TestPoolKeyAwareEntries(t *testing.T) {
+	up := signer(t)
+	srv, _ := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	defer srv.Close()
+	stop := srv.ServeHTTP(8888, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") }))
+	defer stop()
+	store := &memStore{pubs: map[string]string{}}
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, store)
+	defer p.Close()
+	// 首连信任建立的连接：路由仍为空公钥 → 复用；路由带上写回的同一公钥 → 复用
+	tg := upstream.Target{InstanceID: "ins-iiiiiiii", LanIP: "127.0.0.1"}
+	for _, key := range []string{"", "", srv.HostPubLine()} {
+		tg.HostPubkey = key
+		if body, err := httpGet(t, p, tg, 8888); err != nil || body != "ok" {
+			t.Fatalf("key %q = %q %v", key, body, err)
+		}
+		if srv.ConnCount() != 1 || p.Len() != 1 {
+			t.Fatalf("key %q: upstream conns=%d pool=%d", key, srv.ConnCount(), p.Len())
+		}
+	}
+	// 路由公钥变了（实例重建了主机密钥）：丢弃旧连接，按新公钥重拨；与上游不符 → DialError
+	tg.HostPubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	var de *upstream.DialError
+	if _, err := httpGet(t, p, tg, 8888); !errors.As(err, &de) || !strings.Contains(err.Error(), "主机密钥") {
+		t.Fatalf("changed key = %v", err)
+	}
+	if p.Len() != 0 {
+		t.Fatalf("len after key change = %d", p.Len())
+	}
+	waitFor(t, "old conn closed upstream", func() bool { return srv.ConnCount() == 0 })
+}
+
+func TestPoolTOFURaceLoser(t *testing.T) {
+	up := signer(t)
+	srv, _ := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	defer srv.Close()
+	stop := srv.ServeHTTP(8888, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") }))
+	defer stop()
+	// 其它副本已写回同一公钥（路由表还是旧的空公钥）：复读一致 → 接受
+	store := &memStore{pubs: map[string]string{"ins-jjjjjjjj": srv.HostPubLine(), "ins-kkkkkkkk": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, store)
+	defer p.Close()
+	if body, err := httpGet(t, p, upstream.Target{InstanceID: "ins-jjjjjjjj", LanIP: "127.0.0.1"}, 8888); err != nil || body != "ok" {
+		t.Fatalf("race loser same key = %q %v", body, err)
+	}
+	// 写回的是别的公钥 → DialError
+	var de *upstream.DialError
+	if _, err := httpGet(t, p, upstream.Target{InstanceID: "ins-kkkkkkkk", LanIP: "127.0.0.1"}, 8888); !errors.As(err, &de) {
+		t.Fatalf("race loser different key = %v", err)
+	}
+	if p.Len() != 1 {
+		t.Fatalf("len = %d", p.Len())
+	}
+}
+
+func TestPoolCloseIsFinal(t *testing.T) {
+	up := signer(t)
+	srv, _ := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	defer srv.Close()
+	stop := srv.ServeHTTP(8888, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") }))
+	defer stop()
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	tg := upstream.Target{InstanceID: "ins-llllllll", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	if body, err := httpGet(t, p, tg, 8888); err != nil || body != "ok" {
+		t.Fatalf("before close = %q %v", body, err)
+	}
+	p.Close()
+	var de *upstream.DialError
+	_, err := p.Dial(context.Background(), tg, 8888)
+	if err == nil || errors.As(err, &de) || !errors.Is(err, upstream.ErrClosed) {
+		t.Fatalf("dial after close = %v", err)
+	}
+	if p.Len() != 0 {
+		t.Fatalf("len after close = %d", p.Len())
+	}
+	waitFor(t, "upstream conns closed", func() bool { return srv.ConnCount() == 0 })
+}
+
+func TestHostKeyAlgorithms(t *testing.T) {
+	cases := map[string][]string{
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA": {ssh.KeyAlgoED25519},
+		"":        nil,
+		"garbage": nil,
+	}
+	for line, want := range cases {
+		if got := upstream.HostKeyAlgorithms(line); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("HostKeyAlgorithms(%q) = %v, want %v", line, got, want)
+		}
 	}
 }

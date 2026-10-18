@@ -7,15 +7,21 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
+// Store 是首连信任写回所需的实例存储（rental.Service 实现）。
 type Store interface {
 	SetSSHHostPubkeyIfEmpty(ctx context.Context, id, pub string) (bool, error)
+	SSHHostPubkey(ctx context.Context, id string) (string, error) // 写回竞争失败后复读
 }
+
+// ErrClosed 表示池已关闭（平台退出中）；不是 DialError，调用方不应据此告警。
+var ErrClosed = errors.New("upstream: 连接池已关闭")
 
 type Config struct {
 	Signer      ssh.Signer
@@ -42,18 +48,20 @@ func (e *DialError) Error() string { return "上游 " + e.InstanceID + ": " + e.
 func (e *DialError) Unwrap() error { return e.Err }
 
 type entry struct {
-	client *ssh.Client
-	lanIP  string
-	stop   chan struct{}
-	once   sync.Once // dropEntry 可能被 keepalive 与 Dial 并发调用
+	client  *ssh.Client
+	lanIP   string
+	hostPub string // 建立连接时校验通过的主机公钥（固定公钥或首连信任的公钥）
+	stop    chan struct{}
+	once    sync.Once // dropEntry 可能被 keepalive 与 Dial 并发调用
 }
 
 type Pool struct {
-	cfg   Config
-	store Store
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex // 每实例一把：并发首次拨号只建一条
-	conns map[string]*entry
+	cfg    Config
+	store  Store
+	mu     sync.Mutex
+	locks  map[string]chan struct{} // 每实例一个单槽信号量：并发首次拨号只建一条，等待可被 ctx 打断
+	conns  map[string]*entry
+	closed bool
 }
 
 func New(cfg Config, store Store) *Pool {
@@ -66,7 +74,7 @@ func New(cfg Config, store Store) *Pool {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	return &Pool{cfg: cfg, store: store, locks: map[string]*sync.Mutex{}, conns: map[string]*entry{}}
+	return &Pool{cfg: cfg, store: store, locks: map[string]chan struct{}{}, conns: map[string]*entry{}}
 }
 
 func (p *Pool) Len() int {
@@ -85,8 +93,11 @@ func (p *Pool) Dial(ctx context.Context, t Target, port int) (net.Conn, error) {
 			return nil, err
 		}
 		var conn net.Conn
-		if conn, err = c.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port))); err == nil {
+		if conn, err = c.DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port))); err == nil {
 			return conn, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) { // 调用方放弃：共享连接不受影响
+			return nil, err
 		}
 		var oce *ssh.OpenChannelError
 		if errors.As(err, &oce) { // 上游拒绝通道：连接本身完好
@@ -101,33 +112,53 @@ func (p *Pool) client(ctx context.Context, t Target) (*ssh.Client, error) {
 	if net.ParseIP(t.LanIP) == nil {
 		return nil, &DialError{InstanceID: t.InstanceID, Err: fmt.Errorf("机器内网地址无效 %q", t.LanIP)}
 	}
+	want := strings.TrimSpace(t.HostPubkey)
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, ErrClosed
+	}
 	l := p.locks[t.InstanceID]
 	if l == nil {
-		l = &sync.Mutex{}
+		l = make(chan struct{}, 1)
 		p.locks[t.InstanceID] = l
 	}
 	p.mu.Unlock()
-	l.Lock()
-	defer l.Unlock()
+	select {
+	case l <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("等待上游连接: %w", ctx.Err())
+	}
+	defer func() { <-l }()
 	p.mu.Lock()
 	e := p.conns[t.InstanceID]
 	p.mu.Unlock()
-	if e != nil && e.lanIP == t.LanIP {
+	// 路由公钥为空（存量实例、路由表未刷新）时沿用连接上已校验的公钥
+	if e != nil && e.lanIP == t.LanIP && (want == "" || want == e.hostPub) {
 		return e.client, nil
 	}
 	if e != nil {
-		p.Drop(t.InstanceID) // 登记地址变了
+		p.dropEntry(t.InstanceID, e) // 登记地址或主机公钥变了
 	}
 	addr := net.JoinHostPort(t.LanIP, strconv.Itoa(p.cfg.Port))
+	trusted := want
 	tofu := func(pub string) error {
 		ok, err := p.store.SetSSHHostPubkeyIfEmpty(ctx, t.InstanceID, pub)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return errors.New("主机公钥已由其它副本写回，请重试")
+		if !ok { // 其它副本抢先写回：复读，一致即接受
+			cur, err := p.store.SSHHostPubkey(ctx, t.InstanceID)
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(cur) != pub {
+				return fmt.Errorf("上游主机密钥不匹配：其它副本已登记 %s，实际 %s", fingerprintOf(cur), fingerprintOf(pub))
+			}
+			trusted = pub
+			return nil
 		}
+		trusted = pub
 		p.cfg.Log.Warn("upstream host key trusted on first use", "instance", t.InstanceID, "fingerprint", fingerprintOf(pub))
 		return nil
 	}
@@ -136,14 +167,29 @@ func (p *Pool) client(ctx context.Context, t Target) (*ssh.Client, error) {
 	if err != nil {
 		return nil, &DialError{InstanceID: t.InstanceID, Err: err}
 	}
-	cc, chans, reqs, err := ssh.NewClientConn(nc, addr, ClientConfig(p.cfg.Signer, HostKeyCallback(t.HostPubkey, tofu), p.cfg.DialTimeout))
+	// 握手有截止时间，且 ctx 取消即关闭底层连接：卡死的 sshd 不会一直占着该实例的锁
+	nc.SetDeadline(time.Now().Add(p.cfg.DialTimeout))
+	stopAfter := context.AfterFunc(ctx, func() { nc.Close() })
+	cfg := ClientConfig(p.cfg.Signer, HostKeyCallback(want, tofu), p.cfg.DialTimeout)
+	cfg.HostKeyAlgorithms = hostKeyAlgorithms(want)
+	cc, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
+	if !stopAfter() && err == nil { // ctx 已取消、底层连接已被关闭
+		cc.Close()
+		err = ctx.Err()
+	}
 	if err != nil {
 		nc.Close()
 		return nil, &DialError{InstanceID: t.InstanceID, Err: err}
 	}
+	nc.SetDeadline(time.Time{})
 	client := ssh.NewClient(cc, chans, reqs)
-	e = &entry{client: client, lanIP: t.LanIP, stop: make(chan struct{})}
+	e = &entry{client: client, lanIP: t.LanIP, hostPub: trusted, stop: make(chan struct{})}
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		client.Close()
+		return nil, ErrClosed
+	}
 	p.conns[t.InstanceID] = e
 	p.mu.Unlock()
 	go p.keepalive(t.InstanceID, e)
@@ -214,8 +260,10 @@ func (p *Pool) dropEntry(id string, e *entry) {
 	e.client.Close()
 }
 
+// Close 关闭全部连接；之后 Dial 一律返回 ErrClosed。
 func (p *Pool) Close() {
 	p.mu.Lock()
+	p.closed = true
 	all := p.conns
 	p.conns = map[string]*entry{}
 	p.mu.Unlock()

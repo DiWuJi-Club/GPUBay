@@ -108,6 +108,16 @@ func (s *Service) SetSSHHostPubkeyIfEmpty(ctx context.Context, id, pub string) (
 	return tag.RowsAffected() == 1, nil
 }
 
+// SSHHostPubkey 返回实例登记的主机公钥（authorized_keys 一行，未登记为空串）；首连信任竞争失败后复读用。
+func (s *Service) SSHHostPubkey(ctx context.Context, id string) (string, error) {
+	var pub string
+	err := s.d.Pool.QueryRow(ctx, `SELECT ssh_host_pubkey FROM instances WHERE id = $1`, id).Scan(&pub)
+	if db.IsNoRows(err) {
+		return "", apperr.ErrNotFound
+	}
+	return pub, err
+}
+
 // AccessInfo 是 SSH 网关 / Web 入口判定与拨号所需的全部信息。
 type AccessInfo struct {
 	Instance      Instance
