@@ -31,6 +31,7 @@ type fakeDialer struct {
 	errs    map[string]error         // instance → 固定返回的错误
 	block   map[string]chan struct{} // instance → 拨号挂起直到关闭，然后返回 DialError
 	dials   []string
+	done    int // 已返回的拨号次数
 }
 
 func (d *fakeDialer) Dial(_ context.Context, t upstream.Target, port int) (net.Conn, error) {
@@ -40,6 +41,7 @@ func (d *fakeDialer) Dial(_ context.Context, t upstream.Target, port int) (net.C
 	blk := d.block[t.InstanceID]
 	d.dials = append(d.dials, fmt.Sprintf("%s:%d", t.InstanceID, port))
 	d.mu.Unlock()
+	defer func() { d.mu.Lock(); d.done++; d.mu.Unlock() }()
 	if blk != nil {
 		<-blk
 		return nil, &upstream.DialError{InstanceID: t.InstanceID, Err: errors.New("dial tcp: i/o timeout")}
@@ -63,12 +65,16 @@ type fakeSessions struct {
 	mu    sync.Mutex
 	users map[string]int64
 	calls int
+	fail  bool // 模拟数据库故障
 }
 
 func (f *fakeSessions) SessionUserID(_ context.Context, hash string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	if f.fail {
+		return 0, errors.New("db down")
+	}
 	if id, ok := f.users[hash]; ok {
 		return id, nil
 	}
@@ -104,6 +110,7 @@ type env struct {
 	alerts *fakeAlerts
 	logs   *syncBuf
 	ts     *httptest.Server
+	srv    *ingress.Server
 	host   string // ingress 监听的 host:port
 }
 
@@ -128,7 +135,8 @@ func newEnvWith(t *testing.T, dialer ingress.Dialer) *env {
 		dialer = e.dialer
 	}
 	log := slog.New(slog.NewTextHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	ts.Config.Handler = ingress.NewServer(auth, table, e.sess, dialer, e.alerts, clk, log)
+	e.srv = ingress.NewServer(auth, table, e.sess, dialer, e.alerts, clk, log)
+	ts.Config.Handler = e.srv
 	ts.Start()
 	t.Cleanup(ts.Close)
 	return e
@@ -490,9 +498,12 @@ func TestNonDialErrorsDoNotAlert(t *testing.T) {
 	}
 	cancel()
 	waitUntil(t, "slow dial started", func() bool { return e.dialer.dialCount() == 3 })
-	time.Sleep(100 * time.Millisecond) // 让服务端处理完被取消的请求
+	// 服务端已处理完被取消的请求（ErrorHandler 记录了 client gone）、请求已注销
+	waitUntil(t, "cancelled request handled", func() bool {
+		return strings.Contains(e.logs.String(), "ingress client gone") && strings.Contains(e.logs.String(), "instance=ins-slow0000") && e.srv.ActiveStreams() == 0
+	})
 	close(blk)
-	time.Sleep(100 * time.Millisecond)
+	waitUntil(t, "slow dial returned", func() bool { e.dialer.mu.Lock(); defer e.dialer.mu.Unlock(); return e.dialer.done == 3 })
 	if n := e.alerts.count(); n != 0 {
 		t.Fatalf("alerts for non-dial errors = %d", n)
 	}

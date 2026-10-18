@@ -27,6 +27,7 @@ const (
 	unreachThrottle  = 5 * time.Minute
 	responseHeaderTO = 60 * time.Second
 	maxIdlePerHost   = 8
+	maxConnsPerHost  = 256 // 每个实例端口的并发上游通道上限：单个实例不能耗尽资源
 	alertTimeout     = 5 * time.Second
 )
 
@@ -62,6 +63,9 @@ type Server struct {
 	sessCache   map[string]cachedSession
 	lastUnreach map[string]time.Time
 	dialedAt    map[string]string // 实例 → 最近一次转发所用的 lan_ip|主机公钥；变化时丢弃 Transport 空闲连接
+	streams     map[*stream]struct{}
+
+	deadlineOnce sync.Once
 }
 
 type cachedSession struct {
@@ -76,13 +80,14 @@ func NewServer(auth *Auth, routes *Table, sessions SessionChecker, dialer Dialer
 		log = slog.Default()
 	}
 	s := &Server{auth: auth, routes: routes, sess: sessions, dialer: dialer, alerts: alerts, clk: clk, log: log,
-		sessCache: map[string]cachedSession{}, lastUnreach: map[string]time.Time{}, dialedAt: map[string]string{}}
+		sessCache: map[string]cachedSession{}, lastUnreach: map[string]time.Time{}, dialedAt: map[string]string{}, streams: map[*stream]struct{}{}}
 	s.tr = &http.Transport{
 		// 出站地址是 http://<instance_id>:<port>：Transport 以 scheme+host 作为空闲连接池的键，实例之间绝不共用连接。
 		DialContext: s.dial,
 		Proxy:       nil,
 		// 每个实例端口最多保留 8 条空闲通道
 		MaxIdleConnsPerHost:   maxIdlePerHost,
+		MaxConnsPerHost:       maxConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: responseHeaderTO,
 		DisableCompression:    true,
@@ -90,11 +95,12 @@ func NewServer(auth *Auth, routes *Table, sessions SessionChecker, dialer Dialer
 	}
 	s.proxy = &httputil.ReverseProxy{
 		// Rewrite（而非 Director）：调用前已删除客户端带来的 Forwarded / X-Forwarded-For/Host/Proto 与逐跳头。
-		Rewrite:       s.rewrite,
-		Transport:     s.tr,
-		FlushInterval: -1,
-		ErrorHandler:  s.proxyError,
-		ErrorLog:      slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		Rewrite:        s.rewrite,
+		ModifyResponse: func(res *http.Response) error { rewriteSetCookies(res.Header); return nil },
+		Transport:      s.tr,
+		FlushInterval:  -1,
+		ErrorHandler:   s.proxyError,
+		ErrorLog:       slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	return s
 }
@@ -130,13 +136,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		WritePage(w, http.StatusServiceUnavailable, "暂时无法访问", NotRunningPage(route), 10)
 		return
 	}
+	st := &stream{instance: id, port: port}
 	if route.Visibility != "public" {
 		// 兄弟租户（同站不同源）页面借用户的 Cookie 发起写请求或 WebSocket：直接拒绝
 		if s.crossSiteBlocked(r, id, port) {
 			WritePage(w, http.StatusForbidden, "无法访问", "跨站请求被拒绝", 0)
 			return
 		}
-		_, ok := s.auth.ValidCookieWith(r, id, port, func(c Claims) bool {
+		claims, ok := s.auth.ValidCookieWith(r, id, port, func(c Claims) bool {
 			return c.UserID == route.UserID && s.sessionValid(r.Context(), c.SessionHash, c.UserID)
 		})
 		if !ok {
@@ -145,23 +152,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, s.auth.AuthorizeURL(original), http.StatusFound)
 			return
 		}
+		st.authed, st.userID, st.sessHash = true, claims.UserID, claims.SessionHash
 	}
 	s.noteTarget(route)
 	// 长请求 / SSE / WebSocket 不受 http.Server 的 Read/WriteTimeout 约束（只清本请求的期限，控制台路径不受影响）
 	rc := http.NewResponseController(w)
-	rc.SetReadDeadline(time.Time{})
-	rc.SetWriteDeadline(time.Time{})
-	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, route)))
+	if err := errors.Join(rc.SetReadDeadline(time.Time{}), rc.SetWriteDeadline(time.Time{})); err != nil {
+		s.deadlineOnce.Do(func() { s.log.Debug("ingress cannot clear request deadlines", "err", err) })
+	}
+	// 登记为活动流：访问权限变化（端口改私有 / 删除、停机、登出）时由 Sweep 撤销
+	ctx, cancel := context.WithCancel(context.WithValue(r.Context(), ctxKey{}, route))
+	defer cancel()
+	st.cancel = cancel
+	s.addStream(st)
+	defer s.removeStream(st)
+	s.proxy.ServeHTTP(&trackingWriter{ResponseWriter: w, st: st}, r.WithContext(ctx))
 }
 
-// crossSiteBlocked：私有端口上，非 GET/HEAD/OPTIONS 请求若 Sec-Fetch-Site 为 same-site / cross-site 则拒绝（无该头放行：非浏览器客户端不带 Cookie）；
-// WebSocket 升级（GET，但能读写）还须同源：有 Sec-Fetch-Site → 只放 same-origin / none；没有它但有 Origin → 必须等于本实例 origin。
+// crossSiteBlocked：私有端口上，非 GET/HEAD/OPTIONS 请求若 Sec-Fetch-Site 为 same-site / cross-site 则拒绝；没有该头时退到 Origin：
+// 带了且不等于本实例 origin 即拒绝，两者都没有放行（非浏览器客户端不带 Cookie）。
+// WebSocket 升级（GET，但能读写）须同源：有 Sec-Fetch-Site → 只放 same-origin / none；没有它但有 Origin → 必须等于本实例 origin。
 func (s *Server) crossSiteBlocked(r *http.Request, id string, port int) bool {
 	sfs := r.Header.Get("Sec-Fetch-Site")
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 	default:
-		return sfs == "same-site" || sfs == "cross-site"
+		if sfs != "" {
+			return sfs == "same-site" || sfs == "cross-site"
+		}
+		return s.foreignOrigin(r, id, port)
 	}
 	if !isUpgrade(r) {
 		return false
@@ -169,6 +188,11 @@ func (s *Server) crossSiteBlocked(r *http.Request, id string, port int) bool {
 	if sfs != "" {
 		return sfs != "same-origin" && sfs != "none"
 	}
+	return s.foreignOrigin(r, id, port)
+}
+
+// foreignOrigin：带了 Origin 且不等于本实例 origin（没有 Origin 放行）。
+func (s *Server) foreignOrigin(r *http.Request, id string, port int) bool {
 	origin := r.Header.Get("Origin")
 	return origin != "" && origin != strings.TrimSuffix(s.auth.PortURL(id, port), "/")
 }
@@ -237,6 +261,37 @@ func stripIngressCookies(h http.Header) {
 	}
 }
 
+// rewriteSetCookies 让上游设置的 Cookie 一律成为 host-only：删除 Domain 属性（不区分大小写，解析不了的值也删），
+// 其余属性原样保留；名为 sc_ingress 的 Set-Cookie 整条丢弃（租户不能覆盖 / 伪造平台凭证）。
+// 否则租户可用 Domain=<ingress 域> 把 Cookie 种到所有兄弟实例与平台域上。
+func rewriteSetCookies(h http.Header) {
+	vals := h.Values("Set-Cookie")
+	if len(vals) == 0 {
+		return
+	}
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		parts := strings.Split(v, ";")
+		name, _, _ := strings.Cut(parts[0], "=")
+		if strings.TrimSpace(name) == CookieName {
+			continue
+		}
+		kept := []string{parts[0]}
+		for _, a := range parts[1:] {
+			k, _, _ := strings.Cut(a, "=")
+			if strings.EqualFold(strings.TrimSpace(k), "domain") {
+				continue
+			}
+			kept = append(kept, a)
+		}
+		out = append(out, strings.Join(kept, ";"))
+	}
+	h.Del("Set-Cookie")
+	for _, v := range out {
+		h.Add("Set-Cookie", v)
+	}
+}
+
 // dial 是 Transport.DialContext：路由随请求 ctx 传入（Transport 拨号保留请求 ctx 的值）；缺失时按地址查路由表。
 func (s *Server) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 	route, ok := ctx.Value(ctxKey{}).(rental.IngressRoute)
@@ -253,13 +308,20 @@ func (s *Server) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 	return s.dialer.Dial(ctx, upstream.Target{InstanceID: route.InstanceID, LanIP: route.LanIP, HostPubkey: route.HostPubkey}, route.Port)
 }
 
-// sessionValid：Cookie 绑定的控制台会话仍有效（登出即失效）；确定的结果缓存 2 秒，查询出错（数据库故障）不缓存并视为无效。
+// sessionValid：Cookie 绑定的控制台会话仍有效且属于 userID（登出即失效）。查询出错（数据库故障）视为无效。
 func (s *Server) sessionValid(ctx context.Context, hash string, userID int64) bool {
+	uid, ok := s.sessionUser(ctx, hash)
+	return ok && uid != 0 && uid == userID
+}
+
+// sessionUser 返回会话对应的用户（0 = 会话无效 / 已登出 / 被封禁）；确定的结果缓存 2 秒。
+// ok=false 表示查询出错（不缓存）：请求路径据此拒绝，撤销扫描据此不动已有连接。
+func (s *Server) sessionUser(ctx context.Context, hash string) (int64, bool) {
 	now := s.clk.Now()
 	s.mu.Lock()
 	if c, ok := s.sessCache[hash]; ok && now.Before(c.until) {
 		s.mu.Unlock()
-		return c.userID != 0 && c.userID == userID
+		return c.userID, true
 	}
 	s.mu.Unlock()
 	uid, err := s.sess.SessionUserID(ctx, hash)
@@ -268,7 +330,7 @@ func (s *Server) sessionValid(ctx context.Context, hash string, userID int64) bo
 			if ctx.Err() == nil {
 				s.log.Error("ingress session lookup failed", "err", err)
 			}
-			return false
+			return 0, false
 		}
 		uid = 0
 	}
@@ -282,7 +344,7 @@ func (s *Server) sessionValid(ctx context.Context, hash string, userID int64) bo
 	}
 	s.sessCache[hash] = cachedSession{userID: uid, until: now.Add(sessionCacheTTL)}
 	s.mu.Unlock()
-	return uid != 0 && uid == userID
+	return uid, true
 }
 
 // proxyError：只有 *upstream.DialError（到不了容器 sshd）告警；客户端放弃、池关闭、容器端口未监听都不告警。
