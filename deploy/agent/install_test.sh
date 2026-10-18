@@ -74,6 +74,10 @@ if run --platform x:1 --token spk1_t --ca-sha256 ca --binary-sha256 wrong --down
 # shellcheck disable=SC2086
 if (export FAKE_SELFCHECK_FAIL=1; run $OKARGS) >/dev/null 2>&1; then echo "selfcheck 失败应中止"; exit 1; fi
 ! grep -q systemctl "$LOG" || { echo "selfcheck 失败不应调用 systemctl"; exit 1; }
+! grep -q "spark-agent enroll" "$LOG" || { echo "selfcheck 失败时不应 enroll（令牌会被白白消耗）"; exit 1; }
+! grep -q "install -d" "$LOG" || { echo "selfcheck 失败不应创建目录"; exit 1; }
+[ ! -e "$SPARK_INSTALL_BIN_PATH" ] || { echo "selfcheck 失败不应替换二进制"; exit 1; }
+[ -z "$(ls -A "$FAKE/usr")" ] || { echo "selfcheck 失败应清理临时文件"; exit 1; }
 [ ! -e "$FAKE/unit" ] || { echo "selfcheck 失败不应写 unit"; exit 1; }
 
 # 成功路径；预置过宽权限的目录，验证重跑会修正为 700
@@ -94,10 +98,11 @@ grep -q "systemctl restart spark-agent" "$LOG"
 for d in etc var; do
   case "$(ls -ld "$FAKE/$d")" in drwx------*) ;; *) echo "$d 应为 0700"; exit 1 ;; esac
 done
-# 顺序：enroll < selfcheck < systemctl enable（取第一轮）
+# 顺序：selfcheck < enroll < systemctl enable（取第一轮）
 l() { grep -n "$1" "$LOG" | head -1 | cut -d: -f1; }
-[ "$(l 'spark-agent enroll')" -lt "$(l 'spark-agent selfcheck')" ]
-[ "$(l 'spark-agent selfcheck')" -lt "$(l 'systemctl enable')" ]
+[ "$(l 'spark-agent selfcheck')" -lt "$(l 'spark-agent enroll')" ]
+[ "$(l 'spark-agent enroll')" -lt "$(l 'systemctl enable')" ]
+[ -x "$SPARK_INSTALL_BIN_PATH" ] && [ "$(ls -A "$FAKE/usr")" = "spark-agent" ] || { echo "二进制应已安装且无临时文件残留"; exit 1; }
 # unit 内容与仓库里的 unit 文件一致，且满足要求
 cmp "$FAKE/unit" "$HERE/spark-agent.service"
 for k in Restart=always RestartSec=3 User=root OOMScoreAdjust=-900 After=docker.service Wants=docker.service; do

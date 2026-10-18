@@ -6,7 +6,7 @@ Agent 创建容器时用 `--entrypoint /.spark/init.sh` 覆盖镜像入口：`in
 ## 必须
 - 自带 `/usr/sbin/sshd`（Debian / Ubuntu 装 `openssh-server`）；`root` 用户存在；`/bin/sh` 可用；`/run/sshd` 目录由 `init.sh` 创建。
 - 基于带 CUDA 用户态库的镜像，推荐 `nvcr.io/nvidia/cuda:13.0.1-base-ubuntu24.04`（机房内网可达 nvcr.io，不可达 Docker Hub）。容器以 `--gpus all` 启动（宿主机走 CDI），镜像内不装驱动。
-- **不要在镜像里写入任何密钥、口令或 `authorized_keys`**。登录只靠平台注入的 `/.spark/authorized_keys`（平台上游公钥）；`PasswordAuthentication` 被关闭。主机密钥由 Agent 按实例生成放在 `/.spark/hostkeys/`，镜像里的 `/etc/ssh/ssh_host_*` 不会被使用。
+- **不要在镜像里写入任何密钥、口令或 `authorized_keys`**。登录只靠平台注入的 `/.spark/authorized_keys`（平台上游公钥）；`PasswordAuthentication` 被关闭。主机密钥由 Agent 按实例生成放在 `/.spark/hostkeys/`，镜像里的 `/etc/ssh/ssh_host_*` 不会被使用，而且**镜像不得包含 SSH 主机密钥**（否则同一镜像的所有容器共用同一把私钥）：`openssh-server` 的安装脚本会生成它们，构建时必须 `rm -f /etc/ssh/ssh_host_*`（参考 Dockerfile 已处理）。
 - 不依赖 `--ipc=host`、`--privileged`、宿主机网络；容器只额外获得 `IPC_LOCK`、`SYS_NICE`、`SYS_PTRACE`。
 - 建议预装 `ca-certificates`、`curl`、`iproute2`。
 
