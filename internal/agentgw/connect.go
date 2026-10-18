@@ -78,18 +78,31 @@ func (c *conn) unpush(id string) {
 }
 
 // retainPushed 只保留仍为 sent 的指令：被 CancelCommands 取消或已超时的指令不会再有结果，否则集合在连接存活期内只增不减。
-func (c *conn) retainPushed(ids []string) {
+// 返回被移除的指令 id。
+func (c *conn) retainPushed(ids []string) []string {
 	keep := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		keep[id] = true
 	}
+	var dropped []string
 	c.mu.Lock()
 	for id := range c.pushed {
 		if !keep[id] {
 			delete(c.pushed, id)
+			dropped = append(dropped, id)
 		}
 	}
 	c.mu.Unlock()
+	return dropped
+}
+
+func (c *conn) aborted() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
 }
 
 type registry struct {
@@ -370,7 +383,10 @@ func (s *Server) handleHeartbeat(ctx context.Context, c *conn, h *agentpb.Heartb
 
 func (s *Server) handleResult(ctx context.Context, c *conn, r *agentpb.CommandResult) {
 	// 先完成指令再从已推送集合移除：反过来会让同一时刻的 tick 把仍为 sent 的指令再推一次并刷新 sent_at
-	defer c.unpush(r.GetCommandId())
+	defer func() {
+		c.unpush(r.GetCommandId())
+		s.deliveries.Delete(r.GetCommandId())
+	}()
 	err := s.d.Rental.HandleCommandResult(ctx, r.GetCommandId(), r.GetOk(), r.GetMessage())
 	if errors.Is(err, apperr.ErrNotFound) {
 		s.d.Log.Warn("result for unknown command ignored", "machine", c.machineID, "command", r.GetCommandId())

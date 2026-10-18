@@ -195,3 +195,53 @@ func TestTwoMachinesGetOnlyTheirOwnCommands(t *testing.T) {
 		t.Fatalf("routing: %s/%s want %s/%s", got1, got2, c1, c2)
 	}
 }
+
+// 旧指令已认领（sent）但推送时流断了，期间又排入更新的指令：重连后必须按创建顺序先旧后新推送，
+// 否则例如「到期 stop（sent）→ 续费 start（pending）」会被倒序执行，付费实例最终停机。
+func TestRepushKeepsCreationOrderAcrossClaimedAndPending(t *testing.T) {
+	e := newEnv(t)
+	mid := e.machine("SN-001")
+	_, older := e.place(mid)
+	creds := e.enroll(mid)
+	a := e.up(creds, mid)
+	if m := a.next(2 * time.Second); m.GetCommand().GetId() != older {
+		t.Fatalf("first delivery = %v", m)
+	}
+	_ = a.stream.CloseSend()
+	e.waitFor("disconnected", func() bool { return !e.srv.Connected(mid) })
+	e.clk.Advance(time.Minute)
+	newer, err := e.fleet.Enqueue(e.ctx, e.pool, mid, "", fleet.CmdPullImage, fleet.PullImagePayload{ImageRef: "nvcr.io/x/y:3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := e.up(creds, mid)
+	var got []string
+	for range 2 {
+		m := b.next(2 * time.Second)
+		if m == nil {
+			t.Fatalf("missing delivery, got %v", got)
+		}
+		got = append(got, m.GetCommand().GetId())
+	}
+	if got[0] != older || got[1] != newer {
+		t.Fatalf("order = %v, want [%s %s]", got, older, newer)
+	}
+	if m := b.next(4 * tick); m != nil {
+		t.Fatalf("unexpected extra delivery: %v", m)
+	}
+}
+
+func TestDeliveryRecordPrunedOnResult(t *testing.T) {
+	e := newEnv(t)
+	mid := e.machine("SN-001")
+	_, cmdID := e.place(mid)
+	a := e.up(e.enroll(mid), mid)
+	if m := a.next(2 * time.Second); m.GetCommand().GetId() != cmdID {
+		t.Fatal("not delivered")
+	}
+	if _, ok := e.srv.DeliveryTick(cmdID); !ok {
+		t.Fatal("delivery tick not recorded")
+	}
+	a.result(cmdID, true, "ok")
+	e.waitFor("delivery record pruned", func() bool { _, ok := e.srv.DeliveryTick(cmdID); return !ok })
+}

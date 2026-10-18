@@ -154,7 +154,7 @@ func TestSentCommandsTouchAndSentBefore(t *testing.T) {
 		t.Fatal(err)
 	}
 	t0 := clk.Now()
-	sent, err := svc.SentCommands(ctx, a)
+	sent, err := svc.SentCommands(ctx, []int64{a})
 	if err != nil || len(sent) != 1 || sent[0].ID != id {
 		t.Fatalf("sent = %+v, %v", sent, err)
 	}
@@ -162,7 +162,7 @@ func TestSentCommandsTouchAndSentBefore(t *testing.T) {
 	if err := svc.TouchSent(ctx, []string{id, "nope"}); err != nil {
 		t.Fatal(err)
 	}
-	sent, _ = svc.SentCommands(ctx, a)
+	sent, _ = svc.SentCommands(ctx, []int64{a})
 	if !sent[0].SentAt.Equal(t0.Add(time.Minute)) || sent[0].Attempts != 1 {
 		t.Fatalf("after touch = %+v", sent[0])
 	}
@@ -185,7 +185,7 @@ func TestSentCommandsTouchAndSentBefore(t *testing.T) {
 	if _, _, err := svc.CompleteCommand(ctx, pool, id, true, "ok"); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := svc.SentCommands(ctx, a); len(got) != 0 {
+	if got, _ := svc.SentCommands(ctx, []int64{a}); len(got) != 0 {
 		t.Fatalf("done still sent: %+v", got)
 	}
 }

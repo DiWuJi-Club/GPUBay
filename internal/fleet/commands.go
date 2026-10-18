@@ -185,10 +185,13 @@ func (s *Service) ClaimPending(ctx context.Context, connIDs []string) ([]Claimed
 	return out, nil
 }
 
-// SentCommands 返回机器上已下发、尚未回报的指令（补推用）。
-func (s *Service) SentCommands(ctx context.Context, machineID int64) ([]Command, error) {
+// SentCommands 返回这些机器上已下发、尚未回报的指令（补推用），按机器、创建时间排序。
+func (s *Service) SentCommands(ctx context.Context, machineIDs []int64) ([]Command, error) {
+	if len(machineIDs) == 0 {
+		return nil, nil
+	}
 	rows, err := s.pool.Query(ctx, `SELECT `+commandCols+` FROM agent_commands
-		WHERE machine_id = $1 AND status = 'sent' ORDER BY created_at, id`, machineID)
+		WHERE machine_id = ANY($1) AND status = 'sent' ORDER BY machine_id, created_at, id`, machineIDs)
 	if err != nil {
 		return nil, err
 	}
