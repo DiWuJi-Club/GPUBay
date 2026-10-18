@@ -82,10 +82,8 @@ func (n *Netfilter) EnsureRules(ctx context.Context, r netfilter.Rules) error {
 		errs = append(errs, err)
 	} else {
 		for _, j := range [][]string{{"INPUT", "-i", r.Bridge, "-j", chainIn}, {"DOCKER-USER", "-i", r.Bridge, "-j", chainFwd}} {
-			if _, err := n.ipt(ctx, append([]string{"-C"}, j...)...); err != nil {
-				if _, err := n.ipt(ctx, append([]string{"-I", j[0], "1"}, j[1:]...)...); err != nil {
-					errs = append(errs, err)
-				}
+			if err := n.ensureFirstJump(ctx, j); err != nil {
+				errs = append(errs, err)
 			}
 		}
 	}
@@ -93,6 +91,44 @@ func (n *Netfilter) EnsureRules(ctx context.Context, r netfilter.Rules) error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// ensureFirstJump 保证跳转规则 j（{链, 匹配…, -j, 目标}）是该链的第一条规则：只检查存在不够，
+// 别的工具插在前面的 ACCEPT 会绕过隔离链。已在第一位不动；在别处则先删掉（含重复的）再插到第 1 位；不存在直接插入。
+// 列不出链（如 DOCKER-USER 不存在）时返回错误，不盲目插入（fail closed，由调用方上报）。
+func (n *Netfilter) ensureFirstJump(ctx context.Context, j []string) error {
+	chain := j[0]
+	out, err := n.ipt(ctx, "-S", chain)
+	if err != nil {
+		return fmt.Errorf("iptables: 无法列出链 %s：%w", chain, err)
+	}
+	rule := "-A " + strings.Join(j, " ")
+	first, present := "", 0
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "-A ") {
+			continue
+		}
+		if first == "" {
+			first = line
+		}
+		if line == rule {
+			present++
+		}
+	}
+	if first == rule {
+		return nil
+	}
+	if present > 0 {
+		n.log().Warn("iptables jump not first in chain, moving it to position 1", "chain", chain, "first_rule", first)
+	}
+	for range present {
+		if _, err := n.ipt(ctx, append([]string{"-D"}, j...)...); err != nil {
+			return err
+		}
+	}
+	_, err = n.ipt(ctx, append([]string{"-I", chain, "1"}, j[1:]...)...)
+	return err
 }
 
 func (n *Netfilter) chainMatches(ctx context.Context, chain string, want []string) bool {
@@ -155,7 +191,7 @@ func (n *Netfilter) LimitApplied(ctx context.Context, veth string) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	if !strings.Contains(string(ing), "ingress") {
+	if !strings.Contains(string(ing), "qdisc ingress") {
 		return false, nil
 	}
 	flt, err := n.Run.Run(ctx, "tc", "filter", "show", "dev", veth, "parent", "ffff:")

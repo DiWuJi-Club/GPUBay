@@ -27,8 +27,9 @@ func fwdRestoreBody(allow ...string) string {
 func TestEnsureRulesFromScratchUsesSingleRestore(t *testing.T) {
 	r := &cmdrun.Recorder{}
 	nf := &iptables.Netfilter{Run: r}
-	r.Stub("iptables -w -C", "", &cmdrun.CmdError{ExitCode: 1})
-	r.Stub("iptables -w -S", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "No chain/target/match by that name."})
+	r.Stub("iptables -w -S SPARK-", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "No chain/target/match by that name."})
+	r.Stub("iptables -w -S INPUT", "-P INPUT ACCEPT\n", nil)
+	r.Stub("iptables -w -S DOCKER-USER", "-N DOCKER-USER\n", nil)
 	// 非规范输入（主机位）会被规整
 	if err := nf.EnsureRules(context.Background(), netfilter.Rules{Bridge: "spark0", AllowCIDRs: []string{"10.0.9.7/24", "10.0.0.53/32"}}); err != nil {
 		t.Fatal(err)
@@ -37,9 +38,9 @@ func TestEnsureRulesFromScratchUsesSingleRestore(t *testing.T) {
 		"iptables -w -S SPARK-IN",
 		"iptables -w -S SPARK-FWD",
 		restoreCmd,
-		"iptables -w -C INPUT -i spark0 -j SPARK-IN",
+		"iptables -w -S INPUT",
 		"iptables -w -I INPUT 1 -i spark0 -j SPARK-IN",
-		"iptables -w -C DOCKER-USER -i spark0 -j SPARK-FWD",
+		"iptables -w -S DOCKER-USER",
 		"iptables -w -I DOCKER-USER 1 -i spark0 -j SPARK-FWD",
 		"sysctl -q -w net.ipv6.conf.spark0.disable_ipv6=1",
 	}, "\n")
@@ -61,19 +62,88 @@ func TestEnsureRulesFromScratchUsesSingleRestore(t *testing.T) {
 func TestEnsureRulesIsIdempotentWhenAlreadyCorrect(t *testing.T) {
 	r := &cmdrun.Recorder{}
 	nf := &iptables.Netfilter{Run: r}
-	r.Stub("iptables -w -C", "", nil)
+	r.Stub("iptables -w -S INPUT", realInput, nil)
+	r.Stub("iptables -w -S DOCKER-USER", realDockerUser, nil)
 	r.Stub("iptables -w -S SPARK-FWD", strings.Join(iptables.ExpectedFwdRules([]string{"10.0.9.0/24"}), "\n")+"\n", nil)
 	r.Stub("iptables -w -S SPARK-IN", strings.Join(iptables.ExpectedInRules(), "\n")+"\n", nil)
 	if err := nf.EnsureRules(context.Background(), netfilter.Rules{Bridge: "spark0", AllowCIDRs: []string{"10.0.9.0/24"}}); err != nil {
 		t.Fatal(err)
 	}
-	want := "iptables -w -S SPARK-IN\niptables -w -S SPARK-FWD\niptables -w -C INPUT -i spark0 -j SPARK-IN\niptables -w -C DOCKER-USER -i spark0 -j SPARK-FWD\n" +
+	want := "iptables -w -S SPARK-IN\niptables -w -S SPARK-FWD\niptables -w -S INPUT\niptables -w -S DOCKER-USER\n" +
 		"sysctl -q -w net.ipv6.conf.spark0.disable_ipv6=1"
 	if r.Lines() != want || len(r.Inputs) != 0 {
 		t.Fatalf("idempotent:\n%s", r.Lines())
 	}
 	if got := iptables.ExpectedFwdRules(nil)[0]; got != "-N SPARK-FWD" {
 		t.Fatalf("expected rules header = %q", got)
+	}
+}
+
+// 真机 `iptables -S INPUT` / `iptables -S DOCKER-USER` 输出（跳转在第一位）。
+const (
+	realInput      = "-P INPUT ACCEPT\n-A INPUT -i spark0 -j SPARK-IN\n"
+	realDockerUser = "-N DOCKER-USER\n-A DOCKER-USER -i spark0 -j SPARK-FWD\n"
+)
+
+func syncedChains(r *cmdrun.Recorder) {
+	r.Stub("iptables -w -S SPARK-FWD", strings.Join(iptables.ExpectedFwdRules(nil), "\n")+"\n", nil)
+	r.Stub("iptables -w -S SPARK-IN", strings.Join(iptables.ExpectedInRules(), "\n")+"\n", nil)
+}
+
+// 别的工具把规则插到了我们的跳转前面：删掉原跳转，重新插到第 1 位（否则 SPARK-FWD 会被绕过）。
+func TestJumpNotFirstIsMovedToFirst(t *testing.T) {
+	r := &cmdrun.Recorder{}
+	nf := &iptables.Netfilter{Run: r}
+	syncedChains(r)
+	r.Stub("iptables -w -S INPUT", "-P INPUT ACCEPT\n-A INPUT -j ufw-before-input\n-A INPUT -i spark0 -j SPARK-IN\n", nil)
+	r.Stub("iptables -w -S DOCKER-USER", "-N DOCKER-USER\n-A DOCKER-USER -j ACCEPT\n-A DOCKER-USER -i spark0 -j SPARK-FWD\n-A DOCKER-USER -j RETURN\n", nil)
+	if err := nf.EnsureRules(context.Background(), netfilter.Rules{Bridge: "spark0"}); err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Join([]string{
+		"iptables -w -S SPARK-IN",
+		"iptables -w -S SPARK-FWD",
+		"iptables -w -S INPUT",
+		"iptables -w -D INPUT -i spark0 -j SPARK-IN",
+		"iptables -w -I INPUT 1 -i spark0 -j SPARK-IN",
+		"iptables -w -S DOCKER-USER",
+		"iptables -w -D DOCKER-USER -i spark0 -j SPARK-FWD",
+		"iptables -w -I DOCKER-USER 1 -i spark0 -j SPARK-FWD",
+		"sysctl -q -w net.ipv6.conf.spark0.disable_ipv6=1",
+	}, "\n")
+	if r.Lines() != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", r.Lines(), want)
+	}
+}
+
+// 跳转不存在：直接插到第 1 位，不发 -D。
+func TestMissingJumpIsInsertedFirst(t *testing.T) {
+	r := &cmdrun.Recorder{}
+	nf := &iptables.Netfilter{Run: r}
+	syncedChains(r)
+	r.Stub("iptables -w -S INPUT", realInput, nil)
+	r.Stub("iptables -w -S DOCKER-USER", "-N DOCKER-USER\n-A DOCKER-USER -j RETURN\n", nil)
+	if err := nf.EnsureRules(context.Background(), netfilter.Rules{Bridge: "spark0"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(r.Lines(), " -D ") || strings.Contains(r.Lines(), "-I INPUT") || !strings.Contains(r.Lines(), "iptables -w -I DOCKER-USER 1 -i spark0 -j SPARK-FWD") {
+		t.Fatalf("calls:\n%s", r.Lines())
+	}
+}
+
+// 无法列出链时 fail closed：报错，且不盲目插入。
+func TestJumpListFailureIsReported(t *testing.T) {
+	r := &cmdrun.Recorder{}
+	nf := &iptables.Netfilter{Run: r}
+	syncedChains(r)
+	r.Stub("iptables -w -S INPUT", realInput, nil)
+	r.Stub("iptables -w -S DOCKER-USER", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "iptables: No chain/target/match by that name."})
+	err := nf.EnsureRules(context.Background(), netfilter.Rules{Bridge: "spark0"})
+	if err == nil || !strings.Contains(err.Error(), "DOCKER-USER") {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Contains(r.Lines(), "-I DOCKER-USER") || !strings.Contains(r.Lines(), "sysctl") {
+		t.Fatalf("calls:\n%s", r.Lines())
 	}
 }
 
@@ -114,7 +184,6 @@ func TestRestoreFailureReturnsErrorAndIssuesNoPartialState(t *testing.T) {
 func TestEnsureRulesAttemptsEveryStep(t *testing.T) {
 	r := &cmdrun.Recorder{}
 	nf := &iptables.Netfilter{Run: r}
-	r.Stub("iptables -w -C", "", &cmdrun.CmdError{ExitCode: 1})
 	r.Stub("iptables -w -S SPARK-FWD", strings.Join(iptables.ExpectedFwdRules(nil), "\n")+"\n", nil)
 	r.Stub("iptables -w -S SPARK-IN", strings.Join(iptables.ExpectedInRules(), "\n")+"\n", nil)
 	r.Stub("iptables -w -I DOCKER-USER", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "Chain DOCKER-USER does not exist"})
@@ -194,6 +263,8 @@ func TestLimitApplied(t *testing.T) {
 		{"only noqueue", noqueue, "", "", false},
 		{"tbf without ingress", tbfRoot, "", "", false},
 		{"ingress without police", tbfRoot, ingressQ, "", false},
+		// 只认 "qdisc ingress"：别的 qdisc 行里出现 ingress 字样不算
+		{"clsact is not ingress", tbfRoot, "qdisc clsact ffff: parent ffff:fff1 ingress_block 1\n", policeFilt, false},
 	} {
 		r := &cmdrun.Recorder{}
 		nf := &iptables.Netfilter{Run: r}
