@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -160,7 +161,8 @@ func (r *Runtime) List(ctx context.Context) ([]runtime.Container, error) {
 	return list, nil
 }
 
-// VethOf 找容器 eth0 在宿主机上的对端 veth：容器 netns 里 eth0 的 iflink = 宿主机侧接口索引。
+// VethOf 找容器 eth0 在宿主机上的对端 veth：在容器 netns 里 `ip -o link show dev eth0` 输出 `eth0@ifN`，
+// N 即宿主机侧接口索引。不能读 /sys/class/net/eth0/iflink：nsenter -n 只换网络命名空间，/sys 仍是宿主机的 sysfs。
 func (r *Runtime) VethOf(ctx context.Context, id string) (string, error) {
 	out, err := r.Run.Run(ctx, "docker", "inspect", "--type", "container", "--format", "{{.State.Pid}}", id)
 	if err != nil {
@@ -170,11 +172,15 @@ func (r *Runtime) VethOf(ctx context.Context, id string) (string, error) {
 	if pid == "" || pid == "0" {
 		return "", errors.New("container is not running")
 	}
-	out, err = r.Run.Run(ctx, "nsenter", "-t", pid, "-n", "cat", "/sys/class/net/eth0/iflink")
+	out, err = r.Run.Run(ctx, "nsenter", "-t", pid, "-n", "ip", "-o", "link", "show", "dev", "eth0")
 	if err != nil {
 		return "", err
 	}
-	idx := strings.TrimSpace(string(out))
+	m := peerIndexRe.FindStringSubmatch(string(out))
+	if m == nil {
+		return "", fmt.Errorf("container %s eth0 has no veth peer: %q", id, strings.TrimSpace(string(out)))
+	}
+	idx := m[1]
 	out, err = r.Run.Run(ctx, "ip", "-o", "link", "show")
 	if err != nil {
 		return "", err
@@ -190,6 +196,9 @@ func (r *Runtime) VethOf(ctx context.Context, id string) (string, error) {
 	}
 	return "", fmt.Errorf("host interface %s for %s not found", idx, id)
 }
+
+// peerIndexRe 取 `16: eth0@if17: <...>` 里的对端索引 17。
+var peerIndexRe = regexp.MustCompile(`^\d+: eth0@if(\d+):`)
 
 // validateSpec 拒绝会让 docker 静默放宽限制的空值（空 LanIP 会绑定 0.0.0.0，--memory 0 表示不限）。
 func validateSpec(s runtime.Spec) error {

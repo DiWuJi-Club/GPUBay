@@ -107,14 +107,27 @@ func TestInspectListAndVeth(t *testing.T) {
 	}
 	r.Reset()
 	r.Stub("docker inspect --type container --format {{.State.Pid}} ins-a", "4242\n", nil)
-	r.Stub("nsenter -t 4242 -n cat /sys/class/net/eth0/iflink", "17\n", nil)
+	r.Stub("nsenter -t 4242 -n ip -o link show dev eth0", "16: eth0@if17: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 ...\n", nil)
 	r.Stub("ip -o link show", "1: lo: <LOOPBACK> ...\n17: veth1a2b3c@if16: <BROADCAST,MULTICAST,UP> ...\n18: vethzzz@if20: ...\n", nil)
 	veth, err := rt.VethOf(ctx, "ins-a")
 	if err != nil || veth != "veth1a2b3c" {
 		t.Fatalf("veth = %q %v", veth, err)
 	}
-	if r.Lines() != "docker inspect --type container --format {{.State.Pid}} ins-a\nnsenter -t 4242 -n cat /sys/class/net/eth0/iflink\nip -o link show" {
+	if r.Lines() != "docker inspect --type container --format {{.State.Pid}} ins-a\nnsenter -t 4242 -n ip -o link show dev eth0\nip -o link show" {
 		t.Fatalf("calls:\n%s", r.Lines())
+	}
+}
+
+// 容器 eth0 输出里没有 @ifN（不是 veth）时必须报错，不能拿空索引去匹配宿主机接口。
+func TestVethOfRejectsNonVeth(t *testing.T) {
+	rt, r := newRT()
+	r.Stub("docker inspect --type container --format {{.State.Pid}} ins-a", "4242\n", nil)
+	r.Stub("nsenter -t 4242 -n ip -o link show dev eth0", "16: eth0: <BROADCAST,MULTICAST,UP> ...\n", nil)
+	if _, err := rt.VethOf(context.Background(), "ins-a"); err == nil {
+		t.Fatal("eth0 without @ifN must be an error")
+	}
+	if strings.Contains(r.Lines(), "ip -o link show\n") || strings.HasSuffix(r.Lines(), "\nip -o link show") {
+		t.Fatalf("must not scan host links:\n%s", r.Lines())
 	}
 }
 
