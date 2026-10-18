@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/adminapi"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/dbtest"
@@ -170,14 +171,26 @@ func TestEnrollCommandAndRevoke(t *testing.T) {
 	if strings.Contains(diff, strings.TrimPrefix(token, "spk1_")) {
 		t.Fatalf("audit leaks token: %s", diff)
 	}
-	// 未接入时撤销 → invalid_state；接入后撤销成功并清空
+	// 未接入但有未用令牌：撤销成功并使令牌作废；再撤销无物可撤 → invalid_state
+	if code, out := ops.do("POST", fmt.Sprintf("/machines/%d/revoke-enrollment", mid), map[string]any{}); code != 200 || out["enrolled"] != false {
+		t.Fatalf("revoke token-only = %d %v", code, out)
+	}
+	if err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+		_, err := e.fleet.ConsumeEnrollToken(e.ctx, tx, token)
+		return err
+	}); !errors.Is(err, fleet.ErrEnrollToken) {
+		t.Fatalf("token issued before revoke still usable: %v", err)
+	}
 	if code, out := ops.do("POST", fmt.Sprintf("/machines/%d/revoke-enrollment", mid), map[string]any{}); code != 409 || codeOf(out) != "invalid_state" {
-		t.Fatalf("revoke unenrolled = %d %v", code, out)
+		t.Fatalf("revoke nothing = %d %v", code, out)
 	}
 	if _, err := e.pool.Exec(e.ctx, `UPDATE machines SET cert_fingerprint = repeat('ab', 32), agent_conn_id = 'c1', agent_version = '0.1.0', last_metrics = '{"gpu_temp_c":55}' WHERE id = $1`, mid); err != nil {
 		t.Fatal(err)
 	}
 	code, out = ops.do("GET", fmt.Sprintf("/machines/%d", mid), nil)
+	if code != 200 {
+		t.Fatalf("get machine = %d %v", code, out)
+	}
 	m := out["machine"].(map[string]any)
 	if m["enrolled"] != true || m["fingerprint_prefix"] != "abababababababab" || m["connected"] != true || m["agent_version"] != "0.1.0" || m["last_metrics"].(map[string]any)["gpu_temp_c"].(float64) != 55 {
 		t.Fatalf("machine view = %v", m)
@@ -191,19 +204,21 @@ func TestEnrollCommandAndRevoke(t *testing.T) {
 	}
 	var n int
 	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM audit_logs WHERE action = 'machine.revoke_enrollment'`).Scan(&n)
-	if n != 1 {
+	if n != 2 {
 		t.Fatalf("revoke audit = %d", n)
-	}
-	// 撤销前签发的令牌在撤销后不能再用于接入
-	err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
-		_, err := e.fleet.ConsumeEnrollToken(e.ctx, tx, token)
-		return err
-	})
-	if !errors.Is(err, fleet.ErrEnrollToken) {
-		t.Fatalf("token issued before revoke still usable: %v", err)
 	}
 	fin := e.loginAs("fin", admin.RoleFinance)
 	if code, out := fin.do("POST", path, map[string]any{}); code != 403 || codeOf(out) != "forbidden" {
 		t.Fatalf("finance = %d %v", code, out)
+	}
+}
+
+func TestEnrollCommandWithoutGateway(t *testing.T) {
+	e := newEnvWith(t, func(s *adminapi.Server) { s.Gateway = nil })
+	ops := e.loginAs("ops", admin.RoleOps)
+	mid := e.machine("SN-NG")
+	code, out := ops.do("POST", fmt.Sprintf("/machines/%d/enroll-command", mid), map[string]any{"totp": ops.totp()})
+	if code != 500 || out["message"] != "未配置 Agent 网关" {
+		t.Fatalf("no gateway = %d %v", code, out)
 	}
 }

@@ -88,13 +88,13 @@ func (s *Server) handleCreateImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	s.broadcastPull(r, img)
+	s.broadcastPull(r, img, nil)
 	httpx.WriteJSON(w, http.StatusCreated, img)
 }
 
-// broadcastPull 镜像上架或启用时向所有在线机器预拉取；失败不阻塞上架。
-func (s *Server) broadcastPull(r *http.Request, img catalog.AdminImage) {
-	if !img.Enabled {
+// broadcastPull 镜像新建启用、由停用转启用、或启用中改 ref 时向所有在线机器预拉取；失败不阻塞上架。
+func (s *Server) broadcastPull(r *http.Request, img catalog.AdminImage, prev *catalog.AdminImage) {
+	if !img.Enabled || (prev != nil && prev.Enabled && prev.Ref == img.Ref) {
 		return
 	}
 	if n, err := s.Fleet.BroadcastPullImage(r.Context(), img.Ref); err != nil {
@@ -115,12 +115,20 @@ func (s *Server) handleUpdateImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	var prev *catalog.AdminImage
+	if all, err := s.Catalog.AdminImages(r.Context()); err == nil {
+		for k := range all {
+			if all[k].ID == id {
+				prev = &all[k]
+			}
+		}
+	}
 	img, err := s.Catalog.UpdateImage(r.Context(), s.actor(r), id, req.input())
 	if err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	s.broadcastPull(r, img)
+	s.broadcastPull(r, img, prev)
 	httpx.WriteJSON(w, http.StatusOK, img)
 }
 

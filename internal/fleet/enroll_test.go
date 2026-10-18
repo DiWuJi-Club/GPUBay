@@ -172,3 +172,62 @@ func TestConcurrentIssueLeavesOneValidToken(t *testing.T) {
 		t.Fatalf("valid tokens = %d, want 1", valid)
 	}
 }
+
+// 接入事务持有令牌与机器锁时，并发的撤销/签发必须等待而不是死锁，并看到接入后的状态。
+func TestEnrollRacesWithRevokeAndIssueWithoutDeadlock(t *testing.T) {
+	svc, pool, clk := newEnv(t)
+	ctx := context.Background()
+	id := dbtest.CreateMachine(t, pool, "SN-D")
+	tok, _ := svc.IssueEnrollToken(ctx, audit.Actor{AdminID: 1}, id)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := svc.ConsumeEnrollToken(ctx, tx, tok.Plain); err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 2)
+	go func() { errs <- svc.RevokeEnrollment(ctx, audit.Actor{AdminID: 1}, id) }()
+	go func() { _, err := svc.IssueEnrollToken(ctx, audit.Actor{AdminID: 1}, id); errs <- err }()
+	time.Sleep(300 * time.Millisecond) // 让两者阻塞在机器行锁上
+	if err := svc.SetCertFingerprint(ctx, tx, id, strings.Repeat("cd", 32)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent op failed (deadlock?): %v", err)
+		}
+	}
+	m, _ := svc.Get(ctx, pool, id)
+	if m.Enrolled {
+		t.Fatalf("revoke should have seen the enrolled state and cleared it: %+v", m)
+	}
+	var valid int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM machine_enroll_tokens WHERE machine_id = $1 AND used_at IS NULL AND expires_at > $2`, id, clk.Now()).Scan(&valid)
+	if valid > 1 {
+		t.Fatalf("valid tokens = %d", valid)
+	}
+}
+
+func TestRevokeWithoutFingerprintExpiresUnusedTokens(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	id := dbtest.CreateMachine(t, pool, "SN-T")
+	if err := svc.RevokeEnrollment(ctx, audit.Actor{AdminID: 1}, id); !errors.Is(err, apperr.ErrInvalidState) {
+		t.Fatalf("nothing to revoke = %v", err)
+	}
+	tok, _ := svc.IssueEnrollToken(ctx, audit.Actor{AdminID: 1}, id)
+	if err := svc.RevokeEnrollment(ctx, audit.Actor{AdminID: 1}, id); err != nil {
+		t.Fatalf("revoke with only token = %v", err)
+	}
+	if _, err := consume(t, svc, pool, tok.Plain); !errors.Is(err, fleet.ErrEnrollToken) {
+		t.Fatalf("token still valid: %v", err)
+	}
+	if err := svc.RevokeEnrollment(ctx, audit.Actor{AdminID: 1}, id); !errors.Is(err, apperr.ErrInvalidState) {
+		t.Fatalf("second revoke = %v", err)
+	}
+}

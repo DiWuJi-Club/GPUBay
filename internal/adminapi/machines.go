@@ -282,7 +282,7 @@ func (s *Server) handleEnrollCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.Gateway == nil {
-		s.writeError(w, r, errors.New("未配置 Agent 网关"))
+		s.writeError(w, r, apperr.New("gateway_unavailable", "未配置 Agent 网关", http.StatusInternalServerError))
 		return
 	}
 	tok, err := s.Fleet.IssueEnrollToken(r.Context(), s.actor(r), id)

@@ -79,8 +79,20 @@ func (s *Service) ConsumeEnrollToken(ctx context.Context, tx pgx.Tx, plain strin
 		return EnrollTokenRow{}, ErrEnrollToken
 	}
 	now := s.clock.Now()
+	// 锁顺序与签发/撤销一致：先机器行，后令牌行（否则并发会死锁）。
+	var mid int64
+	err := tx.QueryRow(ctx, `SELECT machine_id FROM machine_enroll_tokens WHERE token_hash = $1`, hashEnrollToken(plain)).Scan(&mid)
+	if db.IsNoRows(err) {
+		return EnrollTokenRow{}, ErrEnrollToken
+	}
+	if err != nil {
+		return EnrollTokenRow{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM machines WHERE id = $1 FOR UPDATE`, mid); err != nil {
+		return EnrollTokenRow{}, err
+	}
 	var r EnrollTokenRow
-	err := tx.QueryRow(ctx, `SELECT t.id, t.machine_id, t.issued_by, m.serial
+	err = tx.QueryRow(ctx, `SELECT t.id, t.machine_id, t.issued_by, m.serial
 		FROM machine_enroll_tokens t JOIN machines m ON m.id = t.machine_id
 		WHERE t.token_hash = $1 AND t.used_at IS NULL AND t.expires_at > $2 FOR UPDATE OF t`,
 		hashEnrollToken(plain), now).Scan(&r.ID, &r.MachineID, &r.IssuedBy, &r.Serial)
@@ -101,7 +113,7 @@ func (s *Service) SetCertFingerprint(ctx context.Context, q db.Querier, machineI
 	return err
 }
 
-// RevokeEnrollment 撤销接入：清空指纹与连接归属，写审计。未接入的机器返回 invalid_state。
+// RevokeEnrollment 撤销接入：清空指纹与连接归属并作废未用令牌，写审计。既未接入又无未用令牌时返回 invalid_state。
 func (s *Service) RevokeEnrollment(ctx context.Context, actor audit.Actor, machineID int64) error {
 	now := s.clock.Now()
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
@@ -113,18 +125,19 @@ func (s *Service) RevokeEnrollment(ctx context.Context, actor audit.Actor, machi
 		if err != nil {
 			return err
 		}
-		if fp == "" {
-			return apperr.ErrInvalidState
+		// 撤销前签发、尚未使用的令牌一并作废，避免撤销后仍能用旧令牌重新接入。
+		tag, err := tx.Exec(ctx, `UPDATE machine_enroll_tokens SET expires_at = $2
+			WHERE machine_id = $1 AND used_at IS NULL AND expires_at > $2`, machineID, now)
+		if err != nil {
+			return err
+		}
+		if fp == "" && tag.RowsAffected() == 0 {
+			return apperr.ErrInvalidState // 既未接入也没有待用令牌：无可撤销
 		}
 		if err := s.SetCertFingerprint(ctx, tx, machineID, ""); err != nil {
 			return err
 		}
-		// 撤销前签发、尚未使用的令牌一并作废，避免撤销后仍能用旧令牌重新接入。
-		if _, err := tx.Exec(ctx, `UPDATE machine_enroll_tokens SET expires_at = $2
-			WHERE machine_id = $1 AND used_at IS NULL AND expires_at > $2`, machineID, now); err != nil {
-			return err
-		}
 		return audit.Record(ctx, tx, now, actor.Entry("machine.revoke_enrollment", "machine", strconv.FormatInt(machineID, 10),
-			map[string]any{"fingerprint": fp}))
+			map[string]any{"fingerprint": fp, "tokens_expired": tag.RowsAffected()}))
 	})
 }

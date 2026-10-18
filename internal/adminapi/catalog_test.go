@@ -94,11 +94,11 @@ func TestImageEnableBroadcastsPull(t *testing.T) {
 	if code != 201 {
 		t.Fatalf("create = %d %v", code, out)
 	}
-	cmds, _ := e.fleet.PendingCommands(e.ctx, online)
-	if len(cmds) != 1 || cmds[0].Type != fleet.CmdPullImage || !strings.Contains(string(cmds[0].Payload), "nvcr.io/x/cuda:13") {
+	cmds, err := e.fleet.PendingCommands(e.ctx, online)
+	if err != nil || len(cmds) != 1 || cmds[0].Type != fleet.CmdPullImage || !strings.Contains(string(cmds[0].Payload), "nvcr.io/x/cuda:13") {
 		t.Fatalf("pull = %+v", cmds)
 	}
-	if cmds, _ := e.fleet.PendingCommands(e.ctx, off); len(cmds) != 0 {
+	if cmds, err := e.fleet.PendingCommands(e.ctx, off); err != nil || len(cmds) != 0 {
 		t.Fatal("offline machine got pull")
 	}
 	id := int64(out["id"].(float64))
@@ -106,14 +106,32 @@ func TestImageEnableBroadcastsPull(t *testing.T) {
 	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda", "ref": "nvcr.io/x/cuda:13", "enabled": false, "sort": 1}); code != 200 {
 		t.Fatal(code)
 	}
-	if cmds, _ := e.fleet.PendingCommands(e.ctx, online); len(cmds) != 1 {
-		t.Fatalf("disable broadcast: %+v", cmds)
+	if cmds, err := e.fleet.PendingCommands(e.ctx, online); err != nil || len(cmds) != 1 {
+		t.Fatalf("disable broadcast: %+v %v", cmds, err)
 	}
+	// 重新启用（false→true）广播；随后无变化的 PUT 不再广播
 	e.clk.Advance(time.Second) // 命令按 created_at, uuid 排序；固定时钟下同刻并列会乱序
-	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda", "ref": "nvcr.io/x/cuda:14", "enabled": true, "sort": 1}); code != 200 {
+	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda", "ref": "nvcr.io/x/cuda:13", "enabled": true, "sort": 1}); code != 200 {
 		t.Fatal(code)
 	}
-	if cmds, _ := e.fleet.PendingCommands(e.ctx, online); len(cmds) != 2 || !strings.Contains(string(cmds[1].Payload), "cuda:14") {
-		t.Fatalf("enable broadcast: %+v", cmds)
+	cmds, err = e.fleet.PendingCommands(e.ctx, online)
+	if err != nil || len(cmds) != 2 || !strings.Contains(string(cmds[1].Payload), "cuda:13") {
+		t.Fatalf("re-enable broadcast: %+v %v", cmds, err)
+	}
+	// 启用状态下只改名称：不广播
+	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda2", "ref": "nvcr.io/x/cuda:13", "enabled": true, "sort": 2}); code != 200 {
+		t.Fatal(code)
+	}
+	if cmds, err := e.fleet.PendingCommands(e.ctx, online); err != nil || len(cmds) != 2 {
+		t.Fatalf("unchanged PUT broadcast: %+v %v", cmds, err)
+	}
+	// 启用状态下改 ref：广播新 ref
+	e.clk.Advance(time.Second)
+	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda2", "ref": "nvcr.io/x/cuda:14", "enabled": true, "sort": 2}); code != 200 {
+		t.Fatal(code)
+	}
+	cmds, err = e.fleet.PendingCommands(e.ctx, online)
+	if err != nil || len(cmds) != 3 || !strings.Contains(string(cmds[2].Payload), "cuda:14") {
+		t.Fatalf("ref change broadcast: %+v %v", cmds, err)
 	}
 }
