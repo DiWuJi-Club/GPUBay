@@ -15,6 +15,8 @@ type Netfilter struct {
 	failNext map[string]error
 }
 
+var _ netfilter.Netfilter = (*Netfilter)(nil)
+
 func New() *Netfilter { return &Netfilter{limits: map[string]int{}, failNext: map[string]error{}} }
 
 func (n *Netfilter) FailNext(op string, err error) {

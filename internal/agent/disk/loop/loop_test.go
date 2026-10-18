@@ -222,6 +222,10 @@ func (f runnerFunc) Run(ctx context.Context, name string, args ...string) ([]byt
 	return f(ctx, name, args...)
 }
 
+func (f runnerFunc) RunInput(ctx context.Context, _ []byte, name string, args ...string) ([]byte, error) {
+	return f(ctx, name, args...)
+}
+
 func TestBlkidDecidesMkfs(t *testing.T) {
 	img := "/var/lib/spark-agent/data/ins-aaaaaaaa.img"
 	run := func(out string, err error) (string, error) {

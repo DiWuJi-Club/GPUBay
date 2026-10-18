@@ -87,3 +87,15 @@ func TestExecForcesCLocale(t *testing.T) {
 		t.Fatalf("locale = %q %v", out, err)
 	}
 }
+
+func TestExecRunInputFeedsStdin(t *testing.T) {
+	out, err := cmdrun.Exec{}.RunInput(context.Background(), []byte("hello"), "cat")
+	if err != nil || string(out) != "hello" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	r := &cmdrun.Recorder{}
+	_, _ = r.RunInput(context.Background(), []byte("x"), "foo", "-a")
+	if r.Lines() != "foo -a" || len(r.Inputs) != 1 || r.Inputs[0] != "x" {
+		t.Fatalf("recorder: %q %q", r.Lines(), r.Inputs)
+	}
+}

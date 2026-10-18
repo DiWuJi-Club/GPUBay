@@ -11,6 +11,8 @@ import (
 type Runner interface {
 	// Run 执行命令并返回 stdout；非零退出返回 *CmdError。
 	Run(ctx context.Context, name string, args ...string) ([]byte, error)
+	// RunInput 同 Run，但把 stdin 喂给子进程（如 iptables-restore 的事务输入）。
+	RunInput(ctx context.Context, stdin []byte, name string, args ...string) ([]byte, error)
 }
 
 // Line 组出可读的命令行（不做 shell 转义，只用于日志、错误与快照）。

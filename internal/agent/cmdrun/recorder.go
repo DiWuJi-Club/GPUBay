@@ -16,7 +16,9 @@ type stub struct {
 type Recorder struct {
 	mu    sync.Mutex
 	Calls []string
-	stubs []stub
+	// Inputs 按顺序记录每次 RunInput 的 stdin，供快照断言。
+	Inputs []string
+	stubs  []stub
 }
 
 func (r *Recorder) Stub(cmdPrefix, out string, err error) {
@@ -25,11 +27,22 @@ func (r *Recorder) Stub(cmdPrefix, out string, err error) {
 	r.stubs = append(r.stubs, stub{prefix: cmdPrefix, out: out, err: err})
 }
 
-func (r *Recorder) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+func (r *Recorder) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return r.run(nil, false, name, args...)
+}
+
+func (r *Recorder) RunInput(_ context.Context, stdin []byte, name string, args ...string) ([]byte, error) {
+	return r.run(stdin, true, name, args...)
+}
+
+func (r *Recorder) run(stdin []byte, hasInput bool, name string, args ...string) ([]byte, error) {
 	line := Line(name, args...)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.Calls = append(r.Calls, line)
+	if hasInput {
+		r.Inputs = append(r.Inputs, string(stdin))
+	}
 	for i := len(r.stubs) - 1; i >= 0; i-- {
 		if strings.HasPrefix(line, r.stubs[i].prefix) {
 			return []byte(r.stubs[i].out), r.stubs[i].err
@@ -41,7 +54,7 @@ func (r *Recorder) Run(_ context.Context, name string, args ...string) ([]byte, 
 func (r *Recorder) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.Calls = nil
+	r.Calls, r.Inputs = nil, nil
 }
 
 func (r *Recorder) Lines() string {

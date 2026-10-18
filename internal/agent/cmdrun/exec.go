@@ -10,10 +10,17 @@ import (
 
 type Exec struct{}
 
-func (Exec) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+func (e Exec) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return e.RunInput(ctx, nil, name, args...)
+}
+
+func (Exec) RunInput(ctx context.Context, stdin []byte, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	// 目标机 LANG=zh_CN.utf8，本地化输出会破坏解析（如 df 表头）；后者覆盖前者。
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()

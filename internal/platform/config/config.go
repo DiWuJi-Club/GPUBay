@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -271,8 +272,10 @@ func (c *Config) loadAgent(getenv func(string) string, or func(key, def string) 
 	}
 	c.AgentAllowCIDRs = splitList(getenv("SPARK_AGENT_ALLOW_CIDRS"))
 	for _, cidr := range c.AgentAllowCIDRs {
-		if _, _, err := net.ParseCIDR(cidr); err != nil {
-			return fmt.Errorf("SPARK_AGENT_ALLOW_CIDRS 含无效网段 %q", cidr)
+		// 必须是规范的 IPv4 网段（无主机位）：iptables -S 只会打印规范形式，且 IPv6 无法加入 iptables 链。
+		p, err := netip.ParsePrefix(cidr)
+		if err != nil || !p.Addr().Is4() || p.Bits() == 0 || p.Masked() != p {
+			return fmt.Errorf("SPARK_AGENT_ALLOW_CIDRS 含无效网段 %q（需规范的 IPv4 CIDR，如 10.0.9.0/24，不含主机位）", cidr)
 		}
 	}
 	c.AgentDNSServers = splitList(or("SPARK_AGENT_DNS_SERVERS", "223.5.5.5,119.29.29.29"))
