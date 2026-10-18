@@ -69,11 +69,15 @@ func TestSwitchDeliversWithinTwoTicks(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(agB.Stop)
-	f.waitFor("B delivered", func() bool { return agB.Client.Received(createID) })
+	// push 先发送、后记录 tick：Agent 收到后还要等 DeliveryTick 落表
+	f.waitFor("B delivered", func() bool {
+		_, ok := b.Gateway.DeliveryTick(createID)
+		return agB.Client.Received(createID) && ok
+	})
 	ready, ok := b.Gateway.ReadyTick(mid)
-	delivered, ok2 := b.Gateway.DeliveryTick(createID)
-	if !ok || !ok2 {
-		t.Fatalf("ticks missing: ready=%v delivered=%v", ok, ok2)
+	delivered, _ := b.Gateway.DeliveryTick(createID)
+	if !ok {
+		t.Fatal("ready tick missing")
 	}
 	if delivered-ready > 2 {
 		t.Fatalf("re-push at tick %d, ready at %d: more than 2 ticks", delivered, ready)
@@ -88,10 +92,16 @@ func TestSwitchDeliversWithinTwoTicks(t *testing.T) {
 	// 切换后新入队的指令（到期停机）由 B 在 ≤2 tick 内认领投递
 	f.clk.Advance(24*time.Hour + time.Second)
 	f.syncHeartbeat(mid, agB, true)
+	before := b.Gateway.Ticks() // 入队前取 tick 号：界限量的是入队到投递的真实间隔
 	f.sweep()
 	stopID := f.commandID(id, "stop_instance")
-	before := b.Gateway.Ticks()
-	f.waitFor("stop delivered by B", func() bool { return agB.Client.Received(stopID) })
+	if stopID == "" {
+		t.Fatal("stop not enqueued")
+	}
+	f.waitFor("stop delivered by B", func() bool {
+		_, ok := b.Gateway.DeliveryTick(stopID)
+		return agB.Client.Received(stopID) && ok
+	})
 	if tick, _ := b.Gateway.DeliveryTick(stopID); tick-before > 2 {
 		t.Fatalf("stop delivered at tick %d, enqueued around %d", tick, before)
 	}
@@ -115,40 +125,99 @@ func TestConcurrentOrdersDoNotOversell(t *testing.T) {
 		dbtest.Fund(t, f.pool, users[i], 100000)
 	}
 	productID, imageID := dbtest.ProductID(t, f.pool), dbtest.ImageID(t, f.pool)
+	var price int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT amount FROM prices WHERE product_id = $1 AND duration = '1d'`, productID).Scan(&price); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		uid int64
+		err error
+	}
 	var wg sync.WaitGroup
-	results := make(chan error, 50)
+	start := make(chan struct{}) // 50 个协程就位后一起下单
+	results := make(chan result, 50)
 	for _, uid := range users {
 		wg.Add(1)
 		go func(uid int64) {
 			defer wg.Done()
+			<-start
 			_, _, err := f.a.Rental.Place(f.ctx, rental.PlaceRequest{UserID: uid, ProductID: productID, ImageID: imageID, Duration: catalog.D1d})
-			results <- err
+			results <- result{uid, err}
 		}(uid)
 	}
+	close(start)
 	wg.Wait()
 	close(results)
-	okCount, capCount := 0, 0
-	for err := range results {
+	won := map[int64]bool{}
+	capCount := 0
+	for r := range results {
 		switch {
-		case err == nil:
-			okCount++
-		case apperr.As(err) != nil && apperr.As(err).Code == apperr.ErrNoCapacity.Code:
+		case r.err == nil:
+			won[r.uid] = true
+		case apperr.As(r.err) != nil && apperr.As(r.err).Code == apperr.ErrNoCapacity.Code:
 			capCount++
 		default:
-			t.Fatalf("unexpected error: %v", err)
+			t.Fatalf("unexpected error: %v", r.err)
 		}
 	}
-	if okCount != 10 || capCount != 40 {
-		t.Fatalf("ok=%d no_capacity=%d", okCount, capCount)
+	if len(won) != 10 || capCount != 40 {
+		t.Fatalf("ok=%d no_capacity=%d", len(won), capCount)
+	}
+	// 资金：赢家恰好扣一次价格，落空的余额不动；订单与支付流水各 10 条
+	for _, uid := range users {
+		var balance int64
+		if err := f.pool.QueryRow(f.ctx, `SELECT balance FROM wallet_accounts WHERE user_id = $1`, uid).Scan(&balance); err != nil {
+			t.Fatal(err)
+		}
+		want := int64(100000)
+		if won[uid] {
+			want -= price
+		}
+		if balance != want {
+			t.Fatalf("user %d (won=%v) balance = %d, want %d", uid, won[uid], balance, want)
+		}
+	}
+	var orders, pays int
+	_ = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM orders`).Scan(&orders)
+	_ = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM wallet_ledger WHERE kind = 'order_pay'`).Scan(&pays)
+	if orders != 10 || pays != 10 {
+		t.Fatalf("orders = %d, order_pay ledger rows = %d", orders, pays)
 	}
 	f.waitFor("all running", func() bool {
 		var n int
 		_ = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM instances WHERE state = 'running'`).Scan(&n)
 		return n == 10
 	})
-	var perMachine int
-	_ = f.pool.QueryRow(f.ctx, `SELECT count(DISTINCT machine_id) FROM instances`).Scan(&perMachine)
-	if perMachine != 10 {
-		t.Fatalf("instances spread over %d machines", perMachine)
+	// 每台机器恰好一个实例、一条开通指令，且由该机器自己的 Agent 收到
+	rows, err := f.pool.Query(f.ctx, `SELECT machine_id, (array_agg(instance_id))[1], count(*) FROM agent_commands
+		WHERE type = 'create_instance' GROUP BY machine_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	creates := map[int64]string{}
+	for rows.Next() {
+		var mid int64
+		var inst string
+		var n int
+		if err := rows.Scan(&mid, &inst, &n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf("machine %d got %d create commands", mid, n)
+		}
+		creates[mid] = inst
+	}
+	rows.Close()
+	if len(creates) != 10 {
+		t.Fatalf("create commands spread over %d machines", len(creates))
+	}
+	for mid, inst := range creates {
+		ag, ok := agents[mid]
+		if !ok {
+			t.Fatalf("create command for unknown machine %d", mid)
+		}
+		if !ag.Client.Received(f.commandID(inst, "create_instance")) || !ag.Runtime.Containers()[inst].Running {
+			t.Fatalf("machine %d agent did not run instance %s", mid, inst)
+		}
 	}
 }
