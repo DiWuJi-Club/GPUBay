@@ -133,12 +133,22 @@ func (s *Server) ConnCount() int {
 	return len(s.conns)
 }
 
-// OpenToClient 用最近一条连接向客户端发起 NewChannel（测试网关是否拒绝 x11 等类型）。
+// OpenToClient 用最近一条已完成握手的连接向客户端发起 NewChannel（测试网关是否拒绝 x11 等类型）；
+// 没有已就绪的连接时，等最近一条连接握手完成（卡住则超时）。
 func (s *Server) OpenToClient(chType string, extra []byte) error {
 	s.mu.Lock()
 	var e *connEntry
-	if n := len(s.conns); n > 0 {
-		e = s.conns[n-1]
+	for i := len(s.conns) - 1; i >= 0 && e == nil; i-- {
+		select { // 不阻塞地检查是否就绪
+		case <-s.conns[i].ready:
+			if s.conns[i].sconn != nil {
+				e = s.conns[i]
+			}
+		default:
+		}
+	}
+	if e == nil && len(s.conns) > 0 {
+		e = s.conns[len(s.conns)-1]
 	}
 	s.mu.Unlock()
 	if e == nil {
@@ -347,10 +357,17 @@ type forwardedTCPIPMsg struct {
 
 func (s *Server) globalRequests(sconn *ssh.ServerConn, reqs <-chan *ssh.Request) {
 	listeners := map[uint32]net.Listener{} // 实际监听端口 → 监听器
+	// 连接结束：关闭其全部监听，并清掉指向它们的 ForwardAddr
 	defer func() {
 		for _, l := range listeners {
+			addr := l.Addr().String()
 			l.Close()
 			s.untrack(l)
+			s.mu.Lock()
+			if s.forwardAddr == addr {
+				s.forwardAddr = ""
+			}
+			s.mu.Unlock()
 		}
 	}()
 	for req := range reqs {

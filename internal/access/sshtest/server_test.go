@@ -335,3 +335,45 @@ func TestRejects(t *testing.T) {
 		t.Fatal("non-sftp subsystem accepted")
 	}
 }
+
+func TestOpenToClientSkipsUnestablishedConn(t *testing.T) {
+	up := newSigner(t)
+	srv := newServer(t, up)
+	defer srv.Close()
+	dial(t, srv, up)
+	raw, err := net.Dial("tcp", srv.Addr()) // 更新的一条原始连接，握手永远不完成
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.ConnCount() != 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	err = srv.OpenToClient("x11", nil)
+	var oce *ssh.OpenChannelError
+	if !errors.As(err, &oce) || oce.Reason != ssh.UnknownChannelType {
+		t.Fatalf("x11 to client = %v, want UnknownChannelType via established conn", err)
+	}
+}
+
+func TestForwardAddrClearedOnDrop(t *testing.T) {
+	up := newSigner(t)
+	srv := newServer(t, up)
+	defer srv.Close()
+	c := dial(t, srv, up)
+	if _, err := c.Listen("tcp", "127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	if srv.ForwardAddr() == "" {
+		t.Fatal("no forward addr")
+	}
+	srv.DropAll()
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.ForwardAddr() != "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ForwardAddr() != "" {
+		t.Fatalf("forward addr not cleared after drop: %q", srv.ForwardAddr())
+	}
+}
