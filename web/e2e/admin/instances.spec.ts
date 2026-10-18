@@ -552,18 +552,23 @@ test('A-INS-05 洗机失败后重新洗机：需确认、取消不发请求、�
     expect(posts).toHaveLength(1)
   })
 
-  await test.step('连点确定只发一次；指令表新增一条待执行的洗机', async () => {
+  await test.step('连点确定只发一次；指令表新增一条洗机，经真实网关投递后为已下发', async () => {
     await clickTwiceSync(page.getByTestId('rewipe-ok'))
     await toast(page, '已重新下发洗机指令')
     await expect(page.getByTestId('rewipe-dialog')).toBeHidden()
     await expect(wipeRows).toHaveCount(2)
     await drainTasks(page)
     expect(posts).toHaveLength(2)
+    // 新指令先是 pending，网关几十毫秒内投递给步进式 fake Agent 变为 sent；步进式 Agent 不调 hooks.agent() 就不执行，
+    // 假时钟不推进也不会超时，所以 sent 是稳定终态。等到 sent 再刷新页面，界面与接口逐行一致。
+    const wipeStatuses = async () => (await detailOf(ctx, id)).commands.filter((c) => c.type === 'wipe_instance').map((c) => c.status)
+    await expect.poll(wipeStatuses).toEqual(['sent', 'failed']) // 指令表新的在前
+    await page.reload()
     const cmds = (await detailOf(ctx, id)).commands
     expect(cmds.filter((c) => c.type === 'wipe_instance')).toHaveLength(2)
     await expect(page.getByTestId('adetail-cmd-type')).toHaveText(cmds.map((c) => cmdType[c.type]))
     await expect(page.getByTestId('adetail-cmd-status')).toHaveText(cmds.map((c) => cmdStatus[c.status]))
-    await expect(wipeRows.getByTestId('adetail-cmd-status')).toContainText(['待执行'])
+    await expect(wipeRows.getByTestId('adetail-cmd-status')).toContainText(['已下发'])
     await expect(page.getByTestId('adetail-event').filter({ hasText: /^wiping → wiping · admin rewipe · / })).toHaveCount(1)
   })
 })

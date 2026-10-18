@@ -27,9 +27,12 @@ export const hooks = {
   async advance(seconds: number): Promise<Date> {
     return new Date((await post<{ now: string }>('/hooks/clock/advance', { seconds })).now)
   },
+  /** heartbeat（默认 true）：让每个 fake Agent 通过真实流发一次心跳，再跑一轮清扫。 */
   async sweep(opts: { heartbeat?: boolean } = {}): Promise<void> {
     await post('/hooks/sweep', opts)
   },
+  /** 让步进式 fake Agent 执行该机器（缺省全部）当前队列里的指令并上报；指令经真实网关投递，返回时平台已处理完结果。
+   *  未接入的机器会先被接入。fail=true 时每条指令都按失败回报（result 为原因）。 */
   agent(opts: { machine_id?: number; fail?: boolean; result?: string } = {}) {
     return post<{ completed: number }>('/hooks/agent', opts)
   },
