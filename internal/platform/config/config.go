@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -42,6 +43,18 @@ type Config struct {
 	AgentAllowCIDRs    []string
 	AgentDNSServers    []string
 	AgentBandwidthMbps int
+
+	// 计划 3：接入层
+	SSHAddr            string        // SSH 网关监听地址
+	SSHPublicPort      int           // 写进 ssh_command 的公网端口
+	SSHMaxSessions     int           // 每实例并发 SSH 会话上限
+	SSHDrainTimeout    time.Duration // 停机时等待会话结束
+	UpstreamSSHPort    int           // 容器 sshd 在机器上的端口（Create 的 ssh_port 与上游拨号共用）
+	IngressDomain      string        // 租户子域的父域：ins-<id>-<port>.<IngressDomain>
+	AdminPublicBaseURL string        // 后台对外地址（经反向代理暴露时），用于写请求的 Origin 校验；空表示不比对
+	TLSCertFile        string
+	TLSKeyFile         string
+	HTTPRedirectAddr   string // 纯 HTTP 301 到 https 的监听地址；仅 TLS 开启时有效
 }
 
 // AliyunConfig 阿里云短信与号码百科（三要素核验）共用一组 AccessKey。
@@ -164,6 +177,9 @@ func Load(getenv func(string) string) (Config, error) {
 		c.SweepInterval = d
 	}
 	if err := c.loadAgent(getenv, or); err != nil {
+		return Config{}, err
+	}
+	if err := c.loadAccess(getenv, or); err != nil {
 		return Config{}, err
 	}
 	if err := c.checkPlugins(); err != nil {
@@ -354,4 +370,141 @@ func (c Config) AgentAdvertiseAddr() string {
 		host = c.AgentHosts[0]
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// loadAccess 读取并校验接入层（SSH 网关 / Web 入口 / TLS）配置。
+func (c *Config) loadAccess(getenv func(string) string, or func(key, def string) string) error {
+	var err error
+	c.SSHAddr = or("SPARK_SSH_ADDR", ":2222")
+	if _, _, err := net.SplitHostPort(c.SSHAddr); err != nil {
+		return fmt.Errorf("SPARK_SSH_ADDR 必须是 host:port 形式，当前为 %q", c.SSHAddr)
+	}
+	for _, other := range []string{c.HTTPAddr, c.AdminAddr, c.AgentAddr} {
+		if samePort(c.SSHAddr, other) {
+			return fmt.Errorf("SPARK_SSH_ADDR %q 与其它监听地址冲突", c.SSHAddr)
+		}
+	}
+	if c.SSHPublicPort, err = portValue("SPARK_SSH_PUBLIC_PORT", or("SPARK_SSH_PUBLIC_PORT", "22")); err != nil {
+		return err
+	}
+	if c.SSHMaxSessions, err = positiveInt("SPARK_SSH_MAX_SESSIONS_PER_INSTANCE", or("SPARK_SSH_MAX_SESSIONS_PER_INSTANCE", "16")); err != nil {
+		return err
+	}
+	c.SSHDrainTimeout = 30 * time.Second
+	if v := getenv("SPARK_SSH_DRAIN_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("SPARK_SSH_DRAIN_TIMEOUT 格式不正确：%q", v)
+		}
+		c.SSHDrainTimeout = d
+	}
+	if c.UpstreamSSHPort, err = portValue("SPARK_UPSTREAM_SSH_PORT", or("SPARK_UPSTREAM_SSH_PORT", "2222")); err != nil {
+		return err
+	}
+	c.IngressDomain = strings.ToLower(or("SPARK_INGRESS_DOMAIN", c.Domain))
+	if net.ParseIP(c.IngressDomain) != nil || !validHost(c.IngressDomain) {
+		return fmt.Errorf("SPARK_INGRESS_DOMAIN 不是合法域名：%q", c.IngressDomain)
+	}
+	if c.IngressDomain != strings.ToLower(c.Domain) && strings.HasSuffix(c.IngressDomain, "."+strings.ToLower(c.Domain)) {
+		return fmt.Errorf("SPARK_INGRESS_DOMAIN %q 不能是 SPARK_DOMAIN 的子域（请用不同的注册域，例如 sparkapp.example）", c.IngressDomain)
+	}
+	if c.PublicBaseURL == "" {
+		_, port, _ := net.SplitHostPort(c.HTTPAddr)
+		c.PublicBaseURL = "http://" + net.JoinHostPort(c.Domain, port)
+	}
+	u, err := url.Parse(c.PublicBaseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.Path != "" || u.RawQuery != "" || u.User != nil {
+		return fmt.Errorf("SPARK_PUBLIC_BASE_URL 必须形如 https://域名[:端口]，当前为 %q", c.PublicBaseURL)
+	}
+	if !strings.EqualFold(u.Hostname(), c.Domain) {
+		return fmt.Errorf("SPARK_PUBLIC_BASE_URL 的域名 %q 必须等于 SPARK_DOMAIN %q", u.Hostname(), c.Domain)
+	}
+	if c.Env == "prod" && u.Scheme != "https" {
+		return errors.New("生产环境的 SPARK_PUBLIC_BASE_URL 必须以 https:// 开头")
+	}
+	c.AdminPublicBaseURL = strings.TrimRight(getenv("SPARK_ADMIN_PUBLIC_BASE_URL"), "/")
+	if c.AdminPublicBaseURL != "" {
+		au, err := url.Parse(c.AdminPublicBaseURL)
+		if err != nil || (au.Scheme != "http" && au.Scheme != "https") || au.Hostname() == "" {
+			return fmt.Errorf("SPARK_ADMIN_PUBLIC_BASE_URL 必须形如 https://域名[:端口]，当前为 %q", c.AdminPublicBaseURL)
+		}
+	}
+	c.TLSCertFile, c.TLSKeyFile = getenv("SPARK_TLS_CERT_FILE"), getenv("SPARK_TLS_KEY_FILE")
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		return errors.New("SPARK_TLS_CERT_FILE 与 SPARK_TLS_KEY_FILE 必须同时设置")
+	}
+	c.HTTPRedirectAddr = getenv("SPARK_HTTP_REDIRECT_ADDR")
+	if c.HTTPRedirectAddr != "" {
+		if !c.TLSEnabled() {
+			return errors.New("SPARK_HTTP_REDIRECT_ADDR 只在配置了 TLS 证书时有效")
+		}
+		if _, _, err := net.SplitHostPort(c.HTTPRedirectAddr); err != nil {
+			return fmt.Errorf("SPARK_HTTP_REDIRECT_ADDR 必须是 host:port 形式，当前为 %q", c.HTTPRedirectAddr)
+		}
+	}
+	if c.Env == "prod" && !c.TLSEnabled() && !c.TrustProxy {
+		return errors.New("生产环境必须配置 TLS 证书或在反向代理后设置 SPARK_TRUST_PROXY=true")
+	}
+	return nil
+}
+
+// TLSEnabled 报告公网监听器是否由 platform 自己终止 TLS。
+func (c Config) TLSEnabled() bool { return c.TLSCertFile != "" }
+
+// FillAccessDefaults 给没有经过 Load 的 Config 字面量（测试、e2e-server）补上接入层零值字段的默认值；Load 之后调用无副作用。
+func (c Config) FillAccessDefaults() Config {
+	if c.SSHAddr == "" {
+		c.SSHAddr = ":2222"
+	}
+	if c.SSHPublicPort == 0 {
+		c.SSHPublicPort = 22
+	}
+	if c.SSHMaxSessions == 0 {
+		c.SSHMaxSessions = 16
+	}
+	if c.SSHDrainTimeout == 0 {
+		c.SSHDrainTimeout = 30 * time.Second
+	}
+	if c.UpstreamSSHPort == 0 {
+		c.UpstreamSSHPort = 2222
+	}
+	if c.IngressDomain == "" {
+		c.IngressDomain = strings.ToLower(c.Domain)
+	}
+	if c.PublicBaseURL == "" {
+		_, port, _ := net.SplitHostPort(c.HTTPAddr)
+		if port == "" {
+			port = "8080"
+		}
+		c.PublicBaseURL = "http://" + net.JoinHostPort(c.Domain, port)
+	}
+	return c
+}
+
+// PublicURL 返回已校验的对外地址（Load 之后一定可解析）。
+func (c Config) PublicURL() *url.URL {
+	u, _ := url.Parse(c.PublicBaseURL)
+	return u
+}
+
+// SSHHost 是用户 SSH 命令里的主机名。
+func (c Config) SSHHost() string { return "ssh." + c.Domain }
+
+func portValue(name, v string) (int, error) {
+	n, err := positiveInt(name, v)
+	if err != nil || n > 65535 {
+		return 0, fmt.Errorf("%s 必须是 1～65535 的端口号，当前为 %q", name, v)
+	}
+	return n, nil
+}
+
+// samePort 判断两个监听地址是否会抢同一个端口（host 为空、0.0.0.0 或 :: 视为所有地址）。
+func samePort(a, b string) bool {
+	ha, pa, err1 := net.SplitHostPort(a)
+	hb, pb, err2 := net.SplitHostPort(b)
+	if err1 != nil || err2 != nil || pa != pb {
+		return false
+	}
+	any := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" }
+	return any(ha) || any(hb) || ha == hb
 }

@@ -65,7 +65,7 @@ func TestLoadPlan4Defaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.AdminAddr != "127.0.0.1:8081" || c.UploadDir != "./.devdata/uploads" || c.PayDriver != "mock" || c.PDUDriver != "mock" ||
-		c.PublicBaseURL != "" || c.Aliyun.SMSEndpoint != "https://dysmsapi.aliyuncs.com" ||
+		c.PublicBaseURL != "http://spark.local:8080" || c.Aliyun.SMSEndpoint != "https://dysmsapi.aliyuncs.com" ||
 		c.Aliyun.KYCEndpoint != "https://dytnsapi.aliyuncs.com" || c.Wechat.Enabled() || c.Alipay.Enabled() {
 		t.Fatalf("config = %+v", c)
 	}
@@ -78,8 +78,8 @@ func prodEnv() map[string]string {
 		"SPARK_SMS_DRIVER": "aliyun", "SPARK_KYC_DRIVER": "aliyun", "SPARK_PAY_DRIVER": "real", "SPARK_PDU_DRIVER": "snmp",
 		"SPARK_ALIYUN_ACCESS_KEY_ID": "ak", "SPARK_ALIYUN_ACCESS_KEY_SECRET": "sk",
 		"SPARK_SMS_SIGN": "Spark", "SPARK_SMS_TPL_LOGIN": "SMS_1", "SPARK_SMS_TPL_EXPIRY": "SMS_2", "SPARK_KYC_AUTH_CODE": "auth",
-		"SPARK_PUBLIC_BASE_URL": "https://spark.example.com/",
-		"SPARK_WECHAT_MCH_ID":   "1900000001", "SPARK_WECHAT_APP_ID": "wx123", "SPARK_WECHAT_API_V3_KEY": "0123456789abcdef0123456789abcdef",
+		"SPARK_PUBLIC_BASE_URL": "https://spark.example.com/", "SPARK_DOMAIN": "spark.example.com", "SPARK_TRUST_PROXY": "true",
+		"SPARK_WECHAT_MCH_ID": "1900000001", "SPARK_WECHAT_APP_ID": "wx123", "SPARK_WECHAT_API_V3_KEY": "0123456789abcdef0123456789abcdef",
 		"SPARK_WECHAT_CERT_SERIAL": "SERIAL", "SPARK_WECHAT_PRIVATE_KEY_PATH": "/etc/spark/wx.pem",
 		"SPARK_WECHAT_PUBLIC_KEY_ID": "PUB_KEY_ID_1", "SPARK_WECHAT_PUBLIC_KEY_PATH": "/etc/spark/wxpub.pem",
 		"SPARK_ALIPAY_APP_ID": "2021000000000001", "SPARK_ALIPAY_PRIVATE_KEY_PATH": "/etc/spark/ali.pem",
@@ -224,5 +224,88 @@ func TestLoadAgentErrors(t *testing.T) {
 	m["SPARK_AGENT_DNS_SERVERS"], m["SPARK_AGENT_ALLOW_CIDRS"] = "10.0.0.53", "10.0.0.0/24"
 	if _, err := config.Load(env(m)); err != nil {
 		t.Fatalf("private dns inside allow list: %v", err)
+	}
+}
+
+func TestLoadAccessDefaults(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SSHAddr != ":2222" || c.SSHPublicPort != 22 || c.SSHMaxSessions != 16 || c.SSHDrainTimeout != 30*time.Second || c.UpstreamSSHPort != 2222 ||
+		c.IngressDomain != "spark.local" || c.AdminPublicBaseURL != "" || c.PublicBaseURL != "http://spark.local:8080" || c.TLSEnabled() || c.HTTPRedirectAddr != "" {
+		t.Fatalf("access defaults = %+v", c)
+	}
+	if c.PublicURL().Host != "spark.local:8080" || c.SSHHost() != "ssh.spark.local" {
+		t.Fatalf("derived = %s %s", c.PublicURL(), c.SSHHost())
+	}
+	// 字面量（测试 / e2e-server）补默认值
+	lit := config.Config{Domain: "spark.test"}.FillAccessDefaults()
+	if lit.UpstreamSSHPort != 2222 || lit.IngressDomain != "spark.test" || lit.PublicBaseURL != "http://spark.test:8080" || lit.SSHMaxSessions != 16 || lit.SSHDrainTimeout != 30*time.Second {
+		t.Fatalf("literal defaults = %+v", lit)
+	}
+}
+
+func TestLoadAccessValues(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey,
+		"SPARK_DOMAIN": "spark.example", "SPARK_PUBLIC_BASE_URL": "https://spark.example/", "SPARK_INGRESS_DOMAIN": "sparkapp.example",
+		"SPARK_SSH_ADDR": "0.0.0.0:2200", "SPARK_SSH_PUBLIC_PORT": "2200", "SPARK_SSH_MAX_SESSIONS_PER_INSTANCE": "4", "SPARK_SSH_DRAIN_TIMEOUT": "5s",
+		"SPARK_UPSTREAM_SSH_PORT": "2223", "SPARK_ADMIN_PUBLIC_BASE_URL": "https://admin.spark.example/", "SPARK_TLS_CERT_FILE": "/etc/spark/tls.crt",
+		"SPARK_TLS_KEY_FILE": "/etc/spark/tls.key", "SPARK_HTTP_REDIRECT_ADDR": ":8080"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SSHAddr != "0.0.0.0:2200" || c.SSHPublicPort != 2200 || c.SSHMaxSessions != 4 || c.SSHDrainTimeout != 5*time.Second || c.UpstreamSSHPort != 2223 ||
+		c.IngressDomain != "sparkapp.example" || c.AdminPublicBaseURL != "https://admin.spark.example" || c.PublicBaseURL != "https://spark.example" ||
+		!c.TLSEnabled() || c.HTTPRedirectAddr != ":8080" {
+		t.Fatalf("access values = %+v", c)
+	}
+}
+
+func TestLoadAccessErrors(t *testing.T) {
+	base := func() map[string]string {
+		return map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}
+	}
+	cases := []struct {
+		name string
+		set  map[string]string
+		want string
+	}{
+		{"ssh addr no port", map[string]string{"SPARK_SSH_ADDR": "2222"}, "SPARK_SSH_ADDR"},
+		{"ssh addr equals http", map[string]string{"SPARK_SSH_ADDR": ":8080"}, "SPARK_SSH_ADDR"},
+		{"public port 0", map[string]string{"SPARK_SSH_PUBLIC_PORT": "0"}, "SPARK_SSH_PUBLIC_PORT"},
+		{"max sessions 0", map[string]string{"SPARK_SSH_MAX_SESSIONS_PER_INSTANCE": "0"}, "SPARK_SSH_MAX_SESSIONS_PER_INSTANCE"},
+		{"drain bad", map[string]string{"SPARK_SSH_DRAIN_TIMEOUT": "soon"}, "SPARK_SSH_DRAIN_TIMEOUT"},
+		{"upstream port", map[string]string{"SPARK_UPSTREAM_SSH_PORT": "99999"}, "SPARK_UPSTREAM_SSH_PORT"},
+		{"ingress subdomain", map[string]string{"SPARK_INGRESS_DOMAIN": "app.spark.local"}, "SPARK_INGRESS_DOMAIN"},
+		{"ingress invalid", map[string]string{"SPARK_INGRESS_DOMAIN": "bad domain"}, "SPARK_INGRESS_DOMAIN"},
+		{"base url host mismatch", map[string]string{"SPARK_PUBLIC_BASE_URL": "http://other.local:8080"}, "SPARK_PUBLIC_BASE_URL"},
+		{"base url no scheme", map[string]string{"SPARK_PUBLIC_BASE_URL": "spark.local"}, "SPARK_PUBLIC_BASE_URL"},
+		{"admin url bad", map[string]string{"SPARK_ADMIN_PUBLIC_BASE_URL": "admin.local"}, "SPARK_ADMIN_PUBLIC_BASE_URL"},
+		{"tls half", map[string]string{"SPARK_TLS_CERT_FILE": "/a.crt"}, "SPARK_TLS_KEY_FILE"},
+		{"redirect without tls", map[string]string{"SPARK_HTTP_REDIRECT_ADDR": ":80"}, "SPARK_HTTP_REDIRECT_ADDR"},
+	}
+	for _, c := range cases {
+		m := base()
+		for k, v := range c.set {
+			m[k] = v
+		}
+		if _, err := config.Load(env(m)); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: err = %v, want mention of %s", c.name, err, c.want)
+		}
+	}
+	// prod：无证书且不在代理后 → 拒绝；prodEnv 带 SPARK_TRUST_PROXY=true → 通过；base url 必须 https
+	p := prodEnv()
+	delete(p, "SPARK_TRUST_PROXY")
+	if _, err := config.Load(env(p)); err == nil || !strings.Contains(err.Error(), "SPARK_TRUST_PROXY") {
+		t.Fatalf("prod without tls = %v", err)
+	}
+	p = prodEnv()
+	if _, err := config.Load(env(p)); err != nil {
+		t.Fatalf("prod behind proxy = %v", err)
+	}
+	p["SPARK_PUBLIC_BASE_URL"] = "http://spark.example.com"
+	if _, err := config.Load(env(p)); err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("prod http base = %v", err)
 	}
 }
