@@ -14,6 +14,7 @@ const (
 	keepaliveInterval = 60 * time.Second
 	keepaliveMisses   = 3
 	keepaliveTimeout  = 15 * time.Second
+	maxPendingOpens   = 64 // 每条连接、每个方向上未确认（还在等对端回应）的通道打开数上限
 )
 
 // 策略：白名单 + 默认拒绝。网关不解析任何通道 / 请求的载荷，原样转给对端。
@@ -42,20 +43,10 @@ func (s *Server) relay(sess *session, down *ssh.ServerConn, downChans <-chan ssh
 			}
 		})
 	}()
-	go func() {
-		defer wg.Done()
-		for nc := range downChans { // 打开对端通道要等确认：每个都异步，慢的不挡后面的
-			sess.pipes.Add(1)
-			go func() { defer sess.pipes.Done(); s.openOn(sess, nc, up, true) }()
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for nc := range upChans {
-			sess.pipes.Add(1)
-			go func() { defer sess.pipes.Done(); s.openOn(sess, nc, down, false) }()
-		}
-	}()
+	// 打开对端通道要等确认：每个都异步，慢的不挡后面的；每个方向未确认的打开数有上限，超出回 ResourceShortage
+	var downPending, upPending atomic.Int32
+	go func() { defer wg.Done(); s.acceptOpens(sess, downChans, up, true, &downPending) }()
+	go func() { defer wg.Done(); s.acceptOpens(sess, upChans, down, false, &upPending) }()
 	stop := make(chan struct{})
 	go s.keepalive(down, stop)
 	go s.keepalive(up, stop)
@@ -88,10 +79,28 @@ func forwardGlobal(in <-chan *ssh.Request, out ssh.Conn, allowed map[string]bool
 	}
 }
 
+// acceptOpens 逐个领取一侧的 NewChannel 并异步打开到另一侧；pending 计未确认的打开数（拿到对端回应即减）。
+func (s *Server) acceptOpens(sess *session, chans <-chan ssh.NewChannel, other ssh.Conn, fromClient bool, pending *atomic.Int32) {
+	for nc := range chans {
+		if pending.Add(1) > maxPendingOpens {
+			pending.Add(-1)
+			nc.Reject(ssh.ResourceShortage, "too many pending channel opens")
+			continue
+		}
+		sess.pipes.Add(1)
+		go func() {
+			defer sess.pipes.Done()
+			s.openOn(sess, nc, other, fromClient, func() { pending.Add(-1) })
+		}()
+	}
+}
+
 // openOn 把一侧的 NewChannel 原样开到另一侧；fromClient 决定白名单与字节计数方向。
-func (s *Server) openOn(sess *session, nc ssh.NewChannel, other ssh.Conn, fromClient bool) {
+// settled 恰好调用一次，在回复本侧之前：策略拒绝时，或对端已回应（确认 / 拒绝）时——本侧看到结果时额度已归还。
+func (s *Server) openOn(sess *session, nc ssh.NewChannel, other ssh.Conn, fromClient bool, settled func()) {
 	t := nc.ChannelType()
 	if (fromClient && !clientChannelAllowed(t)) || (!fromClient && !upstreamChannelAllowed(t)) {
+		settled()
 		reason := ssh.Prohibited
 		if fromClient {
 			reason = ssh.UnknownChannelType
@@ -100,6 +109,7 @@ func (s *Server) openOn(sess *session, nc ssh.NewChannel, other ssh.Conn, fromCl
 		return
 	}
 	och, oreqs, err := other.OpenChannel(t, nc.ExtraData())
+	settled()
 	if err != nil {
 		var oce *ssh.OpenChannelError
 		if errors.As(err, &oce) {
@@ -155,21 +165,28 @@ func pipeChannels(a ssh.Channel, aReqs <-chan *ssh.Request, b ssh.Channel, bReqs
 		a.CloseWrite()
 		close(bToA)
 	}()
+	// aBusy / bBusy：正在把 a / b 发来的请求转给对端并等回应。关 a 之前先等 a 的在途请求回完：
+	// 秒退的 exec（`exit 3`、`stderr x`）在上游回 exec 成功后立刻 exit-status + Close，若先关 a，
+	// 客户端的 exec 请求收不到回应，只得到 EOF。
+	var aBusy, bBusy sync.Mutex
+	closeAfter := func(c ssh.Channel, busy *sync.Mutex) { busy.Lock(); c.Close(); busy.Unlock() }
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); forwardChannelRequests(aReqs, b); <-aToB; b.Close() }() // 客户端关了：a 读到 EOF 后拷贝结束，再关容器侧
-	go func() { defer wg.Done(); forwardChannelRequests(bReqs, a); <-bToA; a.Close() }() // 容器关了：b 的尾部数据写完再关客户端侧
+	go func() { defer wg.Done(); forwardChannelRequests(aReqs, b, &aBusy); <-aToB; closeAfter(b, &bBusy) }() // 客户端关了：a 读到 EOF 后拷贝结束，再关容器侧
+	go func() { defer wg.Done(); forwardChannelRequests(bReqs, a, &bBusy); <-bToA; closeAfter(a, &aBusy) }() // 容器关了：b 的尾部数据写完再关客户端侧
 	wg.Wait()
 }
 
 // forwardChannelRequests 结束时该侧通道已被对端关闭，读端随之 EOF，所以上面的 <-aToB / <-bToA 不会永久阻塞。
-
-func forwardChannelRequests(in <-chan *ssh.Request, out ssh.Channel) {
+// busy 在转发一条请求并回复期间持有；此时对端通道已关闭，SendRequest 立即返回，所以 closeAfter 不会久等。
+func forwardChannelRequests(in <-chan *ssh.Request, out ssh.Channel, busy *sync.Mutex) {
 	for req := range in {
+		busy.Lock()
 		ok, err := out.SendRequest(req.Type, req.WantReply, req.Payload)
 		if req.WantReply {
 			req.Reply(ok && err == nil, nil)
 		}
+		busy.Unlock()
 	}
 }
 

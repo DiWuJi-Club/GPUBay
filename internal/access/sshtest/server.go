@@ -41,6 +41,7 @@ type Server struct {
 	extras      map[io.Closer]bool // 转发用的目标连接 / 监听器，Close 时一并关闭
 	holds       map[int]*hold      // direct-tcpip 目标端口 → 挂起闸门（测试慢速通道打开）
 	held        int                // 当前挂起中的 direct-tcpip 打开数
+	globals     []string           // 收到的全局请求类型（按到达顺序）
 	closed      bool
 	wg          sync.WaitGroup
 }
@@ -152,6 +153,13 @@ func (s *Server) LastDirectTCPIP() []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]byte(nil), s.lastDirect...)
+}
+
+// GlobalRequests 返回迄今收到的全局请求类型（按到达顺序；回复之前登记）。
+func (s *Server) GlobalRequests() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.globals...)
 }
 
 func (s *Server) ForwardAddr() string {
@@ -438,6 +446,9 @@ func (s *Server) globalRequests(sconn *ssh.ServerConn, reqs <-chan *ssh.Request)
 		}
 	}()
 	for req := range reqs {
+		s.mu.Lock()
+		s.globals = append(s.globals, req.Type)
+		s.mu.Unlock()
 		switch req.Type {
 		case "tcpip-forward":
 			var m tcpipForwardMsg
@@ -629,8 +640,29 @@ func (x *session) exec(ch ssh.Channel, cmd string) uint32 {
 	case cmd == "hostkeys":
 		x.conn.SendRequest("hostkeys-00@openssh.com", false, ssh.Marshal(struct{ K []byte }{x.srv.signer.PublicKey().Marshal()}))
 		fmt.Fprint(ch, "sent\n")
+	case strings.HasPrefix(cmd, "big "):
+		n, _ := strconv.Atoi(strings.TrimPrefix(cmd, "big "))
+		writeN(ch, n)
+	case strings.HasPrefix(cmd, "bigerr "):
+		n, _ := strconv.Atoi(strings.TrimPrefix(cmd, "bigerr "))
+		writeN(ch.Stderr(), n)
 	default:
 		fmt.Fprintf(ch, "exec:%s\n", cmd)
 	}
 	return 0
+}
+
+// writeN 写 n 个 'x'（64 KiB 一块），命令返回后 session 立即 exit：用来验证网关不截断尾部数据。
+func writeN(w io.Writer, n int) {
+	block := []byte(strings.Repeat("x", 65536))
+	for n > 0 {
+		k := len(block)
+		if n < k {
+			k = n
+		}
+		if _, err := w.Write(block[:k]); err != nil {
+			return
+		}
+		n -= k
+	}
 }
