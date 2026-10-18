@@ -263,3 +263,37 @@ func TestAccessInfoLogValueRedactsPassword(t *testing.T) {
 		t.Fatalf("log = %s", out)
 	}
 }
+
+func TestSessionStates(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	if got, err := e.svc.SessionStates(e.ctx, nil); err != nil || len(got) != 0 {
+		t.Fatalf("empty = %v %v", got, err)
+	}
+	got, err := e.svc.SessionStates(e.ctx, []string{inst.ID, "ins-nope0000"})
+	if err != nil || len(got) != 1 || got[inst.ID] != (rental.SessionState{State: rental.StateRunning}) {
+		t.Fatalf("states = %v %v", got, err)
+	}
+	if _, ok := got["ins-nope0000"]; ok {
+		t.Fatal("missing id present")
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET suspended_at = now() WHERE id = $1`, inst.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = e.svc.SessionStates(e.ctx, []string{inst.ID})
+	if got[inst.ID] != (rental.SessionState{State: rental.StateRunning, Suspended: true}) {
+		t.Fatalf("suspended = %v", got)
+	}
+	e.clock.Advance(25 * time.Hour)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET suspended_at = NULL WHERE id = $1`, inst.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.ExpireDue(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = e.svc.SessionStates(e.ctx, []string{inst.ID})
+	if got[inst.ID].State != rental.StateStopped {
+		t.Fatalf("stopped = %v", got)
+	}
+}

@@ -153,6 +153,9 @@ func (s *Service) Access(ctx context.Context, instanceID string) (AccessInfo, er
 	}
 	if err := s.d.Pool.QueryRow(ctx, `SELECT lan_ip, serial, agent_online FROM machines WHERE id = $1`, inst.MachineID).
 		Scan(&info.MachineLanIP, &info.MachineSerial, &info.AgentOnline); err != nil {
+		if db.IsNoRows(err) {
+			return AccessInfo{}, apperr.ErrNotFound
+		}
 		return AccessInfo{}, err
 	}
 	plain, err := s.d.Box.Open(enc)
@@ -165,6 +168,34 @@ func (s *Service) Access(ctx context.Context, instanceID string) (AccessInfo, er
 		info.RetainUntil = &t
 	}
 	return info, nil
+}
+
+// SessionState 是 SSH 网关周期扫描所需的实例状态（不含密码等需解密的字段）。
+type SessionState struct {
+	State     string
+	Suspended bool
+}
+
+// SessionStates 一次查询返回多个实例的状态；不存在的 ID 不出现在结果里。
+func (s *Service) SessionStates(ctx context.Context, ids []string) (map[string]SessionState, error) {
+	out := make(map[string]SessionState, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.d.Pool.Query(ctx, `SELECT i.id, i.state, i.suspended_at IS NOT NULL FROM instances i WHERE i.id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var st SessionState
+		if err := rows.Scan(&id, &st.State, &st.Suspended); err != nil {
+			return nil, err
+		}
+		out[id] = st
+	}
+	return out, rows.Err()
 }
 
 // ---- SSH 会话记录 ----

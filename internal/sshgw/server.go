@@ -28,10 +28,13 @@ const (
 	upstreamTimeout   = 10 * time.Second // Config.UpstreamTimeout 的默认值
 	rejectWait        = 2 * time.Second
 	limiterSweepEvery = time.Minute
+	acceptBackoffMin  = 5 * time.Millisecond
+	acceptBackoffMax  = time.Second
 )
 
 type Store interface {
 	Access(ctx context.Context, instanceID string) (rental.AccessInfo, error)
+	SessionStates(ctx context.Context, ids []string) (map[string]rental.SessionState, error) // 周期扫描用的批量状态；不存在的 ID 不在结果里
 	SetSSHHostPubkeyIfEmpty(ctx context.Context, id, pub string) (bool, error)
 	SSHHostPubkey(ctx context.Context, id string) (string, error) // 首连信任写回竞争失败后复读
 	OpenSSHSession(ctx context.Context, st rental.SSHSessionStart) (int64, error)
@@ -195,14 +198,7 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	accepted := make(chan struct{})
 	go func() {
 		defer close(accepted)
-		for {
-			nc, err := lis.Accept()
-			if err != nil {
-				return
-			}
-			s.wg.Add(1)
-			go s.handleConn(ctx, nc)
-		}
+		s.acceptLoop(ctx, lis)
 	}()
 	<-ctx.Done()
 	lis.Close()
@@ -210,6 +206,37 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	s.drain()
 	<-loopsDone
 	return nil
+}
+
+// acceptLoop 接受连接直到监听关闭或 ctx 结束；其它 Accept 错误（如 EMFILE）记录后退避重试（5ms 起翻倍，上限 1s，同 net/http）。
+func (s *Server) acceptLoop(ctx context.Context, lis net.Listener) {
+	var delay time.Duration
+	for {
+		nc, err := lis.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+				return
+			}
+			if delay == 0 {
+				delay = acceptBackoffMin
+			} else if delay *= 2; delay > acceptBackoffMax {
+				delay = acceptBackoffMax
+			}
+			s.d.Log.Error("ssh accept", "err", err, "retry_in", delay)
+			t := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+			continue
+		}
+		delay = 0
+		s.wg.Add(1)
+		s.trackConn(nc, true) // 先登记再起 goroutine：drain 一定能看到它
+		go s.handleConn(ctx, nc)
+	}
 }
 
 func remoteIP(addr net.Addr) string {
@@ -244,7 +271,6 @@ func (s *Server) noteAttempt(c ssh.ConnMetadata, found bool) {
 
 func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	defer s.wg.Done()
-	s.trackConn(nc, true)
 	defer s.trackConn(nc, false)
 	ip := remoteIP(nc.RemoteAddr())
 	if !s.lim.acquireConn(ip) {

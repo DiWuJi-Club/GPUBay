@@ -34,16 +34,17 @@ func newSigner(t *testing.T) ssh.Signer {
 }
 
 type fakeStore struct {
-	mu       sync.Mutex
-	infos    map[string]rental.AccessInfo
-	failNext error
-	failLeft int // failNext 还要生效的次数
-	nextID   int64
-	opened   []rental.SSHSessionStart
-	closed   map[int64][2]int64
-	touched  [][]int64
-	alerts   []string
-	accessed int
+	mu           sync.Mutex
+	infos        map[string]rental.AccessInfo
+	failNext     error
+	failLeft     int // failNext 还要生效的次数
+	nextID       int64
+	opened       []rental.SSHSessionStart
+	closed       map[int64][2]int64
+	touched      [][]int64
+	alerts       []string
+	accessed     int
+	stateQueries int
 	// tofuRace 非空：模拟其它副本抢先写回该公钥，SetSSHHostPubkeyIfEmpty 返回 false
 	tofuRace string
 }
@@ -81,6 +82,24 @@ func (f *fakeStore) Access(_ context.Context, id string) (rental.AccessInfo, err
 		return rental.AccessInfo{}, apperr.ErrNotFound
 	}
 	return info, nil
+}
+
+// SessionStates 与 Access 共用失败注入：注入的错误对下一次（批量）查询生效。
+func (f *fakeStore) SessionStates(_ context.Context, ids []string) (map[string]rental.SessionState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stateQueries++
+	if f.failNext != nil && f.failLeft > 0 {
+		f.failLeft--
+		return nil, f.failNext
+	}
+	out := map[string]rental.SessionState{}
+	for _, id := range ids {
+		if info, ok := f.infos[id]; ok {
+			out[id] = rental.SessionState{State: info.Instance.State, Suspended: info.Instance.Suspended()}
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) SetSSHHostPubkeyIfEmpty(_ context.Context, id, pub string) (bool, error) {
@@ -240,7 +259,10 @@ func runningInfo(e *env, id string, userID int64, password string) rental.Access
 	}
 }
 
-func newEnvWith(t *testing.T, tweak func(*sshgw.Config)) *env {
+func newEnvWith(t *testing.T, tweak func(*sshgw.Config)) *env { return newEnvLis(t, tweak, nil) }
+
+// newEnvLis 同 newEnvWith，wrap 非空时用它包装监听器（模拟 Accept 错误）。
+func newEnvLis(t *testing.T, tweak func(*sshgw.Config), wrap func(net.Listener) net.Listener) *env {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	up := newSigner(t)
@@ -262,6 +284,9 @@ func newEnvWith(t *testing.T, tweak func(*sshgw.Config)) *env {
 		t.Fatal(err)
 	}
 	e.addr = lis.Addr().String()
+	if wrap != nil {
+		lis = wrap(lis)
+	}
 	go func() { defer close(e.done); _ = e.srv.Serve(ctx, lis) }()
 	e.store.set(instA, runningInfo(e, instA, 7, "pw-correct-16chr"))
 	t.Cleanup(func() { cancel(); <-e.done; us.Close() })
