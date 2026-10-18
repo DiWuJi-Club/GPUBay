@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package spark.agent.v1;
+
+option go_package = "spark-cloud/internal/agentpb;agentpb";
+
+// AgentGateway 是平台侧网关：Enroll 不需要客户端证书（一次性令牌 + CSR），Connect 必须 mTLS。
+service AgentGateway {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  rpc Connect(stream AgentMessage) returns (stream PlatformMessage);
+}
+
+message EnrollRequest {
+  string token = 1;    // spk1_<令牌>
+  bytes csr_der = 2;   // PKCS#10 DER，平台只取其公钥
+}
+
+message EnrollResponse {
+  bytes cert_der = 1;  // 机器证书 DER（CN = 序列号）
+  bytes ca_der = 2;    // 根 CA 证书 DER
+}
+
+message AgentMessage {
+  oneof msg {
+    Hello hello = 1;          // 建流后第一条
+    StateReport state = 2;    // 建流后第二条，此后每 60 秒一次，以及每条指令执行完后
+    Heartbeat heartbeat = 3;  // 每 10 秒
+    CommandResult result = 4;
+  }
+}
+
+message PlatformMessage {
+  oneof msg {
+    Command command = 1;
+    AgentConfig config = 2;   // 建流后平台发的第一条
+  }
+}
+
+message Hello {
+  string agent_version = 1;
+  string hostname = 2;
+  repeated string ips = 3;    // 本机全部 IPv4 地址
+}
+
+message AgentConfig {
+  string lan_ip = 1;                 // machines.lan_ip，容器 SSH 端口发布到该地址
+  uint32 heartbeat_interval_s = 2;
+  repeated string allow_cidrs = 3;   // 内网白名单
+  repeated string dns_servers = 4;
+  uint32 bandwidth_mbps = 5;         // 默认限速
+  uint32 data_size_gib = 6;          // 数据盘大小
+}
+
+message Command {
+  string id = 1;           // agent_commands.id
+  string instance_id = 2;  // pull_image 为空
+  oneof body {
+    CreateInstance create = 10;
+    StartInstance start = 11;
+    StopInstance stop = 12;
+    WipeInstance wipe = 13;
+    PullImage pull = 14;
+  }
+}
+
+message CreateInstance {
+  string image_ref = 1;
+  string upstream_pubkey = 2;   // authorized_keys 一行
+  uint32 bandwidth_mbps = 3;
+  uint32 ssh_port = 4;          // 本计划固定 2222
+  uint32 data_size_gib = 5;
+}
+message StartInstance {}
+message StopInstance {}
+message WipeInstance {}
+message PullImage { string image_ref = 1; }
+
+message CommandResult {
+  string command_id = 1;
+  bool ok = 2;
+  string message = 3;   // 失败原因：命令 + stderr 末尾 500 字节
+}
+
+message StateReport { repeated InstanceState instances = 1; }
+
+message InstanceState {
+  string instance_id = 1;
+  string phase = 2;   // running / stopped / missing_data / unknown
+}
+
+message Heartbeat { Metrics metrics = 1; }
+
+message Metrics {
+  double gpu_util = 1;
+  double gpu_temp_c = 2;
+  double gpu_power_w = 3;
+  uint64 mem_total = 4;
+  uint64 mem_used = 5;
+  uint64 root_disk_total = 6;
+  uint64 root_disk_used = 7;
+  uint64 data_disk_used = 8;
+  double load1 = 9;
+}
