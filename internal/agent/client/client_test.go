@@ -51,6 +51,7 @@ type fakeGateway struct {
 	drop     chan struct{} // 关闭当前流
 	refuse   bool          // 为真时拒绝新流（模拟平台不可达）
 	reject   bool          // 为真时立即返回 Unauthenticated（模拟证书被撤销）
+	rejected chan struct{} // 非 nil 时，拒绝流的 Connect 返回时关闭（「网关已返回」信号）
 }
 
 func (g *fakeGateway) Enroll(_ context.Context, req *agentpb.EnrollRequest) (*agentpb.EnrollResponse, error) {
@@ -76,6 +77,10 @@ func (g *fakeGateway) Connect(stream agentpb.AgentGateway_ConnectServer) error {
 		return status.Error(codes.Unavailable, "refused")
 	}
 	if g.reject {
+		if g.rejected != nil {
+			defer close(g.rejected)
+			g.rejected = nil // 只关闭一次
+		}
 		g.mu.Unlock()
 		return status.Error(codes.Unauthenticated, "certificate not recognised")
 	}
@@ -141,7 +146,7 @@ type harness struct {
 	key        *ecdsa.PrivateKey
 	dir        string // 最近一个 agent 的状态目录
 	collect    func(context.Context) metrics.Metrics
-	helloDelay time.Duration // 构造 Hello 前的停顿（LocalIPs 在建流之后、发送 Hello 之前被调用）
+	helloGate  chan struct{} // 非 nil 时，构造 Hello 前等它关闭（LocalIPs 在建流之后、发送 Hello 之前被调用）
 }
 
 func newHarness(t *testing.T) *harness {
@@ -162,6 +167,17 @@ func newHarness(t *testing.T) *harness {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	return &harness{t: t, gw: gw, addr: lis.Addr().String(), ca: ca, key: key,
 		collect: func(context.Context) metrics.Metrics { return metrics.Metrics{Load1: 1} }}
+}
+
+func (h *harness) waitHelloGate() {
+	if h.helloGate == nil {
+		return
+	}
+	select {
+	case <-h.helloGate:
+	case <-time.After(5 * time.Second):
+		h.t.Error("gateway never returned the rejection")
+	}
 }
 
 func (h *harness) agent(stepped bool) (*client.Client, *executor.Executor, *rtfake.Runtime) {
@@ -186,7 +202,7 @@ func (h *harness) agentWith(stepped, noReconnect bool) (*client.Client, *executo
 	ex := executor.New(executor.Deps{Runtime: rt, Disk: diskfake.New(4000 << 30), Net: netfake.New(), State: st, StateDir: dir,
 		LocalIPs: func() []string { return []string{"10.0.0.10"} }, MemTotal: func() uint64 { return 128 << 30 },
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, stepped)
-	c := client.New(client.Config{Addr: h.addr, TLS: tc, Version: "test", Hostname: "h", LocalIPs: func() []string { time.Sleep(h.helloDelay); return []string{"10.0.0.10"} },
+	c := client.New(client.Config{Addr: h.addr, TLS: tc, Version: "test", Hostname: "h", LocalIPs: func() []string { h.waitHelloGate(); return []string{"10.0.0.10"} },
 		Stepped: stepped, HeartbeatInterval: 50 * time.Millisecond, ReportInterval: 80 * time.Millisecond, Backoff: client.Backoff{Min: 10 * time.Millisecond, Max: 50 * time.Millisecond},
 		NoReconnect: noReconnect},
 		ex, h.collect, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -581,8 +597,10 @@ func TestSessionSurfacesGatewayRejection(t *testing.T) {
 	c, _, _ := h.agentWith(true, true)
 	h.gw.mu.Lock()
 	h.gw.reject = true
+	h.helloGate = make(chan struct{})
+	h.gw.rejected = h.helloGate
 	h.gw.mu.Unlock()
-	h.helloDelay = 200 * time.Millisecond // 等流被服务端终止后再发 Hello，Send 必然返回 EOF
+	// 等网关的 Connect 带着 Unauthenticated 返回后再发 Hello，Send 走 EOF 路径（不再靠固定 sleep）
 	err := c.Run(context.Background())
 	if status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("err = %v (code %v), want Unauthenticated", err, status.Code(err))
