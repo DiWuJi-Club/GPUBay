@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -685,5 +686,47 @@ func TestEnsureLimitsFallsBackToConfigBandwidth(t *testing.T) {
 	defer stop()
 	if !e.waitLimit(veth, 200) { // Config.BandwidthMbps
 		t.Fatalf("limits = %v", e.net.Limits())
+	}
+}
+
+// SetConfig 改变白名单后立即刷新规则，不等定时器；相同白名单不触发额外刷新。
+func TestSetConfigAllowCIDRsChangeRefreshesRulesImmediately(t *testing.T) {
+	e := newEnv(t)
+	restore := executor.SetRulesIntervalForTest(e.ex, time.Hour)
+	defer restore()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); e.ex.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	waitRules := func(want []string) bool {
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if got := e.net.Rules().AllowCIDRs; slices.Equal(got, want) {
+				return true
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return false
+	}
+	// newEnv 的初始配置（零值 -> 10.0.9.0/24）也算变化，先等它落地
+	if !waitRules([]string{"10.0.9.0/24"}) {
+		t.Fatalf("initial config not applied: %v", e.net.Rules())
+	}
+	cfg := e.ex.Config()
+	cfg.AllowCIDRs = []string{"192.168.1.218/32"}
+	e.ex.SetConfig(cfg)
+	if !waitRules([]string{"192.168.1.218/32"}) {
+		t.Fatalf("allow-list change not applied within 1s: %v", e.net.Rules())
+	}
+
+	n := e.net.EnsuredCount()
+	e.ex.SetConfig(cfg)           // 相同白名单
+	cfg.DNS = []string{"1.1.1.1"} // 非白名单字段变化
+	cfg.BandwidthMbps = 99
+	e.ex.SetConfig(cfg)
+	time.Sleep(200 * time.Millisecond)
+	if got := e.net.EnsuredCount(); got != n {
+		t.Fatalf("EnsureRules called %d extra times without allow-list change", got-n)
 	}
 }

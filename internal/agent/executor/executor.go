@@ -4,6 +4,7 @@ package executor
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -88,6 +89,8 @@ type Executor struct {
 	// 两个队列各有一个唤醒通道（容量 1），入队时按类型通知；共用一个通道时 pull 消费者会抢走实例指令的唤醒。
 	wakeInstance chan struct{}
 	wakePull     chan struct{}
+	// rulesWake：白名单变化时唤醒 Run 立即刷新规则（容量 1，非阻塞写入）。
+	rulesWake chan struct{}
 }
 
 func New(d Deps, stepped bool) *Executor {
@@ -108,10 +111,23 @@ func New(d Deps, stepped bool) *Executor {
 	}
 	return &Executor{d: d, stepped: stepped, results: make(chan ResultMsg, 256), rulesInterval: rulesInterval,
 		pending: map[string]bool{}, unpersisted: map[string]state.Result{},
-		wakeInstance: make(chan struct{}, 1), wakePull: make(chan struct{}, 1)}
+		wakeInstance: make(chan struct{}, 1), wakePull: make(chan struct{}, 1), rulesWake: make(chan struct{}, 1)}
 }
 
-func (e *Executor) SetConfig(c Config)        { e.mu.Lock(); e.cfg = c; e.mu.Unlock() }
+// SetConfig 更新配置；白名单（按顺序逐项）与旧值不同时唤醒 Run 立即刷新规则。
+// 它在 gRPC 接收协程里被调用，所以只做非阻塞通知，不碰 iptables。
+func (e *Executor) SetConfig(c Config) {
+	e.mu.Lock()
+	changed := !slices.Equal(e.cfg.AllowCIDRs, c.AllowCIDRs)
+	e.cfg = c
+	e.mu.Unlock()
+	if changed {
+		select {
+		case e.rulesWake <- struct{}{}:
+		default:
+		}
+	}
+}
 func (e *Executor) Config() Config            { e.mu.Lock(); defer e.mu.Unlock(); return e.cfg }
 func (e *Executor) Results() <-chan ResultMsg { return e.results }
 func (e *Executor) StateStore() *state.Store  { return e.d.State }
@@ -259,22 +275,29 @@ func (e *Executor) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := e.EnsureRules(ctx); err != nil {
-				e.d.Log.Error("ensure rules", "err", err)
-				continue
-			}
-			e.mu.Lock()
-			retry := e.recoverBlocked
-			e.mu.Unlock()
-			if retry {
-				e.d.Log.Info("isolation rules restored, retrying recovery")
-				if err := e.Recover(ctx); err != nil {
-					e.d.Log.Error("recover retry", "err", err)
-				}
-			}
-			e.ensureLimits(ctx)
+			e.refreshRules(ctx)
+		case <-e.rulesWake:
+			e.refreshRules(ctx)
 		}
 	}
+}
+
+// refreshRules 是定时器与白名单变化共用的一轮：刷新规则 → 必要时重试 Recover → 巡检限速。
+func (e *Executor) refreshRules(ctx context.Context) {
+	if err := e.EnsureRules(ctx); err != nil {
+		e.d.Log.Error("ensure rules", "err", err)
+		return
+	}
+	e.mu.Lock()
+	retry := e.recoverBlocked
+	e.mu.Unlock()
+	if retry {
+		e.d.Log.Info("isolation rules restored, retrying recovery")
+		if err := e.Recover(ctx); err != nil {
+			e.d.Log.Error("recover retry", "err", err)
+		}
+	}
+	e.ensureLimits(ctx)
 }
 
 func (e *Executor) consume(ctx context.Context, pull bool) {
