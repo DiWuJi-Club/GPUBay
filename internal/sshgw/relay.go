@@ -14,7 +14,7 @@ const (
 	keepaliveInterval = 60 * time.Second
 	keepaliveMisses   = 3
 	keepaliveTimeout  = 15 * time.Second
-	maxPendingOpens   = 64 // 每条连接、每个方向上未确认（还在等对端回应）的通道打开数上限
+	maxPendingOpens   = 64 // per session, per direction：每个会话、每个方向上未确认（还在等对端回应）的通道打开数上限
 )
 
 // 策略：白名单 + 默认拒绝。网关不解析任何通道 / 请求的载荷，原样转给对端。
@@ -43,7 +43,7 @@ func (s *Server) relay(sess *session, down *ssh.ServerConn, downChans <-chan ssh
 			}
 		})
 	}()
-	// 打开对端通道要等确认：每个都异步，慢的不挡后面的；每个方向未确认的打开数有上限，超出回 ResourceShortage
+	// 打开对端通道要等确认：每个都异步，慢的不挡后面的；每个会话每个方向（per session, per direction）未确认的打开数有上限，超出回 ResourceShortage
 	var downPending, upPending atomic.Int32
 	go func() { defer wg.Done(); s.acceptOpens(sess, downChans, up, true, &downPending) }()
 	go func() { defer wg.Done(); s.acceptOpens(sess, upChans, down, false, &upPending) }()

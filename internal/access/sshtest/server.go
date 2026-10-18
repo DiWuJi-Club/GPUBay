@@ -42,6 +42,7 @@ type Server struct {
 	holds       map[int]*hold      // direct-tcpip 目标端口 → 挂起闸门（测试慢速通道打开）
 	held        int                // 当前挂起中的 direct-tcpip 打开数
 	globals     []string           // 收到的全局请求类型（按到达顺序）
+	opens       []string           // 收到的通道打开类型（按到达顺序）
 	closed      bool
 	wg          sync.WaitGroup
 }
@@ -160,6 +161,13 @@ func (s *Server) GlobalRequests() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.globals...)
+}
+
+// ChannelOpens 返回迄今收到的通道打开类型（按到达顺序；接受 / 拒绝之前登记）。
+func (s *Server) ChannelOpens() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.opens...)
 }
 
 func (s *Server) ForwardAddr() string {
@@ -324,6 +332,9 @@ func (s *Server) handle(e *connEntry) {
 	s.wg.Add(1)
 	go func() { defer s.wg.Done(); s.globalRequests(sconn, reqs) }()
 	for nc := range chans {
+		s.mu.Lock()
+		s.opens = append(s.opens, nc.ChannelType())
+		s.mu.Unlock()
 		switch nc.ChannelType() {
 		case "session":
 			ch, chReqs, err := nc.Accept()

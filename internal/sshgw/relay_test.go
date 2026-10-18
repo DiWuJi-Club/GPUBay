@@ -93,6 +93,7 @@ func TestRemoteForwardAndAgentForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sess.Close()
 	if err := agent.RequestAgentForwarding(sess); err != nil {
 		t.Fatal(err)
 	}
@@ -192,10 +193,19 @@ func TestPolicyRejectsAndDropsHostkeys(t *testing.T) {
 	e := newEnv(t)
 	c := e.rawDial(t, e.addr)
 	var oce *ssh.OpenChannelError
-	for _, typ := range []string{"x11", "direct-streamlocal@openssh.com", "tun@openssh.com", "forwarded-tcpip",
-		"auth-agent@openssh.com", "forwarded-streamlocal@openssh.com", "session-bogus"} {
-		if _, _, err := c.OpenChannel(typ, nil); !errors.As(err, &oce) || oce.Reason != ssh.UnknownChannelType {
+	denied := []string{"x11", "direct-streamlocal@openssh.com", "tun@openssh.com", "forwarded-tcpip",
+		"auth-agent@openssh.com", "forwarded-streamlocal@openssh.com", "session-bogus"}
+	for _, typ := range denied {
+		// sshtest 对不支持的类型也回 UnknownChannelType：必须用消息与上游记录区分「网关拒绝」与「上游拒绝」
+		if _, _, err := c.OpenChannel(typ, nil); !errors.As(err, &oce) || oce.Reason != ssh.UnknownChannelType ||
+			!strings.HasPrefix(oce.Message, "channel type not allowed") {
 			t.Errorf("client %s = %v", typ, err)
+		}
+	}
+	// 被转发的打开要等上游回应（上游先登记再回应），所以 OpenChannel 返回时若被转发必然已登记
+	for _, typ := range e.upstream.ChannelOpens() {
+		if slices.Contains(denied, typ) {
+			t.Fatalf("denied channel %s reached upstream (%v)", typ, e.upstream.ChannelOpens())
 		}
 	}
 	for _, typ := range []string{"streamlocal-forward@openssh.com", "cancel-streamlocal-forward@openssh.com", "bogus@example.com"} {
@@ -232,7 +242,8 @@ func TestPolicyRejectsAndDropsHostkeys(t *testing.T) {
 	}
 	for _, typ := range []string{"x11", "forwarded-streamlocal@openssh.com", "direct-streamlocal@openssh.com", "tun@openssh.com",
 		"session", "direct-tcpip", "bogus-type"} {
-		if err := e.upstream.OpenToClient(typ, nil); !errors.As(err, &oce) || oce.Reason != ssh.Prohibited {
+		if err := e.upstream.OpenToClient(typ, nil); !errors.As(err, &oce) || oce.Reason != ssh.Prohibited ||
+			!strings.HasPrefix(oce.Message, "channel type not allowed") {
 			t.Errorf("upstream %s = %v", typ, err)
 		}
 	}
@@ -249,7 +260,7 @@ func TestPolicyRejectsAndDropsHostkeys(t *testing.T) {
 	}
 }
 
-// 一条连接上未确认的通道打开数有上限：到上限后的新打开回 ResourceShortage，确认 / 拒绝后额度归还。
+// 用户 → 容器方向：一个会话上未确认的通道打开数有上限，到上限后的新打开回 ResourceShortage，确认 / 拒绝后额度归还。
 func TestPendingChannelOpensCapped(t *testing.T) {
 	e := newEnv(t)
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
@@ -314,6 +325,69 @@ func TestPendingChannelOpensCapped(t *testing.T) {
 	}
 	if out, _, err := run(t, c, "echo ok"); err != nil || out != "ok\n" {
 		t.Fatalf("session after release = %q %v", out, err)
+	}
+}
+
+// 容器 → 用户方向（-R 的 forwarded-tcpip 等）：用户迟迟不回应的打开同样有上限，与用户方向分开计数。
+func TestPendingUpstreamOpensCapped(t *testing.T) {
+	e := newEnv(t)
+	c := e.rawDial(t, e.addr)
+	if out, _, err := run(t, c.Client, "echo up"); err != nil || out != "up\n" { // 上游连接已建立
+		t.Fatalf("exec = %q %v", out, err)
+	}
+	n := sshgw.MaxPendingOpensForTest
+	// 用户侧收下 forwarded-tcpip 打开但先不回应；及时取走，免得 x/crypto 的内部缓冲塞满卡住整条连接
+	incoming := c.HandleChannelOpen("forwarded-tcpip")
+	held := make(chan ssh.NewChannel, n+8)
+	go func() {
+		for nc := range incoming {
+			held <- nc
+		}
+	}()
+	results := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() { results <- e.upstream.OpenToClient("forwarded-tcpip", nil) }()
+	}
+	waitFor(t, "opens held at client", func() bool { return len(held) == n })
+	var oce *ssh.OpenChannelError
+	over := make(chan error, 1)
+	go func() { over <- e.upstream.OpenToClient("forwarded-tcpip", nil) }()
+	select { // 没有上限时这次打开会和前面的一样挂在用户侧：限时，失败而不是卡死
+	case err := <-over:
+		if !errors.As(err, &oce) || oce.Reason != ssh.ResourceShortage || !strings.HasPrefix(oce.Message, "too many pending") {
+			t.Fatalf("upstream open over cap = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream open over cap was not rejected (reached the client and is pending)")
+	}
+	if len(held) != n {
+		t.Fatalf("open over cap reached client: %d held", len(held))
+	}
+	// 用户方向的额度不受影响
+	if out, _, err := run(t, c.Client, "echo still"); err != nil || out != "still\n" {
+		t.Fatalf("client-direction open while upstream direction capped = %q %v", out, err)
+	}
+	for i := 0; i < n; i++ {
+		(<-held).Reject(ssh.ConnectionFailed, "held")
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-results:
+			if !errors.As(err, &oce) || oce.Reason != ssh.ConnectionFailed || oce.Message != "held" {
+				t.Fatalf("held open result = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("held open %d never resolved", i)
+		}
+	}
+	go func() { // 只确认、不主动关（由 OpenToClient 关）：用户先关会让上游的 Close 返回 EOF
+		nc := <-held
+		if _, reqs, err := nc.Accept(); err == nil {
+			go ssh.DiscardRequests(reqs)
+		}
+	}()
+	if err := e.upstream.OpenToClient("forwarded-tcpip", nil); err != nil {
+		t.Fatalf("upstream open after release = %v", err)
 	}
 }
 
@@ -444,7 +518,7 @@ func newFreezer(t *testing.T, target string) *freezer {
 
 func TestKeepaliveClosesFrozenClient(t *testing.T) {
 	e := newEnvWith(t, func(c *sshgw.Config) {
-		c.KeepaliveInterval, c.KeepaliveTimeout = 50*time.Millisecond, 100*time.Millisecond
+		c.KeepaliveInterval, c.KeepaliveTimeout = 100*time.Millisecond, 400*time.Millisecond
 	})
 	fz := newFreezer(t, e.addr)
 	c := e.rawDial(t, fz.lis.Addr().String())
