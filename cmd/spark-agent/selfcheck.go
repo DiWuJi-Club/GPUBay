@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,11 +36,8 @@ func selfcheck(ctx context.Context, run cmdrun.Runner, stateDir string, out io.W
 	}
 	v, err := run.Run(ctx, "docker", "version", "--format", "{{.Server.Version}}")
 	report("docker", err, strings.TrimSpace(string(v)))
-	info, err := run.Run(ctx, "docker", "info", "--format", "{{json .Runtimes}}")
-	if err == nil && !strings.Contains(string(info), `"nvidia"`) {
-		err = errors.New("docker 没有 nvidia 运行时，--gpus 不可用（安装 nvidia-container-toolkit 并 nvidia-ctk runtime configure --runtime=docker）")
-	}
-	report("nvidia runtime", err, "")
+	detail, err := gpuSupport(ctx, run)
+	report("nvidia runtime", err, detail)
 	_, err = run.Run(ctx, "iptables", "-w", "-S", "DOCKER-USER")
 	report("iptables DOCKER-USER", err, "")
 	_, err = run.Run(ctx, "tc", "-V")
@@ -73,6 +72,37 @@ func selfcheck(ctx context.Context, run cmdrun.Runner, stateDir string, out io.W
 		return errors.New("自检未通过")
 	}
 	return nil
+}
+
+// gpuSupport 判断 docker run --gpus 是否可用：docker 注册了 nvidia 运行时，或者 docker 的 CDISpecDirs
+// 里有 NVIDIA 的 CDI 规格（DGX Spark 默认走 CDI：没有 nvidia 运行时，/var/run/cdi/nvidia.yaml 由 nvidia-ctk 生成）。
+func gpuSupport(ctx context.Context, run cmdrun.Runner) (string, error) {
+	info, err := run.Run(ctx, "docker", "info", "--format", "{{json .Runtimes}}")
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(string(info), `"nvidia"`) {
+		return "", nil
+	}
+	raw, err := run.Run(ctx, "docker", "info", "--format", "{{json .CDISpecDirs}}")
+	if err != nil {
+		return "", err
+	}
+	var dirs []string
+	if json.Unmarshal(bytes.TrimSpace(raw), &dirs) != nil {
+		dirs = nil
+	}
+	noGPU := errors.New("docker 既没有 nvidia 运行时，CDISpecDirs 里也没有 NVIDIA 的 CDI 规格，--gpus 不可用" +
+		"（安装 nvidia-container-toolkit 后执行 nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml）")
+	if len(dirs) == 0 {
+		return "", noGPU
+	}
+	// 目录不存在时 grep 退出码为 2，但只要输出了文件名就说明找到了，所以只看输出。
+	out, _ := run.Run(ctx, "grep", append([]string{"-rls", "--include=*.yaml", "--include=*.json", "nvidia.com/gpu"}, dirs...)...)
+	if files := strings.Fields(string(out)); len(files) > 0 {
+		return "CDI " + files[0], nil
+	}
+	return "", noGPU
 }
 
 // existingAncestor 返回 dir 本身或其最近的已存在上级目录：首次安装时状态目录还没建，df 要查它将来所在的分区。

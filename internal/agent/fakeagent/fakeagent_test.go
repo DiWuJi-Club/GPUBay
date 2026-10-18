@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -178,5 +179,29 @@ func TestStartNoReconnectFailsFastWhenRefused(t *testing.T) {
 	_, err = fakeagent.Start(context.Background(), fakeagent.Options{Addr: addr, Creds: ag.Creds(), Dir: ag.Dir, NoReconnect: true})
 	if err == nil || !strings.Contains(err.Error(), "revoked") || time.Since(start) > 5*time.Second {
 		t.Fatalf("err = %v after %v", err, time.Since(start))
+	}
+}
+
+func TestStopRemovesOnlyOwnTempDir(t *testing.T) {
+	g, addr := newGateway(t)
+	ag, err := fakeagent.Start(context.Background(), fakeagent.Options{Addr: addr, CAPEM: g.ca.CertPEM(), Token: "spk1_x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ag.Dir); err != nil {
+		t.Fatal(err)
+	}
+	ag.Stop()
+	if _, err := os.Stat(ag.Dir); !os.IsNotExist(err) {
+		t.Fatalf("temp dir not removed: %v", err)
+	}
+	own := t.TempDir()
+	ag, err = fakeagent.Start(context.Background(), fakeagent.Options{Addr: addr, Creds: ag.Creds(), Dir: own})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ag.Stop()
+	if _, err := os.Stat(own); err != nil {
+		t.Fatalf("caller dir must be kept: %v", err)
 	}
 }

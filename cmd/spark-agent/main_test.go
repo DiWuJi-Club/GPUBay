@@ -60,3 +60,53 @@ func TestVersionCommand(t *testing.T) {
 		t.Fatal("unknown subcommand accepted")
 	}
 }
+
+func TestSelfcheckGPUViaRuntimeOrCDI(t *testing.T) {
+	base := func() *cmdrun.Recorder {
+		r := &cmdrun.Recorder{}
+		r.Stub("df", "Avail\n2000000000000\n", nil)
+		r.Stub("ufw status", "", errors.New("not installed"))
+		return r
+	}
+	cases := []struct {
+		name    string
+		stub    func(r *cmdrun.Recorder)
+		want    string
+		grepped bool
+	}{
+		{"runtime", func(r *cmdrun.Recorder) {
+			r.Stub("docker info --format {{json .Runtimes}}", `{"nvidia":{"path":"nvidia-container-runtime"},"runc":{"path":"runc"}}`, nil)
+		}, "ok: nvidia runtime", false},
+		{"cdi only", func(r *cmdrun.Recorder) { // DGX Spark 实测：没有 nvidia 运行时，--gpus 走 CDI
+			r.Stub("docker info --format {{json .Runtimes}}", `{"io.containerd.runc.v2":{"path":"runc"},"runc":{"path":"runc"}}`, nil)
+			r.Stub("docker info --format {{json .CDISpecDirs}}", `["/etc/cdi","/var/run/cdi"]`+"\n", nil)
+			r.Stub("grep", "/var/run/cdi/nvidia.yaml\n", &cmdrun.CmdError{Cmd: "grep", ExitCode: 2, Stderr: "grep: /etc/cdi: No such file or directory"})
+		}, "ok: nvidia runtime CDI /var/run/cdi/nvidia.yaml", true},
+		{"neither", func(r *cmdrun.Recorder) {
+			r.Stub("docker info --format {{json .Runtimes}}", `{"runc":{"path":"runc"}}`, nil)
+			r.Stub("docker info --format {{json .CDISpecDirs}}", `["/etc/cdi","/var/run/cdi"]`, nil)
+			r.Stub("grep", "", &cmdrun.CmdError{Cmd: "grep", ExitCode: 1})
+		}, "FAIL: nvidia runtime", true},
+		{"cdi disabled", func(r *cmdrun.Recorder) {
+			r.Stub("docker info --format {{json .Runtimes}}", `{"runc":{"path":"runc"}}`, nil)
+			r.Stub("docker info --format {{json .CDISpecDirs}}", `[]`, nil)
+		}, "FAIL: nvidia runtime", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := base()
+			c.stub(r)
+			var out bytes.Buffer
+			err := selfcheck(context.Background(), r, "/var/lib/spark-agent", &out)
+			if !strings.Contains(out.String(), c.want) || (err == nil) != strings.HasPrefix(c.want, "ok") {
+				t.Fatalf("err=%v, want %q in:\n%s", err, c.want, out.String())
+			}
+			if c.grepped != strings.Contains(r.Lines(), "grep -rls --include=*.yaml --include=*.json nvidia.com/gpu /etc/cdi /var/run/cdi") {
+				t.Fatalf("grep call mismatch (want %v):\n%s", c.grepped, r.Lines())
+			}
+			if !strings.Contains(out.String(), "ok: command nvidia-smi") {
+				t.Fatalf("nvidia-smi item missing:\n%s", out.String())
+			}
+		})
+	}
+}

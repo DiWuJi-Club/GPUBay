@@ -39,7 +39,7 @@ type Options struct {
 	CAPEM             []byte
 	Token             string
 	Creds             *Creds // 非空时不 Enroll，直接用这套凭据建流
-	Dir               string // 空则临时目录（Stop 不删除，便于用同一 Dir 重新 Start 模拟重连）
+	Dir               string // 空则建临时目录并在 Stop 时删除；要用同一状态目录重新 Start 模拟重连，调用方须自带 Dir
 	Stepped           bool
 	NoReconnect       bool // 被顶掉 / 被撤销后不重连（顶替类测试里的旧 Agent）
 	Version           string
@@ -57,6 +57,7 @@ type Agent struct {
 	Disk    *diskfake.Disk
 	Net     *netfake.Netfilter
 	Dir     string
+	tempDir bool // Dir 由 Start 创建，Stop 时删除
 	creds   *Creds
 	cancel  context.CancelFunc
 	done    chan struct{}  // Client.Run 已返回
@@ -82,13 +83,26 @@ func Start(ctx context.Context, o Options) (*Agent, error) {
 	if o.HeartbeatInterval <= 0 {
 		o.HeartbeatInterval = 100 * time.Millisecond
 	}
-	dir := o.Dir
+	dir, tempDir := o.Dir, false
 	if dir == "" {
 		var err error
 		if dir, err = os.MkdirTemp("", "fakeagent-"); err != nil {
 			return nil, err
 		}
+		tempDir = true
 	}
+	a, err := start(ctx, o, dir)
+	if err != nil {
+		if tempDir {
+			os.RemoveAll(dir)
+		}
+		return nil, err
+	}
+	a.tempDir = tempDir
+	return a, nil
+}
+
+func start(ctx context.Context, o Options, dir string) (*Agent, error) {
 	creds := o.Creds
 	if creds == nil {
 		block, _ := pem.Decode(o.CAPEM)
@@ -154,8 +168,11 @@ func Start(ctx context.Context, o Options) (*Agent, error) {
 	return a, nil
 }
 
-// Stop 断开并停止执行器；状态目录保留。
+// Stop 断开并停止执行器；调用方给的 Dir 保留，Start 自建的临时目录删除。
 func (a *Agent) Stop() {
 	a.cancel()
 	a.wg.Wait()
+	if a.tempDir {
+		os.RemoveAll(a.Dir)
+	}
 }
