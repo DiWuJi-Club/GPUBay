@@ -86,6 +86,9 @@ type Instance struct {
 	Reminded24h     bool
 	Reminded1h      bool
 	CreatedAt       time.Time
+	// 计划 3：密码登录开关与平台生成的容器主机公钥（authorized_keys 一行；存量实例为空，首连信任后写回）
+	PasswordAuth  bool
+	SSHHostPubkey string
 }
 
 func (i Instance) Suspended() bool { return i.SuspendedAt != nil }
@@ -108,12 +111,12 @@ func (i Instance) Remaining(now time.Time) time.Duration {
 }
 
 const instanceCols = `id, user_id, machine_id, product_id, image_id, state, pending_seconds, expires_at,
-	stopped_at, suspended_at, paused_remaining, reminded_24h, reminded_1h, created_at`
+	stopped_at, suspended_at, paused_remaining, reminded_24h, reminded_1h, created_at, password_auth, ssh_host_pubkey`
 
 func scanInstance(row pgx.Row) (Instance, error) {
 	var i Instance
 	err := row.Scan(&i.ID, &i.UserID, &i.MachineID, &i.ProductID, &i.ImageID, &i.State, &i.PendingSeconds, &i.ExpiresAt,
-		&i.StoppedAt, &i.SuspendedAt, &i.PausedRemaining, &i.Reminded24h, &i.Reminded1h, &i.CreatedAt)
+		&i.StoppedAt, &i.SuspendedAt, &i.PausedRemaining, &i.Reminded24h, &i.Reminded1h, &i.CreatedAt, &i.PasswordAuth, &i.SSHHostPubkey)
 	if db.IsNoRows(err) {
 		return Instance{}, apperr.ErrNotFound
 	}

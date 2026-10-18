@@ -16,3 +16,22 @@ func TestActorEntry(t *testing.T) {
 		t.Fatalf("system entry = %+v", e)
 	}
 }
+
+func TestActorEntryResolvesUserAndSystem(t *testing.T) {
+	cases := []struct {
+		actor    audit.Actor
+		wantType string
+		wantID   int64
+	}{
+		{audit.Actor{AdminID: 7, IP: "1.1.1.1"}, "admin", 7},
+		{audit.Actor{UserID: 42, IP: "2.2.2.2"}, "user", 42},
+		{audit.Actor{AdminID: 7, UserID: 42}, "admin", 7},
+		{audit.Actor{}, "system", 0},
+	}
+	for _, c := range cases {
+		e := c.actor.Entry("x.y", "instance", "ins-1", nil)
+		if e.ActorType != c.wantType || e.ActorID != c.wantID || e.IP != c.actor.IP || e.Action != "x.y" {
+			t.Fatalf("%+v → %+v", c.actor, e)
+		}
+	}
+}
