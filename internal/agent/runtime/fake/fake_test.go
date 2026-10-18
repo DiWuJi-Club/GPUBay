@@ -3,7 +3,10 @@ package fake_test
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"spark-cloud/internal/agent/runtime"
 	"spark-cloud/internal/agent/runtime/fake"
@@ -78,14 +81,50 @@ func TestFakeNetworksAndPublishIPs(t *testing.T) {
 	if c, _ = rt.Inspect(ctx, "ins-a"); len(c.Networks) != 0 {
 		t.Fatalf("networks = %v", c.Networks)
 	}
+	// 没有网络挂接时 docker start 成功但容器里没有网卡
+	_ = rt.Start(ctx, "ins-a")
+	if _, err := rt.VethOf(ctx, "ins-a"); err == nil {
+		t.Fatal("VethOf must fail for a container started without networks")
+	}
+	_ = rt.Stop(ctx, "ins-a")
 	if err := rt.ConnectNetwork(ctx, "ins-a", "spark0"); err != nil {
 		t.Fatal(err)
 	}
-	_ = rt.ConnectNetwork(ctx, "ins-a", "spark0") // 幂等
+	// 与 docker 一致：已挂接时再次 connect 报错（endpoint already exists）
+	if err := rt.ConnectNetwork(ctx, "ins-a", "spark0"); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("second connect = %v", err)
+	}
 	if c, _ = rt.Inspect(ctx, "ins-a"); len(c.Networks) != 1 {
 		t.Fatalf("networks = %v", c.Networks)
 	}
 	if rt.ConnectNetwork(ctx, "ins-missing", "spark0") == nil {
 		t.Fatal("connect on missing container must fail")
+	}
+	want := []string{"start ins-a", "veth ins-a", "stop ins-a", "connect ins-a", "connect ins-a", "connect ins-missing"}
+	if got := rt.Ops(); !slices.Equal(got[len(got)-len(want):], want) {
+		t.Fatalf("ops = %v", got)
+	}
+}
+
+// Block 让 List / Inspect 一直阻塞到 ctx 结束（模拟 dockerd 卡死），返回 ctx 的错误。
+func TestFakeBlockWaitsForContext(t *testing.T) {
+	rt := fake.New()
+	rt.Block("list", true)
+	rt.Block("inspect", true)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := rt.List(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("list = %v", err)
+	}
+	if _, err := rt.Inspect(ctx, "ins-a"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("inspect = %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("block ignored ctx")
+	}
+	rt.Block("list", false)
+	if _, err := rt.List(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

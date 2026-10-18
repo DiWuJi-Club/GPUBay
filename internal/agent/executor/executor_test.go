@@ -598,6 +598,14 @@ func (e *env) runLimitLoop() (stop func()) {
 	return func() { cancel(); <-done; restore() }
 }
 
+// waitRounds 等 Run 再开始 n 轮规则刷新（EnsuredCount 增长 n）：此时至少有 n-1 轮完整跑完（重试、限速巡检都已执行），
+// 负向断言（「没有发生」）据此成立，不依赖固定的 sleep。
+func (e *env) waitRounds(n int) {
+	e.t.Helper()
+	base := e.net.EnsuredCount()
+	waitFor(e.t, "refresh rounds", func() bool { return e.net.EnsuredCount() >= base+n })
+}
+
 func (e *env) waitLimit(veth string, want int) bool {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -629,7 +637,7 @@ func TestEnsureLimitsSkipsWhenStillApplied(t *testing.T) {
 	e.run(create("ins-aaaaaaaa"))
 	before := e.net.LimitCount()
 	stop := e.runLimitLoop()
-	time.Sleep(100 * time.Millisecond)
+	e.waitRounds(2)
 	stop()
 	if n := e.net.LimitCount(); n != before {
 		t.Fatalf("Limit called %d extra times although the limit was in place", n-before)
@@ -643,7 +651,7 @@ func TestEnsureLimitsIgnoresStoppedContainer(t *testing.T) {
 	_ = e.rt.Stop(context.Background(), "ins-aaaaaaaa")
 	e.net.Drop(veth)
 	stop := e.runLimitLoop()
-	time.Sleep(100 * time.Millisecond)
+	e.waitRounds(2)
 	stop()
 	if _, ok := e.net.Limits()[veth]; ok {
 		t.Fatal("limit applied to a stopped container")
@@ -661,7 +669,7 @@ func TestEnsureLimitsSkipsWhileOpInProgress(t *testing.T) {
 	unlock := executor.LockOpsForTest(e.ex)
 	stop := e.runLimitLoop()
 	defer stop()
-	time.Sleep(100 * time.Millisecond)
+	e.waitRounds(2)
 	if _, ok := e.net.Limits()[veth]; ok {
 		unlock()
 		t.Fatal("limit applied while opMu held")
@@ -838,7 +846,7 @@ func TestRecoverPendingClearedByInstanceCommand(t *testing.T) {
 	fr.fail.Store(false)
 	before := fr.starts.Load()
 	stop := e.runLimitLoop()
-	time.Sleep(100 * time.Millisecond)
+	e.waitRounds(2)
 	stop()
 	if fr.starts.Load() != before || e.rt.Containers()["ins-aaaaaaaa"].Running {
 		t.Fatal("retried an instance taken over by a stop command")
@@ -884,7 +892,7 @@ func TestRefreshDoesNotStartExternallyStoppedContainer(t *testing.T) {
 	e.rt.Exit("ins-aaaaaaaa")
 	before := fr.starts.Load()
 	stop = e.runLimitLoop()
-	time.Sleep(100 * time.Millisecond)
+	e.waitRounds(2)
 	stop()
 	if fr.starts.Load() != before || e.rt.Containers()["ins-aaaaaaaa"].Running {
 		t.Fatal("externally stopped container was restarted by refresh")
@@ -898,7 +906,7 @@ func TestRecoverRetrySkipsWhileOpInProgress(t *testing.T) {
 	unlock := executor.LockOpsForTest(e.ex)
 	stop := e.runLimitLoop()
 	defer stop()
-	time.Sleep(100 * time.Millisecond)
+	e.waitRounds(2)
 	if fr.starts.Load() != before {
 		unlock()
 		t.Fatal("retry ran while opMu held")

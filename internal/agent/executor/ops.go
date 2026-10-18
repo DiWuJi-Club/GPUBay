@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"spark-cloud/internal/agent/runtime"
 	"spark-cloud/internal/agent/state"
@@ -135,8 +137,12 @@ func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error 
 		return fmt.Errorf("数据盘未挂载：容器 %s 的 /root/data 来源是 %q，期望 %s", inst.ID, c.DataSource, e.d.Disk.MountDir(inst.ID))
 	}
 	// 预防：发布地址（LAN IP）还没配置时 docker start 会失败，且 Docker 会顺带丢掉容器的网络挂接；等地址出现再启动。
+	// 0.0.0.0 / :: 表示所有地址，总是存在。
 	local := e.d.LocalIPs()
 	for _, ip := range c.PublishIPs {
+		if p := net.ParseIP(ip); p != nil && p.IsUnspecified() {
+			continue
+		}
 		if !slices.Contains(local, ip) {
 			return fmt.Errorf("宿主机尚未配置地址 %s，暂不启动", ip)
 		}
@@ -170,7 +176,10 @@ func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error 
 }
 
 // stopAfterFailure 停掉启动后检查失败的容器；Stop 本身出错只记日志，调用方仍返回原错误。
+// 检查失败往往正是调用方 ctx 到期造成的，所以脱离调用方的取消，另给 30 秒上限。
 func (e *Executor) stopAfterFailure(ctx context.Context, id string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopAfterFailureTimeout)
+	defer cancel()
 	if err := e.d.Runtime.Stop(ctx, id); err != nil {
 		e.d.Log.Error("stop container after failed start checks", "instance", id, "err", err)
 	}
@@ -250,7 +259,19 @@ func (e *Executor) wipe(ctx context.Context, id string) error {
 
 // Report 上报本机实例状态：以 docker 列表为准，本地记录里有但容器不存在的不上报（平台视为 missing）。
 // docker 出错时按本地记录报 unknown；挂载检查出错的实例也报 unknown（平台对 unknown 不做对账动作）。
+// 整个采集受 reportTimeout 约束：dockerd 卡死（超时）与 docker 出错同样处理。
+// 重启后待重试启动（recoverPending）且仍在宽限期内的停止实例报 unknown，避免平台误报 container_down。
 func (e *Executor) Report(ctx context.Context) []InstanceState {
+	ctx, cancel := context.WithTimeout(ctx, e.reportTimeout)
+	defer cancel()
+	e.mu.Lock()
+	recovering := map[string]bool{}
+	for id, since := range e.recoverPending {
+		if time.Since(since) < e.recoverGrace {
+			recovering[id] = true
+		}
+	}
+	e.mu.Unlock()
 	list, err := e.d.Runtime.List(ctx)
 	if err != nil {
 		e.d.Log.Error("list containers", "err", err)
@@ -276,6 +297,8 @@ func (e *Executor) Report(ctx context.Context) []InstanceState {
 			phase = "unknown"
 		case !mounted:
 			phase = "missing_data"
+		case phase == "stopped" && recovering[c.Label]:
+			phase = "unknown"
 		}
 		out = append(out, InstanceState{InstanceID: c.Label, Phase: phase})
 	}
@@ -299,17 +322,19 @@ func (e *Executor) DataMount() string {
 func (e *Executor) Recover(ctx context.Context) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
+	// 每一步都有 recoverStepTimeout 上限：卡死的 dockerd / mount 不能让 Agent 在连上平台之前无限阻塞，
+	// 超时按失败处理（实例进入 recoverPending，由规则刷新轮次重试）。
 	var errs []error
-	if err := e.d.Runtime.EnsureNetwork(ctx); err != nil {
+	if err := e.withStep(ctx, e.d.Runtime.EnsureNetwork); err != nil {
 		errs = append(errs, err)
 	}
-	rulesErr := e.EnsureRules(ctx)
+	rulesErr := e.withStep(ctx, e.EnsureRules)
 	if rulesErr != nil {
 		errs = append(errs, fmt.Errorf("网络隔离规则未就绪：%w", rulesErr))
 	}
 	blocked := false
 	for _, inst := range e.d.State.Instances() {
-		if err := e.d.Disk.Mount(ctx, inst.ID); err != nil {
+		if err := e.withStep(ctx, func(ctx context.Context) error { return e.d.Disk.Mount(ctx, inst.ID) }); err != nil {
 			errs = append(errs, fmt.Errorf("instance %s: 数据盘未挂载：%w", inst.ID, err))
 			if inst.Desired == "running" {
 				e.setRecoverPending(inst.ID, true)
@@ -324,7 +349,7 @@ func (e *Executor) Recover(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("instance %s: 未启动：网络隔离规则未就绪", inst.ID))
 			continue
 		}
-		err := e.startChecked(ctx, inst)
+		err := e.withStep(ctx, func(ctx context.Context) error { return e.startChecked(ctx, inst) })
 		if err != nil {
 			errs = append(errs, fmt.Errorf("instance %s: %w", inst.ID, err))
 		}
@@ -336,12 +361,14 @@ func (e *Executor) Recover(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// setRecoverPending 登记 / 移出需要在规则刷新轮次里重试启动的实例。
+// setRecoverPending 登记 / 移出需要在规则刷新轮次里重试启动的实例；已登记的保留首次登记时间。
 func (e *Executor) setRecoverPending(id string, pending bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if pending {
-		e.recoverPending[id] = true
+		if _, ok := e.recoverPending[id]; !ok {
+			e.recoverPending[id] = time.Now()
+		}
 	} else {
 		delete(e.recoverPending, id)
 	}

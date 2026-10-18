@@ -19,7 +19,41 @@ const (
 	HostReserveBytes = uint64(8) << 30   // 容器内存上限 = 机器内存 − 8GiB
 	SSHMountDir      = "/.spark"
 	rulesInterval    = 60 * time.Second
+
+	// ReportTimeout 是一次 StateReport 采集（docker ps、挂载检查）的上限：dockerd 卡死时按本地记录报 unknown，
+	// 不能拖住与心跳共用的发送循环。
+	ReportTimeout = 30 * time.Second
+	// RecoverStepTimeout 是 Recover / 恢复重试中单个步骤（建网、规则、某实例的挂载、某实例的启动）的上限；
+	// 超时按失败处理，实例进入 recoverPending 等下一轮重试。
+	RecoverStepTimeout = 2 * time.Minute
+	// RecoverGrace：重启后待重试启动的实例在这段时间内报 unknown（平台不做对账动作，避免误报 container_down）；
+	// 超过后如实上报，让持续启动失败的实例照常告警。
+	RecoverGrace = 10 * time.Minute
+	// stopAfterFailureTimeout：启动后检查失败时停容器的上限（脱离调用方 ctx，调用方已超时也要停）。
+	stopAfterFailureTimeout = 30 * time.Second
+
+	// 指令执行时限，与平台侧指令超时（rental.*CommandTimeout）一致；同时作为 cmdrun 10 分钟兜底的显式 deadline，
+	// 使大镜像 pull、可能隐式拉取镜像的 docker create 不被兜底误杀。
+	createTimeout = 15 * time.Minute
+	startTimeout  = 5 * time.Minute
+	stopTimeout   = 5 * time.Minute
+	wipeTimeout   = 30 * time.Minute
+	pullTimeout   = 60 * time.Minute
 )
+
+func commandTimeout(typ string) time.Duration {
+	switch typ {
+	case "create_instance":
+		return createTimeout
+	case "start_instance":
+		return startTimeout
+	case "stop_instance":
+		return stopTimeout
+	case "wipe_instance":
+		return wipeTimeout
+	}
+	return pullTimeout
+}
 
 type Config struct {
 	LanIP         string
@@ -69,6 +103,10 @@ type Executor struct {
 	stepped       bool
 	results       chan ResultMsg
 	rulesInterval time.Duration
+	// 以下三项默认取同名常量，测试可调短。
+	reportTimeout      time.Duration
+	recoverStepTimeout time.Duration
+	recoverGrace       time.Duration // 受 mu 保护
 
 	// opMu 串行化所有改动实例的操作（实例指令、Recover），拉取镜像不受它约束。
 	opMu sync.Mutex
@@ -87,7 +125,8 @@ type Executor struct {
 	recoverBlocked bool
 	// recoverPending：Recover 中期望 running 却没能启动的实例（地址、Docker、数据盘等瞬时条件），
 	// 由 refreshRules 逐轮重试直到启动成功；只含 Recover 产生的实例，外部停止的容器不在其中。
-	recoverPending map[string]bool
+	// 值为首次登记的时间（RecoverGrace 宽限期从这里起算）。
+	recoverPending map[string]time.Time
 
 	// 两个队列各有一个唤醒通道（容量 1），入队时按类型通知；共用一个通道时 pull 消费者会抢走实例指令的唤醒。
 	wakeInstance chan struct{}
@@ -113,7 +152,8 @@ func New(d Deps, stepped bool) *Executor {
 		d.LocalIPs = func() []string { return nil }
 	}
 	return &Executor{d: d, stepped: stepped, results: make(chan ResultMsg, 256), rulesInterval: rulesInterval,
-		pending: map[string]bool{}, recoverPending: map[string]bool{}, unpersisted: map[string]state.Result{},
+		reportTimeout: ReportTimeout, recoverStepTimeout: RecoverStepTimeout, recoverGrace: RecoverGrace,
+		pending: map[string]bool{}, recoverPending: map[string]time.Time{}, unpersisted: map[string]state.Result{},
 		wakeInstance: make(chan struct{}, 1), wakePull: make(chan struct{}, 1), rulesWake: make(chan struct{}, 1)}
 }
 
@@ -224,10 +264,15 @@ func (e *Executor) execute(ctx context.Context, c Command, override *state.Resul
 
 func (e *Executor) dispatch(ctx context.Context, c Command) error {
 	if c.Type == "pull_image" {
+		ctx, cancel := context.WithTimeout(ctx, pullTimeout)
+		defer cancel()
 		return e.d.Runtime.Pull(ctx, c.ImageRef)
 	}
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
+	// 时限从拿到 opMu 起算（排队等待不计入）。
+	ctx, cancel := context.WithTimeout(ctx, commandTimeout(c.Type))
+	defer cancel()
 	// 指令接管该实例的状态：不再由恢复重试处理（在 opMu 内移除，此时没有重试在跑）。
 	e.mu.Lock()
 	delete(e.recoverPending, c.InstanceID)
@@ -351,6 +396,9 @@ func (e *Executor) retryRecoverPending(ctx context.Context) {
 	}
 	e.mu.Unlock()
 	for _, id := range ids {
+		if ctx.Err() != nil { // Agent 正在退出：不再启动新的重试
+			return
+		}
 		done := e.retryRecoverOne(ctx, id)
 		if done {
 			e.mu.Lock()
@@ -360,18 +408,24 @@ func (e *Executor) retryRecoverPending(ctx context.Context) {
 	}
 }
 
-// retryRecoverOne 返回 true 表示该实例不必再重试。
+// retryRecoverOne 返回 true 表示该实例不必再重试。查询、挂载、启动各自受 recoverStepTimeout 约束（持有 opMu，不能被卡死的 dockerd 拖住）。
 func (e *Executor) retryRecoverOne(ctx context.Context, id string) bool {
 	inst, ok := e.d.State.Instance(id)
 	if !ok || inst.Desired != "running" {
 		return true
 	}
-	if c, err := e.d.Runtime.Inspect(ctx, id); err == nil && c.Exists && c.Running {
+	running := false
+	e.withStep(ctx, func(ctx context.Context) error {
+		c, err := e.d.Runtime.Inspect(ctx, id)
+		running = err == nil && c.Exists && c.Running
+		return err
+	})
+	if running {
 		return true // 限速交给 ensureLimits
 	}
-	err := e.d.Disk.Mount(ctx, id)
+	err := e.withStep(ctx, func(ctx context.Context) error { return e.d.Disk.Mount(ctx, id) })
 	if err == nil {
-		err = e.startChecked(ctx, inst)
+		err = e.withStep(ctx, func(ctx context.Context) error { return e.startChecked(ctx, inst) })
 	}
 	if err != nil {
 		e.d.Log.Error("recover retry failed", "instance", id, "err", err)
@@ -379,6 +433,13 @@ func (e *Executor) retryRecoverOne(ctx context.Context, id string) bool {
 	}
 	e.d.Log.Info("recovered instance started on retry", "instance", id)
 	return true
+}
+
+// withStep 在 recoverStepTimeout 时限内执行一个恢复步骤。
+func (e *Executor) withStep(ctx context.Context, f func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(ctx, e.recoverStepTimeout)
+	defer cancel()
+	return f(ctx)
 }
 
 // ensureLimits 给运行中却丢了限速的容器补上限速。有实例指令正在执行时（opMu 被占）跳过本轮，
@@ -389,7 +450,8 @@ func (e *Executor) ensureLimits(ctx context.Context) {
 	}
 	defer e.opMu.Unlock()
 	for _, inst := range e.d.State.Instances() {
-		if err := e.ensureLimit(ctx, inst); err != nil {
+		// 持有 opMu：每个实例同样受单步时限约束，卡死的 dockerd 不能把实例指令永远挡在锁外。
+		if err := e.withStep(ctx, func(ctx context.Context) error { return e.ensureLimit(ctx, inst) }); err != nil {
 			e.d.Log.Error("ensure bandwidth limit", "instance", inst.ID, "err", err)
 		}
 	}
