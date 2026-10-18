@@ -391,6 +391,67 @@ func TestFailTimedOutCommands(t *testing.T) {
 	}
 }
 
+// 指令 sent 后机器离线超过超时时长再重连：重连（AttachAgentConn）重启超时计时，补推之前清扫不得判超时（规格 §3.1.5）。
+func TestReconnectRestartsCommandTimeout(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	if err := e.fleet.AttachAgentConn(e.ctx, e.machines[0], "c1"); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := e.fleet.ClaimPending(e.ctx, []string{"c1"}); err != nil || len(claimed) != 1 {
+		t.Fatalf("claim = %+v, %v", claimed, err)
+	}
+	e.clock.Advance(rental.CreateCommandTimeout + time.Hour)
+	if _, err := e.fleet.MarkOfflineStale(e.ctx, rental.OfflineTimeout); err != nil {
+		t.Fatal(err)
+	}
+	// 重连：先登记归属，再心跳上线（与网关 Connect 顺序一致），补推尚未发生
+	if err := e.fleet.AttachAgentConn(e.ctx, e.machines[0], "c2"); err != nil {
+		t.Fatal(err)
+	}
+	e.heartbeatAll()
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 0, "reconnect window")
+	e.clock.Advance(rental.CreateCommandTimeout - time.Second)
+	e.heartbeatAll()
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 0, "before timeout counted from reconnect")
+	e.clock.Advance(time.Second)
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 1, "timeout counted from reconnect")
+	if got := e.get(inst.ID); got.State != rental.StateFailed {
+		t.Fatalf("state = %s", got.State)
+	}
+}
+
+// 流在离线期间没断（未重连）：离线前的 StateReport 不能被清扫器用来恢复计时。
+func TestSweepDoesNotResumeFromPreOfflineReport(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.reportRunning(e.machines[0], inst.ID)
+	e.clock.Advance(rental.OfflineTimeout + time.Minute)
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("must be suspended while offline: %+v", got)
+	}
+	e.heartbeatAll() // 同一条流恢复心跳，尚未发来新的 StateReport
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("resumed from a pre-offline report: %+v", got)
+	}
+	if err := e.fleet.RecordStateReport(e.ctx, e.machines[0], fleet.StateReport{Instances: []fleet.InstanceState{{InstanceID: inst.ID, Phase: fleet.PhaseRunning}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); got.Suspended() {
+		t.Fatalf("fresh report must resume: %+v", got)
+	}
+}
+
 // 暂停期间续费：新租期的提醒标记按续费后的剩余时长重算，不能沿用旧租期已发过的标记。
 func TestRenewWhileSuspendedResetsReminders(t *testing.T) {
 	e := newEnv(t, 1)

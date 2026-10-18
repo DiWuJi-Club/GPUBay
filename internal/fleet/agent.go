@@ -46,14 +46,24 @@ func (s *Service) MachineBySerial(ctx context.Context, serial string) (Machine, 
 	return scanMachine(s.pool.QueryRow(ctx, `SELECT `+machineCols+` FROM machines WHERE serial = $1`, serial))
 }
 
-// AttachAgentConn 把机器的流归属到 connID（新连接顶掉旧归属）。
+// AttachAgentConn 把机器的流归属到 connID（新连接顶掉旧归属），并在同一语句里把该机器所有 sent 指令的 sent_at 刷新为现在：
+// 新流必定补推全部 sent 指令，超时从建流起重新计时，避免「心跳已上线、补推未发生」的窗口里清扫器按离线前的 sent_at 判超时。
 func (s *Service) AttachAgentConn(ctx context.Context, machineID int64, connID string) error {
-	tag, err := s.pool.Exec(ctx, `UPDATE machines SET agent_conn_id = $2, agent_connected_at = $3, updated_at = $3 WHERE id = $1`,
-		machineID, connID, s.clock.Now())
+	var n int
+	// 先按 id 锁指令行、再改机器行（m 的条件依赖 t，强制这个顺序）：与回报路径「指令 → 机器（置 faulty）」的加锁顺序一致。
+	err := s.pool.QueryRow(ctx, `WITH l AS (
+			SELECT id FROM agent_commands WHERE machine_id = $1 AND status = 'sent' ORDER BY id FOR UPDATE
+		), t AS (
+			UPDATE agent_commands SET sent_at = $3, updated_at = $3 FROM l WHERE agent_commands.id = l.id RETURNING agent_commands.id
+		), m AS (
+			UPDATE machines SET agent_conn_id = $2, agent_connected_at = $3, updated_at = $3
+			WHERE id = $1 AND (SELECT count(*) FROM t) >= 0 RETURNING id
+		)
+		SELECT count(*) FROM m`, machineID, connID, s.clock.Now()).Scan(&n)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if n == 0 {
 		return apperr.ErrNotFound
 	}
 	return nil

@@ -213,9 +213,10 @@ func (s *Service) Heartbeat(ctx context.Context, machineID int64) (bool, error) 
 }
 
 // MarkOfflineStale 把超过 timeout 没有心跳的在线机器标记为离线，返回这些机器的 ID。
+// 同时清空 state_reported_at：流若撑过了离线期（未重连），清扫器不能拿离线前的报告恢复计时，须等新的 StateReport。
 func (s *Service) MarkOfflineStale(ctx context.Context, timeout time.Duration) ([]int64, error) {
 	now := s.clock.Now()
-	rows, err := s.pool.Query(ctx, `UPDATE machines SET agent_online = false, updated_at = $1
+	rows, err := s.pool.Query(ctx, `UPDATE machines SET agent_online = false, state_reported_at = NULL, updated_at = $1
 		WHERE agent_online AND (last_seen_at IS NULL OR last_seen_at < $2) RETURNING id`, now, now.Add(-timeout))
 	if err != nil {
 		return nil, err
