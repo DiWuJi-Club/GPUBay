@@ -80,7 +80,7 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 	if err := e.d.Disk.Create(ctx, c.InstanceID, c.DataSizeGiB); err != nil {
 		return err
 	}
-	if err := e.writeSSHDir(c.InstanceID, c.UpstreamPubKey); err != nil {
+	if err := e.writeSSHDir(c.InstanceID, c.UpstreamPubKey, c.HostKeyPEM); err != nil {
 		return err
 	}
 	if err := e.d.Runtime.EnsureNetwork(ctx); err != nil {
@@ -200,6 +200,9 @@ func (e *Executor) start(ctx context.Context, id string) error {
 	}
 	if err := e.EnsureRules(ctx); err != nil {
 		return fmt.Errorf("网络隔离规则未就绪：%w", err)
+	}
+	if err := e.writeInitScript(id); err != nil {
+		return fmt.Errorf("更新 init.sh 失败：%w", err)
 	}
 	if err := e.d.Disk.Mount(ctx, id); err != nil {
 		return fmt.Errorf("数据盘未挂载：%w", err)
@@ -340,6 +343,9 @@ func (e *Executor) Recover(ctx context.Context) error {
 				e.setRecoverPending(inst.ID, true)
 			}
 			continue
+		}
+		if err := e.writeInitScript(inst.ID); err != nil {
+			errs = append(errs, fmt.Errorf("instance %s: 更新 init.sh 失败：%w", inst.ID, err))
 		}
 		if inst.Desired != "running" {
 			continue

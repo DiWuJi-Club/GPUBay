@@ -2,12 +2,14 @@ package agentgw_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"spark-cloud/internal/agentgw"
 	"spark-cloud/internal/agentpb"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/catalog"
@@ -73,6 +75,14 @@ func TestDeliveryWaitsForFirstStateReport(t *testing.T) {
 	if cr.GetImageRef() == "" || cr.GetUpstreamPubkey() != "ssh-ed25519 AAAAtest" || cr.GetBandwidthMbps() != 200 || cr.GetSshPort() != 2222 || cr.GetDataSizeGib() != 2048 {
 		t.Fatalf("create body = %v", cr)
 	}
+	if !strings.Contains(cr.GetHostKeyPem(), "OPENSSH PRIVATE KEY") {
+		t.Fatalf("host_key_pem not delivered: %q", cr.GetHostKeyPem())
+	}
+	var payload string
+	_ = e.pool.QueryRow(e.ctx, `SELECT payload::text FROM agent_commands WHERE id = $1`, cmdID).Scan(&payload)
+	if strings.Contains(payload, "PRIVATE KEY") || strings.Contains(payload, "host_key") {
+		t.Fatalf("private key leaked into agent_commands.payload: %s", payload)
+	}
 	c := e.command(cmdID)
 	if c.Status != "sent" || c.Attempts != 1 || c.SentAt == nil {
 		t.Fatalf("claimed = %+v", c)
@@ -85,6 +95,20 @@ func TestDeliveryWaitsForFirstStateReport(t *testing.T) {
 	e.waitFor("running", func() bool { inst, _ := e.rental.Get(e.ctx, instID); return inst.State == rental.StateRunning })
 	if m := a.next(4 * tick); m != nil {
 		t.Fatalf("nothing else should be delivered: %v", m)
+	}
+}
+
+func TestCreateCarriesConfiguredUpstreamSSHPort(t *testing.T) {
+	e := newEnvWith(t, func(c *agentgw.Config) { c.SSHPort = 2223 })
+	mid := e.machine("SN-002")
+	_, cmdID := e.place(mid)
+	a := e.connect(e.enroll(mid))
+	a.hello("10.0.0.10")
+	a.next(time.Second) // AgentConfig
+	a.report()
+	m := a.next(2 * time.Second)
+	if cmd := m.GetCommand(); cmd == nil || cmd.GetId() != cmdID || cmd.GetCreate().GetSshPort() != 2223 {
+		t.Fatalf("delivered = %v", m)
 	}
 }
 

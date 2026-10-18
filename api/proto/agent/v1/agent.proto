@@ -67,8 +67,11 @@ message CreateInstance {
   string image_ref = 1;
   string upstream_pubkey = 2;   // authorized_keys 一行
   uint32 bandwidth_mbps = 3;
-  uint32 ssh_port = 4;          // 本计划固定 2222
+  uint32 ssh_port = 4;          // 容器 22 发布到 <lan_ip>:<ssh_port>
   uint32 data_size_gib = 5;
+  // 平台生成的容器 sshd 主机私钥（OpenSSH PEM）。敏感：只在 mTLS 流上传输，不落日志，不进 agent_commands.payload；
+  // 为空时 Agent 沿用本地生成（兼容旧平台）。
+  string host_key_pem = 6;
 }
 message StartInstance {}
 message StopInstance {}

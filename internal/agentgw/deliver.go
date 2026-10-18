@@ -90,7 +90,7 @@ func (s *Server) TickNow(ctx context.Context) {
 			if c.aborted() || c.wasPushed(cmd.ID) {
 				continue
 			}
-			if s.push(c, cmd, n) {
+			if s.push(ctx, c, cmd, n) {
 				touched = append(touched, cmd.ID)
 			}
 		}
@@ -104,9 +104,18 @@ func (s *Server) TickNow(ctx context.Context) {
 	}
 }
 
-// push 把指令推给流；发送失败则断流（指令保持 sent，重连后补推）。
-func (s *Server) push(c *conn, cmd fleet.Command, tick int64) bool {
-	msg, err := toProtoCommand(cmd, s.cfg)
+// push 把指令推给流；Create 指令在这里读实例主机私钥（不经过 agent_commands.payload）。发送失败则断流（指令保持 sent，重连后补推）。
+func (s *Server) push(ctx context.Context, c *conn, cmd fleet.Command, tick int64) bool {
+	hostKey := ""
+	if cmd.Type == fleet.CmdCreateInstance && s.d.HostKeys != nil {
+		pem, err := s.d.HostKeys.HostKeyPEM(ctx, cmd.InstanceID)
+		if err != nil {
+			s.d.Log.Error("tick: load instance host key", "command", cmd.ID, "instance", cmd.InstanceID, "err", err)
+			return false
+		}
+		hostKey = pem
+	}
+	msg, err := toProtoCommand(cmd, s.cfg, hostKey)
 	if err != nil {
 		s.d.Log.Error("tick: convert command", "command", cmd.ID, "err", err)
 		return false

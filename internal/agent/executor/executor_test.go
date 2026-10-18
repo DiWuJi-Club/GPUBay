@@ -2,6 +2,9 @@ package executor_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,12 +17,15 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	diskfake "spark-cloud/internal/agent/disk/fake"
 	"spark-cloud/internal/agent/executor"
 	netfake "spark-cloud/internal/agent/netfilter/fake"
 	"spark-cloud/internal/agent/runtime"
 	rtfake "spark-cloud/internal/agent/runtime/fake"
 	"spark-cloud/internal/agent/state"
+	"spark-cloud/internal/pki"
 )
 
 // quiet 让测试输出保持干净（失败路径会打 ERROR 日志）。
@@ -91,7 +97,8 @@ func TestCreateHappyPath(t *testing.T) {
 		t.Fatalf("authorized_keys = %q", ak)
 	}
 	init, _ := os.ReadFile(filepath.Join(ssh, "init.sh"))
-	for _, want := range []string{"#!/bin/sh", "HostKey /.spark/hostkeys/ssh_host_ed25519_key", "AuthorizedKeysFile /.spark/authorized_keys", "StrictModes no", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitRootLogin prohibit-password", "exec /usr/sbin/sshd -D -e"} {
+	for _, want := range []string{"#!/bin/sh", "HostKey /.spark/hostkeys/ssh_host_ed25519_key", "AuthorizedKeysFile /.spark/authorized_keys", "StrictModes no", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitRootLogin prohibit-password", "exec /usr/sbin/sshd -D -e",
+		"Subsystem sftp internal-sftp", "AllowTcpForwarding yes", "GatewayPorts no", "AllowAgentForwarding yes", "X11Forwarding no", "PermitTunnel no", "ClientAliveInterval 60", "ClientAliveCountMax 3", "MaxStartups 50:30:200", "MaxSessions 32"} {
 		if !strings.Contains(string(init), want) {
 			t.Fatalf("init.sh missing %q:\n%s", want, init)
 		}
@@ -1020,4 +1027,89 @@ func TestStartStopsContainerWhenLimitFails(t *testing.T) {
 	if e.rt.Containers()["ins-aaaaaaaa"].Running {
 		t.Fatal("container without limit must be stopped")
 	}
+}
+
+func TestHostKeyFromPlatformIsWrittenOnceAndInitScriptRewritten(t *testing.T) {
+	e := newEnv(t)
+	_, pem, err := pki.GenerateInstanceHostKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := create("ins-aaaaaaaa")
+	cmd.HostKeyPEM = string(pem)
+	if res := e.run(cmd); len(res) != 1 || !res[0].OK {
+		t.Fatalf("create = %+v", res)
+	}
+	keyPath := filepath.Join(e.dir, "ssh", "ins-aaaaaaaa", "hostkeys", "ssh_host_ed25519_key")
+	got, _ := os.ReadFile(keyPath)
+	if string(got) != string(pem) {
+		t.Fatalf("host key = %q, want platform pem", got)
+	}
+	if st, _ := os.Stat(keyPath); st.Mode().Perm() != 0o600 {
+		t.Fatalf("perm = %o", st.Mode().Perm())
+	}
+	pub, _ := os.ReadFile(keyPath + ".pub")
+	signer, _ := ssh.ParsePrivateKey(pem)
+	if strings.TrimSpace(string(pub)) != strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) {
+		t.Fatalf(".pub = %q", pub)
+	}
+	// 重跑 create（步骤幂等）且平台换了一把钥匙：已存在的不被覆盖
+	_, pem2, _ := pki.GenerateInstanceHostKey()
+	cmd2 := cmd
+	cmd2.ID, cmd2.HostKeyPEM = "cmd-again", string(pem2)
+	e.run(cmd2)
+	if got, _ := os.ReadFile(keyPath); string(got) != string(pem) {
+		t.Fatal("existing host key overwritten")
+	}
+	// 旧版 init.sh（没有 sftp 行）在 start 时被重写
+	initPath := filepath.Join(e.dir, "ssh", "ins-aaaaaaaa", "init.sh")
+	os.WriteFile(initPath, []byte("#!/bin/sh\nexec /usr/sbin/sshd -D\n"), 0o755)
+	e.run(executor.Command{ID: "cmd-stop", InstanceID: "ins-aaaaaaaa", Type: "stop_instance"})
+	e.run(executor.Command{ID: "cmd-start", InstanceID: "ins-aaaaaaaa", Type: "start_instance"})
+	init, _ := os.ReadFile(initPath)
+	if !strings.Contains(string(init), "Subsystem sftp internal-sftp") {
+		t.Fatalf("init.sh not rewritten on start:\n%s", init)
+	}
+	// 没有 PEM 的旧平台：本地生成
+	e2 := newEnv(t)
+	e2.run(create("ins-bbbbbbbb"))
+	if _, err := os.Stat(filepath.Join(e2.dir, "ssh", "ins-bbbbbbbb", "hostkeys", "ssh_host_ed25519_key")); err != nil {
+		t.Fatalf("locally generated host key missing: %v", err)
+	}
+}
+
+// 平台下发了密钥但无法解析 / 不是 ed25519：create 失败，不静默回落到本地生成，也不留下密钥文件。
+func TestInvalidPlatformHostKeyFailsCreate(t *testing.T) {
+	_, rsaPEM := rsaKeyPEM(t)
+	for name, bad := range map[string]string{"garbage": "-----BEGIN OPENSSH PRIVATE KEY-----\nnot a key\n-----END OPENSSH PRIVATE KEY-----\n", "rsa": rsaPEM} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			cmd := create("ins-cccccccc")
+			cmd.HostKeyPEM = bad
+			res := e.run(cmd)
+			if len(res) != 1 || res[0].OK || !strings.Contains(res[0].Message, "主机密钥") {
+				t.Fatalf("create = %+v", res)
+			}
+			if strings.Contains(res[0].Message, "PRIVATE KEY") {
+				t.Fatalf("error leaks key material: %q", res[0].Message)
+			}
+			if _, err := os.Stat(filepath.Join(e.dir, "ssh", "ins-cccccccc", "hostkeys", "ssh_host_ed25519_key")); !os.IsNotExist(err) {
+				t.Fatalf("host key file should not exist: %v", err)
+			}
+		})
+	}
+}
+
+// rsaKeyPEM 生成一把 OpenSSH 格式的 RSA 私钥（合法 PEM，但不是 ed25519）。
+func rsaKeyPEM(t *testing.T) (*rsa.PrivateKey, string) {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(k, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k, string(pem.EncodeToMemory(block))
 }

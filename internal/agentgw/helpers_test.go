@@ -78,7 +78,7 @@ func newEnvWith(t *testing.T, tweak func(*agentgw.Config)) *env {
 	if tweak != nil {
 		tweak(&cfg)
 	}
-	srv, err := agentgw.New(cfg, agentgw.Deps{Pool: pool, Fleet: f, Rental: r, CA: ca, Clock: clk, Log: log})
+	srv, err := agentgw.New(cfg, agentgw.Deps{Pool: pool, Fleet: f, Rental: r, HostKeys: r, CA: ca, Clock: clk, Log: log})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -39,12 +39,19 @@ type Config struct {
 	Tick              time.Duration // 投递 tick，零值 1 秒
 	EnrollLimit       int           // Enroll 每 IP 每分钟次数，零值 10
 	HeartbeatInterval time.Duration // 下发给 Agent 的心跳间隔，零值 10 秒
+	SSHPort           int           // 容器 sshd 发布到 <lan_ip>:<SSHPort>（SPARK_UPSTREAM_SSH_PORT）；0 → 2222
+}
+
+// HostKeys 提供实例容器的主机私钥（由 rental 解密），只在投递 Create 指令时读取。
+type HostKeys interface {
+	HostKeyPEM(ctx context.Context, instanceID string) (string, error)
 }
 
 type Deps struct {
 	Pool      *pgxpool.Pool
 	Fleet     *fleet.Service
 	Rental    *rental.Service
+	HostKeys  HostKeys // Create 指令的 host_key_pem 来源（*rental.Service 满足）；nil → 不填，Agent 本地生成
 	CA        *pki.CA
 	Clock     clock.Clock // 业务时间戳（可注入假时钟）
 	CertClock clock.Clock // 证书签发与轮换：必须是墙上时钟，nil → clock.Real{}（对端按真实时间校验证书）
@@ -67,6 +74,9 @@ type Server struct {
 func New(cfg Config, d Deps) (*Server, error) {
 	if cfg.Tick <= 0 {
 		cfg.Tick = time.Second
+	}
+	if cfg.SSHPort <= 0 {
+		cfg.SSHPort = 2222
 	}
 	if cfg.EnrollLimit <= 0 {
 		cfg.EnrollLimit = 10
