@@ -162,29 +162,52 @@ func enroll(ctx context.Context, args []string, out io.Writer) error {
 	return nil
 }
 
-// ensurePrivateDir 创建目录并保证权限是 0700（已存在的目录也收紧）。
+// ensurePrivateDir：目录不存在则以 0700 创建；已存在则不改权限，只核对它是当前用户所有且对其他人不可访问，
+// 否则报错（不去 chmod 可能是别人的系统目录）。
 func ensurePrivateDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	fi, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		return os.Chmod(dir, 0o700) // 抵消 umask，刚创建的目录归我们
+	}
+	if err != nil {
 		return err
 	}
-	return os.Chmod(dir, 0o700)
-}
-
-// writePrivateFile 原子写入 0600 文件：先写临时文件再改名，避免中途失败留下半个证书。
-func writePrivateFile(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+	if !fi.IsDir() {
+		return fmt.Errorf("%s 不是目录", dir)
 	}
-	if err := os.Chmod(tmp, 0o600); err != nil { // WriteFile 不改已存在文件的权限
-		os.Remove(tmp)
-		return err
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("目录 %s 的属主（uid %d）不是当前用户，请检查后改为当前用户所有且权限 0700", dir, st.Uid)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
+	if fi.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("目录 %s 权限 %04o 过宽，请确认后执行 chmod 700 %s", dir, fi.Mode().Perm(), dir)
 	}
 	return nil
+}
+
+// writePrivateFile 原子写入 0600 文件：同目录临时文件写入并 fsync 后改名，避免断电或中途失败留下半个证书。
+func writePrivateFile(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*") // CreateTemp 以 0600 创建
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }
 
 func runAgent(ctx context.Context, args []string, out io.Writer) error {
@@ -195,7 +218,19 @@ func runAgent(ctx context.Context, args []string, out io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	stateDirSet := false
+	fs.Visit(func(f *flag.Flag) { stateDirSet = stateDirSet || f.Name == "state-dir" })
+	if *fake && !stateDirSet { // 防止在真机上误用 --fake 把 fake 状态写进生产状态目录
+		return errors.New("--fake 必须显式指定 --state-dir（不能使用默认的 /var/lib/spark-agent）")
+	}
+	agentVersion := version
+	if *fake {
+		agentVersion += "+fake" // 平台后台能看出这台机器跑的是 fake Agent
+	}
 	log := slog.New(slog.NewJSONHandler(out, nil))
+	if *fake {
+		log.Warn("running with --fake: in-memory runtime/disk/netfilter, no containers will actually be created", "state_dir", *stateDir)
+	}
 	cfg, err := loadAgentConfig(*dir)
 	if err != nil {
 		return fmt.Errorf("读取配置失败（先运行 spark-agent enroll）: %w", err)
@@ -244,11 +279,11 @@ func runAgent(ctx context.Context, args []string, out io.Writer) error {
 	}
 	collector := &metrics.Collector{Run: runner, ReadFile: os.ReadFile}
 	hostname, _ := os.Hostname()
-	c := client.New(client.Config{Addr: cfg.Platform, TLS: tc, Version: version, Hostname: hostname, LocalIPs: localIPs},
+	c := client.New(client.Config{Addr: cfg.Platform, TLS: tc, Version: agentVersion, Hostname: hostname, LocalIPs: localIPs},
 		ex, func(ctx context.Context) metrics.Metrics { return collector.Collect(ctx, ex.DataMount()) }, log)
 	exDone := make(chan struct{})
 	go func() { defer close(exDone); ex.Run(ctx) }()
-	log.Info("spark-agent running", "platform", cfg.Platform, "version", version, "fake", *fake)
+	log.Info("spark-agent running", "platform", cfg.Platform, "version", agentVersion, "fake", *fake)
 	err = c.Run(ctx)
 	<-exDone // Client.Run 只在 ctx 结束（或 NoReconnect，生产不用）时返回
 	return err

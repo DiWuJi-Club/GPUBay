@@ -163,6 +163,9 @@ func start(ctx context.Context, o Options, dir string) (*Agent, error) {
 		if runErr != nil { // Stop 等到 done 关闭后读取，无竞争
 			return nil, fmt.Errorf("fakeagent: not connected: %w", runErr)
 		}
+		if ctx.Err() != nil { // 调用方取消，而不是 10 秒超时
+			return nil, fmt.Errorf("fakeagent: not connected: %w", ctx.Err())
+		}
 		return nil, errors.New("fakeagent: not connected within 10s")
 	}
 	return a, nil

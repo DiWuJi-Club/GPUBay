@@ -130,6 +130,12 @@ func TestEnrollThenRunFake(t *testing.T) {
 		cancel()
 		t.Fatal("agent never connected")
 	}
+	g.mu.Lock()
+	hv := g.hellos[0].GetAgentVersion()
+	g.mu.Unlock()
+	if hv != version+"+fake" {
+		t.Fatalf("hello version = %q", hv)
+	}
 	if fi, err := os.Stat(stateDir); err != nil || fi.Mode().Perm() != 0o700 {
 		t.Fatalf("state dir mode = %v %v", fi, err)
 	}
@@ -141,5 +147,50 @@ func TestEnrollThenRunFake(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("run did not stop on cancel")
+	}
+}
+
+func TestRunFakeRequiresExplicitStateDir(t *testing.T) {
+	err := runAgent(context.Background(), []string{"--dir", t.TempDir(), "--fake"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "--state-dir") {
+		t.Fatalf("fake with default state dir = %v", err)
+	}
+}
+
+func TestEnsurePrivateDirDoesNotLoosenOrChmodExisting(t *testing.T) {
+	root := t.TempDir()
+	fresh := filepath.Join(root, "a", "b")
+	if err := ensurePrivateDir(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(fresh); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("created mode = %v", fi.Mode())
+	}
+	if err := ensurePrivateDir(fresh); err != nil { // 已存在且 0700：通过
+		t.Fatal(err)
+	}
+	shared := filepath.Join(root, "shared")
+	_ = os.Mkdir(shared, 0o755)
+	_ = os.Chmod(shared, 0o755)
+	if err := ensurePrivateDir(shared); err == nil {
+		t.Fatal("pre-existing 0755 dir accepted")
+	}
+	if fi, _ := os.Stat(shared); fi.Mode().Perm() != 0o755 {
+		t.Fatalf("existing dir was chmodded to %v", fi.Mode())
+	}
+}
+
+func TestWritePrivateFileReplacesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "agent.crt")
+	_ = os.WriteFile(p, []byte("old"), 0o644)
+	if err := writePrivateFile(p, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	fi, _ := os.Stat(p)
+	entries, _ := os.ReadDir(dir)
+	if string(b) != "new" || fi.Mode().Perm() != 0o600 || len(entries) != 1 {
+		t.Fatalf("content=%q mode=%v entries=%d", b, fi.Mode(), len(entries))
 	}
 }

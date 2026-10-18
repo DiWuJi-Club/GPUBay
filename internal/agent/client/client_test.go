@@ -525,7 +525,8 @@ func TestSteppedModeSendsNothingAutomatically(t *testing.T) {
 	if err := c.WaitConnected(ctx); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(300 * time.Millisecond) // 远长于心跳与上报间隔
+	waitFor(t, "hello+state recorded", func() bool { return len(h.gw.msgs()) >= 2 })
+	time.Sleep(300 * time.Millisecond) // 否定断言：远长于心跳与上报间隔，期间不应再有自动消息
 	if k := kinds(h.gw.msgs()); len(k) != 2 {
 		t.Fatalf("stepped agent sent %v", k)
 	}

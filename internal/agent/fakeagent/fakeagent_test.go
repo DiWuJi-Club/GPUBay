@@ -3,6 +3,7 @@ package fakeagent_test
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"os"
 	"strings"
@@ -157,8 +158,9 @@ func TestStartEnrollsConnectsAndReconnectsWithSameCreds(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer again.Stop()
-	if enrolls, hellos, _ := g.count(); enrolls != 1 || hellos != 2 {
-		t.Fatalf("enrolls=%d hellos=%d, want 1 and 2", enrolls, hellos)
+	waitFor(t, "second hello", func() bool { _, hellos, _ := g.count(); return hellos == 2 })
+	if enrolls, _, _ := g.count(); enrolls != 1 {
+		t.Fatalf("enrolls=%d, want 1 (creds reused)", enrolls)
 	}
 	if r, ok := again.Exec.StateStore().Result("c1"); !ok || !r.OK { // 同一状态目录：已执行的结果保留
 		t.Fatalf("state not reused: %+v %v", r, ok)
@@ -203,5 +205,24 @@ func TestStopRemovesOnlyOwnTempDir(t *testing.T) {
 	ag.Stop()
 	if _, err := os.Stat(own); err != nil {
 		t.Fatalf("caller dir must be kept: %v", err)
+	}
+}
+
+func TestStartReturnsCallerCancellation(t *testing.T) {
+	g, addr := newGateway(t)
+	ag, err := fakeagent.Start(context.Background(), fakeagent.Options{Addr: addr, CAPEM: g.ca.CertPEM(), Token: "spk1_x", Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ag.Stop()
+	g.mu.Lock()
+	g.refuse = true // 会话一直失败、一直重连，Start 只能靠 ctx 结束
+	g.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = fakeagent.Start(ctx, fakeagent.Options{Addr: addr, Creds: ag.Creds(), Dir: ag.Dir})
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+		t.Fatalf("err = %v after %v", err, time.Since(start))
 	}
 }
