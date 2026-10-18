@@ -139,8 +139,13 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	agentpb.RegisterAgentGatewayServer(gs, s)
 	errc := make(chan error, 1)
 	go func() { errc <- gs.Serve(lis) }()
-	go s.runTicks(ctx)
-	go s.runCertRotation(ctx)
+	loopCtx, stopLoops := context.WithCancel(ctx)
+	var loops sync.WaitGroup
+	loops.Add(2)
+	go func() { defer loops.Done(); s.runTicks(loopCtx) }()
+	go func() { defer loops.Done(); s.runCertRotation(loopCtx) }()
+	defer loops.Wait() // 返回前等投递循环与证书检查退出（在 stopLoops 之后执行）
+	defer stopLoops()
 	select {
 	case <-ctx.Done():
 		s.conns.abortAll(errors.New("gateway shutting down"))

@@ -3,6 +3,7 @@ package executor_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -398,7 +399,7 @@ func TestDuplicateCommandRunsAtMostOnce(t *testing.T) {
 	select {
 	case r := <-auto.Results():
 		t.Fatalf("unexpected extra result %+v", r)
-	case <-time.After(1500 * time.Millisecond): // 消费者 1 秒轮询一次，留足时间让误入队的重复指令暴露
+	case <-time.After(1500 * time.Millisecond): // 留足时间让误入队的重复指令暴露
 	}
 	if n := cr2.creates.Load(); n != 1 {
 		t.Fatalf("create ran %d times", n)
@@ -447,8 +448,9 @@ func TestRecoverFailsClosedWhenRulesFail(t *testing.T) {
 	restore := executor.SetRulesIntervalForTest(e.ex, 10*time.Millisecond)
 	defer restore()
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go e.ex.Run(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); e.ex.Run(ctx) }()
+	defer func() { cancel(); <-done }() // 等 Run（及其中的 Recover）退出，免得它还在写 TempDir 时被清理
 	deadline := time.Now().Add(3 * time.Second)
 	for !e.rt.Containers()["ins-aaaaaaaa"].Running {
 		if time.Now().After(deadline) {
@@ -552,6 +554,36 @@ func TestContainerMemoryAndShmLimits(t *testing.T) {
 		}
 		if cr.spec.MemoryBytes != int64(tc.wantMem) || cr.spec.ShmBytes != int64(tc.wantShm) {
 			t.Fatalf("mem %d: spec memory=%d shm=%d", tc.mem, cr.spec.MemoryBytes, cr.spec.ShmBytes)
+		}
+	}
+}
+
+// 空闲时提交的实例指令立即被实例消费者取走，不会因为唤醒被 pull 消费者抢走而等兜底轮询（曾经约 1 秒）。
+// 连续 5 条：共用唤醒通道时每条约一半概率被抢，全部及时的概率只有 1/32。
+func TestIdleInstanceCommandStartsPromptly(t *testing.T) {
+	e := newEnv(t)
+	auto := executor.New(executor.Deps{Log: quiet, Runtime: e.rt, Disk: e.disk, Net: e.net, State: e.st, StateDir: e.dir,
+		LocalIPs: func() []string { return []string{"192.168.1.221"} }, MemTotal: func() uint64 { return 128 << 30 }}, false)
+	auto.SetConfig(e.ex.Config())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); auto.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	for i := range 5 {
+		time.Sleep(20 * time.Millisecond) // 让两个消费者都进入空闲等待
+		cmd := executor.Command{ID: fmt.Sprintf("cmd-stop-%d", i), InstanceID: "ins-aaaaaaaa", Type: "stop_instance"}
+		start := time.Now()
+		auto.Submit(cmd)
+		select {
+		case r := <-auto.Results():
+			if r.ID != cmd.ID {
+				t.Fatalf("result = %+v", r)
+			}
+			if d := time.Since(start); d > 500*time.Millisecond {
+				t.Fatalf("command %d took %v", i, d)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("command %d never ran", i)
 		}
 	}
 }

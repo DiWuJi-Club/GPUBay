@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log/slog"
@@ -349,8 +350,9 @@ func TestReplaceAndRejectedFingerprint(t *testing.T) {
 	f.waitFor("ag2 aborted", func() bool { return !ag2.Client.Connected() })
 	ctx, cancel := context.WithTimeout(f.ctx, 2*time.Second)
 	defer cancel()
-	if _, err := fakeagent.Start(ctx, fakeagent.Options{Addr: f.addr, CAPEM: f.a.Gateway.CAPEM(), Creds: ag.Creds(), Stepped: true, NoReconnect: true}); err == nil {
-		t.Fatal("old certificate must be rejected")
+	_, err = fakeagent.Start(ctx, fakeagent.Options{Addr: f.addr, CAPEM: f.a.Gateway.CAPEM(), Creds: ag.Creds(), Stepped: true, NoReconnect: true})
+	if status.Code(err) != grpccodes.Unauthenticated || !strings.Contains(err.Error(), "certificate not recognised") {
+		t.Fatalf("old certificate: err = %v, want Unauthenticated「certificate not recognised」", err)
 	}
 	f.waitFor("ag3 still active", func() bool { return ag3.Client.Connected() && f.a.Gateway.Connected(mid) })
 }
@@ -400,8 +402,13 @@ func TestBuildUpstreamKeyFallbackOnlyOutsideProd(t *testing.T) {
 
 	prod := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "aliyun", KYCDriver: "aliyun",
 		PayDriver: "real", PDUDriver: "snmp", UploadDir: t.TempDir(), AgentHosts: []string{"agent.spark.test"}}
-	if _, err := app.Build(prod, dbtest.New(t), discardLog(), app.Options{}); err == nil || !strings.Contains(err.Error(), "SPARK_UPSTREAM_SSH_KEY_FILE") {
+	prodPool := dbtest.New(t)
+	if _, err := app.Build(prod, prodPool, discardLog(), app.Options{}); err == nil || !strings.Contains(err.Error(), "SPARK_UPSTREAM_SSH_KEY_FILE") {
 		t.Fatalf("err = %v, want 生产环境必须设置 SPARK_UPSTREAM_SSH_KEY_FILE", err)
+	}
+	var cas int // 配置错误先于 EnsureCA 报出，不留数据库写入
+	if err := prodPool.QueryRow(context.Background(), `SELECT count(*) FROM platform_pki`).Scan(&cas); err != nil || cas != 0 {
+		t.Fatalf("platform_pki rows = %d, %v", cas, err)
 	}
 	if keys, _ := filepath.Glob(filepath.Join(tmp, "spark-upstream-*.key")); len(keys) != 1 {
 		t.Fatalf("prod must not generate a key: %v", keys)
@@ -409,5 +416,23 @@ func TestBuildUpstreamKeyFallbackOnlyOutsideProd(t *testing.T) {
 	prod.UpstreamSSHKeyFile = upstreamKeyFile(t)
 	if _, err := app.Build(prod, dbtest.New(t), discardLog(), app.Options{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// 内置 CA 的有效期按墙上时钟：注入的假时钟领先真实时间时，CA 也必须已经生效。
+func TestCAValidityFollowsWallClock(t *testing.T) {
+	cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key,
+		SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+	future := clock.NewFake(time.Now().AddDate(1, 0, 0))
+	a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: future})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := x509.ParseCertificate(a.CA.CertDER())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if now := time.Now(); now.Before(ca.NotBefore) || now.After(ca.NotAfter) {
+		t.Fatalf("CA validity %v..%v does not cover wall time %v", ca.NotBefore, ca.NotAfter, now)
 	}
 }

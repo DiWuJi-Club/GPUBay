@@ -166,13 +166,14 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy,
 	}
-	ca, err := pki.EnsureCA(context.Background(), pool, box, clk)
-	if err != nil {
-		return nil, fmt.Errorf("初始化内置 CA: %w", err)
-	}
-	upstreamPub, err := upstreamPublicKey(cfg, log)
+	upstreamPub, err := upstreamPublicKey(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
 	if err != nil {
 		return nil, err
+	}
+	// 证书有效期按墙上时钟（对端按真实时间校验）；注入的假时钟若领先真实时间，会签出尚未生效的 CA。
+	ca, err := pki.EnsureCA(context.Background(), pool, box, clock.Real{})
+	if err != nil {
+		return nil, fmt.Errorf("初始化内置 CA: %w", err)
 	}
 	enrollLimit := 0
 	if opt.DisableRateLimits {

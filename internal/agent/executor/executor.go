@@ -85,7 +85,9 @@ type Executor struct {
 	// recoverBlocked：Recover 因隔离规则失败而没有启动实例，规则刷新成功后重试。
 	recoverBlocked bool
 
-	wake chan struct{}
+	// 两个队列各有一个唤醒通道（容量 1），入队时按类型通知；共用一个通道时 pull 消费者会抢走实例指令的唤醒。
+	wakeInstance chan struct{}
+	wakePull     chan struct{}
 }
 
 func New(d Deps, stepped bool) *Executor {
@@ -105,7 +107,8 @@ func New(d Deps, stepped bool) *Executor {
 		d.LocalIPs = func() []string { return nil }
 	}
 	return &Executor{d: d, stepped: stepped, results: make(chan ResultMsg, 256), rulesInterval: rulesInterval,
-		pending: map[string]bool{}, unpersisted: map[string]state.Result{}, wake: make(chan struct{}, 1)}
+		pending: map[string]bool{}, unpersisted: map[string]state.Result{},
+		wakeInstance: make(chan struct{}, 1), wakePull: make(chan struct{}, 1)}
 }
 
 func (e *Executor) SetConfig(c Config)        { e.mu.Lock(); e.cfg = c; e.mu.Unlock() }
@@ -138,13 +141,15 @@ func (e *Executor) Submit(c Command) {
 		return
 	}
 	e.pending[c.ID] = true
+	wake := e.wakeInstance
 	if c.Type == "pull_image" {
 		e.pulls = append(e.pulls, c)
+		wake = e.wakePull
 	} else {
 		e.queue = append(e.queue, c)
 	}
 	select {
-	case e.wake <- struct{}{}:
+	case wake <- struct{}{}:
 	default:
 	}
 }
@@ -271,15 +276,18 @@ func (e *Executor) Run(ctx context.Context) {
 }
 
 func (e *Executor) consume(ctx context.Context, pull bool) {
+	wake := e.wakeInstance
+	if pull {
+		wake = e.wakePull
+	}
 	for {
 		c, ok := e.pop(pull)
 		if !ok {
-			// wake 被两个消费者共享，可能被另一个抢走，所以同时带 1 秒轮询。
+			// 入队先于通知且通道有 1 个缓冲：pop 落空之后的入队一定留下一次唤醒，不会丢。
 			select {
 			case <-ctx.Done():
 				return
-			case <-e.wake:
-			case <-time.After(time.Second):
+			case <-wake:
 			}
 			continue
 		}
