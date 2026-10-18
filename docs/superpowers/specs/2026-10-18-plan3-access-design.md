@@ -1,7 +1,7 @@
 # Spark Cloud — 计划 3：接入层设计文档（SSH 网关 + Web 入口）
 
 - 日期：2026-10-18
-- 状态：已审定（Fable 设计，独立 Fable 评审「APPROVED WITH REQUIRED CHANGES」，本版已落实全部必改项；负责人已授权由 Fable 设计并确认）
+- 状态：已批准（Fable 评审 2026-10-18；负责人已授权由 Fable 设计并确认）
 - 上位文档：`2026-10-14-spark-cloud-mvp-design.md`（下称「总设计」）§5、§7.1；`2026-10-18-plan2-agent-design.md`（下称「计划 2」）§4.2
 - 范围：用户经公网 SSH 登录实例（`ssh ins-xxxxxxxx@ssh.<domain>`，密码或公钥）、经公网 HTTPS 访问实例内的 Web 端口（`https://ins-xxxxxxxx-<port>.<ingress_domain>`，默认私有、可设公开）、控制台的 SSH 公钥 / 密码 / 端口管理、后台对应视图、TLS 终止、部署示例与真机验收。
 - 不在范围：见 §12。
@@ -179,7 +179,8 @@
 #### 4.2.1 同站（same-site）防护
 租户页面 `ins-*.<ingress_domain>` 与控制台 `<domain>` 在默认配置下是同一注册域；浏览器 `SameSite` 只区分跨站不区分兄弟子域，所以控制台原来「`SameSite=Lax` 防跨站提交」的假设被打破：任一租户的公开端口页面能向 `/api/v1/uploads` 提交 multipart 表单并带上受害者 Cookie；租户页面还能 `document.cookie="sc_session=<攻击者令牌>; Domain=<domain>"` 做登录 CSRF（cookie tossing）。两道防线都做，且不因是否使用独立域名而省略：
 - (a) `SecureCookie = true` 的环境（staging / prod）控制台会话 Cookie 改名 `__Host-sc_session`（浏览器拒绝子域用 Domain 属性覆写 `__Host-` 前缀 Cookie，且该前缀要求 `Secure; Path=/; 无 Domain`，与现状一致）；dev / e2e 走 http 无法用前缀，保持 `sc_session`，文档说明。读取时按环境取对应名字。
-- (b) 控制台对非 GET / HEAD / OPTIONS 请求新增中间件：`Sec-Fetch-Site` 只放行 `same-origin` / `none`；没有该头的旧浏览器要求 `Origin` 等于 `SPARK_PUBLIC_BASE_URL` 的 origin；支付回调 `/api/v1/pay/notify/*` 豁免。放在 `requireJSONForWrites` 旁边，`server.go` 的旧注释改掉。
+- (b) 控制台对非 GET / HEAD / OPTIONS 请求新增中间件，三段规则：有 `Sec-Fetch-Site` → 只放行 `same-origin` / `none`；没有 `Sec-Fetch-Site` 但有 `Origin` → 必须等于 `SPARK_PUBLIC_BASE_URL` 的 origin；两个头都没有 → 放行（非浏览器客户端：Go `api_test`、Playwright `request`、curl；浏览器在跨源 POST 时总会带 `Origin`，不会落到这一段）。支付回调 `/api/v1/pay/notify/*` 豁免。放在 `requireJSONForWrites` 旁边，`server.go` 的旧注释改掉。
+- (c) 同一中间件也加到后台 `/admin/api/v1`（`Origin` 与后台对外地址比较：`SPARK_ADMIN_PUBLIC_BASE_URL`，默认空 = 只接受 `Sec-Fetch-Site` 规则与无头请求；若后台经反向代理挂在 `<domain>` 的兄弟子域上，租户页面与它同站，`sc_admin` 的 `SameSite=Strict` 同样挡不住兄弟子域的提交）。
 - 租户 Web 应用自身的 CSRF 防护由应用负责（§9 安全要点、帮助页）。生产推荐把 `SPARK_INGRESS_DOMAIN` 设为独立注册域（裁定 1）。
 
 ### 4.3 转发
@@ -201,7 +202,7 @@
 - 证书来源（裁定 2）：acme.sh 侧车 DNS-01（示例 `dns_ali`）写共享卷，或人工放商业泛域名证书文件；platform 不区分，热加载同一逻辑。选哪条列入上线前核对。
 
 ### 4.6 URL 生成
-`SPARK_PUBLIC_BASE_URL` 成为所有环境的权威对外地址（dev 默认 `http://<domain>:<HTTP 端口>`，e2e `http://spark.test:18080`，prod 必填且须 https）。启动校验 `host(SPARK_PUBLIC_BASE_URL) == SPARK_DOMAIN`，不一致则启动失败（否则拼出的 URL 与证书 / DNS 对不上）。端口 URL = `scheme://ins-<id>-<port>.<ingress_domain>[:base 的端口]/`；`authorize` 与 callback 的跳转地址同样由它推导，不信任请求里的 Host 拼 URL。
+`SPARK_PUBLIC_BASE_URL` 成为所有环境的权威对外地址（dev 默认 `http://spark.local:8080`，即 `http://<domain>:<HTTP 端口>`；e2e `http://spark.test:18080`；prod 必填且须 https）。开发机本地测 ingress 时要把 `spark.local` 与用到的 `ins-<id>-<port>.spark.local` 加进 `/etc/hosts`（hosts 不支持泛域名），或改用 sslip.io 域（§10.4 的做法）；README「本地开发」注明。启动校验 `host(SPARK_PUBLIC_BASE_URL) == SPARK_DOMAIN`，不一致则启动失败（否则拼出的 URL 与证书 / DNS 对不上）。端口 URL = `scheme://ins-<id>-<port>.<ingress_domain>[:base 的端口]/`；`authorize` 与 callback 的跳转地址同样由它推导，不信任请求里的 Host 拼 URL。
 
 ## 5. 上游连接与 Agent 改动
 
@@ -322,14 +323,15 @@ ALTER TABLE platform_pki ADD COLUMN ssh_host_key_enc BYTEA;  -- 网关主机密�
 | `SPARK_SSH_MAX_SESSIONS_PER_INSTANCE` | 每实例并发 SSH 会话上限 | `16` |
 | `SPARK_SSH_DRAIN_TIMEOUT` | 停机时等待会话结束的时间 | `30s` |
 | `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的端口（Create 的 `ssh_port` 与上游拨号共用） | `2222` |
-| `SPARK_INGRESS_DOMAIN` | 租户子域的父域（`ins-<id>-<port>.<此域>`）；生产推荐独立注册域 | `= SPARK_DOMAIN` |
+| `SPARK_INGRESS_DOMAIN` | 租户子域的父域（`ins-<id>-<port>.<此域>`）；生产推荐与 `SPARK_DOMAIN` 不同的注册域（eTLD+1） | `= SPARK_DOMAIN` |
+| `SPARK_ADMIN_PUBLIC_BASE_URL` | 后台对外地址（经反向代理暴露时填写），用于后台写请求的 `Origin` 校验 | 空 |
 | `SPARK_PUBLIC_BASE_URL` | 对外地址（已有）；prod 必填且 https；host 必须等于 `SPARK_DOMAIN`；dev 默认 `http://<domain>:<HTTP 端口>` | 见左 |
 | `SPARK_TLS_CERT_FILE` / `SPARK_TLS_KEY_FILE` | 证书与私钥（PEM，覆盖 `<domain>` 与 `*.<ingress_domain>`），设置后公网监听器为 HTTPS 并热加载 | 空 |
 | `SPARK_HTTP_REDIRECT_ADDR` | 纯 HTTP 301 到 https 的监听地址（仅 TLS 开启时有效） | 空（关） |
 
 常量（代码内，不做配置）：每 IP（IPv6 /64）并发 32、失败连接阈值 10/10 分钟（IP）与 30/10 分钟（实例）、票据 60 秒、`sc_ingress` 12 小时、路由表与会话校验缓存 2 秒、会话 `last_seen_at` 刷新 60 秒 / 收尾 5 分钟、`MaxSSHKeys 10`、`MaxPortsPerInstance 5`。
 
-校验：prod 下 `SPARK_PUBLIC_BASE_URL` 必须 https；`host(SPARK_PUBLIC_BASE_URL) == SPARK_DOMAIN`；prod 下未配证书且 `SPARK_TRUST_PROXY=false` → 启动失败「生产环境必须配置 TLS 证书或在反向代理后设置 SPARK_TRUST_PROXY=true」；`SPARK_SSH_ADDR` 与 `SPARK_HTTP_ADDR` 等不得相同；`SPARK_INGRESS_DOMAIN` 须是合法域名且不是 `SPARK_DOMAIN` 的子域（否则 `ins-*` 仍落在控制台域下，与裁定 1 的目的相悖；相等允许）。
+校验：prod 下 `SPARK_PUBLIC_BASE_URL` 必须 https；`host(SPARK_PUBLIC_BASE_URL) == SPARK_DOMAIN`；prod 下未配证书且 `SPARK_TRUST_PROXY=false` → 启动失败「生产环境必须配置 TLS 证书或在反向代理后设置 SPARK_TRUST_PROXY=true」；`SPARK_SSH_ADDR` 与 `SPARK_HTTP_ADDR` 等不得相同；`SPARK_INGRESS_DOMAIN` 须是合法域名且不是 `SPARK_DOMAIN` 的子域（相等允许）——这条只防误配；要真正脱离同站，必须是与 `SPARK_DOMAIN` **不同的注册域（eTLD+1）**，例如 `spark.example` 配 `sparkapp.example`，而不是 `app.spark.example`（README 与 `.env.example` 注明）。
 
 ## 9. 失败处理、安全与可观测（决策 6）
 
@@ -353,7 +355,7 @@ ALTER TABLE platform_pki ADD COLUMN ssh_host_key_enc BYTEA;  -- 网关主机密�
 - `sshgw`：用户名解析；密码 / 公钥 / 密码关闭 / 各状态 Banner（假时钟 + 嵌入式 PG）；中继——进程内假上游（`internal/access/sshtest`：x/crypto/ssh 服务端，支持 session exec / shell / pty、`subsystem sftp`（回固定字节）、`direct-tcpip`（拨本地地址）、`tcpip-forward` + `forwarded-tcpip` 回连、`auth-agent` 通道、发 `hostkeys-00`、按要求发 `x11` / `forwarded-streamlocal` 通道）：exec 退出码透传、`-L` 可用、`-R` 回连可用、agent 通道透传、x11 / streamlocal / tun 被拒、未知全局请求回 false、`hostkeys-00` 被丢弃、**网关从不自行拨号**（假上游断言收到的 `direct-tcpip` extra data 与客户端发送的字节一致，且测试里不存在任何网关侧出站拨号）、字节计数、实例停机后 10 秒内会话被断、暂停时不断、上游拒绝原因回传；失败连接计数（agent 多把公钥不计、密码错一次连接只计 1）、IPv6 /64 键、并发上限；主机密钥持久化（两次 `Ensure` 同一把、并发只留一把）；`last_seen_at` 刷新与清扫收尾；drain。
 - `identity`：公钥解析矩阵（ed25519 / ecdsa / rsa-2048 / rsa-1024 拒 / dss 拒 / sk 拒 / 垃圾 / 带注释 / 重复 / 上限 10）。
 - `rental`：密码重置、`password_auth` 规则、端口 CRUD（范围、22、上限 5、重复、非主人、released、forced_private）、主机密钥生成与加密、释放清空私钥、换机复制端口与 `password_auth`、`HostKeys.PEM`、会话清理。
-- `api`：`__Host-` Cookie 名按环境切换；`Sec-Fetch-Site` / `Origin` 中间件矩阵（same-origin 放行、same-site 拒绝、无头且 Origin 匹配放行、支付回调豁免、GET 不检查）；`authorize` 未登录 302、非主人 403、`target` 非法 400。
+- `api`：`__Host-` Cookie 名按环境切换；`Sec-Fetch-Site` / `Origin` 中间件矩阵（same-origin 放行、same-site 拒绝、cross-site 拒绝、无 `Sec-Fetch-Site` 且 `Origin` 匹配放行、`Origin` 不匹配拒绝、**两个头都没有放行**、支付回调豁免、GET 不检查；后台路由同一矩阵）；`authorize` 未登录 302、非主人 403、`target` 非法 400。
 - `ingress`：Host 解析（大小写、带端口、非法、`SPARK_INGRESS_DOMAIN` 独立域）；票据签发 / 验签 / 过期 / 重放；Cookie 逐枚验证、会话失效即拒绝、剥离；`next` 开放重定向用例（`//evil`、`\`、带 host）；私有 / 公开 / forced_private；状态页；ReverseProxy 经 `sshtest` + httptest 上游：普通请求、流式响应、90 秒 SSE 不被 WriteTimeout 掐断、WebSocket 回显、502、**两个实例同端口并发请求不串**；`POST /.spark/logout`（GET 405）；TLS 热加载（写新证书文件 → `GetCertificate` 返回新证书；坏文件 → 保留旧的并告警）；`hostmux` 不影响控制台路径。
 - `agent`：`init.sh` 快照含 sftp 等新行；`host_key_pem` 写入 / 已存在保留 / 为空时本地生成；start 时重写 `init.sh`。
 - `config`：新变量与 prod 校验（含 base URL host 与 `SPARK_DOMAIN` 一致、`SPARK_INGRESS_DOMAIN` 规则）。
@@ -398,7 +400,7 @@ ALTER TABLE platform_pki ADD COLUMN ssh_host_key_enc BYTEA;  -- 网关主机密�
 ## 11. 部署
 - `deploy/compose/`：`docker-compose.yml`（`platform`：`SPARK_HTTP_ADDR=:8443`、`SPARK_HTTP_REDIRECT_ADDR=:8080`、`SPARK_SSH_ADDR=:2222`，端口映射 `22:2222`、`443:8443`、`80:8080`，`9443:9443` 仅内网；`postgres`；可选 `acme`（`neilpang/acme.sh`，`dns_ali`，证书卷共享给 platform）；`.env.example` 列出所有 `SPARK_*` 并与上述映射一一对应；`README`。platform 镜像 Dockerfile（多阶段，`make build` 产物）。
 - 控制面宿主机步骤（README）：**先把宿主机自己的 OpenSSH 挪到其它端口**（例如 `Port 2200`，并先在新端口验证登录再重启 sshd），再 `docker compose up`（裁定 3）。
-- README：新增配置表行；SSH 网关说明（端口映射、主机密钥指纹发布、部署会断 SSH、`SPARK_SECRET_KEY` 轮换连带丢失网关主机密钥）；Web 入口说明（DNS：`<domain>`、`ssh.<domain>`、`*.<ingress_domain>` 都指向控制面；**生产推荐 `SPARK_INGRESS_DOMAIN` 用独立注册域**；证书两种来源）；**发布顺序：先升级全部 Agent，再发布 platform**。
+- README：新增配置表行；SSH 网关说明（端口映射、主机密钥指纹发布、部署会断 SSH、`SPARK_SECRET_KEY` 轮换连带丢失网关主机密钥）；Web 入口说明（DNS：`<domain>`、`ssh.<domain>`、`*.<ingress_domain>` 都指向控制面；**生产推荐 `SPARK_INGRESS_DOMAIN` 用与 `SPARK_DOMAIN` 不同的注册域（eTLD+1），子域不算**；本地开发测 ingress 需在 hosts 加 `spark.local` 与 `ins-*.spark.local` 条目或用 sslip.io；证书两种来源）；**发布顺序：先升级全部 Agent，再发布 platform**。
 - 帮助页（`HelpView`）：SSH 登录（密码 / 公钥 / 指纹核对 / 端口转发 / scp、sftp / `ssh-copy-id` 不生效）、Web 端口（私有 / 公开、`/.spark/` 保留、公开端口风险、应用需监听 `127.0.0.1` 或 `0.0.0.0`——只监听容器 eth0 地址不通、Jupyter 需 `--ServerApp.allow_remote_access=True`、租户应用自己做 CSRF 防护）。
 
 ## 12. 范围与遗留（决策 8）
@@ -434,7 +436,7 @@ ALTER TABLE platform_pki ADD COLUMN ssh_host_key_enc BYTEA;  -- 网关主机密�
 11. `sshgw` 状态扫描断开（不含暂停）、drain；集成进 `app` 与 `cmd/platform`。
 12. `agent.proto` `host_key_pem`；Agent `writeSSHDir` 与 `init.sh` 修订；`agentgw` 经 `HostKeys` 投递填充。
     — **真机检查点 A**（§10.4 第 1～6、9～13 项）——
-13. `api`：`__Host-` Cookie 名、`Sec-Fetch-Site` / `Origin` 中间件、`authorize` 端点（组外）。
+13. `api` / `adminapi`：`__Host-` Cookie 名、`Sec-Fetch-Site` / `Origin` 三段规则中间件（控制台与后台共用一份实现）、`authorize` 端点（组外）。
 14. `ingress` Host 解析（含独立域）、路由表、状态页、404/502/503 页面。
 15. `ingress` 票据、Cookie（逐枚验证、绑定会话）、callback / `POST logout`、`next` / `target` 校验。
 16. `ingress` ReverseProxy（按实例隔离的连接池、SSH 通道拨号、WebSocket、Cookie 剥离、清除 Read/Write 期限）。
