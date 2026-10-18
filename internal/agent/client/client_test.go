@@ -7,12 +7,14 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,6 +134,7 @@ type harness struct {
 	addr    string
 	ca      *pki.CA
 	key     *ecdsa.PrivateKey
+	dir     string // 最近一个 agent 的状态目录
 	collect func(context.Context) metrics.Metrics
 }
 
@@ -171,6 +174,7 @@ func (h *harness) agentWith(stepped, noReconnect bool) (*client.Client, *executo
 		h.t.Fatal(err)
 	}
 	dir := h.t.TempDir()
+	h.dir = dir
 	st, _ := state.Open(filepath.Join(dir, "state.json"))
 	rt := rtfake.New()
 	ex := executor.New(executor.Deps{Runtime: rt, Disk: diskfake.New(4000 << 30), Net: netfake.New(), State: st, StateDir: dir,
@@ -247,7 +251,10 @@ func TestEnrollPinsCAFingerprint(t *testing.T) {
 	if _, _, err := client.Enroll(context.Background(), h.addr, "spk1_x", other, h.key); err == nil {
 		t.Fatal("foreign CA fingerprint accepted")
 	}
-	if n := len(h.gw.tokens); n != 0 {
+	h.gw.mu.Lock()
+	n := len(h.gw.tokens)
+	h.gw.mu.Unlock()
+	if n != 0 {
 		t.Fatalf("token sent to an unpinned server %d times", n)
 	}
 	certDER, caDER, err := client.Enroll(context.Background(), h.addr, "spk1_x", h.ca.Fingerprint(), h.key)
@@ -377,7 +384,8 @@ func TestHungCollectorDoesNotStallHeartbeat(t *testing.T) {
 	h := newHarness(t)
 	release := make(chan struct{})
 	defer close(release)
-	h.collect = func(context.Context) metrics.Metrics { <-release; return metrics.Metrics{} }
+	var calls atomic.Int32
+	h.collect = func(context.Context) metrics.Metrics { calls.Add(1); <-release; return metrics.Metrics{} }
 	c, ex, _ := h.agent(false)
 	client.SetMetricsTimeoutForTest(c, 20*time.Millisecond)
 	ctx := h.start(c, ex, false)
@@ -385,6 +393,93 @@ func TestHungCollectorDoesNotStallHeartbeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "heartbeats despite hung collector", func() bool { return count(h.gw.msgs(), "heartbeat") >= 3 })
+	if n := calls.Load(); n != 1 { // 单飞：卡住的采集没返回前不再起新的
+		t.Fatalf("collector started %d times while hung", n)
+	}
+}
+
+// 结果已发出但「已发送」标记落盘失败（根分区写满）：只记日志，会话不断、心跳照常，不会反复重连。
+func TestMarkSentFailureDoesNotEndSession(t *testing.T) {
+	h := newHarness(t)
+	c, ex, _ := h.agent(false)
+	if err := ex.StateStore().PutResult("cmd-x", state.Result{OK: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(h.dir, 0o500); err != nil { // 状态文件从此写不进去
+		t.Fatal(err)
+	}
+	dir := h.dir
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := ex.StateStore().PutResult("probe", state.Result{}); err == nil {
+		t.Skip("state dir still writable (running as root?)")
+	}
+	ctx := h.start(c, ex, false)
+	if err := c.WaitConnected(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "heartbeats keep flowing", func() bool { return count(h.gw.msgs(), "heartbeat") >= 4 })
+	ms := h.gw.msgs()
+	if n := count(ms, "hello"); n != 1 {
+		t.Fatalf("session flapped: %d hellos %v", n, kinds(ms))
+	}
+	found := false
+	for _, m := range ms {
+		if r := m.GetResult(); r != nil && r.CommandId == "cmd-x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("unsent result not resent")
+	}
+}
+
+// 并发的 SendHeartbeat 不能抢在 Hello 之前：网关要求第一条消息是 Hello。
+func TestHelloIsAlwaysFirst(t *testing.T) {
+	h := newHarness(t)
+	c, ex, _ := h.agent(true)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = c.SendHeartbeat(context.Background())
+			}
+		}
+	}()
+	ctx := h.start(c, ex, false)
+	err := c.WaitConnected(ctx)
+	close(stop)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := kinds(h.gw.msgs()); len(k) < 2 || k[0] != "hello" || k[1] != "state" {
+		t.Fatalf("first messages = %v", k)
+	}
+}
+
+func TestReceivedIsBounded(t *testing.T) {
+	h := newHarness(t)
+	c, ex, _ := h.agent(true)
+	ctx := h.start(c, ex, false)
+	if err := c.WaitConnected(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const n = 1001
+	for i := 0; i < n; i++ {
+		h.gw.push(&agentpb.Command{Id: fmt.Sprintf("cmd-%d", i), Body: &agentpb.Command_Pull{Pull: &agentpb.PullImage{ImageRef: "img:1"}}})
+	}
+	waitFor(t, "last received", func() bool { return c.Received(fmt.Sprintf("cmd-%d", n-1)) })
+	if c.Received("cmd-0") {
+		t.Fatal("oldest command id not evicted")
+	}
+	if !c.Received("cmd-1") {
+		t.Fatal("evicted too much")
+	}
 }
 
 func TestReconnectResendsUnsentResultsAfterHello(t *testing.T) {
@@ -443,7 +538,10 @@ func TestSteppedModeSendsNothingAutomatically(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("step = %d %v", n, err)
 	}
-	waitFor(t, "result+state", func() bool { k := kinds(h.gw.msgs()); return len(k) == 5 && k[2] == "heartbeat" && k[3] == "result" && k[4] == "state" })
+	waitFor(t, "result+state", func() bool {
+		k := kinds(h.gw.msgs())
+		return len(k) == 5 && k[2] == "heartbeat" && k[3] == "result" && k[4] == "state"
+	})
 	if r := h.gw.msgs()[3].GetResult(); r.Ok || r.Message != "simulated" {
 		t.Fatalf("result = %v", r)
 	}

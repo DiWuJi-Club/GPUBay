@@ -25,6 +25,8 @@ const (
 	metricsTimeout = 5 * time.Second
 	// configTimeout 是建流后等待 AgentConfig 的上限。
 	configTimeout = 30 * time.Second
+	// maxReceived 是 Received 记住的指令 ID 上限（只用于测试与排障，不影响去重：去重在执行器里）。
+	maxReceived = 1000
 )
 
 type Config struct {
@@ -46,10 +48,12 @@ type Client struct {
 	collect func(context.Context) metrics.Metrics
 	log     *slog.Logger
 
-	mu       sync.Mutex
-	stream   agentpb.AgentGateway_ConnectClient
-	received map[string]bool
-	sendMu   sync.Mutex
+	mu         sync.Mutex
+	stream     agentpb.AgentGateway_ConnectClient
+	received   map[string]bool
+	recvOrder  []string // received 的插入顺序，超过 maxReceived 时丢最旧的
+	sendMu     sync.Mutex
+	collecting atomic.Bool // 单飞：上一次指标采集尚未返回
 
 	connected      atomic.Bool
 	configured     atomic.Bool
@@ -140,6 +144,14 @@ func (c *Client) session(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// 网关要求第一条消息是 Hello，并且处理完第一份 StateReport 之后才开始投递指令。
+	// 先在本地流上发完这两条再公开 c.stream，避免并发的 Step / SendHeartbeat 抢在 Hello 之前发出。
+	if err := c.sendOn(stream, &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Hello{Hello: &agentpb.Hello{AgentVersion: c.cfg.Version, Hostname: c.cfg.Hostname, Ips: c.cfg.LocalIPs()}}}); err != nil {
+		return err
+	}
+	if err := c.sendOn(stream, c.stateReport(ctx)); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	c.stream = stream
 	c.mu.Unlock()
@@ -150,13 +162,6 @@ func (c *Client) session(ctx context.Context) error {
 		c.stream = nil
 		c.mu.Unlock()
 	}()
-	// 网关要求第一条消息是 Hello，并且处理完第一份 StateReport 之后才开始投递指令
-	if err := c.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Hello{Hello: &agentpb.Hello{AgentVersion: c.cfg.Version, Hostname: c.cfg.Hostname, Ips: c.cfg.LocalIPs()}}}); err != nil {
-		return err
-	}
-	if err := c.SendStateReport(ctx); err != nil {
-		return err
-	}
 
 	configured := make(chan struct{})
 	errc := make(chan error, 1)
@@ -276,10 +281,22 @@ func (c *Client) handle(msg *agentpb.PlatformMessage) {
 		c.applyConfig(m.Config)
 	case *agentpb.PlatformMessage_Command:
 		cmd := m.Command
-		c.mu.Lock()
-		c.received[cmd.GetId()] = true
-		c.mu.Unlock()
+		c.markReceived(cmd.GetId())
 		c.ex.Submit(toCommand(cmd))
+	}
+}
+
+func (c *Client) markReceived(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.received[id] {
+		return
+	}
+	c.received[id] = true
+	c.recvOrder = append(c.recvOrder, id)
+	if len(c.recvOrder) > maxReceived {
+		delete(c.received, c.recvOrder[0])
+		c.recvOrder = c.recvOrder[1:]
 	}
 }
 
@@ -310,25 +327,41 @@ func (c *Client) send(m *agentpb.AgentMessage) error {
 	if s == nil {
 		return errors.New("not connected")
 	}
+	return c.sendOn(s, m)
+}
+
+func (c *Client) sendOn(s agentpb.AgentGateway_ConnectClient, m *agentpb.AgentMessage) error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	return s.Send(m)
 }
 
 // sendResult 发送一条结果，发送成功后才在 state.json 里标记已发送。
+// 只有发送失败才算会话错误：标记落盘失败（如根分区写满）只记日志，否则每次重连补发后都会断流，机器反复掉线。
 func (c *Client) sendResult(id string, r state.Result) error {
 	if err := c.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Result{Result: &agentpb.CommandResult{CommandId: id, Ok: r.OK, Message: r.Message}}}); err != nil {
 		return err
 	}
-	return c.ex.StateStore().MarkSent(id)
+	if err := c.ex.StateStore().MarkSent(id); err != nil {
+		c.log.Error("persist result sent flag", "command", id, "err", err)
+	}
+	return nil
 }
 
 // collectMetrics 在限定时间内采集指标；超时（采集函数不理会 ctx 也一样）返回空指标，心跳照发。
+// 上一次采集仍未返回时不再启动新的采集（单飞），卡死的采集最多占一个 goroutine。
 func (c *Client) collectMetrics(ctx context.Context) metrics.Metrics {
+	if !c.collecting.CompareAndSwap(false, true) {
+		c.log.Warn("previous metrics collection still running, sending heartbeat without metrics")
+		return metrics.Metrics{}
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.metricsTimeout)
 	defer cancel()
 	ch := make(chan metrics.Metrics, 1)
-	go func() { ch <- c.collect(ctx) }()
+	go func() {
+		defer c.collecting.Store(false)
+		ch <- c.collect(ctx)
+	}()
 	select {
 	case m := <-ch:
 		return m
@@ -346,11 +379,15 @@ func (c *Client) SendHeartbeat(ctx context.Context) error {
 }
 
 func (c *Client) SendStateReport(ctx context.Context) error {
+	return c.send(c.stateReport(ctx))
+}
+
+func (c *Client) stateReport(ctx context.Context) *agentpb.AgentMessage {
 	var states []*agentpb.InstanceState
 	for _, s := range c.ex.Report(ctx) {
 		states = append(states, &agentpb.InstanceState{InstanceId: s.InstanceID, Phase: s.Phase})
 	}
-	return c.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Instances: states}}})
+	return &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Instances: states}}}
 }
 
 // Step 步进模式：执行队列（override 非空时直接记录该结果）、逐条发送结果（含回放）、再发 StateReport。
