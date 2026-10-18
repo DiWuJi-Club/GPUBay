@@ -9,6 +9,7 @@
 - 机器上 `ufw` 必须关闭（`selfcheck` 会检查）；若机房用其他防火墙，确认不会清掉 `DOCKER-USER` 跳转。
 - 机器的业务网卡最好用有线 + 静态地址或 DHCP 保留；若启用 `NetworkManager-wait-online` / `systemd-networkd-wait-online`，`network-online.target` 才有意义。Agent 已能在地址就绪前推迟并重试启动（验收缺陷 B1、B2），但地址晚到期间容器不可用。
 - 生产镜像需自带诊断所需工具（参考镜像不含 python、nvcc；验收只用 `nvidia-smi` 与 `libcudart` 验证 GPU）。
+- `install.sh` 走内网 HTTP，二进制校验和写在脚本里，局域网中间人可同时替换脚本与校验和绕过校验：上线后改为 HTTPS，或在后台接入命令里固定脚本哈希。
 
 ## 规格列出的遗留（本计划不做）
 - 机器证书续期（5 年）。
@@ -20,6 +21,12 @@
 ## 可以继续延后
 - 别的机器上的实例出现在本机 StateReport 里时，孤儿 wipe 以同一个实例 id 入队：期间 `HasAnyOpenCommand(id)` 会阻止原机器上对该实例的对账动作，原机器的 `beginWipe` 也会把这条孤儿 wipe 一并取消。同一实例 id 不会真的跑到两台机器上，极少出现。
 - `tc tbf burst 256kbit`（规格原文）在高速率下限不到目标：burst 至少要 rate/HZ（1Gbps 需 ≥125KB，256kbit 只够约 250Mbps）；验收用 50Mbps（实测 ≈46Mbps）没问题，后续按 rate 计算 burst。
+- `ensureLimit` 先 `del ingress` 再 `add`，中间有不到一秒的上行不限速窗口；可改为 `replace` 或先加新规则再删旧规则（终审 M6）。
+- 同一副本上同一台机器的两个 Connect 几乎同时到达，数据库归属与内存登记可能交叉一个 tick，由每 tick 的归属检查自愈（终审 M8）。
+- 指令 payload 无法转成协议消息（`toProtoCommand` 失败）时只记日志，指令保持 sent 直到清扫器判超时；可改为立即按失败处理（终审 M9）。
+- `cmdrun.Exec` 在 `os.Environ()` 后追加 `LC_ALL=C`（systemd 下没问题）；`install.sh` 内嵌的 unit 与 `deploy/agent/spark-agent.service` 重复，应只保留一份来源（下载目录拷贝或 `make agent` 生成）（终审 M10）。
+- Hello 只记录 `agent_version`，`last_metrics` 要等首个心跳；后台机器详情把指标时间标成 `last_seen_at`，略有误导（终审 M11）。
+- 若干 fleet/app 测试丢弃了错误返回；`cmdrun.Recorder` 对未打桩命令返回 `nil, nil`，新代码路径可能空过测试，可加 Strict 模式对未打桩命令直接失败（终审 M12）。
 - 清扫器的 `FailTimedOutCommands` 与网关投递用同一张 `agent_commands` 表，多副本下由咨询锁保证只有一个在判超时；指令量很大时可改为按机器分片。
 - Enroll 限流按副本内存计数，多副本各自计数。
 - fake Agent 的 e2e 步进等待上限 10 秒（真实时间），CI 机器很慢时需要调大 `hookWait`。
