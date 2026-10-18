@@ -18,3 +18,6 @@ func AlertOrphanContainer(serial, instanceID string) string {
 func AlertOrphanWipeFailed(serial, instanceID string) string {
 	return fmt.Sprintf("机器 %s 上实例 %s 的残留容器清理失败", serial, instanceID)
 }
+func AlertInvalidReport(serial string) string {
+	return fmt.Sprintf("机器 %s 上报了无法识别的实例标识", serial)
+}

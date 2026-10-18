@@ -118,26 +118,42 @@ func TestReconcileRunningWhileStoppedEnqueuesStop(t *testing.T) {
 }
 
 func TestReconcileContainerDownAlertsWithoutAction(t *testing.T) {
-	e := newEnv(t, 1)
-	_, inst := e.place(catalog.D1d)
+	e := newEnv(t, 2)
+	_, a := e.place(catalog.D1d)
+	_, b := e.place(catalog.D1d)
 	e.ack(true)
-	for _, rep := range []fleet.StateReport{report(fleet.InstanceState{InstanceID: inst.ID, Phase: fleet.PhaseStopped}), report()} {
-		if err := e.svc.Reconcile(e.ctx, e.machines[0], rep); err != nil {
-			t.Fatal(err)
-		}
+	ma, mb := e.get(a.ID).MachineID, e.get(b.ID).MachineID
+	if ma == mb {
+		t.Fatalf("instances share machine %d", ma)
+	}
+	// a：上报 stopped；b：整个没上报——两条分支各自断言
+	if err := e.svc.Reconcile(e.ctx, ma, report(fleet.InstanceState{InstanceID: a.ID, Phase: fleet.PhaseStopped})); err != nil {
+		t.Fatal(err)
+	}
+	if e.alertCount("container_down", a.ID) != 1 || e.alertCount("container_down", b.ID) != 0 {
+		t.Fatalf("after reported-stopped: a=%d b=%d", e.alertCount("container_down", a.ID), e.alertCount("container_down", b.ID))
+	}
+	if err := e.svc.Reconcile(e.ctx, mb, report()); err != nil {
+		t.Fatal(err)
+	}
+	if e.alertCount("container_down", b.ID) != 1 {
+		t.Fatal("missing container not alerted")
 	}
 	var cmds int
 	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM agent_commands WHERE status IN ('pending','sent')`).Scan(&cmds)
-	got := e.get(inst.ID)
-	if cmds != 0 || got.State != rental.StateRunning || got.Suspended() || e.alertCount("container_down", inst.ID) != 1 {
-		t.Fatalf("container down: cmds=%d state=%s alerts=%d", cmds, got.State, e.alertCount("container_down", inst.ID))
+	for _, id := range []string{a.ID, b.ID} {
+		if got := e.get(id); cmds != 0 || got.State != rental.StateRunning || got.Suspended() {
+			t.Fatalf("instance %s: cmds=%d state=%s", id, cmds, got.State)
+		}
 	}
-	// 暂停中的实例由 ResumeMachine 负责告警，Reconcile 不重复
-	mustCount(t, firstOf(e.svc.SuspendMachines(e.ctx, e.machines)), nil, 1, "suspended")
-	if err := e.svc.Reconcile(e.ctx, e.machines[0], report()); err != nil {
-		t.Fatal(err)
+	// 暂停中的实例由 ResumeMachine 负责告警，Reconcile 不重复（用新的告警文案路径：先清掉再看不新增）
+	mustCount(t, firstOf(e.svc.SuspendMachines(e.ctx, e.machines)), nil, 2, "suspended")
+	for _, m := range []int64{ma, mb} {
+		if err := e.svc.Reconcile(e.ctx, m, report()); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if e.alertCount("container_down", inst.ID) != 1 {
+	if e.alertCount("container_down", "") != 2 {
 		t.Fatal("suspended instance alerted again by reconcile")
 	}
 }
@@ -190,5 +206,35 @@ func TestReconcileCreatingWipingAndUnknownUntouched(t *testing.T) {
 	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM agent_commands WHERE type = 'wipe_instance'`).Scan(&n)
 	if n != 1 || e.alertCount("", "") != 0 {
 		t.Fatalf("wiping: wipes=%d alerts=%d", n, e.alertCount("", ""))
+	}
+}
+
+// 实例在原机器 A 上洗机失败（仍 wiping、A 故障）；机器 B 上报了它的容器 → B 上的孤儿清理成功也不能释放 A。
+func TestReconcileOrphanWipeOnOtherMachineDoesNotReleaseWipingInstance(t *testing.T) {
+	for _, ok := range []bool{true, false} {
+		e := newEnv(t, 2)
+		_, inst := e.place(catalog.D1d)
+		e.ack(true)
+		ma := e.get(inst.ID).MachineID
+		mb := e.machines[0]
+		if mb == ma {
+			mb = e.machines[1]
+		}
+		_ = e.svc.Release(e.ctx, e.userID, inst.ID)
+		e.ack(false) // A 上洗机失败
+		if e.get(inst.ID).State != rental.StateWiping || e.machineState(ma) != fleet.StateFaulty {
+			t.Fatalf("setup: state=%s machine=%s", e.get(inst.ID).State, e.machineState(ma))
+		}
+		if err := e.svc.Reconcile(e.ctx, mb, report(fleet.InstanceState{InstanceID: inst.ID, Phase: fleet.PhaseRunning})); err != nil {
+			t.Fatal(err)
+		}
+		e.ack(ok)
+		if e.get(inst.ID).State != rental.StateWiping || e.machineState(ma) != fleet.StateFaulty {
+			t.Fatalf("ok=%v: state=%s machineA=%s", ok, e.get(inst.ID).State, e.machineState(ma))
+		}
+		failed := e.alertCount("orphan_wipe_failed", inst.ID)
+		if (ok && failed != 0) || (!ok && failed != 1) || e.machineState(mb) == fleet.StateFaulty {
+			t.Fatalf("ok=%v: orphan_wipe_failed=%d machineB=%s", ok, failed, e.machineState(mb))
+		}
 	}
 }

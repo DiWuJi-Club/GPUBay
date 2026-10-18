@@ -39,7 +39,7 @@ func (s *Service) Reconcile(ctx context.Context, machineID int64, report fleet.S
 	}
 	if invalid {
 		if err := s.d.Fleet.RaiseAlertOnce(ctx, s.d.Pool, fleet.Alert{Level: "warning", Kind: "invalid_report", MachineID: machineID,
-			Message: fmt.Sprintf("机器 %s 上报了无法识别的实例标识", m.Serial)}); err != nil {
+			Message: AlertInvalidReport(m.Serial)}); err != nil {
 			errs = append(errs, err)
 		}
 	}

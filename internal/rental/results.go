@@ -62,7 +62,9 @@ func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok 
 					MachineID: inst.MachineID, InstanceID: inst.ID, Message: result})
 			}
 		case fleet.CmdWipeInstance:
-			if inst.State != StateWiping {
+			// 非 wiping，或者指令不在实例所属机器上（别的机器上报了该实例的容器）：都是孤儿清理，
+			// 不改实例状态、不释放机器——否则原机器没洗就会被放给下一个租户。
+			if inst.State != StateWiping || cmd.MachineID != inst.MachineID {
 				if ok {
 					return nil
 				}
