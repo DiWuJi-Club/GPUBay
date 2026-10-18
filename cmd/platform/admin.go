@@ -10,19 +10,24 @@ import (
 	"os"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mdp/qrterminal/v3"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/clock"
+	"spark-cloud/internal/platform/secretbox"
 )
 
 const adminUsage = `用法：
   platform admin create --username <用户名> [--role super|ops|finance]
   platform admin reset-totp --username <用户名>
-  platform admin gen-upstream-key --path <私钥文件>`
+  platform admin gen-upstream-key --path <私钥文件>
+  platform admin ssh-host-key`
 
 // prompter 读取一行输入；secret 为 true 时不回显（用于密码）。
 type prompter func(label string, secret bool) (string, error)
@@ -154,5 +159,18 @@ func adminGenUpstreamKey(args []string, out io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(out, "已生成上游 SSH 密钥：%s（请设置 SPARK_UPSTREAM_SSH_KEY_FILE=%s）\n公钥：%s\n", *path, *path, pub)
+	return nil
+}
+
+// adminSSHHostKey 打印 SSH 网关主机公钥与指纹（写进帮助页「首次连接请核对指纹」）。
+func adminSSHHostKey(ctx context.Context, pool *pgxpool.Pool, box *secretbox.Box, out io.Writer) error {
+	if _, err := pki.EnsureCA(ctx, pool, box, clock.Real{}); err != nil {
+		return err
+	}
+	signer, err := pki.EnsureSSHHostKey(ctx, pool, box)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "公钥：%s\n指纹：%s\n", strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))), pki.SSHFingerprint(signer.PublicKey()))
 	return nil
 }

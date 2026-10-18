@@ -58,6 +58,9 @@ func adminMain(args []string) error {
 	if err != nil {
 		return err
 	}
+	if len(args) > 0 && args[0] == "ssh-host-key" {
+		return adminSSHHostKey(ctx, pool, box, os.Stdout)
+	}
 	svc := admin.NewService(admin.Deps{Pool: pool, Clock: clock.Real{}, Box: box})
 	return runAdmin(ctx, svc, args, os.Stdout, terminalPrompter(os.Stdin, os.Stdout))
 }
