@@ -174,7 +174,7 @@ func (p *Pool) client(ctx context.Context, t Target) (*ssh.Client, error) {
 	nc.SetDeadline(time.Now().Add(p.cfg.DialTimeout))
 	stopAfter := context.AfterFunc(ctx, func() { nc.Close() })
 	cfg := ClientConfig(p.cfg.Signer, HostKeyCallback(want, tofu), p.cfg.DialTimeout)
-	cfg.HostKeyAlgorithms = hostKeyAlgorithms(want)
+	cfg.HostKeyAlgorithms = HostKeyAlgorithms(want)
 	cc, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
 	if !stopAfter() && err == nil { // ctx 已取消、底层连接已被关闭
 		cc.Close()

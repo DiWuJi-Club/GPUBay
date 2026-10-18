@@ -44,8 +44,8 @@ func ClientConfig(signer ssh.Signer, hostKey ssh.HostKeyCallback, timeout time.D
 	return &ssh.ClientConfig{User: "root", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: hostKey, Timeout: timeout, ClientVersion: clientVersion}
 }
 
-// hostKeyAlgorithms 按登记公钥限定协商的主机密钥算法（让对端出示被固定的那把）；未登记或无法解析返回 nil（用默认）。
-func hostKeyAlgorithms(line string) []string {
+// HostKeyAlgorithms 按登记公钥限定协商的主机密钥算法（让对端出示被固定的那把）；未登记或无法解析返回 nil（用默认）。
+func HostKeyAlgorithms(line string) []string {
 	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
 	if err != nil {
 		return nil
