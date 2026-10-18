@@ -3,12 +3,12 @@
 来源：计划 1 逐任务审查与最终整体审查（2026-10-14）。全部不阻塞合并。
 
 ## 计划 2（Agent 网关）必须处理
-- `agent_commands.status = 'sent'` 与 `attempts` 目前没有写入方；网关投递时需写入。
-- `CancelCommands` 会把已 `sent`、Agent 可能正在执行的指令标记失败；网关需处理迟到回报（目前会被忽略）。
-- 机器心跳恢复后的 `ResumeMachine` 已由清扫器对账兜底，网关收到心跳时可直接调用以减少延迟。
-- 机器失联期间 `machine_leases` 上界不随时间推进；档期预订上线前需在清扫对账中刷新。
-- `occupiedUntil` 在状态不一致时回退为 `now`，可能产生空时段；建议加 1µs 下限或改为报错。
-- 「容器正常才恢复计时」需要 Agent 的 StateReport。
+- ✅ 计划 2 已处理：`agent_commands.status = 'sent'` 与 `attempts` 由网关认领时写入（`fleet.ClaimPending`）。
+- ✅ 计划 2 已处理：迟到回报被 `CompleteCommand` 忽略，副作用由 StateReport 对账清理（孤儿 wipe 失败单独告警 `orphan_wipe_failed`）。
+- ✅ 计划 2 已处理：心跳恢复不再直接 `ResumeMachine`，改为收到 StateReport 后按容器状态恢复（`ResumeMachine(ctx, machineID, runningIDs)`）。
+- 机器失联期间 `machine_leases` 上界不随时间推进；档期预订上线前需在清扫对账中刷新。（保留，归子项目 2）
+- `occupiedUntil` 在状态不一致时回退为 `now`，可能产生空时段；建议加 1µs 下限或改为报错。（保留）
+- ✅ 计划 2 已处理：「容器正常才恢复计时」由 StateReport + `ResumeMachine` 实现。
 
 ## 计划 4（管理后台 / 阿里云插件）必须处理
 - ✅ 计划 4 已处理：接入阿里云实名前：个人实名的次数统计与状态检查需在事务内锁用户行，核验失败也计入每日次数（防止并发重复调用付费接口）。
