@@ -40,6 +40,9 @@
 - 同一毫秒内同一机器的多条指令按 UUID 排序，顺序随机（实际只在同一事务内入队时出现）；可加自增序号作次序。
 - Agent 本地 `state.json` 损坏时 Agent 拒绝启动（按计划保持「宁可报错」），需要人工处理。
 
+- 每次 Agent 重新建流都会把该机器所有 sent 指令的超时从头计时（规格「补推刷新 sent_at」）：机器若每隔不到 5 分钟就断线重连，指令永远不会被判超时，只能靠 `machine_offline` 以外的手段发现；如出现需加「累计投递次数 / 首次投递时间」上限。
+- 真机验收中机器重启后换了网络（WiFi 连到另一网段），Agent 仍能连上平台，但容器端口绑定的登记地址不存在：Agent 不启动容器、报 unknown，10 分钟后报 stopped 并告警 `container_down`，平台同时告警 `lan_ip_mismatch`。生产必须用固定地址；登记 IP 变更后需要重建实例（端口绑定随容器创建固定）。
+
 ## 实施中确定的产品行为（裁定）
 - Create 指令的 `upstream_pubkey` / `bandwidth_mbps` / `ssh_port` / `data_size_gib` 由网关在投递时填充，`rental` 的 payload 仍只有 `image_ref`。
 - 孤儿容器告警用 `warning` 级别（表约束只有 warning / critical）。
