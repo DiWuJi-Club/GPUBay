@@ -3,6 +3,7 @@ package rental
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -117,6 +118,13 @@ type AccessInfo struct {
 	RetainUntil   *time.Time // stopped 时的数据保留截止
 }
 
+// LogValue 在 slog 中隐藏明文密码。
+func (a AccessInfo) LogValue() slog.Value {
+	a.Password = "[REDACTED]"
+	type plain AccessInfo // 去掉方法，避免递归
+	return slog.AnyValue(plain(a))
+}
+
 func (s *Service) Access(ctx context.Context, instanceID string) (AccessInfo, error) {
 	var info AccessInfo
 	var enc []byte
@@ -139,7 +147,7 @@ func (s *Service) Access(ctx context.Context, instanceID string) (AccessInfo, er
 	}
 	plain, err := s.d.Box.Open(enc)
 	if err != nil {
-		return AccessInfo{}, err
+		return AccessInfo{}, fmt.Errorf("解密实例 %s 密码: %w", instanceID, err)
 	}
 	info.Password = string(plain)
 	if i.State == StateStopped && i.StoppedAt != nil && i.PendingSeconds == 0 {

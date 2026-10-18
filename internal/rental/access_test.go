@@ -1,7 +1,9 @@
 package rental_test
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -243,5 +245,15 @@ func TestAccessAlertsAreStableAndOnce(t *testing.T) {
 	_ = e.pool.QueryRow(e.ctx, `SELECT message FROM alerts WHERE kind = 'upstream_unreachable'`).Scan(&msg)
 	if msg != rental.AlertUpstreamUnreachable("SN000", inst.ID) || msg != "机器 SN000 上实例 "+inst.ID+" 的 SSH 上游无法连接" {
 		t.Fatalf("message = %q", msg)
+	}
+}
+
+func TestAccessInfoLogValueRedactsPassword(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	log.Info("x", "info", rental.AccessInfo{Password: "s3cretPlain", MachineLanIP: "10.0.0.10"})
+	out := buf.String()
+	if strings.Contains(out, "s3cretPlain") || !strings.Contains(out, "REDACTED") || !strings.Contains(out, "10.0.0.10") {
+		t.Fatalf("log = %s", out)
 	}
 }
