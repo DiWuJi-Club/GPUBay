@@ -170,3 +170,49 @@ func TestLimitSnapshot(t *testing.T) {
 		t.Fatalf("tc:\n%s", r.Lines())
 	}
 }
+
+func stubLimit(r *cmdrun.Recorder, root, ingress, filter string) {
+	r.Stub("tc qdisc show dev veth1 root", root, nil)
+	r.Stub("tc qdisc show dev veth1 ingress", ingress, nil)
+	r.Stub("tc filter show dev veth1 parent ffff:", filter, nil)
+}
+
+const (
+	tbfRoot    = "qdisc tbf 8006: root refcnt 21 rate 50Mbit burst 32Kb lat 50ms\n"
+	noqueue    = "qdisc noqueue 0: root refcnt 2\n"
+	ingressQ   = "qdisc ingress ffff: parent ffff:fff1 ----------------\n"
+	policeFilt = "filter protocol all pref 49152 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid :1\n  action order 1:  police 0x1 rate 50Mbit burst 256Kb mtu 2Kb action drop overhead 0b\n"
+)
+
+func TestLimitApplied(t *testing.T) {
+	for _, c := range []struct {
+		name                  string
+		root, ingress, filter string
+		want                  bool
+	}{
+		{"both present", tbfRoot, ingressQ, policeFilt, true},
+		{"only noqueue", noqueue, "", "", false},
+		{"tbf without ingress", tbfRoot, "", "", false},
+		{"ingress without police", tbfRoot, ingressQ, "", false},
+	} {
+		r := &cmdrun.Recorder{}
+		nf := &iptables.Netfilter{Run: r}
+		stubLimit(r, c.root, c.ingress, c.filter)
+		got, err := nf.LimitApplied(context.Background(), "veth1")
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v, %v want %v", c.name, got, err, c.want)
+		}
+	}
+}
+
+func TestLimitAppliedPropagatesTcErrors(t *testing.T) {
+	for _, failing := range []string{"tc qdisc show dev veth1 root", "tc qdisc show dev veth1 ingress", "tc filter show dev veth1 parent ffff:"} {
+		r := &cmdrun.Recorder{}
+		nf := &iptables.Netfilter{Run: r}
+		stubLimit(r, tbfRoot, ingressQ, policeFilt)
+		r.Stub(failing, "", &cmdrun.CmdError{ExitCode: 2, Stderr: "Cannot find device"})
+		if _, err := nf.LimitApplied(context.Background(), "veth1"); err == nil {
+			t.Fatalf("%q failure not reported", failing)
+		}
+	}
+}

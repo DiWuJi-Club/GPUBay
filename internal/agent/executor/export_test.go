@@ -8,3 +8,9 @@ func SetRulesIntervalForTest(e *Executor, d time.Duration) (restore func()) {
 	e.rulesInterval = d
 	return func() { e.rulesInterval = old }
 }
+
+// LockOpsForTest 占住 opMu，模拟有实例指令正在执行；返回释放函数。
+func LockOpsForTest(e *Executor) (unlock func()) {
+	e.opMu.Lock()
+	return e.opMu.Unlock
+}

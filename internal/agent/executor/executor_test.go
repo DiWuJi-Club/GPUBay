@@ -587,3 +587,103 @@ func TestIdleInstanceCommandStartsPromptly(t *testing.T) {
 		}
 	}
 }
+
+// runLimitLoop 以 10ms 周期跑 Run（步进模式也会跑限速巡检），返回停止函数。
+func (e *env) runLimitLoop() (stop func()) {
+	restore := executor.SetRulesIntervalForTest(e.ex, 10*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); e.ex.Run(ctx) }()
+	return func() { cancel(); <-done; restore() }
+}
+
+func (e *env) waitLimit(veth string, want int) bool {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, ok := e.net.Limits()[veth]; ok && v == want {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+func TestEnsureLimitsReappliesWhenDropped(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa")) // BandwidthMbps=50，创建时已 Limit
+	veth := e.rt.Veth
+	if e.net.Limits()[veth] != 50 {
+		t.Fatalf("limits after create = %v", e.net.Limits())
+	}
+	e.net.Drop(veth)
+	stop := e.runLimitLoop()
+	defer stop()
+	if !e.waitLimit(veth, 50) {
+		t.Fatalf("limit not reapplied: %v", e.net.Limits())
+	}
+}
+
+func TestEnsureLimitsSkipsWhenStillApplied(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	before := e.net.LimitCount()
+	stop := e.runLimitLoop()
+	time.Sleep(100 * time.Millisecond)
+	stop()
+	if n := e.net.LimitCount(); n != before {
+		t.Fatalf("Limit called %d extra times although the limit was in place", n-before)
+	}
+}
+
+func TestEnsureLimitsIgnoresStoppedContainer(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	veth := e.rt.Veth
+	_ = e.rt.Stop(context.Background(), "ins-aaaaaaaa")
+	e.net.Drop(veth)
+	stop := e.runLimitLoop()
+	time.Sleep(100 * time.Millisecond)
+	stop()
+	if _, ok := e.net.Limits()[veth]; ok {
+		t.Fatal("limit applied to a stopped container")
+	}
+	if e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatal("ensureLimits started a container")
+	}
+}
+
+func TestEnsureLimitsSkipsWhileOpInProgress(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	veth := e.rt.Veth
+	e.net.Drop(veth)
+	unlock := executor.LockOpsForTest(e.ex)
+	stop := e.runLimitLoop()
+	defer stop()
+	time.Sleep(100 * time.Millisecond)
+	if _, ok := e.net.Limits()[veth]; ok {
+		unlock()
+		t.Fatal("limit applied while opMu held")
+	}
+	unlock()
+	if !e.waitLimit(veth, 50) {
+		t.Fatalf("limit not reapplied after opMu released: %v", e.net.Limits())
+	}
+}
+
+func TestEnsureLimitsFallsBackToConfigBandwidth(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	veth := e.rt.Veth
+	inst := e.st.Instances()[0]
+	inst.BandwidthMbps = 0
+	if err := e.st.PutInstance(inst); err != nil {
+		t.Fatal(err)
+	}
+	e.net.Drop(veth)
+	stop := e.runLimitLoop()
+	defer stop()
+	if !e.waitLimit(veth, 200) { // Config.BandwidthMbps
+		t.Fatalf("limits = %v", e.net.Limits())
+	}
+}

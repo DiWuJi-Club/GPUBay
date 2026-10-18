@@ -12,6 +12,7 @@ type Netfilter struct {
 	rules    netfilter.Rules
 	ensured  int
 	limits   map[string]int
+	limitN   int
 	failNext map[string]error
 }
 
@@ -45,8 +46,26 @@ func (n *Netfilter) Limit(_ context.Context, veth string, mbps int) error {
 		return err
 	}
 	n.limits[veth] = mbps
+	n.limitN++
 	return nil
 }
+
+func (n *Netfilter) LimitApplied(_ context.Context, veth string) (bool, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if err := n.failNext["limitApplied"]; err != nil {
+		delete(n.failNext, "limitApplied")
+		return false, err
+	}
+	_, ok := n.limits[veth]
+	return ok, nil
+}
+
+// Drop 模拟 veth 上的限速丢失（容器被外部重启、换了新 veth）。
+func (n *Netfilter) Drop(veth string) { n.mu.Lock(); delete(n.limits, veth); n.mu.Unlock() }
+
+// LimitCount 是 Limit 成功调用的累计次数。
+func (n *Netfilter) LimitCount() int { n.mu.Lock(); defer n.mu.Unlock(); return n.limitN }
 
 func (n *Netfilter) Rules() netfilter.Rules { n.mu.Lock(); defer n.mu.Unlock(); return n.rules }
 func (n *Netfilter) EnsuredCount() int      { n.mu.Lock(); defer n.mu.Unlock(); return n.ensured }

@@ -245,6 +245,7 @@ func (e *Executor) RunPending(ctx context.Context, override *state.Result) []Res
 }
 
 // Run 自动模式：两个消费者 + 定时刷新 iptables 规则；步进模式只刷新规则。
+// 每轮规则刷新成功后还会巡检限速（容器被外部 docker stop/start 后换了新 veth，限速会丢）。
 // 规则刷新成功且上一次 Recover 因规则失败没有启动实例时，重做 Recover。
 func (e *Executor) Run(ctx context.Context) {
 	if !e.stepped {
@@ -271,6 +272,7 @@ func (e *Executor) Run(ctx context.Context) {
 					e.d.Log.Error("recover retry", "err", err)
 				}
 			}
+			e.ensureLimits(ctx)
 		}
 	}
 }
@@ -298,4 +300,45 @@ func (e *Executor) consume(ctx context.Context, pull bool) {
 func (e *Executor) EnsureRules(ctx context.Context) error {
 	cfg := e.Config()
 	return e.d.Net.EnsureRules(ctx, netfilter.Rules{Bridge: e.d.Bridge, AllowCIDRs: cfg.AllowCIDRs})
+}
+
+// ensureLimits 给运行中却丢了限速的容器补上限速。有实例指令正在执行时（opMu 被占）跳过本轮，
+// 免得与 create/start 内的 Limit 并发；单个实例出错只记日志，继续下一个。不改期望状态，不启停容器。
+func (e *Executor) ensureLimits(ctx context.Context) {
+	if !e.opMu.TryLock() {
+		return
+	}
+	defer e.opMu.Unlock()
+	for _, inst := range e.d.State.Instances() {
+		if err := e.ensureLimit(ctx, inst); err != nil {
+			e.d.Log.Error("ensure bandwidth limit", "instance", inst.ID, "err", err)
+		}
+	}
+}
+
+func (e *Executor) ensureLimit(ctx context.Context, inst state.Instance) error {
+	c, err := e.d.Runtime.Inspect(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	if !c.Exists || !c.Running {
+		return nil
+	}
+	veth, err := e.d.Runtime.VethOf(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	ok, err := e.d.Net.LimitApplied(ctx, veth)
+	if err != nil || ok {
+		return err
+	}
+	mbps := inst.BandwidthMbps
+	if mbps <= 0 {
+		mbps = e.Config().BandwidthMbps
+	}
+	if err := e.d.Net.Limit(ctx, veth, mbps); err != nil {
+		return err
+	}
+	e.d.Log.Warn("bandwidth limit reapplied", "instance", inst.ID, "veth", veth)
+	return nil
 }

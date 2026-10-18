@@ -140,3 +140,27 @@ func (n *Netfilter) Limit(ctx context.Context, veth string, mbps int) error {
 		"police", "rate", rate, "burst", "256k", "drop", "flowid", ":1")
 	return err
 }
+
+// LimitApplied：root 上有 tbf 且 ingress 上有 police 过滤器才算限速在位。
+// 只判断存在性、不比较速率（tc 会把 1000mbit 打印成 1Gbit）；ingress 不存在直接返回 false，不去查 parent ffff:。
+func (n *Netfilter) LimitApplied(ctx context.Context, veth string) (bool, error) {
+	root, err := n.Run.Run(ctx, "tc", "qdisc", "show", "dev", veth, "root")
+	if err != nil {
+		return false, err
+	}
+	if !strings.Contains(string(root), " tbf ") {
+		return false, nil
+	}
+	ing, err := n.Run.Run(ctx, "tc", "qdisc", "show", "dev", veth, "ingress")
+	if err != nil {
+		return false, err
+	}
+	if !strings.Contains(string(ing), "ingress") {
+		return false, nil
+	}
+	flt, err := n.Run.Run(ctx, "tc", "filter", "show", "dev", veth, "parent", "ffff:")
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(string(flt), "police"), nil
+}

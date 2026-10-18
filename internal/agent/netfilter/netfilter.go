@@ -11,4 +11,6 @@ type Rules struct {
 type Netfilter interface {
 	EnsureRules(ctx context.Context, r Rules) error
 	Limit(ctx context.Context, veth string, mbps int) error
+	// LimitApplied：veth 上下行限速（root tbf + ingress police）是否都在；容器被外部重启后换了新 veth，限速会丢。
+	LimitApplied(ctx context.Context, veth string) (bool, error)
 }
