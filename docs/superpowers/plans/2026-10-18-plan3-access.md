@@ -111,9 +111,9 @@ Task 1 → 2、3 → 4（数据层）；5（配置）；6（pki，依赖 1）；
 
 **Files:**
 - Create: `migrations/00018_access.sql`
-- Modify: `internal/rental/service.go:75-122`（`Instance`、`instanceCols`、`scanInstance`）
-- Modify: `internal/audit/audit.go:38-50`
-- Test: `internal/rental/access_test.go`（新建）、`internal/audit/audit_test.go`（新建）
+- Modify: `internal/rental/service.go`（`Instance`、`instanceCols`、`scanInstance`）
+- Modify: `internal/audit/audit.go`
+- Test: `internal/rental/access_test.go`（新建）、`internal/audit/audit_test.go`（已存在，含 `TestActorEntry`；**追加**用例，保留现有内容）
 
 **Interfaces:**
 - Produces:
@@ -123,18 +123,10 @@ Task 1 → 2、3 → 4（数据层）；5（配置）；6（pki，依赖 1）；
 
 - [ ] **Step 1: 写失败的测试**
 
-`internal/audit/audit_test.go`：
+`internal/audit/audit_test.go` 追加（文件与 import 已存在，不要覆盖 `TestActorEntry`）：
 
 ```go
-package audit_test
-
-import (
-	"testing"
-
-	"spark-cloud/internal/audit"
-)
-
-func TestActorEntryResolvesActorType(t *testing.T) {
+func TestActorEntryResolvesUserAndSystem(t *testing.T) {
 	cases := []struct {
 		actor    audit.Actor
 		wantType string
@@ -193,7 +185,7 @@ func TestInstanceAccessColumnsDefaults(t *testing.T) {
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `go test ./internal/audit/ ./internal/rental/ -run 'TestActorEntryResolvesActorType|TestInstanceAccessColumnsDefaults' 2>&1 | head -20`
+Run: `go test ./internal/audit/ ./internal/rental/ -run 'TestActorEntryResolvesUserAndSystem|TestInstanceAccessColumnsDefaults' 2>&1 | head -20`
 Expected: `audit` 编译错误（`UserID` 未定义）；`rental` 编译错误（`PasswordAuth` 未定义）。
 
 - [ ] **Step 3: 写迁移**
@@ -708,7 +700,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Create: `internal/rental/access.go`
-- Modify: `internal/rental/service.go:52-62`（`Deps` 新增 `Keys`、`HostKeyGen`）、`internal/rental/place.go:249-253`、`internal/rental/migrate.go:342-346`、`internal/rental/results.go:84-86,118`、`internal/rental/alerts.go`、`internal/rental/sweeper.go:650-688`
+- Modify: `internal/rental/service.go`（`Deps` 新增 `Keys`、`HostKeyGen`）、`internal/rental/place.go`、`internal/rental/migrate.go`、`internal/rental/results.go`、`internal/rental/alerts.go`、`internal/rental/sweeper.go`
 - Modify: `internal/pki/sshhost.go`（本任务先只加 `GenerateInstanceHostKey`，网关主机密钥在 Task 6）
 - Test: `internal/rental/access_test.go`（追加）、`internal/rental/helpers_test.go`（`newEnv` 传 `Keys`）
 
@@ -1931,7 +1923,7 @@ func TestLoadAccessErrors(t *testing.T) {
 }
 ```
 
-`prodEnv()` 的 map 增加 `"SPARK_DOMAIN": "spark.example.com", "SPARK_TRUST_PROXY": "true"`（现有的 `SPARK_PUBLIC_BASE_URL` 是 `https://spark.example.com/`，host 必须与域名一致；prod 没有证书时必须声明在代理后）。`config_test.go` import 追加 `"time"`（`strings` 已有）。现有 `TestLoadProdFullyConfigured`、`TestLoadPluginErrors`、`TestLoadPayRealWithOnlyAlipay` 用 `prodEnv()`，改完后照常通过。
+`prodEnv()` 的 map 增加 `"SPARK_DOMAIN": "spark.example.com", "SPARK_TRUST_PROXY": "true"`（现有的 `SPARK_PUBLIC_BASE_URL` 是 `https://spark.example.com/`，host 必须与域名一致；prod 没有证书时必须声明在代理后）。现有 `TestLoadPlan4Defaults` 里对 dev 默认值的断言 `c.PublicBaseURL != ""` 改为 `c.PublicBaseURL != "http://spark.local:8080"`（dev 现在有默认对外地址）。`config_test.go` import 追加 `"time"`（`strings` 已有）。现有 `TestLoadProdFullyConfigured`、`TestLoadPluginErrors`、`TestLoadPayRealWithOnlyAlipay` 用 `prodEnv()`，改完后照常通过。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -2134,7 +2126,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `internal/pki/sshhost.go`（追加）、`internal/pki/sshhost_test.go`（新建）
-- Modify: `cmd/platform/main.go:363-387`、`cmd/platform/admin.go:493-496`、`cmd/platform/admin_test.go`
+- Modify: `cmd/platform/main.go`、`cmd/platform/admin.go`、`cmd/platform/admin_test.go`
 
 **Interfaces:**
 - Produces:
@@ -2573,8 +2565,11 @@ func TestAgentHostkeysAndControl(t *testing.T) {
 		t.Fatalf("x11 to client = %v", err)
 	}
 	srv.DropAll()
-	if _, err := output(t, c, "echo after-drop"); err == nil {
-		t.Fatal("session survived DropAll")
+	// 服务端已关连接：NewSession 或 Output 其一必然出错（不能用 output() 辅助，它在 NewSession 出错时直接 t.Fatal）
+	if sess, err := c.NewSession(); err == nil {
+		if _, err = sess.Output("echo after-drop"); err == nil {
+			t.Fatal("session survived DropAll")
+		}
 	}
 }
 ```
@@ -3131,7 +3126,7 @@ func TestPoolSharesClientAndVerifiesHostKey(t *testing.T) {
 	stop := srv.ServeHTTP(8888, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") }))
 	defer stop()
 	store := &memStore{pubs: map[string]string{}}
-	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: 2 * time.Second}, store)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: 300 * time.Millisecond}, store)
 	defer p.Close()
 	good := upstream.Target{InstanceID: "ins-aaaaaaaa", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
 	for i := 0; i < 3; i++ {
@@ -3160,21 +3155,30 @@ func TestPoolSharesClientAndVerifiesHostKey(t *testing.T) {
 	if _, err := p.Dial(context.Background(), good, 9); err == nil || p.Len() != 2 {
 		t.Fatalf("port 9 = %v, len=%d", err, p.Len())
 	}
-	// lan_ip 变化 → 旧连接丢弃、重建
-	moved := good
-	moved.LanIP = "127.0.0.1"
-	moved.LanIP = "127.000.000.001" // 字面量不同即视为变化（登记地址变了）
-	if _, err := httpGet(t, p, moved, 8888); err == nil {
-		t.Fatal("unparseable lan ip accepted")
-	}
-	p.Drop("ins-aaaaaaaa")
-	if p.Len() != 1 {
-		t.Fatalf("after drop len=%d", p.Len())
-	}
-	// 上游崩溃：下一次 Dial 重建连接
+	// 上游崩溃：旧连接坏掉，下一次 Dial 自动重建（不需要调用方 Drop）
+	before := srv.ConnCount()
 	srv.DropAll()
 	if body, err := httpGet(t, p, good, 8888); err != nil || body != "ok" {
 		t.Fatalf("after upstream drop = %q %v", body, err)
+	}
+	if srv.ConnCount() != 1 || before != 2 {
+		t.Fatalf("conns after rebuild = %d (before drop %d)", srv.ConnCount(), before)
+	}
+	// 登记地址变化（键含 lan_ip）：旧连接被丢弃，按新地址重拨；新地址不可达 → DialError 且池里少一条
+	moved := good
+	moved.LanIP = "10.255.255.1"
+	if _, err := httpGet(t, p, moved, 8888); !errors.As(err, &de) || de.InstanceID != "ins-aaaaaaaa" {
+		t.Fatalf("moved lan ip = %v", err)
+	}
+	if p.Len() != 1 { // 只剩 ins-cccccccc；ins-aaaaaaaa 的旧连接已随地址变化丢弃
+		t.Fatalf("after lan ip change len=%d", p.Len())
+	}
+	if _, err := httpGet(t, p, upstream.Target{InstanceID: "ins-aaaaaaaa", LanIP: "127.000.000.001", HostPubkey: good.HostPubkey}, 8888); err == nil {
+		t.Fatal("unparseable lan ip accepted")
+	}
+	p.Drop("ins-cccccccc")
+	if p.Len() != 0 {
+		t.Fatalf("after drop len=%d", p.Len())
 	}
 }
 
@@ -3498,7 +3502,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
   - `sshgw.Config{HostKey ssh.Signer; Upstream ssh.Signer; UpstreamPort int; MaxSessionsPerInstance int /*0→16*/; MaxConnsPerIP int /*0→32*/; DrainTimeout time.Duration /*0→30s*/; DisableRateLimits bool}`；`sshgw.Deps{Store Store; Keys Keys; Clock clock.Clock; Log *slog.Logger}`。
   - `sshgw.New(cfg Config, d Deps) (*Server, error)`；`(*Server).Serve(ctx context.Context, lis net.Listener) error`（ctx 结束后停止 accept、drain、关闭全部会话；Task 11 补扫描 / 刷新 / drain 细节，本任务 Serve 已能 accept 并在 ctx 结束时关闭）；`(*Server).Sessions() int`。
   - Banner / 提示常量：`BannerUnknown = "用户名应为实例 ID，例如 ins-a1b2c3d4"`、`BannerSuspended = "实例所在机器暂时失联，计时已暂停，请稍后重试"`、`BannerCreating = "实例正在开通，请稍后再试"`、`BannerStoppedFmt = "实例已到期停机，数据保留至 %s，续费后可继续使用"`、`BannerReleased = "实例已释放"`、`MsgTooManySessions = "连接数过多"`、`MsgUpstreamUnreachable = "无法连接到实例，请稍后重试"`、`MsgDisconnected = "实例已停机 / 已释放，连接已断开"`。
-  - 测试钩子（`export_test.go`）：`SetLimitsForTest(s, ipFails, instFails, maxConns int)`、`FailCountForTest(s, ip string) int`、`BlockedForTest(s, ip string) bool`。
+  - 测试钩子（`export_test.go`）：`SetLimitsForTest(s, ipFails, instFails, maxConns int)`、`FailCountForTest(s, ip string) int`、`BlockedForTest(s, ip string) bool`、`HostkeysDroppedForTest(s) int64`、`IPKeyForTest(ip string) string`。保活间隔 / 超时走 `Config.KeepaliveInterval` / `KeepaliveTimeout`（Serve 之后不可改，避免数据竞争）。
 
 - [ ] **Step 1: 写测试辅助与失败的测试**
 
@@ -3544,6 +3548,7 @@ func newSigner(t *testing.T) ssh.Signer {
 type fakeStore struct {
 	mu       sync.Mutex
 	infos    map[string]rental.AccessInfo
+	failNext error
 	nextID   int64
 	opened   []rental.SSHSessionStart
 	closed   map[int64][2]int64
@@ -3562,10 +3567,22 @@ func (f *fakeStore) set(id string, info rental.AccessInfo) {
 	f.infos[id] = info
 }
 
+// setFailNext 让下一次 Access 返回该错误（模拟数据库瞬时故障）。
+func (f *fakeStore) setFailNext(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNext = err
+}
+
 func (f *fakeStore) Access(_ context.Context, id string) (rental.AccessInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.accessed++
+	if f.failNext != nil {
+		err := f.failNext
+		f.failNext = nil
+		return rental.AccessInfo{}, err
+	}
 	info, ok := f.infos[id]
 	if !ok {
 		return rental.AccessInfo{}, apperr.ErrNotFound
@@ -3775,6 +3792,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 package sshgw_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -3886,27 +3904,22 @@ func TestFailureCountingIsPerConnection(t *testing.T) {
 		c.Close()
 		t.Fatal("unknown keys accepted")
 	}
-	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 1 {
-		t.Fatalf("one failed connection counted as %d", n)
-	}
+	// 服务端在读到 EOF 后才计数，客户端 Dial 返回时未必已计入：一律等待
+	fails := func(n int) { waitFor(t, fmt.Sprintf("fail count %d", n), func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") == n }) }
+	fails(1)
 	c2, err := ssh.Dial("tcp", e.addr, &ssh.ClientConfig{User: instA, Auth: []ssh.AuthMethod{ssh.PublicKeys(keys...), ssh.Password("pw-correct-16chr")},
 		HostKeyCallback: ssh.FixedHostKey(e.hostKey.PublicKey()), Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	c2.Close()
-	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 1 {
-		t.Fatalf("successful connection after key probes counted: %d", n)
-	}
+	time.Sleep(100 * time.Millisecond)
+	fails(1) // 成功的连接不计
 	// 密码错 5 次（同一连接内重试）只计 1
 	e.dial(instA, ssh.RetryableAuthMethod(ssh.Password("wrong"), 5))
-	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 2 {
-		t.Fatalf("retries within one connection counted as %d", n)
-	}
+	fails(2)
 	e.dial(instA, ssh.Password("wrong"))
-	if !sshgw.BlockedForTest(e.srv, "127.0.0.1") {
-		t.Fatal("ip not blocked after 3 failed connections")
-	}
+	waitFor(t, "ip blocked", func() bool { return sshgw.BlockedForTest(e.srv, "127.0.0.1") })
 	if _, _, err := e.dial(instA, ssh.Password("pw-correct-16chr")); err == nil {
 		t.Fatal("blocked ip could connect")
 	}
@@ -3920,10 +3933,29 @@ func TestInstanceBruteforceAlertOnce(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		e.dial(instA, ssh.Password("wrong"))
 	}
+	waitFor(t, "alert raised", func() bool { _, _, alerts := e.store.snapshot(); return len(alerts) >= 1 })
+	time.Sleep(100 * time.Millisecond)
 	_, _, alerts := e.store.snapshot()
 	if len(alerts) != 1 || alerts[0] != "bruteforce:"+instA {
 		t.Fatalf("alerts = %v", alerts)
 	}
+}
+
+func TestIPKeyAndConcurrentConnCap(t *testing.T) {
+	if sshgw.IPKeyForTest("203.0.113.9") != "203.0.113.9" || sshgw.IPKeyForTest("2001:db8:1:2::1") != sshgw.IPKeyForTest("2001:db8:1:2:ffff::2") ||
+		sshgw.IPKeyForTest("2001:db8:1:2::1") == sshgw.IPKeyForTest("2001:db8:1:3::1") || !strings.HasSuffix(sshgw.IPKeyForTest("2001:db8::1"), "/64") {
+		t.Fatal("ipKey: IPv6 must be keyed by /64, IPv4 by address")
+	}
+	e := newEnv(t)
+	sshgw.SetLimitsForTest(e.srv, 100, 100, 2)
+	a := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	b := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	if _, _, err := e.dial(instA, ssh.Password("pw-correct-16chr")); err == nil {
+		t.Fatal("third concurrent connection from same ip accepted")
+	}
+	a.Close()
+	waitFor(t, "slot freed", func() bool { _, _, err := e.dial(instA, ssh.Password("pw-correct-16chr")); return err == nil })
+	b.Close()
 }
 
 func TestSessionCapAndUpstreamUnreachable(t *testing.T) {
@@ -4279,6 +4311,8 @@ type Config struct {
 	MaxSessionsPerInstance int           // 0 → 16
 	MaxConnsPerIP          int           // 0 → 32
 	DrainTimeout           time.Duration // 0 → 30s
+	KeepaliveInterval      time.Duration // 0 → 60s；测试调短（必须经 Config 传入，Serve 之后不可改）
+	KeepaliveTimeout       time.Duration // 0 → 15s
 	DisableRateLimits      bool
 }
 
@@ -4309,6 +4343,17 @@ func (x *session) addShell(ch ssh.Channel) {
 	x.mu.Unlock()
 }
 
+func (x *session) removeShell(ch ssh.Channel) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	for i, c := range x.shells {
+		if c == ch {
+			x.shells = append(x.shells[:i], x.shells[i+1:]...)
+			return
+		}
+	}
+}
+
 // disconnect 向所有 session 通道写提示后关闭两端连接。
 func (x *session) disconnect(msg string) {
 	x.mu.Lock()
@@ -4334,9 +4379,8 @@ type Server struct {
 	perInstance map[string]int
 	lastUnreach map[string]time.Time // upstream_unreachable 告警的进程内节流（5 分钟）
 
-	keepaliveInterval time.Duration
-	wg                sync.WaitGroup
-	hostkeysDropped   atomic.Int64
+	wg              sync.WaitGroup
+	hostkeysDropped atomic.Int64
 }
 
 func New(cfg Config, d Deps) (*Server, error) {
@@ -4355,8 +4399,13 @@ func New(cfg Config, d Deps) (*Server, error) {
 	if cfg.DrainTimeout <= 0 {
 		cfg.DrainTimeout = 30 * time.Second
 	}
-	s := &Server{cfg: cfg, d: d, sessions: map[*session]struct{}{}, perInstance: map[string]int{}, lastUnreach: map[string]time.Time{},
-		keepaliveInterval: keepaliveInterval}
+	if cfg.KeepaliveInterval <= 0 {
+		cfg.KeepaliveInterval = keepaliveInterval
+	}
+	if cfg.KeepaliveTimeout <= 0 {
+		cfg.KeepaliveTimeout = keepaliveTimeout
+	}
+	s := &Server{cfg: cfg, d: d, sessions: map[*session]struct{}{}, perInstance: map[string]int{}, lastUnreach: map[string]time.Time{}}
 	s.lim = newLimiter(d.Clock, cfg.DisableRateLimits, cfg.MaxConnsPerIP)
 	s.sshCfg = &ssh.ServerConfig{
 		ServerVersion:     serverVersion,
@@ -4479,9 +4528,14 @@ func (s *Server) serve(down *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <
 	userID, _ := strconv.ParseInt(ext["user_id"], 10, 64)
 	keyID, _ := strconv.ParseInt(ext["key_id"], 10, 64)
 	method := ext["method"]
-	// 全局请求（reqs）不能在这里丢弃：它们由 relay 按白名单转发给上游
+	// 全局请求（reqs）正常路径由 relay 按白名单转发给上游；拒绝路径里必须有人消费并回 false，
+	// 否则 OpenSSH 客户端发的 no-more-sessions@openssh.com（WantReply）会把它卡住
+	reject := func(msg string) {
+		go ssh.DiscardRequests(reqs)
+		rejectWithMessage(chans, msg)
+	}
 	if !s.acquireInstance(instanceID) {
-		rejectWithMessage(chans, MsgTooManySessions)
+		reject(MsgTooManySessions)
 		return
 	}
 	defer s.releaseInstance(instanceID)
@@ -4491,14 +4545,14 @@ func (s *Server) serve(down *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <
 		if ok {
 			msg = stateBanner(info)
 		}
-		rejectWithMessage(chans, msg)
+		reject(msg)
 		return
 	}
 	up, upChans, upReqs, err := s.dialUpstream(info)
 	if err != nil {
 		s.d.Log.Warn("ssh upstream dial failed", "instance", instanceID, "err", err)
 		s.alertUnreachable(instanceID)
-		rejectWithMessage(chans, MsgUpstreamUnreachable)
+		reject(MsgUpstreamUnreachable)
 		return
 	}
 	sess := &session{instanceID: instanceID, userID: userID, ip: ip, down: down, up: up}
@@ -4731,26 +4785,50 @@ func (s *Server) openOn(sess *session, nc ssh.NewChannel, other ssh.Conn, fromCl
 	if fromClient && t == "session" {
 		sess.addShell(ch)
 	}
-	if fromClient {
-		go pipeChannels(ch, reqs, och, oreqs, &sess.bytesUp, &sess.bytesDown)
-	} else {
-		go pipeChannels(och, oreqs, ch, reqs, &sess.bytesUp, &sess.bytesDown)
-	}
+	go func() {
+		if fromClient {
+			pipeChannels(ch, reqs, och, oreqs, &sess.bytesUp, &sess.bytesDown)
+		} else {
+			pipeChannels(och, oreqs, ch, reqs, &sess.bytesUp, &sess.bytesDown)
+		}
+		if fromClient && t == "session" {
+			sess.removeShell(ch) // ControlMaster 长连接会开关成百上千个 session，不能只增不减
+		}
+	}()
 }
 
-// pipeChannels：a 是客户端侧、b 是容器侧。数据与 stderr 双向拷贝，通道内请求双向转发（含 exit-status、eow）；
-// 一侧的请求流结束（即该侧通道已关闭）就关闭另一侧。
+// pipeChannels：a 是客户端侧、b 是容器侧。数据与 stderr 双向拷贝，通道内请求双向转发（含 exit-status、eow）。
+// 关闭顺序：一侧的请求流结束（该侧通道已被对端关闭）后，先等「从该侧读出的数据」全部写到另一侧（io.Copy 返回），
+// 再 Close 另一侧——否则 Close 发出 channelCloseMsg 后 x/crypto 对后续写入直接返回 io.EOF，`cat 大文件` 的尾部会被截断。
 func pipeChannels(a ssh.Channel, aReqs <-chan *ssh.Request, b ssh.Channel, bReqs <-chan *ssh.Request, up, down *atomic.Int64) {
+	aToB := make(chan struct{}) // a → b 的 stdout + stderr 拷贝都结束
+	bToA := make(chan struct{})
+	go func() {
+		var inner sync.WaitGroup
+		inner.Add(2)
+		go func() { defer inner.Done(); n, _ := io.Copy(b, a); up.Add(n) }()
+		go func() { defer inner.Done(); n, _ := io.Copy(b.Stderr(), a.Stderr()); up.Add(n) }()
+		inner.Wait()
+		b.CloseWrite()
+		close(aToB)
+	}()
+	go func() {
+		var inner sync.WaitGroup
+		inner.Add(2)
+		go func() { defer inner.Done(); n, _ := io.Copy(a, b); down.Add(n) }()
+		go func() { defer inner.Done(); n, _ := io.Copy(a.Stderr(), b.Stderr()); down.Add(n) }()
+		inner.Wait()
+		a.CloseWrite()
+		close(bToA)
+	}()
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); forwardChannelRequests(aReqs, b); b.Close() }()
-	go func() { defer wg.Done(); forwardChannelRequests(bReqs, a); a.Close() }()
-	go func() { n, _ := io.Copy(b, a); up.Add(n); b.CloseWrite() }()
-	go func() { n, _ := io.Copy(a, b); down.Add(n); a.CloseWrite() }()
-	go func() { n, _ := io.Copy(b.Stderr(), a.Stderr()); up.Add(n) }()
-	go func() { n, _ := io.Copy(a.Stderr(), b.Stderr()); down.Add(n) }()
+	go func() { defer wg.Done(); forwardChannelRequests(aReqs, b); <-aToB; b.Close() }() // 客户端关了：a 读到 EOF 后拷贝结束，再关容器侧
+	go func() { defer wg.Done(); forwardChannelRequests(bReqs, a); <-bToA; a.Close() }() // 容器关了：b 的尾部数据写完再关客户端侧
 	wg.Wait()
 }
+
+// forwardChannelRequests 结束时该侧通道已被对端关闭，读端随之 EOF，所以上面的 <-aToB / <-bToA 不会永久阻塞。
 
 func forwardChannelRequests(in <-chan *ssh.Request, out ssh.Channel) {
 	for req := range in {
@@ -4761,10 +4839,10 @@ func forwardChannelRequests(in <-chan *ssh.Request, out ssh.Channel) {
 	}
 }
 
-// keepalive 每 keepaliveInterval 发一次 keepalive@openssh.com，连续 keepaliveMisses 次无回应即关闭连接。
+// keepalive 每 Config.KeepaliveInterval 发一次 keepalive@openssh.com，连续 keepaliveMisses 次无回应即关闭连接。
 // 对端回 false（OpenSSH 对未知请求的回复）也算活着；只有发送出错或超时才算未回应。
 func (s *Server) keepalive(c ssh.Conn, stop <-chan struct{}) {
-	t := time.NewTicker(s.keepaliveInterval)
+	t := time.NewTicker(s.cfg.KeepaliveInterval)
 	defer t.Stop()
 	misses := 0
 	for {
@@ -4780,7 +4858,7 @@ func (s *Server) keepalive(c ssh.Conn, stop <-chan struct{}) {
 					misses = 0
 					continue
 				}
-			case <-time.After(keepaliveTimeout):
+			case <-time.After(s.cfg.KeepaliveTimeout):
 			}
 			if misses++; misses >= keepaliveMisses {
 				c.Close()
@@ -4807,11 +4885,13 @@ func SetLimitsForTest(s *Server, ipFails, instFails, maxConns int) {
 func FailCountForTest(s *Server, ip string) int { return s.lim.failCount(ip) }
 func BlockedForTest(s *Server, ip string) bool  { return s.lim.isBlocked(ip) }
 
-// SetKeepaliveForTest 调短保活间隔（必须在 Serve 之前调用）。
-func SetKeepaliveForTest(s *Server, d time.Duration) { s.keepaliveInterval = d }
-
 func HostkeysDroppedForTest(s *Server) int64 { return s.hostkeysDropped.Load() }
+
+// IPKeyForTest 暴露限流键（IPv6 取 /64）。
+func IPKeyForTest(ip string) string { return ipKey(ip) }
 ```
+
+（`export_test.go` 只 import `"time"` 以外不需要的包就去掉：本文件最终不需要 `time`。）
 
 Task 11 之前 `runLoops` 与 `drain` 先按最简实现放在 `server.go` 末尾（Task 11 扩充成扫描 + 刷新）：
 
@@ -4860,11 +4940,11 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Create: `internal/sshgw/relay_test.go`
-- Modify: `internal/sshgw/export_test.go`（`SetKeepaliveForTest` 增加 timeout 参数）、`internal/sshgw/relay.go`（`keepaliveTimeout` 改为 Server 字段）
+- Modify: `internal/access/sshtest/server.go`（`exec big N` / `bigerr N`）
 
 **Interfaces:**
-- Consumes: Task 9 的全部；Task 7 `sshtest` 的 `ServeHTTP` / `ForwardAddr` / `OpenToClient` / `LastDirectTCPIP` / `DropAll`。
-- Produces: `SetKeepaliveForTest(s *Server, interval, timeout time.Duration)`；`Server.keepaliveTimeout` 字段（默认 15s）。
+- Consumes: Task 9 的全部（含 `Config.KeepaliveInterval` / `KeepaliveTimeout`）；Task 7 `sshtest` 的 `ServeHTTP` / `ForwardAddr` / `OpenToClient` / `LastDirectTCPIP` / `DropAll`。
+- Produces: `sshtest` 新命令 `exec big N`（stdout 写 N 个 `x` 后立即退出）、`exec bigerr N`（stderr 同理）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -5141,9 +5221,31 @@ func newFreezer(t *testing.T, target string) *freezer {
 	return f
 }
 
+func TestLargeOutputNotTruncated(t *testing.T) {
+	e := newEnv(t)
+	c := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	sess, _ := c.NewSession()
+	defer sess.Close()
+	out, err := sess.Output("big 4194304") // 上游写满 4 MiB 后立即退出：尾部不能被 Close 截断
+	if err != nil || len(out) != 4194304 {
+		t.Fatalf("big output = %d bytes, err %v", len(out), err)
+	}
+	for i := 0; i < len(out); i += 65536 {
+		if out[i] != 'x' {
+			t.Fatalf("byte %d = %q", i, out[i])
+		}
+	}
+	sess2, _ := c.NewSession()
+	defer sess2.Close()
+	var stderr bytes.Buffer
+	sess2.Stderr = &stderr
+	if err := sess2.Run("bigerr 1048576"); err != nil || stderr.Len() != 1048576 {
+		t.Fatalf("big stderr = %d bytes, err %v", stderr.Len(), err)
+	}
+}
+
 func TestKeepaliveClosesFrozenClient(t *testing.T) {
-	e := newEnvWith(t, nil)
-	sshgw.SetKeepaliveForTest(e.srv, 50*time.Millisecond, 100*time.Millisecond)
+	e := newEnvWith(t, func(c *sshgw.Config) { c.KeepaliveInterval, c.KeepaliveTimeout = 50*time.Millisecond, 100*time.Millisecond })
 	fz := newFreezer(t, e.addr)
 	c, err := ssh.Dial("tcp", fz.lis.Addr().String(), &ssh.ClientConfig{User: instA, Auth: []ssh.AuthMethod{ssh.Password("pw-correct-16chr")},
 		HostKeyCallback: ssh.FixedHostKey(e.hostKey.PublicKey()), Timeout: 5 * time.Second})
@@ -5165,17 +5267,38 @@ func TestKeepaliveClosesFrozenClient(t *testing.T) {
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `go test ./internal/sshgw/ -run 'TestKeepaliveClosesFrozenClient' 2>&1 | head -5`
-Expected: 编译错误（`SetKeepaliveForTest` 参数不符）。其余用例应已通过或暴露中继缺陷——先跑一遍全部：`go test ./internal/sshgw/ 2>&1 | tail -15`，把失败的记下来逐个修。
+Run: `go test ./internal/sshgw/ -run 'TestLargeOutputNotTruncated|TestKeepaliveClosesFrozenClient' 2>&1 | head -8`
+Expected: `TestLargeOutputNotTruncated` 因 `sshtest` 还没有 `big` / `bigerr` 命令而输出 `exec:big 4194304`（长度不符）。其余用例先跑一遍全部：`go test ./internal/sshgw/ 2>&1 | tail -15`，把失败的记下来逐个修。
 
-- [ ] **Step 3: 保活超时可注入**
+- [ ] **Step 3: `sshtest` 增加大输出命令**
 
-`internal/sshgw/relay.go`：删掉常量 `keepaliveTimeout`，`Server` 增加字段 `keepaliveTimeout time.Duration`（`New` 里设为 `15 * time.Second`），`keepalive` 里 `time.After(keepaliveTimeout)` 改为 `time.After(s.keepaliveTimeout)`。`export_test.go`：
+`internal/access/sshtest/server.go` 的 `exec` switch 追加（放在 `default` 之前；import 已有 `strconv`、`strings`、`io`）：
 
 ```go
-// SetKeepaliveForTest 调短保活间隔与等待回应的超时（必须在 Serve 之前调用）。
-func SetKeepaliveForTest(s *Server, interval, timeout time.Duration) {
-	s.keepaliveInterval, s.keepaliveTimeout = interval, timeout
+	case strings.HasPrefix(cmd, "big "):
+		n, _ := strconv.Atoi(strings.TrimPrefix(cmd, "big "))
+		writeN(ch, n)
+	case strings.HasPrefix(cmd, "bigerr "):
+		n, _ := strconv.Atoi(strings.TrimPrefix(cmd, "bigerr "))
+		writeN(ch.Stderr(), n)
+```
+
+文件末尾加：
+
+```go
+// writeN 写 n 个 'x'（64 KiB 一块），命令返回后 session 立即 exit：用来验证网关不截断尾部数据。
+func writeN(w io.Writer, n int) {
+	block := []byte(strings.Repeat("x", 65536))
+	for n > 0 {
+		k := len(block)
+		if n < k {
+			k = n
+		}
+		if _, err := w.Write(block[:k]); err != nil {
+			return
+		}
+		n -= k
+	}
 }
 ```
 
@@ -5218,6 +5341,7 @@ package sshgw_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -5247,6 +5371,13 @@ func TestScanDisconnectsStoppedButKeepsSuspended(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if e.srv.Sessions() != 1 {
 		t.Fatal("suspended instance's session was disconnected")
+	}
+	// 数据库瞬时错误：不是终态，不能踢会话
+	e.store.setFailNext(errors.New("db timeout"))
+	e.srv.ScanNow(context.Background())
+	time.Sleep(100 * time.Millisecond)
+	if e.srv.Sessions() != 1 {
+		t.Fatal("db error kicked the session")
 	}
 	// 停机：10 秒扫描断开并提示
 	info = runningInfo(e, instA, 7, "pw-correct-16chr")
@@ -5352,8 +5483,10 @@ package sshgw
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/rental"
 )
 
@@ -5372,11 +5505,16 @@ func (s *Server) snapshotSessions() []*session {
 	return out
 }
 
-// ScanNow：实例离开 running（到期停机、释放、换机后的旧实例）→ 提示并断开；暂停（机器失联）不断。
+// ScanNow：实例离开 running（到期停机、释放、换机后的旧实例）或已不存在 → 提示并断开；暂停（机器失联）不断。
+// 数据库瞬时错误（超时、连接断）不是终态：只记日志，绝不因此踢会话。
 func (s *Server) ScanNow(ctx context.Context) {
 	for _, x := range s.snapshotSessions() {
 		info, err := s.d.Store.Access(ctx, x.instanceID)
-		terminal := err != nil
+		if err != nil && !errors.Is(err, apperr.ErrNotFound) {
+			s.d.Log.Error("ssh scan access", "instance", x.instanceID, "err", err)
+			continue
+		}
+		terminal := errors.Is(err, apperr.ErrNotFound)
 		if err == nil {
 			switch info.Instance.State {
 			case rental.StateStopped, rental.StateWiping, rental.StateReleased, rental.StateFailed:
@@ -5568,15 +5706,16 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `api/proto/agent/v1/agent.proto`、`internal/agentpb/agent.pb.go`（`make proto` 生成）
-- Modify: `internal/agentgw/server.go:44-52`（`Deps.HostKeys`）、`internal/agentgw/deliver.go:120-135`（`push`）、`internal/agentgw/convert.go:48-58`、`internal/agentgw/deliver_test.go`、`internal/agentgw/helpers_test.go:90`
-- Modify: `internal/agent/executor/executor.go:457-466`（`Command.HostKeyPEM`）、`internal/agent/executor/sshdir.go`、`internal/agent/executor/ops.go:84,194-209,322-363`、`internal/agent/executor/executor_test.go`
-- Modify: `internal/agent/client/client.go:893-911`（`toCommand`）
+- Modify: `internal/agentgw/server.go`（`Deps.HostKeys`）、`internal/agentgw/deliver.go`（`push`）、`internal/agentgw/convert.go`、`internal/agentgw/deliver_test.go`、`internal/agentgw/helpers_test.go`
+- Modify: `internal/agent/executor/executor.go`（`Command.HostKeyPEM`）、`internal/agent/executor/sshdir.go`、`internal/agent/executor/ops.go`、`internal/agent/executor/executor_test.go`
+- Modify: `internal/agent/client/client.go`（`toCommand`）
 - Modify: `docs/image-spec.md`
 
 **Interfaces:**
 - Produces:
   - proto：`message CreateInstance { … string host_key_pem = 6; }`（注释：敏感，仅在 mTLS 流上传输，不落日志、不进 `agent_commands.payload`）。
   - `agentgw.HostKeys interface { HostKeyPEM(ctx, instanceID string) (string, error) }`；`agentgw.Deps.HostKeys HostKeys`（`*rental.Service` 满足；nil → 不填）。`toProtoCommand(cmd fleet.Command, cfg Config, hostKeyPEM string)`。
+  - `agentgw.Config.SSHPort int`（0 → 2222）：Create 指令的 `ssh_port` 不再写死 2222，`app.Build` 传 `SSHPort: cfg.UpstreamSSHPort`，与网关 / ingress 拨号端口保持同一来源（规格 §5.3、§8）。
   - `executor.Command.HostKeyPEM string`；`writeSSHDir(id, upstreamPubKey, hostKeyPEM string) error`（有 PEM 且本地无主机密钥 → 写入 0600 并派生 `.pub`；已存在保留；为空 → 本地生成）；`writeInitScript(id string) error`（只重写 `init.sh`，create / start / Recover 都调用）。
   - `initScript` 追加 10 行配置（见 Global Constraints）。
 
@@ -5595,7 +5734,25 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 	}
 ```
 
-（import 追加 `"strings"`；`helpers_test.go` 的 `agentgw.Deps{...}` 增加 `HostKeys: r`。）
+并新增用例（`SSHPort` 非默认值进入 Create 指令）：
+
+```go
+func TestCreateCarriesConfiguredUpstreamSSHPort(t *testing.T) {
+	e := newEnvWith(t, func(c *agentgw.Config) { c.SSHPort = 2223 })
+	mid := e.machine("SN-002")
+	_, cmdID := e.place(mid)
+	a := e.connect(e.enroll(mid))
+	a.hello("10.0.0.10")
+	a.next(time.Second) // AgentConfig
+	a.report()
+	m := a.next(2 * time.Second)
+	if cmd := m.GetCommand(); cmd == nil || cmd.GetId() != cmdID || cmd.GetCreate().GetSshPort() != 2223 {
+		t.Fatalf("delivered = %v", m)
+	}
+}
+```
+
+（import 追加 `"strings"`；`helpers_test.go` 的 `agentgw.Deps{...}` 增加 `HostKeys: r`；现有 `TestDeliveryWaitsForFirstStateReport` 的 `GetSshPort() != 2222` 断言保留——它验证零值默认。）
 
 `internal/agent/executor/executor_test.go`：`TestCreateHappyPath` 的 `init.sh` 期望列表追加 `"Subsystem sftp internal-sftp"`, `"AllowTcpForwarding yes"`, `"GatewayPorts no"`, `"AllowAgentForwarding yes"`, `"X11Forwarding no"`, `"PermitTunnel no"`, `"ClientAliveInterval 60"`, `"ClientAliveCountMax 3"`, `"MaxStartups 50:30:200"`, `"MaxSessions 32"`；并新增：
 
@@ -5688,7 +5845,7 @@ type HostKeys interface {
 }
 ```
 
-`Deps` 追加 `HostKeys HostKeys`。`convert.go` 的 `toProtoCommand` 签名改为 `toProtoCommand(cmd fleet.Command, cfg Config, hostKeyPEM string)`，`CreateInstance{...}` 增加 `HostKeyPem: hostKeyPEM`。`deliver.go`：`TickNow` 里 `s.push(c, cmd, n)` 改为 `s.push(ctx, c, cmd, n)`，`push` 改为：
+`Deps` 追加 `HostKeys HostKeys`；`Config` 追加 `SSHPort int // 容器 sshd 发布到 <lan_ip>:<SSHPort>（SPARK_UPSTREAM_SSH_PORT）；0 → 2222`，`New` 里 `if cfg.SSHPort <= 0 { cfg.SSHPort = 2222 }`。`convert.go` 的 `toProtoCommand` 签名改为 `toProtoCommand(cmd fleet.Command, cfg Config, hostKeyPEM string)`，`CreateInstance{...}` 里 `SshPort: 2222` 改为 `SshPort: uint32(cfg.SSHPort)`，并增加 `HostKeyPem: hostKeyPEM`。`deliver.go`：`TickNow` 里 `s.push(c, cmd, n)` 改为 `s.push(ctx, c, cmd, n)`，`push` 改为：
 
 ```go
 // push 把指令推给流；Create 指令在这里读实例主机私钥（不经过 agent_commands.payload）。发送失败则断流（指令保持 sent，重连后补推）。
@@ -5717,7 +5874,7 @@ func (s *Server) push(ctx context.Context, c *conn, cmd fleet.Command, tick int6
 }
 ```
 
-`internal/app/app.go` 的 `agentgw.Deps{...}` 增加 `HostKeys: r`。
+`internal/app/app.go` 的 `agentgw.Deps{...}` 增加 `HostKeys: r`，`agentgw.Config{...}` 增加 `SSHPort: cfg.UpstreamSSHPort`。
 
 - [ ] **Step 5: Agent 侧**
 
@@ -5891,7 +6048,9 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 11 的 platform（SSH 网关）、Task 12 的 Agent 二进制与 `make agent` 的 SHA-256。
-- 前提与分工：平台跑在开发 Mac（局域网 IP `ipconfig getifaddr en0`，记为 `$MAC`，验收时是 192.168.1.218），Agent 跑在 Spark。**Claude 可以直接在测试机上执行 `sudo` 命令**（`ssh imac@192.168.1.221 'sudo -S ...'`，密码由负责人在终端输入或通过 `sudo -v` 预先缓存；**任何地方都不得写下或回显密码**，命令、日志、记录里也不能出现）。需要公网的第 8 项不在本检查点。
+- 前提与分工：平台跑在开发 Mac（局域网 IP `ipconfig getifaddr en0`，记为 `$MAC`，验收时是 192.168.1.218），Agent 跑在 Spark。**测试机上需要 root 的命令由协调人（controller）在单条 Bash 里经 ssh 执行**：密码在对话中由负责人临时提供，协调人运行时把它放进**仅该条命令的环境变量**，经 stdin 送给 `sudo -S`，形如
+  `SUDO_PW='<协调人运行时提供>' sh -c 'printf "%s\n" "$SUDO_PW" | ssh -T imac@192.168.1.221 "sudo -S -p \"\" systemctl stop spark-agent"'`
+  （`-p ""` 关掉提示符，`-T` 不分配 tty）。**密码绝不写进任何文件、脚本、记录、提交或本计划**；每一步记录前核对输出里不含密码（`sudo -S` 不回显，`set -x` 不得开启）。下文所有 `sudo -S` 命令都按这个方式执行，计划里只写命令本体。需要公网的第 8 项不在本检查点。
 
 - [ ] **Step 0: 准备**
 
@@ -5916,7 +6075,8 @@ go run ./cmd/platform     # 终端 3
 go run ./cmd/platform admin ssh-host-key   # 记下指纹（环境变量同上）
 ```
 
-后台（已有管理员与机器登记则跳过）：机器 `lan_ip = 192.168.1.221`，商品 spark-1，结束维护。**先升级 Agent 再用新平台开通实例**：后台「生成接入命令」→ 在 Spark 上执行（`ssh imac@192.168.1.221 'curl -fsSL http://$MAC:8000/install.sh | sudo -S sh -s -- …'`，命令由后台原样复制）。
+后台（已有管理员与机器登记则跳过）：机器 `lan_ip = 192.168.1.221`，商品 spark-1，结束维护。**先升级 Agent 再用新平台开通实例**：后台「生成接入命令」→ 协调人在 Spark 上执行。安装脚本本身要从 stdin 读（`curl | sh -s`），不能同时用 `sudo -S` 读密码，所以在**同一条 ssh 命令串**里先 `sudo -S -p "" -v` 缓存凭据（同一会话内后续 `sudo` 不再要密码），再跑后台给出的安装命令：
+`SUDO_PW='<运行时提供>' sh -c 'printf "%s\n" "$SUDO_PW" | ssh -T imac@192.168.1.221 "sudo -S -p \"\" -v && curl -fsSL http://$MAC:8000/install.sh | sudo sh -s -- <后台命令里 -- 之后的参数>"'`。
 
 - [ ] **Step 1: 开通与主机密钥（§10.4.1）**
 
@@ -5964,7 +6124,7 @@ Mac 上用 Go 写的小脚本（`go run` 一个只用 `x/crypto/ssh` 的临时�
 
 - [ ] **Step 12: 记录与提交**
 
-把每项的命令、关键输出与结论写进 `docs/superpowers/acceptance-plan3.md`「检查点 A」一节（格式同 `acceptance-plan2.md`）；发现的缺陷修复后单独提交并在记录里写明提交号。
+把每项的命令、关键输出与结论写进 `docs/superpowers/acceptance-plan3.md`「检查点 A」一节（格式同 `acceptance-plan2.md`）；发现的缺陷修复后单独提交并在记录里写明提交号。**写入前核对记录与提交里没有任何密码或 `SUDO_PW` 的值**（`git diff --cached | grep -i sudo_pw` 应为空）。
 
 ```bash
 git add docs/superpowers/acceptance-plan3.md
@@ -5978,10 +6138,10 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Create: `internal/platform/httpx/sameorigin.go`、`internal/platform/httpx/sameorigin_test.go`
-- Modify: `internal/api/server.go:25-43,49-53,101-137`、`internal/api/auth.go:9-15,49-53`、`internal/api/api_test.go`
-- Modify: `internal/adminapi/server.go:38-60,78-86`、`internal/adminapi/auth_test.go`
+- Modify: `internal/api/server.go`、`internal/api/auth.go`、`internal/api/api_test.go`
+- Modify: `internal/adminapi/server.go`、`internal/adminapi/auth_test.go`
 - Modify: `internal/identity/auth.go`、`internal/identity/auth_test.go`
-- Modify: `internal/app/app.go`（传 `PublicBaseURL` / `AdminPublicBaseURL`）、`internal/app/e2e_test.go:400-431`
+- Modify: `internal/app/app.go`（传 `PublicBaseURL` / `AdminPublicBaseURL`）、`internal/app/e2e_test.go`
 
 **Interfaces:**
 - Produces:
@@ -6340,7 +6500,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Produces:
   - `ingress.ParseHost(host, ingressDomain string) (instanceID string, port int, ok bool)`：去端口、去尾点、小写后匹配 `^ins-([a-z0-9]{8})-([0-9]{1,5})\.<domain>$`，端口 1～65535。
   - `ingress.Source interface { ListIngressRoutes(ctx) ([]rental.IngressRoute, error) }`；`ingress.NewTable(src Source, log *slog.Logger) *Table`；`(*Table).Refresh(ctx) error`、`Run(ctx, interval)`、`Lookup(instanceID string, port int) (rental.IngressRoute, bool)`、`Routes() []rental.IngressRoute`。
-  - 页面：`ingress.WritePage(w http.ResponseWriter, status int, title, body string, refreshSeconds int)`（内联 HTML，`Content-Type: text/html; charset=utf-8`，`Cache-Control: no-store`，`refreshSeconds > 0` 时带 `<meta http-equiv="refresh">`）；文案常量 `PageNotOpen = "该端口未开放"`、`PageNotRunningFmt`（按状态：creating「实例正在开通」、stopped「实例已到期停机，续费后可访问」、暂停「实例所在机器暂时失联」）、`PageUpstreamFmt = "无法连接到实例端口，请确认服务已在容器内监听 %d"`。
+  - 页面：`ingress.WritePage(w http.ResponseWriter, status int, title, body string, refreshSeconds int)`（内联 HTML，`Content-Type: text/html; charset=utf-8`，`Cache-Control: no-store`，`refreshSeconds > 0` 时带 `<meta http-equiv="refresh">`）；文案常量 `PageNotOpen = "该端口未开放"`、`PageSuspended`、`PageCreating`、`PageStopped`、`PageReleased`、`PageUpstreamFmt = "无法连接到实例端口，请确认服务已在容器内监听 %d"`、`PageForbidden`、`PageBadTarget`、`PageTicketInvalid`；`ingress.NotRunningPage(r rental.IngressRoute) string` 按状态选文案（暂停 → `PageSuspended`，creating → `PageCreating`，stopped → `PageStopped`，其它 → `PageReleased`），Task 17 的 503 页用它。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -6688,6 +6848,7 @@ package ingress_test
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -6717,7 +6878,10 @@ func TestTicketSingleUse(t *testing.T) {
 		t.Fatalf("expired = %v", err)
 	}
 	tok3 := s.Ticket(c)
-	tampered := tok3[:len(tok3)-2] + "AA"
+	dot := strings.IndexByte(tok3, '.')
+	sig, _ := base64.RawURLEncoding.DecodeString(tok3[dot+1:])
+	sig[len(sig)/2] ^= 0xff // 翻转签名中间一个字节（改末尾字符在 1/256 情况下不构成篡改）
+	tampered := tok3[:dot+1] + base64.RawURLEncoding.EncodeToString(sig)
 	if _, err := s.VerifyTicket(tampered); !errors.Is(err, ingress.ErrToken) {
 		t.Fatalf("tampered = %v", err)
 	}
@@ -7637,8 +7801,9 @@ func TestUpstreamCloseMidResponseReturns502OrTruncates(t *testing.T) {
 	resp := e.get("ins-a1b2c3d4-8888.spark.test", "/")
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
-	if resp.StatusCode == 200 && err == nil && len(b) == 100 {
-		t.Fatal("truncated upstream response delivered as complete")
+	// 上游已发 200 头再断开：状态码改不了，但客户端必须看到读错误（unexpected EOF）且字节数不足，不能被当成完整响应
+	if resp.StatusCode != 200 || err == nil || len(b) >= 100 {
+		t.Fatalf("truncated upstream response: status=%d err=%v len=%d", resp.StatusCode, err, len(b))
 	}
 	// 之后的请求照常
 	e.route("ins-b2c3d4e5", 7, 80, "public", rental.StateRunning, http.HandlerFunc(echo))
@@ -7953,7 +8118,7 @@ func (s *Server) alertUnreachable(instanceID string) {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `go vet ./internal/ingress/ && go test ./internal/ingress/ -race 2>&1 | tail -5`
-Expected: 全部 `ok`。`TestUpstreamCloseMidResponseReturns502OrTruncates` 里上游已经发出 200 头再断开：ReverseProxy 无法再改状态码，客户端读到的 body 不足 100 字节且 `io.ReadAll` 返回 `unexpected EOF` 即通过（用例只拒绝「完整 100 字节」这一种错误结果）。
+Expected: 全部 `ok`。`TestUpstreamCloseMidResponseReturns502OrTruncates` 里上游已经发出 200 头再断开：ReverseProxy 无法再改状态码，用例断言客户端读到 `unexpected EOF` 且字节数 < 100（ReverseProxy 在拷贝体出错时会 `panic(http.ErrAbortHandler)` 中断连接，客户端据此得到读错误）。
 
 - [ ] **Step 5: 提交**
 
@@ -8194,6 +8359,15 @@ func TestBuildWithTLSFilesAndRedirect(t *testing.T) {
 	if resp.StatusCode != 200 || resp.Header.Get("Strict-Transport-Security") != "max-age=31536000" {
 		t.Fatalf("https = %d hsts=%q", resp.StatusCode, resp.Header.Get("Strict-Transport-Security"))
 	}
+	// httptest.StartTLS 会给 TLSConfig 补自己的证书；按 IP 连接无 SNI 时选不到我们的。带 SNI 握手，确认用的是文件里的证书（序列号 1）
+	conn, err := tls.Dial("tcp", strings.TrimPrefix(ts.URL, "https://"), &tls.Config{ServerName: "spark.test", InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sn := conn.ConnectionState().PeerCertificates[0].SerialNumber.Int64(); sn != 1 {
+		t.Fatalf("served certificate serial = %d, want 1 (file-based loader not used)", sn)
+	}
+	conn.Close()
 	rs := a.RedirectServer(cfg)
 	if rs == nil {
 		t.Fatal("redirect server nil")
@@ -8584,9 +8758,9 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Create: `internal/api/access.go`、`internal/api/access_test.go`
-- Modify: `internal/api/instances.go:19-48`（视图）、`internal/api/server.go`（路由、`SSHHost` / `SSHPort` 字段）
+- Modify: `internal/api/instances.go`（视图）、`internal/api/server.go`（路由、`SSHHost` / `SSHPort` 字段）
 - Create: `internal/adminapi/access.go`、`internal/adminapi/access_test.go`
-- Modify: `internal/adminapi/instances.go:14-22,70-95`、`internal/adminapi/users.go:43-80`、`internal/adminapi/views.go:12-30`、`internal/adminapi/dashboard.go`
+- Modify: `internal/adminapi/instances.go`、`internal/adminapi/users.go`、`internal/adminapi/views.go`、`internal/adminapi/dashboard.go`
 - Modify: `internal/rental/ports.go`（`PortCounts`）、`internal/app/app.go`
 
 **Interfaces:**
@@ -8622,14 +8796,25 @@ func pubLine(t *testing.T) string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(p))) + " test@mac"
 }
 
+// runningInstance：下单并模拟 Agent 回报 create 成功（api_test 没有现成的让实例进入 running 的辅助）。
 func (c *client) runningInstance(t *testing.T, e *testEnv, phone string) string {
 	t.Helper()
-	dbtest.CreateMachine(t, e.pool, "SN-"+phone)
+	mid := dbtest.CreateMachine(t, e.pool, "SN-"+phone)
 	user := c.login(phone)
 	c.do("POST", "/kyc/personal", map[string]string{"name": "张三", "id_number": "11010119900101123X"})
 	e.wallet.AdminAdjust(t.Context(), 1, int64(user["id"].(float64)), 100000, "fund", "")
 	_, out := c.do("POST", "/orders", map[string]any{"product_id": dbtest.ProductID(t, e.pool), "duration": "1d", "image_id": dbtest.ImageID(t, e.pool)})
-	return out["instance"].(map[string]any)["id"].(string)
+	id := out["instance"].(map[string]any)["id"].(string)
+	cmds, err := e.fleet.PendingCommands(t.Context(), mid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range cmds {
+		if err := e.rental.HandleCommandResult(t.Context(), cmd.ID, true, "ok"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return id
 }
 
 func TestSSHKeysEndpoints(t *testing.T) {
@@ -8727,7 +8912,7 @@ func TestInstanceAccessEndpoints(t *testing.T) {
 }
 ```
 
-（`api_test.go` 若没有 `itoa`，追加 `func itoa(n int64) string { return strconv.FormatInt(n, 10) }` 与 import `strconv`；import `"spark-cloud/internal/api"` 已有。）
+（`api_test.go`：`testEnv` 增加字段 `fleet *fleet.Service`、`rental *rental.Service`，`newTestEnvWith` 返回时填 `fleet: f, rental: r`；若没有 `itoa`，追加 `func itoa(n int64) string { return strconv.FormatInt(n, 10) }` 与 import `strconv`；import `"spark-cloud/internal/api"` 已有。）
 
 `internal/adminapi/access_test.go`：
 
@@ -9259,7 +9444,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `web/shared/src/types/access.ts`（并在 `types/index.ts` 导出）
 - Create: `web/console/src/logic/access.ts`、`web/console/src/logic/__tests__/access.spec.ts`
 - Create: `web/console/src/views/SshKeysView.vue`
-- Modify: `web/console/src/router.ts`、`web/console/src/views/LoginView.vue:52`、`web/console/src/views/AccountView.vue`、`web/console/src/views/InstanceDetailView.vue`、`web/console/src/views/HelpView.vue`、`web/console/src/__tests__/router.spec.ts`
+- Modify: `web/console/src/router.ts`、`web/console/src/views/LoginView.vue`、`web/console/src/views/AccountView.vue`、`web/console/src/views/InstanceDetailView.vue`、`web/console/src/views/HelpView.vue`、`web/console/src/__tests__/router.spec.ts`
 
 **Interfaces:**
 - Consumes: Task 19 的接口与 JSON 字段。
@@ -9786,7 +9971,33 @@ const canManagePorts = (s: string) => s === 'creating' || s === 'running' || s =
     </el-card>
 ```
 
+同一文件「怎么用 SSH 连接」里的 `<li>如遇换机，SSH 密码会变化，请在详情页重新查看。</li>` 改为 `<li data-testid="help-migrated-web">如遇换机，SSH 密码会变化，Web 访问地址也会变为新实例 ID，请在详情页重新查看。</li>`（控制台没有按实例的换机提示——换机由后台发起、用户看到的是一个新实例——所以规格 §4.4 的这句提示放在这里；现有 e2e `C-ACC-02` 的 `toContainText('如遇换机，SSH 密码会变化')` 仍成立）。
+
 `web/shared/src/brand.ts` 增加字段 `sshHostKeyFingerprint: ''`（部署时由运维填 `platform admin ssh-host-key` 的指纹，与品牌名、客服文案放在一起）。
+
+`web/console/src/__tests__/router.spec.ts` 追加（覆盖「redirect 是 authorize 路径时整页跳转」这条安全路径）：
+
+```ts
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { isAuthorizeRedirect } from '../logic/access'
+import { safeRedirect } from '../router'
+
+describe('authorize redirect handling', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it('authorize 路径必须整页跳转而不是路由导航', () => {
+    const assign = vi.fn()
+    vi.stubGlobal('location', { ...window.location, assign })
+    const target = safeRedirect('/api/v1/ingress/authorize?target=http%3A%2F%2Fins-a1b2c3d4-8888.spark.test%3A18080%2F')
+    expect(target).not.toBeNull()
+    expect(isAuthorizeRedirect(target)).toBe(true)
+    if (target && isAuthorizeRedirect(target)) window.location.assign(target) // 与 LoginView / 路由守卫同一分支
+    expect(assign).toHaveBeenCalledWith('/api/v1/ingress/authorize?target=http%3A%2F%2Fins-a1b2c3d4-8888.spark.test%3A18080%2F')
+    expect(isAuthorizeRedirect(safeRedirect('//evil.example/api/v1/ingress/authorize'))).toBe(false)
+  })
+})
+```
+
+（与现有 `safeRedirect` 用例并存；`vi`、`afterEach` 在已有 import 基础上补齐。）
 
 - [ ] **Step 8: 运行测试确认通过**
 
@@ -10017,6 +10228,7 @@ import (
 
 	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/app"
+	"spark-cloud/internal/audit"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
@@ -10024,6 +10236,7 @@ import (
 )
 
 // TestAccessLifecycle：下单 → 密码登录 → 公钥 → 关闭密码 → 端口私有 / 公开 → 登出失效 → 到期停机 → 续费 → 换机 → 释放。
+// `sshExec` 闭包读取变量 id，换机后把 id 改为新实例即可复用。
 func TestAccessLifecycle(t *testing.T) {
 	ctx := context.Background()
 	pool := dbtest.New(t)
@@ -10204,9 +10417,46 @@ func TestAccessLifecycle(t *testing.T) {
 	if out, err := sshExec(ssh.PublicKeys(userSigner), "echo back"); err != nil || out != "back\n" {
 		t.Fatalf("after renew = %q %v", out, err)
 	}
+	// 换机：新实例保留端口与 password_auth、能用公钥登录；旧 ID 的 Web 走 404、SSH 被拒
+	mid2 := dbtest.CreateMachine(t, pool, "SN002")
+	pool.Exec(ctx, `UPDATE machines SET lan_ip = '127.0.0.1' WHERE id = $1`, mid2)
+	moved, err := a.Rental.AdminMigrate(ctx, audit.Actor{AdminID: 1}, id, "bad gpu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []int64{mid, mid2} {
+		a.Fleet.Heartbeat(ctx, m)
+		cmds, _ := a.Fleet.PendingCommands(ctx, m)
+		for _, cmd := range cmds {
+			a.Rental.HandleCommandResult(ctx, cmd.ID, true, "ok")
+		}
+	}
+	ports := c.do("GET", "/instances/"+moved.ID+"/ports", nil)["items"].([]any)
+	newInst := c.do("GET", "/instances/"+moved.ID, nil)
+	if len(ports) != 1 || ports[0].(map[string]any)["port"].(float64) != 8888 || newInst["password_auth"] != false || newInst["state"] != "running" {
+		t.Fatalf("migrated instance = %v ports=%v", newInst, ports)
+	}
+	time.Sleep(2500 * time.Millisecond)
+	if r := getHost(http.DefaultClient, host, "/"); r.StatusCode != 404 {
+		t.Fatalf("old instance web after migrate = %d", r.StatusCode)
+	}
+	if _, err := sshExec(ssh.PublicKeys(userSigner), "echo x"); err == nil {
+		t.Fatal("old instance ssh allowed after migrate")
+	}
+	id = moved.ID
+	if out, err := sshExec(ssh.PublicKeys(userSigner), "echo moved"); err != nil || out != "moved\n" {
+		t.Fatalf("new instance ssh = %q %v", out, err)
+	}
 	// 释放 → 拒绝、主机私钥清空
 	c.do("POST", "/instances/"+id+"/release", map[string]any{})
-	agent()
+	agent2 := func() {
+		a.Fleet.Heartbeat(ctx, mid2)
+		cmds, _ := a.Fleet.PendingCommands(ctx, mid2)
+		for _, cmd := range cmds {
+			a.Rental.HandleCommandResult(ctx, cmd.ID, true, "ok")
+		}
+	}
+	agent2()
 	if _, err := sshExec(ssh.PublicKeys(userSigner), "echo x"); err == nil {
 		t.Fatal("ssh allowed after release")
 	}
@@ -10771,7 +11021,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ### Task 23: 部署产物：`deploy/compose`、platform 镜像、README 部署章节
 
 **Files:**
-- Create: `deploy/compose/docker-compose.yml`、`deploy/compose/.env.example`、`deploy/compose/README.md`、`deploy/platform/Dockerfile`
+- Create: `deploy/compose/docker-compose.yml`、`deploy/compose/.env.example`、`deploy/compose/README.md`、`deploy/platform/Dockerfile`、`.dockerignore`
 - Modify: `Makefile`（`platform-image` 目标）、`README.md`（「部署注意」与「节点 Agent」章节）
 
 **Interfaces:**
@@ -10916,6 +11166,25 @@ ALI_SECRET=
 8. 冒烟：`ssh -p 22 ins-xxxxxxxx@ssh.<domain>` 看到 Banner；`docker compose logs platform | grep 'ssh auth failed'` 里的 `ip` 必须是真实客户端地址而不是 172.x（Docker 的 iptables DNAT 保留源地址；若看到网桥地址，检查 dockerd 是否关闭了 iptables 或启用了 userland-proxy）。
 ```
 
+仓库根目录新建 `.dockerignore`（否则 `COPY . .` 会把本地开发数据、上游私钥、`node_modules`、测试产物打进构建上下文）：
+
+```
+.git
+.devdata
+bin
+web/node_modules
+web/*/node_modules
+web/test-results
+web/playwright-report
+web/*/dist
+internal/web/dist/console
+internal/web/dist/admin
+*.test
+coverage.out
+```
+
+（前端产物由 `web` 阶段在镜像内构建，所以忽略本地 `internal/web/dist/{console,admin}` 不影响构建。）
+
 `Makefile` 追加：
 
 ```make
@@ -10946,7 +11215,7 @@ Run:
 ```bash
 export PATH=$HOME/.local/go/bin:$HOME/.local/bin:$PATH
 go vet ./... && go test ./... 2>&1 | tail -3
-scp -r deploy/compose deploy/platform Dockerfile imac@192.168.1.221:/tmp/spark-deploy/ 2>/dev/null || true
+ssh imac@192.168.1.221 'mkdir -p /tmp/spark-deploy' && scp -r deploy/compose deploy/platform imac@192.168.1.221:/tmp/spark-deploy/
 ssh imac@192.168.1.221 'cd /tmp/spark-deploy/compose && cp .env.example .env && sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=x/; s#^SPARK_UPSTREAM_SSH_KEY_HOST_PATH=.*#SPARK_UPSTREAM_SSH_KEY_HOST_PATH=/tmp/up.key#" .env && touch /tmp/up.key && docker compose config >/dev/null && echo CONFIG_OK'
 ```
 Expected: `CONFIG_OK`（实跑冒烟在 Task 24 第 18 项）。
@@ -10968,7 +11237,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - 可能修改：验收中发现的缺陷在对应包修复并补单测（单独提交）
 
 **Interfaces:**
-- Consumes: 全部任务。前提同 Task 13（平台在 Mac，`SPARK_DOMAIN=192-168-1-218.sslip.io`、`SPARK_PUBLIC_BASE_URL=http://192-168-1-218.sslip.io:8080`，Agent 已是新版本）。Claude 可在测试机 `sudo`，**不得记录密码**。
+- Consumes: 全部任务。前提同 Task 13（平台在 Mac，`SPARK_DOMAIN=192-168-1-218.sslip.io`、`SPARK_PUBLIC_BASE_URL=http://192-168-1-218.sslip.io:8080`，Agent 已是新版本）。测试机 root 命令按 Task 13 Interfaces 的方式由协调人经 `sudo -S` + stdin 执行，密码运行时提供、**不进任何文件 / 记录 / 提交**。
 
 - [ ] **Step 1: 密码重置（§10.4.4，A 阶段未做）**
 
@@ -11000,11 +11269,11 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 8: compose 冒烟（§10.4.18）**
 
-测试机上：`make platform-image` 的产物需要 arm64 镜像——在 Spark 上 `docker build -f deploy/platform/Dockerfile -t spark-cloud/platform:test .`（代码经 `git archive` 或 rsync 到 `/tmp/spark-src`），`deploy/compose/.env` 用 staging 配置（自签证书放进 `certs` 卷：`docker run --rm -v spark-deploy_certs:/certs -v /tmp/tls:/src alpine cp /src/tls.crt /certs/fullchain.pem ...`），宿主机 sshd 临时挪到 2200（Claude 执行 `sudo -S sed -i 's/^#\?Port .*/Port 2200/' /etc/ssh/sshd_config && sudo -S systemctl restart ssh`，先用 2200 连通再继续）→ `docker compose up -d platform postgres` → 从 Mac `ssh -p 22 foo@192.168.1.221` 看到 Banner；`docker compose logs platform | grep 'ssh auth failed'` 的 `ip` 是 `192.168.1.218`；`openssl s_client -connect 192.168.1.221:443` 看到证书；替换 `certs` 卷里的证书 → 1 分钟内生效；`docker compose down`；宿主机 sshd 改回 22。
+测试机上：`make platform-image` 的产物需要 arm64 镜像——在 Spark 上 `docker build -f deploy/platform/Dockerfile -t spark-cloud/platform:test .`（代码经 `git archive` 或 rsync 到 `/tmp/spark-src`），`deploy/compose/.env` 用 staging 配置（自签证书放进 `certs` 卷：`docker run --rm -v spark-deploy_certs:/certs -v /tmp/tls:/src alpine cp /src/tls.crt /certs/fullchain.pem ...`），宿主机 sshd 临时挪到 2200（协调人按 Task 13 的方式执行：`sudo -S -p "" sed -i 's/^#\?Port .*/Port 2200/' /etc/ssh/sshd_config && sudo -S -p "" sshd -t && sudo -S -p "" systemctl restart ssh`；**先 `sshd -t` 校验通过、再用 `ssh -p 2200 imac@192.168.1.221 true` 连通，之后才继续**，否则立即把 `Port` 改回并重启）→ `docker compose up -d platform postgres` → 从 Mac `ssh -p 22 foo@192.168.1.221` 看到 Banner；`docker compose logs platform | grep 'ssh auth failed'` 的 `ip` 是 `192.168.1.218`；`openssl s_client -connect 192.168.1.221:443` 看到证书；替换 `certs` 卷里的证书 → 1 分钟内生效；`docker compose down`；宿主机 sshd 改回 22（同样 `sshd -t` 后重启），并用 `ssh -p 22 imac@192.168.1.221 true` 复测连通。
 
 - [ ] **Step 9: 记录、结论、提交**
 
-补齐 `acceptance-plan3.md`：每项命令 / 关键输出 / 结论，缺陷表（编号、现象、原因、修复提交），「观察（列入遗留）」。
+补齐 `acceptance-plan3.md`：每项命令 / 关键输出 / 结论，缺陷表（编号、现象、原因、修复提交），「观察（列入遗留）」。写入前核对记录与提交里没有任何密码或 `SUDO_PW` 的值。
 
 ```bash
 git add docs/superpowers/acceptance-plan3.md
@@ -11099,4 +11368,6 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **类型一致性**：`rental.AccessInfo{Instance, Password, MachineLanIP, MachineSerial, AgentOnline, RetainUntil}`（Task 3、9、11）；`rental.SSHSessionStart` / `SSHSession` / `OpenSSHSession` / `TouchSSHSessions` / `CloseSSHSession`（Task 3、9、11、19）；`rental.IngressRoute{InstanceID, UserID, Port, Visibility, State, Suspended, LanIP, HostPubkey}`（Task 4、15、17、18）；`rental.Port` / `AddPort(ctx, userID, id, port, visibility, note, ip)` / `UpdatePort(…, visibility, note *string, ip)` / `AdminForcePortPrivate` / `AdminDeletePort` / `PortCounts`（Task 4、19）；`rental.Deps.Keys` / `HostKeyGen`、`app.Options.HostKeyGen`（Task 3、11、22）；`identity.SSHKey` / `ParseSSHPublicKey` / `AddSSHKey(ctx, userID, name, raw, ip)` / `FindSSHKey` / `TouchSSHKey` / `CountSSHKeys` / `SessionHash` / `SessionUserID`（Task 2、9、14、17、19）；`pki.GenerateInstanceHostKey` / `EnsureSSHHostKey` / `SSHFingerprint` / `LoadUpstreamSigner`（Task 3、6、11、22）；`sshtest.New(Options{AuthorizedKey, HostKey})` / `ServeHTTP` / `ForwardAddr` / `OpenToClient` / `LastDirectTCPIP` / `DropAll` / `HostPubLine` / `Signer`（Task 7～10、22）；`upstream.Target` / `Pool.Dial(ctx, Target, port)` / `DialError` / `HostKeyCallback` / `ClientConfig`（Task 8、9、17、18）；`sshgw.Config` / `Deps` / `Store` / `Keys` / `Serve(ctx, lis)` / `ScanNow` / `TouchNow` / `Sessions` 与 Banner 常量（Task 9～11、22）；`ingress.ParseHost` / `Table` / `Signer.Ticket|VerifyTicket|Cookie|VerifyCookie` / `Claims` / `Auth.ParseTarget|PortURL|AuthorizeURL|CallbackURL|ValidCookie|HandleCallback|HandleLogout` / `SafeNext` / `NewServer(auth, routes, sessions, dialer, alerts, clk, log)` / `HostMux`（Task 15～19）；`httpx.SameSiteGuard` / `HSTS`（Task 14、18）；`tlsfile.Loader{CertFile, KeyFile, Interval, Now, OnReloadError, OnExpiring}` / `Load` / `GetCertificate` / `CheckNow` / `CheckExpiry` / `TLSConfig`（Task 18）；`config.Config` 新字段与 `FillAccessDefaults` / `TLSEnabled` / `PublicURL` / `SSHHost`（Task 5、11、18、22）；`api.Server.{PublicBaseURL, Ingress, AuthorizeLimit, SSHHost, SSHPort}`、`adminapi.Server.{PublicBaseURL, PortURL}`（Task 14、16、19）；`agentgw.Deps.HostKeys` / `toProtoCommand(cmd, cfg, hostKeyPEM)` / `push(ctx, …)`（Task 12）；`executor.Command.HostKeyPEM` / `writeSSHDir(id, pub, pem)` / `writeInitScript`（Task 12）；前端 `Http.del`、`SshKey` / `InstancePort` / `AdminSshSession` / `Instance.{password_auth, ssh_host, ssh_port, ports_count}`、`logic/access.ts`、`showPortActions`、`hooks.ssh` / `hooks.ingressUpstream` / `loginConsoleAt` / `CONSOLE_SITE_URL`（Task 20～22）。
 
-**Review Focus 落点**：1 → Task 9 `TestBannerForUnknownUsernames`（大写、空白、`@` 后缀、短 ID、空串）；2 → Task 2 `TestParseSSHPublicKeyMatrix`（CRLF 接受、两行拒绝、私钥拒绝）；3 → Task 15 `TestParseHostNormalizes` + Task 17 `TestPublicPortProxiesAndStripsIngressCookie`（大写 / 尾点 Host 实际命中路由）；4 → Task 10 `TestUpstreamDropEndsSession` + Task 17 `TestUpstreamCloseMidResponseReturns502OrTruncates`；5 → Task 16 `TestTicketSingleUse`、`TestCallbackSetsCookieAndLogoutClearsIt`（`next=//evil.example` 回 `/`）。
+**Review Focus 落点**：1 → Task 9 `TestBannerForUnknownUsernames`（大写、空白、`@` 后缀、短 ID、空串）；2 → Task 2 `TestParseSSHPublicKeyMatrix`（CRLF 接受、两行拒绝、私钥拒绝）；3 → Task 15 `TestParseHostNormalizes` + Task 17 `TestPublicPortProxiesAndStripsIngressCookie`（大写 / 尾点 Host 实际命中路由）；4 → Task 10 `TestUpstreamDropEndsSession` + Task 17 `TestUpstreamCloseMidResponseReturns502OrTruncates`（断言 `unexpected EOF` 且字节数不足）；5 → Task 16 `TestTicketSingleUse`（翻转签名字节）、`TestCallbackSetsCookieAndLogoutClearsIt`（`next=//evil.example` 回 `/`）。
+
+**评审后补充的测试落点**（计划评审必改 1、2 与建议 12、13、15、17、19、20）：大输出不截断 → Task 10 `TestLargeOutputNotTruncated`（4 MiB stdout + 1 MiB stderr，`pipeChannels` 等拷贝结束再 Close）；数据库瞬时错误不踢会话 → Task 11 `TestScanDisconnectsStoppedButKeepsSuspended` 的 `setFailNext` 段；`SPARK_UPSTREAM_SSH_PORT` 进 Create → Task 12 `TestCreateCarriesConfiguredUpstreamSSHPort`；IPv6 `/64` 与并发上限 → Task 9 `TestIPKeyAndConcurrentConnCap`；失败计数用 `waitFor` 消除竞态 → Task 9；连接池键含 lan_ip 与崩溃重建 → Task 8 `TestPoolSharesClientAndVerifiesHostKey`；文件证书确实被 TLS 握手选中 → Task 18 `TestBuildWithTLSFilesAndRedirect` 的 SNI 段；authorize 整页跳转 → Task 20 `router.spec.ts`；换机后端口 / 开关复制与旧 ID 404 → Task 22 `TestAccessLifecycle` 换机段。
