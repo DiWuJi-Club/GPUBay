@@ -18,6 +18,7 @@ const (
 	PageCreating      = "实例正在开通，请稍后再试"
 	PageStopped       = "实例已到期停机，续费后可访问"
 	PageReleased      = "实例已释放"
+	PageShuttingDown  = "平台正在重启，请稍后刷新"
 	PageTicketInvalid = "登录票据无效或已过期，请重新访问"
 )
 

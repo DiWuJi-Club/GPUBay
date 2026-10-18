@@ -100,11 +100,24 @@ func run(log *slog.Logger) error {
 	if listensOnAllInterfaces(cfg.AdminAddr) {
 		log.Warn("后台 API 监听在所有网卡上，请确认防火墙只对内网开放该端口", "addr", cfg.AdminAddr)
 	}
-	serverErr := make(chan error, 2)
+	// http.Server 的 ListenAndServe(TLS) 用 net.Listen：零值 ListenConfig 对接受的连接开启 TCP keepalive（15 秒探测），
+	// 半开的 WebSocket / SSE 对端会被内核探测出来并断开。
+	serverErr := make(chan error, 3)
 	go func() {
-		log.Info("platform listening", "addr", cfg.HTTPAddr, "env", cfg.Env)
+		log.Info("platform listening", "addr", cfg.HTTPAddr, "env", cfg.Env, "tls", cfg.TLSEnabled(), "ingress_domain", cfg.IngressDomain)
+		if cfg.TLSEnabled() {
+			serverErr <- srv.ListenAndServeTLS("", "") // 证书来自 TLSConfig.GetCertificate（文件热加载）
+			return
+		}
 		serverErr <- srv.ListenAndServe()
 	}()
+	redirect := a.RedirectServer(cfg)
+	if redirect != nil {
+		go func() {
+			log.Info("http redirect listening", "addr", cfg.HTTPRedirectAddr)
+			serverErr <- redirect.ListenAndServe()
+		}()
+	}
 	go func() {
 		log.Info("admin api listening", "addr", cfg.AdminAddr)
 		serverErr <- adminSrv.ListenAndServe()
@@ -113,6 +126,11 @@ func run(log *slog.Logger) error {
 	go func() { // Serve 内含投递循环与每日服务端证书轮换检查，随 ctx 结束
 		log.Info("agent gateway listening", "addr", cfg.AgentAddr, "hosts", cfg.AgentHosts)
 		gatewayErr <- a.Gateway.ListenAndServe(ctx, cfg.AgentAddr)
+	}()
+	accessDone := make(chan struct{})
+	go func() { // 路由表刷新、活动流撤销、上游连接丢弃、TLS 到期检查
+		defer close(accessDone)
+		a.RunAccessLoops(ctx)
 	}()
 	sshErr := make(chan error, 1)
 	go func() {
@@ -134,22 +152,31 @@ func run(log *slog.Logger) error {
 			runErr = err
 		}
 	}
-	stop() // 确保清扫器与网关退出
+	// 停机顺序：1) 停止 accept（ctx → SSH 网关 / Agent 网关；Shutdown → 各 HTTP 监听器）；2) SSH drain（最长 SPARK_SSH_DRAIN_TIMEOUT，
+	// 与 HTTP 关闭同时进行）；3) HTTP 与 ingress 关闭（先撤销 ingress 活动流，长连接不拖住 Shutdown）；4) 关上游连接池；5) 关数据库（defer）。
+	// 总耗时约 max(SSH drain 30s, HTTP 10s) + 几秒，compose / systemd 的停止超时应 ≥ 45s。
+	stop() // 确保清扫器、网关、访问层循环退出，SSH 网关停止 accept 并开始 drain
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	for _, s := range []*http.Server{srv, adminSrv} {
+	a.Ingress.Shutdown()
+	for _, s := range []*http.Server{srv, adminSrv, redirect} {
+		if s == nil {
+			continue
+		}
 		if err := s.Shutdown(shutdownCtx); err != nil && runErr == nil {
 			runErr = err
 		}
 	}
 	<-sweeperDone
-	// SSH 网关已随 ctx 停止 accept 并在 drain；Serve 总是返回 nil，等它 drain 完（会话记录已落库）再关闭数据库连接池（defer）
+	<-accessDone
+	// SSH 网关已随 ctx 停止 accept 并在 drain；Serve 总是返回 nil，等它 drain 完（会话记录已落库）再关闭连接池与数据库连接池（defer）
 	<-sshErr
 	if !gatewayExited { // 等网关的 Serve 随 ctx 返回（断开所有流、停止 gRPC）
 		if err := <-gatewayErr; err != nil && runErr == nil {
 			runErr = err
 		}
 	}
+	a.Upstream.Close() // HTTP / ingress 已关闭，不再有经它转发的请求
 	return runErr
 }
 

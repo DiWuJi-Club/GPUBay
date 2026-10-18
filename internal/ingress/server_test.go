@@ -123,7 +123,10 @@ type env struct {
 }
 
 // newEnvWith 用给定 Dialer 起一个 ingress（nil → fakeDialer）。
-func newEnvWith(t *testing.T, dialer ingress.Dialer) *env {
+func newEnvWith(t *testing.T, dialer ingress.Dialer) *env { return newEnvFull(t, dialer, nil) }
+
+// newEnvFull 同 newEnvWith；wrap 非 nil 时 http.Server 的 Handler 是 wrap(ingress.Server)（例如公网完整中间件栈）。
+func newEnvFull(t *testing.T, dialer ingress.Dialer, wrap func(*ingress.Server) http.Handler) *env {
 	t.Helper()
 	clk := clock.NewFake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	ts := httptest.NewUnstartedServer(nil)
@@ -145,6 +148,9 @@ func newEnvWith(t *testing.T, dialer ingress.Dialer) *env {
 	log := slog.New(slog.NewTextHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	e.srv = ingress.NewServer(auth, table, e.sess, dialer, e.alerts, clk, log)
 	ts.Config.Handler = e.srv
+	if wrap != nil {
+		ts.Config.Handler = wrap(e.srv)
+	}
 	ts.Start()
 	t.Cleanup(ts.Close)
 	return e

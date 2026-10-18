@@ -6,16 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wechatpay-apiv3/wechatpay-go/utils"
 	"golang.org/x/crypto/ssh"
 
+	"spark-cloud/internal/access/upstream"
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/adminapi"
 	"spark-cloud/internal/agentgw"
@@ -30,6 +34,7 @@ import (
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/platform/secretbox"
+	"spark-cloud/internal/platform/tlsfile"
 	"spark-cloud/internal/plugins/aliyun"
 	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/pay"
@@ -74,7 +79,11 @@ type App struct {
 	Gateway *agentgw.Server // Agent 网关（gRPC，mTLS）；由 cmd/platform 在 SPARK_AGENT_ADDR 上监听
 	CA      *pki.CA
 
-	IngressAuth *ingress.Auth // Web 入口鉴权（票据 / Cookie）；Task 18 组装 ingress.Server 时复用
+	IngressAuth *ingress.Auth   // Web 入口鉴权（票据 / Cookie）
+	Ingress     *ingress.Server // 租户 Web 端口反向代理；Handler 按 Host 把实例域名分给它
+	Routes      *ingress.Table  // 入口路由表（RunAccessLoops 定时刷新）
+	Upstream    *upstream.Pool  // 到容器 sshd 的共享连接池；cmd/platform 在 HTTP 关闭之后 Close
+	TLS         *tlsfile.Loader // 由 platform 终止 TLS 时非 nil
 
 	SSH            *sshgw.Server // SSH 网关；由 cmd/platform 在 SPARK_SSH_ADDR 上监听
 	SSHHostKey     ssh.Signer
@@ -230,8 +239,28 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Gateway: gw,
 		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit, PublicBaseURL: cfg.AdminPublicBaseURL,
 	}
-	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router(),
-		Gateway: gw, CA: ca, IngressAuth: ingressAuth, SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner}, nil
+	var loader *tlsfile.Loader
+	if cfg.TLSEnabled() {
+		loader = &tlsfile.Loader{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Now: clk.Now,
+			OnReloadError: func(err error) {
+				log.Error("tls certificate reload failed, keeping previous certificate", "err", err)
+				go alertOnce(f, log, "critical", "tls_cert_reload_failed", "TLS 证书文件重新加载失败（仍在使用旧证书），详情见日志") // 在 TLS 握手路径上：不等数据库
+			},
+			OnExpiring: func(na time.Time) {
+				log.Warn("tls certificate expiring", "not_after", na)
+				alertOnce(f, log, "warning", "tls_cert_expiring", "TLS 证书将在 14 天内到期")
+			}}
+		if err := loader.Load(); err != nil {
+			return nil, fmt.Errorf("加载 TLS 证书（SPARK_TLS_CERT_FILE=%s, SPARK_TLS_KEY_FILE=%s）: %w", cfg.TLSCertFile, cfg.TLSKeyFile, err)
+		}
+	}
+	upstreamPool := upstream.New(upstream.Config{Signer: upstreamSigner, Port: cfg.UpstreamSSHPort, Log: log}, r)
+	routes := ingress.NewTable(r, log)
+	ingSrv := ingress.NewServer(ingressAuth, routes, ids, upstreamPool, r, clk, log)
+	handler := ingress.Front(cfg.IngressDomain, cfg.TrustProxy, ingSrv, srv.Router())
+	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: handler,
+		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
+		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner}, nil
 }
 
 // upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。
@@ -344,6 +373,9 @@ func (a *App) Servers(cfg config.Config) (public, admin *http.Server) {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	if a.TLS != nil {
+		public.TLSConfig = a.TLS.TLSConfig()
+	}
 	admin = &http.Server{
 		Addr:              cfg.AdminAddr,
 		Handler:           a.AdminHandler,
@@ -353,4 +385,82 @@ func (a *App) Servers(cfg config.Config) (public, admin *http.Server) {
 		IdleTimeout:       120 * time.Second,
 	}
 	return public, admin
+}
+
+func alertOnce(f *fleet.Service, log *slog.Logger, level, kind, message string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.RaiseAlertOnce(ctx, f.Pool(), fleet.Alert{Level: level, Kind: kind, Message: message}); err != nil {
+		log.Error("raise alert", "kind", kind, "err", err)
+	}
+}
+
+// RedirectServer 返回把明文 HTTP 301 到 https 的服务器；未配置 SPARK_HTTP_REDIRECT_ADDR（或未启用 TLS）时为 nil。
+// Location 只由配置决定：控制台域名 → 对外地址（SPARK_PUBLIC_BASE_URL）的 host；合法实例域名 → 规范化的实例地址；
+// 其它 Host（IP、未知域名、其它父域）一律 404，绝不按请求里的 Host 拼出跳转目标。
+func (a *App) RedirectServer(cfg config.Config) *http.Server {
+	if cfg.HTTPRedirectAddr == "" || a.TLS == nil {
+		return nil
+	}
+	cfg = cfg.FillAccessDefaults()
+	base := a.IngressAuth.BaseURL // 已校验的对外地址（scheme + host[:port]）
+	consoleHosts := map[string]bool{strings.ToLower(base.Hostname()): true, strings.ToLower(cfg.Domain): true}
+	return &http.Server{
+		Addr: cfg.HTTPRedirectAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var target string
+			if id, port, ok := ingress.ParseHost(r.Host, cfg.IngressDomain); ok {
+				target = strings.TrimSuffix(a.IngressAuth.PortURL(id, port), "/")
+			} else {
+				host := strings.ToLower(r.Host)
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				if !consoleHosts[strings.TrimSuffix(host, ".")] {
+					http.NotFound(w, r)
+					return
+				}
+				target = "https://" + base.Host
+			}
+			http.Redirect(w, r, target+r.URL.RequestURI(), http.StatusMovedPermanently)
+		}),
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second,
+	}
+}
+
+// accessSweepInterval：活动流复核间隔。加上路由表 2 秒刷新，访问权限变化后最迟约 7 秒断开（≤ ingress.MaxRevokeInterval）。
+const accessSweepInterval = 5 * time.Second
+
+// RunAccessLoops：路由表每 2 秒刷新、活动流（WebSocket / SSE）按访问权限变化撤销、离开 running 的实例从上游连接池丢弃、
+// TLS 到期每日检查；ctx 结束后等所有子循环退出再返回。连接池不在这里关闭：停机时 HTTP / ingress 关闭之后由 cmd/platform 关。
+func (a *App) RunAccessLoops(ctx context.Context) {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	if a.TLS != nil {
+		wg.Go(func() { a.TLS.RunExpiryCheck(ctx, 24*time.Hour, 14*24*time.Hour) })
+	}
+	wg.Go(func() { a.Routes.Run(ctx, 2*time.Second) })
+	wg.Go(func() { a.Ingress.Run(ctx, accessSweepInterval) })
+	running := map[string]bool{}
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			now := map[string]bool{}
+			for _, r := range a.Routes.Routes() {
+				if r.State == rental.StateRunning && !r.Suspended {
+					now[r.InstanceID] = true
+				}
+			}
+			for id := range running {
+				if !now[id] {
+					a.Upstream.Drop(id)
+				}
+			}
+			running = now
+		}
+	}
 }

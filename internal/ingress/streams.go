@@ -70,10 +70,36 @@ func (w *trackingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return c, brw, nil
 }
 
-func (s *Server) addStream(st *stream) {
+// addStream 登记活动流；Shutdown 之后返回 false。
+func (s *Server) addStream(st *stream) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
 	s.streams[st] = struct{}{}
+	return true
+}
+
+func (s *Server) isClosing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closing
+}
+
+// Shutdown 撤销所有活动流（含被劫持的 WebSocket 连接，http.Server.Shutdown 不管它们），之后的转发请求返回 503。
+// 平台停机时与 http.Server.Shutdown 一起调用，SSE / 长轮询不会把 Shutdown 拖到超时。
+func (s *Server) Shutdown() {
+	s.mu.Lock()
+	s.closing = true
+	all := make([]*stream, 0, len(s.streams))
+	for st := range s.streams {
+		all = append(all, st)
+	}
 	s.mu.Unlock()
+	for _, st := range all {
+		s.revokeStream(st, "platform shutdown")
+	}
 }
 
 func (s *Server) removeStream(st *stream) {

@@ -64,6 +64,7 @@ type Server struct {
 	lastUnreach map[string]time.Time
 	dialedAt    map[string]string // 实例 → 最近一次转发所用的 lan_ip|主机公钥；变化时丢弃 Transport 空闲连接
 	streams     map[*stream]struct{}
+	closing     bool // Shutdown 之后不再接受新的转发
 
 	deadlineOnce sync.Once
 }
@@ -154,6 +155,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		st.authed, st.userID, st.sessHash = true, claims.UserID, claims.SessionHash
 	}
+	if s.isClosing() {
+		WritePage(w, http.StatusServiceUnavailable, "暂时无法访问", PageShuttingDown, 10)
+		return
+	}
 	s.noteTarget(route)
 	// 长请求 / SSE / WebSocket 不受 http.Server 的 Read/WriteTimeout 约束（只清本请求的期限，控制台路径不受影响）
 	rc := http.NewResponseController(w)
@@ -164,7 +169,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.WithValue(r.Context(), ctxKey{}, route))
 	defer cancel()
 	st.cancel = cancel
-	s.addStream(st)
+	if !s.addStream(st) { // 与 Shutdown 并发：没登记上就不转发
+		WritePage(w, http.StatusServiceUnavailable, "暂时无法访问", PageShuttingDown, 10)
+		return
+	}
 	defer s.removeStream(st)
 	s.proxy.ServeHTTP(&trackingWriter{ResponseWriter: w, st: st}, r.WithContext(ctx))
 }
