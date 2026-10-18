@@ -50,3 +50,23 @@ func TestFakeDisk(t *testing.T) {
 		t.Fatal("mount missing image must fail")
 	}
 }
+
+func TestFakeCreateRejectsOversizeAndMismatch(t *testing.T) {
+	d := fake.New(3 << 30)
+	ctx := context.Background()
+	if err := d.Create(ctx, "ins-a", 4); err == nil {
+		t.Fatal("oversize accepted")
+	}
+	if free, _ := d.FreeBytes(ctx); free != 3<<30 {
+		t.Fatalf("free changed: %d", free)
+	}
+	if err := d.Create(ctx, "ins-a", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Create(ctx, "ins-a", 3); err == nil {
+		t.Fatal("size mismatch accepted")
+	}
+	if err := d.Create(ctx, "ins-a", 2); err != nil {
+		t.Fatal(err)
+	}
+}

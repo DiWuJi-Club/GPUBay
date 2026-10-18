@@ -3,6 +3,7 @@ package fake
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -45,8 +46,14 @@ func (d *Disk) Create(_ context.Context, id string, sizeGiB int) error {
 		return err
 	}
 	if img, ok := d.images[id]; ok {
+		if img.sizeGiB != sizeGiB {
+			return fmt.Errorf("数据盘镜像大小 %d GiB 与期望 %d GiB 不符", img.sizeGiB, sizeGiB)
+		}
 		img.mounted = true
 		return nil
+	}
+	if need := uint64(sizeGiB) << 30; need > d.free {
+		return fmt.Errorf("磁盘空间不足：需要 %d，剩余 %d", need, d.free)
 	}
 	d.images[id] = &image{sizeGiB: sizeGiB, mounted: true}
 	d.free -= uint64(sizeGiB) << 30
