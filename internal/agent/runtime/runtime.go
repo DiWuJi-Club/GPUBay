@@ -32,6 +32,7 @@ type Runtime interface {
 	Stop(ctx context.Context, id string) error
 	Remove(ctx context.Context, id string) error
 	Inspect(ctx context.Context, id string) (Container, error)
+	// List 只填 Exists/Running/Image/Label；Pid、DataMounted 为零值，需要时用 Inspect。
 	List(ctx context.Context) ([]Container, error)
 	VethOf(ctx context.Context, id string) (string, error)
 }

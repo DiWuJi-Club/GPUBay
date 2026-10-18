@@ -3,6 +3,7 @@ package fake
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 
@@ -60,6 +61,9 @@ func (r *Runtime) Create(_ context.Context, s runtime.Spec) error {
 	defer r.mu.Unlock()
 	if err := r.fail("create"); err != nil {
 		return err
+	}
+	if _, ok := r.containers[s.InstanceID]; ok {
+		return fmt.Errorf("Conflict. The container name %q is already in use", s.InstanceID)
 	}
 	r.containers[s.InstanceID] = &entry{c: runtime.Container{Exists: true, Image: s.ImageRef, Label: s.InstanceID, DataMounted: s.DataDir != "", Pid: 4242}}
 	return nil

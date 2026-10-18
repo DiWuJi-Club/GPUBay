@@ -3,6 +3,7 @@ package docker_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"spark-cloud/internal/agent/cmdrun"
@@ -17,7 +18,7 @@ func newRT() (*docker.Runtime, *cmdrun.Recorder) {
 
 func TestEnsureNetworkCreatesOnce(t *testing.T) {
 	rt, r := newRT()
-	r.Stub("docker network inspect", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "No such network"})
+	r.Stub("docker network inspect", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "Error response from daemon: network spark0 not found"})
 	if err := rt.EnsureNetwork(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +80,7 @@ func TestStartStopRemovePull(t *testing.T) {
 func TestInspectListAndVeth(t *testing.T) {
 	rt, r := newRT()
 	ctx := context.Background()
-	r.Stub("docker inspect --type container --format {{json .}} ins-missing", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "Error: No such object: ins-missing"})
+	r.Stub("docker inspect --type container --format {{json .}} ins-missing", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "error: no such object: ins-missing"})
 	c, err := rt.Inspect(ctx, "ins-missing")
 	if err != nil || c.Exists {
 		t.Fatalf("missing = %+v %v", c, err)
@@ -114,5 +115,37 @@ func TestInspectListAndVeth(t *testing.T) {
 	}
 	if r.Lines() != "docker inspect --type container --format {{.State.Pid}} ins-a\nnsenter -t 4242 -n cat /sys/class/net/eth0/iflink\nip -o link show" {
 		t.Fatalf("calls:\n%s", r.Lines())
+	}
+}
+
+func TestNotFoundLegacyWording(t *testing.T) {
+	rt, r := newRT()
+	r.Stub("docker network inspect", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "No such network"})
+	if err := rt.EnsureNetwork(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(r.Lines(), "docker network create") {
+		t.Fatalf("calls:\n%s", r.Lines())
+	}
+}
+
+func TestCreateRejectsInvalidSpec(t *testing.T) {
+	good := runtime.Spec{InstanceID: "ins-a", ImageRef: "img", LanIP: "192.168.1.221", SSHPort: 2222, SSHDir: "/s", DataDir: "/d", MemoryBytes: 1, ShmBytes: 1}
+	muts := map[string]func(*runtime.Spec){
+		"lanip": func(s *runtime.Spec) { s.LanIP = "" }, "port": func(s *runtime.Spec) { s.SSHPort = 0 },
+		"image": func(s *runtime.Spec) { s.ImageRef = "" }, "sshdir": func(s *runtime.Spec) { s.SSHDir = "" },
+		"datadir": func(s *runtime.Spec) { s.DataDir = "" }, "mem": func(s *runtime.Spec) { s.MemoryBytes = 0 },
+		"shm": func(s *runtime.Spec) { s.ShmBytes = 0 }, "id": func(s *runtime.Spec) { s.InstanceID = "" },
+	}
+	for name, m := range muts {
+		rt, r := newRT()
+		s := good
+		m(&s)
+		if err := rt.Create(context.Background(), s); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+		if r.Lines() != "" {
+			t.Errorf("%s: docker executed: %s", name, r.Lines())
+		}
 	}
 }

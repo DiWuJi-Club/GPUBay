@@ -16,6 +16,9 @@ func TestFakeRuntimeLifecycle(t *testing.T) {
 	if err := rt.Create(ctx, spec); err != nil {
 		t.Fatal(err)
 	}
+	if err := rt.Create(ctx, spec); err == nil {
+		t.Fatal("duplicate create must conflict")
+	}
 	c, _ := rt.Inspect(ctx, "ins-a")
 	if !c.Exists || c.Running || c.Image != "img:1" || c.Label != "ins-a" || !c.DataMounted {
 		t.Fatalf("created = %+v", c)

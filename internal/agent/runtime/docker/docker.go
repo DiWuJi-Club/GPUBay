@@ -25,7 +25,8 @@ func isNotFound(err error) bool {
 		return false
 	}
 	s := strings.ToLower(ce.Stderr)
-	return strings.Contains(s, "no such container") || strings.Contains(s, "no such object") || strings.Contains(s, "no such network")
+	return strings.Contains(s, "no such container") || strings.Contains(s, "no such object") || strings.Contains(s, "no such network") ||
+		(strings.Contains(s, "network") && strings.Contains(s, "not found")) // docker 29: "network X not found"
 }
 
 func (r *Runtime) EnsureNetwork(ctx context.Context) error {
@@ -49,6 +50,9 @@ func (r *Runtime) Pull(ctx context.Context, ref string) error {
 
 // Create 只创建容器，不启动；容器规格见设计 §4.2。
 func (r *Runtime) Create(ctx context.Context, s runtime.Spec) error {
+	if err := validateSpec(s); err != nil {
+		return err
+	}
 	args := []string{"create", "--name", s.InstanceID, "--label", runtime.Label + "=" + s.InstanceID, "--gpus", "all",
 		"--shm-size", strconv.FormatInt(s.ShmBytes, 10), "--memory", strconv.FormatInt(s.MemoryBytes, 10), "--memory-swap", strconv.FormatInt(s.MemoryBytes, 10),
 		"--pids-limit", "32768", "--oom-score-adj", "500",
@@ -184,4 +188,23 @@ func (r *Runtime) VethOf(ctx context.Context, id string) (string, error) {
 		return name, nil
 	}
 	return "", fmt.Errorf("host interface %s for %s not found", idx, id)
+}
+
+// validateSpec 拒绝会让 docker 静默放宽限制的空值（空 LanIP 会绑定 0.0.0.0，--memory 0 表示不限）。
+func validateSpec(s runtime.Spec) error {
+	switch {
+	case s.InstanceID == "":
+		return errors.New("runtime: empty InstanceID")
+	case s.ImageRef == "":
+		return errors.New("runtime: empty ImageRef")
+	case s.LanIP == "":
+		return errors.New("runtime: empty LanIP")
+	case s.SSHPort <= 0:
+		return errors.New("runtime: invalid SSHPort")
+	case s.SSHDir == "" || s.DataDir == "":
+		return errors.New("runtime: empty SSHDir or DataDir")
+	case s.MemoryBytes <= 0 || s.ShmBytes <= 0:
+		return errors.New("runtime: MemoryBytes and ShmBytes must be positive")
+	}
+	return nil
 }
