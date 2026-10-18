@@ -29,9 +29,12 @@ type CmdError struct {
 	Cmd      string
 	ExitCode int
 	Stderr   string // 末尾最多 500 字节
+	cause    error  // 命令被 ctx 终止时的 ctx 错误（context.DeadlineExceeded / Canceled）
 }
 
 func (e *CmdError) Error() string { return fmt.Sprintf("%s: exit %d: %s", e.Cmd, e.ExitCode, e.Stderr) }
+
+func (e *CmdError) Unwrap() error { return e.cause }
 
 // tail 先把非法 UTF-8 替换成 U+FFFD，再取末尾最多 500 字节（切点落在 rune 边界上），保证结果是合法 UTF-8（proto3 string 要求）。
 func tail(b []byte) string {

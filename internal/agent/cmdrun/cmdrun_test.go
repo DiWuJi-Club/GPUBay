@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"spark-cloud/internal/agent/cmdrun"
@@ -85,6 +86,37 @@ func TestExecForcesCLocale(t *testing.T) {
 	out, err := cmdrun.Exec{}.Run(context.Background(), "sh", "-c", `echo "$LC_ALL $LANG"`)
 	if err != nil || strings.TrimSpace(string(out)) != "C C" {
 		t.Fatalf("locale = %q %v", out, err)
+	}
+}
+
+// 调用方 ctx 没有 deadline 时套兜底时限：卡死的命令被终止，错误信息说明是超时。
+func TestExecBackstopKillsHungCommand(t *testing.T) {
+	start := time.Now()
+	_, err := cmdrun.Exec{Backstop: 100 * time.Millisecond}.Run(context.Background(), "sleep", "5")
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("backstop not applied, took %v", time.Since(start))
+	}
+	var ce *cmdrun.CmdError
+	if !errors.As(err, &ce) || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "超时") || !strings.Contains(err.Error(), "100ms") {
+		t.Fatalf("err = %v", err)
+	}
+	if cmdrun.DefaultTimeout != 10*time.Minute {
+		t.Fatalf("DefaultTimeout = %v", cmdrun.DefaultTimeout)
+	}
+}
+
+// 调用方已给出 deadline 时不再套兜底（例如 pull 用 60 分钟上限）；调用方的 deadline 到期同样报超时。
+func TestExecBackstopSkippedWhenCallerHasDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := (cmdrun.Exec{Backstop: 50 * time.Millisecond}).Run(ctx, "sleep", "0.3"); err != nil {
+		t.Fatalf("caller deadline must override backstop: %v", err)
+	}
+	short, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel2()
+	_, err := cmdrun.Exec{}.Run(short, "sleep", "5")
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("caller deadline err = %v", err)
 	}
 }
 
