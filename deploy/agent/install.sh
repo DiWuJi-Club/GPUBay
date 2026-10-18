@@ -66,6 +66,7 @@ main() {
   cat > "$UNIT" <<'UNITEOF' || die "写入 unit 失败（令牌已使用，请在后台重新生成接入命令后再执行）"
 [Unit]
 Description=Spark Cloud node agent
+# network-online 在未启用 *-wait-online 的机器上不保证已有地址，恢复启动失败由 Agent 重试兜底
 After=docker.service network-online.target
 Wants=docker.service network-online.target
 
