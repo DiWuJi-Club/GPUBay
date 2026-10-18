@@ -2,6 +2,7 @@ package agentgw
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 
 	"spark-cloud/internal/agentpb"
@@ -42,4 +43,32 @@ func metricsJSON(m *agentpb.Metrics) (json.RawMessage, error) {
 		MemTotal: m.GetMemTotal(), MemUsed: m.GetMemUsed(), RootDiskTotal: m.GetRootDiskTotal(), RootDiskUsed: m.GetRootDiskUsed(),
 		DataDiskUsed: m.GetDataDiskUsed(), Load1: finite(m.GetLoad1())}
 	return json.Marshal(d)
+}
+
+func toProtoCommand(cmd fleet.Command, cfg Config) (*agentpb.Command, error) {
+	out := &agentpb.Command{Id: cmd.ID, InstanceId: cmd.InstanceID}
+	switch cmd.Type {
+	case fleet.CmdCreateInstance:
+		var p fleet.CreateInstancePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return nil, err
+		}
+		out.Body = &agentpb.Command_Create{Create: &agentpb.CreateInstance{ImageRef: p.ImageRef, UpstreamPubkey: cfg.UpstreamPubKey,
+			BandwidthMbps: uint32(cfg.BandwidthMbps), SshPort: 2222, DataSizeGib: uint32(cfg.DataSizeGiB)}}
+	case fleet.CmdStartInstance:
+		out.Body = &agentpb.Command_Start{Start: &agentpb.StartInstance{}}
+	case fleet.CmdStopInstance:
+		out.Body = &agentpb.Command_Stop{Stop: &agentpb.StopInstance{}}
+	case fleet.CmdWipeInstance:
+		out.Body = &agentpb.Command_Wipe{Wipe: &agentpb.WipeInstance{}}
+	case fleet.CmdPullImage:
+		var p fleet.PullImagePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return nil, err
+		}
+		out.Body = &agentpb.Command_Pull{Pull: &agentpb.PullImage{ImageRef: p.ImageRef}}
+	default:
+		return nil, fmt.Errorf("unknown command type %q", cmd.Type)
+	}
+	return out, nil
 }
