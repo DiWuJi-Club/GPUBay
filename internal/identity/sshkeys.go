@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,18 @@ import (
 
 // MaxSSHKeys 每个用户最多保存的公钥数。
 const MaxSSHKeys = 10
+
+// maxSSHKeyInput 公钥原始输入的最大字节数。
+const maxSSHKeyInput = 16 * 1024
+
+func stripControl(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s))
+}
 
 type SSHKey struct {
 	ID          int64      `json:"id"`
@@ -36,6 +49,9 @@ var allowedKeyTypes = map[string]bool{
 // ParseSSHPublicKey 解析一行 authorized_keys 格式的公钥：去首尾空白与 CRLF，拒绝多行；只接受 ed25519 / ecdsa / rsa（≥ 2048 位）；
 // 返回归一化的 "<type> <base64>"、SHA256 指纹与注释（可能为空）。
 func ParseSSHPublicKey(raw string) (normalized, fingerprint, comment string, err error) {
+	if len(raw) > maxSSHKeyInput {
+		return "", "", "", apperr.ErrSSHKeyInvalid
+	}
 	line := strings.TrimSpace(raw)
 	if line == "" || strings.ContainsAny(line, "\r\n") {
 		return "", "", "", apperr.ErrSSHKeyInvalid
@@ -50,7 +66,7 @@ func ParseSSHPublicKey(raw string) (normalized, fingerprint, comment string, err
 			return "", "", "", apperr.ErrSSHKeyInvalid
 		}
 		rk, ok := ck.CryptoPublicKey().(*rsa.PublicKey)
-		if !ok || rk.N.BitLen() < 2048 {
+		if !ok || rk.N.BitLen() < 2048 || rk.N.BitLen() > 8192 {
 			return "", "", "", apperr.ErrSSHKeyInvalid
 		}
 	}
@@ -74,19 +90,29 @@ func (s *Service) AddSSHKey(ctx context.Context, userID int64, name, raw, ip str
 	if err != nil {
 		return SSHKey{}, err
 	}
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = comment
-	}
+	name = stripControl(name)
 	if utf8.RuneCountInString(name) > 64 {
 		return SSHKey{}, apperr.BadRequest("名称不能超过 64 个字符")
+	}
+	if name == "" {
+		name = stripControl(comment)
+		if r := []rune(name); len(r) > 64 {
+			name = strings.TrimSpace(string(r[:64]))
+		}
 	}
 	now := s.d.Clock.Now()
 	var key SSHKey
 	err = db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 		// 锁用户行：并发添加不会越过上限
+		var one int
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&one); err != nil {
+			if db.IsNoRows(err) {
+				return apperr.ErrNotFound
+			}
+			return err
+		}
 		var n int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM ssh_keys WHERE user_id = (SELECT id FROM users WHERE id = $1 FOR UPDATE)`, userID).Scan(&n); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM ssh_keys WHERE user_id = $1`, userID).Scan(&n); err != nil {
 			return err
 		}
 		if n >= MaxSSHKeys {
