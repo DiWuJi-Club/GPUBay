@@ -74,6 +74,18 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_AGENT_ALLOW_CIDRS` / `SPARK_AGENT_DNS_SERVERS` | 容器可访问的内网白名单（Harbor、HF 镜像站等）与容器 DNS | 空 / 223.5.5.5,119.29.29.29 |
 | `SPARK_TRUST_PROXY` | 仅当 platform 部署在会改写 X-Forwarded-For 的反向代理之后才设为 true（只作用于用户 API；后台 API 始终以连接地址为准） | false |
 
+## 节点 Agent
+
+每台 DGX Spark（arm64，Ubuntu 24.04，Docker + NVIDIA CDI）跑一个 `spark-agent`，经 9443 端口（mTLS）连接平台。
+
+1. 构建：`make agent`（`make build` 也会构建），生成静态二进制 `bin/spark-agent-linux-arm64` 并打印 SHA-256。
+2. 把 `bin/spark-agent-linux-arm64` 与 `deploy/agent/install.sh` 放到内网文件服务器的同一目录；`SPARK_AGENT_DOWNLOAD_URL` 指向该目录，`SPARK_AGENT_BINARY_SHA256` 填 `make agent` 打印的值。
+3. 后台机器详情「生成接入命令」，在机器上以 root 执行。脚本依次：下载并校验二进制 -> 建 `/etc/spark-agent`、`/var/lib/spark-agent`（强制 0700，可重复执行）-> `enroll` -> `selfcheck`（失败则中止，不启用服务）-> 安装并启用 systemd 服务 `spark-agent`（`Restart=always`）。令牌不会被脚本打印；`ps` 里在 enroll 运行期间可见，一次性令牌用后即失效。
+4. 9443 端口只对机房内网开放。
+5. 镜像规范与参考 Dockerfile 见 `docs/image-spec.md`、`deploy/image/Dockerfile`。
+6. 本地无 Docker 时：`spark-agent run --fake --dir ./.devdata/agent --state-dir ./.devdata/agent/state`（`--fake` 仅用于开发，systemd unit 不使用）。
+7. 脚本测试：`sh deploy/agent/install_test.sh`（已并入 `make test`）。
+
 ## 部署注意
 
 - 启动时自动执行数据库迁移（多副本同时启动时由 PostgreSQL 会话级咨询锁串行化）。
