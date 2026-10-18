@@ -66,12 +66,20 @@ type fakeSessions struct {
 	users map[string]int64
 	calls int
 	fail  bool // 模拟数据库故障
+	hang  bool // 模拟数据库卡死
 }
 
-func (f *fakeSessions) SessionUserID(_ context.Context, hash string) (int64, error) {
+func (f *fakeSessions) SessionUserID(ctx context.Context, hash string) (int64, error) {
+	f.mu.Lock()
+	f.calls++
+	hang := f.hang
+	f.mu.Unlock()
+	if hang { // 模拟数据库卡死：直到 ctx 结束
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls++
 	if f.fail {
 		return 0, errors.New("db down")
 	}

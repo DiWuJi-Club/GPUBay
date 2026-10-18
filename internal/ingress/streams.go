@@ -89,7 +89,10 @@ func (s *Server) ActiveStreams() int {
 	return len(s.streams)
 }
 
-// Run 每 interval（应 ≤ MaxRevokeInterval）执行一次 Sweep，直到 ctx 结束。
+// maxSessionCheck：一轮扫描里会话复核的总时限上限（数据库卡住时不拖住下一轮）。
+const maxSessionCheck = 5 * time.Second
+
+// Run 每 interval（应 ≤ MaxRevokeInterval）执行一次扫描，直到 ctx 结束；会话复核时限 min(interval, 5s)。
 func (s *Server) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 || interval > MaxRevokeInterval {
 		interval = MaxRevokeInterval
@@ -101,13 +104,20 @@ func (s *Server) Run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-tk.C:
-			s.Sweep(ctx)
+			s.sweep(ctx, min(interval, maxSessionCheck))
 		}
 	}
 }
 
-// Sweep 按当前路由表复核所有活动流，撤销已无权访问的；并清理已不在路由表中的实例的节流 / 目标记录。
-func (s *Server) Sweep(ctx context.Context) {
+// Sweep 执行一轮扫描（会话复核时限 5 秒）。
+func (s *Server) Sweep(ctx context.Context) { s.sweep(ctx, maxSessionCheck) }
+
+// sweep 按当前路由表复核所有活动流，分两阶段：
+//  1. 只看路由表（不查库）：端口删除、停机 / 暂停、主人变化、端口改私有而流是匿名的 → 立即撤销；
+//  2. 已认证的流复核会话：按会话哈希去重，每个只查一次，总时限 sessTimeout；超时 / 出错视为暂时故障，不撤销。
+//
+// 并清理已不在路由表中的实例的节流 / 目标记录。
+func (s *Server) sweep(ctx context.Context, sessTimeout time.Duration) {
 	present := map[string]bool{}
 	for _, r := range s.routes.Routes() {
 		present[r.InstanceID] = true
@@ -135,15 +145,45 @@ func (s *Server) Sweep(ctx context.Context) {
 		// 实例重新出现时可能已换机：不留经旧上游建立的空闲通道
 		s.tr.CloseIdleConnections()
 	}
+	bySession := map[string][]*stream{}
 	for _, st := range list {
-		if reason := s.revokeReason(ctx, st); reason != "" {
-			s.log.Info("ingress stream revoked", "instance", st.instance, "port", st.port, "reason", reason)
-			st.revoke()
+		if reason := s.routeRevokeReason(st); reason != "" {
+			s.revokeStream(st, reason)
+		} else if st.authed && s.needsSessionCheck(st) {
+			bySession[st.sessHash] = append(bySession[st.sessHash], st)
+		}
+	}
+	if len(bySession) == 0 {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, sessTimeout)
+	defer cancel()
+	for hash, sts := range bySession {
+		uid, ok := s.sessionUser(cctx, hash)
+		if !ok { // 超时 / 出错：暂时故障，不撤销
+			continue
+		}
+		for _, st := range sts {
+			if uid != st.userID {
+				s.revokeStream(st, "session ended")
+			}
 		}
 	}
 }
 
-func (s *Server) revokeReason(ctx context.Context, st *stream) string {
+func (s *Server) revokeStream(st *stream, reason string) {
+	s.log.Info("ingress stream revoked", "instance", st.instance, "port", st.port, "reason", reason)
+	st.revoke()
+}
+
+// needsSessionCheck：路由当前是私有端口（公开端口不复核会话）。
+func (s *Server) needsSessionCheck(st *stream) bool {
+	r, ok := s.routes.Lookup(st.instance, st.port)
+	return ok && r.Visibility != "public"
+}
+
+// routeRevokeReason 只依据路由表判断（不查库）。
+func (s *Server) routeRevokeReason(st *stream) string {
 	r, ok := s.routes.Lookup(st.instance, st.port)
 	switch {
 	case !ok:
@@ -156,10 +196,6 @@ func (s *Server) revokeReason(ctx context.Context, st *stream) string {
 		return "port now private"
 	case r.UserID != st.userID:
 		return "owner changed"
-	}
-	uid, ok := s.sessionUser(ctx, st.sessHash)
-	if ok && uid != st.userID { // 查询出错不撤销
-		return "session ended"
 	}
 	return ""
 }

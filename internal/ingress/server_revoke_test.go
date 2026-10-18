@@ -265,3 +265,55 @@ func TestSSERevokedOnConsoleLogout(t *testing.T) {
 		t.Fatal("upstream request not cancelled")
 	}
 }
+
+// 会话查询卡死时，只依据路由表的撤销不受影响；卡住的查询超时后视为暂时故障，不误撤销；同一会话每轮只查一次。
+func TestSweepRouteRevocationNotBlockedBySessionLookup(t *testing.T) {
+	e := newEnv(t)
+	e.route("ins-a1b2c3d4", 7, 8888, "private", rental.StateRunning, http.HandlerFunc(wsEchoHandler))
+	e.route("ins-b2c3d4e5", 7, 80, "public", rental.StateRunning, http.HandlerFunc(wsEchoHandler))
+	ck := e.cookie("ins-a1b2c3d4", 8888, 7, "sess-7")
+	a1, ba1 := openWS(t, e, "ins-a1b2c3d4-8888.spark.test", ck)
+	a2, ba2 := openWS(t, e, "ins-a1b2c3d4-8888.spark.test", ck)
+	pub, bpub := openWS(t, e, "ins-b2c3d4e5-80.spark.test")
+
+	e.sess.mu.Lock()
+	e.sess.hang = true
+	before := e.sess.calls
+	e.sess.mu.Unlock()
+	e.clk.Advance(3 * time.Second) // 会话缓存过期，扫描必须查库（卡住）
+	e.setRoute("ins-b2c3d4e5", 80, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { e.srv.Sweep(ctx); close(done) }() // 会话复核时限 5 秒：本用例里一直卡着
+	expectClosed(t, pub, bpub, time.Second)
+	select {
+	case <-done:
+		t.Fatal("sweep finished although session lookup hangs")
+	default:
+	}
+	cancel()
+	<-done
+	e.sess.mu.Lock()
+	calls := e.sess.calls - before
+	e.sess.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("session lookups for one hash = %d", calls)
+	}
+	wsEcho(t, a1, ba1, "alive-1")
+	wsEcho(t, a2, ba2, "alive-2")
+
+	// Run：查询按 min(interval, 5s) 超时，几轮下来已认证的流仍在
+	runCtx, runCancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { e.srv.Run(runCtx, 100*time.Millisecond); close(runDone) }()
+	waitUntil(t, "several timed-out sweeps", func() bool {
+		e.sess.mu.Lock()
+		defer e.sess.mu.Unlock()
+		return e.sess.calls-before >= 4
+	})
+	runCancel()
+	<-runDone
+	wsEcho(t, a1, ba1, "alive-3")
+	wsEcho(t, a2, ba2, "alive-4")
+}

@@ -158,7 +158,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 长请求 / SSE / WebSocket 不受 http.Server 的 Read/WriteTimeout 约束（只清本请求的期限，控制台路径不受影响）
 	rc := http.NewResponseController(w)
 	if err := errors.Join(rc.SetReadDeadline(time.Time{}), rc.SetWriteDeadline(time.Time{})); err != nil {
-		s.deadlineOnce.Do(func() { s.log.Debug("ingress cannot clear request deadlines", "err", err) })
+		s.deadlineOnce.Do(func() { s.log.Warn("ingress cannot clear request deadlines", "err", err) })
 	}
 	// 登记为活动流：访问权限变化（端口改私有 / 删除、停机、登出）时由 Sweep 撤销
 	ctx, cancel := context.WithCancel(context.WithValue(r.Context(), ctxKey{}, route))
