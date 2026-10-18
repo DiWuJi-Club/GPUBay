@@ -91,7 +91,19 @@ func (s *Store) save() error {
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.path)
+	if err := os.Rename(tmp.Name(), s.path); err != nil {
+		return err
+	}
+	// 同步目录项，保证 rename 在掉电后也持久。
+	d, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func (s *Store) Result(id string) (Result, bool) {

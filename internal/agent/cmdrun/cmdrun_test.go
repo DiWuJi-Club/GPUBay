@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"spark-cloud/internal/agent/cmdrun"
 )
@@ -52,5 +53,28 @@ func TestRecorderStubsAndSnapshots(t *testing.T) {
 	r.Reset()
 	if len(r.Calls) != 0 {
 		t.Fatal("reset")
+	}
+}
+
+func TestStderrTailIsValidUTF8(t *testing.T) {
+	ctx := context.Background()
+	var ce *cmdrun.CmdError
+	// 600 字节的多字节字符，500 不是 3 的倍数，切点会落在 rune 中间
+	_, err := (cmdrun.Exec{}).Run(ctx, "sh", "-c", "printf '%s' \"a"+strings.Repeat("中", 200)+"\" >&2; exit 1")
+	if !errors.As(err, &ce) || !utf8.ValidString(ce.Stderr) || len(ce.Stderr) > 500 || !strings.HasSuffix(ce.Stderr, "中") || !utf8.ValidString(ce.Error()) {
+		t.Fatalf("multibyte tail = %d %q", len(ce.Stderr), ce.Stderr)
+	}
+	_, err = (cmdrun.Exec{}).Run(ctx, "sh", "-c", "printf '\\377\\376abc\\200' >&2; exit 1")
+	if !errors.As(err, &ce) || !utf8.ValidString(ce.Stderr) || !strings.Contains(ce.Stderr, "abc") {
+		t.Fatalf("invalid bytes = %q", ce.Stderr)
+	}
+	_, err = (cmdrun.Exec{}).Run(ctx, "sh", "-c", "i=0; while [ $i -lt 400 ]; do printf '\\377'; i=$((i+1)); done >&2; exit 1")
+	if !errors.As(err, &ce) || !utf8.ValidString(ce.Stderr) || len(ce.Stderr) > 500 {
+		t.Fatalf("invalid long = %d", len(ce.Stderr))
+	}
+	// 命令名含非法 UTF-8 的回退路径
+	_, err = (cmdrun.Exec{}).Run(ctx, "no-such-\xff-cmd")
+	if !errors.As(err, &ce) || !utf8.ValidString(ce.Stderr) {
+		t.Fatalf("fallback = %q", ce.Stderr)
 	}
 }

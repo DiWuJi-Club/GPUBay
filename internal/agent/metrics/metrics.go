@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"strings"
 
@@ -51,8 +52,8 @@ func (c *Collector) Collect(ctx context.Context, dataMount string) Metrics {
 
 func num(s string) float64 {
 	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil {
-		return 0 // "[N/A]" 等
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0 // "[N/A]"、NaN、Inf 等
 	}
 	return v
 }

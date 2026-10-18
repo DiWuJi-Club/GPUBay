@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 type Runner interface {
@@ -30,9 +31,15 @@ type CmdError struct {
 
 func (e *CmdError) Error() string { return fmt.Sprintf("%s: exit %d: %s", e.Cmd, e.ExitCode, e.Stderr) }
 
+// tail 先把非法 UTF-8 替换成 U+FFFD，再取末尾最多 500 字节（切点落在 rune 边界上），保证结果是合法 UTF-8（proto3 string 要求）。
 func tail(b []byte) string {
-	if len(b) > stderrTail {
-		b = b[len(b)-stderrTail:]
+	s := strings.ToValidUTF8(string(b), "\uFFFD")
+	if len(s) > stderrTail {
+		cut := len(s) - stderrTail
+		for cut < len(s) && !utf8.RuneStart(s[cut]) {
+			cut++
+		}
+		s = s[cut:]
 	}
-	return string(b)
+	return s
 }

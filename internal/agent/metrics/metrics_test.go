@@ -18,6 +18,10 @@ func TestParseNvidiaSMIHandlesNA(t *testing.T) {
 	if u != 0 || tc != 51 || p != 0 {
 		t.Fatalf("N/A = %v %v %v", u, tc, p)
 	}
+	u, tc, p = metrics.ParseNvidiaSMI("NaN, 41, Inf")
+	if u != 0 || tc != 41 || p != 0 {
+		t.Fatalf("NaN/Inf = %v %v %v", u, tc, p)
+	}
 	if u, tc, p = metrics.ParseNvidiaSMI(""); u != 0 || tc != 0 || p != 0 {
 		t.Fatal("empty")
 	}
