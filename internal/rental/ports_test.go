@@ -2,6 +2,7 @@ package rental_test
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"spark-cloud/internal/audit"
@@ -146,5 +147,76 @@ func TestIngressRoutesAndMigrateCopy(t *testing.T) {
 	}
 	if len(routes) != 2 || routes[0].InstanceID != moved.ID {
 		t.Fatalf("routes after migrate = %+v", routes)
+	}
+}
+
+func TestPortNoteControlChars(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	if _, err := e.svc.AddPort(e.ctx, e.userID, inst.ID, 8080, "private", "a\x00b", ""); err == nil {
+		t.Fatal("NUL in note accepted")
+	}
+	if _, err := e.svc.AddPort(e.ctx, e.userID, inst.ID, 8080, "private", "ok", ""); err != nil {
+		t.Fatal(err)
+	}
+	bad := "x\x07"
+	if _, err := e.svc.UpdatePort(e.ctx, e.userID, inst.ID, 8080, nil, &bad, ""); err == nil {
+		t.Fatal("control char in update accepted")
+	}
+}
+
+func TestPortOwnerAndState(t *testing.T) {
+	e := newEnv(t, 2)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	if _, err := e.svc.AddPort(e.ctx, e.userID, inst.ID, 8888, "private", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.UpdatePort(e.ctx, e.userID+1, inst.ID, 8888, str("public"), nil, ""); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("update other user = %v", err)
+	}
+	if err := e.svc.DeletePort(e.ctx, e.userID+1, inst.ID, 8888, ""); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("delete other user = %v", err)
+	}
+	if err := e.svc.Release(e.ctx, e.userID, inst.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.ack(true) // wipe -> released
+	if _, err := e.svc.AddPort(e.ctx, e.userID, inst.ID, 9000, "private", "", ""); !errors.Is(err, apperr.ErrInvalidState) {
+		t.Fatalf("add on released = %v", err)
+	}
+}
+
+func TestPortLimitConcurrent(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	for port := 8001; port <= 8004; port++ {
+		if _, err := e.svc.AddPort(e.ctx, e.userID, inst.ID, port, "private", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	errs := make([]error, 3)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = e.svc.AddPort(e.ctx, e.userID, inst.ID, 9001+i, "private", "", "")
+		}()
+	}
+	wg.Wait()
+	ok, limit := 0, 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, apperr.ErrPortLimit):
+			limit++
+		default:
+			t.Fatalf("unexpected err %v", err)
+		}
+	}
+	if list, _ := e.svc.ListPorts(e.ctx, inst.ID); ok != 1 || limit != 2 || len(list) != rental.MaxPortsPerInstance {
+		t.Fatalf("ok=%d limit=%d count=%d", ok, limit, len(list))
 	}
 }

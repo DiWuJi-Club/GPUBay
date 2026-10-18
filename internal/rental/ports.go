@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -44,6 +45,9 @@ func validVisibility(v string) bool { return v == "private" || v == "public" }
 func checkNote(note string) error {
 	if utf8.RuneCountInString(note) > 32 {
 		return apperr.BadRequest("备注不能超过 32 个字符")
+	}
+	if strings.IndexFunc(note, unicode.IsControl) >= 0 {
+		return apperr.BadRequest("备注不能包含控制字符")
 	}
 	return nil
 }
