@@ -5,6 +5,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,6 +30,17 @@ type Config struct {
 	Aliyun        AliyunConfig
 	Wechat        WechatConfig
 	Alipay        AlipayConfig
+
+	// 计划 2：Agent 网关
+	AgentAddr          string   // gRPC 监听地址，只对机房内网开放
+	AgentHosts         []string // 网关服务端证书 SAN（域名或 IP），第一项用于安装命令
+	AgentDownloadURL   string   // install.sh 与 agent 二进制所在目录 URL；为空时后台只显示 enroll 命令
+	AgentBinarySHA256  string   // agent 二进制 SHA-256，填进安装命令
+	UpstreamSSHKeyFile string   // 上游 ed25519 私钥（OpenSSH 格式，0600）
+	AgentDataSizeGiB   int
+	AgentAllowCIDRs    []string
+	AgentDNSServers    []string
+	AgentBandwidthMbps int
 }
 
 // AliyunConfig 阿里云短信与号码百科（三要素核验）共用一组 AccessKey。
@@ -148,6 +162,9 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 		c.SweepInterval = d
 	}
+	if err := c.loadAgent(getenv, or); err != nil {
+		return Config{}, err
+	}
 	if err := c.checkPlugins(); err != nil {
 		return Config{}, err
 	}
@@ -224,4 +241,114 @@ func requireAll(what string, pairs ...string) error {
 		return fmt.Errorf("%s 需要设置 %s", what, strings.Join(missing, "、"))
 	}
 	return nil
+}
+
+// loadAgent 读取并校验 Agent 网关相关配置。
+func (c *Config) loadAgent(getenv func(string) string, or func(key, def string) string) error {
+	var err error
+	c.AgentAddr = or("SPARK_AGENT_ADDR", ":9443")
+	if _, _, err := net.SplitHostPort(c.AgentAddr); err != nil {
+		return fmt.Errorf("SPARK_AGENT_ADDR 必须是 host:port 形式，当前为 %q", c.AgentAddr)
+	}
+	hosts := getenv("SPARK_AGENT_HOSTS")
+	if hosts == "" && c.Env != "prod" {
+		hosts = "localhost,127.0.0.1"
+	}
+	c.AgentHosts = splitList(hosts)
+	for _, h := range c.AgentHosts {
+		if !validHost(h) {
+			return fmt.Errorf("SPARK_AGENT_HOSTS 含无效的域名或 IP %q（不要带端口、协议或空格）", h)
+		}
+	}
+	c.AgentDownloadURL = strings.TrimRight(getenv("SPARK_AGENT_DOWNLOAD_URL"), "/")
+	c.AgentBinarySHA256 = strings.TrimSpace(getenv("SPARK_AGENT_BINARY_SHA256"))
+	c.UpstreamSSHKeyFile = getenv("SPARK_UPSTREAM_SSH_KEY_FILE")
+	if c.AgentDataSizeGiB, err = positiveInt("SPARK_AGENT_DATA_SIZE_GIB", or("SPARK_AGENT_DATA_SIZE_GIB", "2048")); err != nil {
+		return err
+	}
+	if c.AgentBandwidthMbps, err = positiveInt("SPARK_AGENT_BANDWIDTH_MBPS", or("SPARK_AGENT_BANDWIDTH_MBPS", "200")); err != nil {
+		return err
+	}
+	c.AgentAllowCIDRs = splitList(getenv("SPARK_AGENT_ALLOW_CIDRS"))
+	for _, cidr := range c.AgentAllowCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("SPARK_AGENT_ALLOW_CIDRS 含无效网段 %q", cidr)
+		}
+	}
+	c.AgentDNSServers = splitList(or("SPARK_AGENT_DNS_SERVERS", "223.5.5.5,119.29.29.29"))
+	for _, ip := range c.AgentDNSServers {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			return fmt.Errorf("SPARK_AGENT_DNS_SERVERS 含无效地址 %q", ip)
+		}
+		// 容器的 DNS 查询由 dockerd 在宿主机网络命名空间代发、不经过 SPARK-FWD：私网 DNS 必须显式在白名单里
+		if parsed.IsPrivate() && !inAnyCIDR(parsed, c.AgentAllowCIDRs) {
+			return fmt.Errorf("SPARK_AGENT_DNS_SERVERS 的 %s 是私网地址，必须包含在 SPARK_AGENT_ALLOW_CIDRS 内", ip)
+		}
+	}
+	if c.Env == "prod" {
+		if len(c.AgentHosts) == 0 {
+			return errors.New("生产环境必须设置 SPARK_AGENT_HOSTS（网关证书的域名或 IP）")
+		}
+		if c.UpstreamSSHKeyFile == "" {
+			return errors.New("生产环境必须设置 SPARK_UPSTREAM_SSH_KEY_FILE（用 platform admin gen-upstream-key 生成）")
+		}
+	}
+	return nil
+}
+
+var hostLabel = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
+
+// validHost 判断 s 是 IP 或合法主机名（不含端口、协议、空白）。
+func validHost(s string) bool {
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	if len(s) > 253 {
+		return false
+	}
+	for _, l := range strings.Split(s, ".") {
+		if len(l) > 63 || !hostLabel.MatchString(l) {
+			return false
+		}
+	}
+	return true
+}
+
+// splitList 按逗号切分、去空白、去空项。
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func inAnyCIDR(ip net.IP, cidrs []string) bool {
+	for _, c := range cidrs {
+		if _, n, err := net.ParseCIDR(c); err == nil && n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func positiveInt(name, v string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s 必须是正整数，当前为 %q", name, v)
+	}
+	return n, nil
+}
+
+// AgentAdvertiseAddr 是写进安装命令的平台地址：第一个主机名 + 网关端口。
+func (c Config) AgentAdvertiseAddr() string {
+	_, port, _ := net.SplitHostPort(c.AgentAddr)
+	host := "localhost"
+	if len(c.AgentHosts) > 0 {
+		host = c.AgentHosts[0]
+	}
+	return net.JoinHostPort(host, port)
 }

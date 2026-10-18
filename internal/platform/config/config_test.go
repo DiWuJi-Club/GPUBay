@@ -84,6 +84,7 @@ func prodEnv() map[string]string {
 		"SPARK_WECHAT_PUBLIC_KEY_ID": "PUB_KEY_ID_1", "SPARK_WECHAT_PUBLIC_KEY_PATH": "/etc/spark/wxpub.pem",
 		"SPARK_ALIPAY_APP_ID": "2021000000000001", "SPARK_ALIPAY_PRIVATE_KEY_PATH": "/etc/spark/ali.pem",
 		"SPARK_ALIPAY_PUBLIC_KEY_PATH": "/etc/spark/alipub.pem", "SPARK_ALIPAY_SANDBOX": "false",
+		"SPARK_AGENT_HOSTS": "agent.example", "SPARK_UPSTREAM_SSH_KEY_FILE": "/etc/spark/up.key",
 	}
 }
 
@@ -148,5 +149,76 @@ func TestLoadPayRealWithOnlyAlipay(t *testing.T) {
 	}
 	if c.Wechat.Enabled() || !c.Alipay.Enabled() {
 		t.Fatalf("wechat=%v alipay=%v", c.Wechat.Enabled(), c.Alipay.Enabled())
+	}
+}
+
+func TestLoadAgentDefaults(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AgentAddr != ":9443" || strings.Join(c.AgentHosts, ",") != "localhost,127.0.0.1" || c.AgentDataSizeGiB != 2048 ||
+		c.AgentBandwidthMbps != 200 || strings.Join(c.AgentDNSServers, ",") != "223.5.5.5,119.29.29.29" || len(c.AgentAllowCIDRs) != 0 {
+		t.Fatalf("agent defaults = %+v", c)
+	}
+	if c.AgentAdvertiseAddr() != "localhost:9443" {
+		t.Fatalf("advertise = %s", c.AgentAdvertiseAddr())
+	}
+}
+
+func TestLoadAgentValues(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey,
+		"SPARK_AGENT_ADDR": "10.0.0.5:19443", "SPARK_AGENT_HOSTS": " agent.example , 10.0.0.5,, ", "SPARK_AGENT_ALLOW_CIDRS": "10.0.9.0/24, 192.168.1.10/32",
+		"SPARK_AGENT_DNS_SERVERS": "1.1.1.1", "SPARK_AGENT_DATA_SIZE_GIB": "512", "SPARK_AGENT_BANDWIDTH_MBPS": "50",
+		"SPARK_AGENT_DOWNLOAD_URL": "http://files.local/agent", "SPARK_AGENT_BINARY_SHA256": "abc", "SPARK_UPSTREAM_SSH_KEY_FILE": "/etc/spark/up.key"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(c.AgentHosts, ",") != "agent.example,10.0.0.5" || c.AgentAdvertiseAddr() != "agent.example:19443" ||
+		strings.Join(c.AgentAllowCIDRs, ",") != "10.0.9.0/24,192.168.1.10/32" || c.AgentDNSServers[0] != "1.1.1.1" ||
+		c.AgentDataSizeGiB != 512 || c.AgentBandwidthMbps != 50 || c.AgentDownloadURL != "http://files.local/agent" || c.UpstreamSSHKeyFile != "/etc/spark/up.key" {
+		t.Fatalf("agent config = %+v", c)
+	}
+}
+
+func TestLoadAgentErrors(t *testing.T) {
+	with := func(k, v string) map[string]string {
+		m := prodEnv()
+		m[k] = v
+		return m
+	}
+	if _, err := config.Load(env(prodEnv())); err != nil {
+		t.Fatalf("valid prod: %v", err)
+	}
+	cases := []struct{ name, key, value, want string }{
+		{"prod hosts", "SPARK_AGENT_HOSTS", "", "SPARK_AGENT_HOSTS"},
+		{"prod hosts only separators", "SPARK_AGENT_HOSTS", " , ,", "SPARK_AGENT_HOSTS"},
+		{"host with port", "SPARK_AGENT_HOSTS", "agent.example:9443", "SPARK_AGENT_HOSTS"},
+		{"host with scheme", "SPARK_AGENT_HOSTS", "https://agent.example", "SPARK_AGENT_HOSTS"},
+		{"host with space", "SPARK_AGENT_HOSTS", "agent example", "SPARK_AGENT_HOSTS"},
+		{"host with underscore", "SPARK_AGENT_HOSTS", "bad_host.example", "SPARK_AGENT_HOSTS"},
+		{"prod upstream", "SPARK_UPSTREAM_SSH_KEY_FILE", "", "SPARK_UPSTREAM_SSH_KEY_FILE"},
+		{"bad cidr", "SPARK_AGENT_ALLOW_CIDRS", "10.0.0.0", "SPARK_AGENT_ALLOW_CIDRS"},
+		{"bad dns", "SPARK_AGENT_DNS_SERVERS", "dns.example", "SPARK_AGENT_DNS_SERVERS"},
+		{"private dns outside allow list", "SPARK_AGENT_DNS_SERVERS", "10.0.0.53", "SPARK_AGENT_DNS_SERVERS"},
+		{"bad size", "SPARK_AGENT_DATA_SIZE_GIB", "0", "SPARK_AGENT_DATA_SIZE_GIB"},
+		{"bad bw", "SPARK_AGENT_BANDWIDTH_MBPS", "x", "SPARK_AGENT_BANDWIDTH_MBPS"},
+		{"bad addr", "SPARK_AGENT_ADDR", "9443", "SPARK_AGENT_ADDR"},
+	}
+	for _, c := range cases {
+		_, err := config.Load(env(with(c.key, c.value)))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: err = %v, want mention of %s", c.name, err, c.want)
+		}
+	}
+	// 非生产环境同样校验条目格式
+	if _, err := config.Load(env(map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey, "SPARK_AGENT_HOSTS": "a b"})); err == nil {
+		t.Fatal("dev accepted malformed host")
+	}
+	// 私网 DNS 落在白名单内则允许（规格 §4.2：DNS 须在白名单内或为公网地址）
+	m := prodEnv()
+	m["SPARK_AGENT_DNS_SERVERS"], m["SPARK_AGENT_ALLOW_CIDRS"] = "10.0.0.53", "10.0.0.0/24"
+	if _, err := config.Load(env(m)); err != nil {
+		t.Fatalf("private dns inside allow list: %v", err)
 	}
 }

@@ -38,6 +38,9 @@ func main() {
 
 // adminMain 执行 `platform admin ...`：使用与服务相同的配置连接数据库（会先执行迁移）。
 func adminMain(args []string) error {
+	if len(args) > 0 && args[0] == "gen-upstream-key" { // 不需要数据库
+		return runAdmin(context.Background(), nil, args, os.Stdout, nil)
+	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		return err
