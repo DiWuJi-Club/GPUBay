@@ -58,6 +58,10 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 		if err := openLease(ctx, tx, moved, now); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, `INSERT INTO instance_ports (instance_id, port, visibility, forced_private, note, created_at, updated_at)
+			SELECT $2, port, visibility, forced_private, note, $3, $3 FROM instance_ports WHERE instance_id = $1 ORDER BY port`, old.ID, id, now); err != nil {
+			return err
+		}
 		if err := recordEvent(ctx, tx, id, "", StateCreating, "migrated from "+old.ID+": "+reason, now); err != nil {
 			return err
 		}
