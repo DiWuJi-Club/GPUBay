@@ -36,20 +36,21 @@ const (
 )
 
 type Server struct {
-	Admins       *admin.Service
-	Identity     *identity.Service
-	Wallet       *wallet.Service
-	Catalog      *catalog.Service
-	Fleet        *fleet.Service
-	Rental       *rental.Service
-	Billing      *billing.Service
-	Uploads      *storage.Service
-	Gateway      *agentgw.Server // 机器接入命令与撤销（计划 2）
-	Clock        clock.Clock
-	Log          *slog.Logger
-	SecureCookie bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送
-	Static       http.Handler // 后台静态文件；nil 时使用 web.Admin()
-	LoginLimit   int          // 同一 IP 每分钟登录相关请求上限；零值表示默认 20。只有端到端测试服务会调大它
+	Admins        *admin.Service
+	Identity      *identity.Service
+	Wallet        *wallet.Service
+	Catalog       *catalog.Service
+	Fleet         *fleet.Service
+	Rental        *rental.Service
+	Billing       *billing.Service
+	Uploads       *storage.Service
+	Gateway       *agentgw.Server // 机器接入命令与撤销（计划 2）
+	Clock         clock.Clock
+	Log           *slog.Logger
+	SecureCookie  bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送
+	Static        http.Handler // 后台静态文件；nil 时使用 web.Admin()
+	LoginLimit    int          // 同一 IP 每分钟登录相关请求上限；零值表示默认 20。只有端到端测试服务会调大它
+	PublicBaseURL string       // 后台对外地址（SPARK_ADMIN_PUBLIC_BASE_URL），用于同站防护的 Origin 比对；空表示有 Origin 就拒绝
 
 	limiter *ipLimiter
 	routes  []Route
@@ -80,7 +81,7 @@ func (s *Server) Router() http.Handler {
 	r.Use(middleware.RequestID)
 	// 后台只在内网监听，不使用 RealIP：任何内网客户端都能伪造 X-Forwarded-For，
 	// 会绕过按 IP 的登录限流并伪造审计日志里的 IP。始终以连接的 RemoteAddr 为准。
-	r.Use(httpx.Recoverer(s.Log), s.requireJSONForWrites)
+	r.Use(httpx.Recoverer(s.Log), s.requireJSONForWrites, httpx.SameSiteGuard(s.PublicBaseURL, nil, s.Log))
 	jsonNotFound := func(w http.ResponseWriter, req *http.Request) { s.writeError(w, req, apperr.ErrNotFound) }
 	r.NotFound(jsonNotFound)
 	r.Route(prefix, func(r chi.Router) {

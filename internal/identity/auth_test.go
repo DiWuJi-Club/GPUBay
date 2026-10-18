@@ -331,3 +331,31 @@ func TestSendCodeIPHourLimitConfigurable(t *testing.T) {
 		t.Fatalf("31st send = %v, want rate_limited", err)
 	}
 }
+
+func TestSessionHashAndUserID(t *testing.T) {
+	e := newEnv(t, "000000")
+	ctx := context.Background()
+	if err := e.svc.SendLoginCode(ctx, "13800001234", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	token, u, err := e.svc.Login(ctx, "13800001234", "000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := identity.SessionHash(token)
+	if len(h) != 64 || h == token {
+		t.Fatalf("hash = %q", h)
+	}
+	if id, err := e.svc.SessionUserID(ctx, h); err != nil || id != u.ID {
+		t.Fatalf("session user = %d %v", id, err)
+	}
+	if _, err := e.svc.SessionUserID(ctx, identity.SessionHash("other")); !errors.Is(err, apperr.ErrUnauthorized) {
+		t.Fatalf("unknown = %v", err)
+	}
+	if err := e.svc.Logout(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.SessionUserID(ctx, h); !errors.Is(err, apperr.ErrUnauthorized) {
+		t.Fatalf("after logout = %v", err)
+	}
+}

@@ -161,3 +161,24 @@ func (s *Service) Logout(ctx context.Context, token string) error {
 	_, err := s.d.Pool.Exec(ctx, `DELETE FROM sessions WHERE token_hash = $1`, hashSecret(token))
 	return err
 }
+
+// SessionHash 返回会话 token 的存储哈希（与 sessions.token_hash 一致），供 Web 入口把 Cookie 绑定到控制台会话。
+func SessionHash(token string) string { return hashSecret(token) }
+
+// SessionUserID 按哈希校验会话仍有效并返回用户 ID；不存在 / 过期 → ErrUnauthorized，用户封禁 → ErrBanned。
+func (s *Service) SessionUserID(ctx context.Context, hash string) (int64, error) {
+	var userID int64
+	var status string
+	err := s.d.Pool.QueryRow(ctx, `SELECT u.id, u.status FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token_hash = $1 AND s.expires_at > $2`, hash, s.d.Clock.Now()).Scan(&userID, &status)
+	if db.IsNoRows(err) {
+		return 0, apperr.ErrUnauthorized
+	}
+	if err != nil {
+		return 0, err
+	}
+	if status == "banned" {
+		return 0, apperr.ErrBanned
+	}
+	return userID, nil
+}

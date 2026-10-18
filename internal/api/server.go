@@ -24,23 +24,32 @@ import (
 )
 
 type Server struct {
-	Identity     *identity.Service
-	Wallet       *wallet.Service
-	Catalog      *catalog.Service
-	Fleet        *fleet.Service
-	Rental       *rental.Service
-	Uploads      *storage.Service
-	Billing      *billing.Service
-	DevPay       bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
-	Clock        clock.Clock
-	Log          *slog.Logger
-	Domain       string       // 用于生成 SSH 命令，例如 spark.example.com
-	SecureCookie bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送
-	TrustProxy   bool         // 仅当部署在会改写转发头的反向代理之后才设为 true
-	Static       http.Handler // 控制台静态文件；nil 时使用 web.Console()
+	Identity      *identity.Service
+	Wallet        *wallet.Service
+	Catalog       *catalog.Service
+	Fleet         *fleet.Service
+	Rental        *rental.Service
+	Uploads       *storage.Service
+	Billing       *billing.Service
+	DevPay        bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
+	Clock         clock.Clock
+	Log           *slog.Logger
+	Domain        string       // 用于生成 SSH 命令，例如 spark.example.com
+	SecureCookie  bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送
+	TrustProxy    bool         // 仅当部署在会改写转发头的反向代理之后才设为 true
+	Static        http.Handler // 控制台静态文件；nil 时使用 web.Console()
+	PublicBaseURL string       // 对外地址，用于同站防护的 Origin 比对
 }
 
 const sessionCookie = "sc_session"
+
+// cookieName：staging / prod 用 __Host- 前缀（浏览器拒绝子域用 Domain 属性覆写），dev 走 http 无法用前缀。
+func (s *Server) cookieName() string {
+	if s.SecureCookie {
+		return "__Host-" + sessionCookie
+	}
+	return sessionCookie
+}
 
 type userCtxKey struct{}
 
@@ -50,7 +59,8 @@ func (s *Server) Router() http.Handler {
 	if s.TrustProxy {
 		r.Use(middleware.RealIP)
 	}
-	r.Use(httpx.Recoverer(s.Log), s.requireJSONForWrites)
+	r.Use(httpx.Recoverer(s.Log), s.requireJSONForWrites,
+		httpx.SameSiteGuard(s.PublicBaseURL, func(req *http.Request) bool { return strings.HasPrefix(req.URL.Path, notifyPathPrefix) }, s.Log))
 	static := s.Static
 	if static == nil {
 		static = web.Console()
@@ -99,7 +109,7 @@ func (s *Server) Router() http.Handler {
 }
 
 // requireJSONForWrites 要求写请求使用 application/json（上传接口要求 multipart/form-data）。
-// 浏览器跨站表单无法伪造 JSON 类型，兼作 CSRF 防护；上传接口依赖 SameSite=Lax 会话 Cookie 防跨站提交。
+// 浏览器跨站表单无法伪造 JSON 类型，兼作 CSRF 防护；同站（兄弟子域）与跨站的写请求由 SameSiteGuard 拦截（SameSite Cookie 对兄弟子域无效）。
 func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
@@ -125,7 +135,7 @@ func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 func (s *Server) requireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := ""
-		if c, err := r.Cookie(sessionCookie); err == nil {
+		if c, err := r.Cookie(s.cookieName()); err == nil {
 			token = c.Value
 		}
 		u, err := s.Identity.Authenticate(r.Context(), token)

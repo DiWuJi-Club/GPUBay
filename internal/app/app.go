@@ -171,7 +171,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	})
 	srv := &api.Server{
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
-		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy,
+		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, PublicBaseURL: cfg.PublicBaseURL,
 	}
 	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
 	if err != nil {
@@ -216,7 +216,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
 	adminSrv := &adminapi.Server{
 		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Gateway: gw,
-		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit,
+		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit, PublicBaseURL: cfg.AdminPublicBaseURL,
 	}
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router(),
 		Gateway: gw, CA: ca, SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner}, nil

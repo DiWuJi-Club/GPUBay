@@ -238,3 +238,29 @@ func TestAdminRouterServesSPAAndJSON404(t *testing.T) {
 		t.Fatalf("anonymous dashboard = %d cache=%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
 	}
 }
+
+func TestAdminSameSiteGuard(t *testing.T) {
+	e := newEnvWith(t, func(s *adminapi.Server) { s.PublicBaseURL = "https://admin.spark.test" })
+	req, _ := http.NewRequest("POST", e.ts.URL+"/admin/api/v1/auth/login", strings.NewReader(`{"username":"x","password":"y"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 403 {
+		t.Fatalf("same-site admin login = %d", resp.StatusCode)
+	}
+	req2, _ := http.NewRequest("POST", e.ts.URL+"/admin/api/v1/auth/login", strings.NewReader(`{"username":"x","password":"y"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Origin", "https://admin.spark.test")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == 403 {
+		t.Fatal("matching origin rejected")
+	}
+}

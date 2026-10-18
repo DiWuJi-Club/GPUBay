@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -74,7 +75,7 @@ func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 		NotifyBaseURL: "https://spark.test",
 	})
 	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test",
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test", PublicBaseURL: "http://spark.test",
 		Billing: bill, DevPay: true}
 	if tweak != nil {
 		tweak(srv)
@@ -402,4 +403,75 @@ func TestRouterServesConsoleAndJSON404(t *testing.T) {
 	if resp := get("/api/v1/wallet"); resp.StatusCode != 401 || resp.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("anonymous wallet = %d cache=%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
 	}
+}
+
+func TestSessionCookieNameAndSameSiteGuard(t *testing.T) {
+	e := newTestEnvWith(t, func(s *api.Server) { s.SecureCookie = true })
+	raw := &http.Client{}
+	post := func(path, body string, headers map[string]string) *http.Response {
+		req, _ := http.NewRequest("POST", e.ts.URL+"/api/v1"+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := raw.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+	post("/auth/sms-code", `{"phone":"13800009999"}`, nil)
+	resp := post("/auth/login", `{"phone":"13800009999","code":"000000"}`, nil)
+	var cookie *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "__Host-sc_session" {
+			cookie = c
+		}
+	}
+	if cookie == nil || !cookie.Secure || cookie.Path != "/" || cookie.Domain != "" || !cookie.HttpOnly {
+		t.Fatalf("cookie = %+v", resp.Cookies())
+	}
+	req, _ := http.NewRequest("GET", e.ts.URL+"/api/v1/me", nil)
+	req.AddCookie(cookie)
+	r, err := raw.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != 200 {
+		t.Fatalf("me with __Host- cookie = %d", r.StatusCode)
+	}
+	// 同站（兄弟子域）写请求被拒；same-origin 放行；无头放行
+	if r := post("/auth/logout", `{}`, map[string]string{"Sec-Fetch-Site": "same-site", "Cookie": cookie.String()}); r.StatusCode != 403 {
+		t.Fatalf("same-site logout = %d", r.StatusCode)
+	}
+	if r := post("/auth/logout", `{}`, map[string]string{"Sec-Fetch-Site": "same-origin", "Cookie": cookie.String()}); r.StatusCode != 200 {
+		t.Fatalf("same-origin logout = %d", r.StatusCode)
+	}
+	// 支付回调不受同站限制（这里渠道会因验签失败返回非 403）
+	if r := post("/pay/notify/wechat", `{}`, map[string]string{"Sec-Fetch-Site": "cross-site"}); r.StatusCode == 403 {
+		t.Fatal("payment notify blocked by same-site guard")
+	}
+	if r := post("/pay/notify/alipay", `{}`, map[string]string{"Origin": "https://openapi.alipay.com"}); r.StatusCode == 403 {
+		t.Fatal("payment notify with foreign Origin blocked by same-site guard")
+	}
+	// dev（SecureCookie=false）仍叫 sc_session
+	dev := newTestEnv(t)
+	c := dev.client()
+	c.login("13800009998")
+	for _, ck := range c.http.Jar.Cookies(mustURL(dev.ts.URL)) {
+		if ck.Name == "sc_session" {
+			return
+		}
+	}
+	t.Fatal("dev cookie not named sc_session")
+}
+
+func mustURL(s string) *url.URL {
+	u, err := url.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
 }
