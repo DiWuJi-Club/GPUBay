@@ -79,7 +79,6 @@ func stateBanner(info rental.AccessInfo) string {
 }
 
 func (s *Server) banner(c ssh.ConnMetadata) string {
-	s.noteUser(c)
 	info, ok := s.lookup(c.User())
 	if !ok {
 		return BannerUnknown + "\r\n"
@@ -97,8 +96,8 @@ func perms(info rental.AccessInfo, method string, keyID int64) *ssh.Permissions 
 }
 
 func (s *Server) passwordCallback(c ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
-	s.noteUser(c)
 	info, ok := s.lookup(c.User())
+	s.noteAttempt(c, ok)
 	if !ok || !allowed(info) || !info.Instance.PasswordAuth {
 		return nil, errAuth
 	}
@@ -111,8 +110,8 @@ func (s *Server) passwordCallback(c ssh.ConnMetadata, pw []byte) (*ssh.Permissio
 }
 
 func (s *Server) publicKeyCallback(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-	s.noteUser(c)
 	info, ok := s.lookup(c.User())
+	s.noteAttempt(c, ok)
 	if !ok || !allowed(info) {
 		return nil, errAuth
 	}

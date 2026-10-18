@@ -22,17 +22,21 @@ func upstreamChannelAllowed(t string) bool {
 	return t == "forwarded-tcpip" || t == "auth-agent@openssh.com"
 }
 
-var globalAllowed = map[string]bool{"tcpip-forward": true, "cancel-tcpip-forward": true, "keepalive@openssh.com": true, "no-more-sessions@openssh.com": true}
+// 全局请求按方向分别放行：tcpip-forward 等只能由用户发往容器；容器发来的只放行保活。
+var (
+	clientGlobalAllowed   = map[string]bool{"tcpip-forward": true, "cancel-tcpip-forward": true, "keepalive@openssh.com": true, "no-more-sessions@openssh.com": true}
+	upstreamGlobalAllowed = map[string]bool{"keepalive@openssh.com": true}
+)
 
 // relay 双向转发直到任一侧连接结束。
 func (s *Server) relay(sess *session, down *ssh.ServerConn, downChans <-chan ssh.NewChannel, downReqs <-chan *ssh.Request,
 	up ssh.Conn, upChans <-chan ssh.NewChannel, upReqs <-chan *ssh.Request) {
 	var wg sync.WaitGroup
 	wg.Add(4)
-	go func() { defer wg.Done(); forwardGlobal(downReqs, up, nil) }()
+	go func() { defer wg.Done(); forwardGlobal(downReqs, up, clientGlobalAllowed, nil) }()
 	go func() {
 		defer wg.Done()
-		forwardGlobal(upReqs, down, func(name string) {
+		forwardGlobal(upReqs, down, upstreamGlobalAllowed, func(name string) {
 			if name == "hostkeys-00@openssh.com" {
 				s.hostkeysDropped.Add(1)
 			}
@@ -40,14 +44,16 @@ func (s *Server) relay(sess *session, down *ssh.ServerConn, downChans <-chan ssh
 	}()
 	go func() {
 		defer wg.Done()
-		for nc := range downChans {
-			s.openOn(sess, nc, up, true)
+		for nc := range downChans { // 打开对端通道要等确认：每个都异步，慢的不挡后面的
+			sess.pipes.Add(1)
+			go func() { defer sess.pipes.Done(); s.openOn(sess, nc, up, true) }()
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for nc := range upChans {
-			s.openOn(sess, nc, down, false)
+			sess.pipes.Add(1)
+			go func() { defer sess.pipes.Done(); s.openOn(sess, nc, down, false) }()
 		}
 	}()
 	stop := make(chan struct{})
@@ -64,9 +70,9 @@ func (s *Server) relay(sess *session, down *ssh.ServerConn, downChans <-chan ssh
 }
 
 // forwardGlobal 转发全局请求；不在白名单的回 false（onDrop 用于计数）。
-func forwardGlobal(in <-chan *ssh.Request, out ssh.Conn, onDrop func(name string)) {
+func forwardGlobal(in <-chan *ssh.Request, out ssh.Conn, allowed map[string]bool, onDrop func(name string)) {
 	for req := range in {
-		if !globalAllowed[req.Type] {
+		if !allowed[req.Type] {
 			if onDrop != nil {
 				onDrop(req.Type)
 			}

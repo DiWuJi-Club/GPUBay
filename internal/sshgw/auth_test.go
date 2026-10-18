@@ -1,7 +1,10 @@
 package sshgw_test
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -50,9 +53,15 @@ func TestPublicKeyLoginAndPasswordDisabled(t *testing.T) {
 	if opened[0].AuthMethod != "publickey" || opened[0].KeyID == nil || *opened[0].KeyID != k.ID {
 		t.Fatalf("opened = %+v", opened[0])
 	}
-	// 其他用户的钥匙不行
+	// 未登记的钥匙不行
 	if _, _, err := e.dial(instA, ssh.PublicKeys(newSigner(t))); err == nil {
 		t.Fatal("unknown key accepted")
+	}
+	// 登记在其他用户（8）名下的钥匙也不行：钥匙按实例所属用户查找
+	otherKey := newSigner(t)
+	e.keys.add(8, otherKey.PublicKey())
+	if _, _, err := e.dial(instA, ssh.PublicKeys(otherKey)); err == nil {
+		t.Fatal("another user's key accepted")
 	}
 	// 关闭密码登录后密码被拒、公钥仍通
 	info := runningInfo(e, instA, 7, "pw-correct-16chr")
@@ -198,5 +207,74 @@ func TestSessionCapAndUpstreamUnreachable(t *testing.T) {
 	_, _, alerts := bad.store.snapshot()
 	if len(alerts) != 1 || alerts[0] != "unreachable:"+instA {
 		t.Fatalf("alerts = %v", alerts)
+	}
+}
+
+func TestLimiterSweepAndUnknownInstanceNotCounted(t *testing.T) {
+	e := newEnv(t)
+	sshgw.SetLimitsForTest(e.srv, 2, 100, 32)
+	e.dial("ins-zzzzzzzz", ssh.Password("wrong")) // 实例不存在：只按 IP 计
+	waitFor(t, "ip fail 1", func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") == 1 })
+	if _, instF, _ := sshgw.LimiterSizesForTest(e.srv); instF != 0 {
+		t.Fatalf("nonexistent instance grew instF: %d", instF)
+	}
+	e.dial(instA, ssh.Password("wrong")) // 第 2 次：封禁，IP 失败表的键随之删除
+	waitFor(t, "ip blocked", func() bool { return sshgw.BlockedForTest(e.srv, "127.0.0.1") })
+	if fails, instF, blocked := sshgw.LimiterSizesForTest(e.srv); fails != 0 || instF != 1 || blocked != 1 {
+		t.Fatalf("sizes before sweep = %d %d %d, want 0 1 1", fails, instF, blocked)
+	}
+	e.clk.Advance(10*time.Minute + time.Second)
+	sshgw.SweepForTest(e.srv)
+	if fails, instF, blocked := sshgw.LimiterSizesForTest(e.srv); fails != 0 || instF != 0 || blocked != 0 {
+		t.Fatalf("sizes after sweep = %d %d %d, want all 0", fails, instF, blocked)
+	}
+}
+
+func TestOnlyRealAuthAttemptsCount(t *testing.T) {
+	e := newEnv(t)
+	// 裸 TCP 连上就断
+	nc, err := net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc.Close()
+	// 版本串之后发坏包：密钥交换失败
+	nc, err = net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc.SetDeadline(time.Now().Add(5 * time.Second))
+	nc.Write([]byte("SSH-2.0-probe\r\n\xff\xff\xff\xff garbage"))
+	io.Copy(io.Discard, nc)
+	nc.Close()
+	// 只走到 none 认证（拿到 Banner）就放弃
+	if _, banner, err := e.dial(instA, ssh.KeyboardInteractive(func(string, string, []string, []bool) ([]string, error) {
+		return nil, errors.New("no")
+	})); err == nil || banner != "" {
+		t.Fatalf("none-only dial: banner=%q err=%v", banner, err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 0 {
+		t.Fatalf("non-attempts counted: %d", n)
+	}
+	e.dial(instA, ssh.Password("wrong")) // 真实尝试仍计
+	waitFor(t, "real attempt counted", func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") == 1 })
+}
+
+func TestLookupErrorLooksLikeUnknown(t *testing.T) {
+	e := newEnv(t)
+	e.store.setFailFor(errors.New("pq: connection refused to 10.0.0.5:5432"), 100)
+	_, banner, err := e.dial(instA, ssh.Password("pw-correct-16chr"))
+	if err == nil || banner != sshgw.BannerUnknown {
+		t.Fatalf("db error: banner=%q err=%v", banner, err)
+	}
+	if strings.Contains(err.Error(), "pq") || strings.Contains(err.Error(), "10.0.0.5") {
+		t.Fatalf("db error leaked to client: %v", err)
+	}
+	e.store.setFailFor(nil, 0)
+	e.dial(instA, ssh.Password("wrong-guess-xyz"))
+	waitFor(t, "fail counted", func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") >= 1 })
+	if logs := e.logs.String(); strings.Contains(logs, "pw-correct-16chr") || strings.Contains(logs, "wrong-guess-xyz") {
+		t.Fatalf("password in logs:\n%s", logs)
 	}
 }

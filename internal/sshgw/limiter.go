@@ -94,7 +94,7 @@ func (l *limiter) releaseConn(ip string) {
 	}
 }
 
-// failed 记录一条「关闭时仍未认证成功」的连接；返回该 IP 是否因此被封禁、该实例是否刚达到告警阈值。
+// failed 记录一条「做过真实认证尝试、关闭时仍未认证成功」的连接；instance 只在查到实例时非空。返回该 IP 是否因此被封禁、该实例是否刚达到告警阈值。
 func (l *limiter) failed(ip, instance string) (blocked, alert bool) {
 	if l.disabled {
 		return false, false
@@ -106,7 +106,7 @@ func (l *limiter) failed(ip, instance string) (blocked, alert bool) {
 	l.fails[k] = append(prune(l.fails[k], now), now)
 	if len(l.fails[k]) >= l.ipFails {
 		l.blocked[k] = now.Add(blockFor)
-		l.fails[k] = nil
+		delete(l.fails, k)
 		blocked = true
 	}
 	if instance != "" {
@@ -129,4 +129,30 @@ func (l *limiter) isBlocked(ip string) bool {
 	defer l.mu.Unlock()
 	until, ok := l.blocked[ipKey(ip)]
 	return ok && l.clk.Now().Before(until)
+}
+
+// sweep 清掉已过期的封禁与窗口外的失败记录，使三张表的大小只取决于最近 10 分钟的失败来源（Serve 每分钟调用）。
+func (l *limiter) sweep(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for k, until := range l.blocked {
+		if !now.Before(until) {
+			delete(l.blocked, k)
+		}
+	}
+	for _, m := range []map[string][]time.Time{l.fails, l.instF} {
+		for k, ts := range m {
+			if ts = prune(ts, now); len(ts) == 0 {
+				delete(m, k)
+			} else {
+				m[k] = ts
+			}
+		}
+	}
+}
+
+func (l *limiter) sizes() (fails, instF, blocked int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.fails), len(l.instF), len(l.blocked)
 }

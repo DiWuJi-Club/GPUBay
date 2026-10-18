@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"io"
 	"log/slog"
 	"net"
 	"strings"
@@ -38,6 +37,7 @@ type fakeStore struct {
 	mu       sync.Mutex
 	infos    map[string]rental.AccessInfo
 	failNext error
+	failLeft int // failNext 还要生效的次数
 	nextID   int64
 	opened   []rental.SSHSessionStart
 	closed   map[int64][2]int64
@@ -59,20 +59,22 @@ func (f *fakeStore) set(id string, info rental.AccessInfo) {
 }
 
 // setFailNext 让下一次 Access 返回该错误（模拟数据库瞬时故障）。
-func (f *fakeStore) setFailNext(err error) {
+func (f *fakeStore) setFailNext(err error) { f.setFailFor(err, 1) }
+
+// setFailFor 让接下来 n 次 Access 返回该错误（模拟数据库持续故障）。
+func (f *fakeStore) setFailFor(err error, n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.failNext = err
+	f.failNext, f.failLeft = err, n
 }
 
 func (f *fakeStore) Access(_ context.Context, id string) (rental.AccessInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.accessed++
-	if f.failNext != nil {
-		err := f.failNext
-		f.failNext = nil
-		return rental.AccessInfo{}, err
+	if f.failNext != nil && f.failLeft > 0 {
+		f.failLeft--
+		return rental.AccessInfo{}, f.failNext
 	}
 	info, ok := f.infos[id]
 	if !ok {
@@ -207,6 +209,25 @@ type env struct {
 	hostKey  ssh.Signer
 	addr     string
 	done     chan struct{}
+	logs     *syncBuffer
+}
+
+// syncBuffer 收集网关日志，供断言「日志里没有密码」。
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 func runningInfo(e *env, id string, userID int64, password string) rental.AccessInfo {
@@ -227,12 +248,12 @@ func newEnvWith(t *testing.T, tweak func(*sshgw.Config)) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, ctx: ctx, cancel: cancel, clk: clock.NewFake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)), store: newFakeStore(), keys: &fakeKeys{}, upstream: us, hostKey: newSigner(t), done: make(chan struct{})}
+	e := &env{t: t, ctx: ctx, cancel: cancel, clk: clock.NewFake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)), store: newFakeStore(), keys: &fakeKeys{}, upstream: us, hostKey: newSigner(t), done: make(chan struct{}), logs: &syncBuffer{}}
 	cfg := sshgw.Config{HostKey: e.hostKey, Upstream: up, UpstreamPort: us.Port(), DrainTimeout: time.Second}
 	if tweak != nil {
 		tweak(&cfg)
 	}
-	e.srv, err = sshgw.New(cfg, sshgw.Deps{Store: e.store, Keys: e.keys, Clock: e.clk, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	e.srv, err = sshgw.New(cfg, sshgw.Deps{Store: e.store, Keys: e.keys, Clock: e.clk, Log: slog.New(slog.NewTextHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))})
 	if err != nil {
 		t.Fatal(err)
 	}

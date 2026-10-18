@@ -39,6 +39,8 @@ type Server struct {
 	forwardAddr string
 	conns       []*connEntry       // 每条已 accept 的原始连接（握手前即登记）
 	extras      map[io.Closer]bool // 转发用的目标连接 / 监听器，Close 时一并关闭
+	holds       map[int]*hold      // direct-tcpip 目标端口 → 挂起闸门（测试慢速通道打开）
+	held        int                // 当前挂起中的 direct-tcpip 打开数
 	closed      bool
 	wg          sync.WaitGroup
 }
@@ -71,7 +73,7 @@ func New(o Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{lis: lis, signer: signer, cfg: cfg, targets: map[int]string{}, extras: map[io.Closer]bool{}}
+	s := &Server{lis: lis, signer: signer, cfg: cfg, targets: map[int]string{}, extras: map[io.Closer]bool{}, holds: map[int]*hold{}}
 	s.wg.Add(1)
 	go s.accept()
 	return s, nil
@@ -84,10 +86,43 @@ func (s *Server) HostPubLine() string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(s.signer.PublicKey())))
 }
 
+type hold struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func (h *hold) release() { h.once.Do(func() { close(h.ch) }) }
+
+// HoldDirect 让到 port 的 direct-tcpip 打开挂起（不确认也不拒绝），直到调用返回的 release 或 Close。
+func (s *Server) HoldDirect(port int) (release func()) {
+	h := &hold{ch: make(chan struct{})}
+	s.mu.Lock()
+	s.holds[port] = h
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		if s.holds[port] == h {
+			delete(s.holds, port)
+		}
+		s.mu.Unlock()
+		h.release()
+	}
+}
+
+// HeldDirect 返回当前挂起中的 direct-tcpip 打开数。
+func (s *Server) HeldDirect() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.held
+}
+
 // Close 停止监听并关闭全部连接。
 func (s *Server) Close() {
 	s.mu.Lock()
 	s.closed = true
+	for _, h := range s.holds {
+		h.release()
+	}
 	s.mu.Unlock()
 	s.lis.Close()
 	s.DropAll()
@@ -136,6 +171,30 @@ func (s *Server) ConnCount() int {
 // OpenToClient 用最近一条已完成握手的连接向客户端发起 NewChannel（测试网关是否拒绝 x11 等类型）；
 // 没有已就绪的连接时，等最近一条连接握手完成（卡住则超时）。
 func (s *Server) OpenToClient(chType string, extra []byte) error {
+	e, err := s.latestConn()
+	if err != nil {
+		return err
+	}
+	ch, reqs, err := e.sconn.OpenChannel(chType, extra)
+	if err != nil {
+		return err
+	}
+	go ssh.DiscardRequests(reqs)
+	return ch.Close()
+}
+
+// SendGlobal 用最近一条已完成握手的连接向客户端发全局请求（测试网关的全局请求方向白名单）。
+func (s *Server) SendGlobal(name string, wantReply bool, payload []byte) (bool, error) {
+	e, err := s.latestConn()
+	if err != nil {
+		return false, err
+	}
+	ok, _, err := e.sconn.SendRequest(name, wantReply, payload)
+	return ok, err
+}
+
+// latestConn 返回最近一条已完成握手的连接；没有已就绪的连接时，等最近一条连接握手完成（卡住则超时）。
+func (s *Server) latestConn() (*connEntry, error) {
 	s.mu.Lock()
 	var e *connEntry
 	for i := len(s.conns) - 1; i >= 0 && e == nil; i-- {
@@ -152,22 +211,17 @@ func (s *Server) OpenToClient(chType string, extra []byte) error {
 	}
 	s.mu.Unlock()
 	if e == nil {
-		return errors.New("sshtest: no connection")
+		return nil, errors.New("sshtest: no connection")
 	}
 	select { // sconn 在 NewServerConn 返回后才有；等它就绪（握手卡住则超时）
 	case <-e.ready:
 	case <-time.After(2 * time.Second):
-		return errors.New("sshtest: connection not established")
+		return nil, errors.New("sshtest: connection not established")
 	}
 	if e.sconn == nil {
-		return errors.New("sshtest: handshake failed")
+		return nil, errors.New("sshtest: handshake failed")
 	}
-	ch, reqs, err := e.sconn.OpenChannel(chType, extra)
-	if err != nil {
-		return err
-	}
-	go ssh.DiscardRequests(reqs)
-	return ch.Close()
+	return e, nil
 }
 
 // DropAll 关闭全部服务端连接（含握手中的原始连接与转发目标连接），模拟容器 sshd 崩溃。
@@ -270,8 +324,9 @@ func (s *Server) handle(e *connEntry) {
 			}
 			s.wg.Add(1)
 			go func() { defer s.wg.Done(); (&session{srv: s, conn: sconn}).run(ch, chReqs) }()
-		case "direct-tcpip":
-			s.directTCPIP(nc)
+		case "direct-tcpip": // 异步：挂起或慢速的目标不挡同一连接上的其它通道
+			s.wg.Add(1)
+			go func() { defer s.wg.Done(); s.directTCPIP(nc) }()
 		default:
 			nc.Reject(ssh.UnknownChannelType, "sshtest: unsupported channel "+nc.ChannelType())
 		}
@@ -294,6 +349,18 @@ func (s *Server) directTCPIP(nc ssh.NewChannel) {
 	if err := ssh.Unmarshal(extra, &msg); err != nil {
 		nc.Reject(ssh.ConnectionFailed, "bad direct-tcpip payload")
 		return
+	}
+	s.mu.Lock()
+	h := s.holds[int(msg.Rport)]
+	if h != nil {
+		s.held++
+	}
+	s.mu.Unlock()
+	if h != nil {
+		<-h.ch
+		s.mu.Lock()
+		s.held--
+		s.mu.Unlock()
 	}
 	s.mu.Lock()
 	target, ok := s.targets[int(msg.Rport)]

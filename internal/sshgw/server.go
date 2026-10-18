@@ -22,11 +22,12 @@ import (
 )
 
 const (
-	serverVersion    = "SSH-2.0-SparkCloud"
-	maxAuthTries     = 6
-	handshakeTimeout = 30 * time.Second
-	upstreamTimeout  = 10 * time.Second // Config.UpstreamTimeout 的默认值
-	rejectWait       = 2 * time.Second
+	serverVersion     = "SSH-2.0-SparkCloud"
+	maxAuthTries      = 6
+	handshakeTimeout  = 30 * time.Second
+	upstreamTimeout   = 10 * time.Second // Config.UpstreamTimeout 的默认值
+	rejectWait        = 2 * time.Second
+	limiterSweepEvery = time.Minute
 )
 
 type Store interface {
@@ -115,7 +116,7 @@ type Server struct {
 	sshCfg *ssh.ServerConfig
 	lim    *limiter
 
-	pending sync.Map // 远端地址 → 握手期间最近一次出现的用户名（失败连接按实例计数用）
+	pending sync.Map // 远端地址 → *attempt：握手期间是否做过真实认证尝试、针对哪个实例
 
 	mu          sync.Mutex
 	sessions    map[*session]struct{}
@@ -177,6 +178,7 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	loopCtx, stopLoops := context.WithCancel(ctx)
 	defer stopLoops()
 	go s.runLoops(loopCtx)
+	go s.sweepLimiter(loopCtx) // Task 11 并入 runLoops
 	accepted := make(chan struct{})
 	go func() {
 		defer close(accepted)
@@ -204,7 +206,27 @@ func remoteIP(addr net.Addr) string {
 	return host
 }
 
-func (s *Server) noteUser(c ssh.ConnMetadata) { s.pending.Store(c.RemoteAddr().String(), c.User()) }
+// attempt 记录一条连接在握手期间的认证尝试（只由 password / publickey 回调写入，Banner 不算）。
+type attempt struct {
+	mu       sync.Mutex
+	tried    bool
+	instance string // 最近一次查到的实例 ID；查不到的用户名不计入实例失败
+}
+
+// noteAttempt 在 password / publickey 回调里调用：found 表示用户名对应的实例存在。
+func (s *Server) noteAttempt(c ssh.ConnMetadata, found bool) {
+	v, ok := s.pending.Load(c.RemoteAddr().String())
+	if !ok {
+		return
+	}
+	a := v.(*attempt)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tried = true
+	if found {
+		a.instance = c.User()
+	}
+}
 
 func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	defer s.wg.Done()
@@ -215,14 +237,19 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	}
 	defer s.lim.releaseConn(ip)
 	key := nc.RemoteAddr().String()
-	s.pending.Store(key, "")
+	att := &attempt{}
+	s.pending.Store(key, att)
 	defer s.pending.Delete(key)
 	nc.SetDeadline(time.Now().Add(handshakeTimeout))
 	down, chans, reqs, err := ssh.NewServerConn(nc, s.sshCfg)
 	if err != nil {
-		user, _ := s.pending.Load(key)
-		s.authFailed(ip, user.(string))
 		nc.Close()
+		att.mu.Lock()
+		tried, instance := att.tried, att.instance
+		att.mu.Unlock()
+		if tried { // 裸 TCP、版本串 / 密钥交换失败、只拿了 Banner 的连接都不计
+			s.authFailed(ip, instance)
+		}
 		return
 	}
 	nc.SetDeadline(time.Time{})
@@ -230,12 +257,8 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	s.serve(ctx, down, chans, reqs, ip)
 }
 
-// authFailed：一条连接关闭时仍未认证成功 → 按 IP 与实例各计 1 次。
-func (s *Server) authFailed(ip, user string) {
-	instance := ""
-	if instanceIDRe.MatchString(user) {
-		instance = user
-	}
+// authFailed：一条做过认证尝试的连接关闭时仍未认证成功 → 按 IP 计 1 次；instance 非空（实例存在）时也按实例计 1 次。
+func (s *Server) authFailed(ip, instance string) {
 	blocked, alert := s.lim.failed(ip, instance)
 	// 只记录合法的实例 ID：用户名是攻击者可控的任意文本，用户也可能把密码误填进用户名
 	s.d.Log.Warn("ssh auth failed", "ip", ip, "instance", instance, "ip_blocked", blocked)
@@ -349,6 +372,9 @@ func (s *Server) serve(ctx context.Context, down *ssh.ServerConn, chans <-chan s
 // dialUpstream 用平台上游私钥连容器 sshd，主机密钥固定为 instances.ssh_host_pubkey（为空时首连信任写回）。
 // TCP 拨号与 SSH 握手共用 UpstreamTimeout 截止时间，且 ctx 结束即中止（ClientConfig.Timeout 不覆盖已建立 TCP 上的握手）。
 func (s *Server) dialUpstream(ctx context.Context, info rental.AccessInfo) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+	if net.ParseIP(info.MachineLanIP) == nil { // 不拨任何不是 IP 的地址（空值、主机名）
+		return nil, nil, nil, fmt.Errorf("机器内网地址无效 %q", info.MachineLanIP)
+	}
 	addr := net.JoinHostPort(info.MachineLanIP, strconv.Itoa(s.cfg.UpstreamPort))
 	timeout := s.cfg.UpstreamTimeout
 	d := net.Dialer{Timeout: timeout}
@@ -463,6 +489,20 @@ func rejectWithMessage(chans <-chan ssh.NewChannel, msg string) {
 			return
 		case <-timer.C:
 			return
+		}
+	}
+}
+
+// sweepLimiter 每分钟清扫一次限流表，直到 ctx 结束。
+func (s *Server) sweepLimiter(ctx context.Context) {
+	t := time.NewTicker(limiterSweepEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.lim.sweep(s.d.Clock.Now())
 		}
 	}
 }
