@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -36,7 +37,8 @@ type Server struct {
 	targets     map[int]string // direct-tcpip 目标端口 → 实际拨号地址
 	lastDirect  []byte
 	forwardAddr string
-	conns       []*ssh.ServerConn
+	conns       []*connEntry       // 每条已 accept 的原始连接（握手前即登记）
+	extras      map[io.Closer]bool // 转发用的目标连接 / 监听器，Close 时一并关闭
 	closed      bool
 	wg          sync.WaitGroup
 }
@@ -69,7 +71,7 @@ func New(o Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{lis: lis, signer: signer, cfg: cfg, targets: map[int]string{}}
+	s := &Server{lis: lis, signer: signer, cfg: cfg, targets: map[int]string{}, extras: map[io.Closer]bool{}}
 	s.wg.Add(1)
 	go s.accept()
 	return s, nil
@@ -123,6 +125,8 @@ func (s *Server) ForwardAddr() string {
 	return s.forwardAddr
 }
 
+// ConnCount 返回当前存活的服务端连接数。原始连接在 accept 时就登记（早于握手完成），
+// 所以客户端 Dial 返回时，该连接必然已被计入；握手失败或断开后由 handle 摘除。
 func (s *Server) ConnCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,15 +136,23 @@ func (s *Server) ConnCount() int {
 // OpenToClient 用最近一条连接向客户端发起 NewChannel（测试网关是否拒绝 x11 等类型）。
 func (s *Server) OpenToClient(chType string, extra []byte) error {
 	s.mu.Lock()
-	var c *ssh.ServerConn
+	var e *connEntry
 	if n := len(s.conns); n > 0 {
-		c = s.conns[n-1]
+		e = s.conns[n-1]
 	}
 	s.mu.Unlock()
-	if c == nil {
+	if e == nil {
 		return errors.New("sshtest: no connection")
 	}
-	ch, reqs, err := c.OpenChannel(chType, extra)
+	select { // sconn 在 NewServerConn 返回后才有；等它就绪（握手卡住则超时）
+	case <-e.ready:
+	case <-time.After(2 * time.Second):
+		return errors.New("sshtest: connection not established")
+	}
+	if e.sconn == nil {
+		return errors.New("sshtest: handshake failed")
+	}
+	ch, reqs, err := e.sconn.OpenChannel(chType, extra)
 	if err != nil {
 		return err
 	}
@@ -148,15 +160,44 @@ func (s *Server) OpenToClient(chType string, extra []byte) error {
 	return ch.Close()
 }
 
-// DropAll 关闭全部服务端连接（模拟容器 sshd 崩溃）。
+// DropAll 关闭全部服务端连接（含握手中的原始连接与转发目标连接），模拟容器 sshd 崩溃。
 func (s *Server) DropAll() {
 	s.mu.Lock()
 	conns := s.conns
 	s.conns = nil
+	extras := s.extras
+	s.extras = map[io.Closer]bool{}
 	s.mu.Unlock()
-	for _, c := range conns {
+	for _, e := range conns {
+		e.nc.Close()
+	}
+	for c := range extras {
 		c.Close()
 	}
+}
+
+type connEntry struct {
+	nc    net.Conn
+	sconn *ssh.ServerConn // ready 关闭后读取；握手失败为 nil
+	ready chan struct{}
+}
+
+// track 登记需要随 Close 关闭的辅助资源；服务器已关闭则立即关闭并返回 false。
+func (s *Server) track(c io.Closer) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		c.Close()
+		return false
+	}
+	s.extras[c] = true
+	return true
+}
+
+func (s *Server) untrack(c io.Closer) {
+	s.mu.Lock()
+	delete(s.extras, c)
+	s.mu.Unlock()
 }
 
 func (s *Server) accept() {
@@ -166,10 +207,19 @@ func (s *Server) accept() {
 		if err != nil {
 			return
 		}
+		e := &connEntry{nc: nc, ready: make(chan struct{})}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			nc.Close()
+			return
+		}
+		s.conns = append(s.conns, e)
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
-			s.handle(nc)
+			s.handle(e)
 		}()
 	}
 }
@@ -180,32 +230,27 @@ type session struct {
 	agentRequested bool
 }
 
-func (s *Server) handle(nc net.Conn) {
-	sconn, chans, reqs, err := ssh.NewServerConn(nc, s.cfg)
-	if err != nil {
-		nc.Close()
-		return
-	}
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		sconn.Close()
-		return
-	}
-	s.conns = append(s.conns, sconn)
-	s.mu.Unlock()
+func (s *Server) handle(e *connEntry) {
 	defer func() {
-		sconn.Close()
+		e.nc.Close()
 		s.mu.Lock()
 		for i, c := range s.conns {
-			if c == sconn {
+			if c == e {
 				s.conns = append(s.conns[:i], s.conns[i+1:]...)
 				break
 			}
 		}
 		s.mu.Unlock()
 	}()
-	go s.globalRequests(sconn, reqs)
+	sconn, chans, reqs, err := ssh.NewServerConn(e.nc, s.cfg)
+	if err != nil {
+		close(e.ready)
+		return
+	}
+	e.sconn = sconn
+	close(e.ready)
+	s.wg.Add(1)
+	go func() { defer s.wg.Done(); s.globalRequests(sconn, reqs) }()
 	for nc := range chans {
 		switch nc.ChannelType() {
 		case "session":
@@ -213,7 +258,8 @@ func (s *Server) handle(nc net.Conn) {
 			if err != nil {
 				continue
 			}
-			go (&session{srv: s, conn: sconn}).run(ch, chReqs)
+			s.wg.Add(1)
+			go func() { defer s.wg.Done(); (&session{srv: s, conn: sconn}).run(ch, chReqs) }()
 		case "direct-tcpip":
 			s.directTCPIP(nc)
 		default:
@@ -257,24 +303,34 @@ func (s *Server) directTCPIP(nc ssh.NewChannel) {
 		return
 	}
 	go ssh.DiscardRequests(reqs)
-	go pipe(ch, dst)
+	s.startPipe(ch, dst)
 }
 
-// pipe 双向拷贝；任一方向结束即关闭两端。
-func pipe(ch ssh.Channel, c net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(ch, c); ch.CloseWrite(); done <- struct{}{} }()
+// startPipe 在 wg 内双向拷贝 ch 与 c；任一方向结束后做半关闭，两个方向都结束才关闭两端。
+// c 登记为 extra，Close/DropAll 会关闭它，因此 pipe goroutine 不会在 Close 之后残留。
+func (s *Server) startPipe(ch ssh.Channel, c net.Conn) {
+	if !s.track(c) {
+		ch.Close()
+		return
+	}
+	s.wg.Add(1)
 	go func() {
-		io.Copy(c, ch)
-		if tc, ok := c.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
-		done <- struct{}{}
+		defer s.wg.Done()
+		done := make(chan struct{}, 2)
+		go func() { io.Copy(ch, c); ch.CloseWrite(); done <- struct{}{} }()
+		go func() {
+			io.Copy(c, ch)
+			if tc, ok := c.(*net.TCPConn); ok {
+				tc.CloseWrite()
+			}
+			done <- struct{}{}
+		}()
+		<-done
+		<-done
+		ch.Close()
+		c.Close()
+		s.untrack(c)
 	}()
-	<-done
-	<-done
-	ch.Close()
-	c.Close()
 }
 
 type tcpipForwardMsg struct {
@@ -290,10 +346,11 @@ type forwardedTCPIPMsg struct {
 }
 
 func (s *Server) globalRequests(sconn *ssh.ServerConn, reqs <-chan *ssh.Request) {
-	var listeners []net.Listener
+	listeners := map[uint32]net.Listener{} // 实际监听端口 → 监听器
 	defer func() {
 		for _, l := range listeners {
 			l.Close()
+			s.untrack(l)
 		}
 	}()
 	for req := range reqs {
@@ -305,12 +362,15 @@ func (s *Server) globalRequests(sconn *ssh.ServerConn, reqs <-chan *ssh.Request)
 				continue
 			}
 			l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(m.Port))))
-			if err != nil {
+			if err != nil || !s.track(l) {
+				if err == nil {
+					l.Close()
+				}
 				req.Reply(false, nil)
 				continue
 			}
-			listeners = append(listeners, l)
 			port := uint32(l.Addr().(*net.TCPAddr).Port)
+			listeners[port] = l
 			s.mu.Lock()
 			s.forwardAddr = l.Addr().String()
 			s.mu.Unlock()
@@ -319,7 +379,9 @@ func (s *Server) globalRequests(sconn *ssh.ServerConn, reqs <-chan *ssh.Request)
 			} else {
 				req.Reply(true, nil)
 			}
+			s.wg.Add(1)
 			go func(l net.Listener, bind string, port uint32) {
+				defer s.wg.Done()
 				for {
 					c, err := l.Accept()
 					if err != nil {
@@ -332,14 +394,29 @@ func (s *Server) globalRequests(sconn *ssh.ServerConn, reqs <-chan *ssh.Request)
 						continue
 					}
 					go ssh.DiscardRequests(chReqs)
-					go pipe(ch, c)
+					s.startPipe(ch, c)
 				}
 			}(l, m.Addr, port)
 		case "cancel-tcpip-forward":
-			for _, l := range listeners {
-				l.Close()
+			var m tcpipForwardMsg
+			var l net.Listener
+			ok := false
+			if err := ssh.Unmarshal(req.Payload, &m); err == nil {
+				l, ok = listeners[m.Port]
 			}
-			listeners = nil
+			if !ok {
+				req.Reply(false, nil)
+				continue
+			}
+			addr := l.Addr().String()
+			l.Close()
+			s.untrack(l)
+			delete(listeners, m.Port)
+			s.mu.Lock()
+			if s.forwardAddr == addr {
+				s.forwardAddr = ""
+			}
+			s.mu.Unlock()
 			req.Reply(true, nil)
 		case "keepalive@openssh.com":
 			req.Reply(true, nil)
@@ -353,6 +430,20 @@ func (s *Server) globalRequests(sconn *ssh.ServerConn, reqs <-chan *ssh.Request)
 
 type execMsg struct{ Command string }
 type subsystemMsg struct{ Name string }
+
+// serviceReqs 在 exec/shell/subsystem 启动后继续处理通道请求（window-change / signal / env 回 true，其余回 false）。
+func serviceReqs(reqs <-chan *ssh.Request) {
+	for req := range reqs {
+		if req.WantReply {
+			switch req.Type {
+			case "window-change", "signal", "env":
+				req.Reply(true, nil)
+			default:
+				req.Reply(false, nil)
+			}
+		}
+	}
+}
 
 func (x *session) run(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
@@ -370,15 +461,17 @@ func (x *session) run(ch ssh.Channel, reqs <-chan *ssh.Request) {
 				continue
 			}
 			req.Reply(true, nil)
-			x.exit(ch, x.exec(ch, m.Command))
+			go serviceReqs(reqs)
+			x.finish(ch, x.exec(ch, m.Command))
 			return
 		case "shell":
 			req.Reply(true, nil)
+			go serviceReqs(reqs)
 			sc := bufio.NewScanner(ch)
 			for sc.Scan() {
 				fmt.Fprintf(ch, "shell:%s\n", sc.Text())
 			}
-			x.exit(ch, 0)
+			x.finish(ch, 0)
 			return
 		case "subsystem":
 			var m subsystemMsg
@@ -387,8 +480,9 @@ func (x *session) run(ch ssh.Channel, reqs <-chan *ssh.Request) {
 				continue
 			}
 			req.Reply(true, nil)
+			go serviceReqs(reqs)
 			fmt.Fprint(ch, "SFTP-FAKE\n")
-			x.exit(ch, 0)
+			x.finish(ch, 0)
 			return
 		default:
 			if req.WantReply {
@@ -398,8 +492,10 @@ func (x *session) run(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	}
 }
 
-func (x *session) exit(ch ssh.Channel, status uint32) {
+// finish 按 OpenSSH 的顺序收尾：数据已写完 → exit-status → EOF → （调用方 defer）Close。
+func (x *session) finish(ch ssh.Channel, status uint32) {
 	ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+	ch.CloseWrite()
 }
 
 func (x *session) exec(ch ssh.Channel, cmd string) uint32 {
@@ -407,7 +503,10 @@ func (x *session) exec(ch ssh.Channel, cmd string) uint32 {
 	case strings.HasPrefix(cmd, "echo "):
 		fmt.Fprint(ch, strings.TrimPrefix(cmd, "echo ")+"\n")
 	case strings.HasPrefix(cmd, "exit "):
-		n, _ := strconv.Atoi(strings.TrimPrefix(cmd, "exit "))
+		n, err := strconv.Atoi(strings.TrimPrefix(cmd, "exit "))
+		if err != nil || n < 0 || n > 255 {
+			return 255
+		}
 		return uint32(n)
 	case cmd == "cat":
 		io.Copy(ch, ch)
@@ -424,7 +523,19 @@ func (x *session) exec(ch ssh.Channel, cmd string) uint32 {
 			return 1
 		}
 		go ssh.DiscardRequests(areqs)
-		keys, err := agent.NewClient(ach).List()
+		type listRes struct {
+			keys []*agent.Key
+			err  error
+		}
+		resc := make(chan listRes, 1)
+		go func() { k, err := agent.NewClient(ach).List(); resc <- listRes{k, err} }()
+		var keys []*agent.Key
+		select {
+		case r := <-resc:
+			keys, err = r.keys, r.err
+		case <-time.After(5 * time.Second):
+			err = errors.New("agent list timeout")
+		}
 		ach.Close()
 		if err != nil {
 			fmt.Fprintf(ch, "agent:error %v\n", err)
@@ -432,7 +543,7 @@ func (x *session) exec(ch ssh.Channel, cmd string) uint32 {
 		}
 		fmt.Fprintf(ch, "agent:%d\n", len(keys))
 	case cmd == "hostkeys":
-		x.conn.SendRequest("hostkeys-00@openssh.com", false, x.srv.signer.PublicKey().Marshal())
+		x.conn.SendRequest("hostkeys-00@openssh.com", false, ssh.Marshal(struct{ K []byte }{x.srv.signer.PublicKey().Marshal()}))
 		fmt.Fprint(ch, "sent\n")
 	default:
 		fmt.Fprintf(ch, "exec:%s\n", cmd)

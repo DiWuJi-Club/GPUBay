@@ -32,6 +32,15 @@ func newSigner(t *testing.T) ssh.Signer {
 	return s
 }
 
+func newServer(t *testing.T, up ssh.Signer) *sshtest.Server {
+	t.Helper()
+	srv, err := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}
+
 func dial(t *testing.T, srv *sshtest.Server, signer ssh.Signer) *ssh.Client {
 	t.Helper()
 	c, err := ssh.Dial("tcp", srv.Addr(), &ssh.ClientConfig{User: "root", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
@@ -123,7 +132,7 @@ func TestSessionExecShellSftp(t *testing.T) {
 
 func TestDirectTCPIPAndForward(t *testing.T) {
 	up := newSigner(t)
-	srv, _ := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	srv := newServer(t, up)
 	defer srv.Close()
 	stop := srv.ServeHTTP(8888, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "hello from 8888") }))
 	defer stop()
@@ -171,7 +180,7 @@ func TestDirectTCPIPAndForward(t *testing.T) {
 
 func TestAgentHostkeysAndControl(t *testing.T) {
 	up := newSigner(t)
-	srv, _ := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	srv := newServer(t, up)
 	defer srv.Close()
 	c := dial(t, srv, up)
 	keyring := agent.NewKeyring()
@@ -204,10 +213,125 @@ func TestAgentHostkeysAndControl(t *testing.T) {
 		t.Fatalf("x11 to client = %v", err)
 	}
 	srv.DropAll()
-	// 服务端已关连接：NewSession 或 Output 其一必然出错（不能用 output() 辅助，它在 NewSession 出错时直接 t.Fatal）
-	if sess, err := c.NewSession(); err == nil {
-		if _, err = sess.Output("echo after-drop"); err == nil {
-			t.Fatal("session survived DropAll")
-		}
+	// 服务端已关连接：NewSession 或 Output 其一必然出错（不能用 output() 辅助）
+	sess, err = c.NewSession()
+	if err != nil {
+		return
+	}
+	if _, err = sess.Output("echo after-drop"); err == nil {
+		t.Fatal("session survived DropAll")
+	}
+}
+
+func TestCloseWithStuckHandshake(t *testing.T) {
+	srv := newServer(t, newSigner(t))
+	raw, err := net.Dial("tcp", srv.Addr()) // 不发任何 SSH 数据，握手永远卡住
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.ConnCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ConnCount() != 1 {
+		t.Fatalf("conns = %d", srv.ConnCount())
+	}
+	done := make(chan struct{})
+	go func() { srv.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked on stuck handshake")
+	}
+}
+
+func TestWindowChangeMidShell(t *testing.T) {
+	up := newSigner(t)
+	srv := newServer(t, up)
+	defer srv.Close()
+	c := dial(t, srv, up)
+	sess, err := c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	in, _ := sess.StdinPipe()
+	outp, _ := sess.StdoutPipe()
+	if err := sess.Shell(); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(in, "a")
+	buf := make([]byte, 64)
+	if n, _ := outp.Read(buf); string(buf[:n]) != "shell:a\n" {
+		t.Fatalf("shell = %q", buf[:n])
+	}
+	ok, err := sess.SendRequest("window-change", true, ssh.Marshal(struct{ W, H, X, Y uint32 }{100, 40, 0, 0}))
+	if err != nil || !ok {
+		t.Fatalf("window-change = %v %v", ok, err)
+	}
+	if ok, err := sess.SendRequest("bogus", true, nil); err != nil || ok {
+		t.Fatalf("bogus = %v %v", ok, err)
+	}
+}
+
+func TestCancelForward(t *testing.T) {
+	up := newSigner(t)
+	srv := newServer(t, up)
+	defer srv.Close()
+	c := dial(t, srv, up)
+	ln, err := c.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := srv.ForwardAddr()
+	if addr == "" {
+		t.Fatal("no forward addr")
+	}
+	// 取消一个不存在的端口：false
+	type fwd struct {
+		Addr string
+		Port uint32
+	}
+	if ok, _, err := c.SendRequest("cancel-tcpip-forward", true, ssh.Marshal(fwd{"127.0.0.1", 1})); err != nil || ok {
+		t.Fatalf("cancel unknown = %v %v", ok, err)
+	}
+	if err := ln.Close(); err != nil { // 发送 cancel-tcpip-forward
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.ForwardAddr() != "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ForwardAddr() != "" {
+		t.Fatalf("forward addr not cleared: %q", srv.ForwardAddr())
+	}
+	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		conn.Close()
+		t.Fatal("listener still open after cancel")
+	}
+}
+
+func TestRejects(t *testing.T) {
+	up := newSigner(t)
+	srv := newServer(t, up)
+	defer srv.Close()
+	if _, err := ssh.Dial("tcp", srv.Addr(), &ssh.ClientConfig{User: "bob", Auth: []ssh.AuthMethod{ssh.PublicKeys(up)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 2 * time.Second}); err == nil {
+		t.Fatal("non-root user accepted")
+	}
+	c := dial(t, srv, up)
+	if ok, _, err := c.SendRequest("bogus@example.com", true, nil); err != nil || ok {
+		t.Fatalf("unknown global request = %v %v", ok, err)
+	}
+	if ok, _, err := c.SendRequest("keepalive@openssh.com", true, nil); err != nil || !ok {
+		t.Fatalf("keepalive = %v %v", ok, err)
+	}
+	sess, err := c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if err := sess.RequestSubsystem("netconf"); err == nil {
+		t.Fatal("non-sftp subsystem accepted")
 	}
 }
