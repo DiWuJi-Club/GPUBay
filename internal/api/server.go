@@ -14,6 +14,7 @@ import (
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/ingress"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/httpx"
@@ -24,21 +25,25 @@ import (
 )
 
 type Server struct {
-	Identity      *identity.Service
-	Wallet        *wallet.Service
-	Catalog       *catalog.Service
-	Fleet         *fleet.Service
-	Rental        *rental.Service
-	Uploads       *storage.Service
-	Billing       *billing.Service
-	DevPay        bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
-	Clock         clock.Clock
-	Log           *slog.Logger
-	Domain        string       // 用于生成 SSH 命令，例如 spark.example.com
-	SecureCookie  bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送
-	TrustProxy    bool         // 仅当部署在会改写转发头的反向代理之后才设为 true
-	Static        http.Handler // 控制台静态文件；nil 时使用 web.Console()
-	PublicBaseURL string       // 对外地址，用于同站防护的 Origin 比对
+	Identity       *identity.Service
+	Wallet         *wallet.Service
+	Catalog        *catalog.Service
+	Fleet          *fleet.Service
+	Rental         *rental.Service
+	Uploads        *storage.Service
+	Billing        *billing.Service
+	DevPay         bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
+	Clock          clock.Clock
+	Log            *slog.Logger
+	Domain         string        // 用于生成 SSH 命令，例如 spark.example.com
+	SecureCookie   bool          // 生产环境为 true：Cookie 仅经 HTTPS 发送
+	TrustProxy     bool          // 仅当部署在会改写转发头的反向代理之后才设为 true
+	Static         http.Handler  // 控制台静态文件；nil 时使用 web.Console()
+	PublicBaseURL  string        // 对外地址，用于同站防护的 Origin 比对
+	Ingress        *ingress.Auth // Web 入口鉴权；nil 时不注册 authorize 端点
+	AuthorizeLimit int           // authorize 每用户每分钟上限；零值 60
+
+	authorizeLim *authorizeLimiter
 }
 
 const sessionCookie = "sc_session"
@@ -54,6 +59,11 @@ func (s *Server) cookieName() string {
 type userCtxKey struct{}
 
 func (s *Server) Router() http.Handler {
+	limit := s.AuthorizeLimit
+	if limit <= 0 {
+		limit = defaultAuthorizeLimit
+	}
+	s.authorizeLim = &authorizeLimiter{limit: limit}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -80,6 +90,9 @@ func (s *Server) Router() http.Handler {
 		r.Get("/images", s.handleImages)
 		r.Get("/pay/channels", s.handlePayChannels)
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
+		if s.Ingress != nil {
+			r.With(httpx.NoStore).Get("/ingress/authorize", s.handleIngressAuthorize) // 组外：未登录要 302 到登录页而不是 JSON 401
+		}
 
 		r.Group(func(r chi.Router) {
 			r.Use(httpx.NoStore, s.requireUser)

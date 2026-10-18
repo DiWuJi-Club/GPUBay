@@ -23,6 +23,7 @@ import (
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/ingress"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/secretbox"
@@ -42,12 +43,14 @@ type rentalNoop struct{}
 func (rentalNoop) NotifyExpiry(context.Context, int64, string, time.Duration) error { return nil }
 
 type testEnv struct {
-	t      *testing.T
-	pool   *pgxpool.Pool
-	ts     *httptest.Server
-	wallet *wallet.Service
-	pay    *pay.Mock
-	clk    *clock.Fake
+	t       *testing.T
+	pool    *pgxpool.Pool
+	ts      *httptest.Server
+	wallet  *wallet.Service
+	pay     *pay.Mock
+	clk     *clock.Fake
+	rental  *rental.Service
+	ingress *ingress.Auth
 }
 
 func newTestEnv(t *testing.T) *testEnv { return newTestEnvWith(t, nil) }
@@ -74,15 +77,19 @@ func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 		Providers:     map[string]pay.Provider{pay.ChannelWechat: payMock, pay.ChannelAlipay: payMock},
 		NotifyBaseURL: "https://spark.test",
 	})
+	auth, err := ingress.NewAuth(dbtest.Key, "http://spark.test", "spark.test", false, clk)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test", PublicBaseURL: "http://spark.test",
-		Billing: bill, DevPay: true}
+		Billing: bill, DevPay: true, Ingress: auth}
 	if tweak != nil {
 		tweak(srv)
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
-	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk}
+	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, ingress: auth}
 }
 
 type client struct {

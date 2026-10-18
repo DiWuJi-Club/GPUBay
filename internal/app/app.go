@@ -24,6 +24,7 @@ import (
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/ingress"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
@@ -72,6 +73,8 @@ type App struct {
 
 	Gateway *agentgw.Server // Agent 网关（gRPC，mTLS）；由 cmd/platform 在 SPARK_AGENT_ADDR 上监听
 	CA      *pki.CA
+
+	IngressAuth *ingress.Auth // Web 入口鉴权（票据 / Cookie）；Task 18 组装 ingress.Server 时复用
 
 	SSH            *sshgw.Server // SSH 网关；由 cmd/platform 在 SPARK_SSH_ADDR 上监听
 	SSHHostKey     ssh.Signer
@@ -169,9 +172,18 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Alerts: f,
 		Providers: providers, NotifyBaseURL: cfg.PublicBaseURL,
 	})
+	ingressAuth, err := ingress.NewAuth(cfg.SecretKey, cfg.PublicBaseURL, cfg.IngressDomain, cfg.Env != "dev", clk)
+	if err != nil {
+		return nil, err
+	}
+	authorizeLimit := 0
+	if opt.DisableRateLimits {
+		authorizeLimit = noRateLimit
+	}
 	srv := &api.Server{
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, PublicBaseURL: cfg.PublicBaseURL,
+		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit,
 	}
 	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
 	if err != nil {
@@ -219,7 +231,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit, PublicBaseURL: cfg.AdminPublicBaseURL,
 	}
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router(),
-		Gateway: gw, CA: ca, SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner}, nil
+		Gateway: gw, CA: ca, IngressAuth: ingressAuth, SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner}, nil
 }
 
 // upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。
