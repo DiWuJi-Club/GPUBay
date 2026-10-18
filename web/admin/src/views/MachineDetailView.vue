@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type MachineDetail } from '@spark/shared'
+import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type EnrollCommand, type MachineDetail } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, ref } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
+import { fmtBytes, fmtPercent, fmtTemp } from '../logic/metrics'
 import { notifyError } from '../logic/notify'
 
 const route = useRoute()
@@ -15,6 +16,9 @@ const error = ref('')
 const maintenanceVisible = ref(false)
 const powerVisible = ref(false)
 const busy = ref(false)
+const enrollVisible = ref(false)
+const enroll = ref<EnrollCommand | null>(null)
+const revokeVisible = ref(false)
 const inMaintenance = computed(() => data.value?.machine.state === 'maintenance' || data.value?.machine.state === 'faulty')
 
 let seq = 0
@@ -47,6 +51,8 @@ onBeforeRouteUpdate((to) => {
   error.value = ''
   maintenanceVisible.value = false
   powerVisible.value = false
+  closeEnroll() // 接入命令只属于原机器，换机器时一并丢掉
+  revokeVisible.value = false
   void load(String(to.params.id))
 })
 
@@ -80,6 +86,51 @@ async function powerCycle() {
     busy.value = false
   }
 }
+
+/** 生成接入命令：请求层遇到 totp_required 会弹动态码框；命令只显示一次，关闭后不再可见（需要重新生成）。 */
+async function generateEnroll() {
+  if (busy.value) return // 同步守卫：每次生成都会作废上一条令牌，连点只发一次
+  busy.value = true
+  const target = id.value
+  try {
+    const out = await api.post<EnrollCommand>(`/machines/${target}/enroll-command`, {})
+    if (target !== id.value) return // 等待期间切到了另一台机器：不把旧机器的命令显示在新机器页上
+    enroll.value = out
+    enrollVisible.value = true
+  } catch (e) {
+    notifyError(e) // 「未配置 Agent 网关」等原文
+  } finally {
+    busy.value = false
+  }
+}
+async function copyEnroll() {
+  if (!enroll.value) return
+  try {
+    await navigator.clipboard.writeText(enroll.value.command)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.error('复制失败，请手动选中复制')
+  }
+}
+function closeEnroll() {
+  enrollVisible.value = false
+  enroll.value = null // 明文令牌不留在内存里，关闭后无法再看到
+}
+async function revokeEnrollment() {
+  if (busy.value) return // 同步守卫：连点只发一次
+  busy.value = true
+  try {
+    await api.post(`/machines/${id.value}/revoke-enrollment`, {})
+    ElMessage.success('已撤销接入')
+    revokeVisible.value = false
+    await load()
+  } catch (e) {
+    revokeVisible.value = false
+    notifyError(e) // 「该机器尚未接入」等原文
+  } finally {
+    busy.value = false
+  }
+}
 </script>
 
 <template>
@@ -101,10 +152,31 @@ async function powerCycle() {
             <span v-else class="muted" data-testid="mdetail-none">无</span>
           </el-descriptions-item>
         </el-descriptions>
+        <el-descriptions :column="3" border class="agent">
+          <el-descriptions-item label="接入状态">
+            <span data-testid="mdetail-enrolled" :data-enrolled="String(data.machine.enrolled)">{{ data.machine.enrolled ? `已接入 ${data.machine.fingerprint_prefix}…` : '未接入' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="连接"><span data-testid="mdetail-connected" :data-connected="String(data.machine.connected)">{{ data.machine.connected ? '已连接' : '未连接' }}</span></el-descriptions-item>
+          <el-descriptions-item label="Agent 版本"><span data-testid="mdetail-agent-version">{{ data.machine.agent_version || '—' }}</span></el-descriptions-item>
+        </el-descriptions>
         <div class="actions">
           <el-button data-testid="mdetail-maintenance-btn" @click="maintenanceVisible = true">{{ inMaintenance ? '结束维护' : '进入维护' }}</el-button>
           <el-button type="danger" plain data-testid="mdetail-power-btn" @click="powerVisible = true">断电重启</el-button>
+          <el-button type="primary" plain :loading="busy" data-testid="mdetail-enroll-btn" @click="generateEnroll">生成接入命令</el-button>
+          <el-button type="danger" plain :disabled="!data.machine.enrolled" data-testid="mdetail-revoke-btn" @click="revokeVisible = true">撤销接入</el-button>
         </div>
+      </el-card>
+
+      <el-card header="最近指标" data-testid="mdetail-metrics">
+        <el-descriptions v-if="data.machine.last_metrics" :column="3" border>
+          <el-descriptions-item label="GPU"><span data-testid="mdetail-metric-gpu">{{ Math.round(data.machine.last_metrics.gpu_util) }}% · {{ fmtTemp(data.machine.last_metrics) }} · {{ Math.round(data.machine.last_metrics.gpu_power_w) }}W</span></el-descriptions-item>
+          <el-descriptions-item label="内存"><span data-testid="mdetail-metric-mem">{{ fmtBytes(data.machine.last_metrics.mem_used) }} / {{ fmtBytes(data.machine.last_metrics.mem_total) }}</span></el-descriptions-item>
+          <el-descriptions-item label="根分区"><span data-testid="mdetail-metric-root">{{ fmtPercent(data.machine.last_metrics.root_disk_used, data.machine.last_metrics.root_disk_total) }}</span></el-descriptions-item>
+          <el-descriptions-item label="数据盘已用"><span data-testid="mdetail-metric-data">{{ fmtBytes(data.machine.last_metrics.data_disk_used) }}</span></el-descriptions-item>
+          <el-descriptions-item label="负载"><span data-testid="mdetail-metric-load">{{ data.machine.last_metrics.load1.toFixed(2) }}</span></el-descriptions-item>
+          <el-descriptions-item label="上报时间"><span data-testid="mdetail-metric-at">{{ fmtTime(data.machine.last_seen_at) }}</span></el-descriptions-item>
+        </el-descriptions>
+        <p v-else class="muted" data-testid="mdetail-metrics-none">尚未收到指标</p>
       </el-card>
 
       <el-card header="历史实例">
@@ -116,6 +188,24 @@ async function powerCycle() {
         </el-table>
       </el-card>
 
+      <el-dialog v-model="enrollVisible" title="接入命令（只显示一次）" width="720" align-center :close-on-click-modal="false" data-testid="mdetail-enroll-dialog" @close="closeEnroll">
+        <template v-if="enroll">
+          <p class="muted">在该机器上以 root 执行下面的命令。令牌 24 小时内有效、只能用一次；关闭本窗口后不再显示，需要时重新生成。</p>
+          <pre class="cmd" data-testid="mdetail-enroll-command">{{ enroll.command }}</pre>
+          <p class="muted" data-testid="mdetail-enroll-expires">有效期至 {{ fmtTime(enroll.expires_at) }}</p>
+        </template>
+        <template #footer>
+          <el-button data-testid="mdetail-enroll-copy" @click="copyEnroll">复制</el-button>
+          <el-button type="primary" data-testid="mdetail-enroll-close" @click="closeEnroll">关闭</el-button>
+        </template>
+      </el-dialog>
+      <el-dialog v-model="revokeVisible" title="撤销接入" width="420" align-center data-testid="mdetail-revoke-dialog">
+        <p data-testid="mdetail-revoke-text">撤销后该机器的 Agent 证书立即作废、连接断开，机器上的实例会在 5 分钟后被判失联；重新接入需要再次生成接入命令。确定撤销？</p>
+        <template #footer>
+          <el-button data-testid="mdetail-revoke-cancel" @click="revokeVisible = false">取消</el-button>
+          <el-button type="danger" :loading="busy" data-testid="mdetail-revoke-ok" @click="revokeEnrollment">确定撤销</el-button>
+        </template>
+      </el-dialog>
       <el-dialog v-model="maintenanceVisible" :title="inMaintenance ? '结束维护' : '进入维护'" width="420" align-center data-testid="mdetail-maintenance-dialog">
         <p>{{ inMaintenance ? '结束维护后机器重新进入可售库存。' : '进入维护后该机器不再分配给新订单。' }}</p>
         <template #footer>
@@ -140,4 +230,6 @@ async function powerCycle() {
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; }
 .actions { display: flex; gap: 12px; margin-top: 16px; }
+.agent { margin-top: 12px; }
+.cmd { white-space: pre-wrap; word-break: break-all; background: #f5f7fa; padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>

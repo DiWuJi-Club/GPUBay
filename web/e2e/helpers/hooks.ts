@@ -36,8 +36,16 @@ export const hooks = {
   agent(opts: { machine_id?: number; fail?: boolean; result?: string } = {}) {
     return post<{ completed: number }>('/hooks/agent', opts)
   },
-  async machines(count = 1, serial_prefix?: string): Promise<number[]> {
-    return (await post<{ ids: number[] }>('/hooks/machines', { count, serial_prefix })).ids
+  /** 造已接入并连上 fake Agent 的空闲机器；rack 缺省为 E2E。 */
+  async machines(count = 1, serial_prefix?: string, rack?: string): Promise<number[]> {
+    return (await post<{ ids: number[] }>('/hooks/machines', { count, serial_prefix, rack })).ids
+  },
+  /** fake Agent 是否仍连着网关。机器已被撤销接入时会顺手停掉并移除它的 fake Agent：
+   *  撤销接入的用例结束前必须调用一次，否则之后的全局 hooks.agent() 会把这台机器悄悄重新接入。 */
+  async agentStatus(machine_id: number): Promise<{ connected: boolean }> {
+    const r = await (await api()).get(`/hooks/agent/status?machine_id=${machine_id}`)
+    if (!r.ok()) throw new Error(`hook /hooks/agent/status -> ${r.status()} ${await r.text()}`)
+    return (await r.json()) as { connected: boolean }
   },
   users(opts: { phone?: string; verified?: boolean; balance?: number; ledger_rows?: number } = {}) {
     return post<{ id: number; phone: string }>('/hooks/users', opts)

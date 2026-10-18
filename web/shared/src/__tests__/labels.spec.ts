@@ -14,9 +14,10 @@ describe('labels', () => {
   it('未知值原样显示', () => {
     expect(labelOf(ledgerKindLabel, 'mystery')).toBe('mystery')
     expect(labelOf(alertKindLabel, 'new_kind')).toBe('new_kind')
+    expect(labelOf(alertKindLabel, 'container_down')).toBe('容器未运行')
   })
   it('审计动作列表与后端写入值一致', () => {
-    expect(auditActions).toHaveLength(26)
+    expect(auditActions).toHaveLength(29)
     expect(auditActions).toContain('instance.refund_release')
     expect(auditActions).toContain('wallet.manual_recharge')
   })
