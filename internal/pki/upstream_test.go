@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/crypto/ssh"
+
 	"spark-cloud/internal/pki"
 )
 
@@ -37,5 +39,24 @@ func TestUpstreamKeyGenerateAndLoad(t *testing.T) {
 	}
 	if _, err := pki.LoadUpstreamPublicKey(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Fatal("missing file accepted")
+	}
+}
+
+func TestLoadUpstreamSigner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "up.key")
+	if err := pki.GenerateUpstreamKey(path); err != nil {
+		t.Fatal(err)
+	}
+	s, err := pki.LoadUpstreamSigner(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _ := pki.LoadUpstreamPublicKey(path)
+	if strings.TrimSpace(string(ssh.MarshalAuthorizedKey(s.PublicKey()))) != pub {
+		t.Fatal("signer public key differs from LoadUpstreamPublicKey")
+	}
+	os.Chmod(path, 0o644)
+	if _, err := pki.LoadUpstreamSigner(path); err == nil || !strings.Contains(err.Error(), "权限") {
+		t.Fatalf("loose perm = %v", err)
 	}
 }

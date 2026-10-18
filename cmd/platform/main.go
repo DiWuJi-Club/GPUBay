@@ -86,6 +86,10 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	sshLis, err := net.Listen("tcp", cfg.SSHAddr) // 先于启动任何服务：端口占用时干净退出
+	if err != nil {
+		return fmt.Errorf("ssh gateway listen: %w", err)
+	}
 	sweeperDone := make(chan struct{})
 	go func() {
 		defer close(sweeperDone)
@@ -109,6 +113,11 @@ func run(log *slog.Logger) error {
 	go func() { // Serve 内含投递循环与每日服务端证书轮换检查，随 ctx 结束
 		log.Info("agent gateway listening", "addr", cfg.AgentAddr, "hosts", cfg.AgentHosts)
 		gatewayErr <- a.Gateway.ListenAndServe(ctx, cfg.AgentAddr)
+	}()
+	sshErr := make(chan error, 1)
+	go func() {
+		log.Info("ssh gateway listening", "addr", cfg.SSHAddr, "public_port", cfg.SSHPublicPort)
+		sshErr <- a.SSH.Serve(ctx, sshLis) // ctx 结束后停止 accept，按 SPARK_SSH_DRAIN_TIMEOUT drain
 	}()
 
 	var runErr error
@@ -134,6 +143,8 @@ func run(log *slog.Logger) error {
 		}
 	}
 	<-sweeperDone
+	// SSH 网关已随 ctx 停止 accept 并在 drain；Serve 总是返回 nil，等它 drain 完（会话记录已落库）再关闭数据库连接池（defer）
+	<-sshErr
 	if !gatewayExited { // 等网关的 Serve 随 ctx 返回（断开所有流、停止 gRPC）
 		if err := <-gatewayErr; err != nil && runErr == nil {
 			runErr = err

@@ -98,15 +98,29 @@ func (x *session) removeShell(ch ssh.Channel) {
 	}
 }
 
-// disconnect 向所有 session 通道写提示后关闭两端连接。
+// disconnectWriteWait 是断开前写提示的最长等待：客户端不读数据时通道窗口可能为 0，Write 会一直阻塞。
+const disconnectWriteWait = time.Second
+
+// disconnect 向所有 session 通道的 stderr 写提示（最多等 disconnectWriteWait）后关闭两端连接。
+// x/crypto 不支持带消息的 SSH_MSG_DISCONNECT，提示只能经通道 stderr 送达。
 func (x *session) disconnect(msg string) {
 	x.mu.Lock()
 	shells := append([]ssh.Channel(nil), x.shells...)
 	x.mu.Unlock()
-	for _, ch := range shells {
-		ch.Stderr().Write([]byte("\r\n" + msg + "\r\n"))
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		for _, ch := range shells {
+			ch.Stderr().Write([]byte("\r\n" + msg + "\r\n"))
+		}
+	}()
+	t := time.NewTimer(disconnectWriteWait)
+	select {
+	case <-written:
+	case <-t.C:
 	}
-	x.down.Close()
+	t.Stop()
+	x.down.Close() // 关闭连接也让卡住的 Write 返回
 	x.up.Close()
 }
 
@@ -120,6 +134,7 @@ type Server struct {
 
 	mu          sync.Mutex
 	sessions    map[*session]struct{}
+	conns       map[net.Conn]struct{} // 全部已 accept 的底层连接（含握手中、拒绝中）：drain 超时后逐一关闭
 	perInstance map[string]int
 	lastUnreach map[string]time.Time // upstream_unreachable 告警的进程内节流（5 分钟）
 
@@ -152,7 +167,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 	if cfg.KeepaliveTimeout <= 0 {
 		cfg.KeepaliveTimeout = keepaliveTimeout
 	}
-	s := &Server{cfg: cfg, d: d, sessions: map[*session]struct{}{}, perInstance: map[string]int{}, lastUnreach: map[string]time.Time{}}
+	s := &Server{cfg: cfg, d: d, sessions: map[*session]struct{}{}, conns: map[net.Conn]struct{}{}, perInstance: map[string]int{}, lastUnreach: map[string]time.Time{}}
 	s.lim = newLimiter(d.Clock, cfg.DisableRateLimits, cfg.MaxConnsPerIP)
 	s.sshCfg = &ssh.ServerConfig{
 		ServerVersion:     serverVersion,
@@ -172,13 +187,11 @@ func (s *Server) Sessions() int {
 	return len(s.sessions)
 }
 
-// Serve 接受连接直到 ctx 结束；随后停止 accept，最多等 DrainTimeout 让会话自然结束，再强制关闭。
-// 每 10 秒扫描会话状态、每 60 秒刷新会话 last_seen_at（Task 11 的 runLoops）。
+// Serve 接受连接直到 ctx 结束；随后停止 accept，最多等 DrainTimeout 让会话自然结束，再强制关闭（含握手中的连接）。
+// 运行期间每 10 秒扫描会话状态、每 60 秒刷新会话 last_seen_at、每分钟清扫限流表（runLoops，随 ctx 结束，Serve 返回前已退出）。
 func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
-	loopCtx, stopLoops := context.WithCancel(ctx)
-	defer stopLoops()
-	go s.runLoops(loopCtx)
-	go s.sweepLimiter(loopCtx) // Task 11 并入 runLoops
+	loopsDone := make(chan struct{})
+	go func() { defer close(loopsDone); s.runLoops(ctx) }()
 	accepted := make(chan struct{})
 	go func() {
 		defer close(accepted)
@@ -195,6 +208,7 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	lis.Close()
 	<-accepted
 	s.drain()
+	<-loopsDone
 	return nil
 }
 
@@ -230,6 +244,8 @@ func (s *Server) noteAttempt(c ssh.ConnMetadata, found bool) {
 
 func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	defer s.wg.Done()
+	s.trackConn(nc, true)
+	defer s.trackConn(nc, false)
 	ip := remoteIP(nc.RemoteAddr())
 	if !s.lim.acquireConn(ip) {
 		nc.Close()
@@ -491,42 +507,4 @@ func rejectWithMessage(chans <-chan ssh.NewChannel, msg string) {
 			return
 		}
 	}
-}
-
-// sweepLimiter 每分钟清扫一次限流表，直到 ctx 结束。
-func (s *Server) sweepLimiter(ctx context.Context) {
-	t := time.NewTicker(limiterSweepEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.lim.sweep(s.d.Clock.Now())
-		}
-	}
-}
-
-// runLoops：Task 11 填充扫描与刷新；本任务只等待 ctx 结束。
-func (s *Server) runLoops(ctx context.Context) { <-ctx.Done() }
-
-// drain：最多等 DrainTimeout 让会话自然结束，然后强制断开剩余会话。
-func (s *Server) drain() {
-	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-		return
-	case <-time.After(s.cfg.DrainTimeout):
-	}
-	s.mu.Lock()
-	all := make([]*session, 0, len(s.sessions))
-	for x := range s.sessions {
-		all = append(all, x)
-	}
-	s.mu.Unlock()
-	for _, x := range all {
-		x.disconnect("网关正在重启，连接已断开")
-	}
-	<-done
 }

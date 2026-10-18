@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wechatpay-apiv3/wechatpay-go/utils"
+	"golang.org/x/crypto/ssh"
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/adminapi"
@@ -34,6 +35,7 @@ import (
 	"spark-cloud/internal/plugins/pdu"
 	"spark-cloud/internal/plugins/sms"
 	"spark-cloud/internal/rental"
+	"spark-cloud/internal/sshgw"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
 )
@@ -70,9 +72,14 @@ type App struct {
 
 	Gateway *agentgw.Server // Agent 网关（gRPC，mTLS）；由 cmd/platform 在 SPARK_AGENT_ADDR 上监听
 	CA      *pki.CA
+
+	SSH            *sshgw.Server // SSH 网关；由 cmd/platform 在 SPARK_SSH_ADDR 上监听
+	SSHHostKey     ssh.Signer
+	UpstreamSigner ssh.Signer
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
+	cfg = cfg.FillAccessDefaults() // 测试里的 Config 字面量没有接入层字段
 	if opt.DisableRateLimits && cfg.Env == "prod" {
 		return nil, errors.New("生产环境禁止关闭速率限制")
 	}
@@ -137,7 +144,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	f := fleet.NewService(pool, clk)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
-		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f,
+		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
 		Notifier: expiryNotifier{ids: ids, sms: smsSender},
 	})
 	providers := opt.Pay
@@ -166,14 +173,32 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy,
 	}
-	upstreamPub, err := upstreamPublicKey(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
+	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
 	if err != nil {
 		return nil, err
+	}
+	upstreamPub, err := pki.LoadUpstreamPublicKey(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取上游 SSH 密钥: %w", err)
+	}
+	upstreamSigner, err := pki.LoadUpstreamSigner(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取上游 SSH 密钥: %w", err)
 	}
 	// 证书有效期按墙上时钟（对端按真实时间校验）；注入的假时钟若领先真实时间，会签出尚未生效的 CA。
 	ca, err := pki.EnsureCA(context.Background(), pool, box, clock.Real{})
 	if err != nil {
 		return nil, fmt.Errorf("初始化内置 CA: %w", err)
+	}
+	sshHostKey, err := pki.EnsureSSHHostKey(context.Background(), pool, box)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 SSH 网关主机密钥: %w", err)
+	}
+	sshSrv, err := sshgw.New(sshgw.Config{HostKey: sshHostKey, Upstream: upstreamSigner, UpstreamPort: cfg.UpstreamSSHPort,
+		MaxSessionsPerInstance: cfg.SSHMaxSessions, DrainTimeout: cfg.SSHDrainTimeout, DisableRateLimits: opt.DisableRateLimits},
+		sshgw.Deps{Store: r, Keys: ids, Clock: clk, Log: log})
+	if err != nil {
+		return nil, err
 	}
 	enrollLimit := 0
 	if opt.DisableRateLimits {
@@ -193,11 +218,11 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit,
 	}
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router(),
-		Gateway: gw, CA: ca}, nil
+		Gateway: gw, CA: ca, SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner}, nil
 }
 
-// upstreamPublicKey 读取平台登录容器用的上游公钥；非生产环境未配置时自动在临时目录生成并打印路径。
-func upstreamPublicKey(cfg config.Config, log *slog.Logger) (string, error) {
+// upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。
+func upstreamKeyPath(cfg config.Config, log *slog.Logger) (string, error) {
 	path := cfg.UpstreamSSHKeyFile
 	if path == "" {
 		if cfg.Env == "prod" {
@@ -209,11 +234,7 @@ func upstreamPublicKey(cfg config.Config, log *slog.Logger) (string, error) {
 		}
 		log.Warn("SPARK_UPSTREAM_SSH_KEY_FILE 未设置，已生成临时上游 SSH 密钥（仅开发环境）", "path", path)
 	}
-	pub, err := pki.LoadUpstreamPublicKey(path)
-	if err != nil {
-		return "", fmt.Errorf("读取上游 SSH 密钥: %w", err)
-	}
-	return pub, nil
+	return path, nil
 }
 
 func aliyunClient(cfg config.Config, endpoint string) *aliyun.Client {
