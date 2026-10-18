@@ -136,12 +136,21 @@ func (a *Auth) ValidCookieWith(r *http.Request, instanceID string, port int, acc
 	return Claims{}, false
 }
 
+// sameInstanceOrigin：Sec-Fetch-Site 为 same-origin / none，或（无该头时）Origin 等于本实例的 origin（从配置推导 scheme 与端口）。
+func (a *Auth) sameInstanceOrigin(r *http.Request, instanceID string, port int) bool {
+	if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" {
+		return sfs == "same-origin" || sfs == "none"
+	}
+	origin := r.Header.Get("Origin")
+	return origin != "" && origin == strings.TrimSuffix(a.PortURL(instanceID, port), "/")
+}
+
 // HandleCallback：验票据（必须与当前 Host 的实例 / 端口一致）→ 发 Cookie → 302 到 next。
 func (a *Auth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer") // 票据在 URL 里，不外传
 	id, port, ok := ParseHost(r.Host, a.IngressDomain)
 	if !ok {
-		WritePage(w, http.StatusNotFound, "页面不存在", PageNotOpen, 0)
+		WritePage(w, http.StatusNotFound, "页面不存在", PageNotFound, 0)
 		return
 	}
 	claims, err := a.Signer.VerifyTicket(r.URL.Query().Get("ticket"))
@@ -155,10 +164,20 @@ func (a *Auth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleLogout：POST 清 Cookie（GET 可被任意页面触发，拒绝）。
+// 只接受本实例页面发起的请求：有 Sec-Fetch-Site → 只放 same-origin / none；没有它 → Origin 必须等于本实例 origin；否则 403，不动 Cookie。
 func (a *Auth) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	id, port, ok := ParseHost(r.Host, a.IngressDomain)
+	if !ok {
+		WritePage(w, http.StatusNotFound, "页面不存在", PageNotFound, 0)
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
 		WritePage(w, http.StatusMethodNotAllowed, "方法不允许", "请用 POST 退出", 0)
+		return
+	}
+	if !a.sameInstanceOrigin(r, id, port) {
+		WritePage(w, http.StatusForbidden, "无法访问", "退出请求必须来自本实例页面", 0)
 		return
 	}
 	a.setCookie(w, "", -1)

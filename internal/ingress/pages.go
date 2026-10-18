@@ -10,6 +10,7 @@ import (
 
 const (
 	PageNotOpen       = "该端口未开放"
+	PageNotFound      = "该地址不存在"
 	PageUpstreamFmt   = "无法连接到实例端口，请确认服务已在容器内监听 %d"
 	PageForbidden     = "无权访问该实例"
 	PageBadTarget     = "跳转目标不正确"

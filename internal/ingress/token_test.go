@@ -138,3 +138,47 @@ func TestCookieLifetime(t *testing.T) {
 		t.Fatalf("expired cookie = %v", err)
 	}
 }
+
+// 过期边界：exp 前一刻可用、到 exp 即拒；nonce 清理按秒节流，但重放判定不受清理时机影响。
+func TestTicketExpiryEdgeAndPruneThrottle(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(t0)
+	s := ingress.NewSigner(secret, clk)
+	c := ingress.Claims{InstanceID: "ins-a1b2c3d4", Port: 8888, UserID: 7, SessionHash: "h"}
+	edge := s.Ticket(c) // exp = t0+60s
+	late := s.Ticket(c)
+	for i := 0; i < 10; i++ {
+		if _, err := s.VerifyTicket(s.Ticket(c)); err != nil { // 10 个已用 nonce，exp = t0+60s
+			t.Fatal(err)
+		}
+	}
+	clk.Advance(ingress.TicketTTL - 500*time.Millisecond) // t0+59.5s：仍有效
+	if _, err := s.VerifyTicket(edge); err != nil {
+		t.Fatalf("just before exp = %v", err)
+	}
+	clk.Advance(400 * time.Millisecond) // t0+59.9s：距上次清理 < 1s，不清理；重放仍被拒
+	if _, err := s.VerifyTicket(edge); !errors.Is(err, ingress.ErrToken) {
+		t.Fatalf("replay before exp = %v", err)
+	}
+	clk.Advance(100 * time.Millisecond) // t0+60s：恰好到期
+	if _, err := s.VerifyTicket(late); !errors.Is(err, ingress.ErrToken) {
+		t.Fatalf("at exp = %v", err)
+	}
+	fresh := s.Ticket(c)
+	if _, err := s.VerifyTicket(fresh); err != nil { // t0+60s，距上次清理 0.5s：已过期的 11 个 nonce 尚未清理
+		t.Fatal(err)
+	}
+	if n := ingress.UsedNonces(s); n != 12 {
+		t.Fatalf("within prune interval nonce store = %d, want 12", n)
+	}
+	clk.Advance(time.Second) // 距上次清理 ≥ 1s：清理过期 nonce，未过期的保留
+	if _, err := s.VerifyTicket(s.Ticket(c)); err != nil {
+		t.Fatal(err)
+	}
+	if n := ingress.UsedNonces(s); n != 2 {
+		t.Fatalf("after prune nonce store = %d, want 2", n)
+	}
+	if _, err := s.VerifyTicket(fresh); !errors.Is(err, ingress.ErrToken) {
+		t.Fatalf("replay after prune = %v", err)
+	}
+}

@@ -40,8 +40,12 @@ type Signer struct {
 	cookieKey []byte
 	clk       clock.Clock
 	mu        sync.Mutex
-	used      map[string]time.Time // 已用 nonce → 票据过期时间；过期即删除，大小以 60 秒内签发的票据数为上限
+	used      map[string]time.Time // 已用 nonce → 票据过期时间；过期后清理，大小以约 61 秒内验证的票据数为上限
+	lastPrune time.Time
 }
+
+// noncePruneInterval：清理过期 nonce 的最小间隔。未清理的过期 nonce 不影响正确性（其票据已因过期被 verify 拒绝）。
+const noncePruneInterval = time.Second
 
 func derive(secret []byte, info string) []byte {
 	key, err := hkdf.Key(sha256.New, secret, nil, info, 32)
@@ -95,7 +99,8 @@ func (s *Signer) Ticket(c Claims) string {
 	return sign(s.ticketKey, c)
 }
 
-// VerifyTicket 验签 + 未过期 + nonce 未用过。用过的 nonce 保留到票据过期（之后票据本身已因过期被拒），过期的 nonce 每次验证时清理。
+// VerifyTicket 验签 + 未过期 + nonce 未用过。用过的 nonce 至少保留到票据过期（之后票据本身已因过期被拒）；
+// 过期 nonce 在验证时顺带清理，每秒最多一次（按注入的时钟）。
 func (s *Signer) VerifyTicket(tok string) (Claims, error) {
 	now := s.clk.Now()
 	c, err := verify(s.ticketKey, tok, now)
@@ -104,10 +109,13 @@ func (s *Signer) VerifyTicket(tok string) (Claims, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for n, exp := range s.used {
-		if !now.Before(exp) {
-			delete(s.used, n)
+	if now.Sub(s.lastPrune) >= noncePruneInterval {
+		for n, exp := range s.used {
+			if !now.Before(exp) {
+				delete(s.used, n)
+			}
 		}
+		s.lastPrune = now
 	}
 	if _, dup := s.used[c.Nonce]; dup {
 		return Claims{}, ErrToken

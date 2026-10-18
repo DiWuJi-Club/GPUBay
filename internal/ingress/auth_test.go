@@ -159,9 +159,11 @@ func TestCallbackSetsCookieAndLogoutClearsIt(t *testing.T) {
 	if _, ok := a.ValidCookie(req3, "ins-zzzzzzzz", 8888); ok {
 		t.Fatal("cookie for other instance accepted")
 	}
-	// logout：POST 清 Cookie，GET 405
+	// logout：同源 POST 清 Cookie，GET 405（来源校验见 TestLogoutOriginCheck）
 	rec4 := httptest.NewRecorder()
-	a.HandleLogout(rec4, httptest.NewRequest("POST", "http://ins-a1b2c3d4-8888.spark.test:18080/.spark/logout", nil))
+	logoutReq := httptest.NewRequest("POST", "http://ins-a1b2c3d4-8888.spark.test:18080/.spark/logout", nil)
+	logoutReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	a.HandleLogout(rec4, logoutReq)
 	if c := cookieFrom(rec4); rec4.Code != 200 || c == nil || c.MaxAge >= 0 || c.Path != "/" {
 		t.Fatalf("logout = %d cookie=%+v", rec4.Code, c)
 	}
@@ -200,8 +202,8 @@ func TestCallbackHostSpoofing(t *testing.T) {
 		req.Host = host
 		rec := httptest.NewRecorder()
 		a.HandleCallback(rec, req)
-		if rec.Code != 404 || cookieFrom(rec) != nil {
-			t.Fatalf("host %s → %d", host, rec.Code)
+		if rec.Code != 404 || cookieFrom(rec) != nil || !strings.Contains(rec.Body.String(), ingress.PageNotFound) || strings.Contains(rec.Body.String(), ingress.PageNotOpen) {
+			t.Fatalf("host %s → %d %s", host, rec.Code, rec.Body.String())
 		}
 	}
 }
@@ -248,5 +250,63 @@ func TestValidCookieBinding(t *testing.T) {
 	clk.Advance(ingress.CookieTTL + time.Second)
 	if _, ok := a.ValidCookie(req(ckA), "ins-a1b2c3d4", 8888); ok {
 		t.Fatal("expired cookie accepted")
+	}
+}
+
+// logout 来源校验：Sec-Fetch-Site 只放 same-origin / none；无该头时 Origin 必须等于本实例 origin；否则 403 且不动 Cookie。
+func TestLogoutOriginCheck(t *testing.T) {
+	a := newAuth(t, "http://spark.test:18080", "spark.test", false)
+	const self = "http://ins-a1b2c3d4-8888.spark.test:18080"
+	cases := []struct {
+		name, sfs, origin string
+		want              int
+	}{
+		{"sfs same-origin", "same-origin", "", 200},
+		{"sfs none", "none", "", 200},
+		{"sfs same-origin wins over bad origin", "same-origin", "http://evil.test", 200},
+		{"sfs same-site (sibling instance)", "same-site", self, 403},
+		{"sfs cross-site", "cross-site", self, 403},
+		{"origin equal", "", self, 200},
+		{"origin sibling instance", "", "http://ins-zzzzzzzz-8888.spark.test:18080", 403},
+		{"origin other port of instance", "", "http://ins-a1b2c3d4-7860.spark.test:18080", 403},
+		{"origin wrong scheme", "", "https://ins-a1b2c3d4-8888.spark.test:18080", 403},
+		{"origin missing listen port", "", "http://ins-a1b2c3d4-8888.spark.test", 403},
+		{"origin console", "", "http://spark.test:18080", 403},
+		{"origin null", "", "null", 403},
+		{"neither header", "", "", 403},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", self+"/.spark/logout", nil)
+			if c.sfs != "" {
+				req.Header.Set("Sec-Fetch-Site", c.sfs)
+			}
+			if c.origin != "" {
+				req.Header.Set("Origin", c.origin)
+			}
+			rec := httptest.NewRecorder()
+			a.HandleLogout(rec, req)
+			ck := cookieFrom(rec)
+			if rec.Code != c.want || (c.want == 200) != (ck != nil && ck.MaxAge < 0) {
+				t.Fatalf("code = %d cookie = %+v, want %d", rec.Code, ck, c.want)
+			}
+		})
+	}
+	// 默认端口：prod origin 不带端口
+	prod := newAuth(t, "https://spark.example", "sparkapp.example", true)
+	req := httptest.NewRequest("POST", "https://ins-a1b2c3d4-80.sparkapp.example/.spark/logout", nil)
+	req.Header.Set("Origin", "https://ins-a1b2c3d4-80.sparkapp.example")
+	rec := httptest.NewRecorder()
+	prod.HandleLogout(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("prod origin = %d", rec.Code)
+	}
+	// 非实例 Host → 404 页
+	req = httptest.NewRequest("POST", "http://spark.test:18080/.spark/logout", nil)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	rec = httptest.NewRecorder()
+	a.HandleLogout(rec, req)
+	if rec.Code != 404 || cookieFrom(rec) != nil || !strings.Contains(rec.Body.String(), ingress.PageNotFound) {
+		t.Fatalf("non-instance host logout = %d", rec.Code)
 	}
 }
