@@ -88,12 +88,12 @@ func TestInspectListAndVeth(t *testing.T) {
 	r.Stub("docker inspect --type container --format {{json .}} ins-a",
 		`{"State":{"Running":true,"Pid":4242},"Config":{"Image":"nvcr.io/x:1","Labels":{"spark.instance":"ins-a"}},"Mounts":[{"Destination":"/root/data","Source":"/var/lib/spark-agent/mnt/ins-a"},{"Destination":"/.spark","Source":"/x"}]}`, nil)
 	c, err = rt.Inspect(ctx, "ins-a")
-	if err != nil || !c.Exists || !c.Running || c.Image != "nvcr.io/x:1" || c.Label != "ins-a" || !c.DataMounted || c.Pid != 4242 {
+	if err != nil || !c.Exists || !c.Running || c.Image != "nvcr.io/x:1" || c.Label != "ins-a" || !c.DataMounted || c.DataSource != "/var/lib/spark-agent/mnt/ins-a" || c.Pid != 4242 {
 		t.Fatalf("inspect = %+v %v", c, err)
 	}
 	r.Stub("docker inspect --type container --format {{json .}} ins-b", `{"State":{"Running":false},"Config":{"Image":"img","Labels":{}},"Mounts":[]}`, nil)
 	c, _ = rt.Inspect(ctx, "ins-b")
-	if c.DataMounted || c.Label != "" || c.Running {
+	if c.DataMounted || c.DataSource != "" || c.Label != "" || c.Running {
 		t.Fatalf("inspect b = %+v", c)
 	}
 	r.Stub("docker inspect --type container --format {{json .}} ins-err", "", errors.New("docker daemon down"))

@@ -122,6 +122,7 @@ func (r *Runtime) Inspect(ctx context.Context, id string) (runtime.Container, er
 	for _, m := range d.Mounts {
 		if m.Destination == "/root/data" {
 			c.DataMounted = true
+			c.DataSource = m.Source
 		}
 	}
 	return c, nil

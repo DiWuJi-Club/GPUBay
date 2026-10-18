@@ -20,7 +20,7 @@ func TestFakeRuntimeLifecycle(t *testing.T) {
 		t.Fatal("duplicate create must conflict")
 	}
 	c, _ := rt.Inspect(ctx, "ins-a")
-	if !c.Exists || c.Running || c.Image != "img:1" || c.Label != "ins-a" || !c.DataMounted {
+	if !c.Exists || c.Running || c.Image != "img:1" || c.Label != "ins-a" || !c.DataMounted || c.DataSource != "/mnt/ins-a" {
 		t.Fatalf("created = %+v", c)
 	}
 	_ = rt.Start(ctx, "ins-a")
@@ -32,8 +32,12 @@ func TestFakeRuntimeLifecycle(t *testing.T) {
 		t.Fatal("exit ignored")
 	}
 	rt.SetDataMounted("ins-a", false)
-	if c, _ = rt.Inspect(ctx, "ins-a"); c.DataMounted {
+	if c, _ = rt.Inspect(ctx, "ins-a"); c.DataMounted || c.DataSource != "" {
 		t.Fatal("data mount flag")
+	}
+	rt.SetDataSource("ins-a", "/elsewhere")
+	if c, _ = rt.Inspect(ctx, "ins-a"); !c.DataMounted || c.DataSource != "/elsewhere" {
+		t.Fatalf("data source = %+v", c)
 	}
 	rt.FailNext("start", errors.New("boom"))
 	if err := rt.Start(ctx, "ins-a"); err == nil || err.Error() != "boom" {

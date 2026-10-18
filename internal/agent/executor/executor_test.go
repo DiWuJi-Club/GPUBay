@@ -89,7 +89,7 @@ func TestCreateHappyPath(t *testing.T) {
 		t.Fatalf("authorized_keys = %q", ak)
 	}
 	init, _ := os.ReadFile(filepath.Join(ssh, "init.sh"))
-	for _, want := range []string{"#!/bin/sh", "HostKey /.spark/hostkeys/ssh_host_ed25519_key", "AuthorizedKeysFile /.spark/authorized_keys", "StrictModes no", "PasswordAuthentication no", "PermitRootLogin prohibit-password", "exec /usr/sbin/sshd -D -e"} {
+	for _, want := range []string{"#!/bin/sh", "HostKey /.spark/hostkeys/ssh_host_ed25519_key", "AuthorizedKeysFile /.spark/authorized_keys", "StrictModes no", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitRootLogin prohibit-password", "exec /usr/sbin/sshd -D -e"} {
 		if !strings.Contains(string(init), want) {
 			t.Fatalf("init.sh missing %q:\n%s", want, init)
 		}
@@ -329,12 +329,17 @@ func runtimeSpec(id, image string) runtime.Spec {
 type countingRuntime struct {
 	*rtfake.Runtime
 	creates atomic.Int32
+	mu      sync.Mutex
+	spec    runtime.Spec // 最近一次 Create 的规格
 	entered chan struct{}
 	release chan struct{}
 }
 
 func (r *countingRuntime) Create(ctx context.Context, s runtime.Spec) error {
 	r.creates.Add(1)
+	r.mu.Lock()
+	r.spec = s
+	r.mu.Unlock()
 	if r.entered != nil {
 		r.entered <- struct{}{}
 		<-r.release
@@ -482,5 +487,71 @@ func TestMountCheckErrorsAndDataBindAreEnforced(t *testing.T) {
 	res = e.run(executor.Command{ID: "cmd-start-2", InstanceID: "ins-aaaaaaaa", Type: "start_instance"})
 	if res[0].OK || !strings.HasPrefix(res[0].Message, "数据盘未挂载") || e.rt.Containers()["ins-aaaaaaaa"].Running {
 		t.Fatalf("start without data bind = %+v", res[0])
+	}
+}
+
+func TestRecoverMountsStoppedInstances(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"), executor.Command{ID: "cmd-stop", InstanceID: "ins-aaaaaaaa", Type: "stop_instance"})
+	// 重启：挂载丢失；期望 stopped 的实例也要挂上，否则会被误报 missing_data
+	e.disk.Unmount("ins-aaaaaaaa")
+	if err := e.ex.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, mounted := e.disk.State("ins-aaaaaaaa"); !mounted || e.rt.Containers()["ins-aaaaaaaa"].Running || e.phases()["ins-aaaaaaaa"] != "stopped" {
+		t.Fatalf("recover stopped: mounted=%v phases=%v", mounted, e.phases())
+	}
+}
+
+func TestDataBindMustBeOwnDisk(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	_ = e.rt.Stop(context.Background(), "ins-aaaaaaaa")
+	// /root/data 绑到了别处 → 拒绝启动
+	e.rt.SetDataSource("ins-aaaaaaaa", "/fake/mnt/ins-bbbbbbbb")
+	res := e.run(executor.Command{ID: "cmd-start", InstanceID: "ins-aaaaaaaa", Type: "start_instance"})
+	if res[0].OK || !strings.HasPrefix(res[0].Message, "数据盘未挂载") || e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatalf("start with foreign data bind = %+v", res[0])
+	}
+	// create 重跑时不复用，删掉按正确来源重建
+	cmd := create("ins-aaaaaaaa")
+	cmd.ID = "cmd-2"
+	res = e.run(cmd)
+	c := e.rt.Containers()["ins-aaaaaaaa"]
+	if !res[0].OK || !c.Running || c.DataSource != e.disk.MountDir("ins-aaaaaaaa") {
+		t.Fatalf("recreate = %+v container=%+v", res[0], c)
+	}
+}
+
+func TestCreateRejectsEmptyUpstreamKey(t *testing.T) {
+	e := newEnv(t)
+	cmd := create("ins-aaaaaaaa")
+	cmd.UpstreamPubKey = "  "
+	res := e.run(cmd)
+	if res[0].OK || !strings.Contains(res[0].Message, "上游 SSH 公钥") || len(e.rt.Containers()) != 0 {
+		t.Fatalf("empty key = %+v containers=%d", res[0], len(e.rt.Containers()))
+	}
+	if created, _ := e.disk.State("ins-aaaaaaaa"); created {
+		t.Fatal("disk created despite missing key")
+	}
+}
+
+func TestContainerMemoryAndShmLimits(t *testing.T) {
+	for _, tc := range []struct{ mem, wantMem, wantShm uint64 }{
+		{128 << 30, 120 << 30, 64 << 30},
+		{12 << 30, 4 << 30, 4 << 30}, // shm = 6GiB 超过内存上限 4GiB → 封顶
+	} {
+		e := newEnv(t)
+		cr := &countingRuntime{Runtime: e.rt}
+		ex := executor.New(executor.Deps{Log: quiet, Runtime: cr, Disk: e.disk, Net: e.net, State: e.st, StateDir: e.dir,
+			LocalIPs: func() []string { return []string{"192.168.1.221"} }, MemTotal: func() uint64 { return tc.mem }}, true)
+		ex.SetConfig(e.ex.Config())
+		ex.Submit(create("ins-aaaaaaaa"))
+		if res := ex.RunPending(context.Background(), nil); !res[0].OK {
+			t.Fatalf("create = %+v", res[0])
+		}
+		if cr.spec.MemoryBytes != int64(tc.wantMem) || cr.spec.ShmBytes != int64(tc.wantShm) {
+			t.Fatalf("mem %d: spec memory=%d shm=%d", tc.mem, cr.spec.MemoryBytes, cr.spec.ShmBytes)
+		}
 	}
 }

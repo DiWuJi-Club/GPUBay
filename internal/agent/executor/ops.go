@@ -33,9 +33,11 @@ func (e *Executor) spec(c Command, cfg Config) (runtime.Spec, error) {
 	if mem <= HostReserveBytes {
 		return runtime.Spec{}, fmt.Errorf("无法确定机器内存（读到 %d 字节）", mem)
 	}
+	memLimit := mem - HostReserveBytes
+	shm := min(mem/2, memLimit) // /dev/shm 计入容器内存，不能超过内存上限
 	return runtime.Spec{InstanceID: c.InstanceID, ImageRef: c.ImageRef, LanIP: cfg.LanIP, SSHPort: c.SSHPort, DNS: cfg.DNS,
 		SSHDir: e.sshDir(c.InstanceID), DataDir: e.d.Disk.MountDir(c.InstanceID),
-		MemoryBytes: int64(mem - HostReserveBytes), ShmBytes: int64(mem / 2)}, nil
+		MemoryBytes: int64(memLimit), ShmBytes: int64(shm)}, nil
 }
 
 // create 的每一步都先自检：Agent 在任意一步重启后整条重跑也不会出错。
@@ -52,6 +54,9 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 	}
 	if c.SSHPort <= 0 {
 		c.SSHPort = 2222
+	}
+	if strings.TrimSpace(c.UpstreamPubKey) == "" {
+		return errors.New("缺少上游 SSH 公钥")
 	}
 	if !slices.Contains(e.d.LocalIPs(), cfg.LanIP) {
 		return fmt.Errorf("内网 IP 不匹配：本机没有地址 %s", cfg.LanIP)
@@ -91,7 +96,7 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 	if err != nil {
 		return err
 	}
-	if cur.Exists && !(cur.Label == c.InstanceID && cur.Image == c.ImageRef && cur.DataMounted) {
+	if cur.Exists && !(cur.Label == c.InstanceID && cur.Image == c.ImageRef && e.ownDataBind(cur, c.InstanceID)) {
 		if err := e.d.Runtime.Remove(ctx, c.InstanceID); err != nil {
 			return err
 		}
@@ -126,8 +131,8 @@ func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error 
 	if !c.Exists {
 		return fmt.Errorf("容器 %s 不存在", inst.ID)
 	}
-	if !c.DataMounted {
-		return fmt.Errorf("数据盘未挂载：容器 %s 没有绑定 /root/data", inst.ID)
+	if !e.ownDataBind(c, inst.ID) {
+		return fmt.Errorf("数据盘未挂载：容器 %s 的 /root/data 来源是 %q，期望 %s", inst.ID, c.DataSource, e.d.Disk.MountDir(inst.ID))
 	}
 	if err := e.d.Runtime.Start(ctx, inst.ID); err != nil {
 		return err
@@ -141,6 +146,11 @@ func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error 
 		return fmt.Errorf("查找容器网卡失败: %w", err)
 	}
 	return e.d.Net.Limit(ctx, veth, inst.BandwidthMbps)
+}
+
+// ownDataBind：容器的 /root/data 绑定的是该实例自己的数据盘挂载点。
+func (e *Executor) ownDataBind(c runtime.Container, id string) bool {
+	return c.DataMounted && filepath.Clean(c.DataSource) == filepath.Clean(e.d.Disk.MountDir(id))
 }
 
 func (e *Executor) start(ctx context.Context, id string) error {
@@ -254,7 +264,8 @@ func (e *Executor) DataMount() string {
 	return e.d.Disk.MountDir(insts[0].ID)
 }
 
-// Recover 宿主机重启后：网桥与规则 → 对期望 running 的实例先挂载数据盘、校验、再启动；任一失败只记录并继续。
+// Recover 宿主机重启后：网桥与规则 → 挂载本地记录里全部实例的数据盘（期望 stopped 的也挂，否则会被误报 missing_data）
+// → 只对期望 running 的实例校验后启动；任一失败只记录并继续。
 // 隔离规则失败时 fail closed：一个租户容器都不启动（保持停止，StateReport 如实上报，平台据此告警），
 // 并记下 recoverBlocked，由 Run 在规则刷新成功后重试。
 func (e *Executor) Recover(ctx context.Context) error {
@@ -270,11 +281,11 @@ func (e *Executor) Recover(ctx context.Context) error {
 	}
 	blocked := false
 	for _, inst := range e.d.State.Instances() {
-		if inst.Desired != "running" {
-			continue
-		}
 		if err := e.d.Disk.Mount(ctx, inst.ID); err != nil {
 			errs = append(errs, fmt.Errorf("instance %s: 数据盘未挂载：%w", inst.ID, err))
+			continue
+		}
+		if inst.Desired != "running" {
 			continue
 		}
 		if rulesErr != nil {

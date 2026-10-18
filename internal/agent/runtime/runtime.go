@@ -21,6 +21,7 @@ type Container struct {
 	Image       string
 	Label       string // spark.instance 标签值
 	DataMounted bool   // /root/data 有挂载
+	DataSource  string // /root/data 的宿主机来源目录（应为该实例自己的数据盘挂载点）
 	Pid         int
 }
 
@@ -32,7 +33,7 @@ type Runtime interface {
 	Stop(ctx context.Context, id string) error
 	Remove(ctx context.Context, id string) error
 	Inspect(ctx context.Context, id string) (Container, error)
-	// List 只填 Exists/Running/Image/Label；Pid、DataMounted 为零值，需要时用 Inspect。
+	// List 只填 Exists/Running/Image/Label；Pid、DataMounted、DataSource 为零值，需要时用 Inspect。
 	List(ctx context.Context) ([]Container, error)
 	VethOf(ctx context.Context, id string) (string, error)
 }

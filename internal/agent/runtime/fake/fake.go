@@ -65,7 +65,7 @@ func (r *Runtime) Create(_ context.Context, s runtime.Spec) error {
 	if _, ok := r.containers[s.InstanceID]; ok {
 		return fmt.Errorf("Conflict. The container name %q is already in use", s.InstanceID)
 	}
-	r.containers[s.InstanceID] = &entry{c: runtime.Container{Exists: true, Image: s.ImageRef, Label: s.InstanceID, DataMounted: s.DataDir != "", Pid: 4242}}
+	r.containers[s.InstanceID] = &entry{c: runtime.Container{Exists: true, Image: s.ImageRef, Label: s.InstanceID, DataMounted: s.DataDir != "", DataSource: s.DataDir, Pid: 4242}}
 	return nil
 }
 
@@ -165,6 +165,19 @@ func (r *Runtime) SetDataMounted(id string, mounted bool) {
 	defer r.mu.Unlock()
 	if e, ok := r.containers[id]; ok {
 		e.c.DataMounted = mounted
+		if !mounted {
+			e.c.DataSource = ""
+		}
+	}
+}
+
+// SetDataSource 模拟 /root/data 绑定到了别的宿主机目录（例如被手工重建）。
+func (r *Runtime) SetDataSource(id, src string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.containers[id]; ok {
+		e.c.DataMounted = src != ""
+		e.c.DataSource = src
 	}
 }
 

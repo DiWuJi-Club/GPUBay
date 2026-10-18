@@ -20,6 +20,7 @@ HostKey /.spark/hostkeys/ssh_host_ed25519_key
 AuthorizedKeysFile /.spark/authorized_keys
 StrictModes no
 PasswordAuthentication no
+KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 PidFile /run/spark-sshd.pid
 EOF
