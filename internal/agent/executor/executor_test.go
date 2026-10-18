@@ -906,3 +906,110 @@ func TestRecoverRetrySkipsWhileOpInProgress(t *testing.T) {
 	unlock()
 	waitFor(t, "container running after unlock", func() bool { return e.rt.Containers()["ins-aaaaaaaa"].Running })
 }
+
+// ---- B2：发布地址缺失 / 网络挂接丢失 / veth、限速失败的 fail closed ----
+
+// startCounter 统计 Start 调用次数。
+type startCounter struct {
+	*rtfake.Runtime
+	starts atomic.Int32
+}
+
+func (r *startCounter) Start(ctx context.Context, id string) error {
+	r.starts.Add(1)
+	return r.Runtime.Start(ctx, id)
+}
+
+// ipEnv：LocalIPs 返回值可变；容器已创建并停止。
+func ipEnv(t *testing.T) (*env, *startCounter, *atomic.Value) {
+	t.Helper()
+	e := newEnv(t)
+	sc := &startCounter{Runtime: e.rt}
+	ips := &atomic.Value{}
+	ips.Store([]string{"192.168.1.221"})
+	e.ex = executor.New(executor.Deps{Log: quiet, Runtime: sc, Disk: e.disk, Net: e.net, State: e.st, StateDir: e.dir, Bridge: "spark0",
+		LocalIPs: func() []string { return ips.Load().([]string) }, MemTotal: func() uint64 { return 128 << 30 }}, true)
+	e.ex.SetConfig(executor.Config{LanIP: "192.168.1.221", DNS: []string{"223.5.5.5"}, AllowCIDRs: []string{"10.0.9.0/24"}, BandwidthMbps: 200, DataSizeGiB: 2048})
+	if res := e.run(create("ins-aaaaaaaa")); !res[0].OK {
+		t.Fatalf("create = %+v", res[0])
+	}
+	e.rt.Exit("ins-aaaaaaaa")
+	sc.starts.Store(0)
+	return e, sc, ips
+}
+
+func TestStartRefusedWhilePublishAddressMissing(t *testing.T) {
+	e, sc, ips := ipEnv(t)
+	ips.Store([]string{"127.0.0.1"}) // 重启后 WiFi 还没拿到地址
+	if err := e.ex.Recover(context.Background()); err == nil || !strings.Contains(err.Error(), "192.168.1.221") {
+		t.Fatalf("recover err = %v", err)
+	}
+	if sc.starts.Load() != 0 {
+		t.Fatal("docker start must not be called while the publish address is missing")
+	}
+	if p := executor.RecoverPendingForTest(e.ex); len(p) != 1 {
+		t.Fatalf("pending = %v", p)
+	}
+	ips.Store([]string{"127.0.0.1", "192.168.1.221"})
+	stop := e.runLimitLoop()
+	defer stop()
+	waitFor(t, "container running", func() bool { return e.rt.Containers()["ins-aaaaaaaa"].Running })
+	waitFor(t, "pending cleared", func() bool { return len(executor.RecoverPendingForTest(e.ex)) == 0 })
+}
+
+func TestStartRestoresLostNetworkAttachment(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	e.rt.Exit("ins-aaaaaaaa")
+	e.rt.SetNetworks("ins-aaaaaaaa", nil)
+	start := executor.Command{ID: "cmd-start", InstanceID: "ins-aaaaaaaa", Type: "start_instance"}
+	if res := e.run(start); !res[0].OK {
+		t.Fatalf("start = %+v", res[0])
+	}
+	c := e.rt.Containers()["ins-aaaaaaaa"]
+	if !c.Running || len(c.Networks) != 1 || c.Networks[0] != "spark0" {
+		t.Fatalf("container = %+v", c)
+	}
+}
+
+func TestStartFailsWhenNetworkReconnectFails(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	e.rt.Exit("ins-aaaaaaaa")
+	e.rt.SetNetworks("ins-aaaaaaaa", nil)
+	e.rt.FailNext("connect", errors.New("network spark0 not found"))
+	if res := e.run(executor.Command{ID: "cmd-start", InstanceID: "ins-aaaaaaaa", Type: "start_instance"}); res[0].OK {
+		t.Fatal("start must fail when network attachment cannot be restored")
+	}
+	if e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatal("must not start without network")
+	}
+}
+
+func TestStartStopsContainerWhenVethFails(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	e.rt.Exit("ins-aaaaaaaa")
+	e.rt.FailNext("veth", errors.New("Device eth0 does not exist"))
+	res := e.run(executor.Command{ID: "cmd-start", InstanceID: "ins-aaaaaaaa", Type: "start_instance"})
+	if res[0].OK || !strings.Contains(res[0].Message, "eth0") {
+		t.Fatalf("start = %+v", res[0])
+	}
+	if e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatal("container without veth must be stopped")
+	}
+}
+
+func TestStartStopsContainerWhenLimitFails(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	e.rt.Exit("ins-aaaaaaaa")
+	e.net.FailNext("limit", errors.New("tc failed"))
+	res := e.run(executor.Command{ID: "cmd-start", InstanceID: "ins-aaaaaaaa", Type: "start_instance"})
+	if res[0].OK || !strings.Contains(res[0].Message, "tc failed") {
+		t.Fatalf("start = %+v", res[0])
+	}
+	if e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatal("container without limit must be stopped")
+	}
+}

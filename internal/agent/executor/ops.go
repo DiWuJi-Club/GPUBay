@@ -134,6 +134,20 @@ func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error 
 	if !e.ownDataBind(c, inst.ID) {
 		return fmt.Errorf("数据盘未挂载：容器 %s 的 /root/data 来源是 %q，期望 %s", inst.ID, c.DataSource, e.d.Disk.MountDir(inst.ID))
 	}
+	// 预防：发布地址（LAN IP）还没配置时 docker start 会失败，且 Docker 会顺带丢掉容器的网络挂接；等地址出现再启动。
+	local := e.d.LocalIPs()
+	for _, ip := range c.PublishIPs {
+		if !slices.Contains(local, ip) {
+			return fmt.Errorf("宿主机尚未配置地址 %s，暂不启动", ip)
+		}
+	}
+	// 修复：网络挂接已丢失的容器，docker start 会成功但容器里没有网卡。
+	if !slices.Contains(c.Networks, e.d.Bridge) {
+		if err := e.d.Runtime.ConnectNetwork(ctx, inst.ID, e.d.Bridge); err != nil {
+			return fmt.Errorf("恢复容器网络挂接失败: %w", err)
+		}
+		e.d.Log.Warn("container network attachment restored", "instance", inst.ID, "network", e.d.Bridge)
+	}
 	if err := e.d.Runtime.Start(ctx, inst.ID); err != nil {
 		return err
 	}
@@ -141,11 +155,25 @@ func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error 
 	if err := e.d.State.PutInstance(inst); err != nil {
 		return err
 	}
+	// 兜底：没有网卡 / 限速的容器不能留在运行状态（限速属于租户隔离，fail closed）。
 	veth, err := e.d.Runtime.VethOf(ctx, inst.ID)
 	if err != nil {
-		return fmt.Errorf("查找容器网卡失败: %w", err)
+		err = fmt.Errorf("查找容器网卡失败: %w", err)
+		e.stopAfterFailure(ctx, inst.ID)
+		return err
 	}
-	return e.d.Net.Limit(ctx, veth, inst.BandwidthMbps)
+	if err := e.d.Net.Limit(ctx, veth, inst.BandwidthMbps); err != nil {
+		e.stopAfterFailure(ctx, inst.ID)
+		return err
+	}
+	return nil
+}
+
+// stopAfterFailure 停掉启动后检查失败的容器；Stop 本身出错只记日志，调用方仍返回原错误。
+func (e *Executor) stopAfterFailure(ctx context.Context, id string) {
+	if err := e.d.Runtime.Stop(ctx, id); err != nil {
+		e.d.Log.Error("stop container after failed start checks", "instance", id, "err", err)
+	}
 }
 
 // ownDataBind：容器的 /root/data 绑定的是该实例自己的数据盘挂载点。

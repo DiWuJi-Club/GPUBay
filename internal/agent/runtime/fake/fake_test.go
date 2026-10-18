@@ -65,3 +65,27 @@ func TestFakeRuntimeLifecycle(t *testing.T) {
 		t.Fatal("not removed")
 	}
 }
+
+func TestFakeNetworksAndPublishIPs(t *testing.T) {
+	rt := fake.New()
+	ctx := context.Background()
+	_ = rt.Create(ctx, runtime.Spec{InstanceID: "ins-a", ImageRef: "img:1", LanIP: "192.168.1.221", DataDir: "/mnt/ins-a"})
+	c, _ := rt.Inspect(ctx, "ins-a")
+	if len(c.Networks) != 1 || c.Networks[0] != "spark0" || len(c.PublishIPs) != 1 || c.PublishIPs[0] != "192.168.1.221" {
+		t.Fatalf("created = %+v", c)
+	}
+	rt.SetNetworks("ins-a", nil)
+	if c, _ = rt.Inspect(ctx, "ins-a"); len(c.Networks) != 0 {
+		t.Fatalf("networks = %v", c.Networks)
+	}
+	if err := rt.ConnectNetwork(ctx, "ins-a", "spark0"); err != nil {
+		t.Fatal(err)
+	}
+	_ = rt.ConnectNetwork(ctx, "ins-a", "spark0") // 幂等
+	if c, _ = rt.Inspect(ctx, "ins-a"); len(c.Networks) != 1 {
+		t.Fatalf("networks = %v", c.Networks)
+	}
+	if rt.ConnectNetwork(ctx, "ins-missing", "spark0") == nil {
+		t.Fatal("connect on missing container must fail")
+	}
+}

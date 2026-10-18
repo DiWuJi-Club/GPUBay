@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -101,6 +103,14 @@ type inspectDoc struct {
 		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
+	HostConfig struct {
+		PortBindings map[string][]struct {
+			HostIp string `json:"HostIp"`
+		} `json:"PortBindings"`
+	} `json:"HostConfig"`
+	NetworkSettings struct {
+		Networks map[string]json.RawMessage `json:"Networks"`
+	} `json:"NetworkSettings"`
 	Mounts []struct {
 		Destination string `json:"Destination"`
 		Source      string `json:"Source"`
@@ -126,7 +136,25 @@ func (r *Runtime) Inspect(ctx context.Context, id string) (runtime.Container, er
 			c.DataSource = m.Source
 		}
 	}
+	for name := range d.NetworkSettings.Networks {
+		c.Networks = append(c.Networks, name)
+	}
+	sort.Strings(c.Networks)
+	for _, bs := range d.HostConfig.PortBindings {
+		for _, b := range bs {
+			if b.HostIp != "" && !slices.Contains(c.PublishIPs, b.HostIp) {
+				c.PublishIPs = append(c.PublishIPs, b.HostIp)
+			}
+		}
+	}
+	sort.Strings(c.PublishIPs)
 	return c, nil
+}
+
+// ConnectNetwork：启动失败（如发布地址不存在）后 Docker 会丢掉容器的网络挂接，需手动接回。
+func (r *Runtime) ConnectNetwork(ctx context.Context, id, network string) error {
+	_, err := r.Run.Run(ctx, "docker", "network", "connect", network, id)
+	return err
 }
 
 type psDoc struct {

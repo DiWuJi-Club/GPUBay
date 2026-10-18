@@ -162,3 +162,31 @@ func TestCreateRejectsInvalidSpec(t *testing.T) {
 		}
 	}
 }
+
+// 真机 B2 现场：启动失败后 Docker 清空了网络挂接，HostConfig 里的网络与端口绑定仍在。
+func TestInspectNetworksAndPublishIPs(t *testing.T) {
+	rt, r := newRT()
+	ctx := context.Background()
+	r.Stub("docker inspect --type container --format {{json .}} ins-lost",
+		`{"State":{"Running":false},"Config":{"Image":"img","Labels":{}},"Mounts":[],"HostConfig":{"NetworkMode":"spark0","PortBindings":{"22/tcp":[{"HostIp":"192.168.1.221","HostPort":"2222"}]}},"NetworkSettings":{"Networks":{},"Ports":{}}}`, nil)
+	c, err := rt.Inspect(ctx, "ins-lost")
+	if err != nil || len(c.Networks) != 0 || len(c.PublishIPs) != 1 || c.PublishIPs[0] != "192.168.1.221" {
+		t.Fatalf("lost = %+v %v", c, err)
+	}
+	r.Stub("docker inspect --type container --format {{json .}} ins-ok",
+		`{"State":{"Running":true},"Config":{"Image":"img","Labels":{}},"Mounts":[],"HostConfig":{"PortBindings":{"22/tcp":[{"HostIp":"192.168.1.221","HostPort":"2222"},{"HostIp":"","HostPort":"1"}],"80/tcp":[{"HostIp":"192.168.1.221","HostPort":"80"}]}},"NetworkSettings":{"Networks":{"spark0":{"IPAddress":"10.200.0.2"}}}}`, nil)
+	c, _ = rt.Inspect(ctx, "ins-ok")
+	if len(c.Networks) != 1 || c.Networks[0] != "spark0" || len(c.PublishIPs) != 1 || c.PublishIPs[0] != "192.168.1.221" {
+		t.Fatalf("ok = %+v", c)
+	}
+}
+
+func TestConnectNetworkCommand(t *testing.T) {
+	rt, r := newRT()
+	if err := rt.ConnectNetwork(context.Background(), "ins-a", "spark0"); err != nil {
+		t.Fatal(err)
+	}
+	if r.Lines() != "docker network connect spark0 ins-a" {
+		t.Fatalf("calls:\n%s", r.Lines())
+	}
+}

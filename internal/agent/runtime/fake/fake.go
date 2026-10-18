@@ -4,6 +4,7 @@ package fake
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 
@@ -65,8 +66,50 @@ func (r *Runtime) Create(_ context.Context, s runtime.Spec) error {
 	if _, ok := r.containers[s.InstanceID]; ok {
 		return fmt.Errorf("Conflict. The container name %q is already in use", s.InstanceID)
 	}
-	r.containers[s.InstanceID] = &entry{c: runtime.Container{Exists: true, Image: s.ImageRef, Label: s.InstanceID, DataMounted: s.DataDir != "", DataSource: s.DataDir, Pid: 4242}}
+	r.containers[s.InstanceID] = &entry{c: runtime.Container{Exists: true, Image: s.ImageRef, Label: s.InstanceID, DataMounted: s.DataDir != "", DataSource: s.DataDir, Pid: 4242, Networks: []string{"spark0"}, PublishIPs: publishIPs(s.LanIP)}}
 	return nil
+}
+
+func publishIPs(ip string) []string {
+	if ip == "" {
+		return nil
+	}
+	return []string{ip}
+}
+
+// ConnectNetwork 把网络加回容器的挂接列表（已挂接则不变）。
+func (r *Runtime) ConnectNetwork(_ context.Context, id, network string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.fail("connect"); err != nil {
+		return err
+	}
+	e, ok := r.containers[id]
+	if !ok {
+		return &notFound{id}
+	}
+	if !slices.Contains(e.c.Networks, network) {
+		e.c.Networks = append(e.c.Networks, network)
+	}
+	return nil
+}
+
+// SetNetworks 直接设置容器的网络挂接（nil 模拟 Docker 启动失败后丢掉挂接）。
+func (r *Runtime) SetNetworks(id string, nets []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.containers[id]; ok {
+		e.c.Networks = nets
+	}
+}
+
+// SetPublishIPs 直接设置容器端口发布绑定的宿主机地址。
+func (r *Runtime) SetPublishIPs(id string, ips []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.containers[id]; ok {
+		e.c.PublishIPs = ips
+	}
 }
 
 func (r *Runtime) Start(_ context.Context, id string) error {
