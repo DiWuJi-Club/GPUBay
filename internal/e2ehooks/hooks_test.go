@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/e2ehooks"
+	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
@@ -37,7 +39,12 @@ func newEnv(t *testing.T) *env {
 	clk := clock.NewFake(dbtest.T0)
 	k := &e2ehooks.SwitchableKYC{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+	keyFile := filepath.Join(t.TempDir(), "upstream.key") // 显式给上游密钥，免得 dev 下 Build 在 os.TempDir() 留一把
+	if err := pki.GenerateUpstreamKey(keyFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(),
+		UpstreamSSHKeyFile: keyFile}
 	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: k, DisableRateLimits: true})
 	if err != nil {
 		t.Fatal(err)
