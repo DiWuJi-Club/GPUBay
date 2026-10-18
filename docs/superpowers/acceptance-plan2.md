@@ -4,7 +4,7 @@
 - 机器：DGX Spark `spark-3479`（GB10，内存 130660978688 字节，根分区 3.7T ext4），Ubuntu 24.04，Docker 29.6.2（GPU 走 CDI），iptables 1.8.10（nf_tables），iproute2 6.1.0，局域网地址经 WiFi DHCP 获得。
 - 平台：开发 Mac 192.168.1.218，`go run ./cmd/platform`，开发数据库 `make devdb`；Agent 安装包与二进制由 Mac 上的 `python3 -m http.server 8000` 提供。
 - 规格：`docs/superpowers/specs/2026-10-18-plan2-agent-design.md` §7.1。
-- 结论：§7.1 十一项全部通过（第 7 项第二段按裁定调整）。验收中发现 6 个缺陷（A0～A3、B1、B2），均已修复、经审查并在真机复测通过；最终 Agent 版本 f0393ac。
+- 结论：§7.1 十一项全部通过（第 7 项第二段按裁定调整）。验收中发现 6 个缺陷（A0～A3、B1、B2），均已修复、经审查并在真机复测通过。整分支审查后的修复版本见「最终版本复测」一节（重启恢复一项待测试机网络恢复后补测）。
 
 ## 1. 接入与指标（§7.1.1）——通过
 
@@ -107,6 +107,13 @@
 - `create_instance` failed：「磁盘空间不足：剩余 3526 GiB，需要 100100 GiB（数据盘 100000 GiB + 预留 100 GiB）」。
 - 实例 `failed`，余额不变（订单全额退回），机器转 `faulty`，critical 告警 `create_failed`，正文含「磁盘空间不足」。Spark 上没有留下容器与镜像文件。
 - 恢复默认配置重启平台，后台开 / 关维护后机器回到 `idle`。
+
+## 最终版本复测（Agent 367c6c2，整分支审查修复之后）
+
+- 部署（替换二进制并重启服务）后：`DOCKER-USER` / `INPUT` 跳转在第 1 位，无重建、无告警；新实例开通正常。
+- 隔离跳转位置（审查 M5）：手工 `iptables -I DOCKER-USER 1 -j RETURN`（20:33:30）→ 20:33:40 Agent 告警「iptables jump not first in chain, moving it to position 1」并把 `-i spark0 -j SPARK-FWD` 移回第 1 位。之后 5c1f785 把移动改为「先插入再按序号删除」，消除了中间无隔离的窗口（单元测试覆盖，未再上机）。
+- 重启（20:34:47）：测试机重启后连到了另一个网段（Agent 经 192.168.0.129 连入平台，192.168.1.221 不再存在）。平台立即告警 `lan_ip_mismatch`；容器端口绑定的 192.168.1.221 不存在，Agent 不调用 `docker start`（避免缺陷 B2），实例在宽限期内上报 `unknown`、不误报；10 分钟后（20:45:20）上报 `stopped` 并产生 critical `container_down`。这些行为符合设计。
+- **未完成**：由于测试机换网后从开发机无法访问，最终版本下「重启后容器自动恢复、数据保留、限速」未在真机上复测；同一恢复逻辑已在 f0393ac 上真机验证通过（§9），最终版本只在其外围增加了超时与上报 `unknown`。测试机网络恢复后补测。
 
 ## 验收中发现并修复的缺陷
 
