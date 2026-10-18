@@ -309,6 +309,9 @@ func (s *Service) Sweep(ctx context.Context) error {
 	if _, err := s.FailTimedOutCommands(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("command timeout: %w", err))
 	}
+	if _, _, err := s.ReapSSHSessions(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("ssh sessions: %w", err))
+	}
 	if _, err := s.SendReminders(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("reminders: %w", err))
 	}

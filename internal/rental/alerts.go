@@ -21,3 +21,9 @@ func AlertOrphanWipeFailed(serial, instanceID string) string {
 func AlertInvalidReport(serial string) string {
 	return fmt.Sprintf("机器 %s 上报了无法识别的实例标识", serial)
 }
+func AlertSSHBruteforce(instanceID string) string {
+	return fmt.Sprintf("实例 %s 的 SSH 登录失败次数超过阈值，详情见日志", instanceID)
+}
+func AlertUpstreamUnreachable(serial, instanceID string) string {
+	return fmt.Sprintf("机器 %s 上实例 %s 的 SSH 上游无法连接", serial, instanceID)
+}

@@ -43,11 +43,15 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 		if err != nil {
 			return err
 		}
+		hostPub, hostPEM, err := s.d.HostKeyGen()
+		if err != nil {
+			return err
+		}
 		id := randx.ID("ins-", 8)
 		moved, err = scanInstance(tx.QueryRow(ctx, `INSERT INTO instances
-			(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $8) RETURNING `+instanceCols,
-			id, old.UserID, m.ID, old.ProductID, old.ImageID, remaining, s.d.Box.Seal([]byte(randx.Password(16))), now))
+			(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, password_auth, ssh_host_pubkey, ssh_host_key_enc, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $11) RETURNING `+instanceCols,
+			id, old.UserID, m.ID, old.ProductID, old.ImageID, remaining, s.d.Box.Seal([]byte(randx.Password(16))), old.PasswordAuth, hostPub, s.d.Box.Seal(hostPEM), now))
 		if err != nil {
 			return err
 		}

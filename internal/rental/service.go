@@ -13,6 +13,7 @@ import (
 
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/db"
@@ -58,6 +59,13 @@ type Deps struct {
 	Catalog  *catalog.Service
 	Fleet    *fleet.Service
 	Notifier Notifier
+	// 计划 3
+	Keys       KeyCounter                                 // 关闭密码登录前校验用户至少有一把公钥；nil 视为 0 把
+	HostKeyGen func() (pub string, pem []byte, err error) // 实例主机密钥生成；nil → pki.GenerateInstanceHostKey
+}
+
+type KeyCounter interface {
+	CountSSHKeys(ctx context.Context, userID int64) (int, error)
 }
 
 type Service struct {
@@ -67,6 +75,9 @@ type Service struct {
 func NewService(d Deps) *Service {
 	if d.Log == nil {
 		d.Log = slog.Default()
+	}
+	if d.HostKeyGen == nil {
+		d.HostKeyGen = pki.GenerateInstanceHostKey
 	}
 	return &Service{d: d}
 }
