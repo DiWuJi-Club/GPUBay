@@ -382,17 +382,34 @@ func (s *Server) handleHeartbeat(ctx context.Context, c *conn, h *agentpb.Heartb
 }
 
 func (s *Server) handleResult(ctx context.Context, c *conn, r *agentpb.CommandResult) {
-	// 先完成指令再从已推送集合移除：反过来会让同一时刻的 tick 把仍为 sent 的指令再推一次并刷新 sent_at
-	defer func() {
-		c.unpush(r.GetCommandId())
-		s.deliveries.Delete(r.GetCommandId())
-	}()
-	err := s.d.Rental.HandleCommandResult(ctx, r.GetCommandId(), r.GetOk(), r.GetMessage())
+	id := r.GetCommandId()
+	// 流只代表一台机器：别的机器的指令结果一律忽略（不动其推送记录，也不中止本流）
+	owner, err := s.d.Fleet.CommandMachineID(ctx, s.d.Pool, id)
 	if errors.Is(err, apperr.ErrNotFound) {
-		s.d.Log.Warn("result for unknown command ignored", "machine", c.machineID, "command", r.GetCommandId())
+		s.d.Log.Warn("result for unknown command ignored", "machine", c.machineID, "command", id)
+		c.unpush(id)
+		s.deliveries.Delete(id)
 		return
 	}
 	if err != nil {
-		s.d.Log.Error("handle command result", "machine", c.machineID, "command", r.GetCommandId(), "err", err)
+		s.d.Log.Error("lookup command machine", "machine", c.machineID, "command", id, "err", err)
+		c.abort(status.Error(codes.Unavailable, "result not applied, reconnect to replay"))
+		return
 	}
+	if owner != c.machineID {
+		s.d.Log.Warn("result for another machine's command ignored", "machine", c.machineID, "command", id, "owner", owner)
+		return
+	}
+	err = s.d.Rental.HandleCommandResult(ctx, id, r.GetOk(), r.GetMessage())
+	if errors.Is(err, apperr.ErrNotFound) {
+		s.d.Log.Warn("result for unknown command ignored", "machine", c.machineID, "command", id)
+	} else if err != nil {
+		// 结果没落库：Agent 已把它标为已发送不会再发，本流也不会重推。中止流 → Agent 重连 → 重推 → 执行器从 state.json 回放结果。
+		s.d.Log.Error("handle command result", "machine", c.machineID, "command", id, "err", err)
+		c.abort(status.Error(codes.Unavailable, "result not applied, reconnect to replay"))
+		return
+	}
+	// 先完成指令再从已推送集合移除：反过来会让同一时刻的 tick 把仍为 sent 的指令再推一次并刷新 sent_at
+	c.unpush(id)
+	s.deliveries.Delete(id)
 }

@@ -94,6 +94,19 @@ func TestCommandInstanceID(t *testing.T) {
 	}
 }
 
+func TestCommandMachineID(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	mid := dbtest.CreateMachine(t, pool, "SN001")
+	id, _ := svc.Enqueue(ctx, pool, mid, "ins-abc", fleet.CmdStartInstance, nil)
+	if got, err := svc.CommandMachineID(ctx, pool, id); err != nil || got != mid {
+		t.Fatalf("CommandMachineID = %d, %v (want %d)", got, err, mid)
+	}
+	if _, err := svc.CommandMachineID(ctx, pool, "no-such-command"); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("unknown id = %v, want not found", err)
+	}
+}
+
 func TestEnqueueUnknownMachineIsBadRequest(t *testing.T) {
 	svc, pool, _ := newEnv(t)
 	_, err := svc.Enqueue(context.Background(), pool, 9999, "", fleet.CmdWipeInstance, nil)

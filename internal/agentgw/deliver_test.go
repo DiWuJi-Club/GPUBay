@@ -245,3 +245,80 @@ func TestDeliveryRecordPrunedOnResult(t *testing.T) {
 	a.result(cmdID, true, "ok")
 	e.waitFor("delivery record pruned", func() bool { _, ok := e.srv.DeliveryTick(cmdID); return !ok })
 }
+
+// 机器 A 的流发来机器 B 的指令结果：忽略（不中止 A 的流），B 的指令仍为 sent、实例状态不变。
+func TestResultForAnotherMachinesCommandIgnored(t *testing.T) {
+	e := newEnv(t)
+	ma, mb := e.machine("SN-001"), e.machine("SN-002")
+	a := e.up(e.enroll(ma), ma)
+	b := e.up(e.enroll(mb), mb)
+	_, ca := e.place(ma)
+	instB, cb := e.place(mb)
+	if got := a.next(2 * time.Second).GetCommand().GetId(); got != ca {
+		t.Fatalf("A delivery = %s", got)
+	}
+	if got := b.next(2 * time.Second).GetCommand().GetId(); got != cb {
+		t.Fatalf("B delivery = %s", got)
+	}
+	a.result(cb, false, "forged failure")
+	before := e.srv.HeartbeatCount(ma)
+	a.heartbeat(&agentpb.Metrics{Load1: 1})
+	e.waitFor("heartbeat after forged result", func() bool { return e.srv.HeartbeatCount(ma) > before })
+	if err := a.waitErr(100 * time.Millisecond); err != nil {
+		t.Fatalf("A stream dropped: %v", err)
+	}
+	if c := e.command(cb); c.Status != "sent" || c.Result != "" {
+		t.Fatalf("B command changed: %+v", c)
+	}
+	if inst, _ := e.rental.Get(e.ctx, instB); inst.State != rental.StateCreating {
+		t.Fatalf("B instance state = %s", inst.State)
+	}
+	if _, ok := e.srv.DeliveryTick(cb); !ok {
+		t.Fatal("B delivery record must be kept")
+	}
+	// B 自己的回报照常生效
+	b.result(cb, true, "ok")
+	e.waitFor("B running", func() bool { inst, _ := e.rental.Get(e.ctx, instB); return inst.State == rental.StateRunning })
+}
+
+// 网关处理回报失败（如数据库瞬时错误）：中止该流让 Agent 重连，重推后再次回报，指令最终完成。
+func TestResultApplyFailureAbortsStreamForReplay(t *testing.T) {
+	e := newEnv(t)
+	mid := e.machine("SN-001")
+	instID, cmdID := e.place(mid)
+	creds := e.enroll(mid)
+	a := e.up(creds, mid)
+	if m := a.next(2 * time.Second); m.GetCommand().GetId() != cmdID {
+		t.Fatalf("first delivery = %v", m)
+	}
+	// 故障注入：第一次把指令置为终态的 UPDATE 抛错（序列不随事务回滚，所以只失败一次）
+	for _, q := range []string{
+		`CREATE SEQUENCE inject_fail_seq`,
+		`CREATE FUNCTION inject_fail() RETURNS trigger LANGUAGE plpgsql AS $$
+		 BEGIN IF nextval('inject_fail_seq') = 1 THEN RAISE EXCEPTION 'injected failure'; END IF; RETURN NEW; END $$`,
+		`CREATE TRIGGER inject_fail BEFORE UPDATE ON agent_commands FOR EACH ROW
+		 WHEN (NEW.status IN ('done', 'failed')) EXECUTE FUNCTION inject_fail()`,
+	} {
+		if _, err := e.pool.Exec(e.ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.result(cmdID, true, "ok")
+	err := a.waitErr(2 * time.Second)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("stream must be aborted with Unavailable, got %v", err)
+	}
+	if c := e.command(cmdID); c.Status != "sent" {
+		t.Fatalf("command after failed apply = %+v", c)
+	}
+	e.waitFor("disconnected", func() bool { return !e.srv.Connected(mid) })
+	b := e.up(creds, mid)
+	if m := b.next(2 * time.Second); m.GetCommand().GetId() != cmdID {
+		t.Fatalf("re-push after reconnect = %v", m)
+	}
+	b.result(cmdID, true, "ok") // Agent 从 state.json 回放结果
+	e.waitFor("running", func() bool { inst, _ := e.rental.Get(e.ctx, instID); return inst.State == rental.StateRunning })
+	if c := e.command(cmdID); c.Status != "done" {
+		t.Fatalf("command = %+v", c)
+	}
+}

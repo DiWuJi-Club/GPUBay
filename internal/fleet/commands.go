@@ -88,6 +88,16 @@ func (s *Service) PendingCommands(ctx context.Context, machineID int64) ([]Comma
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Command, error) { return scanCommand(r) })
 }
 
+// CommandMachineID 读取指令所属机器 ID，未知指令返回 apperr.ErrNotFound（网关据此只接受本机指令的回报）。
+func (s *Service) CommandMachineID(ctx context.Context, q db.Querier, id string) (int64, error) {
+	var machineID int64
+	err := q.QueryRow(ctx, `SELECT machine_id FROM agent_commands WHERE id = $1`, id).Scan(&machineID)
+	if db.IsNoRows(err) {
+		return 0, apperr.ErrNotFound
+	}
+	return machineID, err
+}
+
 // CommandInstanceID 不加锁地读取指令所属实例 ID（无实例时为空串），未知指令返回 apperr.ErrNotFound。
 // 调用方据此先锁实例再完成指令，保持「instance → agent_commands」的全局加锁顺序。
 func (s *Service) CommandInstanceID(ctx context.Context, q db.Querier, id string) (string, error) {
@@ -121,9 +131,13 @@ func (s *Service) CompleteCommand(ctx context.Context, q db.Querier, id string, 
 }
 
 // CancelCommands 把某实例所有未完成的指令标记为失败（被新指令取代时使用）。
+// 多行更新先按 id 排序加锁，与 ClaimPending/TouchSent 的加锁顺序一致，避免互相死锁。
 func (s *Service) CancelCommands(ctx context.Context, q db.Querier, instanceID, reason string) error {
-	_, err := q.Exec(ctx, `UPDATE agent_commands SET status = 'failed', result = $2, updated_at = $3
-		WHERE instance_id = $1 AND status IN ('pending', 'sent')`, instanceID, "cancelled: "+reason, s.clock.Now())
+	_, err := q.Exec(ctx, `WITH l AS (
+			SELECT id FROM agent_commands WHERE instance_id = $1 AND status IN ('pending', 'sent') ORDER BY id FOR UPDATE
+		)
+		UPDATE agent_commands SET status = 'failed', result = $2, updated_at = $3 FROM l WHERE agent_commands.id = l.id`,
+		instanceID, "cancelled: "+reason, s.clock.Now())
 	return err
 }
 
@@ -153,15 +167,20 @@ type ClaimedCommand struct {
 
 // ClaimPending 原子认领本副本持有的流（connIDs）所属机器的 pending 指令：状态改为 sent、attempts+1、写 sent_at。
 // 返回行里的 ConnID 若已不是调用方持有的流（SQL 期间被顶掉），调用方不推送，指令保持 sent 由补推处理。
+// 先按 id 排序锁定指令行再更新，与 CancelCommands/TouchSent 的加锁顺序一致，避免互相死锁。
 func (s *Service) ClaimPending(ctx context.Context, connIDs []string) ([]ClaimedCommand, error) {
 	if len(connIDs) == 0 {
 		return nil, nil
 	}
-	rows, err := s.pool.Query(ctx, `UPDATE agent_commands c
+	rows, err := s.pool.Query(ctx, `WITH l AS (
+			SELECT c.id, m.agent_conn_id FROM agent_commands c JOIN machines m ON m.id = c.machine_id
+			WHERE m.agent_conn_id = ANY($1) AND c.status = 'pending' ORDER BY c.id FOR UPDATE OF c
+		)
+		UPDATE agent_commands c
 		SET status = 'sent', attempts = c.attempts + 1, sent_at = $2, updated_at = $2
-		FROM machines m
-		WHERE m.id = c.machine_id AND m.agent_conn_id = ANY($1) AND c.status = 'pending'
-		RETURNING c.id, c.machine_id, c.instance_id, c.type, c.payload, c.status, c.result, c.attempts, c.created_at, c.sent_at, m.agent_conn_id`,
+		FROM l
+		WHERE c.id = l.id
+		RETURNING c.id, c.machine_id, c.instance_id, c.type, c.payload, c.status, c.result, c.attempts, c.created_at, c.sent_at, l.agent_conn_id`,
 		connIDs, s.clock.Now())
 	if err != nil {
 		return nil, err
@@ -198,12 +217,15 @@ func (s *Service) SentCommands(ctx context.Context, machineIDs []int64) ([]Comma
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Command, error) { return scanCommand(r) })
 }
 
-// TouchSent 补推后刷新 sent_at，超时从头计时。
+// TouchSent 补推后刷新 sent_at，超时从头计时。多行更新先按 id 排序加锁（见 CancelCommands）。
 func (s *Service) TouchSent(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE agent_commands SET sent_at = $2, updated_at = $2 WHERE id = ANY($1) AND status = 'sent'`, ids, s.clock.Now())
+	_, err := s.pool.Exec(ctx, `WITH l AS (
+			SELECT id FROM agent_commands WHERE id = ANY($1) AND status = 'sent' ORDER BY id FOR UPDATE
+		)
+		UPDATE agent_commands SET sent_at = $2, updated_at = $2 FROM l WHERE agent_commands.id = l.id`, ids, s.clock.Now())
 	return err
 }
 
