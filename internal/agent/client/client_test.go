@@ -139,14 +139,14 @@ func (g *fakeGateway) setRefuse(v bool) {
 }
 
 type harness struct {
-	t          *testing.T
-	gw         *fakeGateway
-	addr       string
-	ca         *pki.CA
-	key        *ecdsa.PrivateKey
-	dir        string // 最近一个 agent 的状态目录
-	collect    func(context.Context) metrics.Metrics
-	helloGate  chan struct{} // 非 nil 时，构造 Hello 前等它关闭（LocalIPs 在建流之后、发送 Hello 之前被调用）
+	t         *testing.T
+	gw        *fakeGateway
+	addr      string
+	ca        *pki.CA
+	key       *ecdsa.PrivateKey
+	dir       string // 最近一个 agent 的状态目录
+	collect   func(context.Context) metrics.Metrics
+	helloGate chan struct{} // 非 nil 时，构造 Hello 前等它关闭（LocalIPs 在建流之后、发送 Hello 之前被调用）
 }
 
 func newHarness(t *testing.T) *harness {
