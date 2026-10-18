@@ -62,3 +62,29 @@ func TestSameSiteGuardMatrix(t *testing.T) {
 		}
 	}
 }
+
+func TestSameSiteGuardDefaultPortBaseURL(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cases := []struct {
+		base, origin string
+		want         int
+	}{
+		{"https://spark.example:443", "https://spark.example", 204},
+		{"http://spark.example:80", "http://spark.example", 204},
+		{"https://Spark.Example:443/", "https://spark.example", 204},
+		{"https://spark.example:8443", "https://spark.example:8443", 204},
+		{"https://spark.example:8443", "https://spark.example", 403},
+		{"http://spark.example:443", "http://spark.example", 403}, // 443 只对 https 是默认端口
+	}
+	for _, c := range cases {
+		h := httpx.SameSiteGuard(c.base, nil, log)(ok)
+		req := httptest.NewRequest("POST", "/api/v1/orders", nil)
+		req.Header.Set("Origin", c.origin)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Fatalf("base %q origin %q: %d, want %d", c.base, c.origin, rec.Code, c.want)
+		}
+	}
+}

@@ -31,9 +31,25 @@ import (
 )
 
 const (
-	prefix     = "/admin/api/v1"
-	cookieName = "sc_admin"
+	prefix        = "/admin/api/v1"
+	sessionCookie = "sc_admin"
 )
+
+// cookieName：staging / prod 用 __Host- 前缀（必须 Secure、Path=/、无 Domain，子域无法覆写），dev 走 http 保持 sc_admin、Path=/admin/。
+func (s *Server) cookieName() string {
+	if s.SecureCookie {
+		return "__Host-" + sessionCookie
+	}
+	return sessionCookie
+}
+
+// cookiePath：__Host- 前缀要求 Path=/；dev 仍限定在 /admin/，避免与同主机不同端口的控制台互相携带 Cookie。
+func (s *Server) cookiePath() string {
+	if s.SecureCookie {
+		return "/"
+	}
+	return "/admin/"
+}
 
 type Server struct {
 	Admins        *admin.Service
@@ -142,7 +158,7 @@ type sessionKey struct{}
 
 func (s *Server) requireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sess, err := s.Admins.Authenticate(r.Context(), sessionToken(r))
+		sess, err := s.Admins.Authenticate(r.Context(), s.sessionToken(r))
 		if err != nil {
 			s.writeError(w, r, err)
 			return
@@ -167,8 +183,8 @@ func currentSession(r *http.Request) admin.Session {
 	return r.Context().Value(sessionKey{}).(admin.Session)
 }
 
-func sessionToken(r *http.Request) string {
-	if c, err := r.Cookie(cookieName); err == nil {
+func (s *Server) sessionToken(r *http.Request) string {
+	if c, err := r.Cookie(s.cookieName()); err == nil {
 		return c.Value
 	}
 	return ""

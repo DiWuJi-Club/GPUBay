@@ -16,7 +16,12 @@ import (
 func SameSiteGuard(publicBaseURL string, exempt func(*http.Request) bool, log *slog.Logger) func(http.Handler) http.Handler {
 	origin := ""
 	if u, err := url.Parse(publicBaseURL); err == nil && u.Scheme != "" && u.Host != "" {
-		origin = strings.ToLower(u.Scheme + "://" + u.Host)
+		scheme, host := strings.ToLower(u.Scheme), strings.ToLower(u.Host)
+		// 浏览器序列化 Origin 时省略默认端口：https://x:443 的页面发出的 Origin 是 https://x
+		if (scheme == "https" && u.Port() == "443") || (scheme == "http" && u.Port() == "80") {
+			host = strings.TrimSuffix(host, ":"+u.Port())
+		}
+		origin = scheme + "://" + host
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

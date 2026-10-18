@@ -11,7 +11,7 @@ import (
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, token string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
-		Name: cookieName, Value: token, Path: "/admin/", MaxAge: maxAge,
+		Name: s.cookieName(), Value: token, Path: s.cookiePath(), MaxAge: maxAge,
 		HttpOnly: true, Secure: s.SecureCookie, SameSite: http.SameSiteStrictMode,
 	})
 }
@@ -46,7 +46,7 @@ func (s *Server) handleTOTPSetup(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	a, codes, err := s.Admins.ConfirmTOTPSetup(r.Context(), sessionToken(r), req.Code, httpx.ClientIP(r))
+	a, codes, err := s.Admins.ConfirmTOTPSetup(r.Context(), s.sessionToken(r), req.Code, httpx.ClientIP(r))
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -70,9 +70,9 @@ func (s *Server) handleTOTP(w http.ResponseWriter, r *http.Request) {
 	var a admin.Admin
 	var err error
 	if req.Code != "" {
-		a, err = s.Admins.VerifyTOTP(r.Context(), sessionToken(r), req.Code, httpx.ClientIP(r))
+		a, err = s.Admins.VerifyTOTP(r.Context(), s.sessionToken(r), req.Code, httpx.ClientIP(r))
 	} else {
-		a, err = s.Admins.VerifyRecoveryCode(r.Context(), sessionToken(r), req.RecoveryCode, httpx.ClientIP(r))
+		a, err = s.Admins.VerifyRecoveryCode(r.Context(), s.sessionToken(r), req.RecoveryCode, httpx.ClientIP(r))
 	}
 	if err != nil {
 		s.writeError(w, r, err)
@@ -82,7 +82,7 @@ func (s *Server) handleTOTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if token := sessionToken(r); token != "" {
+	if token := s.sessionToken(r); token != "" {
 		if err := s.Admins.Logout(r.Context(), token); err != nil {
 			s.writeError(w, r, err)
 			return

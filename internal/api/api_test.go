@@ -432,22 +432,32 @@ func TestSessionCookieNameAndSameSiteGuard(t *testing.T) {
 	if cookie == nil || !cookie.Secure || cookie.Path != "/" || cookie.Domain != "" || !cookie.HttpOnly {
 		t.Fatalf("cookie = %+v", resp.Cookies())
 	}
-	req, _ := http.NewRequest("GET", e.ts.URL+"/api/v1/me", nil)
-	req.AddCookie(cookie)
-	r, err := raw.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	me := func() int {
+		req, _ := http.NewRequest("GET", e.ts.URL+"/api/v1/me", nil)
+		req.AddCookie(&http.Cookie{Name: cookie.Name, Value: cookie.Value})
+		r, err := raw.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
 	}
-	r.Body.Close()
-	if r.StatusCode != 200 {
-		t.Fatalf("me with __Host- cookie = %d", r.StatusCode)
+	if code := me(); code != 200 {
+		t.Fatalf("me with __Host- cookie = %d", code)
 	}
-	// 同站（兄弟子域）写请求被拒；same-origin 放行；无头放行
-	if r := post("/auth/logout", `{}`, map[string]string{"Sec-Fetch-Site": "same-site", "Cookie": cookie.String()}); r.StatusCode != 403 {
+	// 同站（兄弟子域）写请求被拒且会话仍有效；same-origin 放行且会话真正注销
+	sessionHeader := cookie.Name + "=" + cookie.Value
+	if r := post("/auth/logout", `{}`, map[string]string{"Sec-Fetch-Site": "same-site", "Cookie": sessionHeader}); r.StatusCode != 403 {
 		t.Fatalf("same-site logout = %d", r.StatusCode)
 	}
-	if r := post("/auth/logout", `{}`, map[string]string{"Sec-Fetch-Site": "same-origin", "Cookie": cookie.String()}); r.StatusCode != 200 {
+	if code := me(); code != 200 {
+		t.Fatalf("me after rejected logout = %d, want 200", code)
+	}
+	if r := post("/auth/logout", `{}`, map[string]string{"Sec-Fetch-Site": "same-origin", "Cookie": sessionHeader}); r.StatusCode != 200 {
 		t.Fatalf("same-origin logout = %d", r.StatusCode)
+	}
+	if code := me(); code != 401 {
+		t.Fatalf("me after logout = %d, want 401", code)
 	}
 	// 支付回调不受同站限制（这里渠道会因验签失败返回非 403）
 	if r := post("/pay/notify/wechat", `{}`, map[string]string{"Sec-Fetch-Site": "cross-site"}); r.StatusCode == 403 {
