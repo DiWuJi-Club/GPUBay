@@ -85,6 +85,9 @@ type Executor struct {
 	unpersisted map[string]state.Result
 	// recoverBlocked：Recover 因隔离规则失败而没有启动实例，规则刷新成功后重试。
 	recoverBlocked bool
+	// recoverPending：Recover 中期望 running 却没能启动的实例（地址、Docker、数据盘等瞬时条件），
+	// 由 refreshRules 逐轮重试直到启动成功；只含 Recover 产生的实例，外部停止的容器不在其中。
+	recoverPending map[string]bool
 
 	// 两个队列各有一个唤醒通道（容量 1），入队时按类型通知；共用一个通道时 pull 消费者会抢走实例指令的唤醒。
 	wakeInstance chan struct{}
@@ -110,7 +113,7 @@ func New(d Deps, stepped bool) *Executor {
 		d.LocalIPs = func() []string { return nil }
 	}
 	return &Executor{d: d, stepped: stepped, results: make(chan ResultMsg, 256), rulesInterval: rulesInterval,
-		pending: map[string]bool{}, unpersisted: map[string]state.Result{},
+		pending: map[string]bool{}, recoverPending: map[string]bool{}, unpersisted: map[string]state.Result{},
 		wakeInstance: make(chan struct{}, 1), wakePull: make(chan struct{}, 1), rulesWake: make(chan struct{}, 1)}
 }
 
@@ -225,6 +228,10 @@ func (e *Executor) dispatch(ctx context.Context, c Command) error {
 	}
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
+	// 指令接管该实例的状态：不再由恢复重试处理（在 opMu 内移除，此时没有重试在跑）。
+	e.mu.Lock()
+	delete(e.recoverPending, c.InstanceID)
+	e.mu.Unlock()
 	switch c.Type {
 	case "create_instance":
 		return e.create(ctx, c)
@@ -297,6 +304,7 @@ func (e *Executor) refreshRules(ctx context.Context) {
 			e.d.Log.Error("recover retry", "err", err)
 		}
 	}
+	e.retryRecoverPending(ctx)
 	e.ensureLimits(ctx)
 }
 
@@ -323,6 +331,54 @@ func (e *Executor) consume(ctx context.Context, pull bool) {
 func (e *Executor) EnsureRules(ctx context.Context) error {
 	cfg := e.Config()
 	return e.d.Net.EnsureRules(ctx, netfilter.Rules{Bridge: e.d.Bridge, AllowCIDRs: cfg.AllowCIDRs})
+}
+
+// retryRecoverPending 重试 Recover 时启动失败的实例（重启后网卡还没拿到 IP 等瞬时条件）。
+// 有实例指令正在执行时（opMu 被占）跳过本轮，与 ensureLimits 一致；期望状态不再是 running、
+// 记录已被删除或容器已在运行的实例直接移出；失败的保留到下一轮。
+func (e *Executor) retryRecoverPending(ctx context.Context) {
+	e.mu.Lock()
+	n := len(e.recoverPending)
+	e.mu.Unlock()
+	if n == 0 || !e.opMu.TryLock() {
+		return
+	}
+	defer e.opMu.Unlock()
+	e.mu.Lock()
+	ids := make([]string, 0, len(e.recoverPending))
+	for id := range e.recoverPending {
+		ids = append(ids, id)
+	}
+	e.mu.Unlock()
+	for _, id := range ids {
+		done := e.retryRecoverOne(ctx, id)
+		if done {
+			e.mu.Lock()
+			delete(e.recoverPending, id)
+			e.mu.Unlock()
+		}
+	}
+}
+
+// retryRecoverOne 返回 true 表示该实例不必再重试。
+func (e *Executor) retryRecoverOne(ctx context.Context, id string) bool {
+	inst, ok := e.d.State.Instance(id)
+	if !ok || inst.Desired != "running" {
+		return true
+	}
+	if c, err := e.d.Runtime.Inspect(ctx, id); err == nil && c.Exists && c.Running {
+		return true // 限速交给 ensureLimits
+	}
+	err := e.d.Disk.Mount(ctx, id)
+	if err == nil {
+		err = e.startChecked(ctx, inst)
+	}
+	if err != nil {
+		e.d.Log.Error("recover retry failed", "instance", id, "err", err)
+		return false
+	}
+	e.d.Log.Info("recovered instance started on retry", "instance", id)
+	return true
 }
 
 // ensureLimits 给运行中却丢了限速的容器补上限速。有实例指令正在执行时（opMu 被占）跳过本轮，

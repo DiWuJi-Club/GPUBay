@@ -283,6 +283,9 @@ func (e *Executor) Recover(ctx context.Context) error {
 	for _, inst := range e.d.State.Instances() {
 		if err := e.d.Disk.Mount(ctx, inst.ID); err != nil {
 			errs = append(errs, fmt.Errorf("instance %s: 数据盘未挂载：%w", inst.ID, err))
+			if inst.Desired == "running" {
+				e.setRecoverPending(inst.ID, true)
+			}
 			continue
 		}
 		if inst.Desired != "running" {
@@ -293,14 +296,27 @@ func (e *Executor) Recover(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("instance %s: 未启动：网络隔离规则未就绪", inst.ID))
 			continue
 		}
-		if err := e.startChecked(ctx, inst); err != nil {
+		err := e.startChecked(ctx, inst)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("instance %s: %w", inst.ID, err))
 		}
+		e.setRecoverPending(inst.ID, err != nil)
 	}
 	e.mu.Lock()
 	e.recoverBlocked = blocked
 	e.mu.Unlock()
 	return errors.Join(errs...)
+}
+
+// setRecoverPending 登记 / 移出需要在规则刷新轮次里重试启动的实例。
+func (e *Executor) setRecoverPending(id string, pending bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if pending {
+		e.recoverPending[id] = true
+	} else {
+		delete(e.recoverPending, id)
+	}
 }
 
 func procMemTotal() uint64 {

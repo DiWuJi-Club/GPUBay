@@ -730,3 +730,179 @@ func TestSetConfigAllowCIDRsChangeRefreshesRulesImmediately(t *testing.T) {
 		t.Fatalf("EnsureRules called %d extra times without allow-list change", got-n)
 	}
 }
+
+// flakyStart 让 Start 在 fail 为真时持续失败（fake 的 FailNext 只管一次），并统计 Start 调用次数。
+type flakyStart struct {
+	*rtfake.Runtime
+	fail   atomic.Bool
+	starts atomic.Int32
+}
+
+func (r *flakyStart) Start(ctx context.Context, id string) error {
+	r.starts.Add(1)
+	if r.fail.Load() {
+		return errors.New("failed to bind host port: cannot assign requested address")
+	}
+	return r.Runtime.Start(ctx, id)
+}
+
+// recoverEnv：已创建并运行的实例 ins-aaaaaaaa，模拟重启后 Recover 因 Start 失败而进入待重试。
+func recoverEnv(t *testing.T) (*env, *flakyStart) {
+	t.Helper()
+	e := newEnv(t)
+	fr := &flakyStart{Runtime: e.rt}
+	e.ex = executor.New(executor.Deps{Log: quiet, Runtime: fr, Disk: e.disk, Net: e.net, State: e.st, StateDir: e.dir, Bridge: "spark0",
+		LocalIPs: func() []string { return []string{"192.168.1.221"} }, MemTotal: func() uint64 { return 128 << 30 }}, true)
+	e.ex.SetConfig(executor.Config{LanIP: "192.168.1.221", DNS: []string{"223.5.5.5"}, AllowCIDRs: []string{"10.0.9.0/24"}, BandwidthMbps: 200, DataSizeGiB: 2048})
+	if res := e.run(create("ins-aaaaaaaa")); !res[0].OK {
+		t.Fatalf("create = %+v", res[0])
+	}
+	e.rt.Exit("ins-aaaaaaaa")
+	fr.fail.Store(true)
+	if err := e.ex.Recover(context.Background()); err == nil {
+		t.Fatal("recover must report the start failure")
+	}
+	return e, fr
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestRecoverStartFailureIsRetriedOnRefresh(t *testing.T) {
+	e, fr := recoverEnv(t)
+	if p := executor.RecoverPendingForTest(e.ex); len(p) != 1 || p[0] != "ins-aaaaaaaa" {
+		t.Fatalf("pending = %v", p)
+	}
+	fr.fail.Store(false)
+	e.net.Drop(e.rt.Veth)
+	stop := e.runLimitLoop()
+	defer stop()
+	waitFor(t, "container running", func() bool { return e.rt.Containers()["ins-aaaaaaaa"].Running })
+	waitFor(t, "pending cleared", func() bool { return len(executor.RecoverPendingForTest(e.ex)) == 0 })
+	if !e.waitLimit(e.rt.Veth, 50) {
+		t.Fatalf("limit not applied after retry: %v", e.net.Limits())
+	}
+}
+
+func TestRecoverRetryKeepsPendingWhileFailing(t *testing.T) {
+	e, fr := recoverEnv(t)
+	before := fr.starts.Load()
+	stop := e.runLimitLoop()
+	defer stop()
+	waitFor(t, "several retries", func() bool { return fr.starts.Load() >= before+3 })
+	if p := executor.RecoverPendingForTest(e.ex); len(p) != 1 {
+		t.Fatalf("pending = %v", p)
+	}
+	if e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatal("started despite failure")
+	}
+}
+
+func TestRecoverMountFailureIsRetriedWithMount(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	e.rt.Exit("ins-aaaaaaaa")
+	e.disk.Unmount("ins-aaaaaaaa")
+	e.disk.FailNext("mount", errors.New("loop device busy"))
+	if err := e.ex.Recover(context.Background()); err == nil {
+		t.Fatal("recover must report mount failure")
+	}
+	if p := executor.RecoverPendingForTest(e.ex); len(p) != 1 {
+		t.Fatalf("pending = %v", p)
+	}
+	stop := e.runLimitLoop()
+	defer stop()
+	waitFor(t, "container running", func() bool { return e.rt.Containers()["ins-aaaaaaaa"].Running })
+	if _, mounted := e.disk.State("ins-aaaaaaaa"); !mounted {
+		t.Fatal("retry did not mount the data disk")
+	}
+}
+
+func TestRecoverPendingClearedByInstanceCommand(t *testing.T) {
+	e, fr := recoverEnv(t)
+	res := e.run(executor.Command{ID: "cmd-stop", InstanceID: "ins-aaaaaaaa", Type: "stop_instance"})
+	if !res[0].OK {
+		t.Fatalf("stop = %+v", res[0])
+	}
+	if p := executor.RecoverPendingForTest(e.ex); len(p) != 0 {
+		t.Fatalf("pending after stop = %v", p)
+	}
+	fr.fail.Store(false)
+	before := fr.starts.Load()
+	stop := e.runLimitLoop()
+	time.Sleep(100 * time.Millisecond)
+	stop()
+	if fr.starts.Load() != before || e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatal("retried an instance taken over by a stop command")
+	}
+}
+
+func TestRecoverRetryDropsStoppedOrWipedInstances(t *testing.T) {
+	// Desired 变为 stopped
+	e, fr := recoverEnv(t)
+	inst, _ := e.st.Instance("ins-aaaaaaaa")
+	inst.Desired = "stopped"
+	_ = e.st.PutInstance(inst)
+	fr.fail.Store(false)
+	before := fr.starts.Load()
+	stop := e.runLimitLoop()
+	waitFor(t, "pending cleared", func() bool { return len(executor.RecoverPendingForTest(e.ex)) == 0 })
+	stop()
+	if fr.starts.Load() != before || e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatal("stopped instance was started by retry")
+	}
+	// 记录被删除（wipe）
+	e2, fr2 := recoverEnv(t)
+	_ = e2.st.DeleteInstance("ins-aaaaaaaa")
+	fr2.fail.Store(false)
+	before = fr2.starts.Load()
+	stop = e2.runLimitLoop()
+	waitFor(t, "pending cleared", func() bool { return len(executor.RecoverPendingForTest(e2.ex)) == 0 })
+	stop()
+	if fr2.starts.Load() != before {
+		t.Fatal("wiped instance was started by retry")
+	}
+}
+
+// 回归保护：运行期间被外部停止的容器不在 pending 里，refresh 不会把它拉起来。
+func TestRefreshDoesNotStartExternallyStoppedContainer(t *testing.T) {
+	e, fr := recoverEnv(t)
+	fr.fail.Store(false)
+	e.rt.Exit("ins-aaaaaaaa")
+	stop := e.runLimitLoop()
+	waitFor(t, "pending drained", func() bool { return len(executor.RecoverPendingForTest(e.ex)) == 0 })
+	stop()
+	// 第一次重试已把它启动；现在模拟外部停止，pending 已空
+	e.rt.Exit("ins-aaaaaaaa")
+	before := fr.starts.Load()
+	stop = e.runLimitLoop()
+	time.Sleep(100 * time.Millisecond)
+	stop()
+	if fr.starts.Load() != before || e.rt.Containers()["ins-aaaaaaaa"].Running {
+		t.Fatal("externally stopped container was restarted by refresh")
+	}
+}
+
+func TestRecoverRetrySkipsWhileOpInProgress(t *testing.T) {
+	e, fr := recoverEnv(t)
+	fr.fail.Store(false)
+	before := fr.starts.Load()
+	unlock := executor.LockOpsForTest(e.ex)
+	stop := e.runLimitLoop()
+	defer stop()
+	time.Sleep(100 * time.Millisecond)
+	if fr.starts.Load() != before {
+		unlock()
+		t.Fatal("retry ran while opMu held")
+	}
+	unlock()
+	waitFor(t, "container running after unlock", func() bool { return e.rt.Containers()["ins-aaaaaaaa"].Running })
+}

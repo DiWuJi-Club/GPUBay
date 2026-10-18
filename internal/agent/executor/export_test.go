@@ -14,3 +14,14 @@ func LockOpsForTest(e *Executor) (unlock func()) {
 	e.opMu.Lock()
 	return e.opMu.Unlock
 }
+
+// RecoverPendingForTest 返回当前待重试启动的实例 ID。
+func RecoverPendingForTest(e *Executor) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ids := make([]string, 0, len(e.recoverPending))
+	for id := range e.recoverPending {
+		ids = append(ids, id)
+	}
+	return ids
+}
