@@ -8,9 +8,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,4 +165,110 @@ func (e *env) waitFor(what string, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	e.t.Fatalf("timeout waiting for %s", what)
+}
+
+type agentStream struct {
+	t      *testing.T
+	stream agentpb.AgentGateway_ConnectClient
+	msgs   chan *agentpb.PlatformMessage
+	errs   chan error
+}
+
+// connect 打开双向流并在后台收消息；不发 Hello。
+func (e *env) connect(creds *agentCreds) *agentStream {
+	e.t.Helper()
+	stream, err := e.dial(creds).Connect(e.ctx)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	a := &agentStream{t: e.t, stream: stream, msgs: make(chan *agentpb.PlatformMessage, 64), errs: make(chan error, 1)}
+	go func() {
+		for {
+			m, err := stream.Recv()
+			if err != nil {
+				a.errs <- err
+				return
+			}
+			a.msgs <- m
+		}
+	}()
+	return a
+}
+
+func (a *agentStream) send(m *agentpb.AgentMessage) {
+	a.t.Helper()
+	// io.EOF 表示服务端已结束流（例如认证失败）；真正的状态由 Recv 得到，见 waitErr。
+	if err := a.stream.Send(m); err != nil && !errors.Is(err, io.EOF) {
+		a.t.Fatalf("send: %v", err)
+	}
+}
+func (a *agentStream) hello(ips ...string) {
+	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Hello{Hello: &agentpb.Hello{AgentVersion: "test-0.1", Hostname: "spark", Ips: ips}}})
+}
+func (a *agentStream) report(states ...*agentpb.InstanceState) {
+	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Instances: states}}})
+}
+func (a *agentStream) heartbeat(m *agentpb.Metrics) {
+	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Heartbeat{Heartbeat: &agentpb.Heartbeat{Metrics: m}}})
+}
+func (a *agentStream) result(id string, ok bool, msg string) {
+	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Result{Result: &agentpb.CommandResult{CommandId: id, Ok: ok, Message: msg}}})
+}
+func (a *agentStream) next(timeout time.Duration) *agentpb.PlatformMessage {
+	select {
+	case m := <-a.msgs:
+		return m
+	case <-time.After(timeout):
+		return nil
+	}
+}
+func (a *agentStream) waitErr(timeout time.Duration) error {
+	select {
+	case err := <-a.errs:
+		return err
+	case <-time.After(timeout):
+		return nil
+	}
+}
+func running(id string) *agentpb.InstanceState {
+	return &agentpb.InstanceState{InstanceId: id, Phase: "running"}
+}
+func stopped(id string) *agentpb.InstanceState {
+	return &agentpb.InstanceState{InstanceId: id, Phase: "stopped"}
+}
+
+// up 建流 + Hello + 空 StateReport，并等到平台处理完首个报告（可投递）。
+func (e *env) up(creds *agentCreds, machineID int64, states ...*agentpb.InstanceState) *agentStream {
+	e.t.Helper()
+	a := e.connect(creds)
+	a.hello("10.0.0.10")
+	if cfg := a.next(2 * time.Second); cfg == nil || cfg.GetConfig() == nil {
+		e.t.Fatalf("expected AgentConfig first, got %v", cfg)
+	}
+	before := e.srv.ReportCount(machineID)
+	a.report(states...)
+	e.waitFor("first report", func() bool { return e.srv.ReportCount(machineID) > before })
+	return a
+}
+
+func (e *env) alertCount(kind string) int {
+	e.t.Helper()
+	var n int
+	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM alerts WHERE kind = $1`, kind).Scan(&n)
+	return n
+}
+
+// containsJSON 忽略 jsonb 重新格式化造成的空格差异。
+func containsJSON(doc, fragment string) bool {
+	norm := func(s string) string { return strings.ReplaceAll(s, " ", "") }
+	return strings.Contains(norm(doc), norm(fragment))
+}
+
+func mustReport(e *env, machineID int64) []byte {
+	e.t.Helper()
+	var raw []byte
+	if err := e.pool.QueryRow(e.ctx, `SELECT last_state_report FROM machines WHERE id = $1`, machineID).Scan(&raw); err != nil {
+		e.t.Fatal(err)
+	}
+	return raw
 }
