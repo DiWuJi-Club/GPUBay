@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -151,17 +152,67 @@ func (s *Service) SuspendMachines(ctx context.Context, machineIDs []int64) (int,
 	return n, err
 }
 
-// ResumeMachine 机器恢复在线后补回暂停的时长，并按恢复后的剩余时长重算提醒标记（暂停期间可能已续费）。
-func (s *Service) ResumeMachine(ctx context.Context, machineID int64) (int, error) {
+// CommandTimeout 返回指令类型的超时值。
+func CommandTimeout(t fleet.CommandType) time.Duration {
+	switch t {
+	case fleet.CmdCreateInstance:
+		return CreateCommandTimeout
+	case fleet.CmdStartInstance:
+		return StartCommandTimeout
+	case fleet.CmdStopInstance:
+		return StopCommandTimeout
+	case fleet.CmdWipeInstance:
+		return WipeCommandTimeout
+	}
+	return PullCommandTimeout
+}
+
+// FailTimedOutCommands 把在线机器上超过类型超时仍未回报的 sent 指令判为失败，交给状态机。
+func (s *Service) FailTimedOutCommands(ctx context.Context) (int, error) {
+	now := s.d.Clock.Now()
+	cmds, err := s.d.Fleet.SentBefore(ctx, now.Add(-StartCommandTimeout)) // 最短的超时值
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	var errs []error
+	for _, c := range cmds {
+		timeout := CommandTimeout(c.Type)
+		if c.SentAt == nil || now.Sub(*c.SentAt) < timeout {
+			continue
+		}
+		if err := s.HandleCommandResult(ctx, c.ID, false, "timeout after "+timeout.String()); err != nil {
+			errs = append(errs, fmt.Errorf("command %s: %w", c.ID, err))
+			continue
+		}
+		n++
+	}
+	return n, errors.Join(errs...)
+}
+
+// ResumeMachine 机器恢复在线后，只对容器确实在运行（runningIDs）的暂停实例补回时长并重算提醒标记；
+// 其余暂停实例保持暂停并告警 container_down，由管理员换机或退款。
+func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs []string) (int, error) {
 	now := s.d.Clock.Now()
 	n := 0
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 		list, err := collectInstances(tx.Query(ctx, `SELECT `+instanceCols+` FROM instances
-			WHERE machine_id = $1 AND state = 'running' AND suspended_at IS NOT NULL FOR UPDATE`, machineID))
+			WHERE machine_id = $1 AND state = 'running' AND suspended_at IS NOT NULL ORDER BY id FOR UPDATE`, machineID))
+		if err != nil || len(list) == 0 {
+			return err
+		}
+		m, err := s.d.Fleet.Get(ctx, tx, machineID)
 		if err != nil {
 			return err
 		}
 		for _, inst := range list {
+			if !slices.Contains(runningIDs, inst.ID) {
+				if err := s.d.Fleet.RaiseAlertOnce(ctx, tx, fleet.Alert{Level: "critical", Kind: "container_down",
+					MachineID: machineID, InstanceID: inst.ID, Message: AlertContainerDown(m.Serial, inst.ID)}); err != nil {
+					return err
+				}
+				continue
+			}
 			var remaining time.Duration
 			if inst.PausedRemaining != nil {
 				remaining = time.Duration(*inst.PausedRemaining) * time.Second
@@ -178,8 +229,8 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64) (int, erro
 			if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
 				return err
 			}
+			n++
 		}
-		n = len(list)
 		return nil
 	})
 	return n, err
@@ -255,38 +306,36 @@ func (s *Service) Sweep(ctx context.Context) error {
 	if _, err := s.FailStuckCreating(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("creating timeout: %w", err))
 	}
+	if _, err := s.FailTimedOutCommands(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("command timeout: %w", err))
+	}
 	if _, err := s.SendReminders(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("reminders: %w", err))
 	}
 	return errors.Join(errs...)
 }
 
-// resumeOnline 恢复所有已在线但仍处于暂停状态的实例所在机器。
+// resumeOnline 清扫器兜底：对已在线、且本次连接之后上报过 StateReport 的机器，按报告里 running 的实例恢复计时。
 func (s *Service) resumeOnline(ctx context.Context) error {
-	rows, err := s.d.Pool.Query(ctx, `SELECT DISTINCT machine_id FROM instances WHERE state = 'running' AND suspended_at IS NOT NULL`)
+	rows, err := s.d.Pool.Query(ctx, `SELECT DISTINCT machine_id FROM instances WHERE state = 'running' AND suspended_at IS NOT NULL ORDER BY machine_id`)
 	if err != nil {
 		return err
 	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
 		return err
 	}
-	online, err := s.d.Fleet.OnlineAmong(ctx, ids)
+	reports, err := s.d.Fleet.ReportsFor(ctx, ids)
 	if err != nil {
 		return err
 	}
 	var errs []error
-	for _, id := range online {
-		if _, err := s.ResumeMachine(ctx, id); err != nil {
+	for _, id := range ids {
+		rep, ok := reports[id]
+		if !ok {
+			continue
+		}
+		if _, err := s.ResumeMachine(ctx, id, rep.RunningIDs()); err != nil {
 			errs = append(errs, fmt.Errorf("machine %d: %w", id, err))
 		}
 	}

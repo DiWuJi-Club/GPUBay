@@ -169,3 +169,22 @@ func (e *env) heartbeatAll() {
 		}
 	}
 }
+
+// reportRunning 模拟网关收到一份「该实例 running」的 StateReport（含本次连接归属）。
+func (e *env) reportRunning(machineID int64, instanceID string) {
+	e.t.Helper()
+	if err := e.fleet.AttachAgentConn(e.ctx, machineID, "conn-test"); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := e.fleet.RecordStateReport(e.ctx, machineID, fleet.StateReport{Instances: []fleet.InstanceState{{InstanceID: instanceID, Phase: fleet.PhaseRunning}}}); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// firstOf 把 (n, err) 压成 n，错误直接失败；用于 mustCount 之前已能断言 err 的场合。
+func firstOf(n int, err error) int {
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
