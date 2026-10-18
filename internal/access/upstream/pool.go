@@ -165,6 +165,9 @@ func (p *Pool) client(ctx context.Context, t Target) (*ssh.Client, error) {
 	d := net.Dialer{Timeout: p.cfg.DialTimeout}
 	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil { // 调用方放弃，不是上游不可达
+			return nil, ctxErr
+		}
 		return nil, &DialError{InstanceID: t.InstanceID, Err: err}
 	}
 	// 握手有截止时间，且 ctx 取消即关闭底层连接：卡死的 sshd 不会一直占着该实例的锁
@@ -179,6 +182,9 @@ func (p *Pool) client(ctx context.Context, t Target) (*ssh.Client, error) {
 	}
 	if err != nil {
 		nc.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil { // 调用方放弃，不是上游不可达
+			return nil, ctxErr
+		}
 		return nil, &DialError{InstanceID: t.InstanceID, Err: err}
 	}
 	nc.SetDeadline(time.Time{})

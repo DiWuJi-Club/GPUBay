@@ -284,8 +284,20 @@ func TestPoolHandshakeDeadlineAndCtx(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start = time.Now()
-	if _, err := p2.Dial(ctx, tg, 80); err == nil || time.Since(start) > 2*time.Second {
+	_, err := p2.Dial(ctx, tg, 80)
+	if err == nil || time.Since(start) > 2*time.Second {
 		t.Fatalf("ctx-cancelled handshake = %v after %v", err, time.Since(start))
+	}
+	// 调用方放弃不是「上游不可达」：返回 ctx 错误而非 DialError（不应触发告警）
+	var de *upstream.DialError
+	if errors.As(err, &de) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ctx-cancelled handshake err = %v (want plain ctx error)", err)
+	}
+	// 冷拨号前 ctx 已取消：同样是 ctx 错误
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	if _, err := p2.Dial(cctx, tg, 80); errors.As(err, &de) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-cancelled dial err = %v (want plain ctx error)", err)
 	}
 	if p.Len() != 0 || p2.Len() != 0 {
 		t.Fatalf("len = %d %d", p.Len(), p2.Len())
