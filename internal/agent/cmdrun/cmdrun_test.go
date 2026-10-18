@@ -78,3 +78,12 @@ func TestStderrTailIsValidUTF8(t *testing.T) {
 		t.Fatalf("fallback = %q", ce.Stderr)
 	}
 }
+
+func TestExecForcesCLocale(t *testing.T) {
+	t.Setenv("LC_ALL", "zh_CN.utf8")
+	t.Setenv("LANG", "zh_CN.utf8")
+	out, err := cmdrun.Exec{}.Run(context.Background(), "sh", "-c", `echo "$LC_ALL $LANG"`)
+	if err != nil || strings.TrimSpace(string(out)) != "C C" {
+		t.Fatalf("locale = %q %v", out, err)
+	}
+}
