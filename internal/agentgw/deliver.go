@@ -2,6 +2,7 @@ package agentgw
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -9,6 +10,8 @@ import (
 
 	"spark-cloud/internal/agentpb"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/rental"
 )
 
 func (s *Server) runTicks(ctx context.Context) {
@@ -110,7 +113,7 @@ func (s *Server) push(ctx context.Context, c *conn, cmd fleet.Command, tick int6
 	if cmd.Type == fleet.CmdCreateInstance && s.d.HostKeys != nil {
 		pem, err := s.d.HostKeys.HostKeyPEM(ctx, cmd.InstanceID)
 		if err != nil {
-			s.d.Log.Error("tick: load instance host key", "command", cmd.ID, "instance", cmd.InstanceID, "err", err)
+			s.hostKeyError(ctx, cmd, err)
 			return false
 		}
 		hostKey = pem
@@ -136,4 +139,34 @@ func (s *Server) DeliveryTick(cmdID string) (int64, bool) {
 		return 0, false
 	}
 	return v.(int64), true
+}
+
+// hostKeyLogInterval：读取主机密钥的临时错误（数据库抖动）每个副本至多这么久记一次日志。
+const hostKeyLogInterval = time.Minute
+
+// hostKeyError 处理 Create 指令读取主机密钥失败（调用方持有 tickMu）：
+// 实例不存在或密文无法解密是永久错误，立即按失败结果走指令失败路径（实例转 failed、退款），不再每 tick 重试；
+// 其它错误视为临时，指令保持 sent 下个 tick 重试，日志限频。错误里不含密钥内容。
+func (s *Server) hostKeyError(ctx context.Context, cmd fleet.Command, err error) {
+	var reason string
+	switch {
+	case errors.Is(err, apperr.ErrNotFound):
+		reason = "平台主机密钥不可用：实例不存在"
+	case errors.Is(err, rental.ErrHostKeyUndecryptable):
+		reason = "平台主机密钥不可用：密文无法解密"
+	}
+	if reason != "" {
+		s.d.Log.Error("tick: instance host key permanently unavailable; failing command", "command", cmd.ID, "instance", cmd.InstanceID, "err", err)
+		if herr := s.d.Rental.HandleCommandResult(ctx, cmd.ID, false, reason); herr != nil {
+			s.d.Log.Error("tick: fail command", "command", cmd.ID, "err", herr)
+		}
+		return
+	}
+	now := time.Now()
+	if now.Sub(s.hostKeyLogAt) < hostKeyLogInterval {
+		s.hostKeySuppressed++
+		return
+	}
+	s.d.Log.Error("tick: load instance host key (will retry)", "command", cmd.ID, "instance", cmd.InstanceID, "err", err, "suppressed", s.hostKeySuppressed)
+	s.hostKeyLogAt, s.hostKeySuppressed = now, 0
 }

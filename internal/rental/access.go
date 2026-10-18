@@ -2,6 +2,7 @@ package rental
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -82,6 +83,9 @@ func (s *Service) SetPasswordAuth(ctx context.Context, userID int64, id string, 
 	return out, err
 }
 
+// ErrHostKeyUndecryptable：实例主机密钥密文无法解密（数据损坏或密钥轮换错误），重试无意义。
+var ErrHostKeyUndecryptable = errors.New("实例主机密钥无法解密")
+
 // HostKeyPEM 解密返回实例容器的主机私钥（网关投递 Create 指令时填入 host_key_pem）；已清空返回空串。
 func (s *Service) HostKeyPEM(ctx context.Context, instanceID string) (string, error) {
 	var enc []byte
@@ -94,7 +98,7 @@ func (s *Service) HostKeyPEM(ctx context.Context, instanceID string) (string, er
 	}
 	plain, err := s.d.Box.Open(enc)
 	if err != nil {
-		return "", fmt.Errorf("解密实例 %s 主机密钥: %w", instanceID, err)
+		return "", fmt.Errorf("%w: 实例 %s: %v", ErrHostKeyUndecryptable, instanceID, err)
 	}
 	return string(plain), nil
 }

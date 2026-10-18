@@ -15,7 +15,7 @@ Agent 创建容器时用 `--entrypoint /.spark/init.sh` 覆盖镜像入口：`in
 - `/.spark`（只读）：`authorized_keys`、`hostkeys/`、`init.sh`。
 - 内存上限 = 机器内存 - 8GiB（`/sys/fs/cgroup/memory.max`），无 swap；`--shm-size` = 机器内存一半；`pids-limit 32768`。
 - 网络：专用网桥 `spark0`，只能访问公网与白名单内网地址（Harbor、HF 镜像站等），不能访问宿主机与机房内网；DNS 由平台下发；没有 IPv6。
-- SSH 端口 22 发布到机器内网 IP 的 2222；用户经平台 SSH 网关（`ssh ins-xxxxxxxx@ssh.<domain>`）登录，Web 端口经平台入口访问，都只由控制面持有的上游私钥连入。
+- SSH 端口 22 发布到机器内网 IP 的上游 SSH 端口（`SPARK_UPSTREAM_SSH_PORT`，默认 2222）；用户经平台 SSH 网关（`ssh ins-xxxxxxxx@ssh.<domain>`）登录，Web 端口经平台入口访问，都只由控制面持有的上游私钥连入。
 - sftp 由 sshd 内置实现（`Subsystem sftp internal-sftp`）提供，镜像**不需要** `openssh-sftp-server`；`scp`（OpenSSH ≥ 9 默认走 SFTP）、`sftp`、`rsync` 都可用。
 - 容器主机密钥由平台生成并随开通指令下发（`/.spark/hostkeys/`），平台登录容器时固定校验它；镜像里不得包含 `/etc/ssh/ssh_host_*`。
 

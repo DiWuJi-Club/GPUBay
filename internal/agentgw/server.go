@@ -69,6 +69,9 @@ type Server struct {
 	tickMu  sync.Mutex // 串行化 tick：后台循环与手动 TickNow 重叠会重复补推、打乱顺序
 	// deliveries 记录指令最近一次被本副本推送时的 tick 号（集成测试断言「≤2 个 tick 内投递」）。
 	deliveries sync.Map
+	// 主机密钥临时错误的日志限频（只在 tick 内读写，受 tickMu 保护）
+	hostKeyLogAt      time.Time
+	hostKeySuppressed int
 }
 
 func New(cfg Config, d Deps) (*Server, error) {

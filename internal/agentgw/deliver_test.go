@@ -1,8 +1,12 @@
 package agentgw_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +18,7 @@ import (
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/rental"
 )
@@ -79,7 +84,9 @@ func TestDeliveryWaitsForFirstStateReport(t *testing.T) {
 		t.Fatalf("host_key_pem not delivered: %q", cr.GetHostKeyPem())
 	}
 	var payload string
-	_ = e.pool.QueryRow(e.ctx, `SELECT payload::text FROM agent_commands WHERE id = $1`, cmdID).Scan(&payload)
+	if err := e.pool.QueryRow(e.ctx, `SELECT payload::text FROM agent_commands WHERE id = $1`, cmdID).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(payload, "PRIVATE KEY") || strings.Contains(payload, "host_key") {
 		t.Fatalf("private key leaked into agent_commands.payload: %s", payload)
 	}
@@ -111,6 +118,105 @@ func TestCreateCarriesConfiguredUpstreamSSHPort(t *testing.T) {
 		t.Fatalf("delivered = %v", m)
 	}
 }
+
+// 主机密钥永久不可用（密文无法解密 / 实例不存在）：Create 指令立即判失败、实例转 failed，不再每 tick 重试，也不推给 Agent。
+func TestCreateFailsWhenHostKeyPermanentlyUnavailable(t *testing.T) {
+	for name, c := range map[string]struct {
+		stub   func(ctx context.Context, id string) (string, error)
+		reason string
+	}{
+		"undecryptable": {nil, "密文无法解密"},
+		"not found":     {func(context.Context, string) (string, error) { return "", apperr.ErrNotFound }, "实例不存在"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnvFull(t, nil, func(d *agentgw.Deps) {
+				if c.stub != nil {
+					d.HostKeys = hostKeysFunc(c.stub)
+				}
+			})
+			mid := e.machine("SN-003")
+			instID, cmdID := e.place(mid)
+			if c.stub == nil {
+				if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET ssh_host_key_enc = '\x00deadbeef' WHERE id = $1`, instID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			a := e.connect(e.enroll(mid))
+			a.hello("10.0.0.10")
+			a.next(time.Second) // AgentConfig
+			a.report()
+			e.waitFor("command failed", func() bool { return e.command(cmdID).Status == "failed" })
+			if r := e.command(cmdID).Result; !strings.Contains(r, c.reason) {
+				t.Fatalf("result = %q", r)
+			}
+			if c.stub == nil {
+				if inst, _ := e.rental.Get(e.ctx, instID); inst.State != rental.StateFailed {
+					t.Fatalf("instance state = %s", inst.State)
+				}
+			}
+			if m := a.next(4 * tick); m != nil {
+				t.Fatalf("failed command must not be delivered: %v", m)
+			}
+		})
+	}
+}
+
+// 临时错误（数据库抖动）：指令保持 sent 每 tick 重试，日志限频；恢复后照常投递带主机密钥的 Create。
+func TestCreateHostKeyTransientErrorRetriesWithRateLimitedLog(t *testing.T) {
+	var failing atomic.Bool
+	failing.Store(true)
+	logs := &countHandler{match: "host key"}
+	e := newEnvFull(t, nil, func(d *agentgw.Deps) {
+		real := d.HostKeys
+		d.HostKeys = hostKeysFunc(func(ctx context.Context, id string) (string, error) {
+			if failing.Load() {
+				return "", errors.New("db down")
+			}
+			return real.HostKeyPEM(ctx, id)
+		})
+		d.Log = slog.New(logs)
+	})
+	mid := e.machine("SN-004")
+	_, cmdID := e.place(mid)
+	a := e.connect(e.enroll(mid))
+	a.hello("10.0.0.10")
+	a.next(time.Second) // AgentConfig
+	a.report()
+	if m := a.next(15 * tick); m != nil {
+		t.Fatalf("delivered while host key unavailable: %v", m)
+	}
+	if c := e.command(cmdID); c.Status != "sent" {
+		t.Fatalf("status = %s, want sent (retry)", c.Status)
+	}
+	if n := logs.n.Load(); n != 1 {
+		t.Fatalf("host key error logged %d times over ~15 ticks, want 1 (rate-limited)", n)
+	}
+	failing.Store(false)
+	m := a.next(2 * time.Second)
+	if cmd := m.GetCommand(); cmd == nil || cmd.GetId() != cmdID || !strings.Contains(cmd.GetCreate().GetHostKeyPem(), "OPENSSH PRIVATE KEY") {
+		t.Fatalf("delivered = %v", m)
+	}
+}
+
+type hostKeysFunc func(ctx context.Context, id string) (string, error)
+
+func (f hostKeysFunc) HostKeyPEM(ctx context.Context, id string) (string, error) { return f(ctx, id) }
+
+// countHandler 统计消息含 match 的日志条数。
+type countHandler struct {
+	match string
+	n     atomic.Int64
+}
+
+func (h *countHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *countHandler) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, h.match) {
+		h.n.Add(1)
+	}
+	return nil
+}
+func (h *countHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countHandler) WithGroup(string) slog.Handler      { return h }
 
 func TestSentCommandsRepushedOnReconnect(t *testing.T) {
 	e := newEnv(t)
