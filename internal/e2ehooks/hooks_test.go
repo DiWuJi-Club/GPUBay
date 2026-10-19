@@ -441,3 +441,34 @@ func TestSSHAndIngressUpstreamHooks(t *testing.T) {
 		t.Fatalf("port 0 = %d, want 400", code)
 	}
 }
+
+// POST /hooks/groups 建机组（visible 缺省 true）；POST /hooks/machines 带 group_id 时登记后入组。
+func TestGroupsHookAndMachinesInGroup(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	gid := int64(e.must("POST", "/hooks/groups", map[string]any{"name": "A"})["id"].(float64))
+	hidden := int64(e.must("POST", "/hooks/groups", map[string]any{"name": "留池", "visible": false})["id"].(float64))
+	groups, err := e.a.Fleet.ListGroups(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vis := map[int64]bool{}
+	for _, g := range groups {
+		vis[g.ID] = g.Visible
+	}
+	if v, ok := vis[gid]; !ok || !v {
+		t.Fatalf("group A visible = %v (present %v)", v, ok)
+	}
+	if v, ok := vis[hidden]; !ok || v {
+		t.Fatalf("hidden group visible = %v (present %v)", v, ok)
+	}
+	ids := e.must("POST", "/hooks/machines", map[string]any{"count": 1, "group_id": gid})["ids"].([]any)
+	m, err := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), int64(ids[0].(float64)))
+	if err != nil || m.GroupID == nil || *m.GroupID != gid {
+		t.Fatalf("machine group = %+v, %v", m.GroupID, err)
+	}
+	ids = e.must("POST", "/hooks/machines", map[string]any{"count": 1})["ids"].([]any)
+	if m, _ := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), int64(ids[0].(float64))); m.GroupID != nil {
+		t.Fatalf("machine without group_id = %v", *m.GroupID)
+	}
+}
