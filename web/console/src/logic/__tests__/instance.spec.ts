@@ -6,6 +6,8 @@ const base: Instance = {
   id: 'ins-abc12345', state: 'running', product_id: 1, image_id: 1, product_name: 'DGX Spark 整机', image_name: 'PyTorch', suspended: false,
   expires_at: '2026-10-18T06:00:00Z', remaining_seconds: 86399, pending_seconds: 0, retain_until: null, ssh_command: 'ssh ins-abc12345@ssh.spark.test',
   password_auth: true, ssh_host: 'ssh.spark.test', ssh_port: 22, ports_count: 0,
+  scheduled_start_at: null, scheduled_end_at: null, cancellable_until: null, group_id: null, group_name: '', machine_label: '', batch_id: null,
+  reassign_count: 0, auto_renew: false, auto_renew_duration: '1d', auto_renew_failed_reason: '', renewable_until: null, renew_options: [],
   created_at: '2026-10-17T06:00:00Z',
 }
 

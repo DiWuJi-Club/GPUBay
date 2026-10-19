@@ -1,13 +1,11 @@
 <script setup lang="ts">
-import {
-  durationLabel, fmtYuan, isApiError, labelOf, messageOf, useIdempotencyKey, type Duration, type Image, type Instance, type Listed, type Order, type Product,
-} from '@spark/shared'
+import { durationLabel, fmtYuan, labelOf, messageOf, type Duration, type Image, type Listed, type Product } from '@spark/shared'
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
-import AppDialog from '../components/AppDialog.vue'
 import GuideDialog from '../components/GuideDialog.vue'
+import RentDialog from '../components/RentDialog.vue'
 import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
 import { notifyError } from '../logic/notify'
@@ -61,18 +59,10 @@ const specItems = (p: Product) => [
   { key: 'cpu', label: 'CPU', value: p.spec.cpu },
 ]
 
-// ---- 确认框 ----
-const confirm = reactive<{ visible: boolean; product: Product | null }>({ visible: false, product: null })
-const confirmSel = computed(() => (confirm.product ? sel[confirm.product.id] : null))
-const price = computed(() => confirm.product?.prices.find((p) => p.duration === confirmSel.value?.duration)?.amount ?? null)
-const imageName = computed(() => images.value.find((i) => i.id === confirmSel.value?.imageId)?.name ?? '')
-const balance = computed(() => session.balance ?? 0)
-const after = computed(() => (price.value == null ? null : balance.value - price.value))
-const insufficient = computed(() => price.value != null && balance.value < price.value)
-const submitting = ref(false)
-const key = useIdempotencyKey(() => [confirm.product?.id, confirmSel.value?.duration, confirmSel.value?.imageId])
+// ---- 租用 / 预订对话框（RentDialog）----
+const dialog = reactive<{ visible: boolean; product: Product | null; mode: 'immediate' | 'booking' }>({ visible: false, product: null, mode: 'immediate' })
 
-async function rent(p: Product) {
+async function open(p: Product, mode: 'immediate' | 'booking') {
   if (p.prices.length === 0) return // 全部档位已下架：按钮已禁用，这里再兜一层，不会发出没有价格的订单
   if (session.status !== 'authed') {
     await router.push({ path: '/login', query: { redirect: route.fullPath } })
@@ -88,35 +78,21 @@ async function rent(p: Product) {
     guide.handle(e)
     return
   }
-  confirm.product = p
-  confirm.visible = true
+  dialog.product = p
+  dialog.mode = mode
+  dialog.visible = true
 }
+const rent = (p: Product) => open(p, 'immediate')
+const book = (p: Product) => open(p, 'booking')
 
-async function submit() {
-  if (!confirm.product || !confirmSel.value || submitting.value) return // 双击保护：请求进行中第二次点击不发请求
-  if (insufficient.value) {
-    confirm.visible = false
-    await router.push({ path: '/wallet/recharge', query: { redirect: route.fullPath } })
+async function onPlaced(r: { instances: { id: string }[]; batchId: string | null }) {
+  if (r.batchId && r.instances.length > 1) {
+    ElMessage.success(`已下单 ${r.instances.length} 台`)
+    await router.push({ path: '/instances', query: { batch: r.batchId } })
     return
   }
-  submitting.value = true
-  try {
-    const out = await api.post<{ order: Order; instance: Instance }>(
-      '/orders',
-      { product_id: confirm.product.id, duration: confirmSel.value.duration, image_id: confirmSel.value.imageId },
-      { idempotencyKey: key.current() },
-    )
-    key.rotate()
-    confirm.visible = false
-    ElMessage.success('下单成功，正在开通')
-    await router.push(`/instances/${out.instance.id}`)
-  } catch (e) {
-    // 需要引导的错误关闭确认框；网络错误等保持打开，用户再次点击时复用同一个幂等键
-    if (isApiError(e) && ['kyc_required', 'insufficient_balance', 'no_capacity', 'banned'].includes(e.code)) confirm.visible = false
-    guide.handle(e, { onNoCapacity: load })
-  } finally {
-    submitting.value = false
-  }
+  ElMessage.success(dialog.mode === 'booking' ? '预订成功' : '下单成功，正在开通')
+  await router.push(`/instances/${r.instances[0].id}`)
 }
 </script>
 
@@ -131,7 +107,7 @@ async function submit() {
         <template #header>
           <div class="head">
             <span class="name" data-testid="market-name">{{ p.name }}</span>
-            <span class="idle">空闲 <b data-testid="market-idle">{{ p.idle_count }}</b> 台</span>
+            <span class="idle">现在可租 <b data-testid="market-idle">{{ p.idle_count }}</b> 台</span>
           </div>
         </template>
         <ul class="spec">
@@ -155,26 +131,12 @@ async function submit() {
           <el-button type="primary" class="rent" data-testid="market-rent-btn" :disabled="p.prices.length === 0 || p.idle_count === 0" @click="rent(p)">
             {{ p.prices.length === 0 ? '暂未开放' : p.idle_count === 0 ? '暂无空闲' : '立即租用' }}
           </el-button>
+          <el-button class="rent" data-testid="market-book-btn" :disabled="p.prices.length === 0" @click="book(p)">预订档期</el-button>
         </el-form>
       </el-card>
     </div>
 
-    <AppDialog v-model="confirm.visible" kind="confirm" title="确认下单" data-testid="market-confirm-dialog">
-      <el-descriptions v-if="confirm.product && confirmSel" :column="1" border>
-        <el-descriptions-item label="商品"><span data-testid="market-confirm-product">{{ confirm.product.name }}</span></el-descriptions-item>
-        <el-descriptions-item label="租期"><span data-testid="market-confirm-duration">{{ labelOf(durationLabel, confirmSel.duration) }}</span></el-descriptions-item>
-        <el-descriptions-item label="镜像"><span data-testid="market-confirm-image">{{ imageName }}</span></el-descriptions-item>
-        <el-descriptions-item label="价格"><span data-testid="market-confirm-price">{{ price == null ? '—' : fmtYuan(price) }}</span></el-descriptions-item>
-        <el-descriptions-item label="当前余额"><span data-testid="market-confirm-balance">{{ fmtYuan(balance) }}</span></el-descriptions-item>
-        <el-descriptions-item label="扣款后余额">
-          <span data-testid="market-confirm-after" :class="{ warn: insufficient }">{{ after == null ? '—' : fmtYuan(after) }}<template v-if="insufficient">（余额不足）</template></span>
-        </el-descriptions-item>
-      </el-descriptions>
-      <template #footer>
-        <el-button data-testid="market-confirm-cancel" @click="confirm.visible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" data-testid="market-confirm-ok" @click="submit">{{ insufficient ? '去充值' : '确认下单' }}</el-button>
-      </template>
-    </AppDialog>
+    <RentDialog v-if="dialog.product" v-model="dialog.visible" :product="dialog.product" :images="images" :mode="dialog.mode" :duration="sel[dialog.product.id].duration" :image-id="sel[dialog.product.id].imageId" @placed="onPlaced" />
     <GuideDialog :guide="guide" />
   </div>
 </template>
@@ -188,6 +150,7 @@ async function submit() {
 .spec .label { display: inline-block; width: 48px; color: #909399; }
 .prices { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; font-weight: 600; }
 .rent { width: 100%; }
+.rent + .rent { margin: 8px 0 0; }
 .warn { color: var(--el-color-warning); }
 .muted { color: #909399; font-size: 13px; margin: 0 0 8px; }
 </style>

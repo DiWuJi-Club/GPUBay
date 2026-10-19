@@ -7,11 +7,11 @@ export function labelOf(map: LabelMap, value: string | null | undefined): string
 }
 
 export const instanceStateLabel: LabelMap = {
-  creating: '开通中', running: '运行中', stopped: '已到期停机', wiping: '洗机中', released: '已释放', failed: '开通失败',
+  reserved: '已预订', creating: '开通中', running: '运行中', stopped: '已到期停机', wiping: '洗机中', released: '已释放', failed: '开通失败', cancelled: '已取消',
 }
-/** el-tag 的 type：开通中蓝、运行中绿、停机橙、洗机中灰、已释放灰、失败红。 */
+/** el-tag 的 type：已预订 / 开通中蓝、运行中绿、停机橙、洗机中 / 已释放 / 已取消灰、失败红。 */
 export const instanceStateType: LabelMap = {
-  creating: 'primary', running: 'success', stopped: 'warning', wiping: 'info', released: 'info', failed: 'danger',
+  reserved: 'primary', creating: 'primary', running: 'success', stopped: 'warning', wiping: 'info', released: 'info', failed: 'danger', cancelled: 'info',
 }
 export const orderKindLabel: LabelMap = { new: '新购', renew: '续费' }
 export const orderStatusLabel: LabelMap = { paid: '已支付', refunded: '已退款', partially_refunded: '部分退款' }
@@ -27,6 +27,7 @@ export const alertKindLabel: LabelMap = {
   orphan_container: '残留容器', orphan_wipe_failed: '残留容器清理失败', root_disk_high: '根分区空间不足', gpu_temp_high: 'GPU 温度过高',
   invalid_report: '上报数据异常',
   ssh_bruteforce: 'SSH 暴力破解', upstream_unreachable: '实例 SSH 上游不可达', tls_cert_reload_failed: 'TLS 证书加载失败', tls_cert_expiring: 'TLS 证书即将到期',
+  booking_at_risk: '预订机器不可用', booking_unfulfilled: '预订无法履约', booking_cancel_failed: '预订取消失败',
 }
 export const roleLabel: LabelMap = { super: '超级管理员', ops: '运维', finance: '财务' }
 export const adminStatusLabel: LabelMap = { active: '正常', disabled: '已停用' }
@@ -55,4 +56,6 @@ export const auditActions: readonly string[] = [
   'wallet.adjust', 'wallet.manual_recharge',
   'price.update',
   'image.create', 'image.update',
+  'group.create', 'group.update', 'group.delete', 'group.assign', 'group.unassign', 'machine.update',
+  'booking.cancel', 'booking.admin_cancel', 'booking.reassign', 'instance.auto_renew',
 ]
