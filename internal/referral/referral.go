@@ -14,7 +14,8 @@
 //	发放：users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED →
 //	  [同身份复查命中：referral_bindings → referral_rewards(该绑定其余 pending) 作废] → wallet_accounts(邀请人)
 //	  （users 同计提：写 wallet_ledger 的外键检查会对 users(邀请人) 取 KEY SHARE，须先于账户锁。）
-//	冻结 / 解冻 / 撤销 / 通过：referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
+//	冻结 / 解冻 / 撤销 / 通过：users(邀请人[, 被邀请人]) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
+//	  （与发放同序；冻结与同一轮发放的互斥靠账户锁：releaseOne 在账户锁内复核账户 / 绑定状态。）
 //	OnKYCVerified（identity 事务内）：users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
 //	  （可能锁两行 referral_accounts：先本人的邀请人，再本人自己的账户。安全，因为邀请关系是无环的森林
 //	  ——绑定只在被邀请人注册时建立，邀请人必先存在——所有路径都按「祖先 → 后代」加锁，不会反向等待。）
