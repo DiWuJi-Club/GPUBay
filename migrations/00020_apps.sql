@@ -59,7 +59,7 @@ CREATE TABLE app_deployments (
     cleanup_pending   BOOLEAN NOT NULL DEFAULT false,  -- 实例停机时卸载：目录留在数据盘，实例恢复后由 Runner 删除
     unreachable_count INT NOT NULL DEFAULT 0,          -- 连续 DialError 次数（10 次 → failed(unreachable)）
     crash_count       INT NOT NULL DEFAULT 0,          -- 连续 alive=0 次数（3 次 → failed(crashed)）
-    version           INT NOT NULL DEFAULT 0,          -- 乐观并发版本号：每次写本行都 +1，Runner 回写按它比较（不用 updated_at）
+    row_version       INT NOT NULL DEFAULT 0,          -- 乐观并发版本号：每次写本行都 +1，Runner 回写按它比较（不用 updated_at）
     started_at        TIMESTAMPTZ,
     finished_at       TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL,

@@ -92,9 +92,9 @@ type Deployment struct {
 	CleanupPending   bool
 	UnreachableCount int
 	CrashCount       int
-	// Version 是行的乐观并发版本号（app_deployments.version）：每个写本行的地方都 +1，
+	// RowVersion 是行的乐观并发版本号（app_deployments.row_version）：每个写本行的地方都 +1，
 	// Runner 回写时按它比较（假时钟下 updated_at 会撞车，不能用来判断并发修改）。
-	Version    int
+	RowVersion int
 	StartedAt  *time.Time
 	FinishedAt *time.Time
 	CreatedAt  time.Time
