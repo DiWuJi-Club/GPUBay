@@ -547,3 +547,17 @@ func TestImportDir(t *testing.T) {
 		t.Fatalf("apps after skipped imports = %d", n)
 	}
 }
+
+// 镜像登记成 Docker Hub 全名（或省略 tag）时，与 docker image ls 的短名（Agent 上报的形态）对得上。
+func TestCoverageMatchesFamiliarRef(t *testing.T) {
+	e := newEnv(t, 2)
+	e.exec(`UPDATE images SET ref = 'docker.io/library/ubuntu' WHERE id = $1`, e.imageID)
+	now := e.clk.Now()
+	e.exec(`UPDATE machines SET cached_images = ARRAY['ubuntu:latest'], cached_images_at = $2 WHERE id = $1`, e.machines[0], now)
+	e.exec(`UPDATE machines SET cached_images = ARRAY['other:1'], cached_images_at = $2 WHERE id = $1`, e.machines[1], now)
+	v := e.version(e.app("vllm", "").ID, "1")
+	cov, err := e.cat.VersionCoverage(e.ctx, v)
+	if err != nil || len(cov) != 1 || cov[0].Cached != 1 || cov[0].Online != 2 {
+		t.Fatalf("coverage = %+v %v", cov, err)
+	}
+}

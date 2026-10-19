@@ -1161,3 +1161,26 @@ func rsaKeyPEM(t *testing.T) (*rsa.PrivateKey, string) {
 	}
 	return k, string(pem.EncodeToMemory(block))
 }
+
+func TestImagesReportedFromRuntime(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	if got := e.ex.Images(ctx); got != nil {
+		t.Fatalf("unset = %#v", got)
+	}
+	e.rt.SetImages([]string{"a:1"})
+	if got := e.ex.Images(ctx); !slices.Equal(got, []string{"a:1"}) {
+		t.Fatalf("images = %v", got)
+	}
+	e.rt.FailNext("images", errors.New("docker down"))
+	if got := e.ex.Images(ctx); got != nil {
+		t.Fatalf("on error = %v, want nil", got)
+	}
+	// dockerd 卡死：受 reportTimeout 约束，返回 nil
+	executor.SetReportTimeoutForTest(e.ex, 50*time.Millisecond)
+	e.rt.Block("images", true)
+	start := time.Now()
+	if got := e.ex.Images(ctx); got != nil || time.Since(start) > 2*time.Second {
+		t.Fatalf("blocked = %v after %v", got, time.Since(start))
+	}
+}

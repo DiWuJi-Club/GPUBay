@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/platform/imageref"
 )
 
 // CoverageFreshness：机器的 cached_images 超过这么久没更新就算「未知」（Agent 每分钟上报一次）。
@@ -33,6 +34,7 @@ func (c *Catalog) VersionCoverage(ctx context.Context, v Version) ([]Coverage, e
 		if err != nil {
 			return nil, err
 		}
+		ref = imageref.Familiar(ref) // 与 Agent 上报的 docker image ls 形态对齐（docker.io/library/ 折叠、补 :latest）
 		err = c.pool.QueryRow(ctx, `SELECT
 			count(*) FILTER (WHERE agent_online) AS online,
 			count(*) FILTER (WHERE agent_online AND cached_images_at >= $2 AND $1 = ANY(cached_images)) AS cached,

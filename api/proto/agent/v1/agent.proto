@@ -84,7 +84,11 @@ message CommandResult {
   string message = 3;   // 失败原因：命令 + stderr 末尾 500 字节
 }
 
-message StateReport { repeated InstanceState instances = 1; }
+message StateReport {
+  repeated InstanceState instances = 1;
+  // 已缓存镜像的 repository:tag 列表（docker image ls，≤ 200 项）；计划 7 新增，旧 Agent 不发该字段，平台不覆盖已有记录。
+  repeated string images = 2;
+}
 
 message InstanceState {
   string instance_id = 1;

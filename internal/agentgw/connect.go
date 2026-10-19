@@ -348,6 +348,11 @@ func (s *Server) handleReport(ctx context.Context, c *conn, r *agentpb.StateRepo
 	if err := s.d.Fleet.RecordStateReport(ctx, c.machineID, rep); err != nil {
 		s.d.Log.Error("record state report", "machine", c.machineID, "err", err)
 	}
+	if rep.Images != nil {
+		if err := s.d.Fleet.RecordCachedImages(ctx, c.machineID, rep.Images); err != nil {
+			s.d.Log.Warn("record cached images", "machine", c.machineID, "err", err)
+		}
+	}
 	if err := s.d.Rental.Reconcile(ctx, c.machineID, rep); err != nil {
 		s.d.Log.Error("reconcile", "machine", c.machineID, "err", err)
 	}

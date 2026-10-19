@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,5 +110,57 @@ func TestRecordMetricsAndStateReport(t *testing.T) {
 	}
 	if got, _ := svc.ReportsFor(ctx, []int64{id}); len(got) != 0 {
 		t.Fatalf("offline report = %v", got)
+	}
+}
+
+func TestRecordCachedImages(t *testing.T) {
+	svc, pool, clk := newEnv(t)
+	ctx := context.Background()
+	id := dbtest.CreateMachine(t, pool, "SN-A")
+	m, _ := svc.Get(ctx, pool, id)
+	if m.CachedImages == nil || len(m.CachedImages) != 0 || m.CachedImagesAt != nil {
+		t.Fatalf("fresh machine = %#v at %v", m.CachedImages, m.CachedImagesAt)
+	}
+	// nil = 旧 Agent 未上报：不写
+	if err := svc.RecordCachedImages(ctx, id, nil); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ = svc.Get(ctx, pool, id); m.CachedImagesAt != nil {
+		t.Fatalf("nil wrote cached_images_at = %v", m.CachedImagesAt)
+	}
+	// 网关侧再规范化一遍：去 <none>、去重、排序、docker.io/library 前缀折叠
+	if err := svc.RecordCachedImages(ctx, id, []string{"spark/pytorch:25.09", "<none>:<none>", "docker.io/library/ubuntu:24.04", "spark/pytorch:25.09"}); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = svc.Get(ctx, pool, id)
+	if strings.Join(m.CachedImages, ",") != "spark/pytorch:25.09,ubuntu:24.04" || m.CachedImagesAt == nil || !m.CachedImagesAt.Equal(clk.Now()) {
+		t.Fatalf("cached = %v at %v", m.CachedImages, m.CachedImagesAt)
+	}
+	many := make([]string, 201)
+	for i := range many {
+		many[i] = fmt.Sprintf("img%03d:%s", i, strings.Repeat("x", 300))
+	}
+	clk.Advance(time.Minute)
+	if err := svc.RecordCachedImages(ctx, id, many); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = svc.Get(ctx, pool, id)
+	if len(m.CachedImages) != fleet.MaxCachedImages || len(m.CachedImages[0]) != fleet.MaxCachedImageLen || !m.CachedImagesAt.Equal(clk.Now()) {
+		t.Fatalf("truncation: %d items, first len %d", len(m.CachedImages), len(m.CachedImages[0]))
+	}
+	// 空列表（Agent 本机确实没有镜像）照写
+	if err := svc.RecordCachedImages(ctx, id, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ = svc.Get(ctx, pool, id); m.CachedImages == nil || len(m.CachedImages) != 0 {
+		t.Fatalf("empty = %#v", m.CachedImages)
+	}
+	// 镜像列表不进 last_state_report
+	if err := svc.RecordStateReport(ctx, id, fleet.StateReport{Images: []string{"a:1"}}); err != nil {
+		t.Fatal(err)
+	}
+	var raw string
+	if err := pool.QueryRow(ctx, `SELECT last_state_report::text FROM machines WHERE id = $1`, id).Scan(&raw); err != nil || raw != `{"instances": []}` {
+		t.Fatalf("last_state_report = %s %v", raw, err)
 	}
 }

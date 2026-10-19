@@ -1,7 +1,9 @@
 package agentgw_test
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,5 +198,60 @@ func TestUnknownCommandResultIsIgnored(t *testing.T) {
 	e.waitFor("heartbeat after bogus result", func() bool { return e.srv.HeartbeatCount(mid) > before })
 	if err := a.waitErr(100 * time.Millisecond); err != nil {
 		t.Fatalf("stream dropped: %v", err)
+	}
+}
+
+// reportImages 发一条带 images 的 StateReport 并等平台处理完。
+func (e *env) reportImages(a *agentStream, mid int64, images []string) {
+	e.t.Helper()
+	before := e.srv.ReportCount(mid)
+	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Images: images}}})
+	e.waitFor("images report", func() bool { return e.srv.ReportCount(mid) > before })
+}
+
+func TestReportImagesRecorded(t *testing.T) {
+	e := newEnv(t)
+	mid := e.machine("SN-001")
+	a := e.up(e.enroll(mid), mid)
+	e.reportImages(a, mid, []string{"spark/pytorch:25.09", "spark/llm-serving:25.09"})
+	m, _ := e.fleet.Get(e.ctx, e.pool, mid)
+	if fmt.Sprint(m.CachedImages) != "[spark/llm-serving:25.09 spark/pytorch:25.09]" || m.CachedImagesAt == nil || !m.CachedImagesAt.Equal(e.clk.Now()) {
+		t.Fatalf("cached = %v at %v", m.CachedImages, m.CachedImagesAt)
+	}
+	if strings.Contains(string(mustReport(e, mid)), "images") {
+		t.Fatalf("images leaked into last_state_report: %s", mustReport(e, mid))
+	}
+	// 截断：201 项 → 200；超长项 → 256 字节
+	many := make([]string, 201)
+	for i := range many {
+		many[i] = fmt.Sprintf("img%03d:%s", i, strings.Repeat("x", 300))
+	}
+	e.reportImages(a, mid, many)
+	m, _ = e.fleet.Get(e.ctx, e.pool, mid)
+	if len(m.CachedImages) != 200 || len(m.CachedImages[0]) != 256 {
+		t.Fatalf("truncation: %d items, first len %d", len(m.CachedImages), len(m.CachedImages[0]))
+	}
+}
+
+func TestReportWithoutImagesKeepsCache(t *testing.T) {
+	e := newEnv(t)
+	mid := e.machine("SN-001")
+	a := e.up(e.enroll(mid), mid) // 旧 Agent 的首个报告不带 images：不写
+	m, _ := e.fleet.Get(e.ctx, e.pool, mid)
+	if len(m.CachedImages) != 0 || m.CachedImagesAt != nil {
+		t.Fatalf("report without images wrote cache: %v %v", m.CachedImages, m.CachedImagesAt)
+	}
+	e.reportImages(a, mid, []string{"spark/comfyui:25.09"})
+	at := e.clk.Now()
+	e.clk.Advance(time.Minute)
+	before := e.srv.ReportCount(mid)
+	a.report() // 旧 Agent：StateReport 没有 images 字段
+	e.waitFor("report without images", func() bool { return e.srv.ReportCount(mid) > before })
+	m, _ = e.fleet.Get(e.ctx, e.pool, mid)
+	if fmt.Sprint(m.CachedImages) != "[spark/comfyui:25.09]" || m.CachedImagesAt == nil || !m.CachedImagesAt.Equal(at) {
+		t.Fatalf("cache overwritten by report without images: %v %v", m.CachedImages, m.CachedImagesAt)
+	}
+	if m.StateReportedAt == nil || !m.StateReportedAt.Equal(e.clk.Now()) {
+		t.Fatalf("state report itself not recorded: %v", m.StateReportedAt)
 	}
 }
