@@ -2,6 +2,7 @@ package rental
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -133,7 +134,9 @@ func updateLeaseCapped(ctx context.Context, tx pgx.Tx, id string, desired time.T
 		SET period = target.p, status = $3, updated_at = $4
 		FROM target WHERE m.id = target.id AND (m.period IS DISTINCT FROM target.p OR m.status IS DISTINCT FROM $3)`, id, desired, status, now)
 	if err != nil {
-		_ = sp.Rollback(ctx)
+		if rbErr := sp.Rollback(ctx); rbErr != nil {
+			return errors.Join(err, rbErr)
+		}
 		return err
 	}
 	return sp.Commit(ctx)

@@ -1,5 +1,7 @@
 // 各路径的实际加锁顺序（规格 §14）：
-//   PlaceBatch：idem 咨询锁 → [booking:<uid> 咨询锁] → machines(SKIP LOCKED) → 插实例 / lease → orders → wallet
+//   PlaceBatch / Place：idem 咨询锁 → [booking:<uid> 咨询锁] → [插 rental_batches] → machines(NO KEY UPDATE, SKIP LOCKED)
+//     → 每台 savepoint 内 [machine 标 allocated] → 插实例（FK：machine_groups KEY SHARE）/ lease → orders → wallet → agent_commands
+//     整个事务遇 40P01 / 40001 重试一次（withRetry）
 //   ProvisionDue：instance → 自己的 lease → machine(NO KEY UPDATE) → [改派：machines SKIP LOCKED] → agent_commands
 //   机器行锁一律 FOR NO KEY UPDATE：插入引用 machines(id) 的行会取 FOR KEY SHARE，与 FOR UPDATE 互斥、与 NO KEY UPDATE 不互斥。
 //   后台改派：instance → lease → machines(SKIP LOCKED)
@@ -7,6 +9,8 @@
 //   取消：instance → lease → orders → wallet
 //   HandleCommandResult：instance → agent_commands → lease(refreshLease) → machine(Release)
 //   ExpireDue / WipeStale / Suspend / Resume / RefreshCapped / beginWipe：instance → lease → agent_commands
+//   AdminDeleteGroup：machine_groups(FOR UPDATE) → instances(清 group_id) → machines(只读计数) → 删机组
+//     下单插实例取机组行 KEY SHARE：先插的一方先拿到锁，另一方等它提交；删除方不锁机器，与下单不成环
 //   AdminMigrate：原实例 → machines(SKIP LOCKED) → 新 lease → agent_commands → 旧 lease 收缩
 // 持机器行锁的事务只会在插入 lease 撞到别的事务未提交的 lease 增长时等待；而让 lease 增长的路径都不等机器锁，等待链不成环。
 
