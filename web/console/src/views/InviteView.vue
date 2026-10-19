@@ -182,6 +182,7 @@ watch(rewardsPage, () => void loadRewards())
             <div class="muted">
               消费 {{ fmtYuan(r.order_amount) }}<span v-if="r.refunded_amount > 0">（已退 {{ fmtYuan(r.refunded_amount) }}）</span> · {{ fmtTime(r.paid_at) }} ·
               <span data-testid="reward-status">{{ labelOf(rewardStatusLabel, r.status) }}</span>
+              <span v-if="r.status === 'pending'"> · <span data-testid="reward-settle-after">预计到账 {{ fmtTime(r.settle_after) }}</span></span>
               <span v-if="r.status === 'settled' && r.clawed_amount > 0" data-testid="reward-clawed">（已扣回 {{ fmtYuan(r.clawed_amount) }}）</span>
             </div>
           </div>

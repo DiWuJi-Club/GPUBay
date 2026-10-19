@@ -100,5 +100,18 @@ describe('InviteView', () => {
     expect($('reward-amount')!.textContent).toBe('¥3.90')
     expect($('reward-status')!.textContent).toBe('已发放')
     expect($('reward-clawed')!.textContent).toContain('已扣回 ¥3.00')
+    expect($('reward-settle-after')).toBeNull() // 已发放不再显示预计到账
+  })
+
+  it('待发放行显示预计到账时间（settle_after，北京时间）', async () => {
+    mocks.get.mockImplementation((path: string) => {
+      if (path === '/referral/me') return Promise.resolve(me)
+      if (path === '/referral/rewards')
+        return Promise.resolve({ total: 1, items: [{ order_id: 'ord-2', invitee_masked: '139****5678', paid_at: '2026-10-20T00:00:00Z', order_amount: 6900, refunded_amount: 0, reward: 690, status: 'pending', settle_after: '2026-10-27T00:00:00Z', settled_at: null, clawed_amount: 0 }] })
+      return Promise.resolve({ items: [], total: 0 })
+    })
+    await render('/invite?tab=rewards')
+    expect($('reward-status')!.textContent).toBe('待发放')
+    expect($('reward-settle-after')!.textContent).toBe('预计到账 2026-10-27 08:00')
   })
 })

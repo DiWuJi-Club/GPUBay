@@ -166,7 +166,7 @@ test('A-REF-05 返利明细筛选与 CSV 下载（中文表头、两位小数）
   const lines = text.trim().split(/\r?\n/)
   expect(lines[0]).toBe('订单号,邀请人ID,被邀请人ID,消费(元),退款(元),费率(%),应得(元),状态,发放时间,已扣回(元),费率版本')
   expect(lines).toHaveLength(2)
-  expect(lines[1]).toContain(`,${inv.id},${b.id},${yuan2(6900)},0.00,10.00,${yuan2(690)},settled,`)
+  expect(lines[1]).toContain(`,${inv.id},${b.id},${yuan2(6900)},0.00,10.00,${yuan2(690)},已发放,`)
 })
 
 test('A-REF-06 用户详情邀请区块：被邀请人显示邀请人，邀请人显示统计与链接', async ({ page }) => {

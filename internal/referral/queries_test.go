@@ -29,6 +29,14 @@ func TestMeInviteesRewards(t *testing.T) {
 	if me.Stats.Invitees != 2 || me.Stats.VerifiedInvitees != 1 || me.Stats.Pending != 1380 || me.Stats.SettledNet != 0 || me.Stats.Debt != 50 || me.Stats.MonthSettled != 0 {
 		t.Fatalf("stats = %+v", me.Stats)
 	}
+	// 待发放明细带预计到账时间（settle_after = 扣款 + 持有期 7 天；验收缺陷 P8-A1）
+	pend, _, err := e.svc.Rewards(e.ctx, a, "pending", paging.Page{Number: 1, Size: 20})
+	if err != nil || len(pend) != 2 || pend[0].PaidAt.IsZero() || !pend[0].SettleAfter.Equal(pend[0].PaidAt.Add(7*24*time.Hour)) {
+		t.Fatalf("pending rewards = %+v %v", pend, err)
+	}
+	if raw, _ := json.Marshal(pend[0]); !strings.Contains(string(raw), `"settle_after":"`) {
+		t.Fatalf("reward json lacks settle_after: %s", raw)
+	}
 	// rebate 只给规则摘要：不带费率版本的内部字段（创建人、备注、id）
 	raw, _ := json.Marshal(me)
 	for _, leak := range []string{`"created_by"`, `"note"`, `"id"`} {

@@ -127,16 +127,24 @@ func TestReferralAdminEndpoints(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/csv") || !strings.Contains(string(raw), "绑定ID,邀请人ID,被邀请人ID,邀请码,状态,标记,绑定时间,返利截止,IP,设备") {
 		t.Fatalf("bindings csv = %d %q", resp.StatusCode, raw)
 	}
-	if !strings.Contains(string(raw), ",same_device,") || !strings.Contains(string(raw), ",'=1+1") {
+	// 状态 / 标记用中文标签（与页面一致），不输出原始代码
+	if !strings.Contains(string(raw), ",已失效,同设备,") || strings.Contains(string(raw), "same_device") || strings.Contains(string(raw), ",revoked,") || !strings.Contains(string(raw), ",'=1+1") {
 		t.Fatalf("bindings csv row = %q", raw)
 	}
 	if code, out := fin.do("GET", "/referral/rewards?status=settled", nil); code != 200 || out["total"] != float64(0) {
 		t.Fatalf("rewards = %d %v", code, out)
 	}
+	if _, err := e.pool.Exec(e.ctx, `INSERT INTO referral_rewards (order_id, binding_id, inviter_id, invitee_id, rate_version_id, rate_bp, order_amount, reward_cap, reward, status, settle_after, paid_at, created_at, updated_at)
+		SELECT 'ord-void', id, inviter_id, invitee_id, rate_version_id, 1000, 6900, 690, 690, 'void', $2, $2, $2, $2 FROM referral_bindings WHERE id = $1`, bid, e.clk.Now()); err != nil {
+		t.Fatal(err)
+	}
 	resp, _ = fin.send("GET", "/referral/rewards/export", nil)
 	raw, _ = io.ReadAll(resp.Body)
 	if !strings.Contains(string(raw), "订单号,邀请人ID,被邀请人ID,消费(元),退款(元),费率(%),应得(元),状态,发放时间,已扣回(元),费率版本") {
 		t.Fatalf("rewards csv = %q", raw)
+	}
+	if !strings.Contains(string(raw), "ord-void,") || !strings.Contains(string(raw), ",6.90,已作废,,0.00,") || strings.Contains(string(raw), ",void,") {
+		t.Fatalf("rewards csv row = %q", raw)
 	}
 	// 重扫：super + TOTP；days 范围在二次验证之前校验；写审计（水位拨回与重扫本身由 referral 的 Rescan 测试覆盖）
 	if code, _ := fin.do("POST", "/referral/rescan", map[string]any{"days": 3}); code != 403 {

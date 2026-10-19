@@ -3,7 +3,6 @@ package adminapi
 import (
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -204,8 +203,8 @@ func (s *Server) handleReferralExportBindings(w http.ResponseWriter, r *http.Req
 	s.csvExport(w, r, "referral-bindings", []string{"绑定ID", "邀请人ID", "被邀请人ID", "邀请码", "状态", "标记", "绑定时间", "返利截止", "IP", "设备"},
 		func(write func([]string) error) error {
 			return s.Referral.ExportBindings(r.Context(), f, func(b referral.Binding) error {
-				return write([]string{strconv.FormatInt(b.ID, 10), strconv.FormatInt(b.InviterID, 10), strconv.FormatInt(b.InviteeID, 10), b.Code, b.Status,
-					strings.Join(b.RiskFlags, " "), csvx.Time(b.BoundAt), csvx.Time(b.RebateUntil), b.IP, b.DeviceID})
+				return write([]string{strconv.FormatInt(b.ID, 10), strconv.FormatInt(b.InviterID, 10), strconv.FormatInt(b.InviteeID, 10), b.Code, referral.BindingStatusText(b.Status),
+					referral.FlagsText(b.RiskFlags), csvx.Time(b.BoundAt), csvx.Time(b.RebateUntil), b.IP, b.DeviceID})
 			})
 		})
 }
@@ -304,7 +303,7 @@ func (s *Server) handleReferralExportRewards(w http.ResponseWriter, r *http.Requ
 		func(write func([]string) error) error {
 			return s.Referral.ExportRewards(r.Context(), f, func(v referral.AdminReward) error {
 				return write([]string{v.OrderID, strconv.FormatInt(v.InviterID, 10), strconv.FormatInt(v.InviteeID, 10), csvx.Yuan(v.OrderAmount), csvx.Yuan(v.RefundedAmount),
-					strconv.FormatFloat(float64(v.RateBP)/100, 'f', 2, 64), csvx.Yuan(v.RewardAmt), v.Status, csvx.TimePtr(v.SettledAt), csvx.Yuan(v.ClawedAmount),
+					strconv.FormatFloat(float64(v.RateBP)/100, 'f', 2, 64), csvx.Yuan(v.RewardAmt), referral.RewardStatusText(v.Status), csvx.TimePtr(v.SettledAt), csvx.Yuan(v.ClawedAmount),
 					strconv.FormatInt(v.RateVersionID, 10)})
 			})
 		})

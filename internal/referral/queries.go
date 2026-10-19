@@ -138,6 +138,7 @@ type RewardView struct {
 	RefundedAmount int64      `json:"refunded_amount"`
 	Reward         int64      `json:"reward"`
 	Status         string     `json:"status"`
+	SettleAfter    time.Time  `json:"settle_after"` // 预计到账时间（待发放行显示；到期后仍受实名 / 冻结 / 搁置门槛约束）
 	SettledAt      *time.Time `json:"settled_at"`
 	ClawedAmount   int64      `json:"clawed_amount"`
 }
@@ -151,7 +152,7 @@ func (s *Service) Rewards(ctx context.Context, userID int64, status string, p pa
 	if err := s.d.Pool.QueryRow(ctx, `SELECT count(*) FROM referral_rewards WHERE inviter_id = $1 AND ($2 = '' OR status = $2)`, userID, status).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.d.Pool.Query(ctx, `SELECT r.order_id, u.phone, r.paid_at, r.order_amount, r.refunded_amount, r.reward, r.status, r.settled_at, r.clawed_amount
+	rows, err := s.d.Pool.Query(ctx, `SELECT r.order_id, u.phone, r.paid_at, r.order_amount, r.refunded_amount, r.reward, r.status, r.settle_after, r.settled_at, r.clawed_amount
 		FROM referral_rewards r JOIN users u ON u.id = r.invitee_id WHERE r.inviter_id = $1 AND ($2 = '' OR r.status = $2)
 		ORDER BY r.paid_at DESC, r.order_id DESC LIMIT $3 OFFSET $4`, userID, status, p.Limit(), p.Offset())
 	if err != nil {
@@ -160,7 +161,7 @@ func (s *Service) Rewards(ctx context.Context, userID int64, status string, p pa
 	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (RewardView, error) {
 		var v RewardView
 		var phone string
-		err := r.Scan(&v.OrderID, &phone, &v.PaidAt, &v.OrderAmount, &v.RefundedAmount, &v.Reward, &v.Status, &v.SettledAt, &v.ClawedAmount)
+		err := r.Scan(&v.OrderID, &phone, &v.PaidAt, &v.OrderAmount, &v.RefundedAmount, &v.Reward, &v.Status, &v.SettleAfter, &v.SettledAt, &v.ClawedAmount)
 		v.InviteeMasked = MaskPhone(phone)
 		return v, err
 	})

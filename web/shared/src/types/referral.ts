@@ -59,6 +59,8 @@ export interface RewardItem {
   refunded_amount: number
   reward: number
   status: RewardStatus
+  /** 预计到账时间（扣款 + 持有期）；待发放行显示，到期后仍受实名 / 冻结 / 搁置门槛约束 */
+  settle_after: string
   settled_at: string | null
   clawed_amount: number
 }
