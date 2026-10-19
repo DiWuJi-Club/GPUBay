@@ -269,6 +269,20 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
               </tbody>
             </table>
           </el-tab-pane>
+          <el-tab-pane label="SSH 公钥" name="keys">
+            <table class="grid">
+              <thead><tr><th>名称</th><th>指纹</th><th>添加时间</th><th>最近使用</th></tr></thead>
+              <tbody>
+                <tr v-for="k in data.ssh_keys" :key="k.id" data-testid="udetail-key-row">
+                  <td data-testid="udetail-key-name">{{ k.name }}</td>
+                  <td class="mono" data-testid="udetail-key-fp">{{ k.fingerprint }}</td>
+                  <td>{{ fmtTime(k.created_at) }}</td>
+                  <td>{{ k.last_used_at ? fmtTime(k.last_used_at) : '—' }}</td>
+                </tr>
+                <tr v-if="!data.ssh_keys.length"><td colspan="4" class="muted empty">无公钥</td></tr>
+              </tbody>
+            </table>
+          </el-tab-pane>
         </el-tabs>
       </el-card>
 

@@ -33,3 +33,5 @@ export const showExtend = (r: Role, s: InstanceState) => opsRole(r) && extendabl
 export const showMigrate = (r: Role, s: InstanceState) => opsRole(r) && s === 'running'
 export const showRewipe = (r: Role, s: InstanceState) => opsRole(r) && s === 'wiping'
 export const showRefund = (r: Role, s: InstanceState) => finRole(r) && extendable(s)
+/** 端口处置（强制私有 / 删除）：运维与超管。 */
+export const showPortActions = (role: Role): boolean => role === 'ops' || role === 'super'
