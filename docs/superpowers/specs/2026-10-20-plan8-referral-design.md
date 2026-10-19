@@ -509,14 +509,14 @@ func (s *Service) Admin*(...)                                                // 
 
   | 路径 | 顺序 |
   |---|---|
-  | Bind（在 identity 事务内） | users(被邀请人, INSERT 持有) → referral_accounts(码主) FOR SHARE → 插 referral_bindings |
+  | Bind（在 identity 事务内） | users(被邀请人, INSERT 持有) → users(码主) FOR KEY SHARE → referral_accounts(码主) FOR SHARE → 插 referral_bindings |
   | 计提 / 退款处理 | referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回] |
   | 发放 | referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → wallet_accounts(邀请人) |
   | 冻结 / 解冻 / 撤销 / 通过 | referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards（撤销时批量 void） |
   | OnKYCVerified（在 identity 事务内） | users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards |
   | rental 的扣款 / 退款事务 | 不碰 referral 任何表（只写 wallet），与上面互不等待 |
 
-  所有 referral 路径都从 `referral_accounts(邀请人)` 开始，之后只锁更细粒度的行与 `wallet_accounts`，而 rental / billing 的事务只锁 `wallet_accounts`（从不反过来锁 referral 表）→ 等待链不成环。`OnKYCVerified` 先持有 `users` 行锁再锁 `referral_accounts`，而 `Bind` 持有新用户行（别人不会等它）再 `FOR SHARE` 码主账户：与「冻结」（`FOR UPDATE`）互斥但不成环。
+  所有 referral 路径都从 `referral_accounts(邀请人)` 开始，之后只锁更细粒度的行与 `wallet_accounts`，而 rental / billing 的事务只锁 `wallet_accounts`（从不反过来锁 referral 表）→ 等待链不成环。`OnKYCVerified` 先持有 `users` 行锁再锁 `referral_accounts`，而 `Bind` 持有新用户行（别人不会等它），再显式 `FOR KEY SHARE` 码主的 `users` 行、最后 `FOR SHARE` 码主账户——同样是 users → accounts：插 `referral_bindings` 时外键检查本来也要对码主 `users` 行取 `KEY SHARE`，若放到账户锁之后就与码主本人的 `OnKYCVerified`（users `FOR UPDATE` → accounts `FOR UPDATE`）反向而死锁，所以提前显式加。与「冻结」（`FOR UPDATE`）互斥但不成环。
 - **上限并发**：30 天 / 被邀请人上限在持有 `referral_accounts(邀请人)` 行锁时计算（§4.2），同一邀请人的计提串行。
 - **不变量**（集成测试与 `make check` 断言，对每个邀请人 `v`）：
   1. `Σ wallet_ledger(v, referral_rebate) − Σ wallet_ledger(v, referral_clawback) == Σ(settled_amount − clawed_amount)(v) + debt(v)`；推导：入账 = Σ settled − Σ 抵销，扣款 = Σ clawed − Σ 欠账新增，而 `debt = Σ 欠账新增 − Σ 抵销`。等价表述：钱包净额 = 账面净应得 + 未抵销欠账。

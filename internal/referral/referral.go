@@ -5,7 +5,9 @@
 //
 // 加锁顺序（规格 §14）：
 //
-//	Bind（identity 事务内）：users(被邀请人, INSERT 持有) → referral_accounts(码主) FOR SHARE → 插 referral_bindings
+//	Bind（identity 事务内）：users(被邀请人, INSERT 持有) → users(码主) FOR KEY SHARE → referral_accounts(码主) FOR SHARE → 插 referral_bindings
+//	  （users(码主) 必须先于 referral_accounts 显式加锁：否则插绑定时的外键检查才对码主取 KEY SHARE，
+//	  成了 accounts → users，与码主本人 OnKYCVerified 的 users FOR UPDATE → accounts FOR UPDATE 反向，会死锁。）
 //	计提 / 退款处理：referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回]
 //	发放：referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → wallet_accounts(邀请人)
 //	冻结 / 解冻 / 撤销 / 通过：referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
@@ -41,6 +43,7 @@ const (
 	ReleaseBatch = 200
 
 	BurstThreshold    = 20
+	BurstWindow       = 24 * time.Hour // burst：码主在此窗口内的绑定数（含本次）达到 BurstThreshold
 	SameIPWindow      = 24 * time.Hour
 	MaxDevicesPerUser = 10
 	InviterWindow     = 30 * 24 * time.Hour // max_per_inviter_30d 的窗口
