@@ -38,6 +38,20 @@ func (n *fakeNotifier) NotifyExpiry(_ context.Context, _ int64, instanceID strin
 	return nil
 }
 
+func (n *fakeNotifier) NotifyAutoRenewFailed(_ context.Context, _ int64, instanceID, reason string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.calls = append(n.calls, "auto_renew_failed:"+instanceID+":"+reason)
+	return nil
+}
+
+func (n *fakeNotifier) NotifyBookingCancelled(_ context.Context, _ int64, instanceID, reason string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.calls = append(n.calls, "booking_cancelled:"+instanceID+":"+reason)
+	return nil
+}
+
 func (n *fakeNotifier) Calls() []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()

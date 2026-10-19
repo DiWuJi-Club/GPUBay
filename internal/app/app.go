@@ -318,6 +318,22 @@ func (n expiryNotifier) NotifyExpiry(ctx context.Context, userID int64, instance
 	return n.sms.Send(ctx, u.Phone, sms.TemplateExpiryReminder, map[string]string{"instance": instanceID, "hours": strconv.Itoa(hours)})
 }
 
+func (n expiryNotifier) NotifyAutoRenewFailed(ctx context.Context, userID int64, instanceID, reason string) error {
+	u, err := n.ids.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	return n.sms.Send(ctx, u.Phone, sms.TemplateAutoRenewFailed, map[string]string{"instance": instanceID, "reason": reason})
+}
+
+func (n expiryNotifier) NotifyBookingCancelled(ctx context.Context, userID int64, instanceID, reason string) error {
+	u, err := n.ids.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	return n.sms.Send(ctx, u.Phone, sms.TemplateBookingCancelled, map[string]string{"instance": instanceID, "reason": reason})
+}
+
 // realProviders 按配置读取密钥文件，创建已启用的真实支付渠道。
 func realProviders(cfg config.Config) (map[string]pay.Provider, error) {
 	out := map[string]pay.Provider{}

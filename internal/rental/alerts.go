@@ -27,3 +27,12 @@ func AlertSSHBruteforce(instanceID string) string {
 func AlertUpstreamUnreachable(serial, instanceID string) string {
 	return fmt.Sprintf("机器 %s 上实例 %s 的 SSH 上游无法连接", serial, instanceID)
 }
+func AlertBookingAtRisk(instanceID string) string {
+	return fmt.Sprintf("实例 %s 的预订机器不可用且机组内暂无可改派机器", instanceID)
+}
+func AlertBookingUnfulfilled(instanceID string) string {
+	return fmt.Sprintf("实例 %s 的预订无法履约，已全额退款", instanceID)
+}
+func AlertBookingCancelFailed(instanceID string) string {
+	return fmt.Sprintf("实例 %s 的预订取消失败，详情见日志", instanceID)
+}

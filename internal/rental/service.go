@@ -62,6 +62,9 @@ type UserChecker interface {
 
 type Notifier interface {
 	NotifyExpiry(ctx context.Context, userID int64, instanceID string, remaining time.Duration) error
+	// 计划 6：自动续费失败（reason：余额不足 / 机器已有后续预订）与预订被平台取消（reason：无法安排机器 / 账号不可租用 / 平台取消）
+	NotifyAutoRenewFailed(ctx context.Context, userID int64, instanceID, reason string) error
+	NotifyBookingCancelled(ctx context.Context, userID int64, instanceID, reason string) error
 }
 
 type Deps struct {

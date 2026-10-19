@@ -40,7 +40,9 @@ func TestMain(m *testing.M) { dbtest.Main(m) }
 
 type noopNotifier struct{}
 
-func (noopNotifier) NotifyExpiry(context.Context, int64, string, time.Duration) error { return nil }
+func (noopNotifier) NotifyExpiry(context.Context, int64, string, time.Duration) error    { return nil }
+func (noopNotifier) NotifyAutoRenewFailed(context.Context, int64, string, string) error  { return nil }
+func (noopNotifier) NotifyBookingCancelled(context.Context, int64, string, string) error { return nil }
 
 type env struct {
 	t      *testing.T
