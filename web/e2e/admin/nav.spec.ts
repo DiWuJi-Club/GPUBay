@@ -7,9 +7,9 @@ const ROLE_LABEL: Record<Role, string> = { super: '超级管理员', ops: '运�
 test('A-NAV-01 菜单按角色过滤', async ({ page }) => {
   await page.clock.install() // 角标 60 秒刷新用；pauseClock 之前时间照常流逝
   const cases: [Role, number, string[]][] = [
-    ['super', 13, []],
-    ['ops', 8, ['orders', 'ledger', 'recharges', 'catalog', 'admins']],
-    ['finance', 8, ['machines', 'pdus', 'kyc', 'catalog', 'admins']],
+    ['super', 15, []],
+    ['ops', 10, ['orders', 'ledger', 'recharges', 'catalog', 'admins']],
+    ['finance', 9, ['machines', 'pdus', 'groups', 'kyc', 'catalog', 'admins']],
   ]
   for (const [role, count, missing] of cases) {
     const admin = await createAdmin(role)

@@ -594,8 +594,8 @@ test('A-FIN-04 三张表导出 CSV：与列表同筛选参数（含状态、跨�
       await page.getByTestId('fin-to').fill(day)
     }, `user_id=${e.id}&status=paid&from=${day}&to=${day}`)
     expect(table).toEqual([
-      ['订单号', '用户ID', '类型', '实例', '租期', '金额(元)', '已退(元)', '状态', '下单时间'],
-      [o.id, String(e.id), 'new', o.instance_id, '1d', '69.00', '0.00', 'paid', cstTimeSec(o.created_at)],
+      ['订单号', '用户ID', '类型', '实例', '租期', '数量', '金额(元)', '已退(元)', '状态', '批次', '自动续费', '下单时间'],
+      [o.id, String(e.id), 'new', o.instance_id, '1d', '1', '69.00', '0.00', 'paid', '', '', cstTimeSec(o.created_at)],
     ])
   })
 

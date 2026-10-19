@@ -39,9 +39,13 @@ export const hooks = {
   agent(opts: { machine_id?: number; fail?: boolean; result?: string } = {}) {
     return post<{ completed: number }>('/hooks/agent', opts)
   },
-  /** 造已接入并连上 fake Agent 的空闲机器；rack 缺省为 E2E。 */
-  async machines(count = 1, serial_prefix?: string, rack?: string): Promise<number[]> {
-    return (await post<{ ids: number[] }>('/hooks/machines', { count, serial_prefix, rack })).ids
+  /** 造已接入并连上 fake Agent 的空闲机器；rack 缺省为 E2E；group_id 指定时登记后加入机组。 */
+  async machines(count = 1, serial_prefix?: string, rack?: string, group_id?: number): Promise<number[]> {
+    return (await post<{ ids: number[] }>('/hooks/machines', { count, serial_prefix, rack, group_id })).ids
+  },
+  /** 建一个机组（visible 缺省 true）。 */
+  groups(name: string, visible = true) {
+    return post<{ id: number }>('/hooks/groups', { name, visible })
   },
   /** fake Agent 是否仍连着网关。机器已被撤销接入时会顺手停掉并移除它的 fake Agent：
    *  撤销接入的用例结束前必须调用一次，否则之后的全局 hooks.agent() 会把这台机器悄悄重新接入。 */
