@@ -164,20 +164,6 @@ func (s *Service) SetMaintenanceIn(ctx context.Context, q db.Querier, id int64, 
 	return nil
 }
 
-// Allocate 在调用方事务内锁定一台空闲且在线的机器并标记为已分配。
-func (s *Service) Allocate(ctx context.Context, tx pgx.Tx, productID int64) (Machine, error) {
-	m, err := scanMachine(tx.QueryRow(ctx, `UPDATE machines SET state = 'allocated', updated_at = $2
-		WHERE id = (
-			SELECT id FROM machines
-			WHERE product_id = $1 AND state = 'idle' AND agent_online
-			ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
-		) RETURNING `+machineCols, productID, s.clock.Now()))
-	if errors.Is(err, apperr.ErrNotFound) {
-		return Machine{}, apperr.ErrNoCapacity
-	}
-	return m, err
-}
-
 // Label 对用户展示的机器名：后台设置的展示名，缺省「机器 #<id>」。序列号与内网 IP 不对用户展示。
 func (m Machine) Label() string {
 	if m.DisplayName != "" {

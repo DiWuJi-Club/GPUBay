@@ -39,23 +39,34 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 		if err != nil {
 			return err
 		}
-		m, err := s.d.Fleet.Allocate(ctx, tx, old.ProductID)
-		if err != nil {
-			return err
-		}
+		spec := pickSpec{ProductID: old.ProductID, Immediate: true}
+		spec.Lower, spec.Upper = immediatePeriod(now, remaining)
 		hostPub, hostPEM, err := s.d.HostKeyGen()
 		if err != nil {
 			return err
 		}
 		id := randx.ID("ins-", 8)
-		moved, err = scanInstance(tx.QueryRow(ctx, `INSERT INTO instances
-			(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, password_auth, ssh_host_pubkey, ssh_host_key_enc, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $11) RETURNING `+instanceCols,
-			id, old.UserID, m.ID, old.ProductID, old.ImageID, remaining, s.d.Box.Seal([]byte(randx.Password(16))), old.PasswordAuth, hostPub, s.d.Box.Seal(hostPEM), now))
-		if err != nil {
-			return err
-		}
-		if err := openLease(ctx, tx, moved, now); err != nil {
+		var newMachine int64
+		if _, err := placeOnMachines(ctx, tx, spec, 1, func(sp pgx.Tx, mid int64) error {
+			m, err := s.d.Fleet.MarkAllocated(ctx, sp, mid)
+			if err != nil {
+				return err
+			}
+			moved, err = scanInstance(sp.QueryRow(ctx, `INSERT INTO instances
+				(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, password_auth, ssh_host_pubkey, ssh_host_key_enc,
+				 auto_renew, auto_renew_duration, group_id, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $12, $13, $14, $14) RETURNING `+instanceCols,
+				id, old.UserID, m.ID, old.ProductID, old.ImageID, remaining, s.d.Box.Seal([]byte(randx.Password(16))), old.PasswordAuth, hostPub, s.d.Box.Seal(hostPEM),
+				old.AutoRenew, string(old.AutoRenewDuration), old.GroupID, now))
+			if err != nil {
+				return err
+			}
+			if _, err := insertLease(ctx, sp, m.ID, id, spec.Lower, spec.Upper, "active", now); err != nil {
+				return err
+			}
+			newMachine = m.ID
+			return nil
+		}); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO instance_ports (instance_id, port, visibility, forced_private, note, created_at, updated_at)
@@ -69,14 +80,14 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			VALUES ($1, $2, $3, $4, $5, $6)`, old.ID, id, remaining, reason, actor.AdminID, now); err != nil {
 			return err
 		}
-		if _, err := s.d.Fleet.Enqueue(ctx, tx, m.ID, id, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref}); err != nil {
+		if _, err := s.d.Fleet.Enqueue(ctx, tx, newMachine, id, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref}); err != nil {
 			return err
 		}
 		if err := s.beginWipe(ctx, tx, old, "migrated to "+id+": "+reason, now); err != nil {
 			return err
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("instance.migrate", "instance", old.ID, map[string]any{
-			"to_instance": id, "from_machine": old.MachineID, "to_machine": m.ID, "seconds": remaining, "reason": reason,
+			"to_instance": id, "from_machine": old.MachineID, "to_machine": newMachine, "seconds": remaining, "reason": reason,
 		}))
 	})
 	return moved, err

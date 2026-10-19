@@ -83,15 +83,6 @@ func occupiedUntil(inst Instance, now time.Time) time.Time {
 	return end
 }
 
-// openLease 为新实例写入一条 active 占用时段；与已有时段重叠视为无可用机器。
-func openLease(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
-	_, err := insertLease(ctx, tx, inst.MachineID, inst.ID, now, occupiedUntil(inst, now), "active", now)
-	if db.IsExclusionViolation(err) {
-		return apperr.ErrNoCapacity
-	}
-	return err
-}
-
 // refreshLease 在实例状态变化后同步占用时段：结束的实例关闭时段，其余按 occupiedUntil 更新上界，
 // 但上界封顶于同机下一条 reserved 时段的下界（规格 §4.3）。
 // 预订实例在 reserved 与首次开通的 creating 期间时段固定（下单时定死），不改写。

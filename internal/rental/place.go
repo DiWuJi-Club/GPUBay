@@ -51,32 +51,41 @@ func (s *Service) Place(ctx context.Context, req PlaceRequest) (Order, Instance,
 		if err != nil {
 			return err
 		}
-		m, err := s.d.Fleet.Allocate(ctx, tx, req.ProductID)
-		if err != nil {
+		spec := pickSpec{ProductID: req.ProductID, Immediate: true}
+		spec.Lower, spec.Upper = immediatePeriod(now, seconds(req.Duration))
+		var machineID int64
+		if _, err := placeOnMachines(ctx, tx, spec, 1, func(sp pgx.Tx, mid int64) error {
+			m, err := s.d.Fleet.MarkAllocated(ctx, sp, mid)
+			if err != nil {
+				return err
+			}
+			hostPub, hostPEM, err := s.d.HostKeyGen()
+			if err != nil {
+				return err
+			}
+			id := randx.ID("ins-", 8)
+			inst, err = scanInstance(sp.QueryRow(ctx, `INSERT INTO instances
+				(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, ssh_host_pubkey, ssh_host_key_enc, auto_renew_duration, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $11) RETURNING `+instanceCols,
+				id, req.UserID, m.ID, req.ProductID, img.ID, seconds(req.Duration), s.d.Box.Seal([]byte(randx.Password(16))), hostPub, s.d.Box.Seal(hostPEM), string(req.Duration), now))
+			if err != nil {
+				return err
+			}
+			if _, err := insertLease(ctx, sp, m.ID, inst.ID, spec.Lower, spec.Upper, "active", now); err != nil {
+				return err
+			}
+			machineID = m.ID
+			return nil
+		}); err != nil {
 			return err
 		}
-		hostPub, hostPEM, err := s.d.HostKeyGen()
-		if err != nil {
+		if ord, err = s.charge(ctx, tx, req.UserID, "new", inst.ID, req.ProductID, req.Duration, req.IdempotencyKey, now); err != nil {
 			return err
 		}
-		id := randx.ID("ins-", 8)
-		inst, err = scanInstance(tx.QueryRow(ctx, `INSERT INTO instances
-			(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, ssh_host_pubkey, ssh_host_key_enc, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $10) RETURNING `+instanceCols,
-			id, req.UserID, m.ID, req.ProductID, img.ID, seconds(req.Duration), s.d.Box.Seal([]byte(randx.Password(16))), hostPub, s.d.Box.Seal(hostPEM), now))
-		if err != nil {
+		if err := recordEvent(ctx, tx, inst.ID, "", StateCreating, "order "+ord.ID, now); err != nil {
 			return err
 		}
-		if err := openLease(ctx, tx, inst, now); err != nil {
-			return err
-		}
-		if ord, err = s.charge(ctx, tx, req.UserID, "new", id, req.ProductID, req.Duration, req.IdempotencyKey, now); err != nil {
-			return err
-		}
-		if err := recordEvent(ctx, tx, id, "", StateCreating, "order "+ord.ID, now); err != nil {
-			return err
-		}
-		_, err = s.d.Fleet.Enqueue(ctx, tx, m.ID, id, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: img.Ref})
+		_, err = s.d.Fleet.Enqueue(ctx, tx, machineID, inst.ID, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: img.Ref})
 		return err
 	})
 	if isIdempotencyViolation(err) {

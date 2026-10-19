@@ -112,3 +112,25 @@ func TestAdminMigrateWorksWithDisabledImage(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAdminMigrateCopiesAutoRenewAndGroup(t *testing.T) {
+	e := newEnv(t, 2)
+	gid := e.group("A", true)
+	_, old := e.place(catalog.D1d)
+	e.ack(true)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET auto_renew = true, auto_renew_duration = '1w', group_id = $2 WHERE id = $1`, old.ID, gid); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "GPU 报错")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := e.get(moved.ID)
+	if !got.AutoRenew || got.AutoRenewDuration != catalog.D1w || got.GroupID == nil || *got.GroupID != gid || got.Booked() || got.ProvisionedAt != nil || got.BatchID != nil {
+		t.Fatalf("moved = %+v", got)
+	}
+	lower, upper, status := e.lease(moved.ID)
+	if status != "active" || !lower.Equal(e.clock.Now()) || !upper.Equal(e.clock.Now().Add(rental.CreateTimeout+24*time.Hour+rental.Tail)) {
+		t.Fatalf("lease = [%v, %v) %s", lower, upper, status)
+	}
+}

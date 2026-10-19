@@ -1,0 +1,136 @@
+package rental
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/db"
+)
+
+// pickSpec 描述一次分配的候选集（规格 §4.2）。
+type pickSpec struct {
+	ProductID int64
+	GroupID   *int64 // nil = 不限机组：未分组机器 + 可见机组
+	MachineID *int64 // 指定机器（仍受机组条件约束）
+	Lower     time.Time
+	Upper     time.Time
+	Immediate bool // 即时分支：要求 idle AND agent_online；预订分支允许 allocated 与离线
+	Exclude   []int64
+}
+
+// pickSQL：候选 = 商品匹配 ∩ 机组条件 ∩ 状态允许 ∩ 与 reserved / active 时段无重叠；
+// 按「最紧贴前一档期的机器优先」排序（减少碎片），再按 id。
+const pickSQL = `SELECT m.id FROM machines m
+	LEFT JOIN machine_groups g ON g.id = m.group_id
+	WHERE m.product_id = $1
+	  AND (($2::bigint IS NULL AND (m.group_id IS NULL OR g.visible)) OR m.group_id = $2::bigint)
+	  AND ($3::bigint IS NULL OR m.id = $3::bigint)
+	  AND NOT (m.id = ANY($6::bigint[]))
+	  AND (CASE WHEN $7::boolean THEN m.state = 'idle' AND m.agent_online ELSE m.state IN ('idle', 'allocated') END)
+	  AND NOT EXISTS (SELECT 1 FROM machine_leases l
+	                  WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND l.period && tstzrange($4::timestamptz, $5::timestamptz))
+	ORDER BY (SELECT max(upper(l.period)) FROM machine_leases l
+	          WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active', 'ended') AND upper(l.period) <= $4::timestamptz) DESC NULLS LAST,
+	         m.id`
+
+func pickArgs(spec pickSpec) []any {
+	exclude := spec.Exclude
+	if exclude == nil {
+		exclude = []int64{}
+	}
+	return []any{spec.ProductID, spec.GroupID, spec.MachineID, spec.Lower, spec.Upper, exclude, spec.Immediate}
+}
+
+// pickMachines 返回最多 limit 台候选机器；lock 为 true 时锁行（SKIP LOCKED：并发分配互不等待）。
+func pickMachines(ctx context.Context, q db.Querier, spec pickSpec, limit int, lock bool) ([]int64, error) {
+	sql := pickSQL + ` LIMIT $8`
+	if lock {
+		sql += ` FOR NO KEY UPDATE OF m SKIP LOCKED` // 不用 FOR UPDATE：与外键插入的 KEY SHARE 互斥
+	}
+	rows, err := q.Query(ctx, sql, append(pickArgs(spec), limit)...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
+}
+
+// countAvailable 返回候选台数（只读，供可用性查询与错误消息）。
+func countAvailable(ctx context.Context, q db.Querier, spec pickSpec) (int, error) {
+	var n int
+	err := q.QueryRow(ctx, `SELECT count(*) FROM (`+pickSQL+`) x`, pickArgs(spec)...).Scan(&n)
+	return n, err
+}
+
+// noCapacity：即时分支保持 ErrNoCapacity（消息与错误值不变，前端引导与现有测试依赖它）；预订分支带台数。
+func noCapacity(spec pickSpec, got int) error {
+	if spec.Immediate {
+		return apperr.ErrNoCapacity
+	}
+	if got == 0 {
+		return apperr.New("no_capacity", "该时段暂无可用机器", 409)
+	}
+	return apperr.New("no_capacity", fmt.Sprintf("该时段只有 %d 台可用，请减少数量或更换时段", got), 409)
+}
+
+// placeOnMachines 挑出 want 台机器，对每台在 savepoint 内执行 fn（插实例 + lease [+ 标记 allocated]）：
+// 排他约束冲突（并发事务刚提交了重叠时段，预筛的快照没看到）→ 回滚 savepoint、剔除这台、补取；最多补取 3 轮。
+// 机器行锁（NO KEY UPDATE）在外层事务里取（SKIP LOCKED），savepoint 回滚不释放它，并发批次不会互相等待。
+// 不足 want 台 → 返回 no_capacity，调用方回滚整个事务（没有部分成功）。
+func placeOnMachines(ctx context.Context, tx pgx.Tx, spec pickSpec, want int, fn func(sp pgx.Tx, machineID int64) error) ([]int64, error) {
+	var done []int64
+	tried := append([]int64(nil), spec.Exclude...)
+	for round := 0; round <= 3 && len(done) < want; round++ {
+		s := spec
+		s.Exclude = tried
+		ids, err := pickMachines(ctx, tx, s, want-len(done), true)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			break
+		}
+		for _, mid := range ids {
+			tried = append(tried, mid)
+			sp, err := tx.Begin(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if err := fn(sp, mid); err != nil {
+				_ = sp.Rollback(ctx)
+				if db.IsExclusionViolation(err) {
+					continue
+				}
+				return nil, err
+			}
+			if err := sp.Commit(ctx); err != nil {
+				return nil, err
+			}
+			done = append(done, mid)
+		}
+	}
+	if len(done) < want {
+		return nil, noCapacity(spec, len(done))
+	}
+	return done, nil
+}
+
+// immediatePeriod 即时订单的占用时段：开通估算 + 租期 + 尾段（规格 §4.1）。
+func immediatePeriod(now time.Time, secs int64) (time.Time, time.Time) {
+	return now, now.Add(CreateTimeout + time.Duration(secs)*time.Second + Tail)
+}
+
+// bookingPeriod 预订的占用时段：开始前 1 小时开通，到期后 7 小时尾段。
+func bookingPeriod(start time.Time, secs int64) (time.Time, time.Time) {
+	return start.Add(-PrepLead), start.Add(time.Duration(secs)*time.Second + Tail)
+}
+
+// AvailableNow 此刻可以立即租用 1 天的机器数（市场页展示；按最短租期探测，和下单时的校验一致）。
+func (s *Service) AvailableNow(ctx context.Context, productID int64) (int, error) {
+	spec := pickSpec{ProductID: productID, Immediate: true}
+	spec.Lower, spec.Upper = immediatePeriod(s.d.Clock.Now(), 86400)
+	return countAvailable(ctx, s.d.Pool, spec)
+}

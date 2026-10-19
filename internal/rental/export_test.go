@@ -20,3 +20,15 @@ func SetExtraTaskTimeout(d time.Duration) func() {
 func (s *Service) RefreshLease(ctx context.Context, id string) error {
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error { return s.refreshLease(ctx, tx, id, s.d.Clock.Now()) })
 }
+
+// 计划 6：导出内部分配函数供 rental_test 包直接测试。
+type PickSpec = pickSpec
+
+var (
+	PickMachines    = pickMachines
+	PlaceOnMachines = placeOnMachines
+	ImmediatePeriod = immediatePeriod
+	BookingPeriod   = bookingPeriod
+	CountAvailable  = countAvailable
+	InsertLease     = insertLease
+)
