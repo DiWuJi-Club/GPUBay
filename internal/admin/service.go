@@ -48,6 +48,7 @@ var (
 	ErrInvalidCredentials = apperr.New("invalid_credentials", "用户名或密码错误", 401)
 	ErrLocked             = apperr.New("account_locked", "登录失败次数过多，请 15 分钟后再试", 423)
 	ErrInvalidTOTP        = apperr.New("invalid_totp", "动态码错误或已使用过", 400)
+	ErrTOTPUsed           = apperr.New("totp_used", "该动态码已使用，请等待下一个动态码", 400)
 	ErrTOTPRequired       = apperr.New("totp_required", "该操作需要输入动态码", 403)
 	ErrTOTPSetupRequired  = apperr.New("totp_setup_required", "请先绑定动态码", 403)
 )
@@ -205,32 +206,33 @@ func useStep(ctx context.Context, tx pgx.Tx, adminID, step int64, now time.Time)
 	return tag.RowsAffected() == 1, nil
 }
 
-// checkTOTP 校验动态码并防重放；不通过时累计失败次数并返回 false（调用方应提交事务后返回 ErrInvalidTOTP）。
-func (s *Service) checkTOTP(ctx context.Context, tx pgx.Tx, a adminRow, code string, now time.Time) (bool, error) {
+// checkTOTP 校验动态码并防重放。bizErr 非空时调用方应提交事务（保留失败计数）后返回它：
+//   - 动态码错误：累计失败次数，返回 ErrInvalidTOTP；
+//   - 动态码正确但本时间片已用过：返回 ErrTOTPUsed，不计失败。二次验证的码在操作失败时也已被消耗，
+//     管理员随后重输同一个码是正常行为，不能因此把自己锁住；用过的码仍绝不会通过。
+func (s *Service) checkTOTP(ctx context.Context, tx pgx.Tx, a adminRow, code string, now time.Time) (bizErr, err error) {
 	secret, err := s.secret(a)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	step, ok := MatchTOTP(secret, code, now)
-	if ok {
-		if ok, err = useStep(ctx, tx, a.ID, step, now); err != nil {
-			return false, err
-		}
-	}
 	if !ok {
-		return false, recordFailure(ctx, tx, a.ID, now)
+		return ErrInvalidTOTP, recordFailure(ctx, tx, a.ID, now)
 	}
-	return true, nil
+	fresh, err := useStep(ctx, tx, a.ID, step, now)
+	if err != nil {
+		return nil, err
+	}
+	if !fresh {
+		return ErrTOTPUsed, nil
+	}
+	return nil, nil
 }
 
 // confirmTOTP 用动态码确认绑定，生成并保存新的恢复码。bizErr 非空时调用方应提交事务（保留失败计数）后返回它。
 func (s *Service) confirmTOTP(ctx context.Context, tx pgx.Tx, a adminRow, code string, now time.Time) (codes []string, bizErr, err error) {
-	ok, err := s.checkTOTP(ctx, tx, a, code, now)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !ok {
-		return nil, ErrInvalidTOTP, nil
+	if bizErr, err := s.checkTOTP(ctx, tx, a, code, now); err != nil || bizErr != nil {
+		return nil, bizErr, err
 	}
 	codes = NewRecoveryCodes()
 	if _, err := tx.Exec(ctx, `DELETE FROM admin_recovery_codes WHERE admin_id = $1`, a.ID); err != nil {

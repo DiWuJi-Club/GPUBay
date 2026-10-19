@@ -130,8 +130,10 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 				Client:   aliyunClient(cfg, cfg.Aliyun.SMSEndpoint),
 				SignName: cfg.Aliyun.SMSSign,
 				Templates: map[string]string{
-					sms.TemplateLoginCode:      cfg.Aliyun.SMSTplLogin,
-					sms.TemplateExpiryReminder: cfg.Aliyun.SMSTplExpiry,
+					sms.TemplateLoginCode:        cfg.Aliyun.SMSTplLogin,
+					sms.TemplateExpiryReminder:   cfg.Aliyun.SMSTplExpiry,
+					sms.TemplateAutoRenewFailed:  cfg.Aliyun.SMSTplAutoRenewFailed,
+					sms.TemplateBookingCancelled: cfg.Aliyun.SMSTplBookingCancelled,
 				},
 			}
 		default:
@@ -201,7 +203,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	srv := &api.Server{
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SSHHost: cfg.SSHHost(), SSHPort: cfg.SSHPublicPort, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, TrustedProxyHops: cfg.TrustedProxyHops, PublicBaseURL: cfg.PublicBaseURL,
-		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit,
+		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit, CalendarLimit: authorizeLimit, // 两者零值各取默认（60 / 120）；DisableRateLimits 时同为 noRateLimit
 	}
 	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
 	if err != nil {
@@ -316,6 +318,22 @@ func (n expiryNotifier) NotifyExpiry(ctx context.Context, userID int64, instance
 		hours = 1
 	}
 	return n.sms.Send(ctx, u.Phone, sms.TemplateExpiryReminder, map[string]string{"instance": instanceID, "hours": strconv.Itoa(hours)})
+}
+
+func (n expiryNotifier) NotifyAutoRenewFailed(ctx context.Context, userID int64, instanceID, reason string) error {
+	u, err := n.ids.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	return n.sms.Send(ctx, u.Phone, sms.TemplateAutoRenewFailed, map[string]string{"instance": instanceID, "reason": reason})
+}
+
+func (n expiryNotifier) NotifyBookingCancelled(ctx context.Context, userID int64, instanceID, reason string) error {
+	u, err := n.ids.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	return n.sms.Send(ctx, u.Phone, sms.TemplateBookingCancelled, map[string]string{"instance": instanceID, "reason": reason})
 }
 
 // realProviders 按配置读取密钥文件，创建已启用的真实支付渠道。

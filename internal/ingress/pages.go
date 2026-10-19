@@ -5,6 +5,7 @@ import (
 	"html"
 	"net/http"
 
+	"spark-cloud/internal/platform/tz"
 	"spark-cloud/internal/rental"
 )
 
@@ -20,6 +21,7 @@ const (
 	PageReleased      = "实例已释放"
 	PageShuttingDown  = "平台正在重启，请稍后刷新"
 	PageTicketInvalid = "登录票据无效或已过期，请重新访问"
+	PageReservedFmt   = "实例预订于 %s 开始，开始前 1 小时自动开通"
 )
 
 // NotRunningPage 按实例状态给出 503 页文案。
@@ -27,6 +29,12 @@ func NotRunningPage(r rental.IngressRoute) string {
 	switch {
 	case r.State == rental.StateRunning && r.Suspended:
 		return PageSuspended
+	case r.State == rental.StateReserved:
+		when := "—"
+		if r.ScheduledStartAt != nil {
+			when = tz.Format(*r.ScheduledStartAt)
+		}
+		return fmt.Sprintf(PageReservedFmt, when)
 	case r.State == rental.StateCreating:
 		return PageCreating
 	case r.State == rental.StateStopped:

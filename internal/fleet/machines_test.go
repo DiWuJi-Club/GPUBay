@@ -3,18 +3,14 @@ package fleet_test
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
-	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/dbtest"
 )
 
@@ -24,16 +20,6 @@ func newEnv(t *testing.T) (*fleet.Service, *pgxpool.Pool, *clock.Fake) {
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
 	return fleet.NewService(pool, clk), pool, clk
-}
-
-func allocate(ctx context.Context, pool *pgxpool.Pool, svc *fleet.Service, productID int64) (fleet.Machine, error) {
-	var m fleet.Machine
-	err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
-		var err error
-		m, err = svc.Allocate(ctx, tx, productID)
-		return err
-	})
-	return m, err
 }
 
 func TestRegisterValidatesAndRejectsDuplicates(t *testing.T) {
@@ -77,76 +63,6 @@ func TestMaintenanceTransitions(t *testing.T) {
 	}
 	if err := svc.SetMaintenance(ctx, 9999, true); !errors.Is(err, apperr.ErrNotFound) {
 		t.Fatalf("missing machine want not found, got %v", err)
-	}
-}
-
-func TestAllocateRequiresIdleAndOnline(t *testing.T) {
-	svc, pool, _ := newEnv(t)
-	ctx := context.Background()
-	pid := dbtest.ProductID(t, pool)
-	m, _ := svc.Register(ctx, fleet.NewMachine{Serial: "SN001", LanIP: "10.0.1.3", ProductID: pid})
-	_ = svc.SetMaintenance(ctx, m.ID, false)
-
-	if _, err := allocate(ctx, pool, svc, pid); !errors.Is(err, apperr.ErrNoCapacity) {
-		t.Fatalf("offline machine must not be allocated, got %v", err)
-	}
-	if _, err := svc.Heartbeat(ctx, m.ID); err != nil {
-		t.Fatal(err)
-	}
-	if n, _ := svc.IdleCount(ctx, pid); n != 1 {
-		t.Fatalf("IdleCount = %d, want 1", n)
-	}
-	got, err := allocate(ctx, pool, svc, pid)
-	if err != nil || got.ID != m.ID || got.State != fleet.StateAllocated {
-		t.Fatalf("allocate = %+v, %v", got, err)
-	}
-	if _, err := allocate(ctx, pool, svc, pid); !errors.Is(err, apperr.ErrNoCapacity) {
-		t.Fatalf("second allocate want no capacity, got %v", err)
-	}
-	if err := svc.Release(ctx, pool, m.ID); err != nil {
-		t.Fatal(err)
-	}
-	if n, _ := svc.IdleCount(ctx, pid); n != 1 {
-		t.Fatalf("after release IdleCount = %d, want 1", n)
-	}
-}
-
-func TestConcurrentAllocationNeverDoubleAssigns(t *testing.T) {
-	svc, pool, _ := newEnv(t)
-	ctx := context.Background()
-	pid := dbtest.ProductID(t, pool)
-	for i := 0; i < 10; i++ {
-		dbtest.CreateMachine(t, pool, fmt.Sprintf("SN%03d", i))
-	}
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	got := map[int64]int{}
-	noCap := 0
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			m, err := allocate(ctx, pool, svc, pid)
-			mu.Lock()
-			defer mu.Unlock()
-			switch {
-			case err == nil:
-				got[m.ID]++
-			case errors.Is(err, apperr.ErrNoCapacity):
-				noCap++
-			default:
-				t.Errorf("unexpected error: %v", err)
-			}
-		}()
-	}
-	wg.Wait()
-	if len(got) != 10 || noCap != 90 {
-		t.Fatalf("distinct machines = %d, no capacity = %d", len(got), noCap)
-	}
-	for id, n := range got {
-		if n != 1 {
-			t.Fatalf("machine %d allocated %d times", id, n)
-		}
 	}
 }
 

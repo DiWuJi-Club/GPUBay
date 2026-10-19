@@ -35,13 +35,22 @@ func (s *Service) AdminExtend(ctx context.Context, actor audit.Actor, instanceID
 		if err != nil {
 			return err
 		}
+		if err := s.renewFits(ctx, tx, inst, seconds, now); err != nil {
+			return err
+		}
 		if err := s.addTime(ctx, tx, inst, seconds, now); err != nil {
+			return err
+		}
+		if err := clearAutoRenewFailure(ctx, tx, inst, now); err != nil {
 			return err
 		}
 		if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, fmt.Sprintf("admin extend +%ds: %s", seconds, reason), now); err != nil {
 			return err
 		}
 		if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
+			return err
+		}
+		if err := s.verifyLeaseFits(ctx, tx, inst.ID, now); err != nil {
 			return err
 		}
 		if err := audit.Record(ctx, tx, now, actor.Entry("instance.extend", "instance", inst.ID,

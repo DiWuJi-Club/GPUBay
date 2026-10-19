@@ -4,10 +4,12 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/rental"
 )
 
@@ -218,5 +220,24 @@ func TestPortLimitConcurrent(t *testing.T) {
 	}
 	if list, _ := e.svc.ListPorts(e.ctx, inst.ID); ok != 1 || limit != 2 || len(list) != rental.MaxPortsPerInstance {
 		t.Fatalf("ok=%d limit=%d count=%d", ok, limit, len(list))
+	}
+}
+
+func TestIngressRoutesIncludeReservedWithStart(t *testing.T) {
+	e := newEnv(t, 1)
+	start := dbtest.T0.Add(3 * time.Hour)
+	inst := e.book(start)
+	if _, err := e.svc.AddPort(e.ctx, e.userID, inst.ID, 8888, "private", "lab", ""); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := e.svc.ListIngressRoutes(e.ctx)
+	if err != nil || len(routes) != 1 || routes[0].State != rental.StateReserved || routes[0].ScheduledStartAt == nil || !routes[0].ScheduledStartAt.Equal(start) {
+		t.Fatalf("routes = %+v, %v", routes, err)
+	}
+	if _, err := e.svc.Cancel(e.ctx, e.userID, inst.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if routes, _ = e.svc.ListIngressRoutes(e.ctx); len(routes) != 0 {
+		t.Fatalf("cancelled instance must leave the route table: %+v", routes)
 	}
 }

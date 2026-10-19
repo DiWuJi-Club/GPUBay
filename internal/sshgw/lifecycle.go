@@ -67,10 +67,10 @@ func (s *Server) ScanNow(ctx context.Context) {
 	disconnectAll(victims, MsgDisconnected)
 }
 
-// terminalState：停机、清盘、释放、失败的实例不再允许保持 SSH 会话（creating 不会有会话；暂停仍是 running）。
+// terminalState：停机、清盘、释放、失败、已取消的实例不再允许保持 SSH 会话（creating 不会有会话；暂停仍是 running）。
 func terminalState(state string) bool {
 	switch state {
-	case rental.StateStopped, rental.StateWiping, rental.StateReleased, rental.StateFailed:
+	case rental.StateStopped, rental.StateWiping, rental.StateReleased, rental.StateFailed, rental.StateCancelled:
 		return true
 	}
 	return false

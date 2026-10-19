@@ -156,28 +156,28 @@ func (s *Service) ConfirmTOTPSetup(ctx context.Context, token, code, ip string) 
 
 // VerifyTOTP 第二步：用动态码完成登录。
 func (s *Service) VerifyTOTP(ctx context.Context, token, code, ip string) (Admin, error) {
-	return s.secondFactor(ctx, token, ip, "admin.login", func(tx pgx.Tx, a adminRow, now time.Time) (bool, error) {
+	return s.secondFactor(ctx, token, ip, "admin.login", func(tx pgx.Tx, a adminRow, now time.Time) (error, error) {
 		return s.checkTOTP(ctx, tx, a, code, now)
 	})
 }
 
 // VerifyRecoveryCode 第二步：用一次性恢复码完成登录（手机丢失时使用）。
 func (s *Service) VerifyRecoveryCode(ctx context.Context, token, recoveryCode, ip string) (Admin, error) {
-	return s.secondFactor(ctx, token, ip, "admin.login_recovery_code", func(tx pgx.Tx, a adminRow, now time.Time) (bool, error) {
+	return s.secondFactor(ctx, token, ip, "admin.login_recovery_code", func(tx pgx.Tx, a adminRow, now time.Time) (error, error) {
 		tag, err := tx.Exec(ctx, `UPDATE admin_recovery_codes SET used_at = $3
 			WHERE admin_id = $1 AND code_hash = $2 AND used_at IS NULL`, a.ID, hashRecoveryCode(recoveryCode), now)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		if tag.RowsAffected() == 0 {
-			return false, recordFailure(ctx, tx, a.ID, now)
+			return ErrInvalidTOTP, recordFailure(ctx, tx, a.ID, now)
 		}
-		return true, nil
+		return nil, nil
 	})
 }
 
 func (s *Service) secondFactor(ctx context.Context, token, ip, action string,
-	check func(tx pgx.Tx, a adminRow, now time.Time) (bool, error)) (Admin, error) {
+	check func(tx pgx.Tx, a adminRow, now time.Time) (bizErr, err error)) (Admin, error) {
 	now := s.d.Clock.Now()
 	var a adminRow
 	var bizErr error
@@ -194,13 +194,8 @@ func (s *Service) secondFactor(ctx context.Context, token, ip, action string,
 			bizErr = ErrTOTPSetupRequired
 			return nil
 		}
-		ok, err := check(tx, a, now)
-		if err != nil {
+		if bizErr, err = check(tx, a, now); err != nil || bizErr != nil {
 			return err
-		}
-		if !ok {
-			bizErr = ErrInvalidTOTP
-			return nil
 		}
 		if err := promote(ctx, tx, token, a, ip, now); err != nil {
 			return err
@@ -250,7 +245,8 @@ func (s *Service) Authenticate(ctx context.Context, token string) (Session, erro
 	return sess, nil
 }
 
-// StepUp 高风险操作的二次验证：code 非空时校验动态码并记录验证时间；为空时要求 5 分钟内验证过。
+// StepUp 高风险操作的二次验证：code 非空时只校验动态码（不记录验证时间）；为空时要求 5 分钟内验证过。
+// 验证窗口由 RecordStepUp 在操作成功之后打开：参数错误、业务失败的请求不能借一个正确的动态码打开窗口。
 func (s *Service) StepUp(ctx context.Context, sess Session, code string) error {
 	now := s.d.Clock.Now()
 	if NormalizeCode(code) == "" {
@@ -269,24 +265,22 @@ func (s *Service) StepUp(ctx context.Context, sess Session, code string) error {
 			bizErr = ErrLocked
 			return nil
 		}
-		ok, err := s.checkTOTP(ctx, tx, a, code, now)
-		if err != nil {
+		if bizErr, err = s.checkTOTP(ctx, tx, a, code, now); err != nil || bizErr != nil {
 			return err
 		}
-		if !ok {
-			bizErr = ErrInvalidTOTP
-			return nil
-		}
-		if _, err := tx.Exec(ctx, `UPDATE admins SET failed_attempts = 0, updated_at = $2 WHERE id = $1`, a.ID, now); err != nil {
-			return err
-		}
-		_, err = tx.Exec(ctx, `UPDATE admin_sessions SET stepup_at = $2 WHERE token_hash = $1`, sess.TokenHash, now)
+		_, err = tx.Exec(ctx, `UPDATE admins SET failed_attempts = 0, updated_at = $2 WHERE id = $1`, a.ID, now)
 		return err
 	})
 	if err != nil {
 		return err
 	}
 	return bizErr
+}
+
+// RecordStepUp 打开会话的二次验证窗口（StepUpWindow）；调用方在带动态码的高风险操作成功之后调用。
+func (s *Service) RecordStepUp(ctx context.Context, sess Session) error {
+	_, err := s.d.Pool.Exec(ctx, `UPDATE admin_sessions SET stepup_at = $2 WHERE token_hash = $1`, sess.TokenHash, s.d.Clock.Now())
+	return err
 }
 
 func (s *Service) Logout(ctx context.Context, token string) error {

@@ -22,6 +22,23 @@ const (
 // extraTaskTimeout 限制每个附加任务的执行时间，避免外部调用卡住后一直占着清扫咨询锁（测试可调小）。
 var extraTaskTimeout = 2 * time.Minute
 
+// RefreshCappedLeases 让停机、洗机中与失联暂停实例的占用上界随时间推进（并封顶于下一条预订）：
+// 这些实例的 occupiedUntil 以 now 为基准，不刷新的话上界会「过期」，后来的预订会把机器当空闲挑走。
+// sweepEach 的 pred 必须以 $1 引用参数，这里没有时间条件，用恒真的 created_at <= now 占位。
+// 候选按 instances.updated_at 取前 sweepBatch 条，处理后把 updated_at 推到 now 轮转到队尾，
+// 否则候选超过一批时总是同一批最旧的行被处理，其余实例的上界永远得不到刷新。
+func (s *Service) RefreshCappedLeases(ctx context.Context) (int, error) {
+	now := s.d.Clock.Now()
+	return s.sweepEach(ctx, `(state IN ('stopped', 'wiping') OR (state = 'running' AND suspended_at IS NOT NULL)) AND created_at <= $1`, now, "updated_at",
+		func(tx pgx.Tx, inst Instance) error {
+			if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `UPDATE instances SET updated_at = $2 WHERE id = $1 AND updated_at < $2`, inst.ID, now)
+			return err
+		})
+}
+
 // ExpireDue 把已到期、未暂停的运行中实例转为停机并下发停止指令。
 func (s *Service) ExpireDue(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
@@ -52,6 +69,13 @@ func (s *Service) WipeStale(ctx context.Context) (int, error) {
 // 加锁时用 SKIP LOCKED 并重新校验 pred，已被其他清扫处理或状态已变的行直接跳过；
 // 单行失败只回滚该行，错误汇总返回，其余行继续处理。返回成功处理的行数。
 func (s *Service) sweepEach(ctx context.Context, pred string, arg any, orderBy string, fn func(pgx.Tx, Instance) error) (int, error) {
+	return s.sweepEachAfter(ctx, pred, arg, orderBy, func(tx pgx.Tx, inst Instance) (func(), error) { return nil, fn(tx, inst) }, nil)
+}
+
+// sweepEachAfter 同 sweepEach，但回调可返回一个在该行事务提交后执行的动作（发短信等外部调用不进事务），
+// 单行失败时先回调 onErr（用于在独立事务里告警）。单行事务遇 40P01 / 40001 重试一次（改派路径要求，规格 §14）。
+func (s *Service) sweepEachAfter(ctx context.Context, pred string, arg any, orderBy string,
+	fn func(pgx.Tx, Instance) (func(), error), onErr func(id string, err error)) (int, error) {
 	rows, err := s.d.Pool.Query(ctx, `SELECT id FROM instances WHERE `+pred+` ORDER BY `+orderBy+` LIMIT $2`, arg, sweepBatch)
 	if err != nil {
 		return 0, err
@@ -67,25 +91,36 @@ func (s *Service) sweepEach(ctx context.Context, pred string, arg any, orderBy s
 			errs = append(errs, ctx.Err())
 			break
 		}
-		done := false
-		err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-			inst, err := scanInstance(tx.QueryRow(ctx, `SELECT `+instanceCols+` FROM instances
-				WHERE id = $2 AND `+pred+` FOR UPDATE SKIP LOCKED`, arg, id))
-			if errors.Is(err, apperr.ErrNotFound) {
+		var done bool
+		var after func()
+		err := withRetry(func() error {
+			done, after = false, nil
+			return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+				inst, err := scanInstance(tx.QueryRow(ctx, `SELECT `+instanceCols+` FROM instances
+					WHERE id = $2 AND `+pred+` FOR UPDATE SKIP LOCKED`, arg, id))
+				if errors.Is(err, apperr.ErrNotFound) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				after, err = fn(tx, inst)
+				if err != nil {
+					return err
+				}
+				done = true
 				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if err := fn(tx, inst); err != nil {
-				return err
-			}
-			done = true
-			return nil
+			})
 		})
 		if err != nil {
+			if onErr != nil {
+				onErr(id, err)
+			}
 			errs = append(errs, fmt.Errorf("instance %s: %w", id, err))
 			continue
+		}
+		if after != nil {
+			after()
 		}
 		if done {
 			n++
@@ -113,11 +148,19 @@ func (s *Service) beginWipe(ctx context.Context, tx pgx.Tx, inst Instance, reaso
 	return err
 }
 
-// FailStuckCreating 把开通超时的实例判为失败并全额退款。
+// FailStuckCreating 把开通超时的实例判为失败并全额退款；预订实例改为改派（规格 §5.4）。
+// 超时从预订的开通时刻（provisioned_at）起算，即时订单仍从 created_at 起算。
 func (s *Service) FailStuckCreating(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
-	return s.sweepEach(ctx, `state = 'creating' AND created_at <= $1`, now.Add(-CreateTimeout), "created_at",
-		func(tx pgx.Tx, inst Instance) error { return s.failCreating(ctx, tx, inst, "开通超时", now) })
+	return s.sweepEachAfter(ctx, `state = 'creating' AND COALESCE(provisioned_at, created_at) <= $1`, now.Add(-CreateTimeout), "created_at",
+		func(tx pgx.Tx, inst Instance) (func(), error) {
+			if inst.Booked() {
+				var after func()
+				err := s.reassignAfterCreateFailure(ctx, tx, inst, "开通超时", now, &after)
+				return after, err
+			}
+			return nil, s.failCreating(ctx, tx, inst, "开通超时", now)
+		}, s.alertCancelFailed)
 }
 
 // SuspendMachines 冻结失联机器上运行中实例的剩余时长，暂停期间不计时、不会被判到期。
@@ -190,7 +233,8 @@ func (s *Service) FailTimedOutCommands(ctx context.Context) (int, error) {
 	return n, errors.Join(errs...)
 }
 
-// ResumeMachine 机器恢复在线后，只对容器确实在运行（runningIDs）的暂停实例补回时长并重算提醒标记；
+// ResumeMachine 机器恢复在线后，只对容器确实在运行（runningIDs）的暂停实例补回时长并重算提醒标记
+// （到期 = resumeBase + 冻结的剩余时长：预订实例在开始时刻前恢复，仍到 S + 已付时长）；
 // 其余暂停实例保持暂停并告警 container_down，由管理员换机或退款。
 func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs []string) (int, error) {
 	now := s.d.Clock.Now()
@@ -217,10 +261,11 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs
 			if inst.PausedRemaining != nil {
 				remaining = time.Duration(*inst.PausedRemaining) * time.Second
 			}
-			r24, r1 := reminderFlags(remaining)
+			expires := inst.resumeBase(now).Add(remaining)
+			r24, r1 := reminderFlags(expires.Sub(now))
 			if _, err := tx.Exec(ctx, `UPDATE instances SET expires_at = $2, suspended_at = NULL, paused_remaining = NULL,
 					reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
-				inst.ID, now.Add(remaining), r24, r1, now); err != nil {
+				inst.ID, expires, r24, r1, now); err != nil {
 				return err
 			}
 			if err := recordEvent(ctx, tx, inst.ID, StateRunning, StateRunning, "machine online: lease resumed", now); err != nil {
@@ -229,11 +274,40 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs
 			if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
 				return err
 			}
+			short, err := capExpiryToLease(ctx, tx, inst.ID, expires, now)
+			if err != nil {
+				return err
+			}
+			// 故障停机是平台原因：恢复后被下一条预订封顶吃掉的时长按单价补偿（同迟开通补偿）
+			if short > 0 {
+				if err := s.compensateShortfall(ctx, tx, inst, int64(short/time.Second), "故障恢复补偿 ", "resume capped compensated", now); err != nil {
+					return err
+				}
+			}
 			n++
 		}
 		return nil
 	})
 	return n, err
+}
+
+// capExpiryToLease 恢复后 refreshLease 可能把上界封顶在同机下一条预订的下界：到期随之封顶为上界 − Tail（规格 §4.3），
+// 不能让到期越过别人已付的预订。返回被封顶吃掉的时长（没有封顶为 0）。
+func capExpiryToLease(ctx context.Context, tx pgx.Tx, id string, expires, now time.Time) (time.Duration, error) {
+	var upper time.Time
+	if err := tx.QueryRow(ctx, `SELECT upper(period) FROM machine_leases WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`, id).Scan(&upper); err != nil {
+		if db.IsNoRows(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	capped := upper.Add(-Tail)
+	if !expires.After(capped) {
+		return 0, nil
+	}
+	r24, r1 := reminderFlags(capped.Sub(now))
+	_, err := tx.Exec(ctx, `UPDATE instances SET expires_at = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`, id, capped, r24, r1, now)
+	return expires.Sub(capped), err
 }
 
 type reminder struct {
@@ -275,7 +349,9 @@ func (s *Service) SendReminders(ctx context.Context) (int, error) {
 	return len(due), nil
 }
 
-// Sweep 执行一轮完整清扫：离线检测与暂停、到期停机、保留期洗机、开通超时、到期提醒。
+// Sweep 执行一轮完整清扫，按顺序（规格 §9）：离线检测与暂停 → 恢复计时 → 推进停机 / 洗机 / 暂停实例的占用上界（RefreshCappedLeases）→
+// 到点预订开通（ProvisionDue）→ 自动续费（AutoRenewDue，须在到期停机之前）→ 到期停机 → 保留期洗机 → 开通超时 →
+// 指令超时 → 回收 SSH 会话 → 到期提醒。各步互不阻断，错误合并返回。
 func (s *Service) Sweep(ctx context.Context) error {
 	var errs []error
 	offline, err := s.d.Fleet.MarkOfflineStale(ctx, OfflineTimeout)
@@ -296,6 +372,15 @@ func (s *Service) Sweep(ctx context.Context) error {
 	}
 	if err := s.resumeOnline(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("resume: %w", err))
+	}
+	if _, err := s.RefreshCappedLeases(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("refresh capped leases: %w", err))
+	}
+	if _, err := s.ProvisionDue(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("provision: %w", err))
+	}
+	if _, err := s.AutoRenewDue(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("auto renew: %w", err))
 	}
 	if _, err := s.ExpireDue(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("expire: %w", err))

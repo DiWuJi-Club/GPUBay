@@ -7,8 +7,10 @@ import (
 )
 
 const (
-	TemplateLoginCode      = "login_code"      // 参数：code
-	TemplateExpiryReminder = "expiry_reminder" // 参数：instance、hours
+	TemplateLoginCode        = "login_code"        // 参数：code
+	TemplateExpiryReminder   = "expiry_reminder"   // 参数：instance、hours
+	TemplateAutoRenewFailed  = "auto_renew_failed" // 参数：instance、reason
+	TemplateBookingCancelled = "booking_cancelled" // 参数：instance、reason
 )
 
 type Sender interface {

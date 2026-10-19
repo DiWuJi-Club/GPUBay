@@ -9,7 +9,7 @@ const data = ref<Dashboard | null>(null)
 const loadError = ref('')
 const retrying = ref(false)
 const machineStates = ['idle', 'allocated', 'maintenance', 'faulty'] as const
-const instanceStates = ['creating', 'running', 'stopped', 'wiping', 'released', 'failed'] as const
+const instanceStates = ['reserved', 'creating', 'running', 'stopped', 'wiping', 'released', 'failed', 'cancelled'] as const
 
 // 60 秒定时刷新。故障期间定时器照常每 60 秒取一次（恢复后自动显示），但同一次故障只提示一次，成功后复位；
 // 首次就失败（还没有数据）显示占位与重试按钮；已有数据时刷新失败保留旧数据。
@@ -63,6 +63,7 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
       <el-card header="实例">
         <ul class="kv">
           <li v-for="s in instanceStates" :key="s"><span>{{ instanceStateLabel[s] }}</span><b :data-testid="`dash-instance-${s}`">{{ data.instances[s] ?? 0 }}</b></li>
+          <li><span>未来 7 天预订开始</span><b data-testid="dash-bookings-7d">{{ data.bookings_upcoming_7d }}</b></li>
           <li><span>在线 SSH 会话</span><b data-testid="dash-ssh-sessions">{{ data.ssh_sessions_open }}</b></li>
         </ul>
       </el-card>

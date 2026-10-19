@@ -31,31 +31,46 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 		if old.State != StateRunning {
 			return apperr.ErrInvalidState
 		}
-		remaining := int64(old.Remaining(now) / time.Second)
-		if remaining <= 0 {
+		paid := int64(old.Remaining(now) / time.Second)
+		if paid <= 0 {
 			return apperr.New("invalid_state", "该实例已没有剩余时长，无需换机", 409)
 		}
+		// 新实例不是预订，开通后从 now 起算 pending_seconds。早开通的预订在 S 之前换机时，已付时长从 S 才开始计，
+		// 所以把 now → S 这段（resumeBase）也给新实例，到期不早于 S + 已付时长（终审 M4）；
+		// instance_transfers 只记已付的 paid（新实例开通失败按它退款，早开通的免费时段不折现）。
+		remaining := int64(old.resumeBase(now).Sub(now)/time.Second) + paid
 		ref, err := s.d.Catalog.ImageRef(ctx, tx, old.ImageID)
 		if err != nil {
 			return err
 		}
-		m, err := s.d.Fleet.Allocate(ctx, tx, old.ProductID)
-		if err != nil {
-			return err
-		}
+		spec := pickSpec{ProductID: old.ProductID, Immediate: true}
+		spec.Lower, spec.Upper = immediatePeriod(now, remaining)
 		hostPub, hostPEM, err := s.d.HostKeyGen()
 		if err != nil {
 			return err
 		}
 		id := randx.ID("ins-", 8)
-		moved, err = scanInstance(tx.QueryRow(ctx, `INSERT INTO instances
-			(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, password_auth, ssh_host_pubkey, ssh_host_key_enc, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $11) RETURNING `+instanceCols,
-			id, old.UserID, m.ID, old.ProductID, old.ImageID, remaining, s.d.Box.Seal([]byte(randx.Password(16))), old.PasswordAuth, hostPub, s.d.Box.Seal(hostPEM), now))
-		if err != nil {
-			return err
-		}
-		if err := openLease(ctx, tx, moved, now); err != nil {
+		var newMachine int64
+		if _, err := placeOnMachines(ctx, tx, spec, 1, func(sp pgx.Tx, mid int64) error {
+			m, err := s.d.Fleet.MarkAllocated(ctx, sp, mid)
+			if err != nil {
+				return err
+			}
+			moved, err = scanInstance(sp.QueryRow(ctx, `INSERT INTO instances
+				(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, password_auth, ssh_host_pubkey, ssh_host_key_enc,
+				 auto_renew, auto_renew_duration, group_id, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $12, $13, $14, $14) RETURNING `+instanceCols,
+				id, old.UserID, m.ID, old.ProductID, old.ImageID, remaining, s.d.Box.Seal([]byte(randx.Password(16))), old.PasswordAuth, hostPub, s.d.Box.Seal(hostPEM),
+				old.AutoRenew, string(old.AutoRenewDuration), m.GroupID, now))
+			if err != nil {
+				return err
+			}
+			if _, err := insertLease(ctx, sp, m.ID, id, spec.Lower, spec.Upper, "active", now); err != nil {
+				return err
+			}
+			newMachine = m.ID
+			return nil
+		}); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO instance_ports (instance_id, port, visibility, forced_private, note, created_at, updated_at)
@@ -66,17 +81,17 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO instance_transfers (from_instance_id, to_instance_id, seconds, reason, admin_id, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`, old.ID, id, remaining, reason, actor.AdminID, now); err != nil {
+			VALUES ($1, $2, $3, $4, $5, $6)`, old.ID, id, paid, reason, actor.AdminID, now); err != nil {
 			return err
 		}
-		if _, err := s.d.Fleet.Enqueue(ctx, tx, m.ID, id, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref}); err != nil {
+		if _, err := s.d.Fleet.Enqueue(ctx, tx, newMachine, id, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref}); err != nil {
 			return err
 		}
 		if err := s.beginWipe(ctx, tx, old, "migrated to "+id+": "+reason, now); err != nil {
 			return err
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("instance.migrate", "instance", old.ID, map[string]any{
-			"to_instance": id, "from_machine": old.MachineID, "to_machine": m.ID, "seconds": remaining, "reason": reason,
+			"to_instance": id, "from_machine": old.MachineID, "to_machine": newMachine, "seconds": paid, "pending_seconds": remaining, "reason": reason,
 		}))
 	})
 	return moved, err

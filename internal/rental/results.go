@@ -3,6 +3,7 @@ package rental
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -12,17 +13,37 @@ import (
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/platform/tz"
 	"spark-cloud/internal/wallet"
 )
 
 // HandleCommandResult 处理 Agent 对一条指令的回报。重复回报、已取消指令的回报、与当前状态不符的回报都会被忽略。
+// 预订实例的 Create 失败会改派（reassign），按规格 §14 整个事务遇 40P01 / 40001 重试一次；平台取消的短信在提交后发。
 func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok bool, result string) error {
+	var after func()
+	var instanceID string
+	err := withRetry(func() error {
+		after = nil
+		return s.handleCommandResult(ctx, commandID, ok, result, &instanceID, &after)
+	})
+	if err != nil {
+		s.alertCancelFailed(instanceID, err)
+		return err
+	}
+	if after != nil {
+		after()
+	}
+	return nil
+}
+
+func (s *Service) handleCommandResult(ctx context.Context, commandID string, ok bool, result string, instanceIDOut *string, after *func()) error {
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 		// 先锁实例、再完成指令：与 Release/WipeStale/FailStuckCreating 的加锁顺序一致，避免死锁。
 		instanceID, err := s.d.Fleet.CommandInstanceID(ctx, tx, commandID)
 		if err != nil {
 			return err
 		}
+		*instanceIDOut = instanceID
 		var inst Instance
 		if instanceID != "" {
 			inst, err = lockInstance(ctx, tx, instanceID)
@@ -45,6 +66,9 @@ func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok 
 			}
 			if ok {
 				return s.startLease(ctx, tx, inst, StateCreating, "agent: created", now)
+			}
+			if inst.Booked() {
+				return s.reassignAfterCreateFailure(ctx, tx, inst, "开通失败: "+result, now, after)
 			}
 			return s.failCreating(ctx, tx, inst, "开通失败: "+result, now)
 		case fleet.CmdStartInstance:
@@ -98,8 +122,12 @@ func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok 
 	})
 }
 
-// startLease 把实例转为 running，并从此刻开始计时 pending_seconds。
+// startLease 把实例转为 running，并从此刻开始计时 pending_seconds；预订的首次开通按规格 §5.3 计时。
 func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from, reason string, now time.Time) error {
+	// 只有首次开通（reserved → creating 设了 provisioned_at）走预订计时；停机续费后的 Start 走下面的原有分支
+	if from == StateCreating && inst.Booked() && inst.ProvisionedAt != nil {
+		return s.startBooked(ctx, tx, inst, now)
+	}
 	expires := now.Add(time.Duration(inst.PendingSeconds) * time.Second)
 	r24, r1 := reminderFlags(expires.Sub(now))
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'running', expires_at = $2, pending_seconds = 0,
@@ -111,6 +139,67 @@ func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from
 		return err
 	}
 	return s.refreshLease(ctx, tx, inst.ID, now)
+}
+
+// startBooked：早开通不早计费（base = max(S, now)），迟开通从实际开通算，但到期封顶于同机下一条预订（cap − Tail），
+// 封顶吃掉的时长按最新订单单价退款（迟开通补偿）。
+func (s *Service) startBooked(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
+	start := *inst.ScheduledStartAt
+	base := start
+	if now.After(base) {
+		base = now
+	}
+	pending := time.Duration(inst.PendingSeconds) * time.Second
+	want := base.Add(pending)
+	expires := want
+	if cap, ok, err := nextReservedLower(ctx, tx, inst.MachineID, inst.ID, start.Add(-PrepLead)); err != nil {
+		return err
+	} else if ok && expires.After(cap.Add(-Tail)) {
+		expires = cap.Add(-Tail)
+	}
+	r24, r1 := reminderFlags(expires.Sub(now))
+	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'running', expires_at = $2, pending_seconds = 0,
+			stopped_at = NULL, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
+		inst.ID, expires, r24, r1, now); err != nil {
+		return err
+	}
+	reason := "agent: created (scheduled " + tz.Format(start) + ")"
+	if now.After(start) {
+		reason = fmt.Sprintf("agent: created (scheduled %s, late by %s)", tz.Format(start), now.Sub(start).Round(time.Second))
+	}
+	if err := recordEvent(ctx, tx, inst.ID, StateCreating, StateRunning, reason, now); err != nil {
+		return err
+	}
+	if short := want.Sub(expires); short > 0 {
+		if err := s.compensateShortfall(ctx, tx, inst, int64(short/time.Second), "迟开通补偿 ", "late start compensated", now); err != nil {
+			return err
+		}
+	}
+	return s.refreshLease(ctx, tx, inst.ID, now)
+}
+
+// compensateShortfall 平台原因（迟开通、故障恢复）被同机下一条预订封顶吃掉的 secs 秒，按最新可退订单的单价退款（不足 1 分不退）。
+// 金额只经 refund.go 的 quote 计算（与 refundTransferred 相同：快照的 pending_seconds = secs），不另写价格公式。
+// 订单取换机链路上的全部可退订单（换机后的实例自身可能没有订单）。remark 为流水备注前缀，event 为事件原因前缀。
+func (s *Service) compensateShortfall(ctx context.Context, tx pgx.Tx, inst Instance, secs int64, remark, event string, now time.Time) error {
+	chain, err := instanceChain(ctx, tx, inst.ID)
+	if err != nil {
+		return err
+	}
+	orders, err := refundableOrders(ctx, tx, chain, true)
+	if err != nil || len(orders) == 0 {
+		return err
+	}
+	snap := inst
+	snap.State, snap.PendingSeconds = StateCreating, secs
+	amount := quote(snap, orders, now).Suggested
+	if amount < 1 {
+		return nil
+	}
+	if _, err := s.refundAcross(ctx, tx, inst.UserID, orders, amount, 0, remark+inst.ID, now); err != nil {
+		return err
+	}
+	return recordEvent(ctx, tx, inst.ID, StateRunning, StateRunning, fmt.Sprintf("%s: %ds refund %d", event, secs, amount), now)
 }
 
 // failCreating 开通失败：实例失败、退款、机器隔离为故障、取消剩余指令并告警。
@@ -141,7 +230,7 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 // 若它是换机得到的新实例，再退还转入的剩余时长（以换机记录的秒数为上限，见 refundTransferred）。
 // inst 须为加锁时读到的实例快照（state = creating，含 pending_seconds）。
 func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
-	rows, err := tx.Query(ctx, `SELECT id, amount - refunded_amount, duration FROM orders
+	rows, err := tx.Query(ctx, `SELECT id, amount - refunded_amount, duration, quantity FROM orders
 		WHERE instance_id = $1 AND status IN ('paid', 'partially_refunded') ORDER BY created_at, id FOR UPDATE`, inst.ID)
 	if err != nil {
 		return err
@@ -150,10 +239,11 @@ func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now t
 		id       string
 		amount   int64
 		duration catalog.Duration
+		quantity int
 	}
 	orders, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (paid, error) {
 		var p paid
-		err := r.Scan(&p.id, &p.amount, &p.duration)
+		err := r.Scan(&p.id, &p.amount, &p.duration, &p.quantity)
 		return p, err
 	})
 	if err != nil {
@@ -161,7 +251,7 @@ func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now t
 	}
 	var ownSecs int64
 	for _, o := range orders {
-		ownSecs += seconds(o.duration)
+		ownSecs += seconds(o.duration) * int64(max(o.quantity, 1))
 		if o.amount > 0 {
 			if _, err := s.d.Wallet.Apply(ctx, tx, wallet.Entry{
 				UserID: inst.UserID, Amount: o.amount, Kind: wallet.KindRefund, RefType: "order", RefID: o.id,

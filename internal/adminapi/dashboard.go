@@ -76,9 +76,18 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		util[i] = dayRate{Date: day.Format("2006-01-02"), Rate: math.Round(rate*10000) / 10000}
 	}
+	upcoming, err := s.upcoming(r, 7)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	upcoming7 := 0
+	for _, d := range upcoming {
+		upcoming7 += d.Count
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"machines": machines, "instances": instances,
 		"recharge_today": rechargeToday, "recharge_month": rechargeMonth, "order_today": orderToday, "order_month": orderMonth,
-		"utilization": util, "ssh_sessions_open": sshOpen,
+		"utilization": util, "ssh_sessions_open": sshOpen, "bookings_upcoming_7d": upcoming7,
 	})
 }

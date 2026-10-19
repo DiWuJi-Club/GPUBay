@@ -1,11 +1,13 @@
 import type { Instance } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { canRelease, canRenew, instanceTimeText, releaseWarning, remainingNow } from '../instance'
+import { autoRenewFailureText, canCancel, partitionQuotes, sumCancelQuotes, canRelease, canRenew, canSetAutoRenew, instanceTimeText, releaseWarning, remainingNow, renewQuantityMax } from '../instance'
 
 const base: Instance = {
   id: 'ins-abc12345', state: 'running', product_id: 1, image_id: 1, product_name: 'DGX Spark 整机', image_name: 'PyTorch', suspended: false,
   expires_at: '2026-10-18T06:00:00Z', remaining_seconds: 86399, pending_seconds: 0, retain_until: null, ssh_command: 'ssh ins-abc12345@ssh.spark.test',
   password_auth: true, ssh_host: 'ssh.spark.test', ssh_port: 22, ports_count: 0,
+  scheduled_start_at: null, scheduled_end_at: null, cancellable_until: null, cancellable_seconds: 0, starts_in_seconds: 0, group_id: null, group_name: '', machine_label: '', batch_id: null,
+  reassign_count: 0, auto_renew: false, auto_renew_duration: '1d', auto_renew_failed_reason: '', renewable_until: null, renew_options: [],
   created_at: '2026-10-17T06:00:00Z',
 }
 
@@ -21,6 +23,12 @@ describe('instance time text', () => {
   it('运行中按剩余秒递减', () => {
     expect(remainingNow(base, 1000, 4000)).toBe(86396)
     expect(instanceTimeText(base, 86396)).toBe('剩余 23 小时 59 分')
+  })
+  it('预订提前开通、未到开始时刻前不递减，过了开始时刻才递减（验收 B-1）', () => {
+    const early = { ...base, remaining_seconds: 86400, starts_in_seconds: 60 }
+    expect(remainingNow(early, 1000, 31_000)).toBe(86400)
+    expect(remainingNow(early, 1000, 61_000)).toBe(86400)
+    expect(remainingNow(early, 1000, 71_000)).toBe(86390)
   })
   it('暂停中不递减', () => {
     expect(remainingNow({ ...base, suspended: true }, 1000, 99_000)).toBe(86399)
@@ -45,5 +53,58 @@ describe('按钮与状态匹配 (C-DET-09 的逻辑)', () => {
   ] as const)('%s renew=%s release=%s', (state, renew, release) => {
     expect(canRenew(state)).toBe(renew)
     expect(canRelease(state)).toBe(release)
+  })
+})
+
+describe('booking states (U-21)', () => {
+  const reserved: Instance = { ...base, state: 'reserved', expires_at: null, remaining_seconds: 0, pending_seconds: 86400, ssh_command: '',
+    scheduled_start_at: '2026-10-20T02:00:00Z', scheduled_end_at: '2026-10-21T02:00:00Z', cancellable_until: '2026-10-20T01:00:00Z', cancellable_seconds: 120,
+    renewable_until: '2026-10-25T00:00:00Z', renew_options: [{ duration: '1d', quantity_max: 3 }, { duration: '1w', quantity_max: 0 }, { duration: '1m', quantity_max: 0 }] }
+  it('预订 / 取消的时间文案', () => {
+    expect(instanceTimeText(reserved, 0)).toBe('2026-10-20 10:00 开始 · 共 1 天')
+    expect(instanceTimeText({ ...base, state: 'cancelled' }, 0)).toBe('已取消')
+  })
+  it('可取消：reserved 且按服务器给的 cancellable_seconds 从拿到数据时起算未过截止（不看浏览器时钟与 cancellable_until 的差）', () => {
+    const fetchedAt = Date.parse('2030-01-01T00:00:00Z') // 浏览器时钟比服务器快好几年也不影响
+    expect(canCancel(reserved, fetchedAt, fetchedAt)).toBe(true)
+    expect(canCancel(reserved, fetchedAt, fetchedAt + 119_999)).toBe(true)
+    expect(canCancel(reserved, fetchedAt, fetchedAt + 120_000)).toBe(false)
+    expect(canCancel({ ...reserved, cancellable_seconds: 0 }, fetchedAt, fetchedAt)).toBe(false)
+    expect(canCancel({ ...reserved, state: 'creating' }, fetchedAt, fetchedAt)).toBe(false)
+  })
+  it('续费数量上限来自 renew_options', () => {
+    expect(renewQuantityMax(reserved, '1d')).toBe(3)
+    expect(renewQuantityMax(reserved, '1w')).toBe(0)
+    expect(renewQuantityMax({ ...reserved, renew_options: [] }, '1m')).toBe(3)
+  })
+  it('自动续费失败文案', () => {
+    expect(autoRenewFailureText({ ...base, auto_renew_failed_reason: 'insufficient_balance' })).toBe('自动续费失败：余额不足，请充值后系统会自动重试')
+    expect(autoRenewFailureText({ ...reserved, auto_renew_failed_reason: 'renew_blocked' })).toBe('自动续费失败：机器已有后续预订，可续至 2026-10-25 08:00')
+    expect(autoRenewFailureText(base)).toBe('')
+  })
+  it('按钮矩阵含 reserved / cancelled', () => {
+    expect(canRenew('reserved')).toBe(true)
+    expect(canRelease('reserved')).toBe(false)
+    expect(canRenew('cancelled')).toBe(false)
+    expect(canSetAutoRenew('reserved')).toBe(true)
+    expect(canSetAutoRenew('released')).toBe(false)
+  })
+})
+
+describe('批次取消汇总', () => {
+  it('台数与退款合计', () => {
+    const q = (refund: number, percent: number) => ({ refund, percent, deadline: '2026-10-20T01:00:00Z', max: refund })
+    expect(sumCancelQuotes([q(10000, 100), q(5000, 50), q(0, 0)])).toEqual({ count: 3, refund: 15000 })
+    expect(sumCancelQuotes([])).toEqual({ count: 0, refund: 0 })
+  })
+})
+
+describe('批次报价部分失败', () => {
+  it('报价失败的实例被排除', () => {
+    const q = { refund: 100, percent: 100, deadline: '2026-10-20T01:00:00Z', max: 100 }
+    const out = partitionQuotes(['a', 'b', 'c'], [
+      { status: 'fulfilled', value: q }, { status: 'rejected', reason: new Error('x') }, { status: 'fulfilled', value: { ...q, refund: 50 } },
+    ])
+    expect(out).toEqual({ ids: ['a', 'c'], quotes: [q, { ...q, refund: 50 }], failed: ['b'] })
   })
 })

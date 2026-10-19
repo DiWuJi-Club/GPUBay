@@ -2,7 +2,8 @@ import { expect, test, type APIRequestContext, type Page } from '@playwright/tes
 import {
   adminApi, clickTwiceSync, createAdmin, drainIdleMachines, drainTasks, enterTotpDialog, expectAdminUrl, expectStillOpen, fail500, failOnce, getJSON, isPath, loginAdmin, logout, pick, recordRequests, type SeededAdmin, totpNow, trackToasts,
 } from '../helpers/admin'
-import { placeOrder, seedUser, toast } from '../helpers/console'
+import { bookViaApi, privateGroup, startAfter } from '../helpers/booking'
+import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
 import { yuan } from '../helpers/money'
@@ -932,4 +933,28 @@ test('A-INS-12 删除端口：需原因、写审计、用户端消失', async ({
   const ctx = await adminApi(admin)
   const audit = (await getJSON<{ items: { target_id: string; actor_id: number; diff: { reason: string; port: number } }[] }>(ctx, `/admin/api/v1/audit?action=instance.port_delete&target_id=${id}`)).items
   expect(audit.map((a) => [a.actor_id, a.diff.port, a.diff.reason])).toEqual([[admin.id, 8888, 'abuse']])
+})
+
+test('A-INS-13 实例详情显示预订字段与只读自动续费；财务无改派 / 取消预订，运维有', async ({ page }) => {
+  const g = await privateGroup(1)
+  const u = await seedUser({ balance: 1_000_000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(30)
+  const { ids, batchId } = await bookViaApi(api, { startAt: s.iso, groupId: g.id, autoRenew: true, autoRenewDuration: '1w' })
+  const finance = await createAdmin('finance')
+  await loginAdmin(page, finance)
+  await page.goto(`/admin/instances/${ids[0]}`)
+  await expect(page.getByTestId('adetail-state')).toHaveText('已预订')
+  await expect(page.getByTestId('adetail-start')).toHaveText(`${cstTime(s.iso)} ～ ${cstTime(new Date(s.date.getTime() + 86400e3).toISOString())}`)
+  await expect(page.getByTestId('adetail-batch')).toHaveText(batchId!)
+  await expect(page.getByTestId('adetail-machine')).toHaveText(String(g.machineIds[0]))
+  await expect(page.getByTestId('adetail-auto-renew')).toHaveText('开启（1 周）')
+  await expect(page.getByTestId('adetail-reassign-btn')).toHaveCount(0) // finance 无操作
+  await expect(page.getByTestId('adetail-cancel-booking-btn')).toHaveCount(0)
+  await logout(page)
+  await loginAdmin(page, await createAdmin('ops'))
+  await page.goto(`/admin/instances/${ids[0]}`)
+  await expect(page.getByTestId('adetail-state')).toHaveText('已预订')
+  await expect(page.getByTestId('adetail-reassign-btn')).toBeVisible()
+  await expect(page.getByTestId('adetail-cancel-booking-btn')).toBeVisible()
 })

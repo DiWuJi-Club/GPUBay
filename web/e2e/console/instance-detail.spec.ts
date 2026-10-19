@@ -3,8 +3,10 @@ import { drainTasks, fail500, trackToasts } from '../helpers/admin'
 import { pauseClock } from '../helpers/clock'
 import { dialog, loginConsole, placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
+import { advanceToProvision, bookViaApi, cancelBookingsAndDispose, privateGroup, startAfter } from '../helpers/booking'
 import { instanceOf, runningInstance } from '../helpers/instances'
 import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
+import { cstTime } from '../helpers/time'
 
 const clipboard = (page: Page) => page.evaluate(() => navigator.clipboard.readText())
 
@@ -479,4 +481,198 @@ test('C-DET-16 删除端口', async ({ page }) => {
   await expect(page.getByTestId('detail-port-row')).toHaveCount(0)
   const list = (await (await api.get(`/api/v1/instances/${id}/ports`)).json()) as { items: unknown[] }
   expect(list.items).toHaveLength(0)
+})
+
+// ---- 计划 6：预订、取消、续费上限、自动续费、时间线（预订都在本用例自己的机组里，见 helpers/booking.ts privateGroup）----
+
+const HOUR = 3600e3
+const at = (d: Date, offsetMs: number) => cstTime(new Date(d.getTime() + offsetMs).toISOString())
+
+/** 在自己的机组里即时下单一台并让 Agent 开通成功（钉在该组唯一的机器上）。 */
+async function runningInGroup(phone: string) {
+  const g = await privateGroup(1)
+  const api = await userApi(phone)
+  const { ids } = await bookViaApi(api, { groupId: g.id, machineId: g.machineIds[0] })
+  await hooks.agent()
+  return { api, id: ids[0], g }
+}
+
+test('C-DET-17 预订详情：机组 / 机器 / 开始 / 结束 / 批次，无释放按钮', async ({ page }) => {
+  const g = await privateGroup(1)
+  const u = await seedUser({ balance: 1_000_000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(30)
+  const { ids, batchId } = await bookViaApi(api, { startAt: s.iso, groupId: g.id })
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${ids[0]}`)
+  await expect(page.getByTestId('detail-state')).toHaveText('已预订')
+  await expect(page.getByTestId('detail-group')).toHaveText(g.name)
+  await expect(page.getByTestId('detail-machine')).toHaveText(`机器 #${g.machineIds[0]}`)
+  await expect(page.getByTestId('detail-start')).toHaveText(cstTime(s.iso))
+  await expect(page.getByTestId('detail-end')).toHaveText(at(s.date, 24 * HOUR))
+  await expect(page.getByTestId('detail-batch')).toHaveText(batchId!)
+  await expect(page.getByTestId('detail-remaining')).toHaveText('—')
+  await expect(page.getByTestId('detail-release-btn')).toHaveCount(0)
+  await expect(page.getByTestId('detail-cancel-btn')).toBeVisible()
+  await expect(page.getByTestId('detail-renew-btn')).toHaveText('续费（加时）')
+})
+
+test('C-DET-18 取消（距开始 ≥ 24h，已过冷静期）：全额退款', async ({ page }) => {
+  const g = await privateGroup(1)
+  const u = await seedUser({ balance: 100000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(40)
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id })
+  await hooks.advance(16 * 60) // 过冷静期，仍 ≥ 24h
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${ids[0]}`)
+  await page.getByTestId('detail-cancel-btn').click()
+  await expect(page.getByTestId('detail-cancel-text')).toHaveText(`将退款 ¥69.00（100%），可取消至 ${at(s.date, -HOUR)}。开通后将不能取消。`)
+  await page.getByTestId('detail-cancel-ok').click()
+  await toast(page, '已取消预订，退款已退回余额')
+  await expect(page.getByTestId('detail-state')).toHaveText('已取消')
+  await expect(page.getByTestId('detail-cancelled-hint')).toBeVisible()
+  await expect(page.getByTestId('detail-cancel-btn')).toHaveCount(0)
+  await expect(page.getByTestId('detail-event').filter({ hasText: '已取消预订，已退款 ¥69.00' })).toHaveAttribute('data-kind', 'cancelled')
+  expect((await (await api.get('/api/v1/wallet')).json()).balance).toBe(100000)
+})
+
+test('C-DET-19 取消（距开始 < 24h，已过冷静期）：退 50%', async ({ page }) => {
+  const g = await privateGroup(1)
+  const u = await seedUser({ balance: 100000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(3)
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id })
+  await hooks.advance(16 * 60)
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${ids[0]}`)
+  await page.getByTestId('detail-cancel-btn').click()
+  await expect(page.getByTestId('detail-cancel-text')).toHaveText(`将退款 ¥34.50（50%），可取消至 ${at(s.date, -HOUR)}。开通后将不能取消。`)
+  await page.getByTestId('detail-cancel-ok').click()
+  await toast(page, '已取消预订，退款已退回余额')
+  await expect(page.getByTestId('detail-state')).toHaveText('已取消')
+  expect((await (await api.get('/api/v1/wallet')).json()).balance).toBe(100000 - 6900 + 3450)
+})
+
+test('C-DET-20 开通后取消按钮消失，续费仍可用', async ({ page }) => {
+  const g = await privateGroup(1)
+  const u = await seedUser({ balance: 1_000_000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(3)
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id })
+  await advanceToProvision(s.date)
+  await hooks.sweep()
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${ids[0]}`)
+  await expect(page.getByTestId('detail-state')).toHaveText('开通中')
+  await expect(page.getByTestId('detail-cancel-btn')).toHaveCount(0)
+  await expect(page.getByTestId('detail-renew-btn')).toHaveText('续费')
+  await hooks.agent()
+  await page.reload()
+  await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+  await expect(page.getByTestId('detail-cancel-btn')).toHaveCount(0)
+  await expect(page.getByTestId('detail-release-btn')).toBeVisible()
+})
+
+test('C-DET-21 续费表单显示可续至并禁用超限档位；接口提交超限返回 renew_blocked', async ({ page }) => {
+  const u = await seedUser({ balance: 1_000_000 })
+  const { api, id, g } = await runningInGroup(u.phone)
+  const s = await startAfter(72)
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: g.machineIds[0] })
+  const until = at(s.date, -8 * HOUR) // 下一预订开通前 1 小时、再留 7 小时保留 + 洗机
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await page.getByTestId('detail-renew-btn').click()
+  await expect(page.getByTestId('detail-renew-until')).toHaveText(`可续至 ${until}（机器之后已有预订）`)
+  // testid 在 el-radio-button 的 <label> 上，disabled 落在内部 <input>
+  await expect(page.getByTestId('detail-renew-duration-1w').locator('input')).toBeDisabled()
+  await expect(page.getByTestId('detail-renew-duration-1w')).toContainText('超出可续时间')
+  await expect(page.getByTestId('detail-renew-duration-1m').locator('input')).toBeDisabled()
+  await expect(page.getByTestId('detail-renew-duration-1d').locator('input')).toBeEnabled()
+  await expect(page.getByTestId('detail-renew-duration-1d').locator('input')).toBeChecked()
+  const r = await api.post(`/api/v1/instances/${id}/renew`, { data: { duration: '1w', quantity: 1 }, headers: { 'Idempotency-Key': crypto.randomUUID() } })
+  expect(r.status()).toBe(409)
+  expect((await r.json()) as { code: string; message: string }).toMatchObject({
+    code: 'renew_blocked',
+    message: `该机器自 ${cstTime(s.iso)} 起已有预订，本次最多可续至 ${until}`,
+  })
+  await cancelBookingsAndDispose(api, ids)
+})
+
+test('C-DET-22 自动续费开关；余额不足时失败提示', async ({ page }) => {
+  const u = await seedUser({ balance: 7000 })
+  const { api, id } = await runningInGroup(u.phone) // 余额剩 1 元
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await page.getByTestId('detail-auto-renew').click()
+  await toast(page, '已开启自动续费')
+  expect((await instanceOf(api, id)).auto_renew).toBe(true)
+  await hooks.advance(23 * 3600)
+  await hooks.sweep()
+  await page.reload()
+  await expect(page.getByTestId('detail-auto-renew-failed')).toContainText('自动续费失败：余额不足，请充值后系统会自动重试')
+  await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+  await expect(page.getByTestId('detail-event').filter({ hasText: '自动续费失败：余额不足' })).toHaveAttribute('data-kind', 'auto_renew_failed')
+  expect((await (await api.get('/api/v1/wallet')).json()).balance).toBe(100)
+})
+
+test('C-DET-23 自动续费被预订挡住时降档，动态显示实际档位', async ({ page }) => {
+  const u = await seedUser({ balance: 1_000_000 })
+  const { api, id, g } = await runningInGroup(u.phone) // expires ≈ now + 1d
+  const put = await api.put(`/api/v1/instances/${id}/auto-renew`, { data: { enabled: true, duration: '1m' } })
+  expect(put.status()).toBe(200)
+  // 下一预订开始 = now + 1d + 8d + 8h（整点）→ 可续至 ≈ now + 1d + 8d：1 月放不下、1 周放得下
+  const s = await startAfter(24 + 8 * 24 + 8)
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: g.machineIds[0] })
+  const before = (await (await api.get('/api/v1/wallet')).json()).balance as number
+  await hooks.advance(23 * 3600)
+  await hooks.sweep()
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await expect(page.getByTestId('detail-event').filter({ hasText: '自动续费成功（1 周）' })).toHaveAttribute('data-kind', 'auto_renew')
+  expect(before - ((await (await api.get('/api/v1/wallet')).json()).balance as number)).toBe(41400) // 按 1 周扣款
+  await cancelBookingsAndDispose(api, ids)
+})
+
+test('C-DET-24 时间线：预订下单、开始开通、开通成功（新到旧）', async ({ page }) => {
+  const g = await privateGroup(1)
+  const u = await seedUser({ balance: 1_000_000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(3)
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id })
+  await advanceToProvision(s.date)
+  await hooks.sweep()
+  await hooks.agent()
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${ids[0]}`)
+  await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+  const events = page.getByTestId('detail-event')
+  await expect(events).toHaveCount(3)
+  await expect(events.nth(0)).toHaveAttribute('data-kind', 'created')
+  await expect(events.nth(0)).toHaveText('开通成功')
+  await expect(events.nth(1)).toHaveAttribute('data-kind', 'provision')
+  await expect(events.nth(1)).toHaveText('开始开通')
+  await expect(events.nth(2)).toHaveAttribute('data-kind', 'order')
+  await expect(events.nth(2)).toContainText('预订下单')
+})
+
+test('C-DET-25 续费数量清空后回到 1，按 1 个单位扣款', async ({ page }) => {
+  const u = await seedUser({ balance: 1_000_000 })
+  const { api, id } = await runningInGroup(u.phone)
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await page.getByTestId('detail-renew-btn').click()
+  const qty = page.getByTestId('detail-renew-quantity').locator('input')
+  await qty.fill('3')
+  await qty.blur()
+  await expect(page.getByTestId('detail-renew-price')).toHaveText('¥207.00')
+  await qty.fill('')
+  await qty.blur()
+  await expect(qty).toHaveValue('1')
+  await expect(page.getByTestId('detail-renew-price')).toHaveText('¥69.00')
+  await expect(page.getByTestId('detail-renew-ok')).toBeEnabled()
+  const before = (await (await api.get('/api/v1/wallet')).json()).balance as number
+  await page.getByTestId('detail-renew-ok').click()
+  await toast(page, '续费成功')
+  expect(before - ((await (await api.get('/api/v1/wallet')).json()).balance as number)).toBe(6900)
 })

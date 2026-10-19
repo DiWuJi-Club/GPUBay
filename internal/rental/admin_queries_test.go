@@ -133,8 +133,8 @@ func TestDashboardStats(t *testing.T) {
 	if err != nil || len(occ) != 2 {
 		t.Fatalf("occupancy = %v, %v", occ, err)
 	}
-	// 第一个实例在 T0 释放（时段为空）；第二个实例（1 周）在 e.ack 后开始运行，两天都被占用，第二天截止到 now
-	if occ[0] != 86400 || occ[1] != 12*3600 {
-		t.Fatalf("occupancy = %v, want [86400 43200]", occ)
+	// 第一个实例在 T0 释放（时段不能为空，收为最短的 1 秒）；第二个实例（1 周）在 e.ack 后开始运行，两天都被占用，第二天截止到 now
+	if occ[0] != 86400+1 || occ[1] != 12*3600 {
+		t.Fatalf("occupancy = %v, want [86401 43200]", occ)
 	}
 }

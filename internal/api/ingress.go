@@ -100,7 +100,7 @@ func (s *Server) handleIngressAuthorize(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	switch inst.State {
-	case rental.StateCreating, rental.StateRunning, rental.StateStopped:
+	case rental.StateReserved, rental.StateCreating, rental.StateRunning, rental.StateStopped:
 	default:
 		ingress.WritePage(w, http.StatusGone, "实例已释放", ingress.PageReleased, 0)
 		return

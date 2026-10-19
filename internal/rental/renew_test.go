@@ -265,3 +265,226 @@ func TestRenewExpiredButUnsweptExtendsFromNow(t *testing.T) {
 		t.Fatalf("expires = %v", got.ExpiresAt)
 	}
 }
+
+func TestRenewInfoReflectsNextReservation(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true) // expires = T0 + 24h
+	info, err := e.svc.RenewInfoFor(e.ctx, e.get(inst.ID))
+	if err != nil || info.RenewableUntil != nil || len(info.Options) != 3 || info.Options[0].QuantityMax != 90 || info.Options[1].QuantityMax != 12 || info.Options[2].QuantityMax != 3 {
+		t.Fatalf("no reservation info = %+v, %v", info, err)
+	}
+	e.reserveRaw(e.machines[0], dbtest.T0.Add(72*time.Hour), 86400) // 下一预订 S = T0 + 3d → cap = S − 1h，可续至 = S − 8h = T0 + 64h
+	info, _ = e.svc.RenewInfoFor(e.ctx, e.get(inst.ID))
+	until := dbtest.T0.Add(64 * time.Hour)
+	if info.RenewableUntil == nil || !info.RenewableUntil.Equal(until) {
+		t.Fatalf("renewable_until = %v, want %v", info.RenewableUntil, until)
+	}
+	// base = T0 + 24h，余量 40h：1d 最多 1、1w / 1m 为 0
+	if info.Options[0].QuantityMax != 1 || info.Options[1].QuantityMax != 0 || info.Options[2].QuantityMax != 0 {
+		t.Fatalf("options = %+v", info.Options)
+	}
+}
+
+func TestRenewBlockedByReservationDoesNotCharge(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.reserveRaw(e.machines[0], dbtest.T0.Add(72*time.Hour), 86400)
+	balance := e.balance(e.userID)
+	_, _, upperBefore := e.lease(inst.ID)
+	_, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1w, "")
+	ae := apperr.As(err)
+	if ae == nil || ae.Code != "renew_blocked" || ae.Message != "该机器自 2026-01-04 08:00 起已有预订，本次最多可续至 2026-01-04 00:00" {
+		t.Fatalf("renew 1w = %v", err)
+	}
+	got := e.get(inst.ID)
+	if e.balance(e.userID) != balance || !got.ExpiresAt.Equal(dbtest.T0.Add(24*time.Hour)) {
+		t.Fatal("blocked renewal must not charge or extend")
+	}
+	if _, _, upper := e.lease(inst.ID); upper != upperBefore {
+		t.Fatal("lease must not change")
+	}
+	// 后台延长 7 天同样被挡；1 天可以
+	if _, err := e.svc.AdminExtend(e.ctx, opsActor, inst.ID, 7*86400, "补偿"); apperr.As(err) == nil || apperr.As(err).Code != "renew_blocked" {
+		t.Fatalf("extend 7d = %v", err)
+	}
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
+		t.Fatalf("renew 1d = %v", err)
+	}
+	if !e.get(inst.ID).ExpiresAt.Equal(dbtest.T0.Add(48 * time.Hour)) {
+		t.Fatal("1d renewal must extend")
+	}
+	// 停机期续费：base = now + 20m + pending；停机在 T0 + 48h，续 2d → T0 + 96h20m > 可续至 T0 + 64h → renew_blocked
+	e.clock.Advance(48 * time.Hour)
+	if _, err := e.svc.ExpireDue(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.ack(true)
+	if _, err := e.svc.RenewQuantity(e.ctx, e.userID, inst.ID, catalog.D1d, 2, ""); apperr.As(err) == nil || apperr.As(err).Code != "renew_blocked" {
+		t.Fatalf("stopped renew 2d = %v", err)
+	}
+	if e.get(inst.ID).PendingSeconds != 0 {
+		t.Fatal("blocked stopped renewal must not add pending time")
+	}
+}
+
+// 评审 M2：renewFits 通过之后、本事务提交之前，另一连接提交了同机紧随的预订 → 必须 renew_blocked 且不扣款。
+func TestRenewRaceWithNewReservationIsBlocked(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true) // expires = T0 + 24h，lease 上界 T0 + 31h
+	restore := rental.SetRenewHookForTest(func() {
+		e.reserveRaw(e.machines[0], dbtest.T0.Add(32*time.Hour), 86400) // 下界 T0 + 31h：紧贴当前 lease，续 1d 就越界
+	})
+	defer restore()
+	balance := e.balance(e.userID)
+	_, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, "")
+	if ae := apperr.As(err); ae == nil || ae.Code != "renew_blocked" {
+		t.Fatalf("want renew_blocked, got %v", err)
+	}
+	got := e.get(inst.ID)
+	if e.balance(e.userID) != balance || !got.ExpiresAt.Equal(dbtest.T0.Add(24*time.Hour)) {
+		t.Fatalf("race must roll back charge and expiry: balance=%d expires=%v", e.balance(e.userID), got.ExpiresAt)
+	}
+	if _, upper, _ := e.lease(inst.ID); !upper.Equal(dbtest.T0.Add(31 * time.Hour)) {
+		t.Fatalf("lease upper = %v", upper)
+	}
+	restore()
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); apperr.As(err) == nil || apperr.As(err).Code != "renew_blocked" {
+		t.Fatalf("after the reservation exists renewFits itself must block: %v", err)
+	}
+}
+
+func TestRenewReservedExtendsLeaseUnlessBlocked(t *testing.T) {
+	e := newEnv(t, 1)
+	first := e.book(dbtest.T0.Add(3 * time.Hour))                          // lease [T0+2h, T0+34h)
+	next := e.reserveRaw(e.machines[0], dbtest.T0.Add(35*time.Hour), 3600) // lease 下界 T0 + 34h：紧随其后
+	if _, err := e.svc.Renew(e.ctx, e.userID, first.ID, catalog.D1d, ""); apperr.As(err) == nil || apperr.As(err).Code != "renew_blocked" {
+		t.Fatalf("reserved renew blocked = %v", err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE machine_leases SET status = 'cancelled' WHERE instance_id = $1`, next); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Renew(e.ctx, e.userID, first.ID, catalog.D1d, ""); err != nil {
+		t.Fatalf("reserved renew after cancel = %v", err)
+	}
+	if got := e.get(first.ID); got.PendingSeconds != 2*86400 {
+		t.Fatalf("pending = %d", got.PendingSeconds)
+	}
+	if _, upper, _ := e.lease(first.ID); !upper.Equal(dbtest.T0.Add(3*time.Hour + 48*time.Hour + rental.Tail)) {
+		t.Fatalf("lease upper = %v", upper)
+	}
+}
+
+// Task 5 评审：renewFits 通过后同机紧随的预订才提交 → reserved 分支 addTime 撞排他约束，映射为 renew_blocked，不扣款。
+func TestRenewReservedRaceHitsExclusionIsBlocked(t *testing.T) {
+	e := newEnv(t, 1)
+	first := e.book(dbtest.T0.Add(3 * time.Hour)) // lease [T0+2h, T0+34h)
+	restore := rental.SetRenewHookForTest(func() {
+		e.reserveRaw(e.machines[0], dbtest.T0.Add(35*time.Hour), 3600) // 下界 T0 + 34h
+	})
+	defer restore()
+	balance := e.balance(e.userID)
+	_, err := e.svc.Renew(e.ctx, e.userID, first.ID, catalog.D1d, "")
+	if ae := apperr.As(err); ae == nil || ae.Code != "renew_blocked" || ae.Message != "该机器已有后续预订，无法续费" {
+		t.Fatalf("want generic renew_blocked, got %v", err)
+	}
+	if e.balance(e.userID) != balance || e.get(first.ID).PendingSeconds != 86400 {
+		t.Fatal("blocked reserved renewal must not charge or add time")
+	}
+	if _, upper, _ := e.lease(first.ID); !upper.Equal(dbtest.T0.Add(3*time.Hour + 24*time.Hour + rental.Tail)) {
+		t.Fatalf("lease upper = %v", upper)
+	}
+}
+
+// D7：预订已开通（booked + creating）时续费 / 后台延长不得误报 renew_blocked，且 lease 上界随之推后。
+func TestRenewBookedCreatingExtendsLease(t *testing.T) {
+	e := newEnv(t, 1)
+	start := dbtest.T0.Add(3 * time.Hour)
+	inst := e.book(start)
+	e.clock.Advance(2 * time.Hour)
+	e.heartbeatAll()
+	n, err := e.svc.ProvisionDue(e.ctx)
+	mustCount(t, n, err, 1, "provision")
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
+		t.Fatalf("renew booked creating = %v", err)
+	}
+	if _, err := e.svc.AdminExtend(e.ctx, opsActor, inst.ID, 3600, "补偿"); err != nil {
+		t.Fatalf("extend booked creating = %v", err)
+	}
+	got := e.get(inst.ID)
+	if got.State != rental.StateCreating || got.PendingSeconds != 2*86400+3600 {
+		t.Fatalf("instance = %+v", got)
+	}
+	if _, upper, status := e.lease(inst.ID); status != "active" || !upper.Equal(start.Add(49*time.Hour+rental.Tail)) {
+		t.Fatalf("lease = %v %s", upper, status)
+	}
+	// 同机紧随的预订：续费被挡
+	e.reserveRaw(e.machines[0], start.Add(49*time.Hour+rental.Tail+rental.PrepLead), 3600)
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); apperr.As(err) == nil || apperr.As(err).Code != "renew_blocked" {
+		t.Fatalf("renew booked creating blocked = %v", err)
+	}
+}
+
+func TestAdminExtendReserved(t *testing.T) {
+	e := newEnv(t, 1)
+	start := dbtest.T0.Add(3 * time.Hour)
+	inst := e.book(start)
+	if _, err := e.svc.AdminExtend(e.ctx, opsActor, inst.ID, 7200, "补偿"); err != nil {
+		t.Fatalf("extend reserved = %v", err)
+	}
+	if got := e.get(inst.ID); got.State != rental.StateReserved || got.PendingSeconds != 86400+7200 {
+		t.Fatalf("instance = %+v", got)
+	}
+	if _, upper, status := e.lease(inst.ID); status != "reserved" || !upper.Equal(start.Add(26*time.Hour+rental.Tail)) {
+		t.Fatalf("lease = %v %s", upper, status)
+	}
+}
+
+func TestRenewQuantityNegativeIsBadRequest(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	_, err := e.svc.RenewQuantity(e.ctx, e.userID, inst.ID, catalog.D1d, -1, "")
+	if ae := apperr.As(err); ae == nil || ae.Code != "bad_request" || ae.Message != "数量不正确" {
+		t.Fatalf("quantity -1 = %v", err)
+	}
+}
+
+// 恰好续到可续至（cap − Tail）：允许；再往后哪怕 1 分钟（后台延长的最小值）就挡。
+func TestRenewExactlyAtCapAllowed(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true) // expires = T0 + 24h
+	// 下一预订 S = T0 + 2d + 1h + Tail → 可续至 = S − 1h − Tail = T0 + 48h：续 1d 正好到可续至
+	e.reserveRaw(e.machines[0], dbtest.T0.Add(49*time.Hour+rental.Tail), 86400)
+	info, _ := e.svc.RenewInfoFor(e.ctx, e.get(inst.ID))
+	if info.RenewableUntil == nil || !info.RenewableUntil.Equal(dbtest.T0.Add(48*time.Hour)) || info.Options[0].QuantityMax != 1 {
+		t.Fatalf("info = %+v", info)
+	}
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
+		t.Fatalf("renew exactly at cap = %v", err)
+	}
+	if got := e.get(inst.ID); !got.ExpiresAt.Equal(dbtest.T0.Add(48 * time.Hour)) {
+		t.Fatalf("expires = %v", got.ExpiresAt)
+	}
+	if _, err := e.svc.AdminExtend(e.ctx, opsActor, inst.ID, 60, "补偿"); apperr.As(err) == nil || apperr.As(err).Code != "renew_blocked" {
+		t.Fatalf("one minute past cap = %v", err)
+	}
+}
+
+// 暂停中但 paused_remaining 缺失：renewBase 与 occupiedUntil 一样按 expires_at 估算（而不是 now）。
+func TestRenewInfoSuspendedWithoutPausedRemaining(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true) // expires = T0 + 24h
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET suspended_at = $2, paused_remaining = NULL WHERE id = $1`, inst.ID, dbtest.T0); err != nil {
+		t.Fatal(err)
+	}
+	e.reserveRaw(e.machines[0], dbtest.T0.Add(49*time.Hour+rental.Tail), 86400) // 可续至 T0 + 48h
+	info, _ := e.svc.RenewInfoFor(e.ctx, e.get(inst.ID))
+	if info.Options[0].QuantityMax != 1 { // base = T0 + 24h → 余量 24h；按 now 估算会得 2
+		t.Fatalf("options = %+v", info.Options)
+	}
+}

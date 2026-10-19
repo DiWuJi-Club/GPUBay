@@ -19,7 +19,7 @@ func (s *Server) handleProducts(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]productView, 0, len(products))
 	for _, p := range products {
-		n, err := s.Fleet.IdleCount(r.Context(), p.ID)
+		n, err := s.Rental.AvailableNow(r.Context(), p.ID)
 		if err != nil {
 			s.writeError(w, r, err)
 			return

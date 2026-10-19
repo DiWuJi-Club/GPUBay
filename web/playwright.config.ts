@@ -53,6 +53,10 @@ export default defineConfig({
   // （所有实例共用 e2e-server 里同一个假容器 sshd）；C-MKT-06 / A-INS-04 的 drainIdleMachines 把当时所有空闲机器置为维护。admin 用例推进后都会重新登录（后台会话 2 小时空闲失效），控制台用例只用自己新登记的机器、
   // 按自己实例的剩余时间断言。新增依赖全局时间或空闲机器的用例、或调整 project 顺序时，要跑完整 make check 并同步更新
   // 这里与 docs/superpowers/followups-plan5.md。
+  // 计划 6 的预订用例（C-BKG / C-DET-17～25 / C-INS-05～07 / A-GRP / A-BKG / A-INS-13）按服务器时间（hooks.clock）算开始时刻，
+  // 每个用例最多推进约 1 天（C-DET-22 / 23 推进 23 小时，C-BKG-08 推进 3 小时，到点开通的用例推进 2～3 小时；没有用例推进到 3 天以上），
+  // 预订都下在自己新建的机组（helpers/booking.ts privateGroup）里的新机器上，不依赖共享机器池；C-BKG-11 与 C-MKT-06 一样用
+  // drainIdleMachines 把当时所有空闲机器置为维护（构造旧接口 /orders 的 no_capacity）。
   projects: [
     {
       name: 'console-desktop',

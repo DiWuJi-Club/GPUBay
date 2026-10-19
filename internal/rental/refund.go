@@ -29,6 +29,7 @@ type refundable struct {
 	refunded    int64
 	refundCount int
 	duration    catalog.Duration
+	quantity    int
 }
 
 // instanceChain 返回该实例以及通过换机链路追溯到的全部前身实例 ID。
@@ -46,7 +47,7 @@ func instanceChain(ctx context.Context, q db.Querier, id string) ([]string, erro
 
 // refundableOrders 返回链路上仍可退的订单，从新到旧（同一时刻创建时续费单排在新购单之前）；lock 为 true 时加行锁（调用方须已锁实例）。
 func refundableOrders(ctx context.Context, q db.Querier, chain []string, lock bool) ([]refundable, error) {
-	sql := `SELECT id, amount, refunded_amount, refund_count, duration FROM orders
+	sql := `SELECT id, amount, refunded_amount, refund_count, duration, quantity FROM orders
 		WHERE instance_id = ANY($1) AND status IN ('paid', 'partially_refunded') ORDER BY created_at DESC, (kind = 'renew') DESC, id DESC`
 	if lock {
 		sql += ` FOR UPDATE`
@@ -57,7 +58,7 @@ func refundableOrders(ctx context.Context, q db.Querier, chain []string, lock bo
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (refundable, error) {
 		var o refundable
-		err := r.Scan(&o.id, &o.amount, &o.refunded, &o.refundCount, &o.duration)
+		err := r.Scan(&o.id, &o.amount, &o.refunded, &o.refundCount, &o.duration, &o.quantity)
 		return o, err
 	})
 }
@@ -66,7 +67,7 @@ func remainingSeconds(inst Instance, now time.Time) int64 {
 	switch inst.State {
 	case StateRunning:
 		return int64(inst.Remaining(now) / time.Second)
-	case StateCreating, StateStopped:
+	case StateReserved, StateCreating, StateStopped:
 		return inst.PendingSeconds
 	}
 	return 0
@@ -80,7 +81,7 @@ func quote(inst Instance, orders []refundable, now time.Time) RefundQuote {
 	if len(orders) > 0 {
 		latest := orders[0]
 		q.UnitOrderID = latest.id
-		if secs := seconds(latest.duration); secs > 0 {
+		if secs := seconds(latest.duration) * int64(max(latest.quantity, 1)); secs > 0 {
 			q.Suggested = q.RemainingSeconds * latest.amount / secs
 		}
 	}

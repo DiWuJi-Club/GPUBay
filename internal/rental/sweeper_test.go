@@ -9,6 +9,7 @@ import (
 
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/rental"
 )
 
@@ -578,5 +579,68 @@ func TestRunSweeperExtraTaskTimesOut(t *testing.T) {
 	}
 	if !errors.Is(taskErr, context.DeadlineExceeded) {
 		t.Fatalf("hung task ctx err = %v, want deadline exceeded", taskErr)
+	}
+}
+
+// 恢复后按冻结剩余时长推算的到期若越过同机下一条预订，到期封顶于 lease 上界 − Tail（与 refreshLease 的封顶一致）。
+func TestResumeMachineCapsExpiryAtNextBooking(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)                                                     // 到期 T0+24h，lease 上界 T0+31h
+	e.reserveRaw(e.machines[0], dbtest.T0.Add(33*time.Hour), 86400) // 下一条预订的 lease 下界 T0+32h
+
+	e.clock.Advance(time.Hour)
+	e.heartbeatAll()
+	e.clock.Advance(10 * time.Minute)
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !e.get(inst.ID).Suspended() {
+		t.Fatal("not suspended")
+	}
+	e.clock.Advance(5 * time.Hour) // 冻结 22h50m；恢复后按 now + 22h50m = T0+29h 到期，+Tail 越过 T0+32h
+	if _, err := e.fleet.Heartbeat(e.ctx, e.machines[0]); err != nil {
+		t.Fatal(err)
+	}
+	balance := e.balance(e.userID)
+	n, err := e.svc.ResumeMachine(e.ctx, e.machines[0], []string{inst.ID})
+	mustCount(t, n, err, 1, "resumed")
+	got := e.get(inst.ID)
+	wantExpiry := dbtest.T0.Add(32*time.Hour - rental.Tail)
+	// 封顶吃掉 T0+29h − T0+25h = 4h：故障停机是平台原因，按单价补偿退回余额
+	if refund := int64(4*3600) * 6900 / 86400; e.balance(e.userID) != balance+refund {
+		t.Fatalf("balance = %d, want compensation %d", e.balance(e.userID), refund)
+	}
+	if ev := e.lastEvent(inst.ID); ev.Reason != "resume capped compensated: 14400s refund 1150" {
+		t.Fatalf("last event = %q", ev.Reason)
+	}
+	if evs, err := e.svc.UserEvents(e.ctx, e.userID, inst.ID); err != nil || evs[0].Kind != "compensated" || evs[0].Detail != "故障恢复后可用时长不足，补偿已退回余额" {
+		t.Fatalf("user events = %+v, %v", evs, err)
+	}
+	if got.Suspended() || got.ExpiresAt == nil || !got.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("expires_at = %v, want %v", got.ExpiresAt, wantExpiry)
+	}
+	if _, upper, _ := e.lease(inst.ID); !upper.Equal(dbtest.T0.Add(32 * time.Hour)) {
+		t.Fatalf("lease upper = %v", upper)
+	}
+}
+
+// 同一轮 Sweep：到期前 1 小时的自动续费先于到期停机；到点的预订在同一轮里开通。
+func TestSweepOrderProvisionsAndAutoRenewsBeforeExpiry(t *testing.T) {
+	e := newEnv(t, 2)
+	_, running := e.place(catalog.D1d)
+	e.ack(true)
+	e.autoRenewOn(running.ID, catalog.D1d)
+	booked := e.book(dbtest.T0.Add(25 * time.Hour)) // 开通时刻 T0 + 24h
+	e.clock.Advance(24 * time.Hour)                 // running 恰好到期；自动续费本该在 1 小时前触发，这里让两者同一轮
+	e.heartbeatAll()
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(running.ID); got.State != rental.StateRunning || !got.ExpiresAt.Equal(dbtest.T0.Add(48*time.Hour)) {
+		t.Fatalf("auto renew must run before expiry: %+v", got)
+	}
+	if got := e.get(booked.ID); got.State != rental.StateCreating {
+		t.Fatalf("booking must be provisioned in the same sweep: %+v", got)
 	}
 }

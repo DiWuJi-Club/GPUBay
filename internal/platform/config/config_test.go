@@ -78,6 +78,7 @@ func prodEnv() map[string]string {
 		"SPARK_SMS_DRIVER": "aliyun", "SPARK_KYC_DRIVER": "aliyun", "SPARK_PAY_DRIVER": "real", "SPARK_PDU_DRIVER": "snmp",
 		"SPARK_ALIYUN_ACCESS_KEY_ID": "ak", "SPARK_ALIYUN_ACCESS_KEY_SECRET": "sk",
 		"SPARK_SMS_SIGN": "Spark", "SPARK_SMS_TPL_LOGIN": "SMS_1", "SPARK_SMS_TPL_EXPIRY": "SMS_2", "SPARK_KYC_AUTH_CODE": "auth",
+		"SPARK_SMS_TPL_AUTO_RENEW_FAILED": "SMS_3", "SPARK_SMS_TPL_BOOKING_CANCELLED": "SMS_4",
 		"SPARK_PUBLIC_BASE_URL": "https://spark.example.com/", "SPARK_DOMAIN": "spark.example.com", "SPARK_TRUST_PROXY": "true",
 		"SPARK_WECHAT_MCH_ID": "1900000001", "SPARK_WECHAT_APP_ID": "wx123", "SPARK_WECHAT_API_V3_KEY": "0123456789abcdef0123456789abcdef",
 		"SPARK_WECHAT_CERT_SERIAL": "SERIAL", "SPARK_WECHAT_PRIVATE_KEY_PATH": "/etc/spark/wx.pem",
@@ -355,5 +356,22 @@ func TestLoadAdminBaseURLTrimmed(t *testing.T) {
 		"SPARK_ADMIN_PUBLIC_BASE_URL": "  https://admin.spark.example/  "}))
 	if err != nil || c.AdminPublicBaseURL != "https://admin.spark.example" {
 		t.Fatalf("admin url = %q err %v", c.AdminPublicBaseURL, err)
+	}
+}
+
+func TestAliyunRequiresBookingTemplates(t *testing.T) {
+	env := map[string]string{
+		"SPARK_DATABASE_URL": "postgres://x", "SPARK_SECRET_KEY": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+		"SPARK_SMS_DRIVER": "aliyun", "SPARK_ALIYUN_ACCESS_KEY_ID": "k", "SPARK_ALIYUN_ACCESS_KEY_SECRET": "s",
+		"SPARK_SMS_SIGN": "sign", "SPARK_SMS_TPL_LOGIN": "L", "SPARK_SMS_TPL_EXPIRY": "E",
+	}
+	_, err := config.Load(func(k string) string { return env[k] })
+	if err == nil || !strings.Contains(err.Error(), "SPARK_SMS_TPL_AUTO_RENEW_FAILED") || !strings.Contains(err.Error(), "SPARK_SMS_TPL_BOOKING_CANCELLED") {
+		t.Fatalf("want missing template error, got %v", err)
+	}
+	env["SPARK_SMS_TPL_AUTO_RENEW_FAILED"], env["SPARK_SMS_TPL_BOOKING_CANCELLED"] = "A", "B"
+	cfg, err := config.Load(func(k string) string { return env[k] })
+	if err != nil || cfg.Aliyun.SMSTplAutoRenewFailed != "A" || cfg.Aliyun.SMSTplBookingCancelled != "B" {
+		t.Fatalf("load = %+v, %v", cfg.Aliyun, err)
 	}
 }

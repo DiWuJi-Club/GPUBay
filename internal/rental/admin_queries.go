@@ -20,7 +20,7 @@ type InstanceFilter struct {
 	MachineID int64
 }
 
-var instanceStates = []string{StateCreating, StateRunning, StateStopped, StateWiping, StateReleased, StateFailed}
+var instanceStates = []string{StateReserved, StateCreating, StateRunning, StateStopped, StateWiping, StateReleased, StateFailed, StateCancelled}
 
 // AdminListInstances 按创建时间倒序分页返回实例。
 func (s *Service) AdminListInstances(ctx context.Context, f InstanceFilter, p paging.Page) ([]Instance, int, error) {
@@ -88,6 +88,8 @@ type OrderFilter struct {
 	Status string // paid / refunded / partially_refunded
 	From   *time.Time
 	To     *time.Time // 不含
+	// BatchID 一次多台的批次号（精确匹配）
+	BatchID string
 }
 
 func (f OrderFilter) where() (db.Where, error) {
@@ -112,6 +114,9 @@ func (f OrderFilter) where() (db.Where, error) {
 	}
 	if f.To != nil {
 		w.Add("created_at < ?", *f.To)
+	}
+	if f.BatchID != "" {
+		w.Add("batch_id = ?", f.BatchID)
 	}
 	return w, nil
 }

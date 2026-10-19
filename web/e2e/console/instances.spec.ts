@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test'
-import { loginConsole, nav, placeOrder, seedUser, userApi } from '../helpers/console'
+import { adminApi, adminPost, createAdmin } from '../helpers/admin'
+import { advanceToProvision, bookViaApi, privateGroup, startAfter } from '../helpers/booking'
+import { loginConsole, nav, placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { instanceOf, instanceRow, runningInstance, stateLabels } from '../helpers/instances'
 import { cstTime } from '../helpers/time'
@@ -114,4 +116,72 @@ test('C-INS-04 运行中倒计时每秒递减；停机显示北京时间的数�
   await expect.poll(async () => Number(await page.getByTestId('detail-remaining').getAttribute('data-remaining')), { timeout: 5000 }).toBeLessThan(d1)
   await page.goto(`/instances/${stoppedId}`)
   await expect(page.getByTestId('detail-retain')).toHaveText(cstTime(stopped.retain_until!))
+})
+
+// ---- 计划 6：预订在列表里的状态（预订都在本用例自己的机组里，见 helpers/booking.ts privateGroup）----
+
+test('C-INS-05 预订到点变为开通中，Agent 完成后运行中', async ({ page }, info) => {
+  const g = await privateGroup(1)
+  const u = await seedUser({ balance: 1_000_000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(3)
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id })
+  await loginConsole(page, u.phone)
+  await nav(page, info, 'instances')
+  const row = instanceRow(page, info, ids[0])
+  await expect(row.getByTestId('instance-state')).toHaveText('已预订')
+  await expect(row.getByTestId('instance-time')).toHaveText(`${cstTime(s.iso)} 开始 · 共 1 天`)
+  await expect(row.getByTestId('instance-cancellable')).toBeVisible()
+  await advanceToProvision(s.date)
+  await hooks.sweep()
+  await page.reload()
+  await expect(instanceRow(page, info, ids[0]).getByTestId('instance-state')).toHaveText('开通中')
+  await expect(instanceRow(page, info, ids[0]).getByTestId('instance-cancellable')).toHaveCount(0)
+  await hooks.agent()
+  await page.reload()
+  await expect(instanceRow(page, info, ids[0]).getByTestId('instance-state')).toHaveText('运行中')
+})
+
+test('C-INS-06 预订机器进入维护后到点改派，列表显示已更换机器', async ({ page }, info) => {
+  const g = await privateGroup(2)
+  const [m1, m2] = g.machineIds
+  const u = await seedUser({ balance: 1_000_000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(3)
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: m1 })
+  const admin = await createAdmin('ops')
+  await adminPost(await adminApi(admin), admin, `/admin/api/v1/machines/${m1}/maintenance`, { on: true })
+  await advanceToProvision(s.date)
+  await hooks.sweep()
+  await loginConsole(page, u.phone)
+  await nav(page, info, 'instances')
+  const row = instanceRow(page, info, ids[0])
+  await expect(row.getByTestId('instance-state')).toHaveText('开通中')
+  await expect(row.getByTestId('instance-reassigned')).toHaveText('已更换机器')
+  await page.goto(`/instances/${ids[0]}`)
+  await expect(page.getByTestId('detail-machine')).toHaveText(`机器 #${m2}（已更换机器 1 次）`)
+})
+
+test('C-INS-07 批次视图一键取消全部未开通预订：确认框显示台数与退款合计', async ({ page }) => {
+  const g = await privateGroup(2)
+  const u = await seedUser({ balance: 1_000_000 })
+  const api = await userApi(u.phone)
+  const s = await startAfter(30)
+  const { batchId, ids } = await bookViaApi(api, { startAt: s.iso, count: 2, groupId: g.id })
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances?batch=${batchId}`)
+  await expect(page.getByTestId('instances-batch-head')).toContainText(`批次 ${batchId} · 2 台`)
+  await expect(page.getByTestId('instance-state')).toHaveText(['已预订', '已预订'])
+  await page.getByTestId('instances-cancel-all').click()
+  await expect(page.getByTestId('instances-cancel-all-text')).toHaveText('将取消 2 台未开通的预订，共退款 ¥138.00（按各台当前取消规则计算）。')
+  await page.getByTestId('instances-cancel-all-cancel').click() // 再想想：不取消
+  await expect(page.getByTestId('instances-cancel-all-dialog')).toBeHidden()
+  for (const id of ids) expect(((await (await api.get(`/api/v1/instances/${id}`)).json()) as { state: string }).state).toBe('reserved')
+  await page.getByTestId('instances-cancel-all').click()
+  await expect(page.getByTestId('instances-cancel-all-text')).toHaveText('将取消 2 台未开通的预订，共退款 ¥138.00（按各台当前取消规则计算）。')
+  await page.getByTestId('instances-cancel-all-ok').click()
+  await toast(page, '已取消 2 台')
+  await expect(page.getByTestId('instance-state')).toHaveText(['已取消', '已取消'])
+  await expect(page.getByTestId('instances-cancel-all')).toHaveCount(0)
+  expect((await (await api.get('/api/v1/wallet')).json()).balance).toBe(1_000_000)
 })

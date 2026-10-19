@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"spark-cloud/internal/audit"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/rental"
 )
 
@@ -110,5 +112,100 @@ func TestAdminMigrateWorksWithDisabledImage(t *testing.T) {
 	}
 	if _, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "镜像已下架也要能换机"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAdminMigrateCopiesAutoRenewTakesNewMachineGroup(t *testing.T) {
+	e := newEnv(t, 2)
+	gid := e.group("A", true)
+	target := e.group("B", true)
+	_, old := e.place(catalog.D1d)
+	e.ack(true)
+	for _, mid := range e.machines {
+		if mid == old.MachineID {
+			e.setGroup(mid, gid)
+		} else {
+			e.setGroup(mid, target)
+		}
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET auto_renew = true, auto_renew_duration = '1w', group_id = $2 WHERE id = $1`, old.ID, gid); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "GPU 报错")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := e.get(moved.ID)
+	if !got.AutoRenew || got.AutoRenewDuration != catalog.D1w || got.GroupID == nil || *got.GroupID != target || got.Booked() || got.ProvisionedAt != nil || got.BatchID != nil {
+		t.Fatalf("moved = %+v", got)
+	}
+	lower, upper, status := e.lease(moved.ID)
+	if status != "active" || !lower.Equal(e.clock.Now()) || !upper.Equal(e.clock.Now().Add(rental.CreateTimeout+24*time.Hour+rental.Tail)) {
+		t.Fatalf("lease = [%v, %v) %s", lower, upper, status)
+	}
+}
+
+func TestAdminMigrateToUngroupedMachineClearsGroup(t *testing.T) {
+	e := newEnv(t, 2)
+	actor := audit.Actor{AdminID: 1, IP: "127.0.0.1"}
+	gid := e.group("A", true)
+	_, old := e.place(catalog.D1d)
+	e.ack(true)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET group_id = $2 WHERE id = $1`, old.ID, gid); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "GPU 报错")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(moved.ID); got.GroupID != nil {
+		t.Fatalf("moved group_id = %v, want nil", *got.GroupID)
+	}
+	e.ack(true) // 新实例开通完成，旧实例洗机完成
+	if got := e.get(old.ID); got.State != rental.StateReleased {
+		t.Fatalf("old state = %s", got.State)
+	}
+	if err := e.svc.AdminDeleteGroup(e.ctx, actor, gid); err != nil {
+		t.Fatalf("delete old group after migrate = %v", err)
+	}
+}
+
+// 终审 M4：早开通（S 之前已 running）的预订实例在 S 之前换机，不能少算已付时长：
+// 新实例的待开始时长 = 原到期（S + D）− now，到期不早于 S + D（与普通换机一样，开通耗时算平台的）；
+// instance_transfers.seconds 只记已付的 D（新实例开通失败时按它退款，早开通的免费时段不折现）。
+func TestAdminMigrateEarlyProvisionedBookingKeepsPaidTime(t *testing.T) {
+	e := newEnv(t, 2)
+	start := dbtest.T0.Add(3 * time.Hour)
+	old := e.book(start)
+	e.clock.Advance(2 * time.Hour) // S − 1h：开通
+	e.heartbeatAll()
+	if n, err := e.svc.ProvisionDue(e.ctx); err != nil || n != 1 {
+		t.Fatalf("provision = %d, %v", n, err)
+	}
+	e.clock.Advance(5 * time.Minute)
+	e.ack(true)
+	if got := e.get(old.ID); got.State != rental.StateRunning || !got.ExpiresAt.Equal(start.Add(24*time.Hour)) {
+		t.Fatalf("early provisioned = %+v", got)
+	}
+	e.clock.Advance(25 * time.Minute) // S − 30min 换机
+	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "GPU 报错")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.PendingSeconds != 24*3600+30*60 {
+		t.Fatalf("pending = %d, want %d", moved.PendingSeconds, 24*3600+30*60)
+	}
+	var transferred int64
+	if err := e.pool.QueryRow(e.ctx, `SELECT seconds FROM instance_transfers WHERE to_instance_id = $1`, moved.ID).Scan(&transferred); err != nil || transferred != 86400 {
+		t.Fatalf("transfer seconds = %d, %v", transferred, err)
+	}
+	if _, upper, _ := e.lease(moved.ID); upper.Before(start.Add(24*time.Hour + rental.Tail)) {
+		t.Fatalf("lease upper %v must cover S + D + Tail", upper)
+	}
+	e.clock.Advance(5 * time.Minute)
+	e.ack(true)
+	got := e.get(moved.ID)
+	if got.State != rental.StateRunning || got.ExpiresAt.Before(start.Add(24*time.Hour)) {
+		t.Fatalf("moved expires %v before S + D %v", got.ExpiresAt, start.Add(24*time.Hour))
 	}
 }

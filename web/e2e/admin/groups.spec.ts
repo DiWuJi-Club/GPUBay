@@ -1,0 +1,147 @@
+import { expect, request, test, type Page } from '@playwright/test'
+import { adminApi, createAdmin, getJSON, loginAdmin } from '../helpers/admin'
+import { exact, pickOption, uniqueGroupName } from '../helpers/booking'
+import { toast } from '../helpers/console'
+import { CONSOLE_URL, hooks } from '../helpers/hooks'
+
+const groupRow = (page: Page, name: string) => page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: exact(name) }) })
+
+/** 控制台匿名接口里可见的机组名。 */
+async function consoleGroupNames(): Promise<string[]> {
+  const ctx = await request.newContext({ baseURL: CONSOLE_URL })
+  try {
+    const r = await ctx.get('/api/v1/groups')
+    if (!r.ok()) throw new Error(`GET /api/v1/groups ${r.status()} ${await r.text()}`)
+    return ((await r.json()).items as { name: string }[]).map((g) => g.name)
+  } finally {
+    await ctx.dispose()
+  }
+}
+
+type MachineJSON = { machine: { group_id: number | null; display_name: string } }
+
+test('A-GRP-01 新建 / 编辑机组与可见开关；重名拒绝', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const name = uniqueGroupName()
+  await loginAdmin(page, admin)
+  await page.getByTestId('menu-groups').click()
+  await page.getByTestId('groups-create-btn').click()
+  await page.getByTestId('group-form-name').fill(name)
+  await page.getByTestId('group-form-region').fill('一楼')
+  await page.getByTestId('group-form-submit').click()
+  await toast(page, '机组已创建')
+  const row = groupRow(page, name)
+  await expect(row.getByTestId('group-region')).toHaveText('一楼')
+  await expect(row.getByTestId('group-count')).toHaveText('0')
+  await expect(row.getByTestId('group-visible')).toHaveText('可见')
+  expect(await consoleGroupNames()).toContain(name)
+  await row.getByTestId('group-edit').click()
+  await expect(page.getByTestId('group-form-name')).toHaveValue(name)
+  await page.getByTestId('group-form-visible').click()
+  await page.getByTestId('group-form-submit').click()
+  await toast(page, '机组已更新')
+  await expect(row.getByTestId('group-visible')).toHaveText('仅后台')
+  expect(await consoleGroupNames()).not.toContain(name) // 仅后台：控制台看不到
+  // 重名：提示原文，弹窗保留
+  await page.getByTestId('groups-create-btn').click()
+  await page.getByTestId('group-form-name').fill(name)
+  await page.getByTestId('group-form-submit').click()
+  await toast(page, '机组名称已存在')
+  await expect(page.getByTestId('group-form-name')).toHaveValue(name)
+  await expect(groupRow(page, name)).toHaveCount(1)
+})
+
+test('A-GRP-02 删除：有机器时拒绝，移出后可删', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
+  const [mid] = await hooks.machines(1, undefined, undefined, g.id)
+  await loginAdmin(page, admin)
+  await page.goto('/admin/groups')
+  const row = groupRow(page, name)
+  await expect(row.getByTestId('group-count')).toHaveText('1')
+  await row.getByTestId('group-delete').click()
+  await page.getByTestId('group-delete-ok').click()
+  await toast(page, '机组内还有机器或未结束的实例')
+  await expect(row).toHaveCount(1)
+  await row.getByTestId('group-machines').click()
+  await expect(page.getByTestId('gm-row')).toHaveCount(1)
+  await expect(page.getByTestId('gm-row')).toHaveAttribute('data-id', String(mid))
+  await page.getByTestId('gm-remove').click()
+  await expect(page.getByTestId('gm-row')).toHaveCount(0)
+  await page.keyboard.press('Escape')
+  await expect(page.getByTestId('group-machines-drawer')).toBeHidden()
+  await row.getByTestId('group-delete').click()
+  await page.getByTestId('group-delete-ok').click()
+  await toast(page, '机组已删除')
+  await expect(row).toHaveCount(0)
+  const m = await getJSON<MachineJSON>(await adminApi(admin), `/admin/api/v1/machines/${mid}`)
+  expect(m.machine.group_id).toBeNull()
+})
+
+test('A-GRP-03 批量加入 / 移出机器', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
+  const ids = await hooks.machines(2)
+  await loginAdmin(page, admin)
+  await page.goto('/admin/groups')
+  const row = groupRow(page, name)
+  await row.getByTestId('group-machines').click()
+  await expect(page.getByTestId('gm-total')).toHaveText('0')
+  await page.getByTestId('gm-add-input').fill(ids.join(','))
+  await page.getByTestId('gm-add').click()
+  await toast(page, '已加入 2 台')
+  await expect(page.getByTestId('gm-row')).toHaveCount(2)
+  await expect(page.getByTestId('gm-total')).toHaveText('2')
+  await expect(row.getByTestId('group-count')).toHaveText('2')
+  const ctx = await adminApi(admin)
+  for (const id of ids) expect((await getJSON<MachineJSON>(ctx, `/admin/api/v1/machines/${id}`)).machine.group_id).toBe(g.id)
+  const removed = Number(await page.getByTestId('gm-row').first().getAttribute('data-id'))
+  await page.getByTestId('gm-remove').first().click()
+  await expect(page.getByTestId('gm-row')).toHaveCount(1)
+  await expect(row.getByTestId('group-count')).toHaveText('1')
+  expect((await getJSON<MachineJSON>(ctx, `/admin/api/v1/machines/${removed}`)).machine.group_id).toBeNull()
+})
+
+test('A-GRP-04 展示名：保存、重名拒绝', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
+  await hooks.machines(2, undefined, undefined, g.id)
+  await loginAdmin(page, admin)
+  await page.goto('/admin/groups')
+  await groupRow(page, name).getByTestId('group-machines').click()
+  await expect(page.getByTestId('gm-row')).toHaveCount(2)
+  const [first, second] = await page.getByTestId('gm-row').evaluateAll((rows) => rows.map((r) => Number(r.getAttribute('data-id'))))
+  const label = `${name}-01`
+  await page.getByTestId('gm-display-input').first().fill(label)
+  await page.getByTestId('gm-display-save').first().click()
+  await toast(page, '展示名已保存')
+  const ctx = await adminApi(admin)
+  expect((await getJSON<MachineJSON>(ctx, `/admin/api/v1/machines/${first}`)).machine.display_name).toBe(label)
+  await page.locator(`[data-testid="gm-row"][data-id="${second}"]`).getByTestId('gm-display-input').fill(label)
+  await page.locator(`[data-testid="gm-row"][data-id="${second}"]`).getByTestId('gm-display-save').click()
+  await toast(page, '展示名已被其他机器使用')
+  expect((await getJSON<MachineJSON>(ctx, `/admin/api/v1/machines/${second}`)).machine.display_name).toBe('')
+})
+
+test('A-GRP-05 机器详情编辑机组与展示名', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
+  const [mid] = await hooks.machines(1)
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/machines/${mid}`)
+  await expect(page.getByTestId('mdetail-group')).toHaveText('未分组')
+  await expect(page.getByTestId('mdetail-display')).toHaveText(`机器 #${mid}`)
+  await page.getByTestId('mdetail-edit-btn').click()
+  await pickOption(page, 'medit-group', exact(name))
+  await page.getByTestId('medit-display').fill(`${name}-X`)
+  await page.getByTestId('medit-submit').click()
+  await toast(page, '已保存')
+  await expect(page.getByTestId('mdetail-group')).toHaveText(name)
+  await expect(page.getByTestId('mdetail-display')).toHaveText(`${name}-X`)
+  const m = await getJSON<MachineJSON>(await adminApi(admin), `/admin/api/v1/machines/${mid}`)
+  expect(m.machine).toMatchObject({ group_id: g.id, display_name: `${name}-X` })
+})

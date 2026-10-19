@@ -36,8 +36,9 @@ func (s *Service) Password(ctx context.Context, userID int64, id string) (string
 	return string(plain), nil
 }
 
-// ListInstancesByMachine 返回某台机器上最近的实例（新到旧）。
+// ListInstancesByMachine 返回某台机器上最近的实例（新到旧），不含未开通的预订（reserved）：
+// 预订在机器详情的档期（leases）里单独展示，不能顶替正在跑的实例，也不算历史。
 func (s *Service) ListInstancesByMachine(ctx context.Context, machineID int64, limit int) ([]Instance, error) {
 	return collectInstances(s.d.Pool.Query(ctx, `SELECT `+instanceCols+` FROM instances
-		WHERE machine_id = $1 ORDER BY created_at DESC, id LIMIT $2`, machineID, limit))
+		WHERE machine_id = $1 AND state <> 'reserved' ORDER BY created_at DESC, id LIMIT $2`, machineID, limit))
 }

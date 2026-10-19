@@ -34,7 +34,7 @@ func (s *Service) ResetPassword(ctx context.Context, userID int64, id, ip string
 		if inst.UserID != userID {
 			return apperr.ErrNotFound
 		}
-		if inst.State == StateReleased || inst.State == StateFailed {
+		if inst.State == StateReleased || inst.State == StateFailed || inst.State == StateCancelled {
 			return apperr.ErrInvalidState
 		}
 		if _, err := tx.Exec(ctx, `UPDATE instances SET ssh_password_enc = $2, updated_at = $3 WHERE id = $1`, id, s.d.Box.Seal([]byte(pw)), now); err != nil {
@@ -60,7 +60,7 @@ func (s *Service) SetPasswordAuth(ctx context.Context, userID int64, id string, 
 		if inst.UserID != userID {
 			return apperr.ErrNotFound
 		}
-		if inst.State == StateReleased || inst.State == StateFailed {
+		if inst.State == StateReleased || inst.State == StateFailed || inst.State == StateCancelled {
 			return apperr.ErrInvalidState
 		}
 		if !enabled {

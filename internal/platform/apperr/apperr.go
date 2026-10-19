@@ -39,6 +39,19 @@ var (
 	ErrPortLimit               = New("port_limit", "每个实例最多开放 5 个端口", 409)
 	ErrPortExists              = New("port_exists", "该端口已添加", 409)
 	ErrPortForcedPrivate       = New("port_forced_private", "该端口已被平台限制为私有", 409)
+	// 计划 6
+	ErrBookingTooSoon       = New("booking_too_soon", "开始时间至少在 2 小时之后", 400)
+	ErrBookingTooFar        = New("booking_too_far", "最多提前 60 天预订", 400)
+	ErrBookingTooLong       = New("booking_too_long", "单次租期最长 90 天", 400)
+	ErrBookingNotHour       = New("booking_not_hour", "开始时间需为整点", 400)
+	ErrBookingLimit         = New("booking_limit", "未开通的预订最多 16 台", 409)
+	ErrCountInvalid         = New("count_invalid", "一次最多租用 8 台", 400)
+	ErrGroupNotFound        = New("group_not_found", "机组不存在", 404)
+	ErrMachineUnavailable   = New("machine_unavailable", "该机器在所选时段不可用", 409)
+	ErrCancelNotAllowed     = New("cancel_not_allowed", "预订已开始开通，不能取消", 409)
+	ErrGroupNotEmpty        = New("group_not_empty", "机组内还有机器或未结束的实例", 409)
+	ErrDuplicateGroupName   = New("duplicate_group_name", "机组名称已存在", 409)
+	ErrDuplicateDisplayName = New("duplicate_display_name", "展示名已被其他机器使用", 409)
 )
 
 // As 取出错误链中的 *Error；不是业务错误时返回 nil。

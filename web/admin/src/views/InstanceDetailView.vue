@@ -7,9 +7,13 @@ import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
+import BatchLink from '../components/BatchLink.vue'
+import BookingOpsDialogs from '../components/BookingOpsDialogs.vue'
 import IdLink from '../components/IdLink.vue'
-import { extendSeconds, isZeroRefund, showExtend, showMigrate, showPortActions, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
+import { useBookingOps } from '../composables/useBookingOps'
+import { extendSeconds, isZeroRefund, showCancelBooking, showExtend, showMigrate, showPortActions, showReassign, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
 import { notifyError } from '../logic/notify'
+import { FIN_ROLES } from '../menu'
 import { session } from '../store/session'
 
 const route = useRoute()
@@ -24,6 +28,7 @@ const inst = computed(() => data.value?.instance)
 const imageName = computed(() => images.value.find((i) => i.id === inst.value?.image_id)?.name ?? inst.value?.image_id)
 const productName = computed(() => products.value.find((p) => p.id === inst.value?.product_id)?.name ?? inst.value?.product_id)
 const isFinance = computed(() => role.value === 'finance')
+const canSeeOrders = computed(() => FIN_ROLES.includes(role.value))
 
 let seq = 0
 /**
@@ -74,6 +79,7 @@ onBeforeRouteUpdate((to) => {
   sessions.value = []
   sessionsTotal.value = 0
   portAction.visible = false
+  booking.closeAll()
   void load(String(to.params.id))
   void loadSessions(String(to.params.id))
 })
@@ -178,6 +184,15 @@ async function submitRefund() {
   }
 }
 
+// ---- 预订：改派 / 取消预订（ops；取消的动态码由请求层弹出）----
+const booking = useBookingOps(() => load())
+function openReassign() {
+  if (inst.value) booking.openReassign(inst.value)
+}
+function openCancelBooking() {
+  if (inst.value) booking.openCancel(inst.value)
+}
+
 // ---- 访问：端口处置与 SSH 会话 ----
 const sessions = ref<AdminSshSession[]>([])
 const sessionsTotal = ref(0)
@@ -244,12 +259,18 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
           <el-descriptions-item label="到期时间"><span data-testid="adetail-expires">{{ fmtTime(inst.expires_at) || '—' }}</span></el-descriptions-item>
           <el-descriptions-item label="停机时间">{{ fmtTime(inst.stopped_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ fmtTime(inst.created_at) }}</el-descriptions-item>
+          <el-descriptions-item v-if="inst.scheduled_start_at" label="预订开始"><span key="start" data-testid="adetail-start">{{ fmtTime(inst.scheduled_start_at) }} ～ {{ fmtTime(inst.scheduled_end_at) }}</span></el-descriptions-item>
+          <el-descriptions-item v-if="inst.batch_id" label="批次"><span key="batch" data-testid="adetail-batch"><BatchLink :id="inst.batch_id" :disabled="!canSeeOrders" /></span></el-descriptions-item>
+          <el-descriptions-item label="改派次数"><span data-testid="adetail-reassigned">{{ inst.reassign_count }}</span></el-descriptions-item>
+          <el-descriptions-item label="自动续费"><span data-testid="adetail-auto-renew">{{ inst.auto_renew ? `开启（${labelOf(durationLabel, inst.auto_renew_duration)}）` : '关闭' }}{{ inst.auto_renew_failed_reason ? ` · 最近失败：${inst.auto_renew_failed_reason}` : '' }}</span></el-descriptions-item>
         </el-descriptions>
         <div class="actions">
           <el-button v-if="showExtend(role, inst.state)" data-testid="adetail-extend-btn" @click="openExtend">免费延长</el-button>
           <el-button v-if="showMigrate(role, inst.state)" data-testid="adetail-migrate-btn" @click="openMigrate">换机</el-button>
           <el-button v-if="showRewipe(role, inst.state)" data-testid="adetail-rewipe-btn" @click="rewipe.visible = true">重新洗机</el-button>
           <el-button v-if="showRefund(role, inst.state)" type="danger" plain :loading="refund.quoting" data-testid="adetail-refund-btn" @click="openRefund">退款并释放</el-button>
+          <el-button v-if="showReassign(role, inst.state)" data-testid="adetail-reassign-btn" @click="openReassign">改派</el-button>
+          <el-button v-if="showCancelBooking(role, inst.state)" type="danger" plain data-testid="adetail-cancel-booking-btn" @click="openCancelBooking">取消预订</el-button>
         </div>
       </el-card>
 
@@ -263,18 +284,20 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
         </el-card>
         <el-card header="订单">
           <table class="grid">
-            <thead><tr><th>订单号</th><th>类型</th><th>租期</th><th>金额</th><th>已退</th><th>状态</th><th>时间</th></tr></thead>
+            <thead><tr><th>订单号</th><th>类型</th><th>租期</th><th>数量</th><th>金额</th><th>已退</th><th>状态</th><th>自动</th><th>时间</th></tr></thead>
             <tbody>
               <tr v-for="o in data.orders" :key="o.id" data-testid="adetail-order-row">
                 <td class="mono" data-testid="adetail-order-id">{{ o.id }}</td>
                 <td data-testid="adetail-order-kind">{{ labelOf(orderKindLabel, o.kind) }}</td>
                 <td>{{ labelOf(durationLabel, o.duration) }}</td>
+                <td data-testid="adetail-order-quantity">{{ o.quantity }}</td>
                 <td data-testid="adetail-order-amount">{{ fmtYuan(o.amount) }}</td>
                 <td data-testid="adetail-order-refunded">{{ fmtYuan(o.refunded_amount) }}</td>
                 <td data-testid="adetail-order-status">{{ labelOf(orderStatusLabel, o.status) }}</td>
+                <td data-testid="adetail-order-auto">{{ o.auto ? '是' : '' }}</td>
                 <td>{{ fmtTime(o.created_at) }}</td>
               </tr>
-              <tr v-if="!data.orders.length"><td colspan="7" class="muted empty">无订单</td></tr>
+              <tr v-if="!data.orders.length"><td colspan="9" class="muted empty">无订单</td></tr>
             </tbody>
           </table>
         </el-card>
@@ -345,6 +368,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
         </el-form>
       </el-dialog>
 
+      <BookingOpsDialogs :ops="booking" />
       <el-dialog v-model="extend.visible" title="免费延长" width="460" align-center data-testid="extend-dialog">
         <!-- novalidate：数字框的原生 step 校验会让 1.5 小时这类值根本提交不了，范围由 validateExtend 统一校验 -->
         <el-form label-position="top" novalidate @submit.prevent="submitExtend">

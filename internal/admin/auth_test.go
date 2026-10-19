@@ -100,7 +100,7 @@ func TestVerifyTOTPWindowAndReplay(t *testing.T) {
 	}
 	// 同一动态码不能再用于另一次登录
 	res2, _ := e.svc.Login(e.ctx, "root", password, ip)
-	if _, err := e.svc.VerifyTOTP(e.ctx, res2.Token, code, ip); codeOf(err) != "invalid_totp" {
+	if _, err := e.svc.VerifyTOTP(e.ctx, res2.Token, code, ip); codeOf(err) != "totp_used" {
 		t.Fatalf("replayed code = %v", err)
 	}
 	if _, err := e.svc.VerifyTOTP(e.ctx, res2.Token, e.code(secret, 0), ip); err != nil {
@@ -244,6 +244,17 @@ func TestStepUp(t *testing.T) {
 	if err := e.svc.StepUp(e.ctx, sess, e.code(secret, 0)); err != nil {
 		t.Fatalf("right code = %v", err)
 	}
+	// 只校验不开窗口：窗口由 RecordStepUp 在操作成功后打开
+	sess, _ = e.svc.Authenticate(e.ctx, token)
+	if sess.StepUpAt != nil {
+		t.Fatal("StepUp must not record the window by itself")
+	}
+	if err := e.svc.StepUp(e.ctx, sess, ""); codeOf(err) != "totp_required" {
+		t.Fatalf("verified but not recorded = %v", err)
+	}
+	if err := e.svc.RecordStepUp(e.ctx, sess); err != nil {
+		t.Fatal(err)
+	}
 	sess, _ = e.svc.Authenticate(e.ctx, token)
 	if sess.StepUpAt == nil {
 		t.Fatal("StepUpAt not recorded")
@@ -257,6 +268,50 @@ func TestStepUp(t *testing.T) {
 	sess, _ = e.svc.Authenticate(e.ctx, token)
 	if err := e.svc.StepUp(e.ctx, sess, ""); codeOf(err) != "totp_required" {
 		t.Fatalf("after window = %v", err)
+	}
+}
+
+// 动态码只校验不开窗口：操作失败后管理员重输同一个码是正常行为，不能计入失败次数而把自己锁住；但用过的码也绝不能再次通过。
+func TestStepUpReusedCodeIsNotAFailure(t *testing.T) {
+	e := newEnv(t)
+	e.create("root", admin.RoleSuper)
+	secret, _, token := e.enroll("root")
+	sess, _ := e.svc.Authenticate(e.ctx, token)
+	e.clk.Advance(30 * time.Second)
+	code := e.code(secret, 0)
+	if err := e.svc.StepUp(e.ctx, sess, code); err != nil {
+		t.Fatalf("first use = %v", err)
+	}
+	for i := 0; i < admin.MaxFailures+1; i++ {
+		if err := e.svc.StepUp(e.ctx, sess, code); codeOf(err) != "totp_used" {
+			t.Fatalf("reuse %d = %v", i+1, err)
+		}
+	}
+	// 重用不计失败：再错 MaxFailures-1 次仍未锁定
+	for i := 0; i < admin.MaxFailures-1; i++ {
+		if err := e.svc.StepUp(e.ctx, sess, "000000"); codeOf(err) != "invalid_totp" {
+			t.Fatalf("wrong %d = %v", i+1, err)
+		}
+	}
+	e.clk.Advance(30 * time.Second)
+	if err := e.svc.StepUp(e.ctx, sess, e.code(secret, 0)); err != nil {
+		t.Fatalf("next code after reuses = %v", err)
+	}
+}
+
+func TestStepUpWrongCodesLockAccount(t *testing.T) {
+	e := newEnv(t)
+	e.create("root", admin.RoleSuper)
+	secret, _, token := e.enroll("root")
+	sess, _ := e.svc.Authenticate(e.ctx, token)
+	e.clk.Advance(30 * time.Second)
+	for i := 0; i < admin.MaxFailures; i++ {
+		if err := e.svc.StepUp(e.ctx, sess, "000000"); codeOf(err) != "invalid_totp" {
+			t.Fatalf("wrong %d = %v", i+1, err)
+		}
+	}
+	if err := e.svc.StepUp(e.ctx, sess, e.code(secret, 0)); codeOf(err) != "account_locked" {
+		t.Fatalf("right code while locked = %v", err)
 	}
 }
 

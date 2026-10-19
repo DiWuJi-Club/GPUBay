@@ -78,6 +78,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/agent", s.handle(s.agent))
 	mux.HandleFunc("GET /hooks/agent/status", s.agentStatus)
 	mux.HandleFunc("POST /hooks/machines", s.handle(s.machines))
+	mux.HandleFunc("POST /hooks/groups", s.handle(s.groups))
 	mux.HandleFunc("POST /hooks/users", s.handle(s.users))
 	mux.HandleFunc("POST /hooks/admins", s.handle(s.admins))
 	mux.HandleFunc("POST /hooks/kyc", s.handle(s.kyc))
@@ -366,6 +367,7 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 		Count        int    `json:"count"`
 		SerialPrefix string `json:"serial_prefix"`
 		Rack         string `json:"rack"`
+		GroupID      *int64 `json:"group_id"`
 	}](body)
 	if err != nil {
 		return nil, err
@@ -399,9 +401,31 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 		if _, err := s.agentFor(ctx, m.ID); err != nil { // 真实接入并建流（首个 StateReport 处理完才返回）
 			return nil, err
 		}
+		if req.GroupID != nil {
+			if err := s.App.Fleet.AssignMachines(ctx, audit.Actor{}, *req.GroupID, []int64{m.ID}); err != nil {
+				return nil, err
+			}
+		}
 		ids = append(ids, m.ID)
 	}
 	return map[string]any{"ids": ids}, nil
+}
+
+// groups 建一个机组（visible 缺省 true）。
+func (s *Server) groups(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := decode[struct {
+		Name    string `json:"name"`
+		Visible *bool  `json:"visible"`
+	}](body)
+	if err != nil {
+		return nil, err
+	}
+	visible := req.Visible == nil || *req.Visible
+	g, err := s.App.Fleet.CreateGroup(ctx, audit.Actor{}, fleet.GroupInput{Name: req.Name, Visible: visible})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": g.ID}, nil
 }
 
 // users 创建用户：用户行直接插入（与 dbtest.CreateUser 相同），余额与分页流水通过 Wallet.AdminAdjust 写入。

@@ -59,6 +59,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_PDU_DRIVER` | mock / snmp（生产禁止 mock；snmp 时按每台 PDU 的配置） | mock |
 | `SPARK_ALIYUN_ACCESS_KEY_ID` / `SPARK_ALIYUN_ACCESS_KEY_SECRET` | 阿里云 AccessKey（短信与号码百科共用） | 空 |
 | `SPARK_SMS_SIGN` / `SPARK_SMS_TPL_LOGIN` / `SPARK_SMS_TPL_EXPIRY` | 短信签名、登录验证码模板（参数 code）、到期提醒模板（参数 instance、hours） | 空 |
+| `SPARK_SMS_TPL_AUTO_RENEW_FAILED` / `SPARK_SMS_TPL_BOOKING_CANCELLED` | 自动续费失败模板（参数 instance、reason）、预订被平台取消模板（参数 instance、reason）；`SPARK_SMS_DRIVER=aliyun` 时必填 | 空 |
 | `SPARK_KYC_AUTH_CODE` | 号码百科三要素核验授权码 | 空 |
 | `SPARK_ALIYUN_SMS_ENDPOINT` / `SPARK_ALIYUN_KYC_ENDPOINT` | 阿里云短信 / 号码百科接口地址（一般不用改） | https://dysmsapi.aliyuncs.com / https://dytnsapi.aliyuncs.com |
 | `SPARK_WECHAT_MCH_ID` / `_APP_ID` / `_API_V3_KEY` / `_CERT_SERIAL` / `_PRIVATE_KEY_PATH` | 微信支付商户号、AppID、APIv3 密钥、商户证书序列号、商户私钥文件 | 空 |
@@ -72,7 +73,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_UPSTREAM_SSH_KEY_FILE` | 平台登录容器的 ed25519 私钥（`platform admin gen-upstream-key --path ...` 生成，0600）；生产必填，dev 缺省时自动生成在临时目录 | 空 |
 | `SPARK_AGENT_DATA_SIZE_GIB` / `SPARK_AGENT_BANDWIDTH_MBPS` | 实例数据盘大小（GiB）与默认限速（Mbps） | 2048 / 200 |
 | `SPARK_AGENT_ALLOW_CIDRS` / `SPARK_AGENT_DNS_SERVERS` | 容器可访问的内网白名单（Harbor、HF 镜像站等）与容器 DNS | 空 / 223.5.5.5,119.29.29.29 |
-| `SPARK_TRUST_PROXY` | 仅当 platform 部署在反向代理之后才设为 true：用户 API 与租户 Web 入口的客户端 IP 取 X-Forwarded-For（不看 X-Real-IP / True-Client-IP）；后台 API 始终以连接地址为准 | false |
+| `SPARK_TRUST_PROXY` | 仅当 platform 部署在反向代理之后才设为 true：用户 API 与租户 Web 入口的客户端 IP 取 X-Forwarded-For（不看 X-Real-IP / True-Client-IP）；后台 API 始终以连接地址为准。匿名机组 / 日历 / 可用性端点按客户端 IP 每分钟限流 120 次：在代理之后不设它，所有用户会共用代理地址这一个额度 | false |
 | `SPARK_TRUSTED_PROXY_HOPS` | `SPARK_TRUST_PROXY=true` 时自己的反向代理层数 N（≥ 1）：客户端 IP 取 X-Forwarded-For 自右数第 N 项（每层代理须追加对端地址）；该项缺失或不是合法 IP 时用连接地址 | 1 |
 | `SPARK_SSH_ADDR` | SSH 网关监听地址（compose 把公网 22 映射到它） | :2222 |
 | `SPARK_SSH_PUBLIC_PORT` | 写进用户 SSH 命令的公网端口；非 22 时命令带 `-p` | 22 |
@@ -125,12 +126,20 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - `SPARK_SECRET_KEY` 轮换后网关主机密钥（`platform_pki.ssh_host_key_enc`）不可解密，**平台启动直接失败，不会自动重新生成**（静默换钥会让所有用户的 `known_hosts` 报警）。恢复二选一：换回原来的密钥；或有意接受网关主机密钥变更——执行 `UPDATE platform_pki SET ssh_host_key_enc = NULL WHERE id = 1;` 后启动，平台生成新钥，用户会看到主机密钥变更警告，需用 `platform admin ssh-host-key` 更新帮助页指纹（CA 私钥同样不可解密，见上一条）。已运行实例的主机密钥固定不受影响（`ssh_host_pubkey` 是明文列）；轮换时仍在开通中的实例按开通失败退款。
 - 本地开发测 ingress：`SPARK_PUBLIC_BASE_URL` 默认 `http://spark.local:8080`，在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或用 sslip.io 域（如 `SPARK_DOMAIN=192-168-1-218.sslip.io`）。
 - 控制台与后台的写请求有同站防护：经浏览器从其它子域 / 站点提交会得到 `forbidden`；curl 等不带 `Origin` 的客户端不受影响。
+- 计划 6（档期预订）发布时**一次性重启全部 platform 副本**：旧副本分配机器时不看占用时段，滚动期间可能把带预订的机器分给即时订单。本次不改 Agent 协议，Agent 不需要升级。
+- 预订与自动续费的短信模板（`SPARK_SMS_TPL_AUTO_RENEW_FAILED`、`SPARK_SMS_TPL_BOOKING_CANCELLED`）在阿里云侧申请通过后再切 `SPARK_SMS_DRIVER=aliyun`，否则启动校验失败。
+- 发布计划 6 前先在生产库执行下面的检查，结果必须为 0 行，再让迁移 `00019` 运行（空占用时段只允许出现在已结束、实例已释放或失败的记录上）：
+  `SELECT l.id, l.status, i.state FROM machine_leases l JOIN instances i ON i.id = l.instance_id WHERE isempty(l.period) AND (l.status <> 'ended' OR i.state NOT IN ('released','failed'));`
 
 ## API 约定
 
-- `POST /api/v1/orders` 与 `POST /api/v1/instances/{id}/renew` 支持可选请求头 `Idempotency-Key`（最长 64 字符）。
+- `POST /api/v1/orders`、`POST /api/v1/bookings` 与 `POST /api/v1/instances/{id}/renew` 支持可选请求头 `Idempotency-Key`（最长 64 字符）。
   同一用户用同一个键重复提交（双击、超时重试）只会扣款一次，并返回首次创建的订单（下单还会返回该实例的当前状态）；
   同一个键被用于不同类型的请求或续费不同实例时返回 409 `idempotency_conflict`。客户端应为每次「新操作」生成新的键（如 UUID）。
+  **幂等键按「意图」使用**：重放同一个键时服务器不看请求体，直接返回首次的结果——改了时长、数量、机器等参数后重新提交必须换新键，否则拿到的是旧请求的结果。
+  键不能包含 `#`（400「幂等键不能包含 #」）：`POST /bookings` 的批次子订单键是 `<key>#<n>`。
+- `GET /api/v1/products` 的 `idle_count` 是「此刻可即时租用 1 天」的台数（排除未来时段已被预订挡住的机器），比后台「空闲」台数少是正常的。
+- 预订参数（最早 2 小时后、最多提前 60 天、单次 ≤ 90 天、一单 ≤ 8 台、每用户未开通预订 ≤ 16 台、取消退款档位、自动续费提前量等）是 `internal/rental/booking.go` 里的常量，不做配置；预订开始时刻、日历按天统计与短信 / 页面里的时间一律按 `Asia/Shanghai`（`internal/platform/tz`），不随服务器时区变化。
 - `GET /api/v1/kyc` 返回用户最近一条实名记录（含驳回原因），没有记录时 `record` 为 `null`；个人姓名只保留首字。
 - 实例视图含 `product_name`、`image_name`（镜像停用后仍返回名称）；充值单视图含 `remaining_seconds`（服务器计算的剩余支付秒数）。
 - 后台 `GET /admin/api/v1/products`、`GET /admin/api/v1/images` 对全部角色可读；`GET /admin/api/v1/audit` 每条含 `actor_name`。

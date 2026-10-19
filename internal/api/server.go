@@ -45,8 +45,10 @@ type Server struct {
 	PublicBaseURL    string        // 对外地址，用于同站防护的 Origin 比对
 	Ingress          *ingress.Auth // Web 入口鉴权；nil 时不注册 authorize 端点
 	AuthorizeLimit   int           // authorize 每用户每分钟上限；零值 60
+	CalendarLimit    int           // 匿名机组 / 日历 / 可用性端点按 IP 每分钟上限；零值 120
 
 	authorizeLim *authorizeLimiter
+	calendarLim  *ipLimiter
 }
 
 const sessionCookie = "sc_session"
@@ -67,6 +69,11 @@ func (s *Server) Router() http.Handler {
 		limit = defaultAuthorizeLimit
 	}
 	s.authorizeLim = &authorizeLimiter{limit: limit}
+	climit := s.CalendarLimit
+	if climit <= 0 {
+		climit = defaultCalendarLimit
+	}
+	s.calendarLim = &ipLimiter{limit: climit}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -92,6 +99,14 @@ func (s *Server) Router() http.Handler {
 		r.Get("/products", s.handleProducts)
 		r.Get("/images", s.handleImages)
 		r.Get("/pay/channels", s.handlePayChannels)
+		r.Group(func(r chi.Router) {
+			r.Use(httpx.NoStore, s.calendarRateLimit)
+			r.Get("/groups", s.handleGroups)
+			r.Get("/groups/{id}/machines", s.handleGroupMachines)
+			r.Get("/groups/{id}/calendar", s.handleGroupCalendar)
+			r.Get("/machines/{id}/calendar", s.handleMachineCalendar)
+			r.Get("/availability", s.handleAvailability)
+		})
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
 		if s.Ingress != nil {
 			r.With(httpx.NoStore).Get("/ingress/authorize", s.handleIngressAuthorize) // 组外：未登录要 302 到登录页而不是 JSON 401
@@ -113,6 +128,12 @@ func (s *Server) Router() http.Handler {
 			r.Get("/instances/{id}/password", s.handlePassword)
 			r.Post("/instances/{id}/renew", s.handleRenew)
 			r.Post("/instances/{id}/release", s.handleRelease)
+			r.Post("/bookings", s.handleCreateBooking)
+			r.Get("/bookings/{id}", s.handleBatch)
+			r.Get("/instances/{id}/cancel-quote", s.handleCancelQuote)
+			r.Post("/instances/{id}/cancel", s.handleCancel)
+			r.Put("/instances/{id}/auto-renew", s.handleAutoRenew)
+			r.Get("/instances/{id}/events", s.handleEvents)
 			r.Get("/ssh-keys", s.handleListSSHKeys)
 			r.Post("/ssh-keys", s.handleAddSSHKey)
 			r.Delete("/ssh-keys/{id}", s.handleDeleteSSHKey)
