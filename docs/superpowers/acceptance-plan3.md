@@ -3,6 +3,7 @@
 - 机器：DGX Spark `spark-3479`（GB10），Ubuntu 24.04，Docker 29.6.2，与计划 2 验收同一台。
 - 平台：开发 Mac 192.168.1.218，`go run ./cmd/platform`（`SPARK_SSH_ADDR=:2222`、`SPARK_SSH_PUBLIC_PORT=2222`、`SPARK_DOMAIN=192-168-1-218.sslip.io`），开发数据库 `make devdb`。
 - 规格：`docs/superpowers/specs/2026-10-18-plan3-access-design.md` §10.4。
+- **总结论：§10.4 全部项目在真机通过。** 检查点 A 发现 2 个缺陷（A1、A2），检查点 B 发现 3 个问题（B1～B3）。全部已修复、经审查，并在真机复测通过。剩余观察见文末「观察（列入遗留）」。
 - 说明：Mac 上的 DNS 经代理把 `*.sslip.io` 解析为假地址（198.18.x.x），所以 SSH 客户端直接连 `192.168.1.218:2222`，用 `HostKeyAlias=ssh.192-168-1-218.sslip.io` 记录主机密钥，效果与按域名连接相同。测试密钥是临时生成的，未使用个人密钥。
 
 ## 检查点 A：SSH 网关与 Agent（§10.4 第 1～6、9～13 项）
@@ -106,3 +107,112 @@
 |---|---|---|
 | A1 | 实例停机时 Agent 立即停掉容器，上游连接先于 10 秒状态扫描断开，用户收不到「实例已停机 / 已释放，连接已断开」 | `9c3a4c4`：上游连接异常断开时先保住客户端通道，查一次实例状态，不可登录就写入提示再断开 |
 | A2 | 对停机、暂停、开通中实例的拒绝计入 IP 暴力破解次数 | `9c3a4c4`：只对真正校验过凭据的失败计数；规格 §2.2 同步修改 |
+
+## 检查点 B：Web 入口、后台、TLS、同站防护、独立域名、compose 冒烟（§10.4 第 4、7、8、14～18 项）
+
+- 日期：2026-10-19；平台版本 `b09e18d`（其后只改了部署产物与文档）；实例 `ins-kgfu2ti6`。
+- 浏览器项用真实 Chrome（Playwright 驱动，`--host-resolver-rules` 把 `*.sslip.io` 指到 Mac，原因同上）。脚本在会话临时目录，不入库。
+- 结论：全部通过。发现的问题 B1～B3 均为部署与文档问题，已修复。
+
+### 1. 密码重置（§10.4.4）——通过
+
+- 先用旧密码挂一个 SSH 会话，再调控制台 `POST /instances/{id}/password/reset`（200，新密码 16 位，只在响应里出现一次）。
+- 旧密码 `Permission denied`，新密码登录成功；挂着的会话一直在输出，没有断开。
+- 审计记录 `instance.password_reset`，`actor_type=user`。
+
+### 2. Web 私有端口（§10.4.7）——通过
+
+- 容器内装 JupyterLab：8888 带 `--ServerApp.allow_remote_access=True`，8889 不带。控制台添加两个私有端口，返回的 URL 为 `http://ins-kgfu2ti6-8888.192-168-1-218.sslip.io:8080/`。
+- 未登录访问：跳到 `…/login?redirect=/api/v1/ingress/authorize?target=…`。
+- 主人登录后访问：经授权回跳到 `/lab`，200，标题 `JupyterLab`。
+  - 在页面里新建终端，经 WebSocket 执行 `echo ws-ok-$((40+2))`，收到 `ws-ok-42`。
+- 8889（不带 `allow_remote_access`）：403，Jupyter 自身因 Host 不在允许列表拒绝，符合预期并已记录。
+- 另一个账号访问：403「无权访问」。
+- 控制台登出后刷新租户页：0.7 秒内回到登录页。
+- 加测（容器侧回显请求头，端口 8000）：
+  - 容器收到的 Cookie 只有应用自己的 `app=1; evil=1`，控制台 `sc_session` 和 `sc_ingress` 都没有转发。
+  - `X-Forwarded-For` 是真实客户端 IP。
+  - 容器下发的 `Set-Cookie: evil=1; Domain=192-168-1-218.sslip.io` 被改成只属于该实例域名，控制台页面的 `document.cookie` 为空。
+
+### 3. Web 公开端口（§10.4.8）——通过
+
+- 端口 8000 改为公开后，不带任何 Cookie 访问返回 200。另一台局域网机器（Spark 本机）也能访问，`X-Forwarded-For=192.168.1.221`。
+- 公开时的警告弹窗由 Playwright 用例 C-DET（控制台）覆盖，本次没有在图形界面另测。
+- 后台「强制私有」（原因必填）后：
+  - 匿名访问变成 302 跳授权；
+  - 用户的端口列表显示 `forced_private=true`；
+  - 用户再改公开返回 409「该端口已被平台限制为私有」；
+  - 审计记录 `instance.port_force_private`，`actor_type=admin`。
+
+### 4. 平台重启（§10.4.14）——通过
+
+- 挂着 SSH 会话和一个已登录的 Jupyter 页面，向平台进程发 SIGTERM：
+  - Web 长连接立即撤销（日志 `ingress stream revoked … reason=platform shutdown`）；
+  - SSH 会话在 drain 满 30 秒时收到「网关正在重启，连接已断开」后断开；
+  - 进程 31 秒退出。
+- 重启后：租户页重新加载**不需要重新登录**（`sc_ingress` 仍有效），`ssh_sessions` 里 `ended_at IS NULL` 为 0。
+
+### 5. TLS 与热加载（§10.4.15）——通过
+
+- 第一次用 macOS 自带的 LibreSSL `-newkey ec` 生成的证书带显式曲线参数，平台启动时直接报错退出：「加载 TLS 证书（…）: x509: invalid ECDSA parameters」，明确失败，没有降级。改用 `openssl ecparam -name prime256v1` 生成后正常。
+- `SPARK_ENV=staging` 加 TLS 启动后：
+  - `http://…:8080/market?x=1` 301 到 `https://…:8443/market?x=1`；
+  - 实例域名同样 301 到 https；
+  - Host 为 `evil.com` 时返回 404，不做跳转；
+  - https 响应带 `strict-transport-security: max-age=31536000`。
+- https 下重做第 2 项全部通过：Cookie 名为 `__Host-sc_session`，`sc_ingress` 带 `Secure`，WebSocket 终端可用。
+- 生成第二张证书覆盖文件：27 秒后对外服务的序列号由 `9D4C23A146E258D0` 变为 `DAD08353DC0F009D`，平台进程没有重启。
+
+### 6. 同站防护（§10.4.16）——通过
+
+- 租户公开端口 8001 上放了一个 multipart 表单，提交到 `https://192-168-1-218.sslip.io:8443/api/v1/uploads`。用已登录控制台的浏览器提交：
+  - 请求带 `Sec-Fetch-Site: same-site`、`Origin: https://ins-kgfu2ti6-8001…`；
+  - 响应 `403 {"code":"forbidden"}`。
+- 控制台自身同源上传：201。
+
+### 7. 独立域名（§10.4.17）——通过
+
+- 加 `SPARK_INGRESS_DOMAIN=app-192-168-1-218.sslip.io`（证书 SAN 含 `*.app-…`）后重启：
+  - 端口 URL 全部落在 `ins-…-<port>.app-192-168-1-218.sslip.io`；
+  - 私有端口的跳转、回跳、WebSocket、他人 403、登出回登录页都正常；
+  - 实例域名下看不到控制台 Cookie。
+- 旧域名的 `ins-…` Host 改由控制台处理（返回控制台 index，标题 `Spark Cloud`）。
+
+### 8. compose 冒烟（§10.4.18）——修复 B1～B3 后通过
+
+- **镜像构建**：测试机访问不了 Docker Hub、gcr.io 和 proxy.golang.org。
+  - 基础镜像经 `docker.m.daocloud.io` 拉取后改名；distroless 按固定摘要从 `m.daocloud.io/gcr.io/…@sha256:afa5…` 拉到，摘要真实存在。
+  - 在 Spark 上 `GOPROXY=https://goproxy.cn,direct NPM_REGISTRY=https://registry.npmmirror.com/ DISTROLESS=… make platform-image VERSION=test` 构建成功，arm64 镜像 24.4 MB。
+  - 这三个构建参数是本次发现问题后补的，见 **B2**。
+- **宿主机 sshd 挪端口**：测试机是 `ssh.socket` 套接字激活，只改配置重启 `ssh` 不会换端口，见 **B1**。
+  - 按「先双端口、新端口验证、再去掉 22」挪到 2200。
+  - 结束后同样两步改回 22，并复测 `ssh -p 22` 连通。
+  - 留下的 `/etc/ssh/sshd_config.d/10-spark-ports.conf` 内容为 `Port 22`，与默认等价。
+- **启动**：staging `.env`（`192-168-1-221.sslip.io`，自签证书放进 `certs` 卷，属主 65532），上游密钥用镜像 `admin gen-upstream-key` 生成。`docker compose up -d platform postgres` 后：
+  - postgres 健康检查通过，platform 冷启动迁移成功，各监听正常；
+  - 后台「监听在所有网卡上」的提示按 `.env.example` 说明可忽略。
+- **对外检查**：
+  - 从 Mac `ssh -p 22 foo@192.168.1.221` 显示 Banner「用户名应为实例 ID」，容器日志 `ssh auth failed` 的 `ip` 为 `192.168.1.218`（真实来源，IPv4 发布没有经 docker-proxy 塌缩）；
+  - `openssl s_client -connect 192.168.1.221:443` 拿到预期证书；
+  - 80 端口 301 到 https；
+  - 后台 8081 从局域网连不上，只在宿主机 `127.0.0.1` 可访问（200）；
+  - 9443 只监听在 `192.168.1.221`；
+  - postgres 没有发布端口。
+- **证书热替换**：在 `certs` 卷里原子替换证书后 33 秒生效（序列号 `DC2B84F1…` 变为 `F8EA47C2…`），容器 `RestartCount=0`。
+- **停止**：`docker compose down` 正常结束（没有 SSH 会话，不用等 drain）。
+- **后台经隧道访问**：在 Chrome 里实测，`http://localhost` 会接受并回送 `Secure` / `__Host-` Cookie，所以 `ssh -L 8081:127.0.0.1:8081` 后用 `http://localhost:8081/admin/` 登录可行。
+
+### 缺陷汇总（检查点 B）
+
+| 编号 | 现象 | 修复 |
+|---|---|---|
+| B1 | 部署文档让运维改 `sshd_config` 再 `systemctl restart ssh`；Ubuntu 22.10+ 的 `ssh.socket` 套接字激活下端口不会变 | `0c0020f`：文档改为 `sshd_config.d` 覆盖 + `daemon-reload` + 重启 `ssh.socket`，并要求先双端口验证 |
+| B2 | 镜像构建写死 proxy.golang.org、npmjs、gcr.io，国内机房无法构建 | `a74d732`：`GOPROXY` / `NPM_REGISTRY` / `DISTROLESS` 构建参数，以及国内网络章节 |
+| B3 | 部署 README 的证书签发命令无效、步骤顺序错、IPv6 经 docker-proxy 塌缩成同一来源 IP（Task 23 评审发现，冒烟时确认 IPv4 发布下来源 IP 正确） | `305f16e` |
+
+## 观察（列入遗留）
+
+- VS Code Remote-SSH 的图形界面没有实测：开发 Mac 没装 VS Code。它依赖的 exec 加 stdin、sftp、`-L`/direct-tcpip 已逐项通过，请负责人上线前用图形界面补测一次。
+- Playwright 的 `context.cookies(url)` 会把父域的 host-only Cookie 也列出来，容易误判为「控制台 Cookie 发到了实例域名」。以容器实际收到的请求头为准，见第 2 项加测。
+- 控制台登录短信码在开发环境有 60 秒限流，连续跑浏览器脚本时需要等待，属于预期行为。
+- 主域名与入口域名相同时，租户页面的 JS 仍可给父域写 Cookie（代理只能改写容器响应头）。生产环境请用独立注册域（第 7 项已验证可行），见 README「部署注意」。
