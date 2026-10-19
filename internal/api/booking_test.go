@@ -205,6 +205,34 @@ func TestAnonymousEndpointsHideInternals(t *testing.T) {
 	if code, out := anon.do("GET", "/availability?product_id="+itoa(dbtest.ProductID(t, e.pool))+"&group_id="+itoa(hid.ID)+"&duration=1d", nil); code != 404 {
 		t.Fatalf("availability hidden group = %d %v", code, out)
 	}
+	if code, out := anon.do("GET", "/availability?product_id="+itoa(dbtest.ProductID(t, e.pool))+"&group_id="+itoa(vis.ID)+"&duration=1d&quantity=x", nil); code != 400 || out["code"] != "bad_request" {
+		t.Fatalf("availability bad quantity = %d %v", code, out)
+	}
+	// 指定机器下单：机组不对、机组隐藏、机器不存在一律同一个 404，探测不出隐藏机器属于哪个机组
+	c, _ := e.fundedClient("13800000077")
+	start := dbtest.T0.Add(3 * time.Hour).Format(time.RFC3339)
+	body := func(machine int64, group *int64) map[string]any {
+		b := map[string]any{"product_id": dbtest.ProductID(t, e.pool), "image_id": dbtest.ImageID(t, e.pool), "count": 1, "duration": "1d",
+			"quantity": 1, "start_at": start, "machine_id": machine}
+		if group != nil {
+			b["group_id"] = *group
+		}
+		return b
+	}
+	for name, b := range map[string]map[string]any{
+		"hidden machine, hidden group":  body(m2, &hid.ID),
+		"hidden machine, visible group": body(m2, &vis.ID),
+		"visible machine, hidden group": body(m1, &hid.ID),
+		"visible machine, no group":     body(m1, nil),
+		"missing machine":               body(999999, &vis.ID),
+	} {
+		if code, out := c.do("POST", "/bookings", b); code != 404 || out["code"] != "not_found" {
+			t.Fatalf("%s = %d %v", name, code, out)
+		}
+	}
+	if code, out := c.do("POST", "/bookings", body(m1, &vis.ID)); code != 201 {
+		t.Fatalf("visible machine in its group = %d %v", code, out)
+	}
 }
 
 func TestCalendarEndpointsRateLimitedPerIP(t *testing.T) {

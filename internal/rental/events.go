@@ -45,7 +45,10 @@ func userEventOf(e Event) (UserEvent, bool) {
 	case strings.HasPrefix(r, "create failed, waiting"):
 		out.Kind, out.Detail = "waiting", "开通失败，正在等待可用机器"
 	case strings.HasPrefix(r, "auto renew failed: "):
-		reason := autoRenewFailText[strings.TrimPrefix(r, "auto renew failed: ")]
+		reason, ok := autoRenewFailText[strings.TrimPrefix(r, "auto renew failed: ")]
+		if !ok {
+			reason = "其他原因"
+		}
 		out.Kind, out.Detail = "auto_renew_failed", "自动续费失败："+reason
 	case strings.HasPrefix(r, "auto renew "):
 		d := ""
@@ -98,12 +101,12 @@ func refundText(r string) string {
 	return fmt.Sprintf("，已退款 ¥%d.%02d", cents/100, cents%100)
 }
 
-// UserEvents 返回用户自己实例的最近 20 条白名单事件（新到旧）。
+// UserEvents 返回用户自己实例的最近 20 条白名单事件（新到旧）；只扫描最近 200 条原始事件，事件很多的实例也不全表读。
 func (s *Service) UserEvents(ctx context.Context, userID int64, id string) ([]UserEvent, error) {
 	if _, err := s.GetForUser(ctx, userID, id); err != nil {
 		return nil, err
 	}
-	rows, err := s.d.Pool.Query(ctx, `SELECT id, from_state, to_state, reason, at FROM instance_events WHERE instance_id = $1 ORDER BY id DESC`, id)
+	rows, err := s.d.Pool.Query(ctx, `SELECT id, from_state, to_state, reason, at FROM instance_events WHERE instance_id = $1 ORDER BY id DESC LIMIT 200`, id)
 	if err != nil {
 		return nil, err
 	}

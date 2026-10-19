@@ -225,7 +225,13 @@ func (s *Server) handleAvailability(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	quantity, _ := strconv.Atoi(q.Get("quantity"))
+	quantity := 0
+	if v := q.Get("quantity"); v != "" {
+		if quantity, err = strconv.Atoi(v); err != nil {
+			s.writeError(w, r, apperr.BadRequest("quantity 必须是整数"))
+			return
+		}
+	}
 	out, err := s.Rental.Availability(r.Context(), rental.AvailabilityQuery{ProductID: *productID, GroupID: groupID, MachineID: machineID,
 		StartAt: start, Duration: catalog.Duration(q.Get("duration")), Quantity: quantity})
 	if err != nil {
@@ -256,6 +262,21 @@ func (s *Server) batchResult(ctx context.Context, res rental.BatchResult) (map[s
 	return map[string]any{"batch": res.Batch, "orders": res.Orders, "instances": views}, nil
 }
 
+// bookableMachine 指定机器下单的前置检查：先看机器所在机组可见，再看 group_id 与之相同；任何不满足都是 ErrNotFound。
+func (s *Server) bookableMachine(ctx context.Context, machineID int64, groupID *int64) error {
+	if err := s.Rental.VisibleMachine(ctx, machineID); err != nil {
+		return err
+	}
+	m, err := s.Fleet.Get(ctx, s.Fleet.Pool(), machineID)
+	if err != nil {
+		return err
+	}
+	if groupID == nil || m.GroupID == nil || *m.GroupID != *groupID {
+		return apperr.ErrNotFound
+	}
+	return nil
+}
+
 func (s *Server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 	var req bookingRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -267,11 +288,11 @@ func (s *Server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	// 规格 §10.1：指定机器时 group_id 必须是该机器所在机组（validateBatch 不管这条，后台改派与 rental 测试依赖它的宽松）
+	// 规格 §10.1：指定机器时 group_id 必须是该机器所在的可见机组（validateBatch 不管这条，后台改派与 rental 测试依赖它的宽松）。
+	// 机器不存在 / 所在机组隐藏 / group_id 不对一律同一个 404，探测不出隐藏机器属于哪个机组。
 	if req.MachineID != nil {
-		m, err := s.Fleet.Get(r.Context(), s.Fleet.Pool(), *req.MachineID)
-		if err != nil || m.GroupID == nil || req.GroupID == nil || *m.GroupID != *req.GroupID {
-			s.writeError(w, r, apperr.BadRequest("指定机器时 group_id 必须是该机器所在机组"))
+		if err := s.bookableMachine(r.Context(), *req.MachineID, req.GroupID); err != nil {
+			s.writeError(w, r, err)
 			return
 		}
 	}

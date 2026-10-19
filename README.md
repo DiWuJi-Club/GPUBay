@@ -73,6 +73,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_AGENT_DATA_SIZE_GIB` / `SPARK_AGENT_BANDWIDTH_MBPS` | 实例数据盘大小（GiB）与默认限速（Mbps） | 2048 / 200 |
 | `SPARK_AGENT_ALLOW_CIDRS` / `SPARK_AGENT_DNS_SERVERS` | 容器可访问的内网白名单（Harbor、HF 镜像站等）与容器 DNS | 空 / 223.5.5.5,119.29.29.29 |
 | `SPARK_TRUST_PROXY` | 仅当 platform 部署在反向代理之后才设为 true：用户 API 与租户 Web 入口的客户端 IP 取 X-Forwarded-For（不看 X-Real-IP / True-Client-IP）；后台 API 始终以连接地址为准 | false |
+| （匿名日历限流） | 匿名机组 / 日历 / 可用性端点按客户端 IP 每分钟限流（默认 120 次）；部署在反向代理之后必须设 `SPARK_TRUST_PROXY=true`，否则所有用户共用代理地址这一个额度 | — |
 | `SPARK_TRUSTED_PROXY_HOPS` | `SPARK_TRUST_PROXY=true` 时自己的反向代理层数 N（≥ 1）：客户端 IP 取 X-Forwarded-For 自右数第 N 项（每层代理须追加对端地址）；该项缺失或不是合法 IP 时用连接地址 | 1 |
 | `SPARK_SSH_ADDR` | SSH 网关监听地址（compose 把公网 22 映射到它） | :2222 |
 | `SPARK_SSH_PUBLIC_PORT` | 写进用户 SSH 命令的公网端口；非 22 时命令带 `-p` | 22 |
