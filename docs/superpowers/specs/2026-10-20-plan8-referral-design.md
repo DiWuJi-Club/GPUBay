@@ -259,7 +259,7 @@ CREATE INDEX kyc_records_fingerprint_idx ON kyc_records (fingerprint) WHERE fing
   - 「同邀请人其他被邀请人」只含**未撤销**绑定的被邀请人：已撤销的绑定不再产生返利，不参与比较。
   - 比较用每个用户**全部** verified 指纹（同一用户可能既有个人又有企业实名），本人一侧同样取全部指纹并上本条；`UserLookup.VerifiedFingerprints` 返回 `map[userID][]fingerprint`。
   - 判定在保存点里执行，不让实名失败：死锁 / 序列化冲突（40P01 / 40001）在新保存点里重试一次；仍失败则回滚保存点、记日志，并在外层事务写审计 `referral.kyc_check_failed`（目标 `user`，diff `{kyc_record_id}`），由后台人工核查该用户的邀请绑定。
-  - 该审计未解决（晚于绑定 `reviewed_at`）时，发放（§4.4）把该用户作为邀请人或被邀请人的到期 active 绑定转 `held`（`hold_reason='kyc_check_failed'`），进后台待审核，与 `same_device` 搁置同一裁决流程。
+  - 该审计未解决（晚于绑定的 `reviewed_at`，未复核时晚于 `bound_at`）时，发放（§4.4）把该用户作为邀请人或被邀请人的到期 active 绑定转 `held`（`hold_reason='kyc_check_failed'`），进后台待审核，与 `same_device` 搁置同一裁决流程。
 - 指纹比较只在实名通过时做一次，不做定期全量扫描（遗留）。
 
 ## 4. 返利计算
@@ -316,12 +316,13 @@ switch r.status:
 - **`wallet.ApplyUpTo`（新钱包原语）**：与 `Apply` 相同的锁与记账逻辑，但扣款额取 `min(|amount|, balance)`；`balance = 0` 时不记流水返回 `applied = 0`。单测覆盖（§16.1）。这是本计划对 `wallet` 包唯一的写路径改动。
 
 ### 4.4 发放（`Release`）
-候选：`referral_rewards WHERE status='pending' AND settle_after <= now` 按 `settle_after` 每轮最多 200 行，逐行独立事务：
+候选：`referral_rewards WHERE status='pending' AND settle_after <= now`，并在 SQL 里预筛当前可发的行（JOIN 绑定 `status='active'`、邀请人账户 `status='active'`、邀请人 `users.status='active' AND kyc_status='verified'`；只是优化，锁内复核仍是权威）；按 `(settle_after, order_id)` 游标翻页，每页 `ReleaseBatch`（200）行、每轮最多 `ReleaseMaxPages`（10）页——锁内跳过的行不会挡住后面可发的行（不饿死）。逐行独立事务（`40P01 / 40001` 重试一次）：
 1. `users(邀请人, 被邀请人) FOR KEY SHARE` → `referral_accounts(邀请人) FOR UPDATE` → `referral_rewards(order) FOR UPDATE SKIP LOCKED` 复核 `status='pending' AND settle_after <= now`。
 2. 门槛（任一不满足 → 跳过，本轮不动，下轮再看）：绑定 `status='active'`；邀请人账户 `status='active'`；邀请人 `users.status='active' AND kyc_status='verified'`（`identity.UserState` 接口）。
-   - 同身份复查（纵深防御：实名钩子失败只留审计 `referral.kyc_check_failed`，可能漏撤销）：被邀请人的任一 verified 指纹等于邀请人或同邀请人其它未撤销被邀请人的任一 verified 指纹 → 按 §3.3 同样撤销绑定（`same_identity`，待发放全部 void，审计 `referral.auto_revoke`），本行计入作废。
-   - 邀请人或被邀请人有晚于绑定 `reviewed_at`（NULL 视为从未复核）的 `referral.kyc_check_failed` 审计 → 绑定转 `held`（`hold_reason='kyc_check_failed'`，审计 `referral.auto_hold`），返利保持 pending；后台 approve / revoke（写 `reviewed_at`）即视为已解决，同一条审计不再触发。
-3. `reward == 0` → `status='void'`，事件 `void(detail='zero after refund')`。
+   - 同身份复查（纵深防御：实名钩子失败只留审计 `referral.kyc_check_failed`，可能漏撤销）：被邀请人的任一 verified 指纹等于邀请人或同邀请人其它未撤销被邀请人的任一 verified 指纹 → 按 §3.3 同样撤销绑定（`same_identity`，待发放全部 void，审计 `referral.auto_revoke`），本行计入作废。指纹按邀请人在一轮内缓存（撤销提交后从缓存删去该被邀请人；轮内新增的绑定 / 实名由 `OnKYCVerified` 与下一轮兜底）。
+   - 邀请人或被邀请人有 `created_at > COALESCE(绑定 reviewed_at, 绑定 bound_at)` 的 `referral.kyc_check_failed` 审计（绑定之前的失败与该绑定无关） → 绑定转 `held`（`hold_reason='kyc_check_failed'`，审计 `referral.auto_hold`），返利保持 pending；后台 approve / revoke（写 `reviewed_at`）即视为已解决，同一条审计不再触发。
+3. 重放保护（先于抵欠账）：该订单已有 `referral/<order>` 发放流水或已有 `settle` 事件（全额抵欠时没有流水）→ 不抵欠、不入账，只写 `settle(detail='replay: already released')` 并置 `settled`，记错误日志告警。
+   `reward == 0` → `status='void'`，事件 `void(detail='zero after refund')`。
 4. 抵欠账：`offset := min(debt, reward)`；`debt −= offset`；事件 `debt_offset(amount=offset)`（不写钱包流水）。
 5. `credit := reward − offset`；`credit > 0` → `Wallet.Apply(Entry{inviter, +credit, referral_rebate, ref('referral', order), remark="邀请返利 138****1234 订单 ord-…"})`；事件 `settle(amount=reward, wallet_ledger_id)`。
 6. `status='settled'`、`settled_amount = reward`、`settled_at = now`。
@@ -492,7 +493,8 @@ func (s *Service) Admin*(...)                                                // 
 | 首版费率（迁移写入） | 10% / ¥500 / ¥5,000 / 7 天 / 365 天 | R1～R3、R5；之后后台改 |
 | `InviteStoreDays` | 30 | 控制台 localStorage（R7） |
 | `ScanLookback` / `ScanLag` / `ScanBatch` | 1h / 2m / 500 | §5.1 |
-| `ReleaseBatch` | 200 | §4.4 |
+| `ReleaseBatch` | 200（每页） | §4.4 |
+| `ReleaseMaxPages` | 10（每轮页数上限） | §4.4 |
 | `BurstThreshold` / `SameIPWindow` | 20 / 24h | §3.2 |
 | `MaxDevicesPerUser` | 10 | §3.2 |
 | 码长度 / 字母表 | 8 / Crockford（无 I L O U） | §3.1 |

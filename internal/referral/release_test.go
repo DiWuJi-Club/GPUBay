@@ -3,12 +3,17 @@ package referral_test
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"slices"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/referral"
 )
 
 // release 跑一轮 Release 且必须无错。
@@ -201,6 +206,60 @@ func TestReleaseReplayDoesNotDoubleCredit(t *testing.T) {
 	e.invariantsOK()
 }
 
+// 重放保护先于抵欠账：有欠账时把已发放的行改回 pending 再发 → 不再抵欠、不再入账（含全额抵欠、没有发放流水的行）。
+func TestReleaseReplayWithDebtSkipsOffset(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	// 欠 300：ord-s 发放后花光余额再退 3000
+	e.accrueOK(e.pay(b, "ord-s", 6900))
+	e.clk.Advance(7 * 24 * time.Hour)
+	if n := e.release(); n != 1 {
+		t.Fatalf("settle ord-s = %d", n)
+	}
+	e.spend(a, 690)
+	e.refundOK(e.refund(b, "ord-s-r1", 3000))
+	// ord-1 返利 100（改 cap）：全额抵欠（欠 200），没有发放流水；ord-2 690：抵 200、入 490
+	e.accrueOK(e.pay(b, "ord-1", 6900))
+	e.bindExec(`UPDATE referral_rewards SET reward = 100, reward_cap = 100 WHERE order_id = 'ord-1'`)
+	e.accrueOK(e.pay(b, "ord-2", 6900))
+	e.clk.Advance(7 * 24 * time.Hour)
+	if n := e.release(); n != 2 || e.debt(a) != 0 || e.ledgerSum(a, "referral_rebate") != 690+490 {
+		t.Fatalf("n=%d debt=%d wallet=%d", n, e.debt(a), e.ledgerSum(a, "referral_rebate"))
+	}
+	e.invariantsOK()
+	// 再造欠账 300，然后把 ord-1、ord-2 改回 pending 重放
+	e.accrueOK(e.pay(b, "ord-3", 6900))
+	e.clk.Advance(7 * 24 * time.Hour)
+	if n := e.release(); n != 1 {
+		t.Fatalf("settle ord-3 = %d", n)
+	}
+	e.spend(a, 490+690) // 余额：+690 −690 +490 +690
+	e.refundOK(e.refund(b, "ord-3-r1", 3000))
+	if e.debt(a) != 300 {
+		t.Fatalf("debt = %d", e.debt(a))
+	}
+	e.bindExec(`UPDATE referral_rewards SET status = 'pending', settled_amount = 0, settled_at = NULL WHERE order_id IN ('ord-1', 'ord-2')`)
+	if n := e.release(); n != 2 {
+		t.Fatalf("replay = %d", n)
+	}
+	if e.debt(a) != 300 || e.ledgerSum(a, "referral_rebate") != 690+490+690 {
+		t.Fatalf("replay must not offset or credit: debt=%d wallet=%d", e.debt(a), e.ledgerSum(a, "referral_rebate"))
+	}
+	for _, o := range []string{"ord-1", "ord-2"} {
+		if r := e.reward(o); r["status"] != "settled" {
+			t.Fatalf("%s = %v", o, r)
+		}
+		var offsets int
+		if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM referral_events WHERE order_id = $1 AND kind = 'debt_offset'`, o).Scan(&offsets); err != nil || offsets != 1 {
+			t.Fatalf("%s debt_offset events = %d %v", o, offsets, err)
+		}
+	}
+	e.invariantsOK()
+}
+
+// 每页 ReleaseBatch（200）行，一轮内按 (settle_after, order_id) 游标翻页；限一页时退化为每轮 200 行。
 func TestReleaseBatchLimit(t *testing.T) {
 	e := newEnv(t)
 	a := e.user("13812345678", true)
@@ -210,16 +269,141 @@ func TestReleaseBatchLimit(t *testing.T) {
 		e.accrueOK(e.pay(b, fmt.Sprintf("ord-%03d", i), 100))
 	}
 	e.clk.Advance(7 * 24 * time.Hour)
+	restore := referral.SetReleaseMaxPages(1)
 	if n := e.release(); n != 200 {
-		t.Fatalf("first round = %d", n)
+		t.Fatalf("one page = %d", n)
 	}
-	if n := e.release(); n != 5 {
-		t.Fatalf("second round = %d", n)
+	restore()
+	for i := 205; i < 410; i++ {
+		e.accrueOK(e.pay(b, fmt.Sprintf("ord-%03d", i), 100))
 	}
-	if e.ledgerSum(a, "referral_rebate") != 205*10 {
+	e.clk.Advance(7 * 24 * time.Hour)
+	if n := e.release(); n != 210 { // 5 + 205，两页
+		t.Fatalf("paged round = %d", n)
+	}
+	if e.ledgerSum(a, "referral_rebate") != 410*10 {
 		t.Fatalf("wallet = %d", e.ledgerSum(a, "referral_rebate"))
 	}
 	e.invariantsOK()
+}
+
+// 饿死（预筛）：排在前面的 201 行邀请人未实名，SQL 预筛直接排除；即便每轮只一页，后面可发的行本轮就发。
+func TestReleasePrefilterSkipsUnpayableRows(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	x := e.user("13700000001", true)
+	y := e.user("13700000002", true)
+	e.bind(x, y)
+	e.bind(a, b)
+	for i := 0; i < 201; i++ {
+		e.accrueOK(e.pay(y, fmt.Sprintf("ord-x%03d", i), 100))
+	}
+	e.bindExec(`UPDATE users SET kyc_status = 'none' WHERE id = $1`, x)
+	e.clk.Advance(time.Second)
+	e.accrueOK(e.pay(b, "ord-a", 6900)) // settle_after 晚 1s，排在 201 行之后
+	e.clk.Advance(7 * 24 * time.Hour)
+	defer referral.SetReleaseMaxPages(1)()
+	if n := e.release(); n != 1 || e.reward("ord-a")["status"] != "settled" {
+		t.Fatalf("payable row starved: n=%d %v", n, e.reward("ord-a"))
+	}
+	if e.reward("ord-x000")["status"] != "pending" {
+		t.Fatal("unverified inviter must stay pending")
+	}
+}
+
+// 饿死（翻页）：预筛放行但锁内跳过的行（kyc_check_failed 把绑定转 held，同绑定其余 200 行随即跳过）占满第一页，
+// 游标翻到下一页，可发的行本轮就发。
+func TestReleasePagesPastSkippedRows(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	x := e.user("13700000001", true)
+	y := e.user("13700000002", true)
+	bidY := e.bind(x, y)
+	e.bind(a, b)
+	for i := 0; i < 201; i++ {
+		e.accrueOK(e.pay(y, fmt.Sprintf("ord-x%03d", i), 100))
+	}
+	e.clk.Advance(time.Second)
+	e.kycCheckFailed(y)
+	e.accrueOK(e.pay(b, "ord-a", 6900))
+	e.clk.Advance(7 * 24 * time.Hour)
+	if n := e.release(); n != 1 || e.reward("ord-a")["status"] != "settled" {
+		t.Fatalf("payable row starved: n=%d %v", n, e.reward("ord-a"))
+	}
+	if status, _, _ := e.bindingRow(y); status != "held" || e.autoHoldAudits(bidY) != 1 {
+		t.Fatalf("binding y = %s audits = %d", status, e.autoHoldAudits(bidY))
+	}
+}
+
+// 预筛只是优化：锁内复核仍是权威。绕过预筛直接跑一行，门槛不满足时不动。
+func TestReleaseOneRechecksGatesUnderLock(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	bid := e.bind(a, b)
+	e.accrueOK(e.pay(b, "ord-1", 6900))
+	e.clk.Advance(7 * 24 * time.Hour)
+	one := func() bool {
+		t.Helper()
+		var done bool
+		if err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+			var err error
+			done, err = e.svc.ReleaseOneForTest(e.ctx, tx, e.clk.Now(), "ord-1", a, b)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return done
+	}
+	for _, c := range []struct{ set, reset string }{
+		{`UPDATE referral_bindings SET status = 'held' WHERE id = $1`, `UPDATE referral_bindings SET status = 'active' WHERE id = $1`},
+		{`UPDATE referral_accounts SET status = 'frozen' WHERE user_id = (SELECT inviter_id FROM referral_bindings WHERE id = $1)`, `UPDATE referral_accounts SET status = 'active' WHERE user_id = (SELECT inviter_id FROM referral_bindings WHERE id = $1)`},
+		{`UPDATE users SET kyc_status = 'rejected' WHERE id = (SELECT inviter_id FROM referral_bindings WHERE id = $1)`, `UPDATE users SET kyc_status = 'verified' WHERE id = (SELECT inviter_id FROM referral_bindings WHERE id = $1)`},
+		{`UPDATE users SET status = 'banned' WHERE id = (SELECT inviter_id FROM referral_bindings WHERE id = $1)`, `UPDATE users SET status = 'active' WHERE id = (SELECT inviter_id FROM referral_bindings WHERE id = $1)`},
+	} {
+		e.bindExec(c.set, bid)
+		if one() || e.reward("ord-1")["status"] != "pending" {
+			t.Fatalf("%s: must skip under lock", c.set)
+		}
+		e.bindExec(c.reset, bid)
+	}
+	if !one() || e.reward("ord-1")["status"] != "settled" {
+		t.Fatalf("all gates pass: %v", e.reward("ord-1"))
+	}
+}
+
+// 指纹按邀请人在一轮内缓存：同一邀请人的多行只读一次。
+type countingUsers struct {
+	referral.UserLookup
+	fpCalls int
+}
+
+func (c *countingUsers) VerifiedFingerprints(ctx context.Context, q db.Querier, ids []int64) (map[int64][]string, error) {
+	c.fpCalls++
+	return c.UserLookup.VerifiedFingerprints(ctx, q, ids)
+}
+
+func TestReleaseCachesFingerprintsPerInviter(t *testing.T) {
+	e := newEnv(t)
+	cu := &countingUsers{UserLookup: e.users}
+	svc := referral.NewService(referral.Deps{Pool: e.pool, Clock: e.clk, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Wallet: e.wallet, Users: cu, Orders: e.orders})
+	a := e.user("13812345678", true)
+	e.users.fps[a] = []string{"fp-a"}
+	for i, phone := range []string{"13900000001", "13900000002", "13900000003"} {
+		u := e.user(phone, true)
+		e.users.fps[u] = []string{fmt.Sprintf("fp-%d", i)}
+		e.bind(a, u)
+		e.accrueOK(e.pay(u, fmt.Sprintf("ord-%d", i), 6900))
+	}
+	e.clk.Advance(7 * 24 * time.Hour)
+	if n, err := svc.Release(e.ctx); err != nil || n != 3 {
+		t.Fatalf("release = %d %v", n, err)
+	}
+	if cu.fpCalls != 1 {
+		t.Fatalf("VerifiedFingerprints calls = %d, want 1 per inviter per round", cu.fpCalls)
+	}
 }
 
 // 控制者裁决（纵深防御）：实名钩子可能静默失败，发放前按全部 verified 指纹复查同身份——
@@ -300,14 +484,23 @@ func TestReleaseHoldsOnUnresolvedKYCCheckFailure(t *testing.T) {
 	e := newEnv(t)
 	a := e.user("13812345678", true)
 	b := e.user("13900000001", true)
+	c := e.user("13900000002", true)
 	other := e.user("13900000009", true)
-	bid := e.bind(a, b)
 	e.kycCheckFailed(other) // 无关用户的失败不影响
+	e.kycCheckFailed(c)     // 绑定之前的失败与该绑定无关（created_at ≤ bound_at）
+	e.clk.Advance(time.Second)
+	bid := e.bind(a, b)
+	bidC := e.bind(a, c)
+	e.accrueOK(e.pay(c, "ord-c", 6900))
 	e.accrueOK(e.pay(b, "ord-1", 6900))
+	e.clk.Advance(time.Second)
 	e.kycCheckFailed(b)
 	e.clk.Advance(7 * 24 * time.Hour)
-	if n := e.release(); n != 0 || e.reward("ord-1")["status"] != "pending" || e.ledgerSum(a, "referral_rebate") != 0 {
-		t.Fatalf("invitee kyc_check_failed must hold: %v", e.reward("ord-1"))
+	if n := e.release(); n != 1 || e.reward("ord-1")["status"] != "pending" || e.ledgerSum(a, "referral_rebate") != 690 {
+		t.Fatalf("invitee kyc_check_failed must hold ord-1 only: n=%d ord-1=%v", n, e.reward("ord-1"))
+	}
+	if r := e.reward("ord-c"); r["status"] != "settled" || e.autoHoldAudits(bidC) != 0 {
+		t.Fatalf("pre-binding failure must not hold: %v audits=%d", r, e.autoHoldAudits(bidC))
 	}
 	if status, hold, _ := e.bindingRow(b); status != "held" || hold != "kyc_check_failed" || e.autoHoldAudits(bid) != 1 {
 		t.Fatalf("binding = %s %s audits = %d", status, hold, e.autoHoldAudits(bid))

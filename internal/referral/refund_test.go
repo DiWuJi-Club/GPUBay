@@ -411,7 +411,8 @@ func TestCheckInvariantsDetectsViolations(t *testing.T) {
 		{"inv4 event kind", `UPDATE referral_events SET kind = 'settle' WHERE kind = 'accrue' AND order_id = 'ord-2'`},
 		{"inv6 reward formula", `UPDATE referral_rewards SET reward = reward - 1 WHERE order_id = 'ord-2'`},
 		{"inv6 reward formula", `UPDATE referral_rewards SET reward_cap = 1 WHERE order_id = 'ord-2'`},
-		{"inv6 reward formula", `UPDATE referral_rewards SET refunded_amount = 0 WHERE order_id = 'ord-1'`},
+		{"inv6 reward formula", `UPDATE referral_rewards SET rate_bp = rate_bp - 1 WHERE order_id = 'ord-2'`},
+		{"inv6 reward formula", `UPDATE referral_rewards SET reward_cap = reward - 1 WHERE order_id = 'ord-1'`},
 		{"inv5 per-invitee", `UPDATE referral_rate_versions SET max_per_invitee = 1`},
 		{"inv5 per-inviter", `UPDATE referral_rate_versions SET max_per_inviter_30d = 1`},
 	} {
@@ -431,6 +432,10 @@ func TestCheckInvariantsDetectsViolations(t *testing.T) {
 		}
 		if err == nil || !strings.Contains(err.Error(), c.name) {
 			t.Errorf("%s: want violation %q, got %v", c.sql, c.name, err)
+		}
+		// inv6 的变异只破坏公式本身：不得连带触发其它不变量（否则测不出 inv6 是否单独生效）
+		if err != nil && strings.HasPrefix(c.name, "inv6") && strings.Count(err.Error(), "\n") != strings.Count(err.Error(), "\ninv6") {
+			t.Errorf("%s: inv6 mutation must trip only inv6, got %v", c.sql, err)
 		}
 	}
 	e.invariantsOK()
