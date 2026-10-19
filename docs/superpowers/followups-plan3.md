@@ -18,7 +18,6 @@
 - 公开端口是无鉴权的公网 HTTP 服务：使用条款 / 禁止事项由负责人决定（不进代码）；后台处置手段是强制私有、删端口、封禁用户。
 - `SPARK_SECRET_KEY` 轮换：CA 私钥与网关主机密钥都不可解密，平台启动直接失败（不自动重新生成）；恢复步骤见 README「部署注意」（终审 M-1）。
 - 后台若经反向代理暴露到兄弟子域，设置 `SPARK_ADMIN_PUBLIC_BASE_URL`，否则浏览器带 `Origin` 的写请求全部被拒；staging / prod 未设置时启动日志有 WARN（终审 M-5）。
-- 机器失联时 Web 长连接（JupyterLab 终端 / 内核 WebSocket）不断开：终审 I-1 修复后只有单元测试，真机验收 §10.4.10 只验证过 SSH 会话与新请求 503，上线前补测一次。
 - prod 一定要显式设置 `SPARK_PUBLIC_BASE_URL`（https）：代码在为空时会按 `SPARK_HTTP_ADDR` 的端口推导（compose 下会得到 `:8443`，对外是 443），README 写的是「prod 必填」（Task 5 审查）。
 
 ## 规格列出的遗留（本计划不做）

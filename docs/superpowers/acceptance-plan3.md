@@ -76,7 +76,8 @@
 - 保持一个会话（每 20 秒输出一次时间），然后 `sudo systemctl stop spark-agent`。
 - 约 5 分钟后实例暂停（`suspended_at` 非空），**已有会话一直在输出**（裁定 5）。新连接显示 Banner「实例所在机器暂时失联，计时已暂停，请稍后重试」。
 - `sudo systemctl start spark-agent` 后暂停解除，新连接恢复，旧会话仍在。
-- 补记（终审 I-1）：本项只验证了 SSH 会话与 Web 新请求 503。当时 Web 入口会在暂停后撤销已有 WebSocket / SSE 并丢弃上游连接池，违反裁定 5；终审修复后由单元测试覆盖（`TestWebSocketSurvivesSuspend`、`TestPoolKeepIgnoresSuspend`），真机复测列入 followups。
+- 补记（终审 I-1）：本项最初只验证了 SSH 会话与 Web 新请求 503。当时 Web 入口会在暂停后撤销已有 WebSocket / SSE 并丢弃上游连接池，违反裁定 5；终审修复后由单元测试覆盖（`TestWebSocketSurvivesSuspend`、`TestPoolKeepIgnoresSuspend`）。
+- 真机复测（终审 I-1 修复后）——通过：实例 `ins-2fa3pbns`，私有端口 8000 上保持一条 SSE 流。12:43:03 停止 `spark-agent`，12:48:58 实例暂停；SSE 流在暂停期间持续接收（一直到第 81 个 tick），0 错误。暂停期间对该端口的新请求返回 503「暂时无法访问」。重新启动 Agent 后实例恢复。
 
 ### 9. 隔离未削弱（§10.4.11）——通过
 

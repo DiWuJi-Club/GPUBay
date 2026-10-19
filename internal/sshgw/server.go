@@ -30,7 +30,8 @@ const (
 	limiterSweepEvery = time.Minute
 	acceptBackoffMin  = 5 * time.Millisecond
 	acceptBackoffMax  = time.Second
-	maxUnauthConns    = 256
+	maxUnauthConns    = 1024
+	maxUnauthPerIP    = 8
 	unauthWarnEvery   = time.Minute
 )
 
@@ -58,7 +59,8 @@ type Config struct {
 	UpstreamTimeout        time.Duration // 0 → 10s：拨上游 TCP + SSH 握手的总时限
 	MaxSessionsPerInstance int           // 0 → 16
 	MaxConnsPerIP          int           // 0 → 32
-	MaxUnauthConns         int           // 0 → 256：全进程握手中（未认证）连接上限，超出直接关闭（同 OpenSSH MaxStartups 的兜底）
+	MaxUnauthConns         int           // 0 → 1024：全进程握手中（未认证）连接上限，超出直接关闭（同 OpenSSH MaxStartups 的兜底）
+	MaxUnauthConnsPerIP    int           // 0 → 8：每个来源 IP（IPv6 按 /64）握手中连接上限；DisableRateLimits 时不限
 	DrainTimeout           time.Duration // 0 → 30s
 	KeepaliveInterval      time.Duration // 0 → 60s；测试调短（必须经 Config 传入，Serve 之后不可改）
 	KeepaliveTimeout       time.Duration // 0 → 15s
@@ -154,7 +156,9 @@ type Server struct {
 	wg              sync.WaitGroup
 	hostkeysDropped atomic.Int64
 	unauth          atomic.Int64 // 握手中的连接数
-	unauthWarned    atomic.Int64 // 上次「握手中连接已满」告警的 UnixNano（节流）
+	unauthMu        sync.Mutex
+	unauthPerIP     map[string]int // ipKey → 握手中的连接数
+	unauthWarned    atomic.Int64   // 上次「握手中连接已满」告警的 UnixNano（节流）
 }
 
 func New(cfg Config, d Deps) (*Server, error) {
@@ -169,6 +173,9 @@ func New(cfg Config, d Deps) (*Server, error) {
 	}
 	if cfg.MaxUnauthConns <= 0 {
 		cfg.MaxUnauthConns = maxUnauthConns
+	}
+	if cfg.MaxUnauthConnsPerIP <= 0 {
+		cfg.MaxUnauthConnsPerIP = maxUnauthPerIP
 	}
 	if cfg.MaxSessionsPerInstance <= 0 {
 		cfg.MaxSessionsPerInstance = 16
@@ -185,7 +192,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 	if cfg.KeepaliveTimeout <= 0 {
 		cfg.KeepaliveTimeout = keepaliveTimeout
 	}
-	s := &Server{cfg: cfg, d: d, sessions: map[*session]struct{}{}, conns: map[net.Conn]struct{}{}, perInstance: map[string]int{}, lastUnreach: map[string]time.Time{}}
+	s := &Server{cfg: cfg, d: d, sessions: map[*session]struct{}{}, conns: map[net.Conn]struct{}{}, perInstance: map[string]int{}, lastUnreach: map[string]time.Time{}, unauthPerIP: map[string]int{}}
 	s.lim = newLimiter(d.Clock, cfg.DisableRateLimits, cfg.MaxConnsPerIP)
 	s.sshCfg = &ssh.ServerConfig{
 		ServerVersion:     serverVersion,
@@ -302,15 +309,13 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	defer s.wg.Done()
 	defer s.trackConn(nc, false)
 	ip := remoteIP(nc.RemoteAddr())
-	// 全进程握手中连接上限：超出直接关闭，不计暴力破解失败（还没有任何认证尝试）
-	if s.unauth.Add(1) > int64(s.cfg.MaxUnauthConns) {
-		s.unauth.Add(-1)
+	// 握手中连接上限（全进程 + 按 IP）：超出直接关闭，不计暴力破解失败（还没有任何认证尝试）
+	if !s.acquireUnauth(ip) {
 		nc.Close()
-		s.warnUnauthFull()
 		return
 	}
 	if !s.lim.acquireConn(ip) {
-		s.unauth.Add(-1)
+		s.releaseUnauth(ip)
 		nc.Close()
 		return
 	}
@@ -322,7 +327,7 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	nc.SetDeadline(time.Now().Add(handshakeTimeout))
 	down, chans, reqs, err := ssh.NewServerConn(nc, s.sshCfg)
 	att.dropCache()
-	s.unauth.Add(-1) // 握手结束（成功或失败）：已认证会话不占名额
+	s.releaseUnauth(ip) // 握手结束（成功或失败）：已认证会话不占名额
 	if err != nil {
 		nc.Close()
 		att.mu.Lock()
@@ -336,6 +341,42 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	nc.SetDeadline(time.Time{})
 	defer down.Close()
 	s.serve(ctx, down, chans, reqs, ip)
+}
+
+// acquireUnauth 占一个握手名额：全进程不超过 MaxUnauthConns，同一来源 IP（/64）不超过 MaxUnauthConnsPerIP。
+func (s *Server) acquireUnauth(ip string) bool {
+	if s.unauth.Add(1) > int64(s.cfg.MaxUnauthConns) {
+		s.unauth.Add(-1)
+		s.warnUnauthFull()
+		return false
+	}
+	if s.cfg.DisableRateLimits {
+		return true
+	}
+	k := ipKey(ip)
+	s.unauthMu.Lock()
+	defer s.unauthMu.Unlock()
+	if s.unauthPerIP[k] >= s.cfg.MaxUnauthConnsPerIP {
+		s.unauth.Add(-1)
+		return false
+	}
+	s.unauthPerIP[k]++
+	return true
+}
+
+func (s *Server) releaseUnauth(ip string) {
+	s.unauth.Add(-1)
+	if s.cfg.DisableRateLimits {
+		return
+	}
+	k := ipKey(ip)
+	s.unauthMu.Lock()
+	defer s.unauthMu.Unlock()
+	if s.unauthPerIP[k] <= 1 {
+		delete(s.unauthPerIP, k)
+	} else {
+		s.unauthPerIP[k]--
+	}
 }
 
 // warnUnauthFull 记录握手中连接已满（每分钟最多一条，避免被洪泛刷屏）。

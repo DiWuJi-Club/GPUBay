@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -441,5 +442,70 @@ func TestUnauthConnCap(t *testing.T) {
 	}
 	if !strings.Contains(e.logs.String(), "ssh unauthenticated connection limit reached") {
 		t.Fatal("no warning logged when cap reached")
+	}
+}
+
+// fakeIPListener 把接受的连接的远端 IP 换成 ip（端口保留，pending 键仍唯一）。
+type fakeIPListener struct {
+	net.Listener
+	mu sync.Mutex
+	ip string
+}
+
+func (l *fakeIPListener) set(ip string) { l.mu.Lock(); l.ip = ip; l.mu.Unlock() }
+
+func (l *fakeIPListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	port := c.RemoteAddr().(*net.TCPAddr).Port
+	return &fakeIPConn{Conn: c, addr: &net.TCPAddr{IP: net.ParseIP(l.ip), Port: port}}, nil
+}
+
+type fakeIPConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c *fakeIPConn) RemoteAddr() net.Addr { return c.addr }
+
+// N-1：每个来源 IP（IPv6 按 /64）握手中连接上限；超出立即关闭、不计失败，其它 IP 不受影响。
+func TestUnauthConnCapPerIP(t *testing.T) {
+	fl := &fakeIPListener{}
+	e := newEnvLis(t, nil, func(l net.Listener) net.Listener { fl.Listener = l; return fl })
+	dialFrom := func(ip string, want int64) net.Conn {
+		t.Helper()
+		fl.set(ip)
+		nc, err := net.Dial("tcp", e.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { nc.Close() })
+		if want > 0 {
+			waitFor(t, "connection in handshake", func() bool { return sshgw.UnauthForTest(e.srv) == want })
+		}
+		return nc
+	}
+	// 同一 /64 内不同地址共用名额（默认 8）
+	for i := 1; i <= 8; i++ {
+		dialFrom(fmt.Sprintf("2001:db8::%d", i), int64(i))
+	}
+	over := dialFrom("2001:db8::9", 0)
+	over.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := over.Read(make([]byte, 64)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("9th in-handshake connection from the same /64 not closed: n=%d err=%v", n, err)
+	}
+	if got := sshgw.FailCountForTest(e.srv, "2001:db8::9"); got != 0 {
+		t.Fatalf("per-IP cap counted as auth failure: %d", got)
+	}
+	// 其它 /64：照常握手（收到服务端版本串）
+	other := dialFrom("2001:db8:0:1::1", 9)
+	other.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len("SSH-2.0-"))
+	if _, err := io.ReadFull(other, buf); err != nil || string(buf) != "SSH-2.0-" {
+		t.Fatalf("other IP affected: %q %v", buf, err)
 	}
 }
