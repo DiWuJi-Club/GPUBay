@@ -6,8 +6,8 @@
 - ✅ 计划 2 已处理：`agent_commands.status = 'sent'` 与 `attempts` 由网关认领时写入（`fleet.ClaimPending`）。
 - ✅ 计划 2 已处理：迟到回报被 `CompleteCommand` 忽略，副作用由 StateReport 对账清理（孤儿 wipe 失败单独告警 `orphan_wipe_failed`）。
 - ✅ 计划 2 已处理：心跳恢复不再直接 `ResumeMachine`，改为收到 StateReport 后按容器状态恢复（`ResumeMachine(ctx, machineID, runningIDs)`）。
-- 机器失联期间 `machine_leases` 上界不随时间推进；档期预订上线前需在清扫对账中刷新。（保留，归子项目 2）
-- `occupiedUntil` 在状态不一致时回退为 `now`，可能产生空时段；建议加 1µs 下限或改为报错。（保留）
+- ✅ 计划 6 已处理：机器失联期间 `machine_leases` 上界不随时间推进；档期预订上线前需在清扫对账中刷新。（清扫任务 `RefreshCappedLeases` 每轮对暂停 / 停机 / 洗机中的实例刷新上界，并封顶在下一条预订之前）
+- ✅ 计划 6 已处理：`occupiedUntil` 在状态不一致时回退为 `now`，可能产生空时段；建议加 1µs 下限或改为报错。（约束 `machine_leases_period_nonempty` + `occupiedUntil ≥ now + 1s`，上界至少 `lower + 1s`）
 - ✅ 计划 2 已处理：「容器正常才恢复计时」由 StateReport + `ResumeMachine` 实现。
 
 ## 计划 4（管理后台 / 阿里云插件）必须处理

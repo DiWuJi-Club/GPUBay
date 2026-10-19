@@ -210,11 +210,11 @@ ORDER BY
   (SELECT max(upper(l.period)) FROM machine_leases l            -- 最紧贴前一档期的机器优先（减少碎片）
      WHERE l.machine_id = m.id AND l.status IN ('reserved','active','ended') AND upper(l.period) <= lower($4)) DESC NULLS LAST,
   m.id
-LIMIT $5 FOR UPDATE OF m SKIP LOCKED
+LIMIT $5 FOR NO KEY UPDATE OF m SKIP LOCKED   -- 不能用 FOR UPDATE：插入引用 machines(id) 的行会取 FOR KEY SHARE，与 FOR UPDATE 互斥（计划评审 M1）
 ```
 
 - 预订允许候选 `allocated`（现租户会在时段开始前结束，由 lease 判断）与离线机器（开通时再看在线）；即时订单要求 `idle AND agent_online`（与现状一致）。`maintenance / faulty` 一律不是候选。
-- 挑出的机器行已加锁（按查询顺序取锁，机器 ID 不保证递增；但同一事务对每台机器只锁一次且 `SKIP LOCKED`，两个并发批次不会互相等待——它们要么跳过对方锁住的机器，要么拿到不同机器；详见 §14）。
+- 挑出的机器行已加锁（按查询顺序取锁，机器 ID 不保证递增；但同一事务对每台机器只锁一次且 `SKIP LOCKED`，两个并发批次不会互相等待——它们要么跳过对方锁住的机器，要么拿到不同机器；详见 §14）。跳过被锁行导致挑到的台数不足时，短暂退避（20～80ms 抖动）后重挑，一次分配最多 3 次（实施中裁定：否则并发下单时空闲机器只是被别的事务短暂锁住，也会报假的 `no_capacity`）。
 - 对每台候选机器：`SAVEPOINT` → 插入实例行 → 插入 lease（`reserved` 或 `active`）→ 若排他约束冲突（并发事务刚提交了重叠时段，`NOT EXISTS` 没看到）→ `ROLLBACK TO SAVEPOINT`，记为失败并从候选里剔除。候选不够 `want` 台时再用同一查询补取（`LIMIT 剩余台数`，排除已试过的 ID），最多补取 3 轮；仍不足 → 整个事务回滚，`no_capacity`（消息带可用台数：`该时段只有 X 台可用`）。
 - 即时订单同时 `UPDATE machines SET state='allocated'`（现 `fleet.Allocate` 的后半段）；预订不改机器状态。`fleet.Allocate` 改为调用 `rental.pickMachines` 的即时分支（`AdminMigrate` 继续用它，period 为 `[now, now + 剩余 + Tail)`），不再有「不看 lease」的分配路径。
 
@@ -228,8 +228,8 @@ cap     = (SELECT min(lower(period)) FROM machine_leases WHERE machine_id = inst
 upper   = GREATEST(lower(own.period) + 1s, LEAST(desired, cap))     -- cap 为 NULL 时不封顶
 ```
 
-- 因此 `refreshLease` **不再可能**撞排他约束（上界永远不越过下一条预订）；`ErrNoCapacity` 分支删除。
-- 新清扫任务 `RefreshCappedLeases`：对 `running AND suspended_at IS NOT NULL`、`stopped` 与 `wiping` 的实例每轮 `refreshLease`（`wiping` 的 `occupiedUntil = now + WipeBuffer` 只在 `beginWipe` 写过一次，机器离线、Wipe 一直 pending 时上界 1 小时就「过期」，之后的预订会把它当空闲挑走，开通时再改派——徒增 `booking_at_risk`）（失联的实例剩余时长冻结，上界必须随时间推进才能继续挡住后来的预订——这就是计划 1 遗留的「失联期间上界不随时间推进」）。每轮最多 200 行，按 `updated_at` 轮转。
+- 上界不越过已提交的下一条预订。唯一的例外是并发：`cap` 按语句快照计算，另一个事务正在插入、尚未提交的预订看不到，UPDATE 会等它提交后撞排他约束。所以 UPDATE 放在保存点里（`updateLeaseCapped`），撞约束时回滚保存点**重试一次**（新语句的快照能看到已提交的预订，封顶生效）；仍冲突才返回 `ErrNoCapacity`（实施中修订，计划 6 Task 2 评审）。结果与现值相同时不写。
+- 新清扫任务 `RefreshCappedLeases`：对 `running AND suspended_at IS NOT NULL`、`stopped` 与 `wiping` 的实例每轮 `refreshLease`（`wiping` 的 `occupiedUntil = now + WipeBuffer` 只在 `beginWipe` 写过一次，机器离线、Wipe 一直 pending 时上界 1 小时就「过期」，之后的预订会把它当空闲挑走，开通时再改派——徒增 `booking_at_risk`）（失联的实例剩余时长冻结，上界必须随时间推进才能继续挡住后来的预订——这就是计划 1 遗留的「失联期间上界不随时间推进」）。每轮最多 200 行，按 `updated_at` 轮转：处理完把实例的 `updated_at` 推到 `now`（仅当更早时），否则候选超过一批时总是同一批最旧的行被处理。因此对 `stopped` / `wiping` / 暂停中的实例，`instances.updated_at` 是清扫轮转游标，不代表「最近一次业务变更」。
 - `reserved` 与「预订的 creating」实例的 lease 不由 `refreshLease` 改写（时段在下单时定死；开通时只改 `status`）。`occupiedUntil` 对这两种情况直接返回现有 `upper`。
 
 ### 4.4 可用性与日历查询（只读）
@@ -254,7 +254,7 @@ reserved ──(开通时刻, 机器可用)──▶ creating ──▶ running 
 ### 5.2 开通（清扫任务 `ProvisionDue`）
 每轮取 `state='reserved' AND scheduled_start_at <= $1`（`$1 = now + PrepLead`，谓词不对列做运算，能走 `instances_reserved_idx`），逐个独立事务（`sweepEach` 模式）：
 
-1. 锁实例（`SKIP LOCKED` 复核谓词）→ 锁自己的 reserved lease 行 → 锁机器行（`SELECT … FOR UPDATE`；顺序 instance → lease → machine 与 `AdminMigrate` 的 instance → machine 一致）。
+1. 锁实例（`SKIP LOCKED` 复核谓词）→ 锁自己的 reserved lease 行 → 锁机器行（`SELECT … FOR NO KEY UPDATE`；顺序 instance → lease → machine 与 `AdminMigrate` 的 instance → machine 一致）。
 2. 先复核 `Users.CanRent(user_id)`：用户已被封禁或实名被撤销 → 按 §5.5 第 3 种平台取消（全额退款），事件 `"cancelled: user cannot rent"`，不再往下走。然后机器可用判定：`state='idle' AND agent_online AND NOT EXISTS 活动实例（creating/running/stopped/wiping）`。
 3. 可用 → `machines.state='allocated'`，实例 `state='creating'`（`created_at` 不变，新增 `provisioned_at = now` 用于开通超时判定，见下），lease `status='active'`，事件 `reserved → creating "scheduled start <S>"`，`Enqueue CreateInstance{image_ref}`。
 4. 不可用 → 改派（§5.4）。
@@ -385,7 +385,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 |---|---|
 | 即时租用 | 走 `PlaceBatch` 即时分支：候选只要 `idle AND agent_online` 且 `[now, now+D+Tail)` 无重叠；一台机器若在 D+7h 内有预订就不会被分给这单（用户看到的 `idle_count` 改为「此刻可即时租用」= 同一查询的 count，而不是单纯 idle 台数） |
 | 维护模式 | 进入维护只允许 `idle / faulty`（现状）；机器上有未开通预订时后台提示（B12），预订在开通时改派。结束维护的检查不变 |
-| 换机（`AdminMigrate`） | 新机器用 §4.2 即时分支（period 与 `openLease` 对 creating 的估算一致：`[now, now + CreateTimeout + 剩余 + Tail)`），不会挑到放不下的机器；新实例**复制** `auto_renew`、`auto_renew_duration`、`group_id`（`batch_id` 不复制，`scheduled_*` / `provisioned_at` 为 NULL），否则用户开了自动续费换一次机就静默失效；旧实例 lease 由 `beginWipe → refreshLease` 处理（上界封顶）。预订实例不可换机（§5.6） |
+| 换机（`AdminMigrate`） | 新机器用 §4.2 即时分支（period 与 `openLease` 对 creating 的估算一致：`[now, now + CreateTimeout + 剩余 + Tail)`），不会挑到放不下的机器；新实例**复制** `auto_renew`、`auto_renew_duration`（否则用户开了自动续费换一次机就静默失效）；`group_id` 取**新机器的机组**（实施中裁定，见 `followups-plan6.md`：展示名与机组保持一致，删除机组的检查也以实际机器为准）；`batch_id` 不复制，`scheduled_*` / `provisioned_at` 为 NULL；旧实例 lease 由 `beginWipe → refreshLease` 处理（上界封顶）。预订实例不可换机（§5.6） |
 | 机器失联（暂停） | 上界每轮推进并封顶（§4.3）；若封顶导致到预订开通时刻机器仍被占 → 预订改派，老租户不动（第 11 条决策） |
 | 到期停机 + 6h 保留 | 尾段已计入时段；停机期间续费受 §7.1 约束（用户若想续但被挡 → 控制台提示可续至，或等数据保留结束） |
 | 用户释放（不退款） | 不变；释放后 `beginWipe` 上界封顶为洗机估算 |
@@ -449,7 +449,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 | GET | `/bookings?state=&user_id=&group_id=&machine_id=&from=&to=&page=` | all | 预订列表（`state ∈ reserved / cancelled`，默认 reserved）：实例 ID、用户、机组、机器、开始、结束、批次、改派次数、下单时间 |
 | GET | `/bookings/upcoming?days=7` | all | 仪表盘用：未来 N 天每天开始的预订台数 |
 | POST | `/instances/{id}/cancel-booking` | ops + TOTP | `{reason, totp}` → `{refunded}`；审计 `booking.admin_cancel` |
-| POST | `/instances/{id}/reassign` | ops | `{machine_id?, reason}`：指定目标机器（须在候选集内，否则 `machine_unavailable`）或自动挑选；仅 `reserved`；审计 `booking.reassign` |
+| POST | `/instances/{id}/reassign` | ops | `{machine_id?, reason}`：指定目标机器（须在候选集内，否则 `machine_unavailable`；实例 `group_id` 改为目标机器的机组，之后的自动改派以新机组为准——实施中裁定）或自动挑选；仅 `reserved`；审计 `booking.reassign` |
 | GET | `/instances/{id}` | all | 响应 `instance` 新增 §10.1 的预订 / 自动续费字段，`orders[]` 带 `quantity / batch_id / auto` |
 | GET | `/dashboard` | all | 新增 `bookings_upcoming_7d`、`instances.reserved`（状态计数自然包含） |
 | GET | `/orders` | finance | 筛选新增 `batch_id`；CSV 列新增 |
@@ -525,8 +525,8 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
   | 路径 | 顺序 | 等待点 |
   |---|---|---|
   | PlaceBatch | idem 咨询锁 → [booking:<user> 咨询锁] → machines（`SKIP LOCKED`）→ 插实例 / lease → orders → wallet | 插 lease 可能等待别的事务**未提交的 lease 增长** |
-  | ProvisionDue | instance → 自己的 lease → machine（`FOR UPDATE` 等待）→ [改派：machines `SKIP LOCKED`] → agent_commands | 等批次 / 心跳短暂持有的机器锁 |
-  | 后台改派 | instance → lease → machines（`SKIP LOCKED`） | 同上 |
+  | ProvisionDue | instance → 自己的 lease → machine（`FOR NO KEY UPDATE` 等待）→ [改派：machines `SKIP LOCKED`] → agent_commands | 等批次 / 心跳短暂持有的机器锁 |
+  | 后台改派 | instance → lease → machines（自动挑选 `SKIP LOCKED`；指定机器 `FOR NO KEY UPDATE` 等待该行，实施中修订） | 同上 |
   | Renew / AdminExtend / 自动续费 | [idem] → instance → 自己的 lease（读 cap）→ orders → wallet → 更新 lease | 不锁机器 |
   | 取消 | instance → lease → orders → wallet | — |
   | HandleCommandResult | instance → agent_commands → lease（`refreshLease`，收缩或等长）→ machine（`Fleet.Release`） | Release 等机器锁 |
@@ -561,7 +561,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 - 迁移：Up / Down 往返；Down 对 reserved 实例的降级。
 - `api` / `adminapi`：路由、角色矩阵（`permissions_test.go`）、错误码、TOTP 要求、`idle_count` 语义、`booking_too_soon` 的 5 分钟容差、`duplicate_display_name`。
 - `sshgw` / `ingress` / `rental.ListIngressRoutes`：reserved 实例的 Banner 与 503 页文案各一条断言（含 `<S>` 的 Asia/Shanghai 格式）、路由表含 reserved 实例的端口、cancelled 实例 410 与会话断开。
-- `rental/migrate`：换机复制自动续费与机组；`PlaceBatch` / `reassign` 遇 40P01 / 40001 重试一次。
+- `rental/migrate`：换机复制自动续费，`group_id` 取新机器的机组；`PlaceBatch` / `reassign` 遇 40P01 / 40001 重试一次。
 
 ### 16.2 集成（Go，进程内 fake Agent，`internal/app`）
 - 10 台机器、50 个 goroutine 并发提交随机窗口 / 数量（1～8）的批次 → 事后一致性检查（§14）全部成立、没有部分批次、没有死锁（测试超时 60s）。

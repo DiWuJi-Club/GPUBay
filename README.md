@@ -137,6 +137,9 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
   同一用户用同一个键重复提交（双击、超时重试）只会扣款一次，并返回首次创建的订单（下单还会返回该实例的当前状态）；
   同一个键被用于不同类型的请求或续费不同实例时返回 409 `idempotency_conflict`。客户端应为每次「新操作」生成新的键（如 UUID）。
   **幂等键按「意图」使用**：重放同一个键时服务器不看请求体，直接返回首次的结果——改了时长、数量、机器等参数后重新提交必须换新键，否则拿到的是旧请求的结果。
+  键不能包含 `#`（400「幂等键不能包含 #」）：`POST /bookings` 的批次子订单键是 `<key>#<n>`。
+- `GET /api/v1/products` 的 `idle_count` 是「此刻可即时租用 1 天」的台数（排除未来时段已被预订挡住的机器），比后台「空闲」台数少是正常的。
+- 预订参数（最早 2 小时后、最多提前 60 天、单次 ≤ 90 天、一单 ≤ 8 台、每用户未开通预订 ≤ 16 台、取消退款档位、自动续费提前量等）是 `internal/rental/booking.go` 里的常量，不做配置；预订开始时刻、日历按天统计与短信 / 页面里的时间一律按 `Asia/Shanghai`（`internal/platform/tz`），不随服务器时区变化。
 - `GET /api/v1/kyc` 返回用户最近一条实名记录（含驳回原因），没有记录时 `record` 为 `null`；个人姓名只保留首字。
 - 实例视图含 `product_name`、`image_name`（镜像停用后仍返回名称）；充值单视图含 `remaining_seconds`（服务器计算的剩余支付秒数）。
 - 后台 `GET /admin/api/v1/products`、`GET /admin/api/v1/images` 对全部角色可读；`GET /admin/api/v1/audit` 每条含 `actor_name`。
