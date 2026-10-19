@@ -25,6 +25,7 @@
 - 通知：只有短信（`sms.Sender`，模板 `login_code / expiry_reminder / auto_renew_failed / booking_cancelled`，aliyun 驱动要求全部模板编号配置齐全）。没有站内信。
 - e2e：Playwright 单 worker、假时钟；钩子 `/hooks/users {phone?, verified, balance, ledger_rows}`、`/hooks/kyc {reject}`、`/hooks/sweep`、`/hooks/admins`、`/hooks/clock/advance`。覆盖表前缀已有 `C-AUTH / C-ACC / C-WAL / A-USR / A-FIN` 等。
 - 迁移编号到 `00019_booking.sql`；本计划是 `00020_referral.sql`（带 `+goose Down`）。
+  - **实施注（2026-10-20）**：计划 7 先合并并占用 `00020`，本计划的迁移实际是 `migrations/00021_referral.sql`；本文其余处的「迁移 00020」均指这个文件。合并前须先合入含计划 7 的 `main` 并核对编号（goose 不接受乱序）。
 - 配置：`SPARK_PUBLIC_BASE_URL`（控制台对外地址，形如 `https://域名`）、`SPARK_SECRET_KEY`（`secretbox`，可派生 HMAC 密钥）。
 
 **竞品做法（国内 GPU 云常见）**：邀请链接 / 邀请码；被邀请人注册即绑定、终身或 6～12 个月有效；返利 = 被邀请人实际消费的 5%～15%，退款扣回；返利进不可提现余额，用于抵扣租用；绑定后的被邀请人在邀请人页面显示脱敏手机号；后台有冻结与黑名单。
@@ -93,7 +94,7 @@
 | R13 | 返利流水在用户钱包页按「邀请返利 / 返利扣回」展示，备注写被邀请人脱敏手机号与订单号 | 用户要能对账 |
 | R14 | 费率版本的 `effective_from` 必须 ≥ 提交时刻（不能追溯生效）；首个版本由迁移写入（R1～R3、R5 的默认值） | 追溯生效会改变已发放返利的口径 |
 
-## 2. 数据模型（迁移 `00020_referral.sql`，带 `+goose Down`）
+## 2. 数据模型（迁移 `00020_referral.sql`，带 `+goose Down`；实际文件 `00021_referral.sql`，见 §0 实施注）
 
 ```sql
 -- 费率版本（只增不改）
@@ -182,7 +183,7 @@ CREATE TABLE referral_events (
     binding_id       BIGINT NOT NULL REFERENCES referral_bindings (id),
     kind             TEXT NOT NULL CHECK (kind IN ('accrue', 'refund', 'settle', 'clawback', 'debt_add', 'debt_offset', 'void', 'capped')),
     source_ledger_id BIGINT,                                              -- accrue / refund 来自哪条 wallet_ledger
-    wallet_ledger_id BIGINT,                                              -- settle / clawback / debt_offset 写出的 wallet_ledger
+    wallet_ledger_id BIGINT,                                              -- settle / clawback 写出的 wallet_ledger（debt_offset 不写钱包流水，§4.4）
     amount           BIGINT NOT NULL,
     detail           TEXT NOT NULL DEFAULT '',
     created_at       TIMESTAMPTZ NOT NULL
@@ -289,17 +290,23 @@ INSERT referral_rewards(order_id, …, order_amount=base, rate_bp, reward_cap=ca
 INSERT referral_events(accrue, source_ledger_id=l.id, amount=cap, detail=raw/room 明细)
 cap < raw → 另记事件 capped(amount = raw − cap)
 ```
-- `OrderLookup` 是 rental 提供的只读接口 `OrderForReferral(ctx, q, orderID) (userID int64, scheduledStartAt *time.Time, err error)`（读 `orders JOIN instances`）；订单不存在（理论上不可能）→ 本行记错误日志、跳过，不写事件（下轮重试）。
+- `OrderLookup` 是 rental 提供的只读接口 `OrderForReferral(ctx, q, orderID) (userID int64, scheduledStartAt *time.Time, err error)`（读 `orders JOIN instances`）；订单不存在（理论上不可能）→ 本行记错误日志、跳过，不写事件（下轮重试）。**实施后**：查不到 / 订单不属于付款人时，流水在 `SkipGrace`（24h）内按暂时跳过（钉住水位、每轮重试）；过了 `SkipGrace` 视为永久，写 `void` 占位事件（`source_ledger_id` = 该流水），不再钉住水位，之后该订单的退款走 §4.3 的「无 reward」占位。
 - 并发：同一邀请人的两笔计提同时算 `room_inviter` 会双花上限 → 计提事务先 `SELECT … FROM referral_accounts WHERE user_id = inviter FOR UPDATE`（邀请人必有账户行，因为有码才有绑定）。锁顺序统一为 `users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → [幂等复查] → referral_rewards(订单) → wallet_accounts(邀请人)`（§14）：`users` 须先于账户显式加锁（插 `referral_rewards` / `wallet_ledger` 的外键检查会对 `users` 取 `KEY SHARE`，放在账户锁之后就与实名事务的 users → accounts 反向）；「该流水是否已处理」在拿到账户锁之后复查（并发处理同一行的后来者看到已处理即返回，不撞唯一约束），绑定状态 / 返利期也在锁后读。退款处理（§4.3）同一顺序。
 - 30 天上限按「发放净额 + 待发放」占用，是保守口径：待发放最终可能因退款变小，空出的额度下次计提时自然可用。
 
 ### 4.3 退款（处理一条 `refund` 流水 `l`，`ref_type='order'`）
 ```
 order := strip(l.ref_id, "-r<n>")
-r := referral_rewards[order]（FOR UPDATE，先锁 referral_accounts(邀请人)）；不存在 → 事件不写、返回（此订单无返利）
-r.refunded_amount += l.amount（受 CHECK ≤ order_amount 兜底）
-target := min(r.reward_cap, floor((order_amount − refunded_amount) × rate_bp / 10000))
-事件 refund(source_ledger_id=l.id, amount = r.reward − target)
+if referral_rewards[order] 不存在:                         -- 实施后的占位 / 延后规则（退款可能先于计提落地）
+  if 该订单已有 capped(period_over) / void(binding revoked 或永久跳过) 占位事件:
+    加锁（同下）→ 事件 refund(source_ledger_id=l.id, amount=0, detail='no reward')，返回
+  if now − l.created_at < SkipGrace(24h): 本轮跳过（不写事件，钉住水位，下轮再试），返回
+  if 被绑定用户的该订单 order_pay 流水存在（还没处理完）: 继续跳过（记 Error；扣款行自己钉住水位并触发 stuck 告警），返回
+  加锁（同下）→ 事件 refund(amount=0, detail='no order_pay') 占位，返回
+锁：users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → 复查该流水是否已处理 → r := referral_rewards[order] FOR UPDATE（锁后重读）
+r.refunded_amount += l.amount（超过 order_amount 时记 Error 并截到 order_amount；CHECK 兜底）
+target := min(r.reward_cap, floor((order_amount − refunded_amount) × rate_bp / 10000))   -- 用行内存的 rate_bp / reward_cap，不看当前费率版本
+事件 refund(source_ledger_id=l.id, amount = r.reward − target；void 行记 0)
 switch r.status:
   pending: r.reward = target；target == 0 → 保持 pending（到期时按 0 处理为 void）
   settled: excess := (settled_amount − clawed_amount) − target
@@ -312,7 +319,8 @@ switch r.status:
            r.reward = target
   void: 只更新 refunded_amount
 ```
-- `n` = 该订单已有 `clawback` 事件数 + 1（`-c1`、`-c2` …），与 `wallet_ledger_ref_uniq` 一起保证一次退款只扣一次。
+- `n` = 该订单已有 `clawback` 事件数 + 1（`-c1`、`-c2` …），在账户锁内读、本事务内写回；幂等靠 `referral_events.source_ledger_id` 唯一 + 账户锁后的复查（余额为 0 时 `ApplyUpTo` 不写钱包流水，`wallet_ledger_ref_uniq` 兜不住）。
+- Discover 同一批内先处理 `order_pay` 再处理 `refund`（§5.1），同一轮里先扣款后退款的订单不会被延后。
 - **`wallet.ApplyUpTo`（新钱包原语）**：与 `Apply` 相同的锁与记账逻辑，但扣款额取 `min(|amount|, balance)`；`balance = 0` 时不记流水返回 `applied = 0`。单测覆盖（§16.1）。这是本计划对 `wallet` 包唯一的写路径改动。
 
 ### 4.4 发放（`Release`）
@@ -340,10 +348,15 @@ JOIN referral_bindings b ON b.invitee_id = l.user_id          -- 不过滤 statu
 WHERE l.ref_type = 'order' AND l.kind IN ('order_pay', 'refund')
   AND l.created_at >= $watermark - interval '1 hour'
   AND NOT EXISTS (SELECT 1 FROM referral_events e WHERE e.source_ledger_id = l.id)
-ORDER BY l.id LIMIT 500
+  AND ((l.kind = 'refund'), l.id) > ($after_refund, $after_id)   -- 游标
+ORDER BY (l.kind = 'refund'), l.id LIMIT 500                     -- 扣款先于退款
 ```
-- 每行独立事务处理（§4.2 / §4.3）；单行失败只记日志，不影响其他行（下轮因 `NOT EXISTS` 再试）。
-- 水位：本轮取到 **少于 500 行** 时 `watermark = now − 2 分钟`；否则不动（有积压，下轮继续）。1 小时回看 + 2 分钟滞后覆盖「id 小但提交晚」的流水（事务不会活过几秒）；即便漏过，`source_ledger_id` 唯一 + 后台「重扫」（§10.2，把水位拨回 N 天）也能补上，且重扫绝不重复计提。
+- 每行独立事务处理（§4.2 / §4.3；`40P01 / 40001` 重试一次，撞 `referral_events_source_uniq / referral_rewards_pkey` 视为并发已处理）；单行失败只记日志，不影响其他行（下轮因 `NOT EXISTS` 再试）。
+- 翻页（实施后）：按 `((kind = 'refund'), id)` 游标翻页，每页 `ScanBatch`（500）行、每轮最多 10 页；跳过 / 失败的行留在原处，不会挡住后面的新流水。
+- 水位（实施后，裁定 Q5 / Q10）：翻满 10 页仍有下一页（积压）时不动；否则推进到 `LEAST(now − 2 分钟, 本轮被跳过 / 失败行中最早的 created_at)`——跳过与失败的行**钉住水位**，留在之后每轮的回看窗口里，不会在 1 小时回看之后丢掉；永久跳过的行在 `SkipGrace`（24h）后写占位（§4.2 / §4.3），不再钉住。只在水位仍等于本轮读到的值时更新（比较后写），后台「重扫」并发拨回时不被覆盖；重扫把拨回后的水位**显式传入**本次发现，不重读。
+- 卡住告警：水位被钉在 `now − StuckAfter`（`SkipGrace` + 1h = 25h）之前 → `RaiseAlertOnce(referral_scan_stuck)`（未处理前只一条），并记 Error 日志；处理方式是按日志「referral: process ledger failed」修复后在后台重扫。
+- 超时：`Settle` 里发现与发放各有独立超时（1 分钟 / 50 秒，合计小于清扫器给附加任务的 2 分钟），发现慢或失败不会把发放饿死。
+- 1 小时回看 + 2 分钟滞后覆盖「id 小但提交晚」的流水；已知边界：一个写 `order` 流水的事务若开着超过 62 分钟才提交，它的流水可能落在回看窗口之外而漏扫——`source_ledger_id` 唯一 + 后台「重扫」（§10.2，把水位拨回 N 天）能补上，且重扫绝不重复计提。
 - `revoked` 绑定：计提不做；**退款仍要处理**（撤销前已发放的返利，退款时要扣回）——所以 JOIN 不过滤 `revoked`，在 §4.2 里对 `order_pay` 按状态跳过并写事件 `void(detail='binding revoked', source_ledger_id=l.id)` 占位（否则每轮重扫）。
 - 非绑定用户的流水不会被选中（JOIN），不需要占位。
 - 性能：`wallet_ledger_order_scan_idx` + `referral_bindings.invitee_id` 唯一索引；200 台规模下每小时 `order` 流水不过几百条。
@@ -401,7 +414,7 @@ ORDER BY l.id LIMIT 500
 - 顶部卡片：邀请码（大字 + 复制）、链接（复制）、二维码（`qrcode` 生成，可长按保存）、规则摘要（10%、12 个月、7 天后到账、不可提现、上限）。未实名时顶部提示条「实名认证后才能收到返利 → 去实名」。账户冻结时提示条「邀请功能已暂停，如有疑问请联系客服」并隐藏码与链接。
 - 统计条：已邀请人数、已实名人数、待发放、累计已发放（净额）、本月已发放。
 - Tab「被邀请人」：脱敏手机号、注册时间、状态（未实名 / 已实名 / 审核中 / 已失效）、累计贡献返利（分→元）、返利截止日。
-- Tab「返利明细」：时间、被邀请人（脱敏）、订单号、消费金额、返利、状态（待发放 / 已发放 / 已作废；已发放且有扣回时显示「已扣回 ¥X」）。
+- Tab「返利明细」：时间、被邀请人（脱敏）、订单号、消费金额、返利、状态（待发放 / 已发放 / 已作废；已发放且有扣回时显示「已扣回 ¥X」；待发放时显示「预计到账 YYYY-MM-DD HH:mm」，取 `settle_after`，到期后仍受实名 / 冻结 / 搁置门槛约束——验收缺陷 P8-A1 补）。
 - 手机端两 Tab 各自分页（`page_size 20`）。
 
 ### 8.3 其他页面
@@ -434,7 +447,7 @@ ORDER BY l.id LIMIT 500
 | GET | `/referral/codes/{code}` | 匿名，限流 60/min/IP → `{valid, inviter}` |
 | GET | `/referral/me` | 需登录；**懒生成**码；→ `{code, link, status, kyc_verified, rebate: {rate_bp, period_days, hold_days, max_per_invitee, max_per_inviter_30d}, stats: {invitees, verified_invitees, pending, settled_net, month_settled, debt}}` |
 | GET | `/referral/invitees?page=` | `{items:[{phone_masked, bound_at, status, kyc_verified, contributed, rebate_until}], total}`；`status` 映射：active→`有效`、held→`审核中`、revoked→`已失效` |
-| GET | `/referral/rewards?page=&status=` | `{items:[{order_id, invitee_masked, paid_at, order_amount, refunded_amount, reward, status, settled_at, clawed_amount}], total}` |
+| GET | `/referral/rewards?page=&status=` | `{items:[{order_id, invitee_masked, paid_at, order_amount, refunded_amount, reward, status, settle_after, settled_at, clawed_amount}], total}`（`settle_after` = 预计到账时间，P8-A1 补） |
 | GET | `/me` | 增 `referral_month_settled`（分；0 时省略）——给「我的」页入口用，避免多一次请求 |
 
 ### 10.2 后台（`/admin/api/v1`）
@@ -452,8 +465,8 @@ ORDER BY l.id LIMIT 500
 | POST | `/referral/bindings/{id}/approve` | finance | `held → active`，`{note}`；审计 `referral.approve` |
 | POST | `/referral/bindings/{id}/revoke` | finance + TOTP | 任意非 revoked 状态 → `revoked`，待发放全部 `void`，`{reason, totp}` → `{voided_amount}`；审计 `referral.revoke` |
 | GET | `/referral/rewards?inviter_id=&invitee_id=&status=&from=&to=&page=` | finance | |
-| GET | `/referral/rewards/export?…` | finance | CSV：订单、邀请人、被邀请人、消费、退款、费率、应得、状态、发放时间、扣回、费率版本 |
-| GET | `/referral/bindings/export?…` | finance | CSV：绑定 ID、邀请人、被邀请人、码、状态、标记、绑定时间、截止、IP、设备 |
+| GET | `/referral/rewards/export?…` | finance | CSV：订单、邀请人、被邀请人、消费、退款、费率、应得、状态、发放时间、扣回、费率版本；状态输出中文标签（待发放 / 已发放 / 已作废） |
+| GET | `/referral/bindings/export?…` | finance | CSV：绑定 ID、邀请人、被邀请人、码、状态、标记、绑定时间、截止、IP、设备；状态与标记输出中文标签（与页面一致，如「已失效」「同IP 同设备」） |
 | POST | `/referral/rescan` | super + TOTP | `{days}`（1～30）：`watermark = now − days`，立刻跑一轮 `Settle`；审计 `referral.rescan` |
 | GET | `/users/{id}` | all | 响应增 `referral: {inviter?: {user_id, phone, binding_status}, account?: {code, status, invitees, settled_net, pending, debt}}` |
 | GET | `/ledger` | finance | `kind` 筛选接受两种新类型 |
@@ -503,7 +516,7 @@ func (s *Service) Admin*(...)                                                // 
 全部常量在 `internal/referral/referral.go`；没有新环境变量（链接用 `SPARK_PUBLIC_BASE_URL`）。
 
 ## 13. 迁移与兼容
-1. 迁移 00020 对存量数据：无回填；历史流水不会计返利（上线前没有任何绑定，扫描 JOIN 不命中）。
+1. 迁移 00020（实际 `00021`，见 §0 实施注）对存量数据：无回填；历史流水不会计返利（上线前没有任何绑定，扫描 JOIN 不命中）。
 2. 发布顺序：platform 单独发布；多副本滚动期间旧副本的 `Login` 不认 `invite_code`（请求体多余字段被忽略）→ 滚动窗口内注册的用户可能没绑定；窗口很短，可接受（README 注明）。
 3. 上线后执行一次 `platform referral backfill-fingerprints`（§2），之后同身份判定对存量实名用户生效。
 4. 前端：老版本控制台没有 `X-Device-Id`，后端视为空（不打 `same_device`）。
@@ -520,7 +533,7 @@ func (s *Service) Admin*(...)                                                // 
   | Bind（在 identity 事务内） | users(被邀请人, INSERT 持有) → users(码主) FOR KEY SHARE → referral_accounts(码主) FOR SHARE → 插 referral_bindings |
   | 计提 / 退款处理 | users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → [幂等复查 `alreadyProcessed`] → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回] |
   | 发放 | users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → [同身份复查命中：referral_bindings → referral_rewards 批量 void] → wallet_accounts(邀请人) |
-  | 冻结 / 解冻 / 撤销 / 通过 | referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards（撤销时批量 void） |
+  | 冻结 / 解冻 / 撤销 / 通过 | users(邀请人[, 被邀请人]) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards（撤销时批量 void）；与发放同序，冻结与同一轮发放的互斥靠账户锁（发放在账户锁内复核账户 / 绑定状态） |
   | OnKYCVerified（在 identity 事务内） | users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards |
   | rental 的扣款 / 退款事务 | 不碰 referral 任何表（只写 wallet），与上面互不等待 |
 
