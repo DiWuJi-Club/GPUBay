@@ -428,3 +428,106 @@ func TestHostKeyAlgorithms(t *testing.T) {
 		}
 	}
 }
+
+func shellServer(t *testing.T, up ssh.Signer) *sshtest.Server {
+	t.Helper()
+	srv, err := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey(), Shell: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestPoolExec(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0001", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	ctx := context.Background()
+	out, errb, exit, err := p.Exec(ctx, tg, "echo hi; echo oops >&2", nil, 1024)
+	if err != nil || exit != 0 || string(out) != "hi\n" || string(errb) != "oops\n" {
+		t.Fatalf("exec = %q %q %d %v", out, errb, exit, err)
+	}
+	if _, _, exit, err := p.Exec(ctx, tg, "exit 3", nil, 1024); err != nil || exit != 3 {
+		t.Fatalf("exit 3 = %d %v", exit, err)
+	}
+	// stdin 传递（部署包上传就是这条路径）
+	out, _, exit, err = p.Exec(ctx, tg, "cat > f && wc -c < f", []byte("12345"), 1024)
+	if err != nil || exit != 0 || strings.TrimSpace(string(out)) != "5" {
+		t.Fatalf("stdin = %q %d %v", out, exit, err)
+	}
+	// 截断
+	out, errb, exit, err = p.Exec(ctx, tg, "head -c 5000 /dev/zero | tr '\\0' x; head -c 3000 /dev/zero | tr '\\0' y >&2", nil, 100)
+	if err != nil || exit != 0 || len(out) != 100 || len(errb) != 100 {
+		t.Fatalf("truncate = %d %d %d %v", len(out), len(errb), exit, err)
+	}
+	if p.Len() != 1 || srv.ConnCount() != 1 {
+		t.Fatalf("pool=%d conns=%d, want one shared connection", p.Len(), srv.ConnCount())
+	}
+	// 不可达 → DialError
+	var de *upstream.DialError
+	if _, _, _, err := p.Exec(ctx, upstream.Target{InstanceID: "ins-exec0002", LanIP: "10.255.255.1", HostPubkey: "x"}, "true", nil, 10); !errors.As(err, &de) {
+		t.Fatalf("unreachable = %v", err)
+	}
+	p.Close()
+	if _, _, _, err := p.Exec(ctx, tg, "true", nil, 10); !errors.Is(err, upstream.ErrClosed) {
+		t.Fatalf("closed = %v", err)
+	}
+}
+
+func TestPoolExecTimeoutKeepsConnection(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0003", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	out, _, exit, err := p.Exec(ctx, tg, "echo partial; sleep 10; echo late", nil, 1024)
+	var de *upstream.DialError
+	if !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &de) || exit != -1 || string(out) != "partial\n" || time.Since(start) > 3*time.Second {
+		t.Fatalf("timeout = %q %d %v after %v", out, exit, err, time.Since(start))
+	}
+	// 共享连接仍可用
+	if out, _, exit, err := p.Exec(context.Background(), tg, "echo again", nil, 64); err != nil || exit != 0 || string(out) != "again\n" {
+		t.Fatalf("after timeout = %q %d %v", out, exit, err)
+	}
+	if p.Len() != 1 || srv.ConnCount() != 1 {
+		t.Fatalf("pool=%d conns=%d", p.Len(), srv.ConnCount())
+	}
+}
+
+func TestPoolExecRetriesDeadClient(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0004", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	for i := 0; i < 5; i++ {
+		if out, _, exit, err := p.Exec(context.Background(), tg, "echo ok", nil, 64); err != nil || exit != 0 || string(out) != "ok\n" {
+			t.Fatalf("round %d = %q %d %v", i, out, exit, err)
+		}
+		srv.DropAll() // 上游崩溃：下一次 Exec 发现连接已死，重建一次
+	}
+}
+
+// 命令不读 stdin 就以 0 退出：Wait 报 stdin 拷贝错误，但命令已执行过——不得当作连接错误重跑，也不得丢弃共享连接。
+func TestPoolExecUnreadStdinRunsOnce(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0005", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	if out, errb, exit, err := p.Exec(context.Background(), tg, "echo run >> runs", make([]byte, 8<<20), 64); err != nil || exit != 0 {
+		t.Fatalf("exec = %q %q %d %v", out, errb, exit, err)
+	}
+	if out, _, exit, err := p.Exec(context.Background(), tg, "wc -l < runs", nil, 64); err != nil || exit != 0 || strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("runs = %q %d %v, want the command executed once", out, exit, err)
+	}
+	if p.Len() != 1 || srv.ConnCount() != 1 {
+		t.Fatalf("pool=%d conns=%d, want the shared connection kept", p.Len(), srv.ConnCount())
+	}
+}

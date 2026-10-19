@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -276,4 +277,87 @@ func (p *Pool) Close() {
 	for id, e := range all {
 		p.dropEntry(id, e)
 	}
+}
+
+// limitedBuf 只保留前 max 字节，其余丢弃（exec 输出截断，不报错）。
+type limitedBuf struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (l *limitedBuf) Write(p []byte) (int, error) {
+	n := len(p) // 报告全部写入：截断不能让 io.Copy 以 ErrShortWrite 失败
+	if room := l.max - l.buf.Len(); room > 0 {
+		if len(p) > room {
+			p = p[:room]
+		}
+		l.buf.Write(p)
+	}
+	return n, nil
+}
+
+// Exec 在容器里执行一条命令（复用共享 ssh.Client 上的一个 session）。
+// 远端非零退出：exit = 退出码，err = nil。ctx 到期：关闭 session，返回已收到的输出与 ctx.Err()（共享连接保留）。
+// NewSession / Start 的连接层错误：丢弃连接重试一次，再失败返回 *DialError；命令一旦开始执行就不再重试（避免重复执行）。
+// stdout / stderr 各截断到 maxOutput 字节。
+func (p *Pool) Exec(ctx context.Context, t Target, cmd string, stdin []byte, maxOutput int) (stdout, stderr []byte, exit int, err error) {
+	if maxOutput <= 0 {
+		maxOutput = 1 << 20
+	}
+	type runResult struct {
+		started bool
+		err     error
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		var c *ssh.Client
+		if c, err = p.client(ctx, t); err != nil {
+			return nil, nil, -1, err
+		}
+		sess, serr := c.NewSession()
+		if serr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, nil, -1, ctxErr
+			}
+			p.dropClient(t.InstanceID, c)
+			err = serr
+			continue
+		}
+		out, errb := &limitedBuf{max: maxOutput}, &limitedBuf{max: maxOutput}
+		sess.Stdin, sess.Stdout, sess.Stderr = bytes.NewReader(stdin), out, errb
+		done := make(chan runResult, 1)
+		go func() {
+			if err := sess.Start(cmd); err != nil {
+				done <- runResult{err: err}
+				return
+			}
+			done <- runResult{started: true, err: sess.Wait()}
+		}()
+		select {
+		case r := <-done:
+			sess.Close()
+			if !r.started {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, nil, -1, ctxErr
+				}
+				p.dropClient(t.InstanceID, c) // 连接层错误、命令未执行：重建后再试一次
+				err = r.err
+				continue
+			}
+			var ee *ssh.ExitError
+			var em *ssh.ExitMissingError
+			switch {
+			case errors.As(r.err, &ee):
+				return out.buf.Bytes(), errb.buf.Bytes(), ee.ExitStatus(), nil
+			case errors.As(r.err, &em):
+				return out.buf.Bytes(), errb.buf.Bytes(), -1, fmt.Errorf("远端未返回退出码: %w", r.err)
+			}
+			// r.err 为 nil，或远端已以 0 退出、只是没读完 stdin（Wait 报 stdin 拷贝错误）：都按退出码 0 返回
+			return out.buf.Bytes(), errb.buf.Bytes(), 0, nil
+		case <-ctx.Done():
+			sess.Close() // 只关这个 session；共享连接保留
+			<-done
+			return out.buf.Bytes(), errb.buf.Bytes(), -1, ctx.Err()
+		}
+	}
+	return nil, nil, -1, &DialError{InstanceID: t.InstanceID, Err: err}
 }
