@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type EnrollCommand, type MachineDetail } from '@spark/shared'
+import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type AdminGroup, type EnrollCommand, type Listed, type MachineDetail } from '@spark/shared'
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
@@ -19,6 +19,8 @@ const busy = ref(false)
 const enrollVisible = ref(false)
 const enroll = ref<EnrollCommand | null>(null)
 const revokeVisible = ref(false)
+const groups = ref<AdminGroup[]>([])
+const edit = reactive({ visible: false, groupId: '' as string, displayName: '', busy: false })
 const inMaintenance = computed(() => data.value?.machine.state === 'maintenance' || data.value?.machine.state === 'faulty')
 
 let seq = 0
@@ -42,7 +44,17 @@ async function load(target = id.value) {
     if (mine === seq) loading.value = false
   }
 }
-onMounted(() => void load())
+async function loadGroups() {
+  try {
+    groups.value = (await api.get<Listed<AdminGroup>>('/groups')).items
+  } catch (e) {
+    notifyError(e)
+  }
+}
+onMounted(() => {
+  void load()
+  void loadGroups()
+})
 // 同一组件换了机器（/machines/1 → /machines/2）：清掉旧机器的数据与弹窗，按新 ID 重新加载。
 // 用 onBeforeRouteUpdate 而不是 watch(route.params.id)：离开到实例详情时 params.id 也会变，watch 会拿实例 ID 去请求机器
 onBeforeRouteUpdate((to) => {
@@ -53,6 +65,7 @@ onBeforeRouteUpdate((to) => {
   powerVisible.value = false
   closeEnroll() // 接入命令只属于原机器，换机器时一并丢掉
   revokeVisible.value = false
+  edit.visible = false
   void load(String(to.params.id))
 })
 
@@ -84,6 +97,24 @@ async function powerCycle() {
     notifyError(e) // 「该机器未配置 PDU」等原文
   } finally {
     busy.value = false
+  }
+}
+
+function openEdit() {
+  Object.assign(edit, { visible: true, groupId: data.value?.machine.group_id ? String(data.value.machine.group_id) : '', displayName: data.value?.machine.display_name ?? '' })
+}
+async function submitEdit() {
+  if (edit.busy) return
+  edit.busy = true
+  try {
+    await api.put(`/machines/${id.value}`, { group_id: edit.groupId ? Number(edit.groupId) : null, display_name: edit.displayName.trim() })
+    ElMessage.success('已保存')
+    edit.visible = false
+    await load()
+  } catch (e) {
+    notifyError(e) // duplicate_display_name / group_not_found 原文
+  } finally {
+    edit.busy = false
   }
 }
 
@@ -146,6 +177,8 @@ async function revokeEnrollment() {
           <el-descriptions-item label="内网 IP"><span class="mono">{{ data.machine.lan_ip }}</span></el-descriptions-item>
           <el-descriptions-item label="在线"><span data-testid="mdetail-online">{{ data.machine.agent_online ? '在线' : '离线' }}</span>（{{ fmtTime(data.machine.last_seen_at) || '从未心跳' }}）</el-descriptions-item>
           <el-descriptions-item label="PDU">{{ data.machine.pdu_id ? `#${data.machine.pdu_id} 插座 ${data.machine.pdu_outlet}` : '未配置' }}</el-descriptions-item>
+          <el-descriptions-item label="机组"><span data-testid="mdetail-group">{{ data.group?.name ?? '未分组' }}</span></el-descriptions-item>
+          <el-descriptions-item label="展示名"><span data-testid="mdetail-display">{{ data.machine.display_name || `机器 #${data.machine.id}` }}</span></el-descriptions-item>
           <el-descriptions-item label="登记时间">{{ fmtTime(data.machine.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="当前实例">
             <span v-if="data.current_instance" data-testid="mdetail-current"><IdLink kind="instance" :id="data.current_instance.id" /></span>
@@ -160,6 +193,7 @@ async function revokeEnrollment() {
           <el-descriptions-item label="Agent 版本"><span data-testid="mdetail-agent-version">{{ data.machine.agent_version || '—' }}</span></el-descriptions-item>
         </el-descriptions>
         <div class="actions">
+          <el-button data-testid="mdetail-edit-btn" @click="openEdit">编辑机组 / 展示名</el-button>
           <el-button data-testid="mdetail-maintenance-btn" @click="maintenanceVisible = true">{{ inMaintenance ? '结束维护' : '进入维护' }}</el-button>
           <el-button type="danger" plain data-testid="mdetail-power-btn" @click="powerVisible = true">断电重启</el-button>
           <el-button type="primary" plain :loading="busy" data-testid="mdetail-enroll-btn" @click="generateEnroll">生成接入命令</el-button>
@@ -177,6 +211,19 @@ async function revokeEnrollment() {
           <el-descriptions-item label="上报时间"><span data-testid="mdetail-metric-at">{{ fmtTime(data.machine.last_seen_at) }}</span></el-descriptions-item>
         </el-descriptions>
         <p v-else class="muted" data-testid="mdetail-metrics-none">尚未收到指标</p>
+      </el-card>
+
+      <el-card header="档期（未来 60 天）" data-testid="mdetail-leases">
+        <table class="grid">
+          <thead><tr><th>开始</th><th>结束</th><th>实例</th><th>用户</th></tr></thead>
+          <tbody>
+            <tr v-for="l in data.leases" :key="l.lower" data-testid="mdetail-lease-row">
+              <td>{{ fmtTime(l.lower) }}</td><td>{{ fmtTime(l.upper) }}</td>
+              <td><IdLink kind="instance" :id="l.instance_id" /></td><td><IdLink kind="user" :id="l.user_id" /></td>
+            </tr>
+            <tr v-if="!data.leases.length"><td colspan="4" class="muted">无占用</td></tr>
+          </tbody>
+        </table>
       </el-card>
 
       <el-card header="历史实例">
@@ -208,10 +255,20 @@ async function revokeEnrollment() {
       </el-dialog>
       <el-dialog v-model="maintenanceVisible" :title="inMaintenance ? '结束维护' : '进入维护'" width="420" align-center data-testid="mdetail-maintenance-dialog">
         <p>{{ inMaintenance ? '结束维护后机器重新进入可售库存。' : '进入维护后该机器不再分配给新订单。' }}</p>
+        <p v-if="!inMaintenance && data.upcoming_bookings > 0" class="warn" data-testid="mdetail-maintenance-upcoming">该机器有 {{ data.upcoming_bookings }} 个未开通的预订，将在开通时自动改派。</p>
         <template #footer>
           <el-button @click="maintenanceVisible = false">取消</el-button>
           <el-button type="primary" :loading="busy" data-testid="mdetail-maintenance-ok" @click="toggleMaintenance">确定</el-button>
         </template>
+      </el-dialog>
+      <el-dialog v-model="edit.visible" title="编辑机组 / 展示名" width="460" align-center data-testid="medit-dialog">
+        <el-form label-position="top" @submit.prevent="submitEdit">
+          <el-form-item label="机组">
+            <el-select v-model="edit.groupId" clearable placeholder="未分组" data-testid="medit-group"><el-option v-for="g in groups" :key="g.id" :label="g.name" :value="String(g.id)" /></el-select>
+          </el-form-item>
+          <el-form-item label="展示名（对用户，≤ 32 字；留空显示「机器 #ID」）"><el-input v-model="edit.displayName" maxlength="32" data-testid="medit-display" /></el-form-item>
+          <el-button type="primary" native-type="submit" :loading="edit.busy" data-testid="medit-submit">保存</el-button>
+        </el-form>
       </el-dialog>
       <el-dialog v-model="powerVisible" title="断电重启" width="420" align-center data-testid="mdetail-power-dialog">
         <p data-testid="mdetail-power-text">将通过 PDU 对该机器断电重启，机器上的实例会中断，确定执行？</p>
@@ -231,5 +288,8 @@ async function revokeEnrollment() {
 .muted { color: #909399; }
 .actions { display: flex; gap: 12px; margin-top: 16px; }
 .agent { margin-top: 12px; }
+.warn { color: var(--el-color-warning); }
+.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+.grid th, .grid td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--el-border-color-lighter); }
 .cmd { white-space: pre-wrap; word-break: break-all; background: #f5f7fa; padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>

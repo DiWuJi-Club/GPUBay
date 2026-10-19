@@ -1,6 +1,6 @@
 import type { InstanceState, Role } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { extendSeconds, isZeroRefund, showExtend, showMigrate, showPortActions, showRefund, showRewipe, validateExtend, validateRefund } from '../instanceOps'
+import { extendSeconds, isZeroRefund, showCancelBooking, showExtend, showMigrate, showPortActions, showReassign, showRefund, showRewipe, validateExtend, validateRefund } from '../instanceOps'
 
 const RANGE = '补偿时长需在 1 分钟到 30 天之间'
 
@@ -63,6 +63,17 @@ describe('instance ops', () => {
     expect(visible('super')).toEqual({
       creating: ['extend', 'refund'], running: ['extend', 'migrate', 'refund'], stopped: ['extend', 'refund'], wiping: ['rewipe'], released: [], failed: [],
     })
+  })
+  it('预订操作只对 reserved 且 ops/super 可见', () => {
+    expect(showReassign('ops', 'reserved')).toBe(true)
+    expect(showReassign('super', 'reserved')).toBe(true)
+    expect(showReassign('finance', 'reserved')).toBe(false)
+    expect(showReassign('ops', 'creating')).toBe(false)
+    expect(showCancelBooking('ops', 'reserved')).toBe(true)
+    expect(showCancelBooking('ops', 'running')).toBe(false)
+    expect(showMigrate('ops', 'reserved')).toBe(false)
+    expect(showExtend('ops', 'reserved')).toBe(true)
+    expect(showRefund('finance', 'reserved')).toBe(false)
   })
 })
 
