@@ -2,12 +2,15 @@
 import { fmtDuration, fmtTime, labelOf, machineStateLabel, type AdminGroup, type AdminInstance, type Listed, type Paged } from '@spark/shared'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
+import BatchLink from '../components/BatchLink.vue'
+import BookingOpsDialogs from '../components/BookingOpsDialogs.vue'
 import DateRange from '../components/DateRange.vue'
 import IdLink from '../components/IdLink.vue'
 import { useBookingOps } from '../composables/useBookingOps'
 import { usePaged } from '../composables/usePaged'
 import { showCancelBooking, showReassign } from '../logic/instanceOps'
 import { notifyError } from '../logic/notify'
+import { FIN_ROLES } from '../menu'
 import { session } from '../store/session'
 
 const digits = (v: string) => v.replace(/\D/g, '')
@@ -21,6 +24,7 @@ const groups = ref<AdminGroup[]>([])
 const groupName = computed(() => new Map(groups.value.map((g) => [g.id, g.name])))
 const role = computed(() => session.admin?.role ?? 'finance')
 const isFinance = computed(() => role.value === 'finance')
+const canSeeOrders = computed(() => FIN_ROLES.includes(role.value))
 
 async function loadGroups() {
   try {
@@ -43,7 +47,8 @@ function resetFilter() {
 }
 
 // ---- 改派 / 取消预订（ops；取消的动态码由请求层弹出）----
-const { reassign, openReassign, setReassignMachine, submitReassign, cancel, openCancel, submitCancel } = useBookingOps(() => list.load())
+const bookingOps = useBookingOps(() => list.load())
+const { openReassign, openCancel } = bookingOps
 </script>
 
 <template>
@@ -80,7 +85,7 @@ const { reassign, openReassign, setReassignMachine, submitReassign, cancel, open
       </el-table-column>
       <el-table-column label="开始" width="150"><template #default="{ row }"><span data-testid="booking-start">{{ fmtTime(row.scheduled_start_at) }}</span></template></el-table-column>
       <el-table-column label="时长" width="110"><template #default="{ row }"><span data-testid="booking-duration">{{ fmtDuration(row.pending_seconds) }}</span></template></el-table-column>
-      <el-table-column label="批次" min-width="150"><template #default="{ row }"><span class="mono" data-testid="booking-batch">{{ row.batch_id ?? '—' }}</span></template></el-table-column>
+      <el-table-column label="批次" min-width="150"><template #default="{ row }"><span data-testid="booking-batch"><BatchLink :id="row.batch_id" :disabled="!canSeeOrders" /></span></template></el-table-column>
       <el-table-column label="改派" width="70"><template #default="{ row }"><span data-testid="booking-reassigned">{{ row.reassign_count }}</span></template></el-table-column>
       <el-table-column label="下单" width="150"><template #default="{ row }">{{ fmtTime(row.created_at) }}</template></el-table-column>
       <el-table-column label="操作" width="180">
@@ -95,21 +100,7 @@ const { reassign, openReassign, setReassignMachine, submitReassign, cancel, open
       <el-pagination v-model:current-page="list.page.value" v-model:page-size="list.size.value" :total="list.total.value" layout="prev, pager, next" data-testid="bookings-pager" />
     </div>
 
-    <el-dialog v-model="reassign.visible" title="改派" width="460" align-center data-testid="reassign-dialog">
-      <p class="muted">留空机器 ID 由系统在同机组内自动挑选（只挑可见机组）；指定机器须空闲 / 已分配且所需时段无冲突，可以是任意机组（含仅后台可见的留池），不要求此刻在线——开通时再判断。</p>
-      <el-form label-position="top" @submit.prevent="submitReassign">
-        <el-form-item label="目标机器 ID（可空）"><el-input :model-value="reassign.machineId" data-testid="reassign-machine" @update:model-value="setReassignMachine" /></el-form-item>
-        <el-form-item label="原因（必填）"><el-input v-model="reassign.reason" data-testid="reassign-reason" /></el-form-item>
-        <el-button type="primary" native-type="submit" :loading="reassign.busy" data-testid="reassign-submit">确定改派</el-button>
-      </el-form>
-    </el-dialog>
-    <el-dialog v-model="cancel.visible" title="取消预订" width="460" align-center data-testid="cancel-booking-dialog">
-      <p class="muted">平台原因取消：全额退款到用户余额，并发短信通知；需要动态码。</p>
-      <el-form label-position="top" @submit.prevent="submitCancel">
-        <el-form-item label="原因（必填，写入审计）"><el-input v-model="cancel.reason" data-testid="cancel-booking-reason" /></el-form-item>
-        <el-button type="danger" native-type="submit" :loading="cancel.busy" data-testid="cancel-booking-submit">取消并退款</el-button>
-      </el-form>
-    </el-dialog>
+    <BookingOpsDialogs :ops="bookingOps" />
   </el-card>
 </template>
 

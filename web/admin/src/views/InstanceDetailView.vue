@@ -7,10 +7,13 @@ import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
+import BatchLink from '../components/BatchLink.vue'
+import BookingOpsDialogs from '../components/BookingOpsDialogs.vue'
 import IdLink from '../components/IdLink.vue'
 import { useBookingOps } from '../composables/useBookingOps'
 import { extendSeconds, isZeroRefund, showCancelBooking, showExtend, showMigrate, showPortActions, showReassign, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
 import { notifyError } from '../logic/notify'
+import { FIN_ROLES } from '../menu'
 import { session } from '../store/session'
 
 const route = useRoute()
@@ -25,6 +28,7 @@ const inst = computed(() => data.value?.instance)
 const imageName = computed(() => images.value.find((i) => i.id === inst.value?.image_id)?.name ?? inst.value?.image_id)
 const productName = computed(() => products.value.find((p) => p.id === inst.value?.product_id)?.name ?? inst.value?.product_id)
 const isFinance = computed(() => role.value === 'finance')
+const canSeeOrders = computed(() => FIN_ROLES.includes(role.value))
 
 let seq = 0
 /**
@@ -182,7 +186,6 @@ async function submitRefund() {
 
 // ---- 预订：改派 / 取消预订（ops；取消的动态码由请求层弹出）----
 const booking = useBookingOps(() => load())
-const { reassign, cancel, setReassignMachine, submitReassign, submitCancel } = booking
 function openReassign() {
   if (inst.value) booking.openReassign(inst.value)
 }
@@ -257,7 +260,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
           <el-descriptions-item label="停机时间">{{ fmtTime(inst.stopped_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ fmtTime(inst.created_at) }}</el-descriptions-item>
           <el-descriptions-item v-if="inst.scheduled_start_at" label="预订开始"><span key="start" data-testid="adetail-start">{{ fmtTime(inst.scheduled_start_at) }} ～ {{ fmtTime(inst.scheduled_end_at) }}</span></el-descriptions-item>
-          <el-descriptions-item v-if="inst.batch_id" label="批次"><span key="batch" class="mono" data-testid="adetail-batch">{{ inst.batch_id }}</span></el-descriptions-item>
+          <el-descriptions-item v-if="inst.batch_id" label="批次"><span key="batch" data-testid="adetail-batch"><BatchLink :id="inst.batch_id" :disabled="!canSeeOrders" /></span></el-descriptions-item>
           <el-descriptions-item label="改派次数"><span data-testid="adetail-reassigned">{{ inst.reassign_count }}</span></el-descriptions-item>
           <el-descriptions-item label="自动续费"><span data-testid="adetail-auto-renew">{{ inst.auto_renew ? `开启（${labelOf(durationLabel, inst.auto_renew_duration)}）` : '关闭' }}{{ inst.auto_renew_failed_reason ? ` · 最近失败：${inst.auto_renew_failed_reason}` : '' }}</span></el-descriptions-item>
         </el-descriptions>
@@ -365,21 +368,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
         </el-form>
       </el-dialog>
 
-      <el-dialog v-model="reassign.visible" title="改派" width="460" align-center data-testid="reassign-dialog">
-        <p class="muted">留空机器 ID 由系统在同机组内自动挑选（只挑可见机组）；指定机器须空闲 / 已分配且所需时段无冲突，可以是任意机组（含仅后台可见的留池），不要求此刻在线——开通时再判断。</p>
-        <el-form label-position="top" @submit.prevent="submitReassign">
-          <el-form-item label="目标机器 ID（可空）"><el-input :model-value="reassign.machineId" data-testid="reassign-machine" @update:model-value="setReassignMachine" /></el-form-item>
-          <el-form-item label="原因（必填）"><el-input v-model="reassign.reason" data-testid="reassign-reason" /></el-form-item>
-          <el-button type="primary" native-type="submit" :loading="reassign.busy" data-testid="reassign-submit">确定改派</el-button>
-        </el-form>
-      </el-dialog>
-      <el-dialog v-model="cancel.visible" title="取消预订" width="460" align-center data-testid="cancel-booking-dialog">
-        <p class="muted">平台原因取消：全额退款到用户余额，并发短信通知；需要动态码。</p>
-        <el-form label-position="top" @submit.prevent="submitCancel">
-          <el-form-item label="原因（必填，写入审计）"><el-input v-model="cancel.reason" data-testid="cancel-booking-reason" /></el-form-item>
-          <el-button type="danger" native-type="submit" :loading="cancel.busy" data-testid="cancel-booking-submit">取消并退款</el-button>
-        </el-form>
-      </el-dialog>
+      <BookingOpsDialogs :ops="booking" />
       <el-dialog v-model="extend.visible" title="免费延长" width="460" align-center data-testid="extend-dialog">
         <!-- novalidate：数字框的原生 step 校验会让 1.5 小时这类值根本提交不了，范围由 validateExtend 统一校验 -->
         <el-form label-position="top" novalidate @submit.prevent="submitExtend">

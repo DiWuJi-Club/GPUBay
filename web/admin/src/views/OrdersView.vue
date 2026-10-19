@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { durationLabel, fmtTime, fmtYuan, labelOf, orderKindLabel, orderStatusLabel, type AdminOrder } from '@spark/shared'
+import BatchLink from '../components/BatchLink.vue'
 import FinancePage from '../components/FinancePage.vue'
 import IdLink from '../components/IdLink.vue'
 
@@ -20,7 +21,7 @@ const statuses = Object.entries(orderStatusLabel).map(([value, label]) => ({ val
         <el-table-column label="金额" width="110"><template #default="{ row }"><span data-testid="ord-amount">{{ fmtYuan(row.amount) }}</span></template></el-table-column>
         <el-table-column label="已退" width="110"><template #default="{ row }"><span data-testid="ord-refunded">{{ fmtYuan(row.refunded_amount) }}</span></template></el-table-column>
         <el-table-column label="状态" width="100"><template #default="{ row }"><span data-testid="ord-status">{{ labelOf(orderStatusLabel, row.status) }}</span></template></el-table-column>
-        <el-table-column label="批次" min-width="150"><template #default="{ row }"><span class="mono" data-testid="ord-batch">{{ row.batch_id ?? '—' }}</span></template></el-table-column>
+        <el-table-column label="批次" min-width="150"><template #default="{ row }"><span data-testid="ord-batch"><BatchLink :id="row.batch_id" /></span></template></el-table-column>
         <el-table-column label="自动" width="60"><template #default="{ row }"><span data-testid="ord-auto">{{ row.auto ? '是' : '' }}</span></template></el-table-column>
         <el-table-column label="下单时间" width="160"><template #default="{ row }"><span data-testid="ord-time">{{ fmtTime(row.created_at) }}</span></template></el-table-column>
       </el-table>

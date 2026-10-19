@@ -89,18 +89,32 @@ const drawer = reactive({
 })
 const displayDraft = reactive<Record<number, string>>({})
 async function openMachines(g: AdminGroup) {
+  memberSeq++
+  candidateSeq++
   Object.assign(drawer, { group: g, addInput: '', rack: '', searched: false, candidates: [], candidateTotal: 0, candidatePage: 1, members: [], memberTotal: 0, memberPage: 1 })
   drawer.visible = true
   await loadMembers()
 }
+// 只采用最后一次请求的结果：快速翻页 / 换机组时先发后到的旧响应被丢弃（openMachines 也让在途请求作废）。
+let memberSeq = 0
+let candidateSeq = 0
+/** 当前页被移空（移出 / 加入后）且不是第一页：退到最后一个有数据的页再取一次。 */
+const lastPage = (total: number) => Math.max(1, Math.ceil(total / DRAWER_PAGE))
 async function loadMembers() {
   if (!drawer.group) return
+  const mine = ++memberSeq
   try {
     const out = await api.get<Paged<Machine>>('/machines', { group_id: drawer.group.id, page: drawer.memberPage, page_size: DRAWER_PAGE })
+    if (mine !== memberSeq) return
+    if (!out.items.length && drawer.memberPage > lastPage(out.total)) {
+      drawer.memberPage = lastPage(out.total)
+      if (out.total > 0) return loadMembers()
+    }
     drawer.members = out.items
     drawer.memberTotal = out.total
     for (const m of out.items) displayDraft[m.id] = m.display_name
   } catch (e) {
+    if (mine !== memberSeq) return
     notifyError(e)
   }
 }
@@ -110,12 +124,19 @@ function memberPageChange(p: number) {
 }
 /** 候选：未分组机器（group_id=none），可按机柜筛选；其它机组的机器用上面的 ID 输入加入（改派到本组）。 */
 async function searchCandidates() {
+  const mine = ++candidateSeq
   try {
     const out = await api.get<Paged<Machine>>('/machines', { group_id: 'none', rack: drawer.rack || undefined, page: drawer.candidatePage, page_size: DRAWER_PAGE })
+    if (mine !== candidateSeq) return
+    if (!out.items.length && drawer.candidatePage > lastPage(out.total)) {
+      drawer.candidatePage = lastPage(out.total)
+      if (out.total > 0) return searchCandidates()
+    }
     drawer.candidates = out.items
     drawer.candidateTotal = out.total
     drawer.searched = true
   } catch (e) {
+    if (mine !== candidateSeq) return
     notifyError(e)
   }
 }
@@ -148,8 +169,6 @@ async function removeMachine(m: Machine) {
   busy.value = true
   try {
     await api.del(`/groups/${drawer.group.id}/machines`, { machine_ids: [m.id] })
-    // 移出后本页可能空了：退回上一页
-    if (drawer.members.length === 1 && drawer.memberPage > 1) drawer.memberPage--
     await Promise.all([loadMembers(), load()])
     if (drawer.searched) await searchCandidates()
   } catch (e) {
@@ -159,12 +178,16 @@ async function removeMachine(m: Machine) {
   }
 }
 async function saveDisplay(m: Machine) {
+  if (busy.value) return // 同步守卫：连点只发一次
+  busy.value = true
   try {
     await api.put(`/machines/${m.id}`, { display_name: displayDraft[m.id] ?? '' })
     ElMessage.success('展示名已保存')
     await loadMembers()
   } catch (e) {
     notifyError(e) // duplicate_display_name 原文
+  } finally {
+    busy.value = false
   }
 }
 </script>

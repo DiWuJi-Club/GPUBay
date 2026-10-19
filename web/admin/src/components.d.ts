@@ -11,6 +11,8 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    BatchLink: typeof import('./components/BatchLink.vue')['default']
+    BookingOpsDialogs: typeof import('./components/BookingOpsDialogs.vue')['default']
     DateRange: typeof import('./components/DateRange.vue')['default']
     ElAlert: typeof import('element-plus/es')['ElAlert']
     ElBadge: typeof import('element-plus/es')['ElBadge']
