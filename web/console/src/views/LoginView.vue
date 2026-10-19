@@ -23,24 +23,27 @@ const { remaining: countdown, start: startCountdown } = useCountdown()
 const sendLabel = computed(() => (countdown.value > 0 ? `${countdown.value} 秒后重发` : '发送验证码'))
 const logo = import.meta.env.BASE_URL + brand.logoUrl
 
-// 邀请：本地存下的邀请码（App.vue 落地时写入；直接打开 /login?ic= 时它可能还没写完，所以也看地址栏）
+// 邀请：本地存下的邀请码（App.vue 落地时写入；直接打开 /login?ic= 时它可能还没写完，所以也看地址栏）。
+// inviteCode 是登录时要带上的码；inviter 非空才显示提示条。查询接口临时失败（限流 / 网络）时不显示提示条但仍带码登录，
+// 由后端判定；只有查询明确说无效、或登录已用掉它时才丢弃。
 const inviteCode = ref<string | null>(null)
 const inviter = ref('')
 onMounted(async () => {
   const code = readInvite() ?? parseInviteParam(window.location.search)
   if (!code) return
+  inviteCode.value = code
   try {
     const r = await api.get<{ valid: boolean; inviter: string }>(`/referral/codes/${code}`)
-    if (r.valid) {
-      inviteCode.value = code
-      inviter.value = r.inviter
-    } else clearInvite() // 无效：静默丢弃
+    if (inviteCode.value !== code) return // 查询期间用户已点 ×
+    if (r.valid) inviter.value = r.inviter
+    else dropInvite() // 明确无效：静默丢弃
   } catch {
-    /* 查询失败（限流 / 网络）：不显示，提交时也不带码 */
+    /* 临时失败：不显示提示条，提交时仍带码 */
   }
 })
 function dropInvite() {
   inviteCode.value = null
+  inviter.value = ''
   clearInvite()
 }
 
@@ -97,7 +100,7 @@ async function submit() {
   <div class="login-page">
     <el-card class="login-card" data-testid="login-card">
       <h1 class="brand"><img :src="logo" alt="" width="32" height="32" /> {{ brand.name }}</h1>
-      <el-alert v-if="inviteCode" type="info" :closable="false" show-icon class="invite" data-testid="login-invite">
+      <el-alert v-if="inviteCode && inviter" type="info" :closable="false" show-icon class="invite" data-testid="login-invite">
         <span>通过 <b>{{ inviter }}</b> 的邀请注册</span>
         <el-button link size="small" class="invite-clear" aria-label="不使用邀请码" data-testid="login-invite-clear" @click="dropInvite">×</el-button>
       </el-alert>

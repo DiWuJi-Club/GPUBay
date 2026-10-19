@@ -39,18 +39,19 @@ export function parseInviteParam(search: string): string | null {
   return v ? normalizeInviteCode(v) : null
 }
 
-export function storeInvite(code: string, now = Date.now(), storage: Storage = localStorage): void {
+// storage 参数可选、在 try 内才解析 localStorage：站点数据被禁用时连读 window.localStorage 本身都会抛 SecurityError
+export function storeInvite(code: string, now = Date.now(), storage?: Storage): void {
   try {
-    storage.setItem(INVITE_KEY, JSON.stringify({ code, at: now }))
+    ;(storage ?? localStorage).setItem(INVITE_KEY, JSON.stringify({ code, at: now }))
   } catch {
     /* 隐私模式 / 配额满：不记住邀请码，注册照常 */
   }
 }
 
 /** 读取 30 天内存下的邀请码；过期或内容损坏则清除并返回 null。 */
-export function readInvite(now = Date.now(), storage: Storage = localStorage): string | null {
+export function readInvite(now = Date.now(), storage?: Storage): string | null {
   try {
-    const raw = storage.getItem(INVITE_KEY)
+    const raw = (storage ?? localStorage).getItem(INVITE_KEY)
     if (!raw) return null
     const v = JSON.parse(raw) as { code?: unknown; at?: unknown } | null
     const code = typeof v?.code === 'string' ? normalizeInviteCode(v.code) : null
@@ -65,9 +66,9 @@ export function readInvite(now = Date.now(), storage: Storage = localStorage): s
   }
 }
 
-export function clearInvite(storage: Storage = localStorage): void {
+export function clearInvite(storage?: Storage): void {
   try {
-    storage.removeItem(INVITE_KEY)
+    ;(storage ?? localStorage).removeItem(INVITE_KEY)
   } catch {
     /* ignore */
   }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { clearInvite, INVITE_KEY, inviteToast, normalizeInviteCode, parseInviteParam, readInvite, storeInvite } from '../invite'
 
 class MemStorage implements Storage {
@@ -120,6 +120,30 @@ describe('invite code (Review Focus 5)', () => {
     expect(() => storeInvite('ABCDEFGH', 1_000, s)).not.toThrow()
     expect(readInvite(1_000, s)).toBeNull()
     expect(() => clearInvite(s)).not.toThrow()
+  })
+
+  describe('缺省用 window.localStorage', () => {
+    afterEach(() => {
+      vi.restoreAllMocks()
+      localStorage.clear()
+    })
+
+    it('不传 storage 时读写 localStorage', () => {
+      storeInvite('ABCDEFGH', 1_000)
+      expect(JSON.parse(localStorage.getItem(INVITE_KEY)!)).toEqual({ code: 'ABCDEFGH', at: 1_000 })
+      expect(readInvite(2_000)).toBe('ABCDEFGH')
+      clearInvite()
+      expect(localStorage.getItem(INVITE_KEY)).toBeNull()
+    })
+
+    it('读取 window.localStorage 本身抛 SecurityError（站点数据被禁用）时不外泄', () => {
+      vi.spyOn(window, 'localStorage', 'get').mockImplementation(() => {
+        throw new DOMException('denied', 'SecurityError')
+      })
+      expect(() => storeInvite('ABCDEFGH', 1_000)).not.toThrow()
+      expect(readInvite(1_000)).toBeNull()
+      expect(() => clearInvite()).not.toThrow()
+    })
   })
 
   it('提示文案', () => {
