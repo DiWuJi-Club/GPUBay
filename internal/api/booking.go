@@ -118,7 +118,12 @@ type groupView struct {
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.Fleet.ListGroups(r.Context(), true)
+	productID, err := queryInt64(r, "product_id") // 可选：只算该商品的机器（终审 M1）
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	rows, err := s.Fleet.ListGroups(r.Context(), true, productID)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -145,7 +150,12 @@ func (s *Server) handleGroupMachines(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	items, err := s.Rental.GroupMachines(r.Context(), id, true)
+	productID, err := queryInt64(r, "product_id")
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	items, err := s.Rental.GroupMachines(r.Context(), id, productID, true)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -164,7 +174,12 @@ func (s *Server) handleGroupCalendar(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	out, err := s.Rental.GroupCalendar(r.Context(), id, from, days, true)
+	productID, err := queryInt64(r, "product_id")
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	out, err := s.Rental.GroupCalendar(r.Context(), id, productID, from, days, true)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -229,6 +244,12 @@ func (s *Server) handleAvailability(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("quantity"); v != "" {
 		if quantity, err = strconv.Atoi(v); err != nil {
 			s.writeError(w, r, apperr.BadRequest("quantity 必须是整数"))
+			return
+		}
+	}
+	if machineID != nil { // 与指定机器下单同一校验：未上架的机器探测不到空闲情况（终审 M2）
+		if err := s.bookableMachine(r.Context(), *machineID, groupID); err != nil {
+			s.writeError(w, r, err)
 			return
 		}
 	}

@@ -35,7 +35,7 @@ func TestGroupCRUDAndAssign(t *testing.T) {
 	if err := svc.AssignMachines(ctx, opsActor, g.ID, []int64{m1, 999999}); apperr.As(err) == nil {
 		t.Fatalf("unknown machine = %v", err)
 	}
-	rows, err := svc.ListGroups(ctx, false)
+	rows, err := svc.ListGroups(ctx, false, nil)
 	if err != nil || len(rows) != 1 || rows[0].MachineCount != 2 || rows[0].IdleNow != 2 {
 		t.Fatalf("list = %+v, %v", rows, err)
 	}
@@ -43,7 +43,7 @@ func TestGroupCRUDAndAssign(t *testing.T) {
 		t.Fatalf("delete non-empty = %v", err)
 	}
 	hidden, _ := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "留池", Visible: false})
-	if vis, _ := svc.ListGroups(ctx, true); len(vis) != 1 || vis[0].ID != g.ID {
+	if vis, _ := svc.ListGroups(ctx, true, nil); len(vis) != 1 || vis[0].ID != g.ID {
 		t.Fatalf("visible only = %+v", vis)
 	}
 	// 展示名：唯一、≤ 32 字、三态改组

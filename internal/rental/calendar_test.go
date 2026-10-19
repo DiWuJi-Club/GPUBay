@@ -25,7 +25,7 @@ func TestGroupCalendarCountsFreeMachinesPerDay(t *testing.T) {
 	// 机器 0：T0 + 2d 11:00 CST 起租 1 天 → 占 [T0+2d+2h, T0+2d+3h+24h+7h)，跨北京时间第 3、4 天
 	e.reserveRaw(e.machines[0], dbtest.T0.Add(48*time.Hour+3*time.Hour), 86400)
 	from := dbtest.T0 // 2026-01-01 08:00 CST；DayStart → 1 月 1 日 00:00 CST
-	days, err := e.svc.GroupCalendar(e.ctx, gid, from, 5, true)
+	days, err := e.svc.GroupCalendar(e.ctx, gid, nil, from, 5, true)
 	if err != nil || len(days) != 5 {
 		t.Fatalf("calendar = %+v, %v", days, err)
 	}
@@ -39,13 +39,13 @@ func TestGroupCalendarCountsFreeMachinesPerDay(t *testing.T) {
 		}
 	}
 	hidden := e.group("留池", false)
-	if _, err := e.svc.GroupCalendar(e.ctx, hidden, from, 5, true); !errors.Is(err, apperr.ErrGroupNotFound) {
+	if _, err := e.svc.GroupCalendar(e.ctx, hidden, nil, from, 5, true); !errors.Is(err, apperr.ErrGroupNotFound) {
 		t.Fatalf("hidden group (console) = %v", err)
 	}
-	if _, err := e.svc.GroupCalendar(e.ctx, hidden, from, 5, false); err != nil {
+	if _, err := e.svc.GroupCalendar(e.ctx, hidden, nil, from, 5, false); err != nil {
 		t.Fatalf("hidden group (admin) = %v", err)
 	}
-	if _, err := e.svc.GroupCalendar(e.ctx, gid, from, 62, true); apperr.As(err) == nil {
+	if _, err := e.svc.GroupCalendar(e.ctx, gid, nil, from, 62, true); apperr.As(err) == nil {
 		t.Fatalf("days > 61 = %v", err)
 	}
 }
@@ -77,7 +77,7 @@ func TestMachineCalendarMasksOtherUsers(t *testing.T) {
 		t.Fatalf("outside window = %+v", later)
 	}
 	// busy_until = 最近一条（当前或未来）active / reserved 时段的上界，不是最晚的那条
-	ms, err := e.svc.GroupMachines(e.ctx, gid, true)
+	ms, err := e.svc.GroupMachines(e.ctx, gid, nil, true)
 	if err != nil || len(ms) != 1 || ms[0].Label != "机器 #"+itoa64(e.machines[0]) || ms[0].BusyUntil == nil || !ms[0].BusyUntil.Equal(dbtest.T0.Add(3*time.Hour+24*time.Hour+rental.Tail)) {
 		t.Fatalf("group machines = %+v, %v", ms, err)
 	}

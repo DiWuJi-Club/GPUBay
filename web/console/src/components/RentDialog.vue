@@ -136,7 +136,12 @@ async function loadGroupDetails() {
   const gid = form.groupId
   if (gid === null) return
   try {
-    const [m, c] = await Promise.all([api.get<Listed<GroupMachine>>(`/groups/${gid}/machines`), api.get<{ days: CalendarDay[] }>(`/groups/${gid}/calendar`, { days: 61 })])
+    // product_id：机组可跨商品，机器列表与日历只算本商品的机器（与可用性 / 下单同口径）
+    const pid = props.product.id
+    const [m, c] = await Promise.all([
+      api.get<Listed<GroupMachine>>(`/groups/${gid}/machines`, { product_id: pid }),
+      api.get<{ days: CalendarDay[] }>(`/groups/${gid}/calendar`, { product_id: pid, days: 61 }),
+    ])
     if (form.groupId !== gid) return
     machines.value = m.items
     calendar.value = c.days

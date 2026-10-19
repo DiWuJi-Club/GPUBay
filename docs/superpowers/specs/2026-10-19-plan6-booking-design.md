@@ -385,7 +385,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 |---|---|
 | 即时租用 | 走 `PlaceBatch` 即时分支：候选只要 `idle AND agent_online` 且 `[now, now+D+Tail)` 无重叠；一台机器若在 D+7h 内有预订就不会被分给这单（用户看到的 `idle_count` 改为「此刻可即时租用」= 同一查询的 count，而不是单纯 idle 台数） |
 | 维护模式 | 进入维护只允许 `idle / faulty`（现状）；机器上有未开通预订时后台提示（B12），预订在开通时改派。结束维护的检查不变 |
-| 换机（`AdminMigrate`） | 新机器用 §4.2 即时分支（period 与 `openLease` 对 creating 的估算一致：`[now, now + CreateTimeout + 剩余 + Tail)`），不会挑到放不下的机器；新实例**复制** `auto_renew`、`auto_renew_duration`（否则用户开了自动续费换一次机就静默失效）；`group_id` 取**新机器的机组**（实施中裁定，见 `followups-plan6.md`：展示名与机组保持一致，删除机组的检查也以实际机器为准）；`batch_id` 不复制，`scheduled_*` / `provisioned_at` 为 NULL；旧实例 lease 由 `beginWipe → refreshLease` 处理（上界封顶）。预订实例不可换机（§5.6） |
+| 换机（`AdminMigrate`） | 新机器用 §4.2 即时分支（period 与 `openLease` 对 creating 的估算一致：`[now, now + CreateTimeout + 剩余 + Tail)`），不会挑到放不下的机器；新实例**复制** `auto_renew`、`auto_renew_duration`（否则用户开了自动续费换一次机就静默失效）；`group_id` 取**新机器的机组**（实施中裁定，见 `followups-plan6.md`：展示名与机组保持一致，删除机组的检查也以实际机器为准）；`batch_id` 不复制，`scheduled_*` / `provisioned_at` 为 NULL；旧实例 lease 由 `beginWipe → refreshLease` 处理（上界封顶）。预订实例不可换机（§5.6）。早开通的预订实例（running 且 now < S）换机：新实例 `pending_seconds = (resumeBase(now) − now) + 剩余`，即到原到期 S + D 为止的全部时长，新实例开通后到期不早于 S + D（不少算已付时长）；`instance_transfers.seconds` 与审计 `seconds` 只记已付的剩余（新实例开通失败按它退款，早开通的免费时段不折现），审计另记 `pending_seconds`（终审 M4） |
 | 机器失联（暂停） | 上界每轮推进并封顶（§4.3）；若封顶导致到预订开通时刻机器仍被占 → 预订改派，老租户不动（第 11 条决策） |
 | 到期停机 + 6h 保留 | 尾段已计入时段；停机期间续费受 §7.1 约束（用户若想续但被挡 → 控制台提示可续至，或等数据保留结束） |
 | 用户释放（不退款） | 不变；释放后 `beginWipe` 上界封顶为洗机估算 |
@@ -417,11 +417,11 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/groups?product_id=` | `{items:[{id,name,region,description,machine_count,idle_now}]}`，只含 `visible` 机组；匿名可访问（市场页未登录也能看） |
-| GET | `/groups/{id}/machines` | `{items:[{id,label,busy_until}]}`，`label` = `display_name` 或 `机器 #id`；`busy_until` = 最近一条 active / reserved 时段的 upper（无则 null） |
-| GET | `/groups/{id}/calendar?from=&days=` | `{days:[{date,free,total}]}` |
+| GET | `/groups?product_id=` | `{items:[{id,name,region,description,machine_count,idle_now}], now}`，只含 `visible` 机组；匿名可访问（市场页未登录也能看）；带 `product_id` 时两个计数只算该商品的机器（机组可跨商品，§3.1；终审 M1），不带则不过滤 |
+| GET | `/groups/{id}/machines?product_id=` | `{items:[{id,label,busy_until}]}`，`label` = `display_name` 或 `机器 #id`；`busy_until` = 最近一条 active / reserved 时段的 upper（无则 null）；`product_id` 同上 |
+| GET | `/groups/{id}/calendar?product_id=&from=&days=` | `{days:[{date,free,total}]}`；`product_id` 同上 |
 | GET | `/machines/{id}/calendar?from=&days=` | `{periods:[{lower,upper,mine}]}`；机器不在可见机组 → 404；匿名可访问（`mine` 恒为 false） |
-| GET | `/availability?product_id=&group_id?=&machine_id?=&start_at?=&duration=&quantity=` | `{available:n, period:{lower,upper}}`；`start_at` 缺省 = 立即 |
+| GET | `/availability?product_id=&group_id?=&machine_id?=&start_at?=&duration=&quantity=` | `{available:n, period:{lower,upper}}`；`start_at` 缺省 = 立即；带 `machine_id` 时与 `POST /bookings` 指定机器同一校验（机器在可见机组且 `group_id` 与之一致，否则 `not_found`；终审 M2） |
 | POST | `/bookings` | body `{product_id, image_id, group_id?, machine_id?, count, duration, quantity, start_at?, auto_renew?, auto_renew_duration?}` + `Idempotency-Key` → 201 `{batch:{id,count,created_at}, orders:[Order], instances:[Instance]}`；`start_at` 缺省 = 立即（即时分支）；`machine_id` 要求 `count=1` 且 `group_id` 为该机器所在机组 |
 | POST | `/orders` | 保留，语义 = `count 1 / quantity 1 / 立即`，响应不变（内部走 `PlaceBatch`） |
 | GET | `/bookings/{batch_id}` | `{batch, orders, instances}`（只看自己的） |
@@ -431,7 +431,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 | POST | `/instances/{id}/renew` | body 增加 `quantity?`（默认 1）；错误新增 `renew_blocked` |
 | GET | `/instances/{id}/events` | `{items:[{to_state,reason_kind,at,detail}]}` 最近 20 条，只输出白名单种类（下单 / 开通 / 改派 / 自动续费 / 取消 / 到期 / 释放），`detail` 为可展示文案（不透出机器 ID、序列号） |
 
-`instanceView` 新增字段：`scheduled_start_at`、`scheduled_end_at`、`cancellable_until`、`group_id`、`group_name`、`machine_label`、`batch_id`、`reassign_count`、`auto_renew`、`auto_renew_duration`、`auto_renew_failed_reason`、`renewable_until`、`renew_options`。`Order` 视图新增 `quantity`、`batch_id`、`auto`。`productView.idle_count` 语义改为「此刻可即时租用台数」（§8 第 1 行）。
+`instanceView` 新增字段：`scheduled_start_at`、`scheduled_end_at`、`cancellable_until`、`cancellable_seconds`（按服务器时钟距取消截止的秒数，非 reserved 或已过截止为 0；终审 M3）、`group_id`、`group_name`、`machine_label`、`batch_id`、`reassign_count`、`auto_renew`、`auto_renew_duration`、`auto_renew_failed_reason`、`renewable_until`、`renew_options`。`Order` 视图新增 `quantity`、`batch_id`、`auto`。`productView.idle_count` 语义改为「此刻可即时租用台数」（§8 第 1 行）。
 
 ### 10.2 后台（`/admin/api/v1`）
 
@@ -444,7 +444,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 | POST | `/groups/{id}/machines` | ops | `{machine_ids:[…]}` 批量加入（已在其他机组的机器直接改组）；审计 `group.assign`（含列表） |
 | DELETE | `/groups/{id}/machines` | ops | `{machine_ids}` 移出（置 NULL）；审计 `group.unassign` |
 | PUT | `/machines/{id}` | ops | `{group_id?, display_name?}` 只认这两个字段；审计 `machine.update`（before / after） |
-| GET | `/machines/{id}` | ops | 响应新增 `group`、`display_name`、`leases:[{id,instance_id,status,lower,upper}]`（未来 60 天 + 当前） |
+| GET | `/machines/{id}` | ops | 响应新增 `group`、`display_name`、`leases:[{id,instance_id,status,lower,upper}]`（未来 60 天 + 当前）；`current_instance` 只取活动态（creating / running / stopped / wiping），`reserved` 既不进 `current_instance` 也不进 `history`（只在 `leases` 里出现；终审 I1） |
 | GET | `/machines/{id}/calendar?from&days` | ops | 同控制台但带 `instance_id` / `user_id` |
 | GET | `/bookings?state=&user_id=&group_id=&machine_id=&from=&to=&page=` | all | 预订列表（`state ∈ reserved / cancelled`，默认 reserved）：实例 ID、用户、机组、机器、开始、结束、批次、改派次数、下单时间 |
 | GET | `/bookings/upcoming?days=7` | all | 仪表盘用：未来 N 天每天开始的预订台数 |
@@ -475,7 +475,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 
 ### 11.2 我的实例 `/instances`
 - 新状态标签：`已预订`（青色）、`已取消`（灰）。
-- 预订卡片时间文案：`<S> 开始 · 共 <D>`；`cancellable_until` 之前显示「可取消」小字；`reassign_count > 0` 显示「已更换机器」标记。
+- 预订卡片时间文案：`<S> 开始 · 共 <D>`；取消截止之前显示「可取消」小字（列表与详情的「取消预订」按钮同口径：`cancellable_seconds` 从拿到数据的本地时刻起递减，与 `remaining_seconds` 一样不依赖浏览器时钟；终审 M3）；`reassign_count > 0` 显示「已更换机器」标记。
 - 同批次卡片折叠显示批次头（`批次 bat-xxx · N 台`），`?batch=` 参数时只显示该批次并有「取消全部未开通」按钮（逐台调用 `/cancel`，成功 / 失败各自提示）。
 - 有 `reserved` 实例时与 creating 一样每 10 秒刷新（开通时刻会自动变为开通中）。
 

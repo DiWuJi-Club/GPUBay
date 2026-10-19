@@ -224,7 +224,7 @@ func (s *Server) handleMachine(w http.ResponseWriter, r *http.Request) {
 	for _, i := range insts {
 		v := s.instanceView(i)
 		switch {
-		case current == nil && i.State != rental.StateReleased && i.State != rental.StateFailed && i.State != rental.StateCancelled:
+		case current == nil && (i.State == rental.StateCreating || i.State == rental.StateRunning || i.State == rental.StateStopped || i.State == rental.StateWiping):
 			current = &v
 		case len(history) < 20:
 			history = append(history, v)

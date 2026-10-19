@@ -50,7 +50,7 @@ const shown = computed(() => (batchFilter.value ? items.value.filter((i) => i.ba
 const rows = computed(() =>
   shown.value.map((i) => {
     const remaining = remainingNow(i, fetchedAt.value, now.value)
-    return { ...i, remaining, timeText: instanceTimeText(i, remaining), cancellable: canCancel(i, now.value) }
+    return { ...i, remaining, timeText: instanceTimeText(i, remaining), cancellable: canCancel(i, fetchedAt.value, now.value) }
   }),
 )
 const cancellableCount = computed(() => rows.value.filter((r) => r.cancellable).length)
