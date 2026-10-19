@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { brand, isApiError, useCountdown, type User } from '@spark/shared'
-import { computed, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { postLoginTarget } from '../logic/access'
+import { clearInvite, inviteToast, parseInviteParam, readInvite } from '../logic/invite'
 import { isValidPhone, normalizeCode, normalizePhone } from '../logic/login'
 import { notifyError } from '../logic/notify'
 import { setUser } from '../store/session'
@@ -20,6 +22,27 @@ const submitting = ref(false)
 const { remaining: countdown, start: startCountdown } = useCountdown()
 const sendLabel = computed(() => (countdown.value > 0 ? `${countdown.value} 秒后重发` : '发送验证码'))
 const logo = import.meta.env.BASE_URL + brand.logoUrl
+
+// 邀请：本地存下的邀请码（App.vue 落地时写入；直接打开 /login?ic= 时它可能还没写完，所以也看地址栏）
+const inviteCode = ref<string | null>(null)
+const inviter = ref('')
+onMounted(async () => {
+  const code = readInvite() ?? parseInviteParam(window.location.search)
+  if (!code) return
+  try {
+    const r = await api.get<{ valid: boolean; inviter: string }>(`/referral/codes/${code}`)
+    if (r.valid) {
+      inviteCode.value = code
+      inviter.value = r.inviter
+    } else clearInvite() // 无效：静默丢弃
+  } catch {
+    /* 查询失败（限流 / 网络）：不显示，提交时也不带码 */
+  }
+})
+function dropInvite() {
+  inviteCode.value = null
+  clearInvite()
+}
 
 async function send() {
   const p = normalizePhone(phone.value)
@@ -47,7 +70,13 @@ async function submit() {
   if (phoneError.value || codeError.value) return
   submitting.value = true
   try {
-    const u = await api.post<User>('/auth/login', { phone: p, code: c })
+    const u = await api.post<User>('/auth/login', { phone: p, code: c, ...(inviteCode.value ? { invite_code: inviteCode.value } : {}) })
+    if (u.invite) {
+      const t = inviteToast(u.invite)
+      if (t.type === 'success') ElMessage.success(t.message)
+      else if (t.type === 'warning') ElMessage.warning(t.message)
+    }
+    clearInvite() // 绑定只在注册时：登录成功后邀请码已无用
     setUser(u)
     const next = postLoginTarget(route.query.redirect)
     if (next.kind === 'assign') {
@@ -68,6 +97,10 @@ async function submit() {
   <div class="login-page">
     <el-card class="login-card" data-testid="login-card">
       <h1 class="brand"><img :src="logo" alt="" width="32" height="32" /> {{ brand.name }}</h1>
+      <el-alert v-if="inviteCode" type="info" :closable="false" show-icon class="invite" data-testid="login-invite">
+        <span>通过 <b>{{ inviter }}</b> 的邀请注册</span>
+        <el-button link size="small" class="invite-clear" aria-label="不使用邀请码" data-testid="login-invite-clear" @click="dropInvite">×</el-button>
+      </el-alert>
       <el-form label-position="top" @submit.prevent="submit">
         <el-form-item label="手机号" :error="phoneError" data-testid="login-phone-item">
           <el-input v-model="phone" data-testid="login-phone" inputmode="tel" autocomplete="tel" maxlength="13" placeholder="请输入手机号" />
@@ -92,5 +125,7 @@ async function submit() {
 .code-row { display: flex; gap: 8px; width: 100%; }
 .code-row .el-input { flex: 1; }
 .submit { width: 100%; }
+.invite { margin-bottom: 12px; }
+.invite-clear { margin-left: 8px; }
 .hint { color: #909399; font-size: 12px; text-align: center; margin: 12px 0 0; }
 </style>
