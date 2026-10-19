@@ -54,7 +54,26 @@ func TestNormalizeFiltersDedupesSortsAndCaps(t *testing.T) {
 	if len(got) != 1 || len(got[0]) > imageref.MaxLen || !utf8.ValidString(got[0]) {
 		t.Fatalf("multibyte truncation = %d %q", len(got[0]), got[0])
 	}
+	// 非法 UTF-8 的行整行丢弃（docker 输出不应出现；写进 text[] 会让整条 UPDATE 失败）
+	got = imageref.Normalize([]string{"ok:1", "bad\xff:1", "a:\xc3"})
+	if !slices.Equal(got, []string{"ok:1"}) {
+		t.Fatalf("invalid utf-8 = %q", got)
+	}
 	if got := imageref.Normalize(nil); got == nil || len(got) != 0 {
 		t.Fatalf("empty input must give empty, non-nil list: %#v", got)
+	}
+}
+
+func TestKeyTruncatesFamiliarForm(t *testing.T) {
+	long := "r/" + strings.Repeat("x", 250) // 252 字节，补 :latest 后 259
+	want := (long + ":latest")[:imageref.MaxLen]
+	if got := imageref.Key(long); got != want {
+		t.Fatalf("Key = %d bytes %q", len(got), got)
+	}
+	if got := imageref.Normalize([]string{long + ":latest"}); !slices.Equal(got, []string{want}) {
+		t.Fatalf("Normalize must store the same Key: %q", got)
+	}
+	if got := imageref.Key("docker.io/library/ubuntu"); got != "ubuntu:latest" {
+		t.Fatalf("Key short = %q", got)
 	}
 }

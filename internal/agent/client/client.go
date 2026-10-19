@@ -403,10 +403,11 @@ func (c *Client) SendStateReport(ctx context.Context) error {
 
 func (c *Client) stateReport(ctx context.Context) *agentpb.AgentMessage {
 	var states []*agentpb.InstanceState
-	for _, s := range c.ex.Report(ctx) {
+	report, images := c.ex.Snapshot(ctx)
+	for _, s := range report {
 		states = append(states, &agentpb.InstanceState{InstanceId: s.InstanceID, Phase: s.Phase})
 	}
-	return &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Instances: states, Images: c.ex.Images(ctx)}}}
+	return &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Instances: states, Images: images}}}
 }
 
 // Step 步进模式：执行队列（override 非空时直接记录该结果）、逐条发送结果（含回放）、再发 StateReport。

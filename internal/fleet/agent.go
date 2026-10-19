@@ -121,13 +121,17 @@ func (s *Service) RecordMetrics(ctx context.Context, machineID int64, version st
 
 // RecordCachedImages 写 machines.cached_images / cached_images_at；images 为 nil 时不写（旧 Agent）。
 // 网关侧按 imageref.Normalize 再规范化一遍（不信任 Agent 的截断与形态）。
+// 每分钟每台机器一次：列表没变时保留原值（不重写数组，updated_at 也不动），只刷新 cached_images_at。
 func (s *Service) RecordCachedImages(ctx context.Context, machineID int64, images []string) error {
 	if images == nil {
 		return nil
 	}
 	now := s.clock.Now()
-	_, err := s.pool.Exec(ctx, `UPDATE machines SET cached_images = $2, cached_images_at = $3, updated_at = $3 WHERE id = $1`,
-		machineID, imageref.Normalize(images), now)
+	_, err := s.pool.Exec(ctx, `UPDATE machines SET
+		cached_images = CASE WHEN cached_images = $2::text[] THEN cached_images ELSE $2::text[] END,
+		updated_at = CASE WHEN cached_images = $2::text[] THEN updated_at ELSE $3 END,
+		cached_images_at = $3
+		WHERE id = $1`, machineID, imageref.Normalize(images), now)
 	return err
 }
 

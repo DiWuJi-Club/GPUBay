@@ -561,3 +561,16 @@ func TestCoverageMatchesFamiliarRef(t *testing.T) {
 		t.Fatalf("coverage = %+v %v", cov, err)
 	}
 }
+
+// 登记的镜像地址补 :latest 后超过 256 字节：覆盖率按与 cached_images 相同的规则截断后比对。
+func TestCoverageMatchesTruncatedRef(t *testing.T) {
+	e := newEnv(t, 1)
+	long := "r/" + strings.Repeat("x", 250)
+	e.exec(`UPDATE images SET ref = $2 WHERE id = $1`, e.imageID, long)
+	e.exec(`UPDATE machines SET cached_images = ARRAY[$2], cached_images_at = $3 WHERE id = $1`, e.machines[0], (long + ":latest")[:256], e.clk.Now())
+	v := e.version(e.app("vllm", "").ID, "1")
+	cov, err := e.cat.VersionCoverage(e.ctx, v)
+	if err != nil || len(cov) != 1 || cov[0].Cached != 1 {
+		t.Fatalf("coverage = %+v %v", cov, err)
+	}
+}

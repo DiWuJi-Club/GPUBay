@@ -1184,3 +1184,29 @@ func TestImagesReportedFromRuntime(t *testing.T) {
 		t.Fatalf("blocked = %v after %v", got, time.Since(start))
 	}
 }
+
+// Snapshot：实例状态与镜像共用一个 reportTimeout；状态采集用完时限后不再调用 docker 列镜像。
+func TestSnapshotSharesReportDeadline(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.run(create("ins-aaaaaaaa"))
+	e.rt.SetImages([]string{"a:1"})
+	states, imgs := e.ex.Snapshot(ctx)
+	if len(states) != 1 || states[0].Phase != "running" || !slices.Equal(imgs, []string{"a:1"}) {
+		t.Fatalf("snapshot = %v %v", states, imgs)
+	}
+	executor.SetReportTimeoutForTest(e.ex, 50*time.Millisecond)
+	e.rt.Block("list", true)
+	e.rt.FailNext("images", errors.New("must not be consumed"))
+	states, imgs = e.ex.Snapshot(ctx)
+	if len(states) != 1 || states[0].Phase != "unknown" || imgs != nil {
+		t.Fatalf("stalled snapshot = %v %v", states, imgs)
+	}
+	// 镜像没被列过：预置的失败仍在队列里
+	if got := e.ex.Images(ctx); got != nil {
+		t.Fatalf("images was listed after report deadline: next call = %v", got)
+	}
+	if got := e.ex.Images(ctx); !slices.Equal(got, []string{"a:1"}) {
+		t.Fatalf("images = %v", got)
+	}
+}

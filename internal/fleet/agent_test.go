@@ -148,12 +148,29 @@ func TestRecordCachedImages(t *testing.T) {
 	if len(m.CachedImages) != fleet.MaxCachedImages || len(m.CachedImages[0]) != fleet.MaxCachedImageLen || !m.CachedImagesAt.Equal(clk.Now()) {
 		t.Fatalf("truncation: %d items, first len %d", len(m.CachedImages), len(m.CachedImages[0]))
 	}
+	// 列表没变：只刷新 cached_images_at，不重写数组（updated_at 不动）；变了才动 updated_at
+	updatedAt := func() time.Time {
+		var at time.Time
+		if err := pool.QueryRow(ctx, `SELECT updated_at FROM machines WHERE id = $1`, id).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	changedAt := updatedAt()
+	clk.Advance(time.Minute)
+	if err := svc.RecordCachedImages(ctx, id, many); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = svc.Get(ctx, pool, id)
+	if len(m.CachedImages) != fleet.MaxCachedImages || !m.CachedImagesAt.Equal(clk.Now()) || !updatedAt().Equal(changedAt) {
+		t.Fatalf("unchanged list: %d items at %v, updated_at %v (was %v)", len(m.CachedImages), m.CachedImagesAt, updatedAt(), changedAt)
+	}
 	// 空列表（Agent 本机确实没有镜像）照写
 	if err := svc.RecordCachedImages(ctx, id, []string{}); err != nil {
 		t.Fatal(err)
 	}
-	if m, _ = svc.Get(ctx, pool, id); m.CachedImages == nil || len(m.CachedImages) != 0 {
-		t.Fatalf("empty = %#v", m.CachedImages)
+	if m, _ = svc.Get(ctx, pool, id); m.CachedImages == nil || len(m.CachedImages) != 0 || !updatedAt().Equal(clk.Now()) {
+		t.Fatalf("empty = %#v, updated_at %v", m.CachedImages, updatedAt())
 	}
 	// 镜像列表不进 last_state_report
 	if err := svc.RecordStateReport(ctx, id, fleet.StateReport{Images: []string{"a:1"}}); err != nil {

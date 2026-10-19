@@ -34,7 +34,7 @@ func (c *Catalog) VersionCoverage(ctx context.Context, v Version) ([]Coverage, e
 		if err != nil {
 			return nil, err
 		}
-		ref = imageref.Familiar(ref) // 与 Agent 上报的 docker image ls 形态对齐（docker.io/library/ 折叠、补 :latest）
+		ref = imageref.Key(ref) // 与 cached_images 同一形态（docker.io/library/ 折叠、补 :latest、截到 256 字节）
 		err = c.pool.QueryRow(ctx, `SELECT
 			count(*) FILTER (WHERE agent_online) AS online,
 			count(*) FILTER (WHERE agent_online AND cached_images_at >= $2 AND $1 = ANY(cached_images)) AS cached,

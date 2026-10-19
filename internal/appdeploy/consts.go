@@ -21,8 +21,6 @@ const (
 	DefaultAppRoot        = "/root/data"
 	AppDirName            = ".spark-apps"
 	ModelsDirName         = "models"
-	MaxCachedImages       = 200
-	MaxCachedImageLen     = 256
 	MinSecretLen          = 8
 	UserOpsPerHour        = 60
 	MaxMessageLen         = 200

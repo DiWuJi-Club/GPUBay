@@ -36,18 +36,22 @@ func Familiar(ref string) string {
 	return ref
 }
 
+// Key 是 cached_images 里存、覆盖率统计拿 images.ref 去比的形态：Familiar 后截到 MaxLen 字节（不切开多字节字符）。
+// 两边都经过 Key，超长的引用也按同一规则截断，仍然对得上。
+func Key(ref string) string { return truncate(Familiar(ref)) }
+
 // Normalize 把 docker image ls 的输出行（或 Agent 上报的列表）整理成 cached_images：
-// 去掉空行与含 <none> 的项、Familiar 化、每项截到 MaxLen 字节（不切开多字节字符）、去重、排序、截到 MaxItems 项。
+// 去掉空行、含 <none> 的项与非法 UTF-8 的项（text[] 只收合法 UTF-8），逐项取 Key、去重、排序、截到 MaxItems 项。
 // 结果总是非 nil（text[] 列 NOT NULL）。
 func Normalize(lines []string) []string {
 	seen := map[string]bool{}
 	list := []string{}
 	for _, l := range lines {
 		l = strings.TrimSpace(l)
-		if l == "" || strings.Contains(l, "<none>") {
+		if l == "" || strings.Contains(l, "<none>") || !utf8.ValidString(l) {
 			continue
 		}
-		l = truncate(Familiar(l))
+		l = Key(l)
 		if seen[l] {
 			continue
 		}
