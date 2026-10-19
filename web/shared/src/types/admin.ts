@@ -5,6 +5,7 @@ import type { InstanceState, OrderKind, OrderStatus } from './instance'
 import type { KycResult } from './kyc'
 import type { LedgerKind, LedgerRow } from './wallet'
 import type { RechargeChannel, RechargeStatus } from './recharge'
+import type { BindingStatus, RebateRule, ReferralAccountStatus, RewardStatus } from './referral'
 import type { User } from './user'
 
 export interface Paged<T> {
@@ -272,6 +273,11 @@ export interface UserDetail {
   ledger: LedgerRow[]
   kyc: AdminKYCRecord[]
   ssh_keys: SshKey[]
+  /** 邀请区块：作为被邀请人时的邀请人、作为邀请人时的统计；两者都没有时为空对象 */
+  referral: {
+    inviter?: { user_id: number; phone: string; binding_status: BindingStatus }
+    account?: { code: string; status: ReferralAccountStatus; invitees: number; settled_net: number; pending: number; debt: number }
+  }
 }
 
 export interface AdminPrice {
@@ -332,4 +338,121 @@ export interface Dashboard {
   utilization: { date: string; rate: number }[]
   ssh_sessions_open: number
   bookings_upcoming_7d: number
+  /** 本月已发放返利净额（返利 − 扣回，分） */
+  referral_month_settled: number
+}
+
+// ---- 邀请返利（计划 8，金额单位：分）。手机号为原文，页面显示前须脱敏；后端从不返回实名指纹 / 证件号 ----
+
+export type RiskFlag = 'same_ip' | 'same_device' | 'burst' | 'same_identity'
+
+/** GET /referral/summary */
+export interface AdminReferralSummary {
+  pending: number
+  month_settled: number
+  settled_net: number
+  debt: number
+  held_count: number
+}
+
+/** 费率版本（GET /referral/config 的 current 与 versions[]） */
+export interface AdminRateVersion extends RebateRule {
+  id: number
+  effective_from: string
+  note: string
+  created_by: number | null
+  created_at: string
+}
+
+/** 邀请账户（referral_accounts） */
+export interface AdminReferralAccount {
+  user_id: number
+  code: string
+  status: ReferralAccountStatus
+  frozen_reason: string
+  debt: number
+  created_at: string
+}
+
+/** GET /referral/inviters 的一行 */
+export interface AdminInviterRow extends AdminReferralAccount {
+  phone: string
+  kyc_status: string
+  user_status: string
+  invitees: number
+  held_count: number
+  pending: number
+  settled_net: number
+  last_bound_at: string | null
+}
+
+/** 绑定（GET /referral/bindings；ip / device_id / user_agent 只用于导出核查，页面不展示） */
+export interface AdminBinding {
+  id: number
+  inviter_id: number
+  invitee_id: number
+  inviter_phone: string
+  invitee_phone: string
+  code: string
+  status: BindingStatus
+  risk_flags: RiskFlag[]
+  hold_reason: string
+  rate_version_id: number
+  bound_at: string
+  rebate_until: string
+  ip: string
+  device_id: string
+  user_agent: string
+  reviewed_by: number | null
+  reviewed_at: string | null
+  review_note: string
+  pending: number
+  contributed: number
+  /** 邀请人或被邀请人有未处理的实名同身份核查失败（晚于绑定 / 上次审核），通过前须人工核查 */
+  kyc_check_unresolved: boolean
+}
+
+/** GET /referral/rewards 的一行 */
+export interface AdminReferralReward {
+  order_id: string
+  binding_id: number
+  inviter_id: number
+  invitee_id: number
+  rate_version_id: number
+  rate_bp: number
+  order_amount: number
+  refunded_amount: number
+  reward_cap: number
+  reward: number
+  status: RewardStatus
+  settle_after: string
+  settled_amount: number
+  clawed_amount: number
+  settled_at: string | null
+  paid_at: string
+  created_at: string
+  updated_at: string
+  inviter_phone: string
+  invitee_phone: string
+}
+
+export interface AdminReferralEvent {
+  id: number
+  order_id: string
+  binding_id: number
+  kind: string
+  source_ledger_id: number | null
+  wallet_ledger_id: number | null
+  amount: number
+  detail: string
+  created_at: string
+}
+
+/** GET /referral/inviters/{id} */
+export interface AdminInviterDetail {
+  account: AdminReferralAccount
+  phone: string
+  bindings: AdminBinding[]
+  rewards: AdminReferralReward[]
+  events: AdminReferralEvent[]
 }

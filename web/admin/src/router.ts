@@ -32,6 +32,7 @@ export const routes: RouteRecordRaw[] = [
   { path: '/orders', component: () => import('./views/OrdersView.vue'), meta: { title: '订单', roles: FIN_ROLES } },
   { path: '/ledger', component: () => import('./views/LedgerView.vue'), meta: { title: '流水', roles: FIN_ROLES } },
   { path: '/recharges', component: () => import('./views/RechargesView.vue'), meta: { title: '充值单', roles: FIN_ROLES } },
+  { path: '/referral', component: () => import('./views/ReferralView.vue'), meta: { title: '邀请返利', roles: FIN_ROLES } },
   { path: '/catalog', component: () => import('./views/CatalogView.vue'), meta: { title: '价格与镜像', roles: SUPER_ONLY } },
   { path: '/admins', component: () => import('./views/AdminsView.vue'), meta: { title: '管理员', roles: SUPER_ONLY } },
   { path: '/audit', component: () => import('./views/AuditView.vue'), meta: { title: '审计日志', roles: ALL_ROLES } },

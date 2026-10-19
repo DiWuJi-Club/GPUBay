@@ -4,6 +4,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { barsOf, CHART } from '../logic/chart'
 import { notifyError } from '../logic/notify'
+import { session } from '../store/session'
 
 const data = ref<Dashboard | null>(null)
 const loadError = ref('')
@@ -73,6 +74,7 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
           <li><span>本月</span><b data-testid="dash-recharge-month">{{ fmtYuan(data.recharge_month) }}</b></li>
         </ul>
       </el-card>
+      <el-card v-if="session.admin?.role !== 'ops'" header="本月已发放返利"><div class="big" data-testid="dash-referral-month">{{ fmtYuan(data.referral_month_settled) }}</div></el-card>
       <el-card header="下单金额">
         <ul class="kv">
           <li><span>今日</span><b data-testid="dash-order-today">{{ fmtYuan(data.order_today) }}</b></li>

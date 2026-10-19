@@ -26,6 +26,7 @@ export const menu: MenuItem[] = [
   { key: 'orders', path: '/orders', label: '订单', roles: FIN_ROLES },
   { key: 'ledger', path: '/ledger', label: '流水', roles: FIN_ROLES },
   { key: 'recharges', path: '/recharges', label: '充值单', roles: FIN_ROLES },
+  { key: 'referral', path: '/referral', label: '邀请返利', roles: FIN_ROLES },
   { key: 'catalog', path: '/catalog', label: '价格与镜像', roles: SUPER_ONLY },
   { key: 'admins', path: '/admins', label: '管理员', roles: SUPER_ONLY },
   { key: 'audit', path: '/audit', label: '审计日志', roles: ALL_ROLES },
