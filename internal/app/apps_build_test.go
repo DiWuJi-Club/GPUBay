@@ -102,3 +102,16 @@ func TestBuildRejectsAppHealthAddrInProd(t *testing.T) {
 		t.Fatalf("err = %v, want app health addr rejection", err)
 	}
 }
+
+// 测试注入的应用根目录（假容器里按实例分目录）同样不能用于生产。
+func TestBuildRejectsAppRootInProd(t *testing.T) {
+	cfg := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key}
+	for name, opt := range map[string]app.Options{
+		"AppRoot":    {AppRoot: "/tmp/x"},
+		"AppRootFor": {AppRootFor: func(string) string { return "/tmp/x" }},
+	} {
+		if _, err := app.Build(cfg, nil, discardLog(), opt); err == nil || !strings.Contains(err.Error(), "应用根目录") {
+			t.Fatalf("%s: err = %v, want app root rejection", name, err)
+		}
+	}
+}

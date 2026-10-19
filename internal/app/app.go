@@ -65,6 +65,10 @@ type Options struct {
 	// AppHealthAddr 是测试注入的应用健康检查地址（run.sh 在容器里探测的 host:port）；nil = 127.0.0.1:<主端口>（生产）。
 	// e2e-server 与集成测试的假容器共用一个回环地址时用它把探测指向假应用；生产环境设置时 Build 直接报错。
 	AppHealthAddr func(port int) string
+	// AppRoot / AppRootFor 是测试注入的容器内应用根目录（透传到 appdeploy.Deps 与 RunnerConfig）；零值 = /root/data（生产）。
+	// 集成测试与 e2e-server 的所有实例共用一个假容器 sshd，用 AppRootFor 让每个实例各用 <Root>/<实例 ID>/root/data；生产环境设置时 Build 直接报错。
+	AppRoot    string
+	AppRootFor func(instanceID string) string
 }
 
 const noRateLimit = 1_000_000
@@ -110,6 +114,9 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	if opt.AppHealthAddr != nil && cfg.Env == "prod" {
 		return nil, errors.New("生产环境禁止注入应用健康检查地址")
+	}
+	if (opt.AppRoot != "" || opt.AppRootFor != nil) && cfg.Env == "prod" {
+		return nil, errors.New("生产环境禁止注入应用根目录")
 	}
 	ipHourLimit, loginLimit := 0, 0
 	if opt.DisableRateLimits {
@@ -280,11 +287,12 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	upstreamPool := upstream.New(upstream.Config{Signer: upstreamSigner, Port: cfg.UpstreamSSHPort, Log: log}, r)
 	// 应用一键部署：服务需要上游连接池（实时日志）与入口地址；接上 rental 钩子之后带 app_id 的下单才可用（noop 钩子报 app_not_found）。
-	// 应用根目录用默认的容器路径 /root/data（appdeploy.DefaultAppRoot）。
+	// 应用根目录生产用默认的容器路径 /root/data（appdeploy.DefaultAppRoot）；测试 / e2e 经 Options 注入，Runner 与「查看日志」用同一个。
 	apps := appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
-		Upstream: upstreamPool, PortURL: ingressAuth.PortURL, HFEndpoint: cfg.AppHFEndpoint, PipIndexURL: cfg.AppPipIndexURL})
+		Upstream: upstreamPool, PortURL: ingressAuth.PortURL, HFEndpoint: cfg.AppHFEndpoint, PipIndexURL: cfg.AppPipIndexURL,
+		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor})
 	r.SetAppHooks(apps)
-	appRunner := appdeploy.NewRunner(apps, upstreamPool, appdeploy.RunnerConfig{HealthAddr: opt.AppHealthAddr})
+	appRunner := appdeploy.NewRunner(apps, upstreamPool, appdeploy.RunnerConfig{HealthAddr: opt.AppHealthAddr, AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor})
 	srv.Apps, srv.AppsLimit = apps, authorizeLimit // 零值取默认（每用户每小时 60 次写）；DisableRateLimits 时为 noRateLimit
 	adminSrv.Apps, adminSrv.AppCatalog = apps, appCat
 	routes := ingress.NewTable(r, log)
