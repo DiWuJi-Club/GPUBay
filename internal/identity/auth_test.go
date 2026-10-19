@@ -687,3 +687,108 @@ func TestLoginWithConcurrentFirstLoginBindsOnce(t *testing.T) {
 		t.Fatalf("ok=%d isNew=%d binds=%d users=%d", ok, isNew, len(hook.calls), users)
 	}
 }
+
+// 计划 8 终审 I1：控制台会话启动（GET /me）时补记设备与最近登录——同一设备 / 登录信息一小时内最多写一次；
+// 设备 ID 规则（只认 UUID、按小写存）与 10 台上限同登录；封禁用户不记。
+func TestTouchSessionRecordsDeviceAndLastLogin(t *testing.T) {
+	e := newEnv(t, "000000")
+	ctx := context.Background()
+	if err := e.svc.SendLoginCode(ctx, "13800000031", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	_, r, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000031", Code: "000000", IP: "1.2.3.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := func() (ip string, at time.Time, devSeen map[string]time.Time) {
+		t.Helper()
+		var atp *time.Time
+		if err := e.pool.QueryRow(ctx, `SELECT last_login_ip, last_login_at FROM users WHERE id = $1`, r.ID).Scan(&ip, &atp); err != nil || atp == nil {
+			t.Fatalf("users = %v %v", atp, err)
+		}
+		rows, err := e.pool.Query(ctx, `SELECT device_id, last_seen_at FROM user_devices WHERE user_id = $1`, r.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		devSeen = map[string]time.Time{}
+		for rows.Next() {
+			var d string
+			var s time.Time
+			if err := rows.Scan(&d, &s); err != nil {
+				t.Fatal(err)
+			}
+			devSeen[d] = s
+		}
+		return ip, *atp, devSeen
+	}
+	loginAt := e.clock.Now()
+
+	// 10 分钟后带新设备（大写）启动会话：设备按小写记下；同 IP 且一小时内登录过，last_login 不动
+	e.clock.Advance(10 * time.Minute)
+	t1 := e.clock.Now()
+	if err := e.svc.TouchSession(ctx, r.ID, "1.2.3.4", strings.ToUpper(devA)); err != nil {
+		t.Fatal(err)
+	}
+	if ip, at, devs := state(); ip != "1.2.3.4" || !at.Equal(loginAt) || len(devs) != 1 || !devs[devA].Equal(t1) {
+		t.Fatalf("after first touch: ip=%q at=%v devs=%v", ip, at, devs)
+	}
+	if has, err := e.svc.HasDevice(ctx, e.pool, r.ID, devA); err != nil || !has {
+		t.Fatalf("HasDevice = %v %v", has, err)
+	}
+	// 再过 10 分钟：一小时内不重复写设备
+	e.clock.Advance(10 * time.Minute)
+	if err := e.svc.TouchSession(ctx, r.ID, "1.2.3.4", devA); err != nil {
+		t.Fatal(err)
+	}
+	if _, at, devs := state(); !at.Equal(loginAt) || !devs[devA].Equal(t1) {
+		t.Fatalf("throttled touch wrote: at=%v devs=%v", at, devs)
+	}
+	// IP 变化：立即刷新 last_login_*
+	t2 := e.clock.Now()
+	if err := e.svc.TouchSession(ctx, r.ID, "5.6.7.8", devA); err != nil {
+		t.Fatal(err)
+	}
+	if ip, at, devs := state(); ip != "5.6.7.8" || !at.Equal(t2) || !devs[devA].Equal(t1) {
+		t.Fatalf("ip change: ip=%q at=%v devs=%v", ip, at, devs)
+	}
+	// 超过一小时：同 IP 同设备也刷新
+	e.clock.Advance(61 * time.Minute)
+	t3 := e.clock.Now()
+	if err := e.svc.TouchSession(ctx, r.ID, "5.6.7.8", devA); err != nil {
+		t.Fatal(err)
+	}
+	if ip, at, devs := state(); ip != "5.6.7.8" || !at.Equal(t3) || !devs[devA].Equal(t3) {
+		t.Fatalf("after an hour: ip=%q at=%v devs=%v", ip, at, devs)
+	}
+	// 非 UUID 不记；空 IP 不覆盖
+	e.clock.Advance(2 * time.Hour)
+	if err := e.svc.TouchSession(ctx, r.ID, "", "not-a-uuid"); err != nil {
+		t.Fatal(err)
+	}
+	if ip, at, devs := state(); ip != "5.6.7.8" || !at.Equal(t3) || len(devs) != 1 {
+		t.Fatalf("garbage touch: ip=%q at=%v devs=%v", ip, at, devs)
+	}
+	// 10 台上限：再来 10 台新设备后，最旧的 devA 被删
+	for i := 0; i < 10; i++ {
+		e.clock.Advance(time.Second)
+		if err := e.svc.TouchSession(ctx, r.ID, "5.6.7.8", fmt.Sprintf("00000000-0000-4000-8000-%012d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, devs := state(); len(devs) != 10 || !devs[devA].IsZero() {
+		t.Fatalf("cap: %d devices, devA kept=%v", len(devs), !devs[devA].IsZero())
+	}
+	// 封禁用户：不更新 last_login_*，不记设备
+	if _, err := e.pool.Exec(ctx, `UPDATE users SET status = 'banned' WHERE id = $1`, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	ipB, atB, _ := state()
+	e.clock.Advance(2 * time.Hour)
+	if err := e.svc.TouchSession(ctx, r.ID, "9.9.9.9", "99999999-0000-4000-8000-000000000000"); err != nil {
+		t.Fatal(err)
+	}
+	if ip, at, devs := state(); ip != ipB || !at.Equal(atB) || !devs["99999999-0000-4000-8000-000000000000"].IsZero() {
+		t.Fatalf("banned touch: ip=%q at=%v devs=%v", ip, at, devs)
+	}
+}

@@ -87,7 +87,7 @@
 | R6 | 邀请人**必须已实名**才发放（未实名时返利保持待发放，实名后下一轮发放）；被邀请人下单本身已要求实名 | 返利是收益，收益人要可追溯 |
 | R7 | 绑定只在注册时；邀请码存 localStorage **30 天**；老用户带码登录不绑定；邀请码无效 / 码主被冻结时**注册照常成功、不绑定**，登录响应 `invite.bound=false` 并给原因 | 邀请码问题不能挡注册 |
 | R8 | 自动搁置（`held`，返利待发放但不发放，等后台裁决）的条件：被邀请人与邀请人**同设备**，或同身份（撤销而非搁置）；**同 IP（24h 内）**与**爆发（同一邀请人 24h 内 ≥ 20 个绑定）**只打标记不搁置 | 家庭 / 公司 NAT 下同 IP 很常见，搁置会误伤；同设备几乎只有自刷 |
-| R9 | 后台裁决：搁置 → `approve`（转 active，待发放照常发放）或 `revoke`（撤销：待发放全部作废，已发放不自动扣回、由财务用现有调账处理）；冻结邀请人：码不再可绑定、返利停止发放（继续累计），解冻后恢复 | 撤销与冻结是两个粒度（单个绑定 / 整个邀请人） |
+| R9 | 后台裁决：搁置 → `approve`（转 active，待发放照常发放）或 `revoke`（撤销：待发放全部作废，已发放不自动扣回、由财务用现有调账处理——但订单仍可能退款的已发放返利**不要**手工调账：该订单退款时系统会按 §4.3 自动扣回，手工调账再叠加就重复扣了（终审 M1，见 §15））；冻结邀请人：码不再可绑定、返利停止发放（继续累计），解冻后恢复 | 撤销与冻结是两个粒度（单个绑定 / 整个邀请人） |
 | R10 | 不发短信、不做站内信；控制台「我的」页显示「本月返利 ¥X」入口 | 见 §1.1 第 11 条 |
 | R11 | 邀请页需登录；未实名也能看到码与链接（页面提示「实名后才能收款」）；被邀请人在邀请人页面以脱敏手机号 `138****1234` 显示，不显示姓名 | 先让用户能分享；隐私最小化 |
 | R12 | 邀请码不可自定义、不可更换；一人一码永久有效 | 自定义码会被用来冒充运营活动，更换码会让线下传播的旧码失效 |
@@ -223,7 +223,7 @@ CREATE INDEX kyc_records_fingerprint_idx ON kyc_records (fingerprint) WHERE fing
 - `referral_rewards.order_id` 不加外键（模块边界：referral 不引用 rental 的表），由测试保证每行都对应真实订单。
 - `wallet_ledger_kind_check` 的约束名以实际库为准（`00004` 用的是列内 CHECK，PG 自动命名为 `wallet_ledger_kind_check`；迁移前用 `\d` 核对，Down 恢复四种）。
 - `wallet.ledgerKinds`、`web/shared/src/labels.ts`、后台流水筛选下拉同步加两种类型（中文：`邀请返利`、`返利扣回`）。
-- **存量实名用户没有指纹**：迁移不解密回填（迁移脚本拿不到密钥）；提供 `platform referral backfill-fingerprints` 子命令，用 `SPARK_SECRET_KEY` 解密 `id_number_enc` 逐条写 `fingerprint`，上线后执行一次（§15）。未回填前同身份判定只对新实名生效。
+- **存量实名用户没有指纹**：迁移不解密回填（迁移脚本拿不到密钥）；提供 `platform referral backfill-fingerprints` 子命令，用 `SPARK_SECRET_KEY` 解密 `id_number_enc` 逐条写 `fingerprint`，上线后执行一次（§15）。未回填前同身份判定只对新实名生效。回填本身只写指纹、不撤销绑定；但有了指纹之后，存量同身份绑定的下一笔待发放返利到期时，发放前的同身份复查（§4.4）会自动撤销该绑定（审计 `referral.auto_revoke`，待发放作废）；没有待发放返利的绑定不会被复查，由后台人工处置。
 - **Down**：`DROP TABLE referral_events, referral_rewards, referral_bindings, referral_accounts, referral_rate_versions, referral_state, user_devices`；`kyc_records` / `users` 删新列；`wallet_ledger_kind_check` 恢复四种——**若已存在 `referral_*` 流水则 Down 拒绝**（`DO $$ … RAISE EXCEPTION '仍有邀请返利流水，不能回滚' $$`）：流水只追加，改类型就是篡改账目。
 
 ## 3. 邀请码与绑定
@@ -250,6 +250,11 @@ CREATE INDEX kyc_records_fingerprint_idx ON kyc_records (fingerprint) WHERE fing
      - `burst`：`count(referral_bindings WHERE inviter_id = inviter AND bound_at > now − 24h) >= 20`（含本次前的 19 条）。
   4. `status = 'held'`（`hold_reason='same_device'`）若含 `same_device`，否则 `active`。
   5. 插入绑定（`invitee_id UNIQUE` 兜底）；写审计 `referral.bind`（actor user，diff 含 flags）。
+- **会话启动补记（终审 I1）**：只在登录时记设备 / 最近登录，会漏掉上线前已登录（会话 30 天、不滑动）或之后清过本地存储的邀请人。因此控制台会话启动调用的 `GET /me` 也调 `identity.TouchSession(userID, ip, X-Device-Id)`：
+  - 设备 ID 规则（只认 UUID、按小写存）与 10 台上限同登录（复用 `touchDevice`）；`last_login_ip / last_login_at` 在 IP 变化时立即刷新，否则同一小时内不重复写；空 IP 不覆盖；封禁用户不记。
+  - 都不需要写时只有一次只读查询；需要写时在事务里先 `users FOR NO KEY UPDATE`（与登录同序：`users → user_devices`），锁后复查。
+  - 2 秒超时；任何失败只记日志，`/me` 照常返回。
+  - 因此 `last_login_*` 的含义是「最近一次登录或会话启动」（目前只有邀请返利的同 IP 判定使用这两列）。
 - **不做**：同一手机号注销重注册（系统没有注销）；绑定后改邀请人（没有接口）。
 
 ### 3.3 实名通过时的同身份判定（`identity.SubmitPersonalKYC` / `ReviewEnterpriseKYC` 的结果事务）
@@ -414,7 +419,7 @@ ORDER BY (l.kind = 'refund'), l.id LIMIT 500                     -- 扣款先于
 - 顶部卡片：邀请码（大字 + 复制）、链接（复制）、二维码（`qrcode` 生成，可长按保存）、规则摘要（10%、12 个月、7 天后到账、不可提现、上限）。未实名时顶部提示条「实名认证后才能收到返利 → 去实名」。账户冻结时提示条「邀请功能已暂停，如有疑问请联系客服」并隐藏码与链接。
 - 统计条：已邀请人数、已实名人数、待发放、累计已发放（净额）、本月已发放。
 - Tab「被邀请人」：脱敏手机号、注册时间、状态（未实名 / 已实名 / 审核中 / 已失效）、累计贡献返利（分→元）、返利截止日。
-- Tab「返利明细」：时间、被邀请人（脱敏）、订单号、消费金额、返利、状态（待发放 / 已发放 / 已作废；已发放且有扣回时显示「已扣回 ¥X」；待发放时显示「预计到账 YYYY-MM-DD HH:mm」，取 `settle_after`，到期后仍受实名 / 冻结 / 搁置门槛约束——验收缺陷 P8-A1 补）。
+- Tab「返利明细」：时间、被邀请人（脱敏）、订单号、消费金额、返利、状态（待发放 / 已发放 / 已作废；已发放且有扣回时显示「已扣回 ¥X」；待发放时显示「预计到账 YYYY-MM-DD HH:mm」，取 `settle_after`，到期后仍受实名 / 冻结 / 搁置门槛约束——验收缺陷 P8-A1 补；待发放但已退款且 `reward = 0` 的行不显示「待发放 · 预计到账」，改为「已退款，将作废」，因为发放环节到期会把它作废——终审 M2）。
 - 手机端两 Tab 各自分页（`page_size 20`）。
 
 ### 8.3 其他页面
@@ -448,7 +453,7 @@ ORDER BY (l.kind = 'refund'), l.id LIMIT 500                     -- 扣款先于
 | GET | `/referral/me` | 需登录；**懒生成**码；→ `{code, link, status, kyc_verified, rebate: {rate_bp, period_days, hold_days, max_per_invitee, max_per_inviter_30d}, stats: {invitees, verified_invitees, pending, settled_net, month_settled, debt}}` |
 | GET | `/referral/invitees?page=` | `{items:[{phone_masked, bound_at, status, kyc_verified, contributed, rebate_until}], total}`；`status` 映射：active→`有效`、held→`审核中`、revoked→`已失效` |
 | GET | `/referral/rewards?page=&status=` | `{items:[{order_id, invitee_masked, paid_at, order_amount, refunded_amount, reward, status, settle_after, settled_at, clawed_amount}], total}`（`settle_after` = 预计到账时间，P8-A1 补） |
-| GET | `/me` | 增 `referral_month_settled`（分；0 时省略）——给「我的」页入口用，避免多一次请求 |
+| GET | `/me` | 增 `referral_month_settled`（分；0 时省略）——给「我的」页入口用，避免多一次请求；按请求头 `X-Device-Id` 与客户端 IP 补记设备 / 最近登录（§3.2「会话启动补记」，失败不影响响应） |
 
 ### 10.2 后台（`/admin/api/v1`）
 
@@ -518,7 +523,7 @@ func (s *Service) Admin*(...)                                                // 
 ## 13. 迁移与兼容
 1. 迁移 00020（实际 `00021`，见 §0 实施注）对存量数据：无回填；历史流水不会计返利（上线前没有任何绑定，扫描 JOIN 不命中）。
 2. 发布顺序：platform 单独发布；多副本滚动期间旧副本的 `Login` 不认 `invite_code`（请求体多余字段被忽略）→ 滚动窗口内注册的用户可能没绑定；窗口很短，可接受（README 注明）。
-3. 上线后执行一次 `platform referral backfill-fingerprints`（§2），之后同身份判定对存量实名用户生效。
+3. 上线后执行一次 `platform referral backfill-fingerprints`（§2），之后同身份判定对存量实名用户生效（存量同身份绑定在下一笔返利发放前被自动撤销，见 §2）。
 4. 前端：老版本控制台没有 `X-Device-Id`，后端视为空（不打 `same_device`）。
 5. 回滚：Down 在存在 `referral_*` 流水时拒绝（§2）；若必须回滚，先在后台冻结全部账户让发放停止，再评估。
 
@@ -535,6 +540,7 @@ func (s *Service) Admin*(...)                                                // 
   | 发放 | users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → [同身份复查命中：referral_bindings → referral_rewards 批量 void] → wallet_accounts(邀请人) |
   | 冻结 / 解冻 / 撤销 / 通过 | users(邀请人[, 被邀请人]) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards（撤销时批量 void）；与发放同序，冻结与同一轮发放的互斥靠账户锁（发放在账户锁内复核账户 / 绑定状态） |
   | OnKYCVerified（在 identity 事务内） | users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards |
+  | 会话启动补记 `TouchSession`（`GET /me`，§3.2） | users(本人) FOR NO KEY UPDATE → user_devices；与登录同序，不碰 referral 表；与 Bind / 计提 / 发放的 `FOR KEY SHARE` 兼容 |
   | rental 的扣款 / 退款事务 | 不碰 referral 任何表（只写 wallet），与上面互不等待 |
 
   所有 referral 路径都从 `referral_accounts(邀请人)` 开始，之后只锁更细粒度的行与 `wallet_accounts`，而 rental / billing 的事务只锁 `wallet_accounts`（从不反过来锁 referral 表）→ 等待链不成环。`OnKYCVerified` 先持有 `users` 行锁再锁 `referral_accounts`，而 `Bind` 持有新用户行（别人不会等它），再显式 `FOR KEY SHARE` 码主的 `users` 行、最后 `FOR SHARE` 码主账户——同样是 users → accounts：插 `referral_bindings` 时外键检查本来也要对码主 `users` 行取 `KEY SHARE`，若放到账户锁之后就与码主本人的 `OnKYCVerified`（users `FOR UPDATE` → accounts `FOR UPDATE`）反向而死锁，所以提前显式加。与「冻结」（`FOR UPDATE`）互斥但不成环。
@@ -552,7 +558,8 @@ func (s *Service) Admin*(...)                                                // 
 ## 15. 上线前核对（写入 `followups-plan8.md`）
 - 执行 `platform referral backfill-fingerprints`。
 - 法务：帮助页与邀请页的规则文案（不可提现、平台有权撤销异常返利）。
-- 财务：线下退款核算口径（R4）。
+- 财务：线下退款核算口径（R4）；撤销绑定后，订单仍可能退款的已发放返利不要手工调账（退款时系统自动扣回，终审 M1）。
+- 可选：发布时清空控制台会话（`DELETE FROM sessions`），让所有邀请人重新登录、立即带上设备头；不清空时由 `GET /me` 的会话启动补记覆盖（§3.2，终审 I1）。
 - 运营：首版费率是否调整（后台可改）；是否需要公告。
 - `SPARK_PUBLIC_BASE_URL` 必须是用户可访问的控制台地址（链接据此生成）。
 
@@ -561,7 +568,7 @@ func (s *Service) Admin*(...)                                                // 
 ### 16.1 单元（Go，嵌入式 PG，假时钟）
 - `wallet`：`ApplyUpTo` 余额充足 / 不足 / 为 0（不记流水）/ 重复 ref（`ErrDuplicate`）；新类型通过 `LedgerFilter`；Down 拒绝已有 referral 流水。
 - `referral/code`：生成字母表与长度、撞码重试、规范化（`o→0`、`l→1`、空白、大小写）、`LookupCode` 对冻结 / 封禁码主返回无效。
-- `identity.Login`：`is_new` 判定（首次 true、再次 false）；`last_login_*`、`user_devices` 维护与 10 台上限；带 `invite_code` 的新用户绑定、老用户不绑定（`existing_user`）、无效码不影响注册；`Bind` 的数据库错误回滚注册。
+- `identity.Login`：`is_new` 判定（首次 true、再次 false）；`last_login_*`、`user_devices` 维护与 10 台上限；`TouchSession`（会话启动补记：一小时节流、IP 变化即刷新、非 UUID 不记、上限、封禁不记）；带 `invite_code` 的新用户绑定、老用户不绑定（`existing_user`）、无效码不影响注册；`Bind` 的数据库错误回滚注册。
 - `referral.Bind`：风险标记矩阵（同 IP 24h 内 / 超过 24h、同设备、第 20 个绑定触发 burst）；`same_device` → held；码主冻结 / 封禁 → `inviter_frozen`；`invitee_id` 唯一兜底；审计。
 - `OnKYCVerified`：指纹写入（HMAC 可复现、不同密钥不同）；被邀请人与邀请人同指纹 → revoked + 待发放 void；两被邀请人同指纹 → 后者 revoked；邀请人后实名触发对其被邀请人的检查；企业信用代码同理；存量无指纹不误判。
 - `ConfigAt`：版本选择（边界 `effective_from == t`）、`effective_from < now` 被拒、CHECK 范围、审计。
@@ -622,7 +629,7 @@ func (s *Service) Admin*(...)                                                // 
 - 注册后补填邀请码；更换邀请码；自定义邀请码；邀请海报生成。
 - 短信 / 站内信 / 邮件通知（绑定成功、返利到账、月度汇总）。
 - 定期全量同身份扫描；更强的设备指纹（Canvas / 字体）；手机号段 / 虚拟号识别；行为模型风控。
-- 撤销时自动扣回已发放返利（现由财务调账）。
+- 撤销时自动扣回已发放返利（现由财务调账）：后续做成后台「撤销并扣回已发放」，走 referral 的扣回路径（计入 `clawed_amount`），之后的退款就不会再扣（终审 M1）。
 - 返利期到期前提醒；返利期延长 / 续约。
 - 后台代用户生成码；运营活动码（非个人码）。
 - 邀请页的 H5 分享卡片 / 微信小程序。

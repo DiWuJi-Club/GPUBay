@@ -232,3 +232,48 @@ func TestMeSurvivesMonthSettledFailure(t *testing.T) {
 		t.Fatalf("me = %v, want referral_month_settled omitted", me)
 	}
 }
+
+// 计划 8 终审 I1：邀请人只有上线前的旧会话（登录时没带设备头）时，GET /me 会话启动补记设备；
+// 之后同设备注册的被邀请人仍被搁置（same_device）。
+func TestMeRecordsDeviceForSameDeviceHold(t *testing.T) {
+	e := newTestEnv(t)
+	const dev = "dddddddd-1111-4222-8333-444444444444"
+	owner := e.client()
+	owner.login("13812345678") // 旧会话：无 X-Device-Id
+	_, me := owner.do("GET", "/referral/me", nil)
+	code := me["code"].(string)
+	var n int
+	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM user_devices d JOIN users u ON u.id = d.user_id WHERE u.phone = '13812345678'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("devices before /me = %d %v", n, err)
+	}
+	if st, out := owner.doH("GET", "/me", nil, map[string]string{"X-Device-Id": dev}); st != 200 || out["phone"] != "13812345678" {
+		t.Fatalf("/me = %d %v", st, out)
+	}
+	newbie := e.client() // 同一浏览器（同设备 ID）换号注册
+	newbie.do("POST", "/auth/sms-code", map[string]string{"phone": "13900000003"})
+	st, out := newbie.doH("POST", "/auth/login", map[string]string{"phone": "13900000003", "code": "000000", "invite_code": code}, map[string]string{"X-Device-Id": dev})
+	if inv, _ := out["invite"].(map[string]any); st != 200 || inv == nil || inv["bound"] != true {
+		t.Fatalf("register = %d %v", st, out)
+	}
+	var status, hold string
+	if err := e.pool.QueryRow(context.Background(), `SELECT b.status, COALESCE(b.hold_reason, '') FROM referral_bindings b JOIN users u ON u.id = b.invitee_id
+		WHERE u.phone = '13900000003'`).Scan(&status, &hold); err != nil {
+		t.Fatal(err)
+	}
+	if status != "held" || hold != "same_device" {
+		t.Fatalf("binding = %s / %s", status, hold)
+	}
+}
+
+// 补记失败（这里让 user_devices 不可写）不影响 /me。
+func TestMeTouchFailureDoesNotFailMe(t *testing.T) {
+	e := newTestEnv(t)
+	owner := e.client()
+	owner.login("13812345678")
+	if _, err := e.pool.Exec(context.Background(), `ALTER TABLE user_devices RENAME TO user_devices_gone`); err != nil {
+		t.Fatal(err)
+	}
+	if st, out := owner.doH("GET", "/me", nil, map[string]string{"X-Device-Id": "dddddddd-1111-4222-8333-444444444444"}); st != 200 || out["phone"] != "13812345678" {
+		t.Fatalf("/me = %d %v", st, out)
+	}
+}

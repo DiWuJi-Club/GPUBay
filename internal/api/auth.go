@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -67,8 +68,17 @@ type meView struct {
 	ReferralMonthSettled int64 `json:"referral_month_settled,omitempty"` // 计划 8：「我的」页入口小字；0 时省略
 }
 
+const touchSessionTimeout = 2 * time.Second
+
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
+	// 会话启动时补记设备与最近登录（计划 8 终审 I1，同设备 / 同 IP 判定用）：失败只记日志，/me 照常返回；
+	// 短超时，数据库慢时不拖住登录态判断。
+	tctx, cancel := context.WithTimeout(r.Context(), touchSessionTimeout)
+	if err := s.Identity.TouchSession(tctx, u.ID, clientIP(r), r.Header.Get("X-Device-Id")); err != nil {
+		s.Log.Error("touch session failed", "err", err, "user_id", u.ID)
+	}
+	cancel()
 	v := meView{User: u}
 	if s.Referral != nil {
 		// 入口小字是锦上添花：查询失败只记日志、省略字段，/me 本身照常返回（前端靠它判断登录态）。

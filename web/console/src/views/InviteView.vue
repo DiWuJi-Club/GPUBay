@@ -26,6 +26,9 @@ const period = computed(() => {
   return d >= 30 ? `${Math.floor(d / 30)} 个月` : `${d} 天`
 })
 
+/** 待发放但已全额退款（reward 为 0）：发放环节到期会作废，页面直接说明，不显示「预计到账」 */
+const refundedToVoid = (r: RewardItem) => r.status === 'pending' && r.reward === 0 && r.refunded_amount > 0
+
 async function load() {
   try {
     const m = await api.get<ReferralMe>('/referral/me')
@@ -181,8 +184,12 @@ watch(rewardsPage, () => void loadRewards())
             </div>
             <div class="muted">
               消费 {{ fmtYuan(r.order_amount) }}<span v-if="r.refunded_amount > 0">（已退 {{ fmtYuan(r.refunded_amount) }}）</span> · {{ fmtTime(r.paid_at) }} ·
-              <span data-testid="reward-status">{{ labelOf(rewardStatusLabel, r.status) }}</span>
-              <span v-if="r.status === 'pending'"> · <span data-testid="reward-settle-after">预计到账 {{ fmtTime(r.settle_after) }}</span></span>
+              <!-- 冷静期内全额退款：reward 已为 0，到 settle_after 时发放环节会作废，不再显示「待发放 · 预计到账」（终审 M2） -->
+              <span v-if="refundedToVoid(r)" data-testid="reward-refunded-void">已退款，将作废</span>
+              <template v-else>
+                <span data-testid="reward-status">{{ labelOf(rewardStatusLabel, r.status) }}</span>
+                <span v-if="r.status === 'pending'"> · <span data-testid="reward-settle-after">预计到账 {{ fmtTime(r.settle_after) }}</span></span>
+              </template>
               <span v-if="r.status === 'settled' && r.clawed_amount > 0" data-testid="reward-clawed">（已扣回 {{ fmtYuan(r.clawed_amount) }}）</span>
             </div>
           </div>

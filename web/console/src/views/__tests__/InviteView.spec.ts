@@ -113,5 +113,19 @@ describe('InviteView', () => {
     await render('/invite?tab=rewards')
     expect($('reward-status')!.textContent).toBe('待发放')
     expect($('reward-settle-after')!.textContent).toBe('预计到账 2026-10-27 08:00')
+    expect($('reward-refunded-void')).toBeNull()
+  })
+
+  it('全额退款的待发放行（reward=0）显示「已退款，将作废」，不显示待发放 / 预计到账', async () => {
+    mocks.get.mockImplementation((path: string) => {
+      if (path === '/referral/me') return Promise.resolve(me)
+      if (path === '/referral/rewards')
+        return Promise.resolve({ total: 1, items: [{ order_id: 'ord-3', invitee_masked: '139****5678', paid_at: '2026-10-20T00:00:00Z', order_amount: 6900, refunded_amount: 6900, reward: 0, status: 'pending', settle_after: '2026-10-27T00:00:00Z', settled_at: null, clawed_amount: 0 }] })
+      return Promise.resolve({ items: [], total: 0 })
+    })
+    await render('/invite?tab=rewards')
+    expect($('reward-refunded-void')!.textContent).toBe('已退款，将作废')
+    expect($('reward-status')).toBeNull()
+    expect($('reward-settle-after')).toBeNull()
   })
 })

@@ -31,7 +31,9 @@ SPARK_DATABASE_URL=... SPARK_SECRET_KEY=... go run ./cmd/platform admin create -
 按提示输入两次密码（至少 12 位），用验证器 App 扫描终端里的二维码并输入一次动态码完成绑定，然后离线保存打印出的 8 个恢复码。
 管理员丢失手机时用 `platform admin reset-totp --username <名称>` 重置，下次登录重新绑定。
 
-计划 8（邀请返利）上线后执行一次 `platform referral backfill-fingerprints`：为存量已实名用户计算同身份指纹（用 `SPARK_SECRET_KEY` 解密身份证号，必须与服务用同一把密钥），之后「同一身份证 / 营业执照互相邀请」的判定才对老用户生效。回填不会撤销任何既有绑定（存量用户之间的同身份由后台「邀请返利」人工处置）；可重复执行（只补没有指纹的记录）。子命令与服务读同样的环境变量，启动时会先执行迁移。
+计划 8（邀请返利）上线后执行一次 `platform referral backfill-fingerprints`：为存量已实名用户计算同身份指纹（用 `SPARK_SECRET_KEY` 解密身份证号，必须与服务用同一把密钥），之后「同一身份证 / 营业执照互相邀请」的判定才对老用户生效。回填命令本身不撤销绑定，但有了指纹之后，存量同身份绑定在下一笔待发放返利到期时会被发放前的同身份复查自动撤销（审计 `referral.auto_revoke`，待发放作废）；没有待发放返利的同身份绑定由后台「邀请返利」人工处置。可重复执行（只补没有指纹的记录）。子命令与服务读同样的环境变量，启动时会先执行迁移。
+
+邀请返利的财务操作：后台撤销绑定后，已发放的返利不会自动扣回。如果对应订单**仍可能退款**，不要用「调账」手工扣回：订单退款时系统会自动扣回这笔返利（余额不足记欠账），再手工调账就会扣两次。只对已经不能再退款的订单手工调账。后台「撤销并扣回已发放」列为后续事项。
 
 ### 前端开发
 
@@ -148,4 +150,4 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - `GET /api/v1/kyc` 返回用户最近一条实名记录（含驳回原因），没有记录时 `record` 为 `null`；个人姓名只保留首字。
 - 实例视图含 `product_name`、`image_name`（镜像停用后仍返回名称）；充值单视图含 `remaining_seconds`（服务器计算的剩余支付秒数）。
 - 后台 `GET /admin/api/v1/products`、`GET /admin/api/v1/images` 对全部角色可读；`GET /admin/api/v1/audit` 每条含 `actor_name`。
-- `POST /api/v1/auth/login` 可带 `invite_code`（只在首次登录即注册时绑定邀请关系；码无效 / 老用户 / 邀请人冻结都不影响登录，响应 `invite: {bound, inviter?, reason?}`），请求头 `X-Device-Id`（控制台生成的 UUID）用于风险标记。
+- `POST /api/v1/auth/login` 可带 `invite_code`（只在首次登录即注册时绑定邀请关系；码无效 / 老用户 / 邀请人冻结都不影响登录，响应 `invite: {bound, inviter?, reason?}`），请求头 `X-Device-Id`（控制台生成的 UUID）用于风险标记。`GET /api/v1/me`（控制台会话启动）也按 `X-Device-Id` 与客户端 IP 补记设备和最近登录（同一设备 / 登录信息一小时内最多写一次，失败不影响响应），上线前就已登录的邀请人也能触发「同设备」搁置。

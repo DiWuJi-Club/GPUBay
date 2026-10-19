@@ -109,11 +109,7 @@ func (s *Service) Login(ctx context.Context, phone, code string) (string, User, 
 // Bind 的业务失败（码无效 / 码主冻结）只体现在响应里，不影响注册；数据库错误回滚整个登录。
 func (s *Service) LoginWith(ctx context.Context, req LoginRequest) (string, LoginResult, error) {
 	now := s.d.Clock.Now()
-	// 裁定 Q15：只有 UUID 形态才算设备 ID，其余视同未提供。
-	deviceID := ""
-	if uuidRe.MatchString(req.DeviceID) {
-		deviceID = strings.ToLower(req.DeviceID)
-	}
+	deviceID := normalizeDeviceID(req.DeviceID)
 	var (
 		bizErr error // 需要提交事务（记录试错次数）后再返回的业务错误
 		res    LoginResult
@@ -194,6 +190,70 @@ func (s *Service) LoginWith(ctx context.Context, req LoginRequest) (string, Logi
 		return "", LoginResult{}, bizErr
 	}
 	return token, res, nil
+}
+
+// normalizeDeviceID 实现裁定 Q15：只有 UUID 形态才算设备 ID（按小写存），其余视同未提供（返回 ""）。
+func normalizeDeviceID(raw string) string {
+	if uuidRe.MatchString(raw) {
+		return strings.ToLower(raw)
+	}
+	return ""
+}
+
+// touchSessionEvery：会话启动时补记设备 / 最近登录的最小间隔（同 IP、同设备一小时内最多写一次）。
+const touchSessionEvery = time.Hour
+
+// TouchSession 在控制台会话启动（GET /me）时补记设备与最近登录（计划 8 终审 I1）：只在登录时记录的话，
+// 上线前就已登录（会话 30 天不滑动）或清过本地存储的邀请人没有设备 / 最近登录，同设备、同 IP 判定会漏。
+//   - 设备 ID 规则与 10 台上限同登录（normalizeDeviceID / touchDevice）；
+//   - last_login_ip / last_login_at：IP 变了立即刷新，否则一小时内不重复写；空 IP 不覆盖；
+//   - 两者都新鲜时只有一次只读查询；需要写时先锁 users 行（与登录同序：users → user_devices），封禁用户不记。
+//
+// 调用方（/me）只记日志，错误不影响响应。
+func (s *Service) TouchSession(ctx context.Context, userID int64, ip, rawDeviceID string) error {
+	now := s.d.Clock.Now()
+	cutoff := now.Add(-touchSessionEvery)
+	deviceID := normalizeDeviceID(rawDeviceID)
+	// fresh 判定：IP 为空视为无需刷新；设备为空视为无需记录。
+	const freshSQL = `SELECT u.status,
+		($2::text = '' OR (u.last_login_ip = $2::text AND COALESCE(u.last_login_at > $3::timestamptz, false))),
+		($4::text = '' OR EXISTS (SELECT 1 FROM user_devices d WHERE d.user_id = u.id AND d.device_id = $4::text AND d.last_seen_at > $3::timestamptz))
+		FROM users u WHERE u.id = $1`
+	var status string
+	var loginFresh, deviceFresh bool
+	err := s.d.Pool.QueryRow(ctx, freshSQL, userID, ip, cutoff, deviceID).Scan(&status, &loginFresh, &deviceFresh)
+	if db.IsNoRows(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if status == "banned" || (loginFresh && deviceFresh) {
+		return nil
+	}
+	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		// 锁 users 行后复查（并发的 /me 或登录已写过就不再写），也让 touchDevice 的上限删除与登录串行。
+		err := tx.QueryRow(ctx, freshSQL+` FOR NO KEY UPDATE OF u`, userID, ip, cutoff, deviceID).
+			Scan(&status, &loginFresh, &deviceFresh)
+		if db.IsNoRows(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if status == "banned" {
+			return nil
+		}
+		if !loginFresh {
+			if _, err := tx.Exec(ctx, `UPDATE users SET last_login_ip = $2, last_login_at = $3 WHERE id = $1`, userID, ip, now); err != nil {
+				return err
+			}
+		}
+		if !deviceFresh {
+			return s.touchDevice(ctx, tx, userID, deviceID, now)
+		}
+		return nil
+	})
 }
 
 // touchDevice 记录设备；每用户最多 MaxDevicesPerUser 台，超出删最旧。

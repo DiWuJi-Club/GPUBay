@@ -55,7 +55,8 @@ func referralKeys(cfg config.Config) (*secretbox.Box, []byte, error) {
 }
 
 // runReferral 处理 `platform referral ...` 子命令。
-// backfill-fingerprints 只写指纹，不调用 OnKYCVerified：存量用户之间的同身份不自动撤销，由后台人工处置。
+// backfill-fingerprints 只写指纹，不调用 OnKYCVerified：回填时不撤销任何绑定。有了指纹之后，存量同身份绑定会在
+// 下一笔待发放返利到期时被 Release 的同身份复查自动撤销（referral.auto_revoke）；没有待发放返利的由后台人工处置。
 func runReferral(ctx context.Context, pool *pgxpool.Pool, box *secretbox.Box, key []byte, args []string, out io.Writer) error {
 	if len(args) == 0 || args[0] != "backfill-fingerprints" {
 		return errors.New(referralUsage)
