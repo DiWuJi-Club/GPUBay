@@ -48,10 +48,10 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | 变量 | 说明 | 默认 |
 |---|---|---|
 | `SPARK_ENV` | dev / staging / prod | dev |
-| `SPARK_HTTP_ADDR` | 监听地址 | :8080 |
+| `SPARK_HTTP_ADDR` | 公网监听地址：控制台、用户 API 与租户 Web 入口（按 Host 分流；配置 TLS 证书时为 HTTPS） | :8080 |
 | `SPARK_DATABASE_URL` | PostgreSQL 连接串 | 必填 |
-| `SPARK_SECRET_KEY` | 32 字节密钥的 base64，加密身份证号与实例密码 | 必填 |
-| `SPARK_DOMAIN` | 对外域名，用于生成 SSH 命令 | spark.local |
+| `SPARK_SECRET_KEY` | 32 字节密钥的 base64，加密身份证号、实例密码、内置 CA 私钥、SSH 网关主机密钥与实例主机私钥（轮换的后果见「部署注意」） | 必填 |
+| `SPARK_DOMAIN` | 控制台域名（须等于 `SPARK_PUBLIC_BASE_URL` 的域名）；用户 SSH 命令连 `ssh.<此域>`；未设 `SPARK_INGRESS_DOMAIN` 时也是租户 Web 子域的父域 | spark.local |
 | `SPARK_ADMIN_ADDR` | 后台 API 监听地址（只应绑定内网地址） | 127.0.0.1:8081 |
 | `SPARK_UPLOAD_DIR` | 上传文件（营业执照）保存目录，需定期备份 | ./.devdata/uploads |
 | `SPARK_SMS_DRIVER` / `SPARK_KYC_DRIVER` | mock / aliyun（生产禁止 mock） | mock |
@@ -60,6 +60,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_ALIYUN_ACCESS_KEY_ID` / `SPARK_ALIYUN_ACCESS_KEY_SECRET` | 阿里云 AccessKey（短信与号码百科共用） | 空 |
 | `SPARK_SMS_SIGN` / `SPARK_SMS_TPL_LOGIN` / `SPARK_SMS_TPL_EXPIRY` | 短信签名、登录验证码模板（参数 code）、到期提醒模板（参数 instance、hours） | 空 |
 | `SPARK_KYC_AUTH_CODE` | 号码百科三要素核验授权码 | 空 |
+| `SPARK_ALIYUN_SMS_ENDPOINT` / `SPARK_ALIYUN_KYC_ENDPOINT` | 阿里云短信 / 号码百科接口地址（一般不用改） | https://dysmsapi.aliyuncs.com / https://dytnsapi.aliyuncs.com |
 | `SPARK_WECHAT_MCH_ID` / `_APP_ID` / `_API_V3_KEY` / `_CERT_SERIAL` / `_PRIVATE_KEY_PATH` | 微信支付商户号、AppID、APIv3 密钥、商户证书序列号、商户私钥文件 | 空 |
 | `SPARK_WECHAT_PUBLIC_KEY_ID` / `SPARK_WECHAT_PUBLIC_KEY_PATH` | 微信支付公钥 ID 与公钥文件（商户平台「API 安全」中下载） | 空 |
 | `SPARK_ALIPAY_APP_ID` / `_PRIVATE_KEY_PATH` / `_PUBLIC_KEY_PATH` / `_SANDBOX` | 支付宝应用 ID、应用私钥文件、支付宝公钥文件、是否沙箱 | 空 / false |

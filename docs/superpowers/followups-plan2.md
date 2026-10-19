@@ -10,6 +10,7 @@
 - 机器的业务网卡最好用有线 + 静态地址或 DHCP 保留；若启用 `NetworkManager-wait-online` / `systemd-networkd-wait-online`，`network-online.target` 才有意义。Agent 已能在地址就绪前推迟并重试启动（验收缺陷 B1、B2），但地址晚到期间容器不可用。
 - 生产镜像需自带诊断所需工具（参考镜像不含 python、nvcc；验收只用 `nvidia-smi` 与 `libcudart` 验证 GPU）。
 - `install.sh` 走内网 HTTP，二进制校验和写在脚本里，局域网中间人可同时替换脚本与校验和绕过校验：上线后改为 HTTPS，或在后台接入命令里固定脚本哈希。
+- ✅ 计划 3 裁定：实例 Web 端口 `UpdatePorts` 指令不再需要（Web 流量经容器 sshd 的 direct-tcpip 通道，端口只是平台数据）。
 
 ## 规格列出的遗留（本计划不做）
 - 机器证书续期（5 年）。
