@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/audit"
@@ -398,9 +399,10 @@ func TestKYCWritesFingerprintAndCallsHook(t *testing.T) {
 	e.svc = identity.NewService(identity.Deps{Pool: e.pool, Clock: e.clock, SMS: e.sms, KYC: kyc.Mock{Reject: true}, Box: mustBox(t), FixedCode: "000000", FingerprintKey: key})
 	e.svc.SetReferral(hook)
 	uid2 := dbtest.CreateUser(t, e.pool, "13800000022", false)
-	e.svc.SubmitPersonalKYC(ctx, uid2, "李四", "110101199001011235")
-	e.pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1`, uid2).Scan(&fp)
-	if fp != "" || len(hook.kyc) != 1 {
+	if _, err := e.svc.SubmitPersonalKYC(ctx, uid2, "李四", "110101199001011235"); apperr.As(err) == nil || apperr.As(err).Code != "kyc_rejected" {
+		t.Fatalf("rejected submit = %v", err)
+	}
+	if err := e.pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1`, uid2).Scan(&fp); err != nil || fp != "" || len(hook.kyc) != 1 {
 		t.Fatalf("rejected: fp=%q hooks=%d", fp, len(hook.kyc))
 	}
 }
@@ -438,58 +440,110 @@ func TestEnterpriseKYCWritesFingerprintAndCallsHook(t *testing.T) {
 	}
 	// 驳回不写指纹、不调钩子
 	uid = review("13900000032", false)
-	pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1`, uid).Scan(&fp)
-	if fp != "" || len(hook.kyc) != 1 {
+	if err := pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1`, uid).Scan(&fp); err != nil || fp != "" || len(hook.kyc) != 1 {
 		t.Fatalf("rejected: fp=%q hooks=%d", fp, len(hook.kyc))
 	}
 }
 
-// brokenHook 在事务里执行一条会出错的语句后返回错误：模拟 referral 侧的任何故障。
-type brokenHook struct{ hookRec }
+// brokenHook 先在（保存点内的）事务里写一行审计 test.hook_write，再按配置失败：前 fails 次调用失败；
+// code 非空时以该 SQLSTATE 的 PgError 失败（模拟死锁 / 序列化冲突），否则执行 1/0（子事务进入失败态）后返回普通错误。
+type brokenHook struct {
+	hookRec
+	fails int
+	code  string
+	calls int
+}
 
 func (h *brokenHook) OnKYCVerified(ctx context.Context, tx pgx.Tx, _ int64, _ string) error {
+	h.calls++
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_logs (actor_type, action, created_at) VALUES ('system', 'test.hook_write', now())`); err != nil {
+		return err
+	}
+	if h.calls > h.fails {
+		return nil
+	}
+	if h.code != "" {
+		return &pgconn.PgError{Code: h.code, Message: "simulated"}
+	}
 	if _, err := tx.Exec(ctx, `SELECT 1 / 0`); err == nil {
 		return errors.New("expected division by zero")
 	}
 	return errors.New("referral exploded")
 }
 
-// 邀请返利钩子出错不能让实名失败（个人实名已调用付费接口；企业审核是管理员操作）：钩子在保存点里执行，出错回滚到保存点并记日志。
+// 邀请返利钩子出错不能让实名失败（个人实名已调用付费接口；企业审核是管理员操作）：钩子在保存点里执行，
+// 死锁 / 序列化冲突重试一次；仍失败则回滚保存点（钩子的写入消失）、写审计 referral.kyc_check_failed，实名照常通过。
 func TestKYCHookErrorDoesNotFailVerification(t *testing.T) {
-	pool := dbtest.New(t)
-	key, _ := referral.DeriveFingerprintKey(dbtest.Key)
-	svc := identity.NewService(identity.Deps{Pool: pool, Clock: clock.NewFake(dbtest.T0), SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: mustBox(t), Uploads: fakeUploads{}, FingerprintKey: key})
-	svc.SetReferral(&brokenHook{})
-	ctx := context.Background()
+	cases := []struct {
+		name                   string
+		hook                   *brokenHook
+		calls, writes, failure int // 每条实名路径的期望
+	}{
+		{"plain error", &brokenHook{fails: 99}, 1, 0, 1},
+		{"deadlock then ok", &brokenHook{fails: 1, code: "40P01"}, 2, 1, 0},
+		{"serialization twice", &brokenHook{fails: 99, code: "40001"}, 2, 0, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := dbtest.New(t)
+			key, _ := referral.DeriveFingerprintKey(dbtest.Key)
+			svc := identity.NewService(identity.Deps{Pool: pool, Clock: clock.NewFake(dbtest.T0), SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: mustBox(t), Uploads: fakeUploads{}, FingerprintKey: key})
+			svc.SetReferral(tc.hook)
+			ctx := context.Background()
 
-	uid := dbtest.CreateUser(t, pool, "13900000041", false)
-	u, err := svc.SubmitPersonalKYC(ctx, uid, "张三", validID)
-	if err != nil || u.KYCStatus != "verified" {
-		t.Fatalf("personal = %+v %v", u, err)
-	}
-	var fp string
-	if err := pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1 AND result = 'verified'`, uid).Scan(&fp); err != nil || fp != referral.Fingerprint(key, "kyc", validID) {
-		t.Fatalf("personal fingerprint = %q %v", fp, err)
-	}
+			personal := dbtest.CreateUser(t, pool, "13900000041", false)
+			u, err := svc.SubmitPersonalKYC(ctx, personal, "张三", validID)
+			if err != nil || u.KYCStatus != "verified" {
+				t.Fatalf("personal = %+v %v", u, err)
+			}
+			var fp string
+			var personalRecord int64
+			if err := pool.QueryRow(ctx, `SELECT id, fingerprint FROM kyc_records WHERE user_id = $1 AND result = 'verified'`, personal).Scan(&personalRecord, &fp); err != nil || fp != referral.Fingerprint(key, "kyc", validID) {
+				t.Fatalf("personal fingerprint = %q %v", fp, err)
+			}
 
-	uid = dbtest.CreateUser(t, pool, "13900000042", false)
-	if err := svc.SubmitEnterpriseKYC(ctx, uid, "某某科技有限公司", "91420100MA4KXXXX1X", licenseKeyFor(uid)); err != nil {
-		t.Fatal(err)
-	}
-	var recordID int64
-	if err := pool.QueryRow(ctx, `SELECT id FROM kyc_records WHERE user_id = $1`, uid).Scan(&recordID); err != nil {
-		t.Fatal(err)
-	}
-	if err := svc.ReviewEnterpriseKYC(ctx, audit.Actor{AdminID: 99}, recordID, true, ""); err != nil {
-		t.Fatalf("review: %v", err)
-	}
-	if u, _ := svc.GetUser(ctx, uid); u.KYCStatus != "verified" || u.Kind != "enterprise" {
-		t.Fatalf("enterprise user = %+v", u)
-	}
-	var n int
-	pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action = 'kyc.review' AND target_id = $1`, fmt.Sprint(recordID)).Scan(&n)
-	if n != 1 {
-		t.Fatalf("kyc.review audit rows = %d", n)
+			personalCalls := tc.hook.calls
+			tc.hook.calls = 0 // 每条路径各自从第一次调用算起
+			enterprise := dbtest.CreateUser(t, pool, "13900000042", false)
+			if err := svc.SubmitEnterpriseKYC(ctx, enterprise, "某某科技有限公司", "91420100MA4KXXXX1X", licenseKeyFor(enterprise)); err != nil {
+				t.Fatal(err)
+			}
+			var enterpriseRecord int64
+			if err := pool.QueryRow(ctx, `SELECT id FROM kyc_records WHERE user_id = $1`, enterprise).Scan(&enterpriseRecord); err != nil {
+				t.Fatal(err)
+			}
+			if err := svc.ReviewEnterpriseKYC(ctx, audit.Actor{AdminID: 99}, enterpriseRecord, true, ""); err != nil {
+				t.Fatalf("review: %v", err)
+			}
+			if u, err := svc.GetUser(ctx, enterprise); err != nil || u.KYCStatus != "verified" || u.Kind != "enterprise" {
+				t.Fatalf("enterprise user = %+v %v", u, err)
+			}
+			var n int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action = 'kyc.review' AND target_id = $1`, fmt.Sprint(enterpriseRecord)).Scan(&n); err != nil || n != 1 {
+				t.Fatalf("kyc.review audit rows = %d %v", n, err)
+			}
+
+			if personalCalls != tc.calls || tc.hook.calls != tc.calls {
+				t.Fatalf("hook calls = %d / %d, want %d per path", personalCalls, tc.hook.calls, tc.calls)
+			}
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action = 'test.hook_write'`).Scan(&n); err != nil || n != 2*tc.writes {
+				t.Fatalf("hook writes kept = %d %v, want %d (failed attempts must be rolled back)", n, err, 2*tc.writes)
+			}
+			for uid, rec := range map[int64]int64{personal: personalRecord, enterprise: enterpriseRecord} {
+				var got []int64
+				rows, err := pool.Query(ctx, `SELECT (diff->>'kyc_record_id')::bigint FROM audit_logs
+					WHERE action = 'referral.kyc_check_failed' AND actor_type = 'system' AND target_type = 'user' AND target_id = $1`, fmt.Sprint(uid))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err = pgx.CollectRows(rows, pgx.RowTo[int64]); err != nil {
+					t.Fatal(err)
+				}
+				if len(got) != tc.failure || (tc.failure == 1 && got[0] != rec) {
+					t.Fatalf("user %d kyc_check_failed = %v, want %d row(s) for record %d", uid, got, tc.failure, rec)
+				}
+			}
+		})
 	}
 }
 
@@ -499,6 +553,7 @@ type slowHook struct {
 	real    *referral.Service
 	delay   time.Duration
 	entered chan struct{} // 进入判定（KYC 事务已持有 users 行锁）时关闭；每轮重置
+	once    *sync.Once    // 冲突重试会再次调用钩子：只关一次
 	mu      sync.Mutex
 	errs    []error
 }
@@ -508,7 +563,7 @@ func (h *slowHook) Bind(ctx context.Context, tx pgx.Tx, req referral.BindRequest
 }
 
 func (h *slowHook) OnKYCVerified(ctx context.Context, tx pgx.Tx, userID int64, fp string) error {
-	close(h.entered)
+	h.once.Do(func() { close(h.entered) })
 	time.Sleep(h.delay)
 	err := h.real.OnKYCVerified(ctx, tx, userID, fp)
 	if err != nil {
@@ -552,7 +607,7 @@ func TestKYCConcurrentWithRegistrationsNoDeadlock(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		hook.entered = make(chan struct{})
+		hook.entered, hook.once = make(chan struct{}), &sync.Once{}
 		start := make(chan struct{})
 		var wg sync.WaitGroup
 		loginErrs := make([]error, n)
@@ -569,7 +624,11 @@ func TestKYCConcurrentWithRegistrationsNoDeadlock(t *testing.T) {
 				defer wg.Done()
 				<-start
 				if i%2 == 0 {
-					<-hook.entered // 一半在 KYC 持有 users(A) 行锁期间注册（必然与同身份判定交错）
+					// 一半在 KYC 持有 users(A) 行锁期间注册（必然与同身份判定交错）；KYC 提前出错时不挂住，由下面的 kycErr 断言报告
+					select {
+					case <-hook.entered:
+					case <-time.After(10 * time.Second):
+					}
 				} else {
 					time.Sleep(time.Duration(i) * time.Millisecond) // 另一半自由竞争
 				}
@@ -600,5 +659,85 @@ func TestKYCConcurrentWithRegistrationsNoDeadlock(t *testing.T) {
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM referral_bindings WHERE inviter_id = $1`, inviter).Scan(&bound); err != nil || bound != n+1 {
 			t.Fatalf("round %d bindings = %d %v", round, bound, err)
 		}
+	}
+}
+
+// 真实 identity + referral：同一用户既有个人又有企业实名时，同身份判定比较其全部指纹（不只最新一条）。
+func TestKYCSameIdentityAcrossPersonalAndEnterprise(t *testing.T) {
+	pool := dbtest.New(t)
+	clk := clock.NewFake(dbtest.T0)
+	key, _ := referral.DeriveFingerprintKey(dbtest.Key)
+	svc := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: mustBox(t), Uploads: fakeUploads{}, FixedCode: "000000", FingerprintKey: key, CodeIPHourLimit: 10000})
+	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Users: svc})
+	svc.SetReferral(ref)
+	ctx := context.Background()
+
+	inviterWithCode := func(phone string) (int64, string) {
+		t.Helper()
+		uid := dbtest.CreateUser(t, pool, phone, false)
+		acc, err := ref.EnsureCode(ctx, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return uid, acc.Code
+	}
+	register := func(phone, code string) int64 {
+		t.Helper()
+		if err := svc.SendLoginCode(ctx, phone, "9.9.9.9"); err != nil {
+			t.Fatal(err)
+		}
+		_, r, err := svc.LoginWith(ctx, identity.LoginRequest{Phone: phone, Code: "000000", InviteCode: code})
+		if err != nil || r.Invite == nil || !r.Invite.Bound {
+			t.Fatalf("register %s = %+v %v", phone, r, err)
+		}
+		return r.ID
+	}
+	personal := func(uid int64, id string) {
+		t.Helper()
+		if _, err := svc.SubmitPersonalKYC(ctx, uid, "张三", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 已个人实名的用户不能再走提交接口，直接插一条待审企业记录再审核通过（与 TestRejectEnterpriseKYCKeepsPersonalVerification 同法）
+	enterprise := func(uid int64, license string) {
+		t.Helper()
+		var recordID int64
+		if err := pool.QueryRow(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, license_no, license_file, result, created_at, updated_at)
+			VALUES ($1, 'enterprise', '某某科技有限公司', $2, 'f', 'pending', $3, $3) RETURNING id`, uid, license, dbtest.T0).Scan(&recordID); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.ReviewEnterpriseKYC(ctx, audit.Actor{AdminID: 99}, recordID, true, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status := func(invitee int64) string {
+		t.Helper()
+		var st string
+		if err := pool.QueryRow(ctx, `SELECT status FROM referral_bindings WHERE invitee_id = $1`, invitee).Scan(&st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+
+	// (a) A 个人 X → A 企业 L → B（A 邀请）个人 X：B 撤销
+	a, codeA := inviterWithCode("13700000001")
+	b := register("13700000002", codeA)
+	personal(a, "110101199001011234")
+	enterprise(a, "91420100MA4KXXXX1X")
+	personal(b, "110101199001011234")
+	if st := status(b); st != "revoked" {
+		t.Fatalf("(a) B = %s", st)
+	}
+	// (b) B（A 邀请）个人 X → B 企业 L → A 个人 X：B 撤销
+	a2, codeA2 := inviterWithCode("13700000011")
+	b2 := register("13700000012", codeA2)
+	personal(b2, "110101199001015678")
+	enterprise(b2, "91420100MA4KYYYY2Y")
+	if st := status(b2); st != "active" {
+		t.Fatalf("(b) B before inviter verifies = %s", st)
+	}
+	personal(a2, "110101199001015678")
+	if st := status(b2); st != "revoked" {
+		t.Fatalf("(b) B = %s", st)
 	}
 }

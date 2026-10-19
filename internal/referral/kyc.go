@@ -14,7 +14,8 @@ import (
 )
 
 // OnKYCVerified 在 identity 的实名结果事务内（已持有 users(本人) 行锁）做同身份判定：
-// 被邀请人的指纹等于邀请人或同邀请人其它被邀请人 → 该绑定撤销；本人作为邀请人时对其所有未撤销绑定做同样比较。
+// 被邀请人的任一 verified 指纹等于邀请人或同邀请人其它未撤销被邀请人的任一 verified 指纹 → 该绑定撤销；
+// 本人作为邀请人时对其所有未撤销绑定做同样比较。比较用全部指纹（同一用户可能既有个人又有企业实名），不只最新一条。
 // 加锁顺序见包注释：先本人的邀请人的 referral_accounts，再本人自己的。
 // 只接收 userID 与 identity 算出的十六进制指纹，没有用户可控的字符串进入 SQL；并发撤销等竞态按「已处理」跳过。
 func (s *Service) OnKYCVerified(ctx context.Context, tx pgx.Tx, userID int64, fingerprint string) error {
@@ -22,14 +23,30 @@ func (s *Service) OnKYCVerified(ctx context.Context, tx pgx.Tx, userID int64, fi
 		return nil
 	}
 	now := s.d.Clock.Now()
+	selfFps, err := s.d.Users.VerifiedFingerprints(ctx, tx, []int64{userID})
+	if err != nil {
+		return err
+	}
+	mine := map[string]bool{fingerprint: true} // 本条指纹 identity 已写入，这里再并上以防调用方未写
+	for _, fp := range selfFps[userID] {
+		mine[fp] = true
+	}
+	matches := func(fps []string) bool {
+		for _, fp := range fps {
+			if mine[fp] {
+				return true
+			}
+		}
+		return false
+	}
 	// (a) 作为被邀请人
 	var bindingID, inviterID int64
-	err := tx.QueryRow(ctx, `SELECT id, inviter_id FROM referral_bindings WHERE invitee_id = $1 AND status <> 'revoked'`, userID).Scan(&bindingID, &inviterID)
+	err = tx.QueryRow(ctx, `SELECT id, inviter_id FROM referral_bindings WHERE invitee_id = $1 AND status <> 'revoked'`, userID).Scan(&bindingID, &inviterID)
 	if err != nil && !db.IsNoRows(err) {
 		return err
 	}
 	if err == nil {
-		if err := s.checkInvitee(ctx, tx, now, bindingID, inviterID, userID, fingerprint); err != nil {
+		if err := s.checkInvitee(ctx, tx, now, bindingID, inviterID, userID, matches); err != nil {
 			return err
 		}
 	}
@@ -62,7 +79,7 @@ func (s *Service) OnKYCVerified(ctx context.Context, tx pgx.Tx, userID int64, fi
 		return err
 	}
 	for _, r := range list {
-		if fps[r.invitee] == fingerprint {
+		if matches(fps[r.invitee]) {
 			if err := s.autoRevoke(ctx, tx, now, r.id); err != nil {
 				return err
 			}
@@ -72,7 +89,7 @@ func (s *Service) OnKYCVerified(ctx context.Context, tx pgx.Tx, userID int64, fi
 }
 
 // checkInvitee：本人是被邀请人时，锁邀请人账户后与邀请人及同邀请人其它未撤销被邀请人的指纹比较。
-func (s *Service) checkInvitee(ctx context.Context, tx pgx.Tx, now time.Time, bindingID, inviterID, self int64, fingerprint string) error {
+func (s *Service) checkInvitee(ctx context.Context, tx pgx.Tx, now time.Time, bindingID, inviterID, self int64, matches func([]string) bool) error {
 	if _, err := lockAccount(ctx, tx, inviterID); err != nil {
 		if errors.Is(err, apperr.ErrNotFound) {
 			return nil // 有绑定必有码主账户；防御性跳过
@@ -87,8 +104,8 @@ func (s *Service) checkInvitee(ctx context.Context, tx pgx.Tx, now time.Time, bi
 	if err != nil {
 		return err
 	}
-	for _, fp := range fps {
-		if fp == fingerprint {
+	for _, list := range fps {
+		if matches(list) {
 			return s.autoRevoke(ctx, tx, now, bindingID)
 		}
 	}

@@ -58,5 +58,5 @@ export const auditActions: readonly string[] = [
   'image.create', 'image.update',
   'group.create', 'group.update', 'group.delete', 'group.assign', 'group.unassign', 'machine.update',
   'booking.cancel', 'booking.admin_cancel', 'booking.reassign', 'instance.auto_renew',
-  'referral.bind', 'referral.auto_revoke', 'referral.config', 'referral.freeze', 'referral.unfreeze', 'referral.approve', 'referral.revoke', 'referral.rescan',
+  'referral.bind', 'referral.auto_revoke', 'referral.kyc_check_failed', 'referral.config', 'referral.freeze', 'referral.unfreeze', 'referral.approve', 'referral.revoke', 'referral.rescan',
 ]

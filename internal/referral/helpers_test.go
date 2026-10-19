@@ -23,7 +23,7 @@ func TestMain(m *testing.M) { dbtest.Main(m) }
 type fakeUsers struct {
 	pool    *pgxpool.Pool
 	devices map[int64]map[string]bool
-	fps     map[int64]string
+	fps     map[int64][]string
 }
 
 func (f *fakeUsers) UserState(ctx context.Context, q db.Querier, id int64) (referral.UserState, error) {
@@ -38,11 +38,11 @@ func (f *fakeUsers) UserState(ctx context.Context, q db.Querier, id int64) (refe
 func (f *fakeUsers) HasDevice(_ context.Context, _ db.Querier, userID int64, deviceID string) (bool, error) {
 	return f.devices[userID][deviceID], nil
 }
-func (f *fakeUsers) VerifiedFingerprints(_ context.Context, _ db.Querier, ids []int64) (map[int64]string, error) {
-	out := map[int64]string{}
+func (f *fakeUsers) VerifiedFingerprints(_ context.Context, _ db.Querier, ids []int64) (map[int64][]string, error) {
+	out := map[int64][]string{}
 	for _, id := range ids {
-		if fp := f.fps[id]; fp != "" {
-			out[id] = fp
+		if fps := f.fps[id]; len(fps) > 0 {
+			out[id] = fps
 		}
 	}
 	return out, nil
@@ -78,7 +78,7 @@ func newEnv(t *testing.T) *env {
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
 	w := wallet.NewService(pool, clk)
-	users := &fakeUsers{pool: pool, devices: map[int64]map[string]bool{}, fps: map[int64]string{}}
+	users := &fakeUsers{pool: pool, devices: map[int64]map[string]bool{}, fps: map[int64][]string{}}
 	orders := &fakeOrders{m: map[string]fakeOrder{}}
 	svc := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Wallet: w, Users: users, Orders: orders})
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, svc: svc, wallet: w, users: users, orders: orders}

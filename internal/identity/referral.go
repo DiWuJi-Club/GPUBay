@@ -26,13 +26,14 @@ func (s *Service) HasDevice(ctx context.Context, q db.Querier, userID int64, dev
 	return has, err
 }
 
-func (s *Service) VerifiedFingerprints(ctx context.Context, q db.Querier, userIDs []int64) (map[int64]string, error) {
-	out := map[int64]string{}
+// VerifiedFingerprints 返回每个用户全部 verified 且指纹非空的实名指纹（去重，按首次出现的记录排序）。
+func (s *Service) VerifiedFingerprints(ctx context.Context, q db.Querier, userIDs []int64) (map[int64][]string, error) {
+	out := map[int64][]string{}
 	if len(userIDs) == 0 {
 		return out, nil
 	}
-	rows, err := q.Query(ctx, `SELECT DISTINCT ON (user_id) user_id, fingerprint FROM kyc_records
-		WHERE user_id = ANY($1) AND result = 'verified' AND fingerprint <> '' ORDER BY user_id, id DESC`, userIDs)
+	rows, err := q.Query(ctx, `SELECT user_id, fingerprint FROM kyc_records
+		WHERE user_id = ANY($1) AND result = 'verified' AND fingerprint <> '' GROUP BY user_id, fingerprint ORDER BY user_id, min(id)`, userIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +44,7 @@ func (s *Service) VerifiedFingerprints(ctx context.Context, q db.Querier, userID
 		if err := rows.Scan(&id, &fp); err != nil {
 			return nil, err
 		}
-		out[id] = fp
+		out[id] = append(out[id], fp)
 	}
 	return out, rows.Err()
 }

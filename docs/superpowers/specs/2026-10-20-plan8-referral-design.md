@@ -256,6 +256,9 @@ CREATE INDEX kyc_records_fingerprint_idx ON kyc_records (fingerprint) WHERE fing
 - 然后调用 `referral.OnKYCVerified(ctx, tx, userID, fingerprint)`：
   1. 若该用户是**被邀请人**（有 `referral_bindings.invitee_id = userID` 且状态 ≠ revoked）：查「邀请人的 verified 指纹」与「同邀请人其他被邀请人的 verified 指纹」是否等于本指纹（`kyc_records_fingerprint_idx`）；命中 → 绑定 `revoked`，`risk_flags += same_identity`，`hold_reason='same_identity'`，该绑定全部 `pending` 返利 → `void`（事件 `void`），审计 `referral.auto_revoke`。
   2. 若该用户是**邀请人**（有被邀请人）：对其所有未撤销绑定做同样比较（被邀请人先实名、邀请人后实名的情况）。
+  - 「同邀请人其他被邀请人」只含**未撤销**绑定的被邀请人：已撤销的绑定不再产生返利，不参与比较。
+  - 比较用每个用户**全部** verified 指纹（同一用户可能既有个人又有企业实名），本人一侧同样取全部指纹并上本条；`UserLookup.VerifiedFingerprints` 返回 `map[userID][]fingerprint`。
+  - 判定在保存点里执行，不让实名失败：死锁 / 序列化冲突（40P01 / 40001）在新保存点里重试一次；仍失败则回滚保存点、记日志，并在外层事务写审计 `referral.kyc_check_failed`（目标 `user`，diff `{kyc_record_id}`），由后台人工核查该用户的邀请绑定。
 - 指纹比较只在实名通过时做一次，不做定期全量扫描（遗留）。
 
 ## 4. 返利计算

@@ -574,7 +574,7 @@ func TestUserLookupImplementation(t *testing.T) {
 	if _, err := e.pool.Exec(ctx, `INSERT INTO user_devices (user_id, device_id, first_seen_at, last_seen_at) VALUES ($1, $2, $3, $3)`, uid, devA, dbtest.T0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.pool.Exec(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, result, fingerprint, created_at, updated_at) VALUES ($1, 'personal', 'x', 'verified', 'fp-old', $2, $2), ($1, 'personal', 'x', 'verified', 'fp-new', $2, $2)`, uid, dbtest.T0); err != nil {
+	if _, err := e.pool.Exec(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, result, fingerprint, created_at, updated_at) VALUES ($1, 'personal', 'x', 'verified', 'fp-old', $2, $2), ($1, 'enterprise', 'x', 'verified', 'fp-new', $2, $2), ($1, 'personal', 'x', 'verified', 'fp-old', $2, $2), ($1, 'personal', 'x', 'rejected', 'fp-bad', $2, $2)`, uid, dbtest.T0); err != nil {
 		t.Fatal(err)
 	}
 	var lookup referral.UserLookup = e.svc
@@ -592,7 +592,7 @@ func TestUserLookupImplementation(t *testing.T) {
 		t.Fatalf("HasDevice other = %v %v", has, err)
 	}
 	fps, err := lookup.VerifiedFingerprints(ctx, e.pool, []int64{uid, 999999})
-	if err != nil || len(fps) != 1 || fps[uid] != "fp-new" {
+	if err != nil || len(fps) != 1 || len(fps[uid]) != 2 || fps[uid][0] != "fp-old" || fps[uid][1] != "fp-new" {
 		t.Fatalf("fps = %v %v", fps, err)
 	}
 }

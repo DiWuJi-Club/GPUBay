@@ -101,8 +101,9 @@ type UserState struct {
 type UserLookup interface {
 	UserState(ctx context.Context, q db.Querier, id int64) (UserState, error)
 	HasDevice(ctx context.Context, q db.Querier, userID int64, deviceID string) (bool, error)
-	// VerifiedFingerprints 返回每个用户最新一条 verified 且指纹非空的实名记录的指纹；没有的用户不在 map 里。
-	VerifiedFingerprints(ctx context.Context, q db.Querier, userIDs []int64) (map[int64]string, error)
+	// VerifiedFingerprints 返回每个用户全部 verified 且指纹非空的实名记录的指纹（去重；同一用户可能既有个人又有企业实名）；
+	// 没有的用户不在 map 里。
+	VerifiedFingerprints(ctx context.Context, q db.Querier, userIDs []int64) (map[int64][]string, error)
 }
 
 type OrderLookup interface {

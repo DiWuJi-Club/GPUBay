@@ -98,6 +98,7 @@ func runReferral(ctx context.Context, pool *pgxpool.Pool, box *secretbox.Box, ke
 		case r.kind == "enterprise" && r.license != "":
 			fp = referral.Fingerprint(key, "lic", r.license)
 		default:
+			fmt.Fprintf(out, "记录 %d：无号码，跳过\n", r.id)
 			skipped++
 			continue
 		}

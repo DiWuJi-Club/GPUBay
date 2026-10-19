@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -154,29 +155,41 @@ func TestReferralBackfillFingerprints(t *testing.T) {
 	u1 := dbtest.CreateUser(t, pool, "13800000031", true)
 	u2 := dbtest.CreateUser(t, pool, "13800000032", true)
 	u3 := dbtest.CreateUser(t, pool, "13800000033", true)
-	pool.Exec(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, id_number_enc, result, created_at, updated_at) VALUES ($1, 'personal', 'a', $2, 'verified', $3, $3)`, u1, box.Seal([]byte("110101199001011234")), dbtest.T0)
-	pool.Exec(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, license_no, result, created_at, updated_at) VALUES ($1, 'enterprise', 'b', '91110000MA01ABCD2X', 'verified', $2, $2)`, u2, dbtest.T0)
-	pool.Exec(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, id_number_enc, result, created_at, updated_at) VALUES ($1, 'personal', 'c', '\x00', 'verified', $2, $2)`, u3, dbtest.T0) // 解密失败
+	u4 := dbtest.CreateUser(t, pool, "13800000034", true)
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO kyc_records (user_id, kind, real_name, id_number_enc, result, created_at, updated_at) VALUES ($1, 'personal', 'a', $2, 'verified', $3, $3)`, []any{u1, box.Seal([]byte("110101199001011234")), dbtest.T0}},
+		{`INSERT INTO kyc_records (user_id, kind, real_name, license_no, result, created_at, updated_at) VALUES ($1, 'enterprise', 'b', '91110000MA01ABCD2X', 'verified', $2, $2)`, []any{u2, dbtest.T0}},
+		{`INSERT INTO kyc_records (user_id, kind, real_name, id_number_enc, result, created_at, updated_at) VALUES ($1, 'personal', 'c', '\x00', 'verified', $2, $2)`, []any{u3, dbtest.T0}}, // 解密失败
+		{`INSERT INTO kyc_records (user_id, kind, real_name, result, created_at, updated_at) VALUES ($1, 'enterprise', 'd', 'verified', $2, $2)`, []any{u4, dbtest.T0}},                      // 无号码
+	} {
+		if _, err := pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var noNumber int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM kyc_records WHERE user_id = $1`, u4).Scan(&noNumber); err != nil {
+		t.Fatal(err)
+	}
 	var out bytes.Buffer
 	if err := runReferral(ctx, pool, box, key, []string{"backfill-fingerprints"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "已回填 2 条，跳过 1 条") {
+	if !strings.Contains(out.String(), "已回填 2 条，跳过 2 条") || !strings.Contains(out.String(), fmt.Sprintf("记录 %d：无号码，跳过", noNumber)) {
 		t.Fatalf("out = %s", out.String())
 	}
 	var fp string
-	pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1`, u1).Scan(&fp)
-	if fp != referral.Fingerprint(key, "kyc", "110101199001011234") {
+	if err := pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1`, u1).Scan(&fp); err != nil || fp != referral.Fingerprint(key, "kyc", "110101199001011234") {
 		t.Fatalf("u1 fp = %q", fp)
 	}
-	pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1`, u2).Scan(&fp)
-	if fp != referral.Fingerprint(key, "lic", "91110000MA01ABCD2X") {
+	if err := pool.QueryRow(ctx, `SELECT fingerprint FROM kyc_records WHERE user_id = $1`, u2).Scan(&fp); err != nil || fp != referral.Fingerprint(key, "lic", "91110000MA01ABCD2X") {
 		t.Fatalf("u2 fp = %q", fp)
 	}
 	// 幂等：第二次 0 条
 	out.Reset()
-	runReferral(ctx, pool, box, key, []string{"backfill-fingerprints"}, &out)
-	if !strings.Contains(out.String(), "已回填 0 条") {
+	if err := runReferral(ctx, pool, box, key, []string{"backfill-fingerprints"}, &out); err != nil || !strings.Contains(out.String(), "已回填 0 条") {
 		t.Fatalf("second run = %s", out.String())
 	}
 	if err := runReferral(ctx, pool, box, key, []string{"bogus"}, &out); err == nil {
