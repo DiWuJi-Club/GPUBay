@@ -109,8 +109,11 @@ const disconnectWriteWait = time.Second
 
 // disconnect 向所有 session 通道的 stderr 写提示（最多等 disconnectWriteWait）后关闭两端连接。
 // x/crypto 不支持带消息的 SSH_MSG_DISCONNECT，提示只能经通道 stderr 送达。
+// 只有第一次调用生效：扫描、drain、上游断开复查可能同时触发，提示只写一次。
 func (x *session) disconnect(msg string) {
-	x.closing.Store(true)
+	if !x.closing.CompareAndSwap(false, true) {
+		return
+	}
 	x.mu.Lock()
 	shells := append([]ssh.Channel(nil), x.shells...)
 	x.mu.Unlock()

@@ -1,5 +1,7 @@
 package sshgw
 
+import "sync"
+
 func SetLimitsForTest(s *Server, ipFails, instFails, maxConns int) {
 	s.lim.mu.Lock()
 	defer s.lim.mu.Unlock()
@@ -21,3 +23,17 @@ func SweepForTest(s *Server) { s.lim.sweep(s.d.Clock.Now()) }
 func LimiterSizesForTest(s *Server) (fails, instF, blocked int) { return s.lim.sizes() }
 
 const MaxPendingOpensForTest = maxPendingOpens
+
+// DisconnectConcurrentlyForTest 对每个会话同时发起 n 次 disconnect（模拟扫描、drain、上游断开复查撞在一起）。
+func DisconnectConcurrentlyForTest(s *Server, msg string, n int) {
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for _, x := range s.snapshotSessions() {
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); <-start; x.disconnect(msg) }()
+		}
+	}
+	close(start)
+	wg.Wait()
+}

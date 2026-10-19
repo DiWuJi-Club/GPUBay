@@ -599,3 +599,46 @@ func TestKeepaliveClosesFrozenClient(t *testing.T) {
 	waitFor(t, "frozen client dropped", func() bool { return e.srv.Sessions() == 0 })
 	waitFor(t, "session record closed", func() bool { _, closed, _ := e.store.snapshot(); return len(closed) == 1 })
 }
+
+// 容器正常结束通道（上游仍活着）不等状态复查：exit 0 不被拖慢。
+func TestNormalExitNotDelayed(t *testing.T) {
+	e := newEnv(t)
+	c := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	run(t, c, "exit 0") // 预热
+	for i := 0; i < 5; i++ {
+		start := time.Now()
+		if _, _, err := run(t, c, "exit 0"); err != nil {
+			t.Fatal(err)
+		}
+		if d := time.Since(start); d > 500*time.Millisecond {
+			t.Fatalf("exit 0 took %v", d)
+		}
+	}
+	if n := e.store.stateQueriesCount(); n != 0 {
+		t.Fatalf("normal exit triggered %d state checks", n)
+	}
+}
+
+// 多路断开同时触发（扫描、drain、上游断开复查撞在一起）：提示只写一次。
+func TestDisconnectNoticeExactlyOnce(t *testing.T) {
+	e := newEnv(t)
+	c := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	sess, _ := c.NewSession()
+	var stderr syncBuffer
+	sess.Stderr = &stderr
+	sess.StdinPipe()
+	if err := sess.Start("cat"); err != nil {
+		t.Fatal(err)
+	}
+	sshgw.DisconnectConcurrentlyForTest(e.srv, sshgw.MsgDisconnected, 8)
+	done := make(chan error, 1)
+	go func() { done <- sess.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session not closed")
+	}
+	if n := strings.Count(stderr.String(), sshgw.MsgDisconnected); n != 1 {
+		t.Fatalf("notice written %d times: %q", n, stderr.String())
+	}
+}

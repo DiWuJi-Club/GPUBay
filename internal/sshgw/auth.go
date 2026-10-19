@@ -97,8 +97,12 @@ func perms(info rental.AccessInfo, method string, keyID int64) *ssh.Permissions 
 
 func (s *Server) passwordCallback(c ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
 	info, ok := s.lookup(c.User())
-	if ok && (!allowed(info) || !info.Instance.PasswordAuth) {
+	if ok && !allowed(info) {
 		return nil, errAuth // 不校验凭据、猜也不可能成功：不计失败（停机实例的 IDE 反复重连不能封用户 IP）
+	}
+	if ok && !info.Instance.PasswordAuth {
+		s.d.Log.Info("ssh password refused: password_auth disabled", "instance", info.Instance.ID) // 同上不计失败
+		return nil, errAuth
 	}
 	s.noteAttempt(c, ok)
 	if !ok {

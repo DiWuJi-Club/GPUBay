@@ -347,3 +347,9 @@ var (
 	_ sshgw.Store = (*rental.Service)(nil)
 	_ sshgw.Keys  = (*identity.Service)(nil)
 )
+
+func (f *fakeStore) stateQueriesCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stateQueries
+}

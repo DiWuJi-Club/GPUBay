@@ -339,3 +339,27 @@ func TestWrongPasswordsAndUnknownInstancesStillBlock(t *testing.T) {
 	}
 	waitFor(t, "unknown ids block ip", func() bool { return sshgw.BlockedForTest(u.srv, "127.0.0.1") })
 }
+
+// 关闭了密码登录：密码尝试不可能成功，不计失败；日志记一行原因与实例，不含密码。
+func TestPasswordAuthDisabledRefusalsNotCounted(t *testing.T) {
+	e := newEnv(t)
+	info := runningInfo(e, instA, 7, "pw-correct-16chr")
+	info.Instance.PasswordAuth = false
+	e.store.set(instA, info)
+	for i := 0; i < 12; i++ {
+		if _, _, err := e.dial(instA, ssh.Password(fmt.Sprintf("guess-%02d-xyz", i))); err == nil {
+			t.Fatal("password accepted while disabled")
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 0 || sshgw.BlockedForTest(e.srv, "127.0.0.1") {
+		t.Fatalf("disabled-password refusals counted: fails=%d", n)
+	}
+	logs := e.logs.String()
+	if !strings.Contains(logs, "password_auth disabled") || !strings.Contains(logs, "instance="+instA) {
+		t.Fatalf("missing refusal log:\n%s", logs)
+	}
+	if strings.Contains(logs, "guess-") || strings.Contains(logs, "pw-correct-16chr") {
+		t.Fatalf("password in logs:\n%s", logs)
+	}
+}

@@ -111,7 +111,7 @@
 - `PasswordCallback`：实例 `password_auth = true` 且 `subtle.ConstantTimeCompare(解密密码, 输入)`；否则失败。关闭密码登录时失败原因只记日志。
 - `PublicKeyCallback`：按 `ssh_keys WHERE user_id = <实例主人> AND fingerprint = SHA256(<key>)` 查；命中则在 `Permissions.Extensions` 记 `key_id`。会话建立后 `UPDATE ssh_keys SET last_used_at`。
 - `MaxAuthTries = 6`（与 OpenSSH 一致）；握手（含认证）总超时 30 秒。
-- 暴力破解计数**按连接而不是按认证尝试**：OpenSSH 客户端会把 agent 里的每把公钥逐个试探，每次不匹配都触发 `PublicKeyCallback`，若按尝试计数，一个 agent 里有 4 把密钥的用户连两次就会把自己锁掉。规则：一条连接关闭时仍未认证成功 → 计 1 次失败（公钥查询不计，密码错多次也只计 1 次）。来源 IP（IPv6 按 /64）10 分钟内失败连接 ≥ 10 → 该 IP 10 分钟内新连接直接断开；同一实例 10 分钟内失败连接 ≥ 30 → `RaiseAlertOnce(warning, ssh_bruteforce, machine, instance, "实例 <id> 的 SSH 登录失败次数超过阈值，详情见日志")`（文案稳定，不含次数与 IP）。进程内计数，多副本各自计数（已接受）；e2e-server 的 `DisableRateLimits` 同样关闭这两项。
+- 暴力破解计数**按连接而不是按认证尝试**：OpenSSH 客户端会把 agent 里的每把公钥逐个试探，每次不匹配都触发 `PublicKeyCallback`，若按尝试计数，一个 agent 里有 4 把密钥的用户连两次就会把自己锁掉。规则：一条连接关闭时仍未认证成功、且其间凭据真正针对可登录实例（running 且未暂停）做过校验或用户名对应的实例不存在 → 计 1 次失败（公钥查询不计，密码错多次也只计 1 次）；实例存在但不在 running、已暂停、或关闭了密码登录时的拒绝（密码登录关闭时的密码尝试）一律不计——这些状态下猜什么都不可能成功，计入只会把自动重连的合法客户端（IDE、脚本）封掉。（真机检查点 A 确认的变更。）来源 IP（IPv6 按 /64）10 分钟内失败连接 ≥ 10 → 该 IP 10 分钟内新连接直接断开；同一实例 10 分钟内失败连接 ≥ 30 → `RaiseAlertOnce(warning, ssh_bruteforce, machine, instance, "实例 <id> 的 SSH 登录失败次数超过阈值，详情见日志")`（文案稳定，不含次数与 IP）。进程内计数，多副本各自计数（已接受）；e2e-server 的 `DisableRateLimits` 同样关闭这两项。
 - 连接上限：每来源 IP（IPv6 /64）并发连接 ≤ 32，每实例并发会话 ≤ 16（`SPARK_SSH_MAX_SESSIONS_PER_INSTANCE`，默认 16），超限断开并提示「连接数过多」。
 
 ### 2.3 状态门控（对新连接）
