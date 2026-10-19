@@ -9,6 +9,7 @@ import (
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/paging"
 	"spark-cloud/internal/platform/tz"
+	"spark-cloud/internal/wallet"
 )
 
 // 控制台邀请页的只读查询（规格 §10.1）。被邀请人只以脱敏手机号出现（R11），不返回 user id、实名信息或风险标记。
@@ -49,8 +50,8 @@ func (s *Service) monthStart() time.Time {
 // MonthSettledFor 本月已发放到该用户钱包的返利（Σ referral_rebate 流水）。
 func (s *Service) MonthSettledFor(ctx context.Context, userID int64) (int64, error) {
 	var n int64
-	err := s.d.Pool.QueryRow(ctx, `SELECT COALESCE(sum(amount), 0) FROM wallet_ledger WHERE user_id = $1 AND kind = 'referral_rebate' AND created_at >= $2`,
-		userID, s.monthStart()).Scan(&n)
+	err := s.d.Pool.QueryRow(ctx, `SELECT COALESCE(sum(amount), 0) FROM wallet_ledger WHERE user_id = $1 AND kind = $2 AND created_at >= $3`,
+		userID, string(wallet.KindReferralRebate), s.monthStart()).Scan(&n)
 	return n, err
 }
 

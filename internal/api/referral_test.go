@@ -195,7 +195,10 @@ func TestLoginWithGarbageInviteCodeStillRegisters(t *testing.T) {
 
 func postRaw(t *testing.T, url string, body []byte, headers map[string]string) (int, map[string]any) {
 	t.Helper()
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -206,6 +209,26 @@ func postRaw(t *testing.T, url string, body []byte, headers map[string]string) (
 	}
 	defer resp.Body.Close()
 	var out map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode %s response (status %d): %v", url, resp.StatusCode, err)
+	}
 	return resp.StatusCode, out
+}
+
+// /me 的返利小字查询失败不能拖垮 /me：记日志、省略字段、照常 200。
+func TestMeSurvivesMonthSettledFailure(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.client()
+	c.login("13812345678")
+	// 让 MonthSettledFor 的查询报错（每个测试独占一个库）；会话校验不读 wallet_ledger
+	if _, err := e.pool.Exec(context.Background(), `ALTER TABLE wallet_ledger RENAME COLUMN created_at TO created_at_broken`); err != nil {
+		t.Fatal(err)
+	}
+	st, me := c.do("GET", "/me", nil)
+	if st != 200 || me["phone"] != "13812345678" {
+		t.Fatalf("me = %d %v", st, me)
+	}
+	if _, ok := me["referral_month_settled"]; ok {
+		t.Fatalf("me = %v, want referral_month_settled omitted", me)
+	}
 }

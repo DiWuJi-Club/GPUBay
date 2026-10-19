@@ -6,7 +6,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/httpx"
 	"spark-cloud/internal/platform/paging"
 )
@@ -29,16 +28,6 @@ func sanitizeInviteCode(c string) string {
 		return invalidInviteCode
 	}
 	return c
-}
-
-func (s *Server) referralRateLimit(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.referralLim.allow(clientIP(r), s.Clock.Now()) {
-			s.writeError(w, r, apperr.ErrRateLimited)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 // handleReferralCode 匿名查码（登录页显示「通过 138****1234 的邀请注册」）：只返回有效与否和脱敏手机号，

@@ -71,12 +71,12 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
 	v := meView{User: u}
 	if s.Referral != nil {
-		n, err := s.Referral.MonthSettledFor(r.Context(), u.ID)
-		if err != nil {
-			s.writeError(w, r, err)
-			return
+		// 入口小字是锦上添花：查询失败只记日志、省略字段，/me 本身照常返回（前端靠它判断登录态）。
+		if n, err := s.Referral.MonthSettledFor(r.Context(), u.ID); err != nil {
+			s.Log.Error("referral month settled failed", "err", err, "user_id", u.ID)
+		} else {
+			v.ReferralMonthSettled = n
 		}
-		v.ReferralMonthSettled = n
 	}
 	writeJSON(w, http.StatusOK, v)
 }

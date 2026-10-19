@@ -109,7 +109,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/images", s.handleImages)
 		r.Get("/pay/channels", s.handlePayChannels)
 		r.Group(func(r chi.Router) {
-			r.Use(httpx.NoStore, s.calendarRateLimit)
+			r.Use(httpx.NoStore, s.ipRateLimit(s.calendarLim))
 			r.Get("/groups", s.handleGroups)
 			r.Get("/groups/{id}/machines", s.handleGroupMachines)
 			r.Get("/groups/{id}/calendar", s.handleGroupCalendar)
@@ -121,7 +121,7 @@ func (s *Server) Router() http.Handler {
 			r.With(httpx.NoStore).Get("/ingress/authorize", s.handleIngressAuthorize) // 组外：未登录要 302 到登录页而不是 JSON 401
 		}
 		if s.Referral != nil {
-			r.With(httpx.NoStore, s.referralRateLimit).Get("/referral/codes/{code}", s.handleReferralCode) // 匿名：登录页显示邀请人
+			r.With(httpx.NoStore, s.ipRateLimit(s.referralLim)).Get("/referral/codes/{code}", s.handleReferralCode) // 匿名：登录页显示邀请人
 		}
 
 		r.Group(func(r chi.Router) {
