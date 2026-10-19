@@ -1,0 +1,56 @@
+package adminapi_test
+
+import (
+	"testing"
+
+	"spark-cloud/internal/admin"
+	"spark-cloud/internal/platform/dbtest"
+)
+
+func TestPricesAndImagesEndpoints(t *testing.T) {
+	e := newEnv(t)
+	root := e.loginAs("root", admin.RoleSuper)
+	pid := itoa(dbtest.ProductID(t, e.pool))
+	if code, out := root.do("GET", "/products", nil); code != 200 || len(out["items"].([]any)) != 1 {
+		t.Fatalf("products = %d %v", code, out)
+	}
+	if code, out := root.do("PUT", "/products/"+pid+"/prices/1d", map[string]any{"amount": 7900, "enabled": true}); code != 403 || codeOf(out) != "totp_required" {
+		t.Fatalf("price without totp = %d %v", code, out)
+	}
+	if code, out := root.do("PUT", "/products/"+pid+"/prices/1d", map[string]any{"amount": 7900, "enabled": true, "totp": root.totp()}); code != 200 || out["amount"].(float64) != 7900 {
+		t.Fatalf("price = %d %v", code, out)
+	}
+	if code, out := root.do("PUT", "/products/"+pid+"/prices/2h", map[string]any{"amount": 100, "enabled": true}); code != 400 {
+		t.Fatalf("bad duration = %d %v", code, out)
+	}
+	code, out := root.do("POST", "/images", map[string]any{"name": "SGLang", "ref": "registry.spark.internal/base/sglang:0.5", "enabled": true, "sort": 40})
+	if code != 201 {
+		t.Fatalf("create image = %d %v", code, out)
+	}
+	id := itoa(int64(out["id"].(float64)))
+	if code, out := root.do("PUT", "/images/"+id, map[string]any{"name": "SGLang", "ref": "registry.spark.internal/base/sglang:0.6", "enabled": false}); code != 200 || out["enabled"] != false {
+		t.Fatalf("update image = %d %v", code, out)
+	}
+	if code, out := root.do("GET", "/images", nil); code != 200 || len(out["items"].([]any)) != 4 {
+		t.Fatalf("images = %d %v", code, out)
+	}
+	ops := e.loginAs("ops", admin.RoleOps)
+	if code, out := ops.do("GET", "/products", nil); code != 403 || codeOf(out) != "forbidden" {
+		t.Fatalf("ops products = %d %v", code, out)
+	}
+}
+
+func TestAuditEndpoint(t *testing.T) {
+	e := newEnv(t)
+	root := e.loginAs("root", admin.RoleSuper)
+	fin := e.loginAs("fin", admin.RoleFinance)
+	if code, out := fin.do("GET", "/audit?action=admin.totp_bind", nil); code != 200 || out["total"].(float64) != 2 {
+		t.Fatalf("audit = %d %v", code, out)
+	}
+	if code, out := fin.do("GET", "/audit?actor_id="+itoa(root.admin.ID)+"&action=admin.totp_bind", nil); code != 200 || out["total"].(float64) != 1 {
+		t.Fatalf("audit by actor = %d %v", code, out)
+	}
+	if code, _ := fin.do("GET", "/audit?from=bad", nil); code != 400 {
+		t.Fatalf("bad from = %d", code)
+	}
+}

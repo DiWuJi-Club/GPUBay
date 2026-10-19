@@ -34,3 +34,18 @@ func Record(ctx context.Context, q db.Querier, at time.Time, e Entry) error {
 		e.ActorType, e.ActorID, e.Action, e.TargetType, e.TargetID, diff, e.IP, at)
 	return err
 }
+
+// Actor 标识发起后台操作的管理员与来源 IP；AdminID 为 0 表示命令行等系统操作。
+type Actor struct {
+	AdminID int64
+	IP      string
+}
+
+// Entry 生成一条以该操作人为主体的审计记录。
+func (a Actor) Entry(action, targetType, targetID string, diff any) Entry {
+	actorType := "admin"
+	if a.AdminID == 0 {
+		actorType = "system"
+	}
+	return Entry{ActorType: actorType, ActorID: a.AdminID, Action: action, TargetType: targetType, TargetID: targetID, Diff: diff, IP: a.IP}
+}

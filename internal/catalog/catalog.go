@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/db"
 )
 
@@ -60,10 +61,17 @@ type Image struct {
 }
 
 type Service struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	clock clock.Clock
 }
 
-func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool, clock: clock.Real{}} }
+
+// WithClock 替换时钟（测试与 app 组装时注入同一个时钟）。
+func (s *Service) WithClock(c clock.Clock) *Service {
+	s.clock = c
+	return s
+}
 
 func (s *Service) ListProducts(ctx context.Context) ([]ProductWithPrices, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, code, name, spec FROM products WHERE status = 'active' ORDER BY id`)
@@ -131,4 +139,24 @@ func (s *Service) ListImages(ctx context.Context) ([]Image, error) {
 		err := r.Scan(&img.ID, &img.Name, &img.Ref, &img.Description)
 		return img, err
 	})
+}
+
+// ImageRef 返回镜像地址，不要求镜像仍在售（换机时沿用用户原来的镜像）。
+func (s *Service) ImageRef(ctx context.Context, q db.Querier, id int64) (string, error) {
+	var ref string
+	err := q.QueryRow(ctx, `SELECT ref FROM images WHERE id = $1`, id).Scan(&ref)
+	if db.IsNoRows(err) {
+		return "", apperr.ErrNotFound
+	}
+	return ref, err
+}
+
+// ProductIDByCode 按商品编码查 ID（批量导入机器时使用）。
+func (s *Service) ProductIDByCode(ctx context.Context, code string) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx, `SELECT id FROM products WHERE code = $1`, code).Scan(&id)
+	if db.IsNoRows(err) {
+		return 0, apperr.ErrNotFound
+	}
+	return id, err
 }

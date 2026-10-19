@@ -2,6 +2,7 @@ package catalog_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -94,5 +95,22 @@ func TestImages(t *testing.T) {
 	}
 	if _, err := svc.GetImage(ctx, pool, 99999); err == nil {
 		t.Fatal("missing image must error")
+	}
+}
+
+func TestImageRefIgnoresEnabledFlag(t *testing.T) {
+	pool := dbtest.New(t)
+	svc := catalog.NewService(pool)
+	ctx := context.Background()
+	id := dbtest.ImageID(t, pool)
+	if _, err := pool.Exec(ctx, `UPDATE images SET enabled = false WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := svc.ImageRef(ctx, pool, id)
+	if err != nil || ref == "" {
+		t.Fatalf("ref = %q, %v", ref, err)
+	}
+	if _, err := svc.ImageRef(ctx, pool, 9999); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("missing image = %v", err)
 	}
 }

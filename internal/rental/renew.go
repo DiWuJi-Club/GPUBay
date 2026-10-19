@@ -47,37 +47,7 @@ func (s *Service) Renew(ctx context.Context, userID int64, instanceID string, d 
 		if ord, err = s.charge(ctx, tx, userID, "renew", inst.ID, inst.ProductID, d, idempotencyKey, now); err != nil {
 			return err
 		}
-		secs := seconds(d)
-		switch {
-		case inst.State == StateCreating:
-			_, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
-		case inst.State == StateRunning && inst.Suspended():
-			var paused int64
-			if inst.PausedRemaining != nil {
-				paused = *inst.PausedRemaining
-			}
-			r24, r1 := reminderFlags(time.Duration(paused+secs) * time.Second)
-			_, err = tx.Exec(ctx, `UPDATE instances SET paused_remaining = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
-				inst.ID, paused+secs, r24, r1, now)
-		case inst.State == StateRunning:
-			base := *inst.ExpiresAt // 已过期但尚未被清扫的实例从当前时刻起算
-			if base.Before(now) {
-				base = now
-			}
-			expires := base.Add(d.Length())
-			r24, r1 := reminderFlags(expires.Sub(now))
-			_, err = tx.Exec(ctx, `UPDATE instances SET expires_at = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
-				inst.ID, expires, r24, r1, now)
-		case inst.State == StateStopped:
-			if _, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now); err != nil {
-				return err
-			}
-			var open bool // 已有未完成的启动指令则不重复下发；启动失败后再次续费会重新下发
-			if open, err = s.d.Fleet.HasOpenCommand(ctx, tx, inst.ID, fleet.CmdStartInstance); err == nil && !open {
-				_, err = s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdStartInstance, nil)
-			}
-		}
-		if err != nil {
+		if err := s.addTime(ctx, tx, inst, seconds(d), now); err != nil {
 			return err
 		}
 		if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, "renew "+ord.ID, now); err != nil {
@@ -125,4 +95,43 @@ func (s *Service) Release(ctx context.Context, userID int64, instanceID string) 
 		}
 		return s.beginWipe(ctx, tx, inst, "user released", now)
 	})
+}
+
+// addTime 按实例当前状态增加可用时长（续费与后台免费延长共用）：
+// 运行中延长到期时间（已到期未清扫的从当前时刻起算；暂停中加到冻结的剩余时长）并重算提醒标记；
+// 开通中或停机时计入待开始时长，停机且没有未完成的启动指令时下发启动。
+func (s *Service) addTime(ctx context.Context, tx pgx.Tx, inst Instance, secs int64, now time.Time) error {
+	var err error
+	switch {
+	case inst.State == StateCreating:
+		_, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
+	case inst.State == StateRunning && inst.Suspended():
+		var paused int64
+		if inst.PausedRemaining != nil {
+			paused = *inst.PausedRemaining
+		}
+		r24, r1 := reminderFlags(time.Duration(paused+secs) * time.Second)
+		_, err = tx.Exec(ctx, `UPDATE instances SET paused_remaining = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
+			inst.ID, paused+secs, r24, r1, now)
+	case inst.State == StateRunning:
+		base := *inst.ExpiresAt
+		if base.Before(now) {
+			base = now
+		}
+		expires := base.Add(time.Duration(secs) * time.Second)
+		r24, r1 := reminderFlags(expires.Sub(now))
+		_, err = tx.Exec(ctx, `UPDATE instances SET expires_at = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
+			inst.ID, expires, r24, r1, now)
+	case inst.State == StateStopped:
+		if _, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now); err != nil {
+			return err
+		}
+		var open bool // 已有未完成的启动指令则不重复下发；启动失败后再次加时会重新下发
+		if open, err = s.d.Fleet.HasOpenCommand(ctx, tx, inst.ID, fleet.CmdStartInstance); err == nil && !open {
+			_, err = s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdStartInstance, nil)
+		}
+	default:
+		return apperr.ErrInvalidState
+	}
+	return err
 }

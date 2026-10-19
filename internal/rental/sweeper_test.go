@@ -1,6 +1,8 @@
 package rental_test
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -342,5 +344,50 @@ func TestFailStuckCreatingRowFailureDoesNotBlockOthers(t *testing.T) {
 	}
 	if got := e.get(bad.ID); got.State != rental.StateCreating {
 		t.Fatalf("bad instance = %s, want creating", got.State)
+	}
+}
+
+func TestRunSweeperRunsExtraTasks(t *testing.T) {
+	e := newEnv(t, 0)
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+	var calls []string
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.svc.RunSweeper(ctx, time.Hour,
+			func(context.Context) error { calls = append(calls, "a"); return errors.New("boom") },
+			func(context.Context) error { calls = append(calls, "b"); cancel(); return nil })
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunSweeper did not stop")
+	}
+	if len(calls) != 2 || calls[0] != "a" || calls[1] != "b" {
+		t.Fatalf("calls = %v (a failing task must not stop later tasks)", calls)
+	}
+}
+
+func TestRunSweeperExtraTaskTimesOut(t *testing.T) {
+	e := newEnv(t, 0)
+	defer rental.SetExtraTaskTimeout(50 * time.Millisecond)()
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+	var taskErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.svc.RunSweeper(ctx, time.Hour,
+			func(c context.Context) error { <-c.Done(); taskErr = c.Err(); return c.Err() },
+			func(context.Context) error { cancel(); return nil })
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a hung extra task blocked the sweeper")
+	}
+	if !errors.Is(taskErr, context.DeadlineExceeded) {
+		t.Fatalf("hung task ctx err = %v, want deadline exceeded", taskErr)
 	}
 }

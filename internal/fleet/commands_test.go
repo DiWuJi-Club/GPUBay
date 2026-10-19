@@ -92,3 +92,11 @@ func TestCommandInstanceID(t *testing.T) {
 		t.Fatalf("unknown id = %v, want not found", err)
 	}
 }
+
+func TestEnqueueUnknownMachineIsBadRequest(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	_, err := svc.Enqueue(context.Background(), pool, 9999, "", fleet.CmdWipeInstance, nil)
+	if ae := apperr.As(err); ae == nil || ae.Code != "bad_request" || ae.Message != "机器不存在" {
+		t.Fatalf("want bad_request 机器不存在, got %v", err)
+	}
+}

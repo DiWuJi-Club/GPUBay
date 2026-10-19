@@ -223,3 +223,11 @@ func TestOfflineMachineIDsAndOnlineAmong(t *testing.T) {
 		t.Fatalf("online among = %v, %v; want [%d]", got, err, b)
 	}
 }
+
+func TestRegisterUnknownProductIsBadRequest(t *testing.T) {
+	svc, _, _ := newEnv(t)
+	_, err := svc.Register(context.Background(), fleet.NewMachine{Serial: "SN009", LanIP: "10.0.1.9", ProductID: 9999})
+	if ae := apperr.As(err); ae == nil || ae.Code != "bad_request" || ae.Message != "商品不存在" {
+		t.Fatalf("want bad_request 商品不存在, got %v", err)
+	}
+}

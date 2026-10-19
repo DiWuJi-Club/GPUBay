@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -75,10 +77,53 @@ func IsUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// IsForeignKeyViolation 判断是否违反外键约束（引用了不存在的记录）。
+func IsForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
+
 func IsNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
 
 // IsExclusionViolation 判断是否违反排他约束（例如同一台机器的占用时段重叠）。
 func IsExclusionViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23P01"
+}
+
+// ConstraintName 返回违反的约束名（非数据库错误返回空串），用于区分同一张表上的多个约束。
+func ConstraintName(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.ConstraintName
+	}
+	return ""
+}
+
+// Where 拼接带参数的 AND 条件；条件中的 ? 依次替换为 $1、$2……，用于后台列表的可选筛选。
+type Where struct {
+	conds []string
+	Args  []any
+}
+
+func (w *Where) Add(cond string, args ...any) {
+	var b strings.Builder
+	i := 0
+	for _, r := range cond {
+		if r == '?' && i < len(args) {
+			w.Args = append(w.Args, args[i])
+			b.WriteString("$" + strconv.Itoa(len(w.Args)))
+			i++
+			continue
+		}
+		b.WriteRune(r)
+	}
+	w.conds = append(w.conds, b.String())
+}
+
+func (w *Where) SQL() string {
+	if len(w.conds) == 0 {
+		return "TRUE"
+	}
+	return strings.Join(w.conds, " AND ")
 }

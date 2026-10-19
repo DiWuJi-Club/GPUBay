@@ -27,13 +27,19 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// UploadChecker 校验上传文件确实属于该用户且用途正确。
+type UploadChecker interface {
+	CheckOwned(ctx context.Context, key string, userID int64, purpose string) error
+}
+
 type Deps struct {
 	Pool      *pgxpool.Pool
 	Clock     clock.Clock
 	SMS       sms.Sender
 	KYC       kyc.Verifier
 	Box       *secretbox.Box
-	FixedCode string // 仅开发环境：非空时验证码固定为该值
+	Uploads   UploadChecker // 校验营业执照文件归属（storage 模块实现）
+	FixedCode string        // 仅开发环境：非空时验证码固定为该值
 }
 
 type Service struct {

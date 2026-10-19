@@ -27,8 +27,10 @@ var (
 	ErrNoCapacity          = New("no_capacity", "暂无空闲机器，请稍后再试", 409)
 	ErrInvalidState        = New("invalid_state", "当前状态不允许该操作", 409)
 	ErrDuplicate           = New("duplicate", "重复操作", 409)
-	ErrRateLimited         = New("rate_limited", "操作过于频繁，请稍后再试", 429)
-	ErrInvalidCode         = New("invalid_code", "验证码错误或已过期", 400)
+	// ErrRepeatedSubmit 管理员在短时间内重复提交完全相同的资金操作（双击、重试）。
+	ErrRepeatedSubmit = New("duplicate", "60 秒内已提交过相同的操作，请勿重复提交", 409)
+	ErrRateLimited    = New("rate_limited", "操作过于频繁，请稍后再试", 429)
+	ErrInvalidCode    = New("invalid_code", "验证码错误或已过期", 400)
 )
 
 // As 取出错误链中的 *Error；不是业务错误时返回 nil。
