@@ -277,8 +277,25 @@ func TestReleaseRechecksSameIdentity(t *testing.T) {
 	e.invariantsOK()
 }
 
-// 控制者裁决：被邀请人或邀请人有未解决的 referral.kyc_check_failed 审计（创建晚于绑定的 reviewed_at）→ 保持 pending、本轮跳过；
-// 后台复核绑定（reviewed_at 更新）之后视为已解决，下一轮照常发放。
+// approveForTest 模拟后台「通过」（Task 11 Approve：held → active，写 reviewed_at）。
+func (e *env) approveForTest(bindingID int64) {
+	e.t.Helper()
+	e.bindExec(`UPDATE referral_bindings SET status = 'active', hold_reason = '', reviewed_at = $2, updated_at = $2 WHERE id = $1 AND status = 'held'`, bindingID, e.clk.Now())
+}
+
+func (e *env) autoHoldAudits(bindingID int64) int {
+	e.t.Helper()
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM audit_logs WHERE action = 'referral.auto_hold' AND actor_type = 'system' AND target_type = 'referral_binding' AND target_id = $1`,
+		strconv.FormatInt(bindingID, 10)).Scan(&n); err != nil {
+		e.t.Fatal(err)
+	}
+	return n
+}
+
+// 控制者裁决：被邀请人或邀请人有未解决的 referral.kyc_check_failed 审计（创建晚于绑定的 reviewed_at，NULL 视为从未复核）→
+// 绑定转 held（hold_reason=kyc_check_failed，审计 referral.auto_hold），返利保持 pending；后台通过（写 reviewed_at）后下一轮照常发放，
+// 同一条审计不再触发。
 func TestReleaseHoldsOnUnresolvedKYCCheckFailure(t *testing.T) {
 	e := newEnv(t)
 	a := e.user("13812345678", true)
@@ -292,14 +309,24 @@ func TestReleaseHoldsOnUnresolvedKYCCheckFailure(t *testing.T) {
 	if n := e.release(); n != 0 || e.reward("ord-1")["status"] != "pending" || e.ledgerSum(a, "referral_rebate") != 0 {
 		t.Fatalf("invitee kyc_check_failed must hold: %v", e.reward("ord-1"))
 	}
+	if status, hold, _ := e.bindingRow(b); status != "held" || hold != "kyc_check_failed" || e.autoHoldAudits(bid) != 1 {
+		t.Fatalf("binding = %s %s audits = %d", status, hold, e.autoHoldAudits(bid))
+	}
 	if ev := e.events("ord-1"); len(ev) != 1 {
-		t.Fatalf("hold must not write events: %v", ev)
+		t.Fatalf("hold must not write reward events: %v", ev)
 	}
-	e.bindExec(`UPDATE referral_bindings SET reviewed_at = $2 WHERE id = $1`, bid, e.clk.Now())
+	// 搁置中：再跑不发放、不重复审计
+	if n := e.release(); n != 0 || e.autoHoldAudits(bid) != 1 {
+		t.Fatalf("held: n = %d audits = %d", n, e.autoHoldAudits(bid))
+	}
+	e.approveForTest(bid)
 	if n := e.release(); n != 1 || e.reward("ord-1")["status"] != "settled" {
-		t.Fatalf("resolved invitee failure must release: %v", e.reward("ord-1"))
+		t.Fatalf("approved binding must release: %v", e.reward("ord-1"))
 	}
-	// 邀请人一侧
+	if status, _, _ := e.bindingRow(b); status != "active" || e.autoHoldAudits(bid) != 1 {
+		t.Fatalf("resolved audit must not re-hold: %s audits = %d", status, e.autoHoldAudits(bid))
+	}
+	// 邀请人一侧：新的失败审计晚于 reviewed_at → 再次搁置
 	e.accrueOK(e.pay(b, "ord-2", 6900))
 	e.clk.Advance(time.Second)
 	e.kycCheckFailed(a)
@@ -307,9 +334,12 @@ func TestReleaseHoldsOnUnresolvedKYCCheckFailure(t *testing.T) {
 	if n := e.release(); n != 0 || e.reward("ord-2")["status"] != "pending" {
 		t.Fatalf("inviter kyc_check_failed must hold: %v", e.reward("ord-2"))
 	}
-	e.bindExec(`UPDATE referral_bindings SET reviewed_at = $2 WHERE id = $1`, bid, e.clk.Now())
+	if status, hold, _ := e.bindingRow(b); status != "held" || hold != "kyc_check_failed" || e.autoHoldAudits(bid) != 2 {
+		t.Fatalf("binding = %s %s audits = %d", status, hold, e.autoHoldAudits(bid))
+	}
+	e.approveForTest(bid)
 	if n := e.release(); n != 1 || e.reward("ord-2")["status"] != "settled" {
-		t.Fatalf("resolved inviter failure must release: %v", e.reward("ord-2"))
+		t.Fatalf("approved binding must release: %v", e.reward("ord-2"))
 	}
 	e.invariantsOK()
 }

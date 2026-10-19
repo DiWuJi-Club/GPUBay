@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"spark-cloud/internal/audit"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/wallet"
 )
@@ -76,7 +77,7 @@ func (s *Service) Release(ctx context.Context) (int, error) {
 	return released, errors.Join(errs...)
 }
 
-// releaseOne 返回是否把该行推进到了终态（settled / void，含同身份撤销作废）。门槛不满足或搁置时返回 false, nil（下轮再看）。
+// releaseOne 返回是否把该行推进到了终态（settled / void，含同身份撤销作废）。门槛不满足或转搁置时返回 false, nil（下轮再看）。
 // 加锁：users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED →
 // [同身份撤销：referral_bindings → referral_rewards(该绑定其余 pending)] → wallet_accounts(邀请人)。
 func (s *Service) releaseOne(ctx context.Context, tx pgx.Tx, now time.Time, order string, inviterID, inviteeID int64) (bool, error) {
@@ -126,8 +127,14 @@ func (s *Service) releaseOne(ctx context.Context, tx pgx.Tx, now time.Time, orde
 		return false, err
 	}
 	if held {
-		s.d.Log.Warn("referral: unresolved kyc_check_failed, holding reward", "order", order, "binding", r.BindingID)
-		return false, nil
+		// 转 held 进后台待审核队列（与 same_device 搁置同一流程）：返利保持 pending；后台 approve 写 reviewed_at 后该审计即视为已解决。
+		s.d.Log.Warn("referral: unresolved kyc_check_failed, holding binding", "order", order, "binding", r.BindingID)
+		if _, err := tx.Exec(ctx, `UPDATE referral_bindings SET status = 'held', hold_reason = $2, updated_at = $3 WHERE id = $1 AND status = 'active'`,
+			r.BindingID, HoldKYCCheckFailed, now); err != nil {
+			return false, err
+		}
+		return false, audit.Record(ctx, tx, now, audit.Actor{}.Entry("referral.auto_hold", "referral_binding", strconv.FormatInt(r.BindingID, 10),
+			map[string]any{"reason": HoldKYCCheckFailed, "order": order}))
 	}
 	if r.RewardAmt == 0 {
 		if _, err := tx.Exec(ctx, `UPDATE referral_rewards SET status = 'void', updated_at = $2 WHERE order_id = $1`, order, now); err != nil {
@@ -197,7 +204,8 @@ func (s *Service) sameIdentityAtRelease(ctx context.Context, tx pgx.Tx, inviterI
 }
 
 // kycCheckUnresolved 报告邀请人或被邀请人是否有晚于绑定最近一次后台复核（reviewed_at；NULL 视为从未复核）的
-// referral.kyc_check_failed 审计——实名同身份判定失败、尚待人工核查。后台对该绑定的裁决（通过 / 撤销）即视为已解决。
+// referral.kyc_check_failed 审计——实名同身份判定失败、尚待人工核查。命中时 releaseOne 把绑定转 held（hold_reason=kyc_check_failed），
+// 后台对该绑定的裁决（通过 / 撤销）写 reviewed_at，之后同一条审计不再触发。
 func kycCheckUnresolved(ctx context.Context, q db.Querier, inviterID, inviteeID int64, reviewedAt *time.Time) (bool, error) {
 	var held bool
 	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM audit_logs WHERE target_type = 'user' AND target_id IN ($1, $2)

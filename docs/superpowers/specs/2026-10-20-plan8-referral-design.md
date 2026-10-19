@@ -259,6 +259,7 @@ CREATE INDEX kyc_records_fingerprint_idx ON kyc_records (fingerprint) WHERE fing
   - 「同邀请人其他被邀请人」只含**未撤销**绑定的被邀请人：已撤销的绑定不再产生返利，不参与比较。
   - 比较用每个用户**全部** verified 指纹（同一用户可能既有个人又有企业实名），本人一侧同样取全部指纹并上本条；`UserLookup.VerifiedFingerprints` 返回 `map[userID][]fingerprint`。
   - 判定在保存点里执行，不让实名失败：死锁 / 序列化冲突（40P01 / 40001）在新保存点里重试一次；仍失败则回滚保存点、记日志，并在外层事务写审计 `referral.kyc_check_failed`（目标 `user`，diff `{kyc_record_id}`），由后台人工核查该用户的邀请绑定。
+  - 该审计未解决（晚于绑定 `reviewed_at`）时，发放（§4.4）把该用户作为邀请人或被邀请人的到期 active 绑定转 `held`（`hold_reason='kyc_check_failed'`），进后台待审核，与 `same_device` 搁置同一裁决流程。
 - 指纹比较只在实名通过时做一次，不做定期全量扫描（遗留）。
 
 ## 4. 返利计算
@@ -319,7 +320,7 @@ switch r.status:
 1. `users(邀请人, 被邀请人) FOR KEY SHARE` → `referral_accounts(邀请人) FOR UPDATE` → `referral_rewards(order) FOR UPDATE SKIP LOCKED` 复核 `status='pending' AND settle_after <= now`。
 2. 门槛（任一不满足 → 跳过，本轮不动，下轮再看）：绑定 `status='active'`；邀请人账户 `status='active'`；邀请人 `users.status='active' AND kyc_status='verified'`（`identity.UserState` 接口）。
    - 同身份复查（纵深防御：实名钩子失败只留审计 `referral.kyc_check_failed`，可能漏撤销）：被邀请人的任一 verified 指纹等于邀请人或同邀请人其它未撤销被邀请人的任一 verified 指纹 → 按 §3.3 同样撤销绑定（`same_identity`，待发放全部 void，审计 `referral.auto_revoke`），本行计入作废。
-   - 邀请人或被邀请人有晚于绑定 `reviewed_at`（NULL 视为从未复核）的 `referral.kyc_check_failed` 审计 → 搁置：保持 pending、本轮跳过；后台对该绑定的裁决即视为已解决。
+   - 邀请人或被邀请人有晚于绑定 `reviewed_at`（NULL 视为从未复核）的 `referral.kyc_check_failed` 审计 → 绑定转 `held`（`hold_reason='kyc_check_failed'`，审计 `referral.auto_hold`），返利保持 pending；后台 approve / revoke（写 `reviewed_at`）即视为已解决，同一条审计不再触发。
 3. `reward == 0` → `status='void'`，事件 `void(detail='zero after refund')`。
 4. 抵欠账：`offset := min(debt, reward)`；`debt −= offset`；事件 `debt_offset(amount=offset)`（不写钱包流水）。
 5. `credit := reward − offset`；`credit > 0` → `Wallet.Apply(Entry{inviter, +credit, referral_rebate, ref('referral', order), remark="邀请返利 138****1234 订单 ord-…"})`；事件 `settle(amount=reward, wallet_ledger_id)`。

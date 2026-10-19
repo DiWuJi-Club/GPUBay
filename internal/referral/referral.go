@@ -83,6 +83,8 @@ const (
 	FlagBurst        = "burst"
 	FlagSameIdentity = "same_identity"
 
+	HoldKYCCheckFailed = "kyc_check_failed" // hold_reason：实名同身份判定失败待人工核查（发放时转 held）
+
 	RefType = "referral" // wallet_ledger.ref_type
 )
 
