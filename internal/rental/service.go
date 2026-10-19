@@ -1,5 +1,14 @@
-// 锁顺序：instance → agent_commands → orders → wallet；machine → wallet。
-// 所有事务按此顺序加行锁，避免并发路径之间死锁。
+// 各路径的实际加锁顺序（规格 §14）：
+//   PlaceBatch：idem 咨询锁 → [booking:<uid> 咨询锁] → machines(SKIP LOCKED) → 插实例 / lease → orders → wallet
+//   ProvisionDue：instance → 自己的 lease → machine(NO KEY UPDATE) → [改派：machines SKIP LOCKED] → agent_commands
+//   机器行锁一律 FOR NO KEY UPDATE：插入引用 machines(id) 的行会取 FOR KEY SHARE，与 FOR UPDATE 互斥、与 NO KEY UPDATE 不互斥。
+//   后台改派：instance → lease → machines(SKIP LOCKED)
+//   Renew / AdminExtend / 自动续费：[idem] → instance → 自己的 lease(读 cap) → orders → wallet → 更新 lease（不锁机器）
+//   取消：instance → lease → orders → wallet
+//   HandleCommandResult：instance → agent_commands → lease(refreshLease) → machine(Release)
+//   ExpireDue / WipeStale / Suspend / Resume / RefreshCapped / beginWipe：instance → lease → agent_commands
+//   AdminMigrate：原实例 → machines(SKIP LOCKED) → 新 lease → agent_commands → 旧 lease 收缩
+// 持机器行锁的事务只会在插入 lease 撞到别的事务未提交的 lease 增长时等待；而让 lease 增长的路径都不等机器锁，等待链不成环。
 
 package rental
 
@@ -22,12 +31,14 @@ import (
 )
 
 const (
-	StateCreating = "creating"
-	StateRunning  = "running"
-	StateStopped  = "stopped"
-	StateWiping   = "wiping"
-	StateReleased = "released"
-	StateFailed   = "failed"
+	StateCreating  = "creating"
+	StateRunning   = "running"
+	StateStopped   = "stopped"
+	StateWiping    = "wiping"
+	StateReleased  = "released"
+	StateFailed    = "failed"
+	StateReserved  = "reserved"  // 计划 6：已预订、未开通
+	StateCancelled = "cancelled" // 计划 6：开通前取消（终态）
 
 	CreateTimeout   = 20 * time.Minute // 开通超时（从 created_at 计），大镜像首次拉取可能较慢
 	RetainAfterStop = 6 * time.Hour    // 到期停机后保留数据的时长
@@ -100,7 +111,21 @@ type Instance struct {
 	// 计划 3：密码登录开关与平台生成的容器主机公钥（authorized_keys 一行；存量实例为空，首连信任后写回）
 	PasswordAuth  bool
 	SSHHostPubkey string
+	// 计划 6：预订与自动续费
+	ScheduledStartAt      *time.Time // 预订开始时刻；即时订单为 nil
+	GroupID               *int64     // 下单时选的机组（改派范围）；nil = 不限
+	BatchID               *string    // 一次多台的批次；单台旧接口为 nil
+	AutoRenew             bool
+	AutoRenewDuration     catalog.Duration // 自动续费档位（默认 = 首单档位）
+	AutoRenewFailedAt     *time.Time
+	AutoRenewFailedReason string // insufficient_balance / renew_blocked
+	ReassignCount         int
+	ProvisionedAt         *time.Time // 预订开通（reserved → creating）时刻
+	CancelledAt           *time.Time
 }
+
+// Booked 表示这是一个预订（有预定开始时刻）的实例。
+func (i Instance) Booked() bool { return i.ScheduledStartAt != nil }
 
 func (i Instance) Suspended() bool { return i.SuspendedAt != nil }
 
@@ -122,15 +147,21 @@ func (i Instance) Remaining(now time.Time) time.Duration {
 }
 
 const instanceCols = `id, user_id, machine_id, product_id, image_id, state, pending_seconds, expires_at,
-	stopped_at, suspended_at, paused_remaining, reminded_24h, reminded_1h, created_at, password_auth, ssh_host_pubkey`
+	stopped_at, suspended_at, paused_remaining, reminded_24h, reminded_1h, created_at, password_auth, ssh_host_pubkey,
+	scheduled_start_at, group_id, batch_id, auto_renew, auto_renew_duration, auto_renew_failed_at, auto_renew_failed_reason,
+	reassign_count, provisioned_at, cancelled_at`
 
 func scanInstance(row pgx.Row) (Instance, error) {
 	var i Instance
+	var autoDur string
 	err := row.Scan(&i.ID, &i.UserID, &i.MachineID, &i.ProductID, &i.ImageID, &i.State, &i.PendingSeconds, &i.ExpiresAt,
-		&i.StoppedAt, &i.SuspendedAt, &i.PausedRemaining, &i.Reminded24h, &i.Reminded1h, &i.CreatedAt, &i.PasswordAuth, &i.SSHHostPubkey)
+		&i.StoppedAt, &i.SuspendedAt, &i.PausedRemaining, &i.Reminded24h, &i.Reminded1h, &i.CreatedAt, &i.PasswordAuth, &i.SSHHostPubkey,
+		&i.ScheduledStartAt, &i.GroupID, &i.BatchID, &i.AutoRenew, &autoDur, &i.AutoRenewFailedAt, &i.AutoRenewFailedReason,
+		&i.ReassignCount, &i.ProvisionedAt, &i.CancelledAt)
 	if db.IsNoRows(err) {
 		return Instance{}, apperr.ErrNotFound
 	}
+	i.AutoRenewDuration = catalog.Duration(autoDur)
 	return i, err
 }
 

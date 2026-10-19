@@ -66,7 +66,7 @@ func remainingSeconds(inst Instance, now time.Time) int64 {
 	switch inst.State {
 	case StateRunning:
 		return int64(inst.Remaining(now) / time.Second)
-	case StateCreating, StateStopped:
+	case StateReserved, StateCreating, StateStopped:
 		return inst.PendingSeconds
 	}
 	return 0

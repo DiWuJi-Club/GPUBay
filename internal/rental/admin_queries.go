@@ -20,7 +20,7 @@ type InstanceFilter struct {
 	MachineID int64
 }
 
-var instanceStates = []string{StateCreating, StateRunning, StateStopped, StateWiping, StateReleased, StateFailed}
+var instanceStates = []string{StateReserved, StateCreating, StateRunning, StateStopped, StateWiping, StateReleased, StateFailed, StateCancelled}
 
 // AdminListInstances 按创建时间倒序分页返回实例。
 func (s *Service) AdminListInstances(ctx context.Context, f InstanceFilter, p paging.Page) ([]Instance, int, error) {

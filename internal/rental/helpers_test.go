@@ -195,3 +195,11 @@ func firstOf(n int, err error) int {
 type fakeKeys struct{ n int }
 
 func (f *fakeKeys) CountSSHKeys(context.Context, int64) (int, error) { return f.n, nil }
+
+// newMachine 再登记一台空闲在线机器并加入 e.machines。
+func (e *env) newMachine(serial string) int64 {
+	e.t.Helper()
+	id := dbtest.CreateMachine(e.t, e.pool, serial)
+	e.machines = append(e.machines, id)
+	return id
+}
