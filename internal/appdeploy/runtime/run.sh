@@ -8,7 +8,12 @@ set -u
 cd "$(dirname "$0")" || exit 1
 DIR=$(pwd)
 SEQ_FILE="$DIR/.seq"
-APP_STOP_LIMIT_S=5 # app.sh stop 的时限：5 + kill_group 10 + 服务 2，整体留在 Runner 的 20 秒 exec 上限内
+# 时间预算（Runner 对 stop / deploy 的 exec 上限都是 ExecStatusTimeout = 20 秒）：
+#   stop  ：app.sh stop 5 秒 + 进程组 TERM 后等 10 秒 + 服务进程 TERM 后等 2 秒 = 最坏 17 秒
+#   deploy：先停旧的 app.sh stop 2 秒 + 进程组 4 秒 + 服务 1 秒，再等新进程组出现 ≤ 2 秒，
+#           加 prepare（df、sh -n）不到 1 秒 = 最坏约 10 秒（要求 ≤ 12 秒）
+STOP_APP_S=5 STOP_GROUP_DS=100 STOP_PID_DS=20      # stop / remove（DS = 0.1 秒）
+DEPLOY_APP_S=2 DEPLOY_GROUP_DS=40 DEPLOY_PID_DS=10 # deploy 前停旧的
 
 load_env() {
   # shellcheck disable=SC1091
@@ -106,26 +111,31 @@ pid_alive() {
   return 0
 }
 
-# kill_group <pgid> ：TERM，10 秒后 KILL。
+# kill_group <pgid> [等待，0.1 秒为单位，默认 100]：TERM，等不到全部退出就 KILL。
+# 目标是本脚本自己所在的进程组（.pgid 陈旧 / pid 被复用）时拒绝，否则会连 SSH 会话一起杀掉。
 # 注意不能写 `kill -TERM -- -<pgid>`：dash 的 kill 不认 `--`（Illegal number），会静默失败；
 # `kill -TERM -<pgid>` 在 dash / bash / macOS sh 上都按进程组处理。
 kill_group() {
   [ "$(num "${1:-}")" -gt 1 ] || return 0
+  if [ "$1" = "$(num "$(my_pgid)")" ]; then
+    logln "warn: refuse to kill own process group $1 (stale .pgid)"
+    return 0
+  fi
   kill -TERM "-$1" 2>/dev/null || return 0
   _i=0
-  while [ $_i -lt 100 ]; do
+  while [ $_i -lt "${2:-100}" ]; do
     kill -0 "-$1" 2>/dev/null || return 0
     sleep 0.1; _i=$((_i + 1))
   done
   kill -KILL "-$1" 2>/dev/null || true
 }
 
-# kill_pid <pid> ：TERM，2 秒后 KILL（服务自己 setsid 出了进程组时 kill_group 够不着）
+# kill_pid <pid> [等待，0.1 秒为单位，默认 20]：TERM，等不到退出就 KILL（服务自己 setsid 出了进程组时 kill_group 够不着）
 kill_pid() {
   pid_alive "${1:-}" || return 0
   kill -TERM "$1" 2>/dev/null
   _i=0
-  while [ $_i -lt 20 ]; do
+  while [ $_i -lt "${2:-20}" ]; do
     pid_alive "$1" || return 0
     sleep 0.1; _i=$((_i + 1))
   done
@@ -137,17 +147,18 @@ has_stop() {
   grep -Eq '^[[:space:]]*\(?([^)#]*\|)?[[:space:]]*stop[[:space:]]*(\|[^)]*)?\)' "$DIR/app.sh" 2>/dev/null
 }
 
-# 限时执行 app.sh stop，输出进日志
+# app_stop <时限秒>：限时执行 app.sh stop，输出进日志
 app_stop() {
+  _lim=$1
   [ -f "$DIR/app.sh" ] && has_stop || return 0
   if command -v timeout >/dev/null 2>&1; then
-    (cd "$DIR" && timeout -s KILL "$APP_STOP_LIMIT_S" sh "$DIR/app.sh" stop) </dev/null >>"$DIR/log" 2>&1
+    (cd "$DIR" && timeout -s KILL "$_lim" sh "$DIR/app.sh" stop) </dev/null >>"$DIR/log" 2>&1
   else
     # 没有 timeout（macOS）：后台跑 + 看门狗。整段放子 shell 并丢弃 stderr，免得 bash 打印 "Terminated" 作业通知
     (
       (cd "$DIR" && exec sh "$DIR/app.sh" stop) </dev/null >>"$DIR/log" 2>&1 &
       _ap=$!
-      (sleep "$APP_STOP_LIMIT_S"; kill -KILL "$_ap") </dev/null >/dev/null 2>&1 &
+      (sleep "$_lim"; kill -KILL "$_ap") </dev/null >/dev/null 2>&1 &
       _wd=$!
       wait "$_ap"
       kill "$_wd"
@@ -156,13 +167,15 @@ app_stop() {
   return 0
 }
 
-# 停掉本应用的全部进程（app.sh stop → 进程组 → 服务进程），清掉 pid 文件，免得之后误杀被复用的 pid
+# stop_procs <always|tracked> <app.sh stop 秒> <进程组等待> <服务等待>：
+# 停掉本应用的全部进程（app.sh stop → 进程组 → 服务进程），清掉 pid 文件，免得之后误杀被复用的 pid。
+# tracked = 只有记录了 pgid / service.pid 时才跑 app.sh stop（首次部署不跑）
 stop_procs() {
   _pg=$(num "$(cat "$DIR/.pgid" 2>/dev/null)")
   _sp=$(num "$(cat "$DIR/service.pid" 2>/dev/null)")
-  [ "${1:-}" = always ] || [ "$_pg" -gt 1 ] || [ "$_sp" -gt 1 ] && app_stop
-  kill_group "$_pg"
-  kill_pid "$_sp"
+  [ "$1" = always ] || [ "$_pg" -gt 1 ] || [ "$_sp" -gt 1 ] && app_stop "$2"
+  kill_group "$_pg" "$3"
+  kill_pid "$_sp" "$4"
   rm -f "$DIR/.pgid" "$DIR/service.pid"
 }
 
@@ -206,7 +219,7 @@ cmd_prepare() {
 cmd_deploy() {
   load_env
   # 旧的部署 / 服务先停掉（幂等：没有也不报错）。放在 prepare 之前：prepare 失败时旧服务也已停，状态 failed 与实际一致
-  stop_procs
+  stop_procs tracked "$DEPLOY_APP_S" "$DEPLOY_GROUP_DS" "$DEPLOY_PID_DS"
   cmd_prepare || return $?
   _n=$(num "$(cat "$DIR/.attempt" 2>/dev/null)"); _n=$((_n + 1)); put "$DIR/.attempt" "$_n"
   logln "==== deploy #$_n $(now_iso) ===="
@@ -226,17 +239,21 @@ cmd_deploy() {
   return 0
 }
 
-# _bg 的失败出口：先写 failed 状态，再清掉整个进程组（服务、孙进程、本进程自己），pid 文件一并清除
+# _bg 的失败出口：先写 failed 状态，再杀服务进程（它可能自己 setsid 离开了本组）和整个进程组
+# （孙进程、本进程自己），pid 文件在杀完之后才清除，中途 stop 仍能按文件找到它们
 fail_exit() { # fail_exit <phase> <progress> <message> <service_pid> <exit_code>
   write_status failed "$1" "$2" "$3" "$4" "$5"
   trap '' TERM INT
-  rm -f "$DIR/.pgid" "$DIR/service.pid"
+  _fs=$(num "$4"); [ "$_fs" -gt 1 ] || _fs=$(num "$(cat "$DIR/service.pid" 2>/dev/null)")
   if [ "$(num "$SPARK_PGID")" -gt 1 ]; then
     kill -TERM "-$SPARK_PGID" 2>/dev/null
     sleep 1
+    kill_pid "$_fs"
+    rm -f "$DIR/.pgid" "$DIR/service.pid"
     kill -KILL "-$SPARK_PGID" 2>/dev/null # 本进程也在组里，到这里为止
   else
-    kill_pid "$4"
+    kill_pid "$_fs"
+    rm -f "$DIR/.pgid" "$DIR/service.pid"
   fi
   exit "$5"
 }
@@ -300,7 +317,7 @@ cmd_bg_deploy() {
 cmd_stop() {
   load_env
   _sp0=$(num "$(cat "$DIR/service.pid" 2>/dev/null)")
-  stop_procs always
+  stop_procs always "$STOP_APP_S" "$STOP_GROUP_DS" "$STOP_PID_DS"
   write_status stopped "" 0 "stopped" "$_sp0" 0
   return 0
 }

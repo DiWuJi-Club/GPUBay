@@ -472,6 +472,7 @@ func TestRunShFailureReapsProcessGroup(t *testing.T) {
 		{"hang", "health", "timeout"},
 		{"exit", "health", "服务进程已退出"},
 		{"fail", "start", "start 失败"},
+		{"setsid", "health", "timeout"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			b := newBox(t, "app_grandchild.sh", map[string]string{"GC_MODE": tc.mode})
@@ -487,6 +488,7 @@ func TestRunShFailureReapsProcessGroup(t *testing.T) {
 			if err != nil || gc <= 1 {
 				t.Fatalf("grandchild.pid = %q %v", data, err)
 			}
+			t.Cleanup(func() { syscall.Kill(gc, syscall.SIGKILL) }) // 失败时别留下 600 秒的进程
 			waitDead(t, "grandchild", gc)
 			for deadline := time.Now().Add(5 * time.Second); !groupGone(st.Pid); {
 				if time.Now().After(deadline) {
@@ -616,4 +618,37 @@ func TestRunShCurlTCPProbe(t *testing.T) {
 			t.Fatalf("status = %+v", st)
 		}
 	})
+}
+
+// 重新部署先停旧服务，但 deploy 也在 Runner 的 20 秒 exec 上限里：app.sh stop 卡住、服务不理 TERM 时 deploy 也要在 12 秒内返回。
+func TestRunShRedeployTimeBudget(t *testing.T) {
+	b := newBox(t, "app_slowstop.sh", map[string]string{"IGNORE_TERM": "1"})
+	b.run("deploy")
+	old := b.waitState("running")
+	start := time.Now()
+	if _, code := b.run("deploy"); code != 0 {
+		t.Fatalf("redeploy = %d", code)
+	}
+	d := time.Since(start)
+	t.Logf("redeploy took %v", d)
+	if d > 12*time.Second {
+		t.Fatalf("redeploy took %v", d)
+	}
+	waitDead(t, "old service", old.ServicePid)
+	b.waitState("running")
+}
+
+// .pgid 可能陈旧 / 被复用成调用方自己的进程组：kill_group 不能把 run.sh 自己（以及 SSH 会话）一起杀掉。
+func TestRunShKillGroupRefusesOwnGroup(t *testing.T) {
+	b := newBox(t, "app_ok.sh", nil)
+	cmd := exec.Command("/bin/sh", "-c", `echo $$ > .pgid; /bin/sh run.sh stop; echo "survived rc=$?"`)
+	cmd.Dir = b.dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // 包装 shell 自己当组长，组号 = $$
+	out, _ := cmd.CombinedOutput()
+	if !strings.Contains(string(out), "survived rc=0") {
+		t.Fatalf("stop killed its own process group: %q", out)
+	}
+	if st, _ := b.status(); st.State != "stopped" {
+		t.Fatalf("status = %+v", st)
+	}
 }
