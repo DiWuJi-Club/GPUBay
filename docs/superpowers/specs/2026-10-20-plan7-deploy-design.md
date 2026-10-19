@@ -91,11 +91,11 @@
 | D7 | 部署期间**不临时放开限速**；模型下载速度受实例限速约束，帮助页注明 | 临时改 tc 要新增 Agent 指令，本计划不碰 Agent 的实例指令；列入遗留 |
 | D8 | 应用目录读写角色：**super** 创建 / 编辑 / 发布 / 退役版本（与「价格与镜像」一致）；**ops** 可查看目录、查看任意部署的状态与脱敏日志、「强制卸载」（填原因，审计）；finance 只读目录 | 脚本会在用户容器里以 root 执行，发布权限等同发布镜像；ops 处置滥用需要卸载权 |
 | D9 | 敏感变量（`type = secret`）在数据库 secretbox 加密、控制台与后台只显示 `***`、不进审计 / 事件；回写数据库的日志尾部用已知敏感值做替换脱敏 | 用户的 HF 令牌、WebUI 密钥不应在后台可见 |
-| D10 | 应用版本发布后不可改（spec / 脚本 / 兼容镜像）；要改就发新版本；**已有部署不自动升级**，用户在控制台看到「有新版本」后主动「重新部署」到新版本 | 不可变 + 用户主动，避免平台改脚本把用户正在用的服务改坏 |
+| D10 | 应用版本发布后不可改（spec / 脚本 / 兼容镜像）；被未下线（draft / published）版本引用的镜像不能改 `images.ref`（`invalid_state`，停用仍可以）；要改就发新版本；**已有部署不自动升级**，用户在控制台看到「有新版本」后主动「重新部署」到新版本 | 不可变 + 用户主动，避免平台改脚本把用户正在用的服务改坏 |
 | D11 | 版本缓存覆盖率 < 100% 也允许发布（后台显示警告与未缓存机器数）；市场页不按覆盖率隐藏应用；开通时镜像未缓存走现有 20 分钟 `CreateTimeout` | 新版本发布与 200 台预拉取不该互相卡；运维按后台数字决定何时发布 |
 | D12 | `StateReport.images` 是本计划唯一的 Agent 协议改动，**旧 Agent 可继续工作**（后台显示「未知」）；发布顺序仍按「先 Agent 后 platform」 | 见 §1.1 第 5 条 |
 | D13 | 实例被释放 / 洗机 / 失败 / 取消时部署标 `removed`，不发通知；换机时按 §1.1 第 12 条复制为 `queued` | 数据盘随实例消失，没有什么可保留的 |
-| D14 | 应用脚本语言固定 **POSIX sh**（`/bin/sh`），镜像规范新增「必须有 `curl`、`tar`、`setsid`（util-linux）」 | 四个应用镜像都是 Ubuntu 基础，三者都在；不引入 bash 特性让脚本在 `sh -n` 下可静态检查 |
+| D14 | 应用脚本语言固定 **POSIX sh**（`/bin/sh`），镜像规范新增「必须有 `curl`、`tar`、`setsid`（util-linux）」 | 四个应用镜像都是 Ubuntu 基础，三者都在；不引入 bash 特性让平台能按 POSIX 语法静态检查脚本 |
 | D15 | 控制台「应用」卡片的进度显示在实例列表卡片上也有一行（「部署中 45%」/「运行中」），但**不发短信**；部署完成 / 失败只在控制台可见 | 与计划 6「开通成功不发短信」一致 |
 
 ## 2. 数据模型（迁移 `00020_apps.sql`，带 `+goose Down`）
@@ -195,7 +195,7 @@ ALTER TABLE machines ADD COLUMN cached_images TEXT[] NOT NULL DEFAULT '{}', ADD 
 - `slug` 创建后不可改（容器内目录名）。`name / summary / description / category / icon / sort / status` 可随时改（`app.update` 审计）。
 - 删除应用：只允许 `draft` 且没有任何版本；其余用 `retired`。
 - 版本号在应用内唯一；不要求 semver，但列表按 `published_at` 排序而不是按字符串。
-- 发布版本的前置校验：spec 校验通过（§3.3）、脚本 `sh -n` 通过（平台用 `/bin/sh -n` 静态检查，dev Mac 与 Linux 都有）、`image_ids` 非空且全部 `enabled`、应用的每个 `published` 版本之间 `spec.ports` 可以不同（没有约束）。
+- 发布版本的前置校验：spec 校验通过（§3.3）、脚本通过 POSIX sh 语法检查（平台进程内用 `mvdan.cc/sh/v3/syntax` 以 `LangPOSIX` 解析，不起子进程——生产镜像是 distroless、没有 shell，且 dash / bash 的 `-n` 报错各不相同；错误消息形如 `script：第 12 行: <原因>`，各平台一致）、`image_ids` 非空且全部 `enabled`、应用的每个 `published` 版本之间 `spec.ports` 可以不同（没有约束）。
 - 发布时计算 `spec_hash` 并冻结；`PUT` 对 `published` 版本只允许改 `changelog` 与 `status → retired`。
 - 「复制为新版本」：后台从任一版本复制 spec / 脚本 / 镜像到新 `draft`，是改脚本的常规路径（D10）。
 
@@ -384,7 +384,7 @@ queued ──(Runner 上传+启动)──▶ installing ──(status: running, 
 - **脚本固定、变量走文件**：`app.sh` 是后台 super 发布的内容，用户不能改；用户变量只以 `export NAME='…'` 写入 `env`（单引号转义，值不含换行），`run.sh` 用 `. ./env` 加载；exec 的命令行只含 slug 推导的路径。命令注入面为零；变量名白名单（§3.2）防止覆盖 `PATH / LD_PRELOAD` 等影响 `run.sh` 自身。
 - **权限边界不变**：脚本在用户容器里以 root 跑，这与用户自己 SSH 进去跑没有区别；容器的能力集、网络隔离、资源上限都不变。平台侧 exec 用的是已有的上游连接，没有新的信任关系。
 - **敏感变量**（D9）：secretbox 加密；API 返回 `secret_env: {NAME: true}` 只表示「已设置」；重新部署时不传则沿用、传空串则清除；日志尾部与 `message` 回写前用全部 secret 值做 `strings.ReplaceAll(…, "***")`（值长度 ≥ 8 才替换，更短的 secret 在校验时就拒绝：`secret` 类型最短 8）；事件 detail 不含变量值；审计（后台强制卸载）只记部署 ID。
-- **后台脚本发布**：super + 动态码（与「生成接入命令」同级，因为脚本会在所有用户容器里以 root 执行）；审计 `app.version.publish` 记 `spec_hash`。脚本 ≤ 64KB、`sh -n` 通过；不做内容审查（运维自己负责）。
+- **后台脚本发布**：super + 动态码（与「生成接入命令」同级，因为脚本会在所有用户容器里以 root 执行）；审计 `app.version.publish` 记 `spec_hash`。脚本 ≤ 64KB、POSIX 语法检查通过；不做内容审查（运维自己负责）。
 - **健康检查**：平台经 `Pool.Dial` 请求容器内 `127.0.0.1:<port><health_path>`，与 ingress 同一路径，不信任响应内容（只看状态码）；响应体丢弃，≤ 4KB 读取后关闭。
 - **资源**：`log_tail` 上限 64KB、`status.json` 解析上限 16KB（超过视为损坏）、部署包 ≤ 256KB；每轮 exec 并发 ≤ 16；每用户限流。
 - **公开端口**：自动登记为私有；Open WebUI 的首个访问者注册为管理员——帮助页与应用描述都提醒「部署完成后先自己打开一次」。vLLM 的 `API_KEY` 为空时接口不鉴权，描述里提醒私有端口 + 票据已保护，设公开前先设密钥。
@@ -437,7 +437,7 @@ NGC 标签 `25.09` 以实施时能拉到的最近版本为准（实施任务 2 �
 | PUT | `/apps/{id}` | super | 除 slug；`status` 可改；审计 `app.update` |
 | DELETE | `/apps/{id}` | super | 仅 draft 且无版本；审计 `app.delete` |
 | GET | `/apps/{id}/versions` | all | 版本列表，每项带 `coverage:[{image_id,image_name,cached,online,unknown}]` |
-| POST | `/apps/{id}/versions` | super | `{version,image_ids,spec,script,changelog, copy_from?}` → draft；**draft 也必须通过 spec 与 `sh -n` 校验**（失败 `app_version_invalid`，不保存），避免「能保存不能发布」；审计 `app.version.create` |
+| POST | `/apps/{id}/versions` | super | `{version,image_ids,spec,script,changelog, copy_from?}` → draft；**draft 也必须通过 spec 与脚本语法校验**（失败 `app_version_invalid`，不保存），避免「能保存不能发布」；审计 `app.version.create` |
 | PUT | `/apps/{id}/versions/{vid}` | super | draft 可改全部；published 只能改 `changelog`、`status=retired`（其余 → `app_version_frozen`）；审计 `app.version.update` |
 | POST | `/apps/{id}/versions/{vid}/publish` | super + TOTP | 校验 → `published`、`published_at`、`spec_hash`；广播预拉取；审计 `app.version.publish`（含 `spec_hash`） |
 | POST | `/apps/{id}/versions/{vid}/prepull` | ops | 重新广播预拉取 → `{machines}` |
@@ -525,7 +525,7 @@ NGC 标签 `25.09` 以实施时能拉到的最近版本为准（实施任务 2 �
 - `appdeploy/runner`（用 `sshtest` 的 **shell 模式**，见 §16.2）：状态表每一行（queued 上传失败 / DialError 10 次 / installing 进度回写 / running 登记端口 / 端口认领（换机场景）/ failed 三种错误码 / timeout 用假时钟 / stop / start / remove / removing 时容器不可达 / running 的 alive=0 三次 → crashed / health_path 2xx 与 500）；`seq` 回退忽略；回写时 `updated_at` 不一致丢弃；脱敏（日志里出现 secret 值被替换，短于 8 的 secret 在校验层已拒绝）；`status.json` 超 16KB 或非法 JSON 视为损坏；咨询锁拿不到跳过；每轮并发 ≤ 16。
 - `appdeploy/service`（用户操作）：D2 上限、`app_exists`、镜像兼容（多镜像列表）、端口冲突（与用户端口 / 另一应用）、端口总数 5、reserved 实例可建 queued、非主人 `not_found`、各状态允许操作矩阵（§6.2）、redeploy 换版本更新 `spec_hash` / 变量沿用 secret / 清 secret、退役版本 `app_unavailable`、限流。
 - `rental` 钩子：`startLease`（首次开通、续费 Start、换机新实例）→ running / stopped 部署回 queued 且 failed 不动；`beginWipe` / `failCreating` / 取消 → removed；`AdminMigrate` → 旧 lost、新 queued 复制、`instance_ports.deployment_id` 置 NULL 后被认领；`Place` / `PlaceBatch` 带 `app_id`：镜像不符整单失败、变量错误整单失败、N 台各一条 queued、幂等回放带部署。
-- `catalog / adminapi`：应用 CRUD、slug 不可改、删除条件、版本 draft 校验（spec、`sh -n` 失败路径带行号）、发布需 TOTP、published 冻结（`app_version_frozen`）、retired、复制为新版本、覆盖率计算（含未知）、`force-remove` 审计、角色矩阵（`permissions_test.go`）。
+- `catalog / adminapi`：应用 CRUD、slug 不可改、删除条件、版本 draft 校验（spec、脚本语法失败带行号）、发布需 TOTP、published 冻结（`app_version_frozen`）、retired、复制为新版本、覆盖率计算（含未知）、`force-remove` 审计、角色矩阵（`permissions_test.go`）。
 - `agentgw / agent`：`StateReport.images` 解析、截断 200 项与 256 字符、旧 Agent 无字段不覆盖 `cached_images`；Agent `docker image ls` 命令快照与输出解析（过滤 `<none>`）；fake Agent 注入镜像。
 - `upstream.Pool.Exec`：退出码、stdout / stderr 截断、超时取消、stdin 传递、连接坏掉时重建一次、`ErrClosed`。
 - `api`：路由、匿名 `GET /apps` 限流、Deployment 视图字段（secret 只给 `true`）、`/log` 实时与回落、`apps_summary`。
@@ -546,7 +546,7 @@ NGC 标签 `25.09` 以实施时能拉到的最近版本为准（实施任务 2 �
   - `C-MKT-09`～`12`：市场页应用卡片打开对话框并预选；选应用后镜像锁定与变量表单（必填校验、生成密钥）；确认页显示预装应用；开通后实例详情出现 queued 的应用，`tick` 后变部署中并显示进度，再 `tick` 变运行中且「打开」链接指向 `ins-…-8000`。
   - `C-APP-01`～`10`：实例详情添加应用（不兼容灰显并提示镜像）；第二个应用部署成功；上限 3 提示；失败显示错误与日志抽屉；重新部署（改变量，secret 留空沿用）；停止 / 启动；卸载确认文案与端口消失；实例停机时的提示；有新版本标签（后台发布新版本后）；列表页应用摘要标签。
   - `C-ING-07`：应用端口私有，打开链接走登录跳转后拿到 httptest 内容。
-  - `A-APP-01`～`08`：应用新建 / 编辑 / 删除条件；版本新建（结构化表单）→ 校验错误显示字段路径；脚本 `sh -n` 错误显示行号；发布需动态码并显示覆盖率警告（fake Agent 注入镜像后覆盖率变 100%）；published 版本只读；复制为新版本；部署列表筛选与详情（secret 显示 `***`）；强制卸载需原因并写审计。
+  - `A-APP-01`～`08`：应用新建 / 编辑 / 删除条件；版本新建（结构化表单）→ 校验错误显示字段路径；脚本语法错误显示行号；发布需动态码并显示覆盖率警告（fake Agent 注入镜像后覆盖率变 100%）；published 版本只读；复制为新版本；部署列表筛选与详情（secret 显示 `***`）；强制卸载需原因并写审计。
   - `A-INS-14`：实例详情应用卡片；`A-MCH-10`：机器详情已缓存镜像。
 - 注意：应用用例在各自实例上操作，不改全局机器状态；用到假时钟的只有超时用例（推进 ≤ 2 小时）。
 
@@ -595,7 +595,7 @@ NGC 标签 `25.09` 以实施时能拉到的最近版本为准（实施任务 2 �
 4. 容器内 `run.sh`（embed）+ `spark_status`；`sh` 测试（§16.1）。
 5. `upstream.Pool.Exec`；单测。
 6. `sshtest` shell 模式；单测。
-7. 目录服务（`appdeploy/catalog.go`）：应用 / 版本 CRUD、发布（`sh -n`、hash、冻结、预拉取广播）、覆盖率、`platform admin app import`；单测。
+7. 目录服务（`appdeploy/catalog.go`）：应用 / 版本 CRUD、发布（脚本语法检查、hash、冻结、预拉取广播）、覆盖率、`platform admin app import`；单测。
 8. 部署服务（`appdeploy/service.go`）：创建 / 重新部署 / 停止 / 启动 / 卸载 / 日志 / 事件，限额与端口冲突；单测。
 9. Runner：轮询、咨询锁、状态表、回写乐观并发、端口登记 / 认领、脱敏、告警；单测（用 sshtest shell 模式）。
 10. rental 钩子（`AppHooks`）：`startLease` / `beginWipe` / `failCreating` / 取消 / `AdminMigrate`；`Place` / `PlaceBatch` 带 `app_id`；单测。
@@ -603,7 +603,7 @@ NGC 标签 `25.09` 以实施时能拉到的最近版本为准（实施任务 2 �
 12. 控制台 API（§10.1）+ `instanceView.apps_summary`；单测。
 13. 后台 API（§10.2）+ 角色矩阵 + 审计；单测。
 14. `app.go` 组装（Runner 启动、`SPARK_APP_RUNNER`、配置项）、README 配置表与部署注意。
-15. 四个应用的 `deploy/apps/<slug>/{spec.json, app.sh}`（含模型大小表、进度汇报、ModelScope / hf-mirror 切换）；`sh -n` 与 spec 校验进 `make test`。
+15. 四个应用的 `deploy/apps/<slug>/{spec.json, app.sh}`（含模型大小表、进度汇报、ModelScope / hf-mirror 切换）；脚本语法与 spec 校验进 `make test`。
 16. 集成测试（§16.2）。
 17. 控制台：`RentDialog` 预装应用与变量表单组件（`AppEnvForm.vue`，供添加 / 重新部署复用）、市场页应用卡片。
 18. 控制台：实例详情「应用」卡片（进度、日志抽屉、操作）、列表摘要、帮助页。

@@ -61,10 +61,13 @@ func TestAdminAppImportPrintsResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	write("1.0.1")
+	if err := os.Symlink(filepath.Join(root, "demo"), filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
 	if err := runAdmin(context.Background(), nil, cat, []string{"app", "import", root}, &out, nil); err != nil {
 		t.Fatal(err)
 	}
-	if want := "demo 1.0.0 created\ndemo 1.0.1 version-added\n"; out.String() != want {
+	if want := "demo 1.0.0 created\ndemo 1.0.1 version-added\nlink skipped: link 是符号链接，已跳过\n"; out.String() != want {
 		t.Fatalf("output %q, want %q", out.String(), want)
 	}
 }

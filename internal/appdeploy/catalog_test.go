@@ -137,7 +137,8 @@ func TestVersionDraftValidation(t *testing.T) {
 		}
 	}
 	invalid("spec", func(in *appdeploy.VersionInput) { in.Spec.Ports[0].Port = 22 }, "ports[0].port")
-	invalid("syntax", func(in *appdeploy.VersionInput) { in.Script = "#!/bin/sh\nif true; then\n  echo x\n" }, "line")
+	invalid("syntax", func(in *appdeploy.VersionInput) { in.Script = "#!/bin/sh\nif true; then\n  echo x\n" }, "第 2 行")
+	invalid("bashism", func(in *appdeploy.VersionInput) { in.Script = "#!/bin/sh\narr=(1 2)\n" }, "第 2 行")
 	invalid("too big", func(in *appdeploy.VersionInput) { in.Script = "#" + strings.Repeat("x", appdeploy.MaxScriptBytes) }, "script")
 	invalid("empty script", func(in *appdeploy.VersionInput) { in.Script = "" }, "script")
 	invalid("version", func(in *appdeploy.VersionInput) { in.Version = "-1" }, "version")
@@ -208,6 +209,11 @@ func TestPublishFreezesAndBroadcasts(t *testing.T) {
 	a := e.app("vllm", "published")
 	v := e.version(a.ID, "1.0.0")
 	e.clk.Advance(time.Minute)
+	e.exec(`UPDATE images SET enabled = false WHERE id = $1`, e.imageID)
+	if _, _, err := e.cat.PublishVersion(e.ctx, e.actor(), a.ID, v.ID); codeOf(err) != "app_version_invalid" || !strings.Contains(err.Error(), "image_ids") {
+		t.Fatalf("publish with disabled image: %v", err)
+	}
+	e.exec(`UPDATE images SET enabled = true WHERE id = $1`, e.imageID)
 
 	pv, n, err := e.cat.PublishVersion(e.ctx, e.actor(), a.ID, v.ID)
 	if err != nil {
@@ -384,12 +390,13 @@ func TestListPublishedFiltersDrafts(t *testing.T) {
 }
 
 func TestCoverageCountsUnknownAndStale(t *testing.T) {
-	e := newEnv(t, 4)
+	e := newEnv(t, 5)
 	ref := e.imageRef(e.imageID)
 	now := e.clk.Now()
 	e.exec(`UPDATE machines SET cached_images = ARRAY[$2, 'other:1'], cached_images_at = $3 WHERE id = $1`, e.machines[0], ref, now)
 	e.exec(`UPDATE machines SET cached_images = ARRAY[$2], cached_images_at = $3 WHERE id = $1`, e.machines[1], ref, now.Add(-6*time.Minute))
 	e.exec(`UPDATE machines SET agent_online = false, cached_images = ARRAY[$2], cached_images_at = $3 WHERE id = $1`, e.machines[3], ref, now)
+	e.exec(`UPDATE machines SET cached_images = ARRAY['other:1'], cached_images_at = $2 WHERE id = $1`, e.machines[4], now.Add(-time.Minute)) // 新鲜但没有该镜像
 	a := e.app("vllm", "")
 	v := e.version(a.ID, "1")
 
@@ -401,23 +408,33 @@ func TestCoverageCountsUnknownAndStale(t *testing.T) {
 	if err := e.pool.QueryRow(e.ctx, `SELECT name FROM images WHERE id = $1`, e.imageID).Scan(&name); err != nil {
 		t.Fatal(err)
 	}
-	want := []appdeploy.Coverage{{ImageID: e.imageID, ImageName: name, Cached: 1, Online: 3, Unknown: 2}}
+	want := []appdeploy.Coverage{{ImageID: e.imageID, ImageName: name, Cached: 1, Online: 4, Unknown: 2}}
 	if !slices.Equal(cov, want) {
 		t.Fatalf("coverage = %+v, want %+v", cov, want)
 	}
 }
 
 func TestCheckShellSyntax(t *testing.T) {
-	if err := appdeploy.CheckShellSyntax(t.Context(), "echo ok\n"); err != nil {
-		t.Fatalf("valid script: %v", err)
+	for _, ok := range []string{"echo ok\n", goodScript, "f() { local a=1; echo \"${a:-x}\" $((a + 1)); }\nf\n"} {
+		if err := appdeploy.CheckShellSyntax(t.Context(), ok); err != nil {
+			t.Fatalf("valid script %q: %v", ok, err)
+		}
 	}
-	err := appdeploy.CheckShellSyntax(t.Context(), "if true; then\n  echo x\n")
-	if codeOf(err) != "app_version_invalid" {
-		t.Fatalf("want app_version_invalid, got %v", err)
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "line") || !strings.Contains(strings.ToLower(msg), "syntax error") || strings.Contains(msg, os.TempDir()) || strings.Contains(msg, "spark-app-") {
-		t.Fatalf("message %q must contain line + syntax error and no temp path", msg)
+	for script, want := range map[string][]string{
+		"if true; then\n  echo x\n":    {"第 1 行", "fi"},
+		"echo a\necho b\nfi\n":         {"第 3 行"},
+		"echo a\narr=(1 2)\n":          {"第 2 行", "posix"},
+		"echo a\necho 'unterminated\n": {"第 2 行", "quote"},
+	} {
+		err := appdeploy.CheckShellSyntax(t.Context(), script)
+		if codeOf(err) != "app_version_invalid" {
+			t.Fatalf("%q: want app_version_invalid, got %v", script, err)
+		}
+		for _, w := range want {
+			if !strings.Contains(err.Error(), w) {
+				t.Errorf("%q: message %q missing %q", script, err.Error(), w)
+			}
+		}
 	}
 }
 
@@ -500,5 +517,33 @@ func TestImportDir(t *testing.T) {
 	}
 	if _, err := e.cat.ImportDir(e.ctx, e.actor(), filepath.Join(root, "missing")); err == nil {
 		t.Fatal("missing dir must fail")
+	}
+
+	// 符号链接（目录或文件）跳过并给出原因；超大文件在读之前拒绝
+	root2 := t.TempDir()
+	if err := os.Symlink(filepath.Join(root, "alpha"), filepath.Join(root2, "a-link")); err != nil {
+		t.Fatal(err)
+	}
+	writeApp(t, root2, "b-file", meta("9.0.0", "PyTorch"))
+	if err := os.Remove(filepath.Join(root2, "b-file", "app.sh")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc/passwd", filepath.Join(root2, "b-file", "app.sh")); err != nil {
+		t.Fatal(err)
+	}
+	writeApp(t, root2, "c-big", meta("9.0.0", "PyTorch"))
+	if err := os.WriteFile(filepath.Join(root2, "c-big", "app.sh"), []byte("#"+strings.Repeat("x", appdeploy.MaxScriptBytes)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = e.cat.ImportDir(e.ctx, e.actor(), root2)
+	if err == nil || !strings.Contains(err.Error(), "c-big") || !strings.Contains(err.Error(), "app.sh 超过") {
+		t.Fatalf("oversized app.sh: %v", err)
+	}
+	want = []appdeploy.ImportResult{{Slug: "a-link", Skipped: "a-link 是符号链接，已跳过"}, {Slug: "b-file", Skipped: "app.sh 是符号链接，已跳过"}}
+	if !slices.Equal(res, want) {
+		t.Fatalf("symlink results = %+v", res)
+	}
+	if n := e.count(`SELECT count(*) FROM apps`); n != 2 {
+		t.Fatalf("apps after skipped imports = %d", n)
 	}
 }

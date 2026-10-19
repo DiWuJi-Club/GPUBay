@@ -305,12 +305,8 @@ func (c *Catalog) validateVersionInput(ctx context.Context, q db.Querier, in *Ve
 	if len(in.ImageIDs) == 0 {
 		return Spec{}, "", invalid("image_ids", "至少选择一个镜像")
 	}
-	var n int
-	if err := q.QueryRow(ctx, `SELECT count(*) FROM images WHERE id = ANY($1) AND enabled`, in.ImageIDs).Scan(&n); err != nil {
+	if err := checkImagesEnabled(ctx, q, in.ImageIDs, false); err != nil {
 		return Spec{}, "", err
-	}
-	if n != len(in.ImageIDs) {
-		return Spec{}, "", invalid("image_ids", "镜像不存在或未启用")
 	}
 	if runeLen(in.Changelog) > MaxChangelogLen {
 		return Spec{}, "", invalid("changelog", "最多 1000 个字符")
@@ -318,12 +314,33 @@ func (c *Catalog) validateVersionInput(ctx context.Context, q db.Querier, in *Ve
 	return spec, SpecHash(spec, in.Script), nil
 }
 
+// checkImagesEnabled 要求 ids 全部存在且 enabled。forShare 为 true 时（事务内）对镜像行加 FOR SHARE，
+// 与 catalog.UpdateImage 的 FOR UPDATE 互斥：提交前镜像不会被停用或改 ref。
+func checkImagesEnabled(ctx context.Context, q db.Querier, ids []int64, forShare bool) error {
+	sql := `SELECT id FROM images WHERE id = ANY($1) AND enabled`
+	if forShare {
+		sql += ` FOR SHARE`
+	}
+	rows, err := q.Query(ctx, sql, ids)
+	if err != nil {
+		return err
+	}
+	found, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return err
+	}
+	if len(found) != len(ids) {
+		return invalid("image_ids", "镜像不存在或未启用")
+	}
+	return nil
+}
+
 // withCopy 按 in.CopyFrom（须属于 appID）合成建版本的输入。
 func (c *Catalog) withCopy(ctx context.Context, appID int64, in VersionInput) (VersionInput, error) {
 	if in.CopyFrom == nil {
 		return in, nil
 	}
-	base, err := scanVersion(c.pool.QueryRow(ctx, `SELECT `+versionCols+` FROM app_versions WHERE id = $1 AND app_id = $2`, *in.CopyFrom, appID))
+	base, err := c.version(ctx, c.pool, appID, *in.CopyFrom, false)
 	if err != nil {
 		return in, err
 	}
@@ -351,6 +368,11 @@ func (c *Catalog) CreateVersion(ctx context.Context, actor audit.Actor, appID in
 	if err != nil {
 		return Version{}, err
 	}
+	return c.insertVersion(ctx, actor, appID, in, spec, hash)
+}
+
+// insertVersion 写入已校验过的草稿版本（spec / hash 来自 validateVersionInput）。
+func (c *Catalog) insertVersion(ctx context.Context, actor audit.Actor, appID int64, in VersionInput, spec Spec, hash string) (Version, error) {
 	specJSON, err := json.Marshal(spec)
 	if err != nil {
 		return Version{}, err
@@ -390,9 +412,28 @@ func (c *Catalog) ValidateVersion(ctx context.Context, appID int64, in VersionIn
 // UpdateVersion：草稿整体可改；已发布版本只能改 Changelog 或下线（Status = "retired"），其它字段与当前值不同 → app_version_frozen；
 // 已下线版本不能再改。
 func (c *Catalog) UpdateVersion(ctx context.Context, actor audit.Actor, appID, vid int64, in VersionInput) (Version, error) {
+	// 草稿的完整校验（含脚本解析）放在事务外；锁内只廉价地复查镜像仍启用
+	pre, err := c.version(ctx, c.pool, appID, vid, false)
+	if err != nil {
+		return Version{}, err
+	}
+	var specJSON []byte
+	var hash string
+	if pre.Status == StatusDraft {
+		if in.Status != "" && in.Status != StatusDraft {
+			return Version{}, apperr.ErrInvalidState // 发布走 PublishVersion（需动态码）
+		}
+		var spec Spec
+		if spec, hash, err = c.validateVersionInput(ctx, c.pool, &in); err != nil {
+			return Version{}, err
+		}
+		if specJSON, err = json.Marshal(spec); err != nil {
+			return Version{}, err
+		}
+	}
 	var out Version
-	err := db.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
-		cur, err := scanVersion(tx.QueryRow(ctx, `SELECT `+versionCols+` FROM app_versions WHERE id = $1 AND app_id = $2 FOR UPDATE`, vid, appID))
+	err = db.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+		cur, err := c.version(ctx, tx, appID, vid, true)
 		if err != nil {
 			return err
 		}
@@ -400,15 +441,10 @@ func (c *Catalog) UpdateVersion(ctx context.Context, actor audit.Actor, appID, v
 		var v Version
 		switch cur.Status {
 		case StatusDraft:
-			if in.Status != "" && in.Status != StatusDraft {
-				return apperr.ErrInvalidState // 发布走 PublishVersion（需动态码）
+			if specJSON == nil { // 读到时不是草稿、锁住时却是：不会发生（没有回到 draft 的转换）
+				return apperr.ErrInvalidState
 			}
-			spec, hash, err := c.validateVersionInput(ctx, tx, &in)
-			if err != nil {
-				return err
-			}
-			specJSON, err := json.Marshal(spec)
-			if err != nil {
+			if err := checkImagesEnabled(ctx, tx, in.ImageIDs, true); err != nil {
 				return err
 			}
 			v, err = scanVersion(tx.QueryRow(ctx, `UPDATE app_versions SET version = $2, image_ids = $3, spec = $4, script = $5, spec_hash = $6, changelog = $7, updated_at = $8
@@ -477,23 +513,34 @@ func (c *Catalog) broadcast(ctx context.Context, refs []string) (int, error) {
 	return sent, lastErr
 }
 
-// PublishVersion 重新校验草稿（镜像可能已停用）并发布，然后向在线机器广播预拉取；返回发布后的版本与下发台数。
+// PublishVersion 重新校验草稿（规则可能已更新、镜像可能已停用）并发布，然后向在线机器广播预拉取；返回发布后的版本与下发台数。
+// 完整校验在事务外；锁内只复查镜像仍启用（FOR SHARE），hash 按锁住的内容重算（草稿写入时都已校验过）。
 func (c *Catalog) PublishVersion(ctx context.Context, actor audit.Actor, appID, vid int64) (Version, int, error) {
+	pre, err := c.version(ctx, c.pool, appID, vid, false)
+	if err != nil {
+		return Version{}, 0, err
+	}
+	if pre.Status != StatusDraft {
+		return Version{}, 0, apperr.ErrInvalidState
+	}
+	in := VersionInput{Version: pre.Version, ImageIDs: pre.ImageIDs, Spec: pre.Spec, Script: pre.Script, Changelog: pre.Changelog}
+	if _, _, err := c.validateVersionInput(ctx, c.pool, &in); err != nil {
+		return Version{}, 0, err
+	}
 	var out Version
 	var refs []string
-	err := db.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
-		cur, err := scanVersion(tx.QueryRow(ctx, `SELECT `+versionCols+` FROM app_versions WHERE id = $1 AND app_id = $2 FOR UPDATE`, vid, appID))
+	err = db.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+		cur, err := c.version(ctx, tx, appID, vid, true)
 		if err != nil {
 			return err
 		}
 		if cur.Status != StatusDraft {
 			return apperr.ErrInvalidState
 		}
-		in := VersionInput{Version: cur.Version, ImageIDs: cur.ImageIDs, Spec: cur.Spec, Script: cur.Script, Changelog: cur.Changelog}
-		_, hash, err := c.validateVersionInput(ctx, tx, &in)
-		if err != nil {
+		if err := checkImagesEnabled(ctx, tx, cur.ImageIDs, true); err != nil {
 			return err
 		}
+		hash := SpecHash(cur.Spec, cur.Script)
 		now := c.clock.Now()
 		if out, err = scanVersion(tx.QueryRow(ctx, `UPDATE app_versions SET status = 'published', published_at = $2, spec_hash = $3, updated_at = $2
 			WHERE id = $1 RETURNING `+versionCols, vid, now, hash)); err != nil {
@@ -513,9 +560,18 @@ func (c *Catalog) PublishVersion(ctx context.Context, actor audit.Actor, appID, 
 	return out, sent, nil
 }
 
+// version 读应用 appID 下的版本 vid；forUpdate 时加行锁（须在事务内）。
+func (c *Catalog) version(ctx context.Context, q db.Querier, appID, vid int64, forUpdate bool) (Version, error) {
+	sql := `SELECT ` + versionCols + ` FROM app_versions WHERE id = $1 AND app_id = $2`
+	if forUpdate {
+		sql += ` FOR UPDATE`
+	}
+	return scanVersion(q.QueryRow(ctx, sql, vid, appID))
+}
+
 // Prepull 再次向在线机器下发该版本全部镜像的预拉取；返回下发台数（全部失败时返回错误）。
 func (c *Catalog) Prepull(ctx context.Context, actor audit.Actor, appID, vid int64) (int, error) {
-	v, err := scanVersion(c.pool.QueryRow(ctx, `SELECT `+versionCols+` FROM app_versions WHERE id = $1 AND app_id = $2`, vid, appID))
+	v, err := c.version(ctx, c.pool, appID, vid, false)
 	if err != nil {
 		return 0, err
 	}

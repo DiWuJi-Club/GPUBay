@@ -2,37 +2,30 @@ package appdeploy
 
 import (
 	"context"
-	"os"
-	"os/exec"
+	"errors"
+	"fmt"
 	"strings"
-	"time"
+
+	"mvdan.cc/sh/v3/syntax"
 
 	"spark-cloud/internal/platform/apperr"
 )
 
-// CheckShellSyntax 用 `/bin/sh -n` 检查脚本语法（不执行），5 秒超时；
-// 失败返回 app_version_invalid，消息为 sh 输出的第一行（去掉临时文件路径），形如 `line 12: Syntax error: ...`。
-func CheckShellSyntax(ctx context.Context, script string) error {
-	f, err := os.CreateTemp("", "spark-app-*.sh")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if _, err := f.WriteString(script); err != nil {
-		f.Close()
-		return err
-	}
-	f.Close()
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "/bin/sh", "-n", f.Name()).CombinedOutput()
+// CheckShellSyntax 在进程内按 POSIX sh 语法解析脚本（不执行、不起子进程；生产镜像里没有 shell），
+// 失败返回 app_version_invalid，消息形如 `script：第 12 行: reached EOF without matching if with fi`，各平台一致。
+// ctx 保留给调用方（解析是纯 CPU，64KB 上限内很快）。
+func CheckShellSyntax(_ context.Context, script string) error {
+	_, err := syntax.NewParser(syntax.Variant(syntax.LangPOSIX)).Parse(strings.NewReader(script), "")
 	if err == nil {
 		return nil
 	}
-	msg := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
-	msg = strings.TrimPrefix(msg, f.Name()+": ")
-	if msg == "" {
-		msg = err.Error()
+	var pe syntax.ParseError
+	var le syntax.LangError
+	switch {
+	case errors.As(err, &pe):
+		return apperr.AppVersionInvalid("script", fmt.Sprintf("第 %d 行: %s", pe.Pos.Line(), pe.Text))
+	case errors.As(err, &le):
+		return apperr.AppVersionInvalid("script", fmt.Sprintf("第 %d 行: %s", le.Pos.Line(), strings.TrimPrefix(le.Error(), le.Pos.String()+": ")))
 	}
-	return apperr.AppVersionInvalid("script", msg)
+	return apperr.AppVersionInvalid("script", err.Error())
 }
