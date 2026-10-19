@@ -1,0 +1,23 @@
+# 构建上下文只需要源码：排除版本库、本地开发数据、开发笔记、依赖与构建 / 测试产物、任何密钥
+.git
+.gitignore
+.dockerignore
+.devdata
+.superpowers
+.claude
+bin
+**/node_modules
+web/test-results
+web/playwright-report
+web/*/dist
+internal/web/dist/console
+internal/web/dist/admin
+*.test
+coverage.out
+# 密钥与本地配置：上游私钥、证书、compose 的 .env 都不进镜像（运行时挂载）
+**/.env
+**/.env.*
+!deploy/compose/.env.example
+**/*.key
+**/*.pem
+**/*.p12

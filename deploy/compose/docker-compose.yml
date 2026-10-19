@@ -1,0 +1,61 @@
+# 控制面：platform + postgres（+ 可选 acme 证书侧车）。步骤见同目录 README.md。
+services:
+  postgres:
+    image: postgres:16.15-bookworm
+    environment:
+      POSTGRES_USER: spark
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: spark
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spark"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  platform:
+    image: spark-cloud/platform:${PLATFORM_VERSION:-latest}
+    env_file: .env
+    environment:
+      SPARK_DATABASE_URL: postgres://spark:${POSTGRES_PASSWORD}@postgres:5432/spark?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # 容器内全部是非特权端口（见 .env 的 *_ADDR），镜像以 nonroot 运行，不需要额外 capability
+    ports:
+      - "22:2222"      # SSH 网关（宿主机自己的 sshd 先挪到别的端口，见 README）
+      - "443:8443"     # 控制台 + 租户 Web 入口（TLS 由 platform 终止，证书来自 certs 卷）
+      - "80:8080"      # 301 到 https
+      # Agent 网关只对机房内网开放：Docker 发布的端口绕过 ufw / INPUT 链，务必绑到内网地址
+      - "${AGENT_BIND_IP:?set AGENT_BIND_IP (control-plane LAN address) in .env}:9443:9443"
+      # 后台只绑宿主机回环：运维经 ssh -L 8081:127.0.0.1:8081 <宿主机> 后访问 http://localhost:8081/admin/
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - certs:/certs:ro
+      - uploads:/data/uploads
+      - ${SPARK_UPSTREAM_SSH_KEY_HOST_PATH:?set SPARK_UPSTREAM_SSH_KEY_HOST_PATH}:/secrets/upstream.key:ro
+    # 停机：SSH drain（SPARK_SSH_DRAIN_TIMEOUT 默认 30s）与 HTTP / ingress 关闭（≤ 10s）并行，总计约 30～40s，留足余量
+    stop_grace_period: 60s
+    # 不配 healthcheck：distroless 镜像没有 shell / curl；外部监控请探 HTTPS（README「监控」），绝不要对 SSH 端口做 TCP 探测
+    restart: unless-stopped
+
+  # 可选：acme.sh 侧车按 DNS-01 申请 / 续签泛域名证书并写进 certs 卷；用商业证书时不启用本服务，把文件放进 certs 卷即可
+  acme:
+    image: neilpang/acme.sh:3.1.1
+    profiles: ["acme"]
+    command: daemon
+    environment:
+      Ali_Key: ${ALI_KEY:-}
+      Ali_Secret: ${ALI_SECRET:-}
+    volumes:
+      - acme:/acme.sh
+      - certs:/certs
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  certs:
+  uploads:
+  acme:

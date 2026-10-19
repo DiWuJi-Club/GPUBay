@@ -6,7 +6,7 @@ DEV_DB  := postgres://postgres:postgres@localhost:5433/spark?sslmode=disable
 # 仅本地开发使用的固定密钥，生产环境必须用 openssl rand -base64 32 生成
 DEV_KEY := MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
 
-.PHONY: test devdb run build web-install web web-test e2e check proto agent
+.PHONY: test devdb run build web-install web web-test e2e check proto agent platform-image
 
 # 协议代码已入库，日常构建不需要 protoc。重新生成：protoc 36.2 + protoc-gen-go v1.36.12 + protoc-gen-go-grpc v1.6.2（都在 ~/.local/bin）
 proto:
@@ -45,5 +45,9 @@ build: web
 	GOOS=linux GOARCH=amd64 go build -o bin/platform-linux-amd64 ./cmd/platform
 	GOOS=linux GOARCH=arm64 go build -o bin/platform-linux-arm64 ./cmd/platform
 	$(MAKE) agent
+
+# platform 容器镜像（前端 + 后端多阶段构建，部署见 deploy/compose/README.md）；只在本地打标签，不推送
+platform-image:
+	docker build -f deploy/platform/Dockerfile --build-arg VERSION=$(VERSION) -t spark-cloud/platform:$(VERSION) -t spark-cloud/platform:latest .
 
 check: test e2e
