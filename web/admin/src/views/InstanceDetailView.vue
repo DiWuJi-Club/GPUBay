@@ -181,12 +181,18 @@ async function submitRefund() {
 // ---- 访问：端口处置与 SSH 会话 ----
 const sessions = ref<AdminSshSession[]>([])
 const sessionsTotal = ref(0)
+let sessionsSeq = 0
+/** 与 load() 相同：只采用最后一次请求、且仍是当前路由实例的结果（换实例后旧实例迟到的会话列表丢弃）。 */
 async function loadSessions(target = id.value) {
+  const mine = ++sessionsSeq
+  const stale = () => mine !== sessionsSeq || target !== String(route.params.id)
   try {
     const p = await api.get<Paged<AdminSshSession>>(`/instances/${target}/ssh-sessions`, { page: 1, page_size: 20 })
+    if (stale()) return
     sessions.value = p.items
     sessionsTotal.value = p.total
   } catch (e) {
+    if (stale()) return
     notifyError(e)
   }
 }
