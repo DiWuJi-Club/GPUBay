@@ -85,12 +85,20 @@ const resetPassword = ref('')
 async function confirmReset() {
   if (resetting.value) return
   resetting.value = true
+  const of = id.value
   try {
-    resetPassword.value = (await api.post<{ password: string }>(`/instances/${id.value}/password/reset`)).password
+    const { password: next } = await api.post<{ password: string }>(`/instances/${of}/password/reset`)
+    if (of !== id.value) return // 已换实例：响应作废（watch(id) 已关掉对话框、清掉页面密码）
     password.value = '' // 页面上显示过的旧密码已失效
+    // 请求期间对话框可以关闭；关闭后迟到的响应不再写入，避免新密码留在内存里、下次打开时又显示出来
+    if (!resetVisible.value) {
+      ElMessage.success('密码已重置，可点「显示」查看新密码')
+      return
+    }
+    resetPassword.value = next
     ElMessage.success('密码已重置，请复制保存')
   } catch (e) {
-    resetVisible.value = false
+    if (of === id.value) resetVisible.value = false
     notifyError(e)
   } finally {
     resetting.value = false
