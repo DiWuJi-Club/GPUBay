@@ -38,3 +38,17 @@ func (s *Service) ProcessRowForTest(ctx context.Context, l ledgerRow) error {
 func (s *Service) DiscoverFromForTest(ctx context.Context, since time.Time) (int, error) {
 	return s.discoverFrom(ctx, since)
 }
+
+// SetDiscoverMaxPages 改发现每轮翻页上限；返回恢复函数。
+func SetDiscoverMaxPages(n int) (restore func()) {
+	old := discoverMaxPages
+	discoverMaxPages = n
+	return func() { discoverMaxPages = old }
+}
+
+// SetSettleTimeouts 改 Settle 中发现 / 发放各自的超时；返回恢复函数。
+func SetSettleTimeouts(discover, release time.Duration) (restore func()) {
+	od, or := discoverTimeout, releaseTimeout
+	discoverTimeout, releaseTimeout = discover, release
+	return func() { discoverTimeout, releaseTimeout = od, or }
+}

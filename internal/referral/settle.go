@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 )
@@ -23,54 +24,104 @@ func (s *Service) Discover(ctx context.Context) (int, error) {
 	return s.discoverFrom(ctx, since)
 }
 
+// DiscoverMaxPages：每轮最多翻 DiscoverMaxPages 页（每页 ScanBatch 行）。测试可经 export_test.go 改小。
+const DiscoverMaxPages = 10
+
+var discoverMaxPages = DiscoverMaxPages
+
+// StuckAfter：水位被钉在比 now − StuckAfter 更早的流水上时告警 referral_scan_stuck。暂时跳过的行过了 SkipGrace 会写占位，
+// 再多 1 小时仍钉着只可能是处理一直失败（或在等一直失败的扣款）的行，需要人工处理。
+const StuckAfter = SkipGrace + time.Hour
+
+// AlertScanStuck 是水位卡住时的告警种类；消息固定，RaiseAlertOnce 按 kind + 消息去重，未处理前只有一条。
+const (
+	AlertScanStuck    = "referral_scan_stuck"
+	alertScanStuckMsg = "邀请返利扫描有流水超过 25 小时仍未处理成功，扫描水位被钉住：请按日志「referral: process ledger failed」排查修复，" +
+		"修复后在后台「邀请返利」执行重扫（重扫天数覆盖卡住的流水）"
+)
+
 // discoverFrom 扫描 created_at ≥ since − ScanLookback 的未处理 order 流水（扣款先于退款，同类按 id）。
+// 按 ((kind = 'refund'), id) 游标翻页，每页 ScanBatch 行、每轮最多 discoverMaxPages 页：被跳过 / 失败的行留在原处，
+// 不会让后面的新流水饿死。
 //
 // 水位（裁定 Q5 / Q10）：
-//   - 取到 ScanBatch 行（有积压）时不动，下轮继续。
+//   - 翻满 discoverMaxPages 页仍有下一页（有积压）时不动，下轮继续。
 //   - 否则推进到 LEAST(now − ScanLag, 本轮被跳过 / 失败行中最早的 created_at)：跳过与失败的行留在之后每轮的窗口里，
 //     不会在 1 小时回看之后被丢掉（规格 §5.1「下轮再试」）。永久跳过的行由 accrue / applyRefund 在 SkipGrace 后写占位，不会一直钉住水位。
 //   - 只在水位仍等于本轮读到的 since 时更新（比较后写）：后台 Rescan 在本轮进行中把水位拨回时，本轮不会把它覆盖掉。
+//   - 被钉在 now − StuckAfter 之前时告警一次（referral_scan_stuck）。
+//
+// ctx 到期（Settle 给发现单独的超时）时立即停止，不推进水位。
+// 单行失败已由 processRow 逐行记日志；返回的错误只汇总失败行数，避免清扫器再把每行错误打一遍。
 func (s *Service) discoverFrom(ctx context.Context, since time.Time) (int, error) {
 	now := s.d.Clock.Now()
-	rows, err := s.d.Pool.Query(ctx, `SELECT l.id, l.user_id, l.kind, l.amount, l.ref_id, l.created_at
-		FROM wallet_ledger l JOIN referral_bindings b ON b.invitee_id = l.user_id
-		WHERE l.ref_type = 'order' AND l.kind IN ('order_pay', 'refund')
-		  AND l.created_at >= $1::timestamptz - make_interval(secs => $2)
-		  AND NOT EXISTS (SELECT 1 FROM referral_events e WHERE e.source_ledger_id = l.id)
-		ORDER BY (l.kind = 'refund'), l.id LIMIT $3`, since, ScanLookback.Seconds(), ScanBatch)
-	if err != nil {
-		return 0, err
-	}
-	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (ledgerRow, error) {
-		var l ledgerRow
-		err := r.Scan(&l.ID, &l.UserID, &l.Kind, &l.Amount, &l.RefID, &l.CreatedAt)
-		return l, err
-	})
-	if err != nil {
-		return 0, err
-	}
-	processed := 0
+	processed, failed := 0, 0
 	var errs []error
 	next := now.Add(-ScanLag)
-	for _, l := range list {
-		err := s.processRow(ctx, l)
-		if err == nil {
-			processed++
-			continue
+	pinned := false
+	drained := false
+	afterRefund, afterID := false, int64(0)
+	for page := 0; page < discoverMaxPages && !drained; page++ {
+		rows, err := s.d.Pool.Query(ctx, `SELECT l.id, l.user_id, l.kind, l.amount, l.ref_id, l.created_at
+			FROM wallet_ledger l JOIN referral_bindings b ON b.invitee_id = l.user_id
+			WHERE l.ref_type = 'order' AND l.kind IN ('order_pay', 'refund')
+			  AND l.created_at >= $1::timestamptz - make_interval(secs => $2)
+			  AND NOT EXISTS (SELECT 1 FROM referral_events e WHERE e.source_ledger_id = l.id)
+			  AND ((l.kind = 'refund'), l.id) > ($3::bool, $4::bigint)
+			ORDER BY (l.kind = 'refund'), l.id LIMIT $5`, since, ScanLookback.Seconds(), afterRefund, afterID, ScanBatch)
+		if err != nil {
+			return processed, errors.Join(append(errs, err)...)
 		}
-		if !errors.Is(err, errSkip) {
-			errs = append(errs, fmt.Errorf("ledger %d: %w", l.ID, err))
+		list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (ledgerRow, error) {
+			var l ledgerRow
+			err := r.Scan(&l.ID, &l.UserID, &l.Kind, &l.Amount, &l.RefID, &l.CreatedAt)
+			return l, err
+		})
+		if err != nil {
+			return processed, errors.Join(append(errs, err)...)
 		}
-		if l.CreatedAt.Before(next) {
-			next = l.CreatedAt // 跳过 / 失败的行钉住水位
+		for _, l := range list {
+			if err := ctx.Err(); err != nil {
+				return processed, errors.Join(append(errs, failedRows(failed), err)...)
+			}
+			err := s.processRow(ctx, l)
+			if err == nil {
+				processed++
+				continue
+			}
+			if !errors.Is(err, errSkip) {
+				failed++
+			}
+			if l.CreatedAt.Before(next) {
+				next, pinned = l.CreatedAt, true // 跳过 / 失败的行钉住水位
+			}
+		}
+		drained = len(list) < ScanBatch
+		if n := len(list); n > 0 {
+			afterRefund, afterID = list[n-1].Kind == "refund", list[n-1].ID
 		}
 	}
-	if len(list) < ScanBatch {
+	errs = append(errs, failedRows(failed))
+	if drained {
 		if _, err := s.d.Pool.Exec(ctx, `UPDATE referral_state SET watermark = $1 WHERE id = 1 AND watermark = $2`, next, since); err != nil {
 			errs = append(errs, fmt.Errorf("advance watermark: %w", err))
 		}
 	}
+	if pinned && next.Before(now.Add(-StuckAfter)) && s.d.Alerts != nil {
+		s.d.Log.Error("referral: scan watermark stuck behind an unprocessed ledger row", "oldest", next)
+		if err := s.d.Alerts.RaiseAlertOnce(ctx, s.d.Pool, fleet.Alert{Level: "warning", Kind: AlertScanStuck, Message: alertScanStuckMsg}); err != nil {
+			errs = append(errs, fmt.Errorf("raise %s alert: %w", AlertScanStuck, err))
+		}
+	}
 	return processed, errors.Join(errs...)
+}
+
+// failedRows 汇总本轮失败行数（逐行详情已在 processRow 的日志里）；0 返回 nil。
+func failedRows(n int) error {
+	if n == 0 {
+		return nil
+	}
+	return fmt.Errorf("referral discover: %d ledger rows failed (see per-row log)", n)
 }
 
 // processRow 在独立事务里处理一条流水；死锁 / 序列化失败重试一次。
@@ -97,10 +148,25 @@ func (s *Service) processRow(ctx context.Context, l ledgerRow) error {
 	return err
 }
 
-// Settle 是清扫附加任务：先发现（计提 / 退款处理）再发放。两步独立，任一失败不阻止另一步。
+// Settle 是清扫附加任务：先发现（计提 / 退款处理）再发放。两步各有自己的超时、互相独立：
+// 发现慢（或失败）不会把发放饿死，任一失败不阻止另一步。
 func (s *Service) Settle(ctx context.Context) error {
-	_, derr := s.Discover(ctx)
-	_, rerr := s.Release(ctx)
+	return s.settle(ctx, s.Discover)
+}
+
+// 发现 / 发放各自的超时；两者之和小于清扫器给附加任务的总超时（rental extraTaskTimeout，2 分钟）。
+var (
+	discoverTimeout = time.Minute
+	releaseTimeout  = 50 * time.Second
+)
+
+func (s *Service) settle(ctx context.Context, discover func(context.Context) (int, error)) error {
+	dctx, cancel := context.WithTimeout(ctx, discoverTimeout)
+	_, derr := discover(dctx)
+	cancel()
+	rctx, cancel := context.WithTimeout(ctx, releaseTimeout)
+	defer cancel()
+	_, rerr := s.Release(rctx)
 	return errors.Join(derr, rerr)
 }
 
@@ -122,7 +188,5 @@ func (s *Service) Rescan(ctx context.Context, actor audit.Actor, days int) error
 	}); err != nil {
 		return err
 	}
-	_, derr := s.discoverFrom(ctx, since)
-	_, rerr := s.Release(ctx)
-	return errors.Join(derr, rerr)
+	return s.settle(ctx, func(ctx context.Context) (int, error) { return s.discoverFrom(ctx, since) })
 }

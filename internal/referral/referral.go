@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/db"
@@ -126,6 +127,12 @@ type Deps struct {
 	Wallet WalletOps
 	Users  UserLookup
 	Orders OrderLookup
+	Alerts AlertRaiser // nil 时不告警（单元测试）
+}
+
+// AlertRaiser 写后台告警（由 fleet 模块实现）。
+type AlertRaiser interface {
+	RaiseAlertOnce(ctx context.Context, q db.Querier, a fleet.Alert) error
 }
 
 type Service struct {

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/db"
@@ -55,9 +56,14 @@ type fakeOrder struct {
 type fakeOrders struct {
 	m    map[string]fakeOrder
 	fail map[string]error // 查询该订单时返回的错误（模拟查询失败）
+	hang map[string]bool  // 查询该订单时一直等到 ctx 结束（模拟慢查询）
 }
 
-func (f *fakeOrders) OrderForReferral(_ context.Context, _ db.Querier, id string) (int64, *time.Time, error) {
+func (f *fakeOrders) OrderForReferral(ctx context.Context, _ db.Querier, id string) (int64, *time.Time, error) {
+	if f.hang[id] {
+		<-ctx.Done()
+		return 0, nil, ctx.Err()
+	}
 	if err := f.fail[id]; err != nil {
 		return 0, nil, err
 	}
@@ -85,8 +91,8 @@ func newEnv(t *testing.T) *env {
 	clk := clock.NewFake(dbtest.T0)
 	w := wallet.NewService(pool, clk)
 	users := &fakeUsers{pool: pool, devices: map[int64]map[string]bool{}, fps: map[int64][]string{}}
-	orders := &fakeOrders{m: map[string]fakeOrder{}, fail: map[string]error{}}
-	svc := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Wallet: w, Users: users, Orders: orders})
+	orders := &fakeOrders{m: map[string]fakeOrder{}, fail: map[string]error{}, hang: map[string]bool{}}
+	svc := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Wallet: w, Users: users, Orders: orders, Alerts: fleet.NewService(pool, clk)})
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, svc: svc, wallet: w, users: users, orders: orders}
 }
 

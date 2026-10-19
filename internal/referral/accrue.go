@@ -129,15 +129,15 @@ func (s *Service) accrue(ctx context.Context, tx pgx.Tx, now time.Time, l ledger
 	order := l.RefID
 	userID, start, err := s.d.Orders.OrderForReferral(ctx, tx, order)
 	if errors.Is(err, apperr.ErrNotFound) {
-		s.d.Log.Error("referral: order not found for order_pay ledger", "ledger", l.ID, "order", order, "user", l.UserID)
-		return s.skipOrMark(ctx, tx, now, l, bindingID, "order not found")
+		return s.skipOrMark(ctx, tx, now, l, bindingID, "order not found",
+			"referral: order not found for order_pay ledger", "ledger", l.ID, "order", order, "user", l.UserID)
 	}
 	if err != nil {
 		return err
 	}
 	if userID != l.UserID {
-		s.d.Log.Error("referral: order_pay ledger user is not the order owner", "ledger", l.ID, "order", order, "user", l.UserID, "owner", userID)
-		return s.skipOrMark(ctx, tx, now, l, bindingID, "order owner mismatch")
+		return s.skipOrMark(ctx, tx, now, l, bindingID, "order owner mismatch",
+			"referral: order_pay ledger user is not the order owner", "ledger", l.ID, "order", order, "user", l.UserID, "owner", userID)
 	}
 	v, err := s.ConfigAt(ctx, tx, l.CreatedAt)
 	if err != nil {
@@ -178,13 +178,18 @@ func (s *Service) accrue(ctx context.Context, tx pgx.Tx, now time.Time, l ledger
 	return nil
 }
 
-// skipOrMark：流水还在 SkipGrace 内 → errSkip（本轮不写事件，Discover 钉住水位、下轮重试）；
-// 已过 SkipGrace → 视为永久跳过，写 void 占位（source_ledger_id = 该流水），之后该订单的退款走「无 reward」占位。
+// skipOrMark：流水还在 SkipGrace 内 → 记 Warn、errSkip（本轮不写事件，Discover 钉住水位、下轮重试）；
+// 已过 SkipGrace → 记 Error，视为永久跳过，写 void 占位（source_ledger_id = 该流水），之后该订单的退款走「无 reward」占位。
 // 调用方须已持有邀请人账户锁并做过幂等复查。
-func (s *Service) skipOrMark(ctx context.Context, tx pgx.Tx, now time.Time, l ledgerRow, bindingID int64, reason string) error {
+//
+// 宽限期从流水的 created_at 起算，前提是 OrderForReferral 的 NotFound / 主人不符是「最终」结论：rental 在扣款的同一事务里
+// 写订单，订单行从不删除、不改 user_id，所以流水可见时订单必然可见，过了宽限期仍查不到 / 不符只可能是数据异常
+// （宽限期只是留给人工修数据的时间）。若将来订单可能晚于扣款流水落库或被删除，这里的假设要重审。
+func (s *Service) skipOrMark(ctx context.Context, tx pgx.Tx, now time.Time, l ledgerRow, bindingID int64, reason, msg string, attrs ...any) error {
 	if now.Sub(l.CreatedAt) < SkipGrace {
+		s.d.Log.Warn(msg, attrs...)
 		return errSkip
 	}
-	s.d.Log.Error("referral: giving up on order_pay ledger, writing void placeholder", "ledger", l.ID, "order", l.RefID, "reason", reason)
+	s.d.Log.Error(msg+"; past SkipGrace, writing void placeholder", append(attrs, "reason", reason)...)
 	return addEvent(ctx, tx, now, l.RefID, bindingID, EventVoid, l.ID, 0, 0, reason)
 }

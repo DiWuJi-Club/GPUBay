@@ -139,8 +139,11 @@ func (s *Service) lockForRefund(ctx context.Context, tx pgx.Tx, inviterID, invit
 //     它计提或写占位之后本退款再处理——绝不在这里放弃，否则已发放的返利会漏扣回。
 //   - 不存在这样的扣款，且退款已过 SkipGrace → 永久无可扣回：写 refund(0) 占位（detail "no order_pay"），不再钉住水位。
 //   - 否则（SkipGrace 内）→ errSkip。
+//
+// 日志：宽限期内 Warn；过了宽限期仍在等扣款 → Error（扣款行本身卡住了，同时有 referral_scan_stuck 告警兜底）。
 func (s *Service) refundWithoutPay(ctx context.Context, tx pgx.Tx, now time.Time, l ledgerRow, order string) error {
 	if now.Sub(l.CreatedAt) < SkipGrace {
+		s.d.Log.Warn("referral: refund has no accrual yet, deferring", "ledger", l.ID, "order", order)
 		return errSkip
 	}
 	var payPending bool
@@ -149,6 +152,7 @@ func (s *Service) refundWithoutPay(ctx context.Context, tx pgx.Tx, now time.Time
 		return err
 	}
 	if payPending {
+		s.d.Log.Error("referral: refund past SkipGrace still waiting for its unprocessed order_pay", "ledger", l.ID, "order", order)
 		return errSkip
 	}
 	var bindingID, inviterID int64

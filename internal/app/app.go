@@ -178,7 +178,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
 		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen,
 	})
-	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r})
+	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r, Alerts: f})
 	ids.SetReferral(ref)
 	providers := opt.Pay
 	devPay := false

@@ -11,6 +11,7 @@ describe('labels', () => {
     expect(labelOf(instanceStateLabel, 'cancelled')).toBe('已取消')
     expect(labelOf(instanceStateType, 'reserved')).toBe('primary')
     expect(labelOf(alertKindLabel, 'booking_at_risk')).toBe('预订机器不可用')
+    expect(labelOf(alertKindLabel, 'referral_scan_stuck')).toBe('邀请返利扫描卡住')
   })
   it('指令状态中文', () => {
     expect(commandStatusLabel).toEqual({ pending: '待执行', sent: '已下发', done: '已完成', failed: '失败' })

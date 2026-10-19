@@ -1,14 +1,17 @@
 package referral_test
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"spark-cloud/internal/audit"
-	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/referral"
 )
 
@@ -113,6 +116,8 @@ func TestDiscoverBacklogKeepsWatermark(t *testing.T) {
 	for i := 0; i < referral.ScanBatch+3; i++ {
 		e.pay(b, fmt.Sprintf("ord-%04d", i), 100)
 	}
+	restore := referral.SetDiscoverMaxPages(1) // 一轮只翻一页：模拟超过一轮页数上限的积压
+	defer restore()
 	w0 := e.watermark()
 	n, err := e.svc.Discover(e.ctx)
 	if err != nil || n != referral.ScanBatch || !e.watermark().Equal(w0) {
@@ -279,6 +284,8 @@ func TestDiscoverPermanentSkipWritesMarkerAfterGrace(t *testing.T) {
 // 等它计提（或写占位）后退款再处理，避免漏扣回。
 func TestRefundWaitsForPendingPayEvenAfterGrace(t *testing.T) {
 	e := newEnv(t)
+	var buf bytes.Buffer
+	e.svc = referral.NewService(referral.Deps{Pool: e.pool, Clock: e.clk, Log: slog.New(slog.NewTextHandler(&buf, nil)), Wallet: e.wallet, Users: e.users, Orders: e.orders})
 	a := e.user("13812345678", true)
 	b := e.user("13900000001", true)
 	e.bind(a, b)
@@ -289,6 +296,9 @@ func TestRefundWaitsForPendingPayEvenAfterGrace(t *testing.T) {
 	e.clk.Advance(referral.SkipGrace + time.Hour)
 	if n, err := e.svc.Discover(e.ctx); err == nil || n != 0 || len(e.events("ord-1")) != 0 {
 		t.Fatalf("pay failing = %d %v events=%v", n, err, e.events("ord-1"))
+	}
+	if !strings.Contains(buf.String(), `level=ERROR msg="referral: refund past SkipGrace still waiting`) {
+		t.Fatalf("past-grace refund waiting on its pay must log at Error: %q", buf.String())
 	}
 	delete(e.orders.fail, "ord-1")
 	if n, err := e.svc.Discover(e.ctx); err != nil || n != 2 {
@@ -337,7 +347,6 @@ func TestProcessRowConcurrentDuplicateIsBenign(t *testing.T) {
 	if len(e.events("ord-1")) != 1 {
 		t.Fatalf("events = %v", e.events("ord-1"))
 	}
-	_ = dbtest.T0
 }
 
 // 裁定 Q3 兜底：撞 referral_rewards_pkey（23505，事务已失败）时回滚并视为已处理，不返回错误。
@@ -382,6 +391,8 @@ func TestRescanNotUndoneByStaleDiscover(t *testing.T) {
 	for i := 1; i <= referral.ScanBatch+3; i++ {
 		e.orders.m[fmt.Sprintf("ord-old-%d", i)] = fakeOrder{userID: b}
 	}
+	restore := referral.SetDiscoverMaxPages(1) // 积压超过一轮的页数上限
+	defer restore()
 	if err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -402,5 +413,139 @@ func TestRescanNotUndoneByStaleDiscover(t *testing.T) {
 	var cnt int
 	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM referral_events WHERE order_id LIKE 'ord-old-%'`).Scan(&cnt); err != nil || cnt != referral.ScanBatch+3 {
 		t.Fatalf("old events = %d %v", cnt, err)
+	}
+}
+
+// 水位被钉在 now − StuckAfter 之前（一直失败的行）→ 告警 referral_scan_stuck 一条（去重），提示重扫。
+func TestDiscoverStuckRaisesOneAlert(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	e.pay(b, "ord-1", 6900)
+	e.orders.fail["ord-1"] = errors.New("orders db down")
+	alerts := func() (n int, msg string) {
+		t.Helper()
+		if err := e.pool.QueryRow(e.ctx, `SELECT count(*), COALESCE(max(message), '') FROM alerts WHERE kind = $1 AND resolved_at IS NULL`, referral.AlertScanStuck).Scan(&n, &msg); err != nil {
+			t.Fatal(err)
+		}
+		return n, msg
+	}
+	e.clk.Advance(referral.StuckAfter - time.Minute)
+	if _, err := e.svc.Discover(e.ctx); err == nil {
+		t.Fatal("failing row must surface an error")
+	}
+	if n, _ := alerts(); n != 0 {
+		t.Fatalf("alerts before StuckAfter = %d", n)
+	}
+	e.clk.Advance(2 * time.Minute)
+	for i := 0; i < 3; i++ {
+		if _, err := e.svc.Discover(e.ctx); err == nil {
+			t.Fatal("failing row must surface an error")
+		}
+	}
+	if n, msg := alerts(); n != 1 || !strings.Contains(msg, "重扫") {
+		t.Fatalf("stuck alerts = %d %q, want exactly one mentioning 重扫", n, msg)
+	}
+}
+
+// 游标翻页：本轮前面 ScanBatch+ 行都被跳过（订单暂查不到），后面的新流水仍在同一轮被处理；水位钉在最早的跳过行。
+func TestDiscoverPagesPastStuckRows(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	t0 := e.clk.Now()
+	if _, err := e.pool.Exec(e.ctx, `INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, remark, created_at)
+		SELECT $1, -100, 0, 'order_pay', 'order', 'ord-ghost-' || g, '', $2 FROM generate_series(1, $3) g`, b, t0, referral.ScanBatch+3); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(10 * time.Minute)
+	e.pay(b, "ord-new", 6900)
+	if n, err := e.svc.Discover(e.ctx); err != nil || n != 1 || e.reward("ord-new")["reward"] != int64(690) {
+		t.Fatalf("discover = %d %v; new row must not starve behind skipped rows", n, err)
+	}
+	if !e.watermark().Equal(t0) {
+		t.Fatalf("watermark = %v, want pinned at %v", e.watermark(), t0)
+	}
+	// 页数上限：翻满仍有下一页 → 水位不动（下轮继续）
+	restore := referral.SetDiscoverMaxPages(1)
+	defer restore()
+	if _, err := e.pool.Exec(e.ctx, `UPDATE referral_state SET watermark = '2000-01-01' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := e.svc.Discover(e.ctx); err != nil || n != 0 {
+		t.Fatalf("single page = %d %v", n, err)
+	}
+	if w := e.watermark(); w.Year() != 2000 {
+		t.Fatalf("full last page must keep watermark, got %v", w)
+	}
+}
+
+// Settle 给发现与发放各自的超时：发现卡住（订单查询挂起）时发放照常进行，水位不推进。
+func TestSettleReleaseRunsWhenDiscoverHangs(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE referral_rate_versions SET hold_days = 0`); err != nil {
+		t.Fatal(err)
+	}
+	e.pay(b, "ord-1", 6900)
+	if n, err := e.svc.Discover(e.ctx); err != nil || n != 1 {
+		t.Fatalf("discover = %d %v", n, err)
+	}
+	w0 := e.watermark()
+	e.clk.Advance(10 * time.Minute)
+	e.pay(b, "ord-2", 6900)
+	e.orders.hang["ord-2"] = true
+	restore := referral.SetSettleTimeouts(200*time.Millisecond, 10*time.Second)
+	defer restore()
+	ctx, cancel := context.WithTimeout(e.ctx, 3*time.Second) // 清扫器给整个附加任务的总超时
+	defer cancel()
+	err := e.svc.Settle(ctx)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("settle = %v, want discover deadline", err)
+	}
+	if e.reward("ord-1")["status"] != "settled" || e.ledgerSum(a, "referral_rebate") != 690 {
+		t.Fatalf("release must run despite a hung discover: %v", e.reward("ord-1"))
+	}
+	if !e.watermark().Equal(w0) {
+		t.Fatalf("timed-out discover moved watermark %v → %v", w0, e.watermark())
+	}
+}
+
+// 日志：宽限期内 Warn、过了宽限期 Error；失败行逐行记一次日志，Discover 返回的错误只是汇总（不重复每行错误）。
+func TestDiscoverSkipLogLevelsAndErrorSummary(t *testing.T) {
+	e := newEnv(t)
+	var buf bytes.Buffer
+	e.svc = referral.NewService(referral.Deps{Pool: e.pool, Clock: e.clk, Log: slog.New(slog.NewTextHandler(&buf, nil)), Wallet: e.wallet, Users: e.users, Orders: e.orders})
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	e.ledgerAt(b, "order_pay", -6900, "ord-ghost", e.clk.Now())
+	if _, err := e.svc.Discover(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "order not found") || strings.Contains(out, "level=ERROR") {
+		t.Fatalf("within grace log = %q, want WARN only", out)
+	}
+	buf.Reset()
+	e.clk.Advance(referral.SkipGrace)
+	if n, err := e.svc.Discover(e.ctx); err != nil || n != 1 {
+		t.Fatalf("after grace = %d %v", n, err)
+	}
+	if out := buf.String(); !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "void placeholder") {
+		t.Fatalf("after grace log = %q, want ERROR", out)
+	}
+	buf.Reset()
+	e.pay(b, "ord-fail", 6900)
+	e.orders.fail["ord-fail"] = errors.New("orders db down")
+	_, err := e.svc.Discover(e.ctx)
+	if err == nil || strings.Contains(err.Error(), "orders db down") || !strings.Contains(err.Error(), "1 ledger rows failed") {
+		t.Fatalf("discover error = %v, want a summary without the per-row error", err)
+	}
+	if c := strings.Count(buf.String(), "orders db down"); c != 1 {
+		t.Fatalf("per-row error logged %d times: %q", c, buf.String())
 	}
 }

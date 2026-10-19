@@ -28,6 +28,7 @@ export const alertKindLabel: LabelMap = {
   invalid_report: '上报数据异常',
   ssh_bruteforce: 'SSH 暴力破解', upstream_unreachable: '实例 SSH 上游不可达', tls_cert_reload_failed: 'TLS 证书加载失败', tls_cert_expiring: 'TLS 证书即将到期',
   booking_at_risk: '预订机器不可用', booking_unfulfilled: '预订无法履约', booking_cancel_failed: '预订取消失败',
+  referral_scan_stuck: '邀请返利扫描卡住',
 }
 export const roleLabel: LabelMap = { super: '超级管理员', ops: '运维', finance: '财务' }
 export const adminStatusLabel: LabelMap = { active: '正常', disabled: '已停用' }
