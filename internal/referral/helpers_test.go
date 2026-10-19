@@ -52,9 +52,15 @@ type fakeOrder struct {
 	userID int64
 	start  *time.Time
 }
-type fakeOrders struct{ m map[string]fakeOrder }
+type fakeOrders struct {
+	m    map[string]fakeOrder
+	fail map[string]error // 查询该订单时返回的错误（模拟查询失败）
+}
 
 func (f *fakeOrders) OrderForReferral(_ context.Context, _ db.Querier, id string) (int64, *time.Time, error) {
+	if err := f.fail[id]; err != nil {
+		return 0, nil, err
+	}
 	o, ok := f.m[id]
 	if !ok {
 		return 0, nil, apperr.ErrNotFound
@@ -79,7 +85,7 @@ func newEnv(t *testing.T) *env {
 	clk := clock.NewFake(dbtest.T0)
 	w := wallet.NewService(pool, clk)
 	users := &fakeUsers{pool: pool, devices: map[int64]map[string]bool{}, fps: map[int64][]string{}}
-	orders := &fakeOrders{m: map[string]fakeOrder{}}
+	orders := &fakeOrders{m: map[string]fakeOrder{}, fail: map[string]error{}}
 	svc := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Wallet: w, Users: users, Orders: orders})
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, svc: svc, wallet: w, users: users, orders: orders}
 }

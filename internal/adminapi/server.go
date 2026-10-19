@@ -24,6 +24,7 @@ import (
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/httpx"
 	"spark-cloud/internal/platform/paging"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
@@ -60,7 +61,8 @@ type Server struct {
 	Rental        *rental.Service
 	Billing       *billing.Service
 	Uploads       *storage.Service
-	Gateway       *agentgw.Server // 机器接入命令与撤销（计划 2）
+	Gateway       *agentgw.Server   // 机器接入命令与撤销（计划 2）
+	Referral      *referral.Service // 计划 8：邀请返利（路由由 Task 13 注册）
 	Clock         clock.Clock
 	Log           *slog.Logger
 	SecureCookie  bool                                     // 生产环境为 true：Cookie 仅经 HTTPS 发送

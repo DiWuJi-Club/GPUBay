@@ -44,6 +44,9 @@ const (
 	ScanLookback = time.Hour
 	ScanLag      = 2 * time.Minute
 	ScanBatch    = 500
+	// SkipGrace：扣款的订单查不到 / 不属于付款人、退款找不到任何被绑定的扣款时，先按暂时跳过（钉住水位、每轮重试，
+	// 留给数据修复的时间）；流水过了这么久仍如此则视为永久，写占位事件（扣款 void、退款 refund(0)），不再钉住水位。
+	SkipGrace    = 24 * time.Hour
 	ReleaseBatch = 200
 
 	BurstThreshold    = 20

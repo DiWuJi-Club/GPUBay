@@ -260,7 +260,7 @@ func (s *Server) heartbeatAll(ctx context.Context) error {
 	return nil
 }
 
-// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep。
+// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep + Referral.Settle。
 // Rental.Sweep 先做离线检测与暂停、再做到期停机，而到期停机只处理未暂停的实例：推进 24 小时后不心跳直接清扫，
 // 机器会被判失联、实例被暂停而永远不会停机。
 func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
@@ -280,6 +280,9 @@ func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 	}
 	if err := s.App.Billing.Sweep(ctx); err != nil {
 		return nil, fmt.Errorf("billing sweep: %w", err)
+	}
+	if err := s.App.Referral.Settle(ctx); err != nil {
+		return nil, fmt.Errorf("referral settle: %w", err)
 	}
 	return map[string]bool{"ok": true}, nil
 }

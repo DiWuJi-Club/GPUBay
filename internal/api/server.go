@@ -18,6 +18,7 @@ import (
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/httpx"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
@@ -32,7 +33,8 @@ type Server struct {
 	Rental           *rental.Service
 	Uploads          *storage.Service
 	Billing          *billing.Service
-	DevPay           bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
+	Referral         *referral.Service // 计划 8：邀请返利（路由由 Task 12 注册）
+	DevPay           bool              // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
 	Clock            clock.Clock
 	Log              *slog.Logger
 	Domain           string        // 主域名，例如 spark.example.com

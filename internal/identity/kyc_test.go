@@ -1,9 +1,12 @@
 package identity_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -487,7 +490,9 @@ func TestKYCHookErrorDoesNotFailVerification(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := dbtest.New(t)
 			key, _ := referral.DeriveFingerprintKey(dbtest.Key)
-			svc := identity.NewService(identity.Deps{Pool: pool, Clock: clock.NewFake(dbtest.T0), SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: mustBox(t), Uploads: fakeUploads{}, FingerprintKey: key})
+			var logBuf bytes.Buffer
+			svc := identity.NewService(identity.Deps{Pool: pool, Clock: clock.NewFake(dbtest.T0), SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: mustBox(t), Uploads: fakeUploads{}, FingerprintKey: key,
+				Log: slog.New(slog.NewTextHandler(&logBuf, nil))})
 			svc.SetReferral(tc.hook)
 			ctx := context.Background()
 
@@ -542,6 +547,10 @@ func TestKYCHookErrorDoesNotFailVerification(t *testing.T) {
 				if len(got) != tc.failure || (tc.failure == 1 && got[0] != rec) {
 					t.Fatalf("user %d kyc_check_failed = %v, want %d row(s) for record %d", uid, got, tc.failure, rec)
 				}
+			}
+			// 吞掉的钩子错误写到注入的日志（app 的 logger），而不是 slog.Default()
+			if logged := strings.Count(logBuf.String(), "实名同身份判定失败"); logged != 2*tc.failure {
+				t.Fatalf("hook errors logged %d times, want %d: %q", logged, 2*tc.failure, logBuf.String())
 			}
 		})
 	}

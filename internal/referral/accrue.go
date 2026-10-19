@@ -130,14 +130,14 @@ func (s *Service) accrue(ctx context.Context, tx pgx.Tx, now time.Time, l ledger
 	userID, start, err := s.d.Orders.OrderForReferral(ctx, tx, order)
 	if errors.Is(err, apperr.ErrNotFound) {
 		s.d.Log.Error("referral: order not found for order_pay ledger", "ledger", l.ID, "order", order, "user", l.UserID)
-		return errSkip
+		return s.skipOrMark(ctx, tx, now, l, bindingID, "order not found")
 	}
 	if err != nil {
 		return err
 	}
 	if userID != l.UserID {
 		s.d.Log.Error("referral: order_pay ledger user is not the order owner", "ledger", l.ID, "order", order, "user", l.UserID, "owner", userID)
-		return errSkip
+		return s.skipOrMark(ctx, tx, now, l, bindingID, "order owner mismatch")
 	}
 	v, err := s.ConfigAt(ctx, tx, l.CreatedAt)
 	if err != nil {
@@ -176,4 +176,15 @@ func (s *Service) accrue(ctx context.Context, tx pgx.Tx, now time.Time, l ledger
 		return addEvent(ctx, tx, now, order, bindingID, EventCapped, 0, 0, raw-rewardCap, "cap")
 	}
 	return nil
+}
+
+// skipOrMark：流水还在 SkipGrace 内 → errSkip（本轮不写事件，Discover 钉住水位、下轮重试）；
+// 已过 SkipGrace → 视为永久跳过，写 void 占位（source_ledger_id = 该流水），之后该订单的退款走「无 reward」占位。
+// 调用方须已持有邀请人账户锁并做过幂等复查。
+func (s *Service) skipOrMark(ctx context.Context, tx pgx.Tx, now time.Time, l ledgerRow, bindingID int64, reason string) error {
+	if now.Sub(l.CreatedAt) < SkipGrace {
+		return errSkip
+	}
+	s.d.Log.Error("referral: giving up on order_pay ledger, writing void placeholder", "ledger", l.ID, "order", l.RefID, "reason", reason)
+	return addEvent(ctx, tx, now, l.RefID, bindingID, EventVoid, l.ID, 0, 0, reason)
 }

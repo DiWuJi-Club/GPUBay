@@ -28,6 +28,7 @@ import (
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/paging"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/sshgw"
 )
@@ -301,6 +302,12 @@ func TestSweepHeartbeatGoesThroughAgent(t *testing.T) {
 	m, _ := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), mid)
 	if !m.AgentOnline || !m.LastSeenAt.Equal(e.clk.Now()) || len(m.LastMetrics) == 0 {
 		t.Fatalf("after sweep = %+v", m)
+	}
+	// sweep 也跑 Referral.Settle：扫描水位离开迁移写入的初值 2000-01-01，推进到 now − ScanLag
+	var watermark time.Time
+	if err := e.a.Fleet.Pool().QueryRow(ctx, `SELECT watermark FROM referral_state WHERE id = 1`).Scan(&watermark); err != nil ||
+		!watermark.Equal(e.clk.Now().Add(-referral.ScanLag)) {
+		t.Fatalf("referral watermark = %v %v, want sweep to run Referral.Settle", watermark, err)
 	}
 	e.must("POST", "/hooks/clock/advance", map[string]int{"seconds": 360})
 	e.must("POST", "/hooks/sweep", map[string]any{"heartbeat": false})

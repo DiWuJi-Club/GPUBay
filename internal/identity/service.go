@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -45,6 +46,7 @@ type Deps struct {
 	FixedCode       string        // 仅开发环境：非空时验证码固定为该值
 	Referral        ReferralHook  // 计划 8；装配时 referral 依赖 identity，故用 SetReferral 后置注入
 	FingerprintKey  []byte        // 计划 8：实名指纹 HMAC 密钥（referral.DeriveFingerprintKey）；空时不写指纹
+	Log             *slog.Logger  // nil 时用 slog.Default()
 }
 
 // ReferralHook 由 referral 模块实现（计划 8）：注册时绑定邀请关系、实名通过时同身份判定。nil 时两者都跳过。
@@ -57,7 +59,12 @@ type Service struct {
 	d Deps
 }
 
-func NewService(d Deps) *Service { return &Service{d: d} }
+func NewService(d Deps) *Service {
+	if d.Log == nil {
+		d.Log = slog.Default()
+	}
+	return &Service{d: d}
+}
 
 // SetReferral 后置注入邀请返利钩子（referral.Service 的构造需要 identity 先存在）。必须在开始服务前调用。
 func (s *Service) SetReferral(h ReferralHook) { s.d.Referral = h }

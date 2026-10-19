@@ -40,7 +40,7 @@ func (s *Service) applyRefund(ctx context.Context, tx pgx.Tx, now time.Time, l l
 		err := tx.QueryRow(ctx, `SELECT e.binding_id, b.inviter_id, b.invitee_id FROM referral_events e JOIN referral_bindings b ON b.id = e.binding_id
 			WHERE e.order_id = $1 AND e.kind IN ('capped', 'void') AND e.source_ledger_id IS NOT NULL ORDER BY e.id LIMIT 1`, order).Scan(&bindingID, &inviterID, &inviteeID)
 		if db.IsNoRows(err) {
-			return errSkip
+			return s.refundWithoutPay(ctx, tx, now, l, order)
 		}
 		if err != nil {
 			return err
@@ -132,4 +132,32 @@ func (s *Service) lockForRefund(ctx context.Context, tx pgx.Tx, inviterID, invit
 		return false, err
 	}
 	return alreadyProcessed(ctx, tx, ledgerID)
+}
+
+// refundWithoutPay 处理既没有 reward 行、也没有计提占位的退款：
+//   - 被绑定用户的该订单 order_pay 流水存在（还没处理完：失败 / 暂时跳过 / 本批之后）→ errSkip。扣款行自己钉住水位，
+//     它计提或写占位之后本退款再处理——绝不在这里放弃，否则已发放的返利会漏扣回。
+//   - 不存在这样的扣款，且退款已过 SkipGrace → 永久无可扣回：写 refund(0) 占位（detail "no order_pay"），不再钉住水位。
+//   - 否则（SkipGrace 内）→ errSkip。
+func (s *Service) refundWithoutPay(ctx context.Context, tx pgx.Tx, now time.Time, l ledgerRow, order string) error {
+	if now.Sub(l.CreatedAt) < SkipGrace {
+		return errSkip
+	}
+	var payPending bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wallet_ledger p JOIN referral_bindings b ON b.invitee_id = p.user_id
+		WHERE p.kind = 'order_pay' AND p.ref_type = 'order' AND p.ref_id = $1)`, order).Scan(&payPending); err != nil {
+		return err
+	}
+	if payPending {
+		return errSkip
+	}
+	var bindingID, inviterID int64
+	if err := tx.QueryRow(ctx, `SELECT id, inviter_id FROM referral_bindings WHERE invitee_id = $1`, l.UserID).Scan(&bindingID, &inviterID); err != nil {
+		return err // Discover 的 JOIN 保证有绑定
+	}
+	if done, err := s.lockForRefund(ctx, tx, inviterID, l.UserID, l.ID); err != nil || done {
+		return err
+	}
+	s.d.Log.Error("referral: refund ledger has no bound order_pay, writing refund placeholder", "ledger", l.ID, "order", order)
+	return addEvent(ctx, tx, now, order, bindingID, EventRefund, l.ID, 0, 0, "no order_pay")
 }

@@ -3,7 +3,6 @@ package identity
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -170,7 +169,7 @@ func (s *Service) afterVerified(ctx context.Context, tx pgx.Tx, at time.Time, us
 	if herr == nil {
 		return nil
 	}
-	slog.Default().Error("referral: 实名同身份判定失败，已跳过（需人工核查该用户的邀请绑定）", "user_id", userID, "kyc_record_id", recordID, "err", herr)
+	s.d.Log.Error("referral: 实名同身份判定失败，已跳过（需人工核查该用户的邀请绑定）", "user_id", userID, "kyc_record_id", recordID, "err", herr)
 	return audit.Record(ctx, tx, at, audit.Actor{}.Entry("referral.kyc_check_failed", "user", strconv.FormatInt(userID, 10),
 		map[string]any{"kyc_record_id": recordID}))
 }
