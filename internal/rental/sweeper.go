@@ -24,10 +24,19 @@ var extraTaskTimeout = 2 * time.Minute
 
 // RefreshCappedLeases 让停机、洗机中与失联暂停实例的占用上界随时间推进（并封顶于下一条预订）：
 // 这些实例的 occupiedUntil 以 now 为基准，不刷新的话上界会「过期」，后来的预订会把机器当空闲挑走。
+// sweepEach 的 pred 必须以 $1 引用参数，这里没有时间条件，用恒真的 created_at <= now 占位。
+// 候选按 instances.updated_at 取前 sweepBatch 条，处理后把 updated_at 推到 now 轮转到队尾，
+// 否则候选超过一批时总是同一批最旧的行被处理，其余实例的上界永远得不到刷新。
 func (s *Service) RefreshCappedLeases(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
 	return s.sweepEach(ctx, `(state IN ('stopped', 'wiping') OR (state = 'running' AND suspended_at IS NOT NULL)) AND created_at <= $1`, now, "updated_at",
-		func(tx pgx.Tx, inst Instance) error { return s.refreshLease(ctx, tx, inst.ID, now) })
+		func(tx pgx.Tx, inst Instance) error {
+			if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `UPDATE instances SET updated_at = $2 WHERE id = $1 AND updated_at < $2`, inst.ID, now)
+			return err
+		})
 }
 
 // ExpireDue 把已到期、未暂停的运行中实例转为停机并下发停止指令。

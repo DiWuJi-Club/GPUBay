@@ -27,3 +27,22 @@ func TestHourHelpers(t *testing.T) {
 		t.Fatalf("Format = %q", got)
 	}
 }
+
+func TestHourHelpersBoundaries(t *testing.T) {
+	// 北京时间 00:00 整 = 前一天 16:00 UTC：DayStart 返回自身
+	midnight := time.Date(2026, 3, 1, 16, 0, 0, 0, time.UTC)
+	if got := tz.DayStart(midnight); !got.Equal(midnight) {
+		t.Fatalf("DayStart(midnight) = %v", got)
+	}
+	// 差 1 纳秒到北京时间零点：仍属前一天
+	before := midnight.Add(-time.Nanosecond)
+	if got := tz.DayStart(before); !got.Equal(midnight.Add(-24 * time.Hour)) {
+		t.Fatalf("DayStart(just before midnight) = %v", got)
+	}
+	if !tz.IsHour(midnight) {
+		t.Fatal("midnight is an hour boundary")
+	}
+	if tz.IsHour(midnight.Add(time.Nanosecond)) {
+		t.Fatal("non-zero nanoseconds is not an hour boundary")
+	}
+}

@@ -93,8 +93,10 @@ func openLease(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) err
 }
 
 // refreshLease 在实例状态变化后同步占用时段：结束的实例关闭时段，其余按 occupiedUntil 更新上界，
-// 但上界封顶于同机下一条 reserved 时段的下界（规格 §4.3），所以永远不会撞排他约束。
+// 但上界封顶于同机下一条 reserved 时段的下界（规格 §4.3）。
 // 预订实例在 reserved 与首次开通的 creating 期间时段固定（下单时定死），不改写。
+// 封顶值按语句快照计算：并发事务正在插入、尚未提交的预订看不到，UPDATE 会等它提交后撞排他约束。
+// 所以 UPDATE 放在保存点里，冲突时回滚保存点重试一次（新语句的快照能看到已提交的预订，封顶生效）；仍冲突 → ErrNoCapacity。
 func (s *Service) refreshLease(ctx context.Context, tx pgx.Tx, id string, now time.Time) error {
 	inst, err := lockInstance(ctx, tx, id)
 	if err != nil {
@@ -107,17 +109,41 @@ func (s *Service) refreshLease(ctx context.Context, tx pgx.Tx, id string, now ti
 	if inst.State == StateReleased || inst.State == StateFailed || inst.State == StateCancelled {
 		desired, status = now, "ended"
 	}
+	for attempt := 0; ; attempt++ {
+		err = updateLeaseCapped(ctx, tx, id, desired, status, now)
+		if !db.IsExclusionViolation(err) {
+			return err
+		}
+		if attempt == 1 {
+			return apperr.ErrNoCapacity
+		}
+	}
+}
+
+// updateLeaseCapped 在保存点内把实例的 active 时段改为 [lower, min(desired, cap))（至少 1 秒）；结果与现值相同则不写。
+func updateLeaseCapped(ctx context.Context, tx pgx.Tx, id string, desired time.Time, status string, now time.Time) error {
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return err
+	}
 	// cap 按 lease 自己的 machine_id 算（不用 inst.MachineID）：改派过渡期 lease 与实例的机器可能短暂不一致
-	_, err = tx.Exec(ctx, `WITH own AS (
+	_, err = sp.Exec(ctx, `WITH own AS (
 			SELECT id, machine_id, lower(period) AS lo FROM machine_leases
 			WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1 FOR UPDATE
 		), cap AS (
 			SELECT min(lower(l.period)) AS c FROM machine_leases l, own
 			WHERE l.machine_id = own.machine_id AND l.status = 'reserved' AND l.instance_id <> $1 AND lower(l.period) >= own.lo
+		), target AS (
+			SELECT own.id, tstzrange(own.lo, GREATEST(own.lo + interval '1 second',
+				LEAST($2::timestamptz, COALESCE((SELECT c FROM cap), $2::timestamptz)))) AS p
+			FROM own
 		)
 		UPDATE machine_leases m
-		SET period = tstzrange(own.lo, GREATEST(own.lo + interval '1 second', LEAST($2::timestamptz, COALESCE((SELECT c FROM cap), $2::timestamptz)))),
-		    status = $3, updated_at = $4
-		FROM own WHERE m.id = own.id`, id, desired, status, now)
-	return err
+		SET period = target.p, status = $3, updated_at = $4
+		FROM target WHERE m.id = target.id AND (m.period IS DISTINCT FROM target.p OR m.status IS DISTINCT FROM $3)`, id, desired, status, now)
+	if err != nil {
+		_ = sp.Rollback(ctx)
+		return err
+	}
+	return sp.Commit(ctx)
 }
