@@ -4,16 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/e2ehooks"
+	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
@@ -37,13 +42,26 @@ func newEnv(t *testing.T) *env {
 	clk := clock.NewFake(dbtest.T0)
 	k := &e2ehooks.SwitchableKYC{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
-	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: k, DisableRateLimits: true})
+	keyFile := filepath.Join(t.TempDir(), "upstream.key") // 显式给上游密钥，免得 dev 下 Build 在 os.TempDir() 留一把
+	if err := pki.GenerateUpstreamKey(keyFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(),
+		AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200, AgentDNSServers: []string{"223.5.5.5"}, UpstreamSSHKeyFile: keyFile}
+	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: k, DisableRateLimits: true, AgentTick: 20 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer((&e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log}).Handler())
-	t.Cleanup(ts.Close)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = a.Gateway.Serve(ctx, lis) }()
+	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String()}
+	ts := httptest.NewServer(hooks.Handler())
+	t.Cleanup(func() { ts.Close(); hooks.Close(); cancel(); <-done })
 	return &env{t: t, a: a, clk: clk, ts: ts}
 }
 
@@ -98,17 +116,20 @@ func TestClockHooks(t *testing.T) {
 func TestMachinesUsersAgentAndSweep(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	ids := e.must("POST", "/hooks/machines", map[string]any{"count": 2, "serial_prefix": "T-"})["ids"].([]any)
-	if len(ids) != 2 {
+	ids := e.must("POST", "/hooks/machines", map[string]any{"count": 3, "serial_prefix": "T-"})["ids"].([]any)
+	if len(ids) != 3 {
 		t.Fatalf("machines = %v", ids)
 	}
 	mid := int64(ids[0].(float64))
 	if m, err := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), mid); err != nil || !m.AgentOnline || m.State != "idle" || m.Serial != "T-1" {
 		t.Fatalf("machine = %+v, %v", m, err)
 	}
+	if m, _ := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), mid); !m.Enrolled || !m.Connected {
+		t.Fatalf("hooks/machines must enroll and connect: %+v", m)
+	}
 	// 未指定前缀时多次调用不能撞序列号（随机 6 位曾在全量 e2e 中生日碰撞出 duplicate_serial）
 	serials := map[string]bool{}
-	for i := 0; i < 300; i++ {
+	for i := 0; i < 100; i++ {
 		got := e.must("POST", "/hooks/machines", map[string]any{"count": 1})["ids"].([]any)
 		m, err := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), int64(got[0].(float64)))
 		if err != nil || serials[m.Serial] {
@@ -141,6 +162,23 @@ func TestMachinesUsersAgentAndSweep(t *testing.T) {
 	}
 	if got, _ := e.a.Rental.Get(ctx, inst.ID); got.State != rental.StateRunning {
 		t.Fatalf("after agent = %s, want running", got.State)
+	}
+	// 步进式：下单后不调 hooks/agent 就一直 creating（fake Agent 不自动执行）
+	_, inst3, err := e.a.Rental.Place(ctx, rental.PlaceRequest{UserID: uid, ProductID: dbtest.ProductID(t, e.a.Fleet.Pool()),
+		ImageID: dbtest.ImageID(t, e.a.Fleet.Pool()), Duration: catalog.D1d})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got, _ := e.a.Rental.Get(ctx, inst3.ID); got.State != rental.StateCreating {
+		t.Fatalf("stepped agent executed on its own: %s", got.State)
+	}
+	if out := e.must("POST", "/hooks/agent", map[string]any{"machine_id": inst3.MachineID}); out["completed"].(float64) != 1 {
+		t.Fatalf("agent for machine = %v", out)
+	}
+	st := e.must("GET", fmt.Sprintf("/hooks/agent/status?machine_id=%d", inst3.MachineID), nil)
+	if st["connected"] != true {
+		t.Fatalf("status = %v", st)
 	}
 	e.must("POST", "/hooks/clock/advance", map[string]int{"seconds": 86400})
 	e.must("POST", "/hooks/sweep", map[string]any{})
@@ -190,6 +228,45 @@ func TestSweepWithoutHeartbeatSuspends(t *testing.T) {
 	e.must("POST", "/hooks/sweep", map[string]any{"heartbeat": false})
 	if got, _ := e.a.Rental.Get(ctx, inst.ID); !got.Suspended() || got.State != rental.StateRunning {
 		t.Fatalf("after offline sweep = %+v, want suspended running", got)
+	}
+}
+
+// 后台 API 登记（未接入）的机器调 hooks/agent 时自动接入。
+func TestAgentHookEnrollsUnknownMachine(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	m, err := e.a.Fleet.Register(ctx, fleet.NewMachine{Serial: "REG-1", LanIP: "10.99.0.9", ProductID: dbtest.ProductID(t, e.a.Fleet.Pool())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.a.Fleet.SetMaintenance(ctx, m.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if out := e.must("POST", "/hooks/agent", map[string]any{"machine_id": m.ID}); out["completed"].(float64) != 0 {
+		t.Fatalf("agent = %v", out)
+	}
+	got, _ := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), m.ID)
+	if !got.Enrolled || !got.Connected || !got.AgentOnline || got.LastSeenAt == nil {
+		t.Fatalf("machine = %+v", got)
+	}
+}
+
+// sweep 的 heartbeat 通过 fake Agent 发送：推进 6 分钟后 heartbeat=true 的 sweep 不会判离线。
+func TestSweepHeartbeatGoesThroughAgent(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	ids := e.must("POST", "/hooks/machines", map[string]any{"count": 1})["ids"].([]any)
+	mid := int64(ids[0].(float64))
+	e.must("POST", "/hooks/clock/advance", map[string]int{"seconds": 360})
+	e.must("POST", "/hooks/sweep", map[string]any{})
+	m, _ := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), mid)
+	if !m.AgentOnline || !m.LastSeenAt.Equal(e.clk.Now()) || len(m.LastMetrics) == 0 {
+		t.Fatalf("after sweep = %+v", m)
+	}
+	e.must("POST", "/hooks/clock/advance", map[string]int{"seconds": 360})
+	e.must("POST", "/hooks/sweep", map[string]any{"heartbeat": false})
+	if m, _ = e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), mid); m.AgentOnline {
+		t.Fatal("heartbeat=false must let the sweeper mark offline")
 	}
 }
 

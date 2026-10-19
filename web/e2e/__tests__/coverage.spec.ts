@@ -8,8 +8,8 @@ const table = JSON.parse(readFileSync(join(__dirname, '..', 'coverage.json'), 'u
 describe('coverage.json', () => {
   it('与设计 §7.5 的数量一致且无重复', () => {
     expect(table.console).toHaveLength(53)
-    expect(table.admin).toHaveLength(50)
-    expect(new Set([...table.console, ...table.admin]).size).toBe(103)
+    expect(table.admin).toHaveLength(53) // 计划 5 的 50 个 + 计划 2 追加 A-MCH-07～09
+    expect(new Set([...table.console, ...table.admin]).size).toBe(106)
   })
 })
 

@@ -21,6 +21,7 @@ import (
 
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/e2ehooks"
+	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/db"
@@ -30,6 +31,7 @@ const (
 	publicAddr = "127.0.0.1:18080"
 	adminAddr  = "127.0.0.1:18081"
 	hooksAddr  = "127.0.0.1:18090"
+	agentAddr  = "127.0.0.1:18443" // 真实 Agent 网关（gRPC + mTLS）；进程内的步进式 fake Agent 连到这里
 )
 
 func main() {
@@ -69,21 +71,41 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// 上游 SSH 密钥放在本进程临时目录里（退出时随目录删除），不让 app.Build 每次运行都在 os.TempDir() 留一把
+	keyFile := filepath.Join(dir, "upstream.key")
+	if err := pki.GenerateUpstreamKey(keyFile); err != nil {
+		return err
+	}
 	cfg := config.Config{
 		Env: "dev", HTTPAddr: publicAddr, AdminAddr: adminAddr, DatabaseURL: dbURL, Domain: "spark.test",
 		SecretKey: bytes.Repeat([]byte("e"), 32), SMSDriver: "mock", KYCDriver: "mock", PayDriver: "mock", PDUDriver: "mock",
 		UploadDir: filepath.Join(dir, "uploads"), SweepInterval: time.Minute,
+		AgentAddr: agentAddr, AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200,
+		AgentDNSServers: []string{"223.5.5.5", "119.29.29.29"}, UpstreamSSHKeyFile: keyFile,
 	}
 	clk := clock.NewFake(time.Now())
 	kycSwitch := &e2ehooks.SwitchableKYC{}
-	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: kycSwitch, DisableRateLimits: true})
+	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: kycSwitch, DisableRateLimits: true, AgentTick: 50 * time.Millisecond})
 	if err != nil {
 		return err
 	}
+	// 先同步 Listen：端口被占用时立即失败，而不是让 fake Agent 连到别的进程上
+	gwLis, err := net.Listen("tcp", agentAddr)
+	if err != nil {
+		return fmt.Errorf("agent gateway: %w", err)
+	}
+	// 网关不随 SIGTERM 的 ctx 退出，只在 defer 里、fake Agent 全部停掉之后关闭：否则几百个 fake Agent 会在退出前刷屏重连
+	gwCtx, stopGW := context.WithCancel(context.Background())
+	gwErr := make(chan error, 1)
+	go func() { gwErr <- a.Gateway.Serve(gwCtx, gwLis) }()
+	defer func() { stopGW(); <-gwErr }() // 在 fake Agent 停掉之后再关网关（defer 逆序）
+	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr}
+	defer hooksSrv.Close()
+
 	public, adminSrv := a.Servers(cfg) // 与 cmd/platform 完全相同的监听与路由；不启动定时清扫器，清扫由钩子触发
 	hooks := &http.Server{
 		Addr:              hooksAddr,
-		Handler:           (&e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log}).Handler(),
+		Handler:           hooksSrv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	servers := []*http.Server{public, adminSrv, hooks}
@@ -97,7 +119,7 @@ func run() error {
 		}
 	}
 	fmt.Println("E2E READY") // Playwright 以 GET /healthz 为就绪探测；这一行便于人工查看
-	log.Info("e2e-server ready", "console", "http://"+publicAddr, "admin", "http://"+adminAddr+"/admin/", "hooks", "http://"+hooksAddr)
+	log.Info("e2e-server ready", "console", "http://"+publicAddr, "admin", "http://"+adminAddr+"/admin/", "hooks", "http://"+hooksAddr, "agent", agentAddr)
 
 	var runErr error
 	select {
@@ -106,6 +128,9 @@ func run() error {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			runErr = err
 		}
+	case err := <-gwErr:
+		gwErr <- err // 留给 defer 读取
+		runErr = fmt.Errorf("agent gateway stopped: %v", err)
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

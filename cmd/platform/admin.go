@@ -15,12 +15,14 @@ import (
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
 )
 
 const adminUsage = `用法：
   platform admin create --username <用户名> [--role super|ops|finance]
-  platform admin reset-totp --username <用户名>`
+  platform admin reset-totp --username <用户名>
+  platform admin gen-upstream-key --path <私钥文件>`
 
 // prompter 读取一行输入；secret 为 true 时不回显（用于密码）。
 type prompter func(label string, secret bool) (string, error)
@@ -35,6 +37,8 @@ func runAdmin(ctx context.Context, svc *admin.Service, args []string, out io.Wri
 		return adminCreate(ctx, svc, args[1:], out, prompt)
 	case "reset-totp":
 		return adminResetTOTP(ctx, svc, args[1:], out)
+	case "gen-upstream-key":
+		return adminGenUpstreamKey(args[1:], out)
 	}
 	return errors.New(adminUsage)
 }
@@ -130,4 +134,25 @@ func terminalPrompter(in *os.File, out io.Writer) prompter {
 		}
 		return strings.TrimRight(line, "\r\n"), nil
 	}
+}
+
+func adminGenUpstreamKey(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("admin gen-upstream-key", flag.ContinueOnError)
+	fs.SetOutput(out)
+	path := fs.String("path", "", "私钥保存路径（将以 0600 写入，另生成 .pub）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *path == "" {
+		return errors.New("请用 --path 指定私钥保存路径\n" + adminUsage)
+	}
+	if err := pki.GenerateUpstreamKey(*path); err != nil {
+		return err
+	}
+	pub, err := pki.LoadUpstreamPublicKey(*path)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "已生成上游 SSH 密钥：%s（请设置 SPARK_UPSTREAM_SSH_KEY_FILE=%s）\n公钥：%s\n", *path, *path, pub)
+	return nil
 }

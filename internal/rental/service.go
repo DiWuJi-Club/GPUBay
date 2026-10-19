@@ -28,9 +28,16 @@ const (
 	StateReleased = "released"
 	StateFailed   = "failed"
 
-	CreateTimeout   = 10 * time.Minute // 开通超时，超时判失败并退款
+	CreateTimeout   = 20 * time.Minute // 开通超时（从 created_at 计），大镜像首次拉取可能较慢
 	RetainAfterStop = 6 * time.Hour    // 到期停机后保留数据的时长
 	OfflineTimeout  = 5 * time.Minute  // Agent 失联判定
+
+	// 指令超时（从 sent_at 计，只对在线机器），由清扫器 FailTimedOutCommands 判定
+	CreateCommandTimeout = 15 * time.Minute
+	StartCommandTimeout  = 5 * time.Minute
+	StopCommandTimeout   = 5 * time.Minute
+	WipeCommandTimeout   = 30 * time.Minute
+	PullCommandTimeout   = 60 * time.Minute
 )
 
 type UserChecker interface {

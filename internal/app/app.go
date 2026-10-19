@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -16,11 +17,13 @@ import (
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/adminapi"
+	"spark-cloud/internal/agentgw"
 	"spark-cloud/internal/api"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/randx"
@@ -42,7 +45,9 @@ type Options struct {
 	KYC   kyc.Verifier
 	Pay   map[string]pay.Provider // 测试注入的支付渠道
 	PDU   pdu.Driver              // 测试注入：所有 PDU 都使用该驱动
-	// DisableRateLimits 把验证码按 IP 限流与后台登录限流调到 100 万次。只供 cmd/e2e-server 使用：
+	// AgentTick 是 Agent 网关投递 tick 间隔；零值用网关默认（1 秒）。测试与 e2e-server 调小。
+	AgentTick time.Duration
+	// DisableRateLimits 把验证码按 IP 限流、后台登录限流与 Agent 接入（Enroll）按 IP 限流调到 100 万次。只供 cmd/e2e-server 使用：
 	// 两个限流器都按注入的时钟计窗口，假时钟下窗口永不滑过。没有任何配置项或环境变量能打开它，
 	// 并且生产环境设置为 true 时 Build 直接报错。
 	DisableRateLimits bool
@@ -62,6 +67,9 @@ type App struct {
 
 	Admins       *admin.Service
 	AdminHandler http.Handler // 后台 API，只应监听内网地址
+
+	Gateway *agentgw.Server // Agent 网关（gRPC，mTLS）；由 cmd/platform 在 SPARK_AGENT_ADDR 上监听
+	CA      *pki.CA
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
@@ -158,12 +166,54 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy,
 	}
+	upstreamPub, err := upstreamPublicKey(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
+	if err != nil {
+		return nil, err
+	}
+	// 证书有效期按墙上时钟（对端按真实时间校验）；注入的假时钟若领先真实时间，会签出尚未生效的 CA。
+	ca, err := pki.EnsureCA(context.Background(), pool, box, clock.Real{})
+	if err != nil {
+		return nil, fmt.Errorf("初始化内置 CA: %w", err)
+	}
+	enrollLimit := 0
+	if opt.DisableRateLimits {
+		enrollLimit = noRateLimit
+	}
+	gw, err := agentgw.New(agentgw.Config{
+		AdvertiseAddr: cfg.AgentAdvertiseAddr(), Hosts: cfg.AgentHosts, AllowCIDRs: cfg.AgentAllowCIDRs, DNSServers: cfg.AgentDNSServers,
+		BandwidthMbps: cfg.AgentBandwidthMbps, DataSizeGiB: cfg.AgentDataSizeGiB, UpstreamPubKey: upstreamPub,
+		DownloadURL: cfg.AgentDownloadURL, BinarySHA256: cfg.AgentBinarySHA256, Tick: opt.AgentTick, EnrollLimit: enrollLimit,
+	}, agentgw.Deps{Pool: pool, Fleet: f, Rental: r, CA: ca, Clock: clk, Log: log})
+	if err != nil {
+		return nil, err
+	}
 	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
 	adminSrv := &adminapi.Server{
-		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads,
+		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Gateway: gw,
 		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit,
 	}
-	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router()}, nil
+	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router(),
+		Gateway: gw, CA: ca}, nil
+}
+
+// upstreamPublicKey 读取平台登录容器用的上游公钥；非生产环境未配置时自动在临时目录生成并打印路径。
+func upstreamPublicKey(cfg config.Config, log *slog.Logger) (string, error) {
+	path := cfg.UpstreamSSHKeyFile
+	if path == "" {
+		if cfg.Env == "prod" {
+			return "", errors.New("生产环境必须设置 SPARK_UPSTREAM_SSH_KEY_FILE")
+		}
+		path = filepath.Join(os.TempDir(), "spark-upstream-"+randx.ID("", 8)+".key")
+		if err := pki.GenerateUpstreamKey(path); err != nil {
+			return "", err
+		}
+		log.Warn("SPARK_UPSTREAM_SSH_KEY_FILE 未设置，已生成临时上游 SSH 密钥（仅开发环境）", "path", path)
+	}
+	pub, err := pki.LoadUpstreamPublicKey(path)
+	if err != nil {
+		return "", fmt.Errorf("读取上游 SSH 密钥: %w", err)
+	}
+	return pub, nil
 }
 
 func aliyunClient(cfg config.Config, endpoint string) *aliyun.Client {

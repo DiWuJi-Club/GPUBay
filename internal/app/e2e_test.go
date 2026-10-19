@@ -69,7 +69,7 @@ func TestFullRentalLifecycle(t *testing.T) {
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
 	smsMock := &sms.Mock{}
-	cfg := config.Config{Env: "dev", UploadDir: t.TempDir(), Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock"}
+	cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: "dev", UploadDir: t.TempDir(), Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock"}
 	a, err := app.Build(cfg, pool, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{Clock: clk, SMS: smsMock})
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +194,7 @@ func TestBuildWiresAliyunPlugins(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "aliyun", KYCDriver: "aliyun",
+	cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "aliyun", KYCDriver: "aliyun",
 		UploadDir: t.TempDir(), Aliyun: config.AliyunConfig{AccessKeyID: "ak", AccessKeySecret: "sk", SMSSign: "Spark",
 			SMSTplLogin: "SMS_1", SMSTplExpiry: "SMS_2", KYCAuthCode: "auth", SMSEndpoint: srv.URL, KYCEndpoint: srv.URL}}
 	a, err := app.Build(cfg, pool, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{Clock: clock.NewFake(dbtest.T0)})
@@ -246,7 +246,7 @@ func TestBuildWiresRealPayProviders(t *testing.T) {
 	dir := t.TempDir()
 	wxPriv, wxPub := writeKeys(t, dir, "wechat")
 	aliPriv, aliPub := writeKeys(t, dir, "alipay")
-	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock",
+	cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock",
 		PayDriver: "real", PublicBaseURL: "https://spark.test", UploadDir: t.TempDir(),
 		Wechat: config.WechatConfig{MchID: "1900000001", AppID: "wx123", APIv3Key: "0123456789abcdef0123456789abcdef",
 			CertSerial: "SERIAL", PrivateKeyPath: wxPriv, PublicKeyID: "PUB_KEY_ID_1", PublicKeyPath: wxPub},
@@ -278,7 +278,7 @@ func TestAdminRefundEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
-	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+	cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
 	a, err := app.Build(cfg, pool, slog.New(slog.NewTextHandler(io.Discard, nil)), app.Options{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
@@ -383,7 +383,7 @@ func TestBuildRejectsDisabledRateLimitsInProd(t *testing.T) {
 }
 
 func TestServersUseConfiguredAddressesAndTimeouts(t *testing.T) {
-	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+	cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
 	a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +399,7 @@ func TestServersUseConfiguredAddressesAndTimeouts(t *testing.T) {
 
 func TestSecureCookieOutsideDev(t *testing.T) {
 	for env, wantSecure := range map[string]bool{"dev": false, "staging": true} {
-		cfg := config.Config{Env: env, Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+		cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: env, Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
 		a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0)})
 		if err != nil {
 			t.Fatal(err)
@@ -433,7 +433,7 @@ func TestSecureCookieOutsideDev(t *testing.T) {
 func TestDisableRateLimitsLiftsBothLimits(t *testing.T) {
 	const smsTries, loginTries = 31, 21
 	for _, disabled := range []bool{false, true} {
-		cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+		cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
 		a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0), DisableRateLimits: disabled})
 		if err != nil {
 			t.Fatal(err)

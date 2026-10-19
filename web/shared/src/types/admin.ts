@@ -46,6 +46,31 @@ export interface Machine {
   pdu_id: number | null
   pdu_outlet: number | null
   created_at: string
+  enrolled: boolean
+  fingerprint_prefix: string
+  connected: boolean
+  agent_version: string
+  agent_connected_at: string | null
+  state_reported_at: string | null
+  last_metrics: MachineMetrics | null
+}
+
+export interface MachineMetrics {
+  gpu_util: number
+  gpu_temp_c: number
+  gpu_power_w: number
+  mem_total: number
+  mem_used: number
+  root_disk_total: number
+  root_disk_used: number
+  data_disk_used: number
+  load1: number
+}
+
+export interface EnrollCommand {
+  command: string
+  token_id: number
+  expires_at: string
 }
 
 export interface AdminInstance {

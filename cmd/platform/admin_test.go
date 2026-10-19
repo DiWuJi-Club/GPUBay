@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -108,5 +110,19 @@ func TestListensOnAllInterfaces(t *testing.T) {
 		if got := listensOnAllInterfaces(addr); got != want {
 			t.Fatalf("%s = %v, want %v", addr, got, want)
 		}
+	}
+}
+
+func TestAdminGenUpstreamKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "up.key")
+	var out bytes.Buffer
+	if err := runAdmin(context.Background(), nil, []string{"gen-upstream-key", "--path", path}, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".pub"); err != nil || !strings.Contains(out.String(), "ssh-ed25519 ") {
+		t.Fatalf("output = %s, err = %v", out.String(), err)
+	}
+	if err := runAdmin(context.Background(), nil, []string{"gen-upstream-key"}, &out, nil); err == nil {
+		t.Fatal("missing --path accepted")
 	}
 }

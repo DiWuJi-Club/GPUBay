@@ -65,7 +65,28 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_WECHAT_PUBLIC_KEY_ID` / `SPARK_WECHAT_PUBLIC_KEY_PATH` | 微信支付公钥 ID 与公钥文件（商户平台「API 安全」中下载） | 空 |
 | `SPARK_ALIPAY_APP_ID` / `_PRIVATE_KEY_PATH` / `_PUBLIC_KEY_PATH` / `_SANDBOX` | 支付宝应用 ID、应用私钥文件、支付宝公钥文件、是否沙箱 | 空 / false |
 | `SPARK_SWEEP_INTERVAL` | 清扫间隔 | 1m |
+| `SPARK_AGENT_ADDR` | Agent 网关 gRPC 监听地址（mTLS，只对机房内网开放） | :9443 |
+| `SPARK_AGENT_HOSTS` | 网关证书的域名 / IP（逗号分隔，每项须是主机名或 IP，不含端口），第一项写进安装命令；生产必填 | dev: localhost,127.0.0.1 |
+| `SPARK_AGENT_DOWNLOAD_URL` | 内网文件服务器上 `install.sh` 与 `spark-agent-linux-arm64` 所在目录；为空时后台只显示 `spark-agent enroll` 一行 | 空 |
+| `SPARK_AGENT_BINARY_SHA256` | agent 二进制 SHA-256（`make agent` 输出），填进安装命令供 install.sh 校验 | 空 |
+| `SPARK_UPSTREAM_SSH_KEY_FILE` | 平台登录容器的 ed25519 私钥（`platform admin gen-upstream-key --path ...` 生成，0600）；生产必填，dev 缺省时自动生成在临时目录 | 空 |
+| `SPARK_AGENT_DATA_SIZE_GIB` / `SPARK_AGENT_BANDWIDTH_MBPS` | 实例数据盘大小（GiB）与默认限速（Mbps） | 2048 / 200 |
+| `SPARK_AGENT_ALLOW_CIDRS` / `SPARK_AGENT_DNS_SERVERS` | 容器可访问的内网白名单（Harbor、HF 镜像站等）与容器 DNS | 空 / 223.5.5.5,119.29.29.29 |
 | `SPARK_TRUST_PROXY` | 仅当 platform 部署在会改写 X-Forwarded-For 的反向代理之后才设为 true（只作用于用户 API；后台 API 始终以连接地址为准） | false |
+
+## 节点 Agent
+
+每台 DGX Spark（arm64，Ubuntu 24.04，Docker + NVIDIA CDI）跑一个 `spark-agent`，经 9443 端口（mTLS）连接平台。
+
+1. 构建：`make agent`（`make build` 也会构建），生成静态二进制 `bin/spark-agent-linux-arm64` 并打印 SHA-256。
+2. 把 `bin/spark-agent-linux-arm64` 与 `deploy/agent/install.sh` 放到内网文件服务器的同一目录；`SPARK_AGENT_DOWNLOAD_URL` 指向该目录，`SPARK_AGENT_BINARY_SHA256` 填 `make agent` 打印的值。
+3. 后台机器详情「生成接入命令」，在机器上以 root 执行。脚本依次：下载并校验二进制 -> 用下载的临时二进制执行 `selfcheck`（失败则中止）-> 原子替换 `/usr/local/bin/spark-agent` -> 建 `/etc/spark-agent`、`/var/lib/spark-agent`（强制 0700，可重复执行）-> `enroll` -> 安装并启用 systemd 服务 `spark-agent`（`Restart=always`）。自检失败时令牌未被消耗，可原样重跑；`enroll` 之后的任何失败都需要在后台重新生成接入命令。令牌不会被脚本打印，但 `ps` 里在 enroll 运行期间可见，也会留在 shell 历史和 `sudo` 的 `/var/log/auth.log` 里；一次性令牌用后即失效，过期未用的令牌请在后台作废。
+4. 9443 端口只对机房内网开放。
+5. 镜像规范与参考 Dockerfile 见 `docs/image-spec.md`、`deploy/image/Dockerfile`。
+6. 升级 Agent：`make agent` 后更新文件服务器上的二进制与 `SPARK_AGENT_BINARY_SHA256`（平台重启生效），在后台重新生成接入命令并在机器上执行（会换新证书，运行中的实例不受影响）。
+7. 机器网络：Agent 在宿主机重启后先挂载数据盘再拉起应运行的容器；若容器端口要绑定的局域网地址还没就绪，Agent 推迟启动并每 60 秒重试。业务网卡建议用有线 + 固定地址，并启用 `NetworkManager-wait-online`。
+8. 本地无 Docker 时：`spark-agent run --fake --dir ./.devdata/agent --state-dir ./.devdata/agent/state`（`--fake` 仅用于开发，systemd unit 不使用）。
+9. 脚本测试：`sh deploy/agent/install_test.sh`（已并入 `make test`）。
 
 ## 部署注意
 
@@ -79,6 +100,8 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - 用户控制台与用户 API 同在 `:8080`（`/` 为页面，`/api/*` 为接口），前面的反向代理不需要额外路由规则；管理后台与后台 API 同在 `:8081`（`/admin/`），仍只监听内网地址。
 - `make build` 会先构建前端再编译后端，二进制内含页面；`index.html` 以 `Cache-Control: no-cache` 返回（浏览器每次加载都向服务器校验，发布后刷新即生效），`assets/` 文件名带内容哈希，缓存一年（`immutable`），其余不带哈希的文件（favicon、`brand/` 等）缓存 1 小时。
 - `SPARK_ENV=staging` 与 `prod` 都会给 Cookie 加 `Secure`，所以 staging 必须走 HTTPS。
+- `SPARK_SECRET_KEY` 同时加密内置 CA 的私钥：**轮换该密钥会使 CA 不可解密，所有机器都要重新接入**；轮换前先导出 `platform_pki` 表备份。
+- 从备份恢复平台数据库前，先把全部机器置为维护或停止平台的 Agent 网关：网关对账会把数据库里不存在的实例容器当作孤儿洗掉。
 
 ## API 约定
 

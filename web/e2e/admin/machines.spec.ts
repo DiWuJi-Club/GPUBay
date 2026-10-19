@@ -2,7 +2,7 @@ import { expect, request, test, type Page } from '@playwright/test'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
-  adminApi, adminPost, clickTwiceSync, createAdmin, createPDU, drainIdleMachines, drainTasks, expectAdminUrl, fail500, loginAdmin, nextSerial, pick, recordRequests, registerMachine, trackToasts,
+  adminApi, adminPost, clickTwiceSync, createAdmin, createPDU, drainIdleMachines, drainTasks, enterTotpDialog, expectAdminUrl, fail500, getJSON, loginAdmin, nextSerial, pick, recordRequests, registerMachine, trackToasts,
 } from '../helpers/admin'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { CONSOLE_URL, hooks } from '../helpers/hooks'
@@ -586,5 +586,187 @@ test('A-MCH-06 机器详情：当前实例与历史实例（可点击），首�
     await expect(page.getByTestId('mdetail-serial')).toHaveText(other.serial)
     await expect(page.getByTestId('mdetail-current')).toHaveCount(0)
     await page.unroute(isDetail)
+  })
+})
+
+test('A-MCH-07 生成接入命令：动态码、只显示一次、可复制、再生成换令牌、审计不含明文', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const ctx = await adminApi(admin)
+  const m = await registerMachine(ctx, admin)
+  const posts = recordRequests(page, 'POST', `/machines/${m.id}/enroll-command`)
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/machines/${m.id}`)
+  await expect(page.getByTestId('mdetail-enrolled')).toHaveText('未接入')
+  await expect(page.getByTestId('mdetail-enrolled')).toHaveAttribute('data-enrolled', 'false')
+  await expect(page.getByTestId('mdetail-connected')).toHaveText('未连接')
+  await expect(page.getByTestId('mdetail-revoke-btn')).toBeDisabled()
+
+  await test.step('点击生成（连点只发一次）→ 弹动态码框 → 显示命令；复制与剪贴板一致', async () => {
+    await clickTwiceSync(page.getByTestId('mdetail-enroll-btn'))
+    await enterTotpDialog(page, admin.totp_secret!)
+    await expect(page.getByTestId('mdetail-enroll-dialog')).toBeVisible()
+    const cmd = await page.getByTestId('mdetail-enroll-command').textContent()
+    expect(cmd).toMatch(/^sudo spark-agent enroll --platform 127\.0\.0\.1:18443 --token spk1_[A-Za-z0-9_-]{43} --ca-sha256 [0-9a-f]{64}$/)
+    await expect(page.getByTestId('mdetail-enroll-expires')).toContainText('有效期至')
+    await page.getByTestId('mdetail-enroll-copy').click()
+    await toast(page, '已复制')
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(cmd)
+    await drainTasks(page)
+    expect(posts).toHaveLength(2) // 第一次 totp_required，第二次带动态码
+    expect(posts[1].body).toMatchObject({ totp: expect.any(String) })
+  })
+
+  await test.step('关闭后命令不再可见；再生成得到不同令牌（5 分钟内免动态码）', async () => {
+    const first = await page.getByTestId('mdetail-enroll-command').textContent()
+    await page.getByTestId('mdetail-enroll-close').click()
+    await expect(page.getByTestId('mdetail-enroll-dialog')).toBeHidden()
+    await expect(page.getByTestId('mdetail-enroll-command')).toHaveCount(0)
+    await page.getByTestId('mdetail-enroll-btn').click()
+    await expect(page.getByTestId('mdetail-enroll-dialog')).toBeVisible()
+    const second = await page.getByTestId('mdetail-enroll-command').textContent()
+    expect(second).not.toBe(first)
+    expect(posts).toHaveLength(3)
+    await page.getByTestId('mdetail-enroll-close').click()
+    await expect(page.getByTestId('mdetail-enroll-command')).toHaveCount(0)
+  })
+
+  await test.step('审计记录两次签发（只看本管理员对本机器的记录），diff 只有 token_id / expires_at', async () => {
+    const audit = await getJSON<{ total: number; items: { diff: Record<string, unknown> }[] }>(
+      ctx, `/admin/api/v1/audit?action=machine.enroll_token&target_type=machine&target_id=${m.id}&actor_id=${admin.id}`)
+    expect(audit.total).toBe(2)
+    for (const it of audit.items) expect(Object.keys(it.diff).sort()).toEqual(['expires_at', 'token_id'])
+    expect(JSON.stringify(audit.items)).not.toContain('spk1_')
+  })
+
+  await test.step('生成失败：原文提示，不弹命令框', async () => {
+    await page.route(`**/admin/api/v1/machines/${m.id}/enroll-command`, fail500('req-enr-1'))
+    await page.getByTestId('mdetail-enroll-btn').click()
+    await toast(page, '服务器内部错误（请求号 req-enr-1）')
+    await drainTasks(page)
+    await expect(page.getByTestId('mdetail-enroll-command')).toHaveCount(0)
+    await page.unroute(`**/admin/api/v1/machines/${m.id}/enroll-command`)
+  })
+
+  await test.step('生成请求未返回时切到另一台机器：旧机器的命令不会显示在新机器页上', async () => {
+    const other = await registerMachine(ctx, admin)
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    let held = 0
+    const isEnroll = (u: URL) => u.pathname === `/admin/api/v1/machines/${m.id}/enroll-command`
+    await page.route(isEnroll, async (route) => {
+      held += 1
+      await gate
+      await route.continue()
+    })
+    await page.getByTestId('mdetail-enroll-btn').click()
+    await expect.poll(() => held).toBe(1)
+    // 与 A-MCH-06 相同：在同一文档里造出 [m, other, m] 再后退，由 vue-router 处理 popstate，组件复用
+    await page.evaluate(([a, b]) => {
+      history.pushState(null, '', `/admin/machines/${b}`)
+      history.pushState(null, '', `/admin/machines/${a}`)
+      history.back()
+    }, [m.id, other.id])
+    await expectAdminUrl(page, `/machines/${other.id}`)
+    await expect(page.getByTestId('mdetail-serial')).toHaveText(other.serial)
+    const late = page.waitForResponse((r) => isEnroll(new URL(r.url())))
+    release()
+    await late
+    await drainTasks(page)
+    await expect(page.getByTestId('mdetail-enroll-command')).toHaveCount(0)
+    await expect(page.getByTestId('mdetail-enroll-dialog')).toBeHidden()
+    await page.unroute(isEnroll)
+  })
+})
+
+test('A-MCH-08 撤销接入：确认文案、取消不发请求、动态码、成功后未接入且连接断开、审计', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const ctx = await adminApi(admin)
+  const [mid] = await hooks.machines(1) // 已接入并连接
+  const posts = recordRequests(page, 'POST', `/machines/${mid}/revoke-enrollment`)
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/machines/${mid}`)
+  await expect(page.getByTestId('mdetail-enrolled')).toHaveAttribute('data-enrolled', 'true')
+  await expect(page.getByTestId('mdetail-connected')).toHaveText('已连接')
+  await expect(page.getByTestId('mdetail-connected')).toHaveAttribute('data-connected', 'true')
+  await expect(page.getByTestId('mdetail-revoke-btn')).toBeEnabled()
+  expect((await hooks.agentStatus(mid)).connected).toBe(true)
+
+  await test.step('确认框文案固定；取消不发请求', async () => {
+    await page.getByTestId('mdetail-revoke-btn').click()
+    await expect(page.getByTestId('mdetail-revoke-text')).toHaveText('撤销后该机器的 Agent 证书立即作废、连接断开，机器上的实例会在 5 分钟后被判失联；重新接入需要再次生成接入命令。确定撤销？')
+    await page.getByTestId('mdetail-revoke-cancel').click()
+    await expect(page.getByTestId('mdetail-revoke-dialog')).toBeHidden()
+    await drainTasks(page)
+    expect(posts).toHaveLength(0)
+  })
+
+  await test.step('确定（连点只发一次）→ 动态码 → 未接入、未连接、按钮禁用；fake Agent 断开；审计', async () => {
+    await page.getByTestId('mdetail-revoke-btn').click()
+    await clickTwiceSync(page.getByTestId('mdetail-revoke-ok'))
+    await enterTotpDialog(page, admin.totp_secret!)
+    await toast(page, '已撤销接入')
+    await expect(page.getByTestId('mdetail-revoke-dialog')).toBeHidden()
+    await expect(page.getByTestId('mdetail-enrolled')).toHaveText('未接入')
+    await expect(page.getByTestId('mdetail-connected')).toHaveText('未连接')
+    await expect(page.getByTestId('mdetail-revoke-btn')).toBeDisabled()
+    await drainTasks(page)
+    expect(posts).toHaveLength(2) // 第一次 totp_required，第二次带动态码
+    // 查询状态的同时会停掉并移除这台机器的 fake Agent，之后的全局 hooks.agent() 不会把它重新接入
+    await expect.poll(async () => (await hooks.agentStatus(mid)).connected).toBe(false)
+    const audit = await getJSON<{ total: number; items: { diff: Record<string, unknown> }[] }>(
+      ctx, `/admin/api/v1/audit?action=machine.revoke_enrollment&target_type=machine&target_id=${mid}&actor_id=${admin.id}`)
+    expect(audit.total).toBe(1)
+    expect(audit.items[0].diff).toMatchObject({ tokens_expired: 0 })
+  })
+
+  // 这台机器已没有 Agent：放进维护，免得之后的用例下单分到它
+  await adminPost(ctx, admin, `/admin/api/v1/machines/${mid}/maintenance`, { on: true })
+})
+
+test('A-MCH-09 接入状态与指标：列表两列、详情接入 / 连接 / 版本 / 指标卡片、无指标显示占位', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const ctx = await adminApi(admin)
+  const rack = `M${runStamp}`
+  const bare = await registerMachine(ctx, admin, { rack })
+  const [mid] = await hooks.machines(1, undefined, rack) // 同一机柜，列表筛选只剩这两台
+  await adminPost(ctx, admin, `/admin/api/v1/machines/${mid}/maintenance`, { on: true }) // 不影响其它用例的空闲数
+  const before = await getJSON<{ machine: { last_metrics: unknown } }>(ctx, `/admin/api/v1/machines/${mid}`)
+  expect(before.machine.last_metrics).toBeNull() // 步进模式：心跳之前没有指标
+  await hooks.sweep() // fake Agent 心跳 → last_metrics
+  const detail = await getJSON<{ machine: { serial: string; fingerprint_prefix: string; agent_version: string } }>(ctx, `/admin/api/v1/machines/${mid}`)
+  expect(detail.machine.fingerprint_prefix).toMatch(/^[0-9a-f]{16}$/)
+  await loginAdmin(page, admin)
+  await page.getByTestId('menu-machines').click()
+
+  await test.step('列表：有指标的机器显示 55°C / 40%，没有的显示 —', async () => {
+    await page.getByTestId('machines-filter-rack').fill(rack)
+    await page.getByTestId('machines-search').click()
+    await expect(page.getByTestId('machines-total')).toHaveText('共 2 台')
+    const bareRow = rowBySerial(page, bare.serial)
+    await expect(bareRow.getByTestId('machine-gpu-temp')).toHaveText('—')
+    await expect(bareRow.getByTestId('machine-root-disk')).toHaveText('—')
+    const row = rowBySerial(page, detail.machine.serial)
+    await expect(row.getByTestId('machine-gpu-temp')).toHaveText('55°C')
+    await expect(row.getByTestId('machine-root-disk')).toHaveText('40%')
+  })
+
+  await test.step('详情：接入状态、连接、版本、指标卡片', async () => {
+    await page.goto(`/admin/machines/${mid}`)
+    await expect(page.getByTestId('mdetail-enrolled')).toHaveText(`已接入 ${detail.machine.fingerprint_prefix}…`)
+    await expect(page.getByTestId('mdetail-connected')).toHaveText('已连接')
+    await expect(page.getByTestId('mdetail-agent-version')).toHaveText(detail.machine.agent_version)
+    await expect(page.getByTestId('mdetail-agent-version')).toHaveText('fake-0.1')
+    await expect(page.getByTestId('mdetail-metric-gpu')).toHaveText('12% · 55°C · 30W')
+    await expect(page.getByTestId('mdetail-metric-mem')).toHaveText('8.0 GiB / 128.0 GiB')
+    await expect(page.getByTestId('mdetail-metric-root')).toHaveText('40%')
+    await expect(page.getByTestId('mdetail-metric-data')).toHaveText('0 B')
+    await expect(page.getByTestId('mdetail-metric-load')).toHaveText('0.50')
+    await expect(page.getByTestId('mdetail-metric-at')).not.toHaveText('')
+    await expect(page.getByTestId('mdetail-metrics-none')).toHaveCount(0)
+    await page.goto(`/admin/machines/${bare.id}`)
+    await expect(page.getByTestId('mdetail-metrics-none')).toHaveText('尚未收到指标')
+    await expect(page.getByTestId('mdetail-metric-gpu')).toHaveCount(0)
+    await expect(page.getByTestId('mdetail-agent-version')).toHaveText('—')
+    await expect(page.getByTestId('mdetail-enrolled')).toHaveText('未接入')
   })
 })

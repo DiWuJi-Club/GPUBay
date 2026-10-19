@@ -1,4 +1,4 @@
-// Package e2ehooks 为 cmd/e2e-server 提供端到端测试钩子：推进假时钟、模拟 Agent、造数据、切换实名 mock。
+// Package e2ehooks 为 cmd/e2e-server 提供端到端测试钩子：推进假时钟、驱动步进式 fake Agent（经真实网关）、造数据、切换实名 mock。
 // 只被 cmd/e2e-server 引用，生产二进制不包含它。所有钩子用 app.App 暴露的服务实现，不复制业务逻辑。
 package e2ehooks
 
@@ -11,12 +11,18 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/agent/fakeagent"
+	"spark-cloud/internal/agent/metrics"
+	"spark-cloud/internal/agent/state"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/fleet"
@@ -31,11 +37,25 @@ const SeedPassword = "e2e-password-123456"
 var machineBatch atomic.Int64
 
 type Server struct {
-	App   *app.App
-	Pool  *pgxpool.Pool
-	Clock *clock.Fake
-	KYC   *SwitchableKYC
-	Log   *slog.Logger
+	App       *app.App
+	Pool      *pgxpool.Pool
+	Clock     *clock.Fake
+	KYC       *SwitchableKYC
+	Log       *slog.Logger
+	AgentAddr string // 真实网关监听地址；fake Agent 连到这里
+
+	mu     sync.Mutex
+	agents map[int64]*fakeagent.Agent
+}
+
+// Close 停掉全部 fake Agent。
+func (s *Server) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.agents {
+		a.Stop()
+	}
+	s.agents = nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -45,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/clock/advance", s.handle(s.advance))
 	mux.HandleFunc("POST /hooks/sweep", s.handle(s.sweep))
 	mux.HandleFunc("POST /hooks/agent", s.handle(s.agent))
+	mux.HandleFunc("GET /hooks/agent/status", s.agentStatus)
 	mux.HandleFunc("POST /hooks/machines", s.handle(s.machines))
 	mux.HandleFunc("POST /hooks/users", s.handle(s.users))
 	mux.HandleFunc("POST /hooks/admins", s.handle(s.admins))
@@ -123,37 +144,109 @@ func (s *Server) advance(_ context.Context, body json.RawMessage) (any, error) {
 	return map[string]any{"now": s.Clock.Now()}, nil
 }
 
-func (s *Server) machineIDs(ctx context.Context) ([]int64, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id FROM machines ORDER BY id`)
+const hookWait = 10 * time.Second
+
+var fakeMetrics = metrics.Metrics{GPUUtil: 12, GPUTempC: 55, GPUPowerW: 30, MemTotal: 128 << 30, MemUsed: 8 << 30, RootDiskTotal: 4000 << 30, RootDiskUsed: 1600 << 30, Load1: 0.5}
+
+// agentFor 返回机器的步进式 fake Agent；没有（或机器已被撤销接入）时签发令牌、接入、建流并等首个 StateReport 被处理。
+func (s *Server) agentFor(ctx context.Context, machineID int64) (*fakeagent.Agent, error) {
+	m, err := s.App.Fleet.Get(ctx, s.Pool, machineID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
+	s.mu.Lock()
+	if s.agents == nil {
+		s.agents = map[int64]*fakeagent.Agent{}
 	}
-	return ids, rows.Err()
+	ag, ok := s.agents[machineID]
+	s.mu.Unlock()
+	if ok && m.Enrolled {
+		return ag, nil
+	}
+	if ok {
+		ag.Stop()
+	}
+	tok, err := s.App.Fleet.IssueEnrollToken(ctx, audit.Actor{}, machineID)
+	if err != nil {
+		return nil, err
+	}
+	ag, err = fakeagent.Start(ctx, fakeagent.Options{Addr: s.AgentAddr, CAPEM: s.App.Gateway.CAPEM(), Token: tok.Plain, Stepped: true,
+		IPs: []string{m.LanIP}, Metrics: fakeMetrics, Log: s.Log})
+	if err != nil {
+		return nil, fmt.Errorf("fake agent for machine %d: %w", machineID, err)
+	}
+	s.mu.Lock()
+	s.agents[machineID] = ag
+	s.mu.Unlock()
+	if err := s.waitUntil(ctx, "first state report", func() bool { return s.App.Gateway.ReportCount(machineID) >= 1 }); err != nil {
+		return nil, err
+	}
+	return ag, nil
 }
 
+func (s *Server) agentIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]int64, 0, len(s.agents))
+	for id := range s.agents {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func (s *Server) waitUntil(ctx context.Context, what string, cond func() bool) error {
+	deadline := time.Now().Add(hookWait)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("timeout waiting for %s", what)
+}
+
+// heartbeatAll 让每个仍连着的 fake Agent 发一次心跳并等网关处理完（心跳走真实流，但由钩子触发，假时钟保持确定）。
+// 整轮 Playwright 下来进程里会累积几百个 fake Agent：先并发发送、再统一等计数增加，避免串行几百次往返。
 func (s *Server) heartbeatAll(ctx context.Context) error {
-	ids, err := s.machineIDs(ctx)
-	if err != nil {
+	ids := s.agentIDs()
+	before := make(map[int64]int64, len(ids))
+	var wg sync.WaitGroup
+	errs := make(chan error, len(ids))
+	for _, id := range ids {
+		s.mu.Lock()
+		ag := s.agents[id]
+		s.mu.Unlock()
+		if ag == nil || !ag.Client.Connected() { // 被撤销接入的 Agent 不再心跳
+			continue
+		}
+		before[id] = s.App.Gateway.HeartbeatCount(id)
+		wg.Add(1)
+		go func(id int64) {
+			defer wg.Done()
+			if err := ag.Client.SendHeartbeat(ctx); err != nil {
+				errs <- fmt.Errorf("heartbeat %d: %w", id, err)
+			}
+		}(id)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
 		return err
 	}
-	for _, id := range ids {
-		if _, err := s.App.Fleet.Heartbeat(ctx, id); err != nil {
-			return fmt.Errorf("heartbeat %d: %w", id, err)
+	for id, n := range before {
+		if err := s.waitUntil(ctx, fmt.Sprintf("heartbeat %d", id), func() bool { return s.App.Gateway.HeartbeatCount(id) > n }); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// sweep 先对全部机器心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep。
+// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep。
 // Rental.Sweep 先做离线检测与暂停、再做到期停机，而到期停机只处理未暂停的实例：推进 24 小时后不心跳直接清扫，
 // 机器会被判失联、实例被暂停而永远不会停机。
 func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
@@ -177,7 +270,7 @@ func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 	return map[string]bool{"ok": true}, nil
 }
 
-// agent 模拟 Agent：对指定机器（缺省全部）心跳，并把全部待处理指令按成功 / 失败回报。
+// agent 让步进式 fake Agent 执行当前队列：先等网关把 pending 指令投递到 Agent，再执行并上报，最后等网关处理完本次报告。
 func (s *Server) agent(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := decode[struct {
 		MachineID *int64 `json:"machine_id"`
@@ -187,49 +280,88 @@ func (s *Server) agent(ctx context.Context, body json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	ids := []int64{}
+	var ids []int64
 	if req.MachineID != nil {
-		ids = append(ids, *req.MachineID)
-	} else if ids, err = s.machineIDs(ctx); err != nil {
-		return nil, err
+		ids = []int64{*req.MachineID}
+	} else {
+		ids = s.agentIDs()
 	}
-	result := req.Result
-	if result == "" {
-		if req.Fail {
-			result = "e2e: simulated failure"
-		} else {
-			result = "ok"
+	var override *state.Result
+	if req.Fail {
+		msg := req.Result
+		if msg == "" {
+			msg = "e2e: simulated failure"
 		}
+		override = &state.Result{OK: false, Message: msg}
 	}
 	completed := 0
 	for _, mid := range ids {
-		if _, err := s.App.Fleet.Heartbeat(ctx, mid); err != nil {
-			return nil, fmt.Errorf("heartbeat %d: %w", mid, err)
-		}
-		cmds, err := s.App.Fleet.PendingCommands(ctx, mid)
+		ag, err := s.agentFor(ctx, mid)
 		if err != nil {
 			return nil, err
 		}
-		for _, c := range cmds {
-			if err := s.App.Rental.HandleCommandResult(ctx, c.ID, !req.Fail, result); err != nil {
-				return nil, fmt.Errorf("command %s (%s): %w", c.ID, c.Type, err)
+		if err := s.waitUntil(ctx, fmt.Sprintf("delivery to machine %d", mid), func() bool {
+			cmds, err := s.App.Fleet.PendingCommands(ctx, mid)
+			if err != nil {
+				return false
 			}
-			completed++
+			for _, c := range cmds {
+				if c.Status != "sent" || !ag.Client.Received(c.ID) {
+					return false
+				}
+			}
+			return true
+		}); err != nil {
+			return nil, err
 		}
+		before := s.App.Gateway.ReportCount(mid)
+		n, err := ag.Client.Step(ctx, override)
+		if err != nil {
+			return nil, fmt.Errorf("step machine %d: %w", mid, err)
+		}
+		if err := s.waitUntil(ctx, fmt.Sprintf("report of machine %d", mid), func() bool { return s.App.Gateway.ReportCount(mid) > before }); err != nil {
+			return nil, err
+		}
+		completed += n
 	}
 	return map[string]int{"completed": completed}, nil
+}
+
+// agentStatus 报告 fake Agent 是否仍连着；机器已被撤销接入时顺手停掉它的 Agent（否则它会以 ≤1s 退避无限重试 Unauthenticated 刷日志）。
+func (s *Server) agentStatus(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.URL.Query().Get("machine_id"), 10, 64)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "machine_id 不正确"})
+		return
+	}
+	s.mu.Lock()
+	ag := s.agents[id]
+	s.mu.Unlock()
+	if m, err := s.App.Fleet.Get(r.Context(), s.Pool, id); err == nil && !m.Enrolled && ag != nil {
+		ag.Stop()
+		s.mu.Lock()
+		delete(s.agents, id)
+		s.mu.Unlock()
+		ag = nil
+	}
+	connected := ag != nil && ag.Client.Connected() && s.App.Gateway.Connected(id)
+	writeJSON(w, 200, map[string]any{"connected": connected})
 }
 
 func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := decode[struct {
 		Count        int    `json:"count"`
 		SerialPrefix string `json:"serial_prefix"`
+		Rack         string `json:"rack"`
 	}](body)
 	if err != nil {
 		return nil, err
 	}
 	if req.Count <= 0 || req.Count > 50 {
 		return nil, badRequest("count 必须在 1～50 之间")
+	}
+	if req.Rack == "" {
+		req.Rack = "E2E"
 	}
 	prefix := req.SerialPrefix
 	if prefix == "" {
@@ -242,7 +374,7 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 	}
 	ids := make([]int64, 0, req.Count)
 	for i := 1; i <= req.Count; i++ {
-		m, err := s.App.Fleet.Register(ctx, fleet.NewMachine{Serial: fmt.Sprintf("%s%d", prefix, i), Rack: "E2E", Slot: fmt.Sprint(i),
+		m, err := s.App.Fleet.Register(ctx, fleet.NewMachine{Serial: fmt.Sprintf("%s%d", prefix, i), Rack: req.Rack, Slot: fmt.Sprint(i),
 			LanIP: fmt.Sprintf("10.99.%d.%d", (len(ids)/250)%250, len(ids)%250+1), ProductID: pid})
 		if err != nil {
 			return nil, err
@@ -251,7 +383,7 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 		if err := s.App.Fleet.SetMaintenance(ctx, m.ID, false); err != nil {
 			return nil, err
 		}
-		if _, err := s.App.Fleet.Heartbeat(ctx, m.ID); err != nil {
+		if _, err := s.agentFor(ctx, m.ID); err != nil { // 真实接入并建流（首个 StateReport 处理完才返回）
 			return nil, err
 		}
 		ids = append(ids, m.ID)

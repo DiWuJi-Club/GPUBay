@@ -6,6 +6,7 @@ import { useRouter } from 'vue-router'
 import { api } from '../api'
 import { usePaged } from '../composables/usePaged'
 import { downloadText, importBody, readCSVFile, templateCSV } from '../logic/csv'
+import { fmtTemp, rootUsage } from '../logic/metrics'
 import { notifyError } from '../logic/notify'
 
 const router = useRouter()
@@ -156,6 +157,8 @@ async function doImport() {
           <span data-testid="machine-online" :data-online="String(row.agent_online)"><i class="dot" :class="row.agent_online ? 'on' : 'off'" />{{ row.agent_online ? '在线' : '离线' }} <small class="muted">{{ fmtTime(row.last_seen_at) || '从未心跳' }}</small></span>
         </template>
       </el-table-column>
+      <el-table-column label="GPU 温度" width="100"><template #default="{ row }"><span data-testid="machine-gpu-temp">{{ fmtTemp(row.last_metrics) }}</span></template></el-table-column>
+      <el-table-column label="根分区" width="90"><template #default="{ row }"><span data-testid="machine-root-disk">{{ rootUsage(row.last_metrics) }}</span></template></el-table-column>
       <el-table-column label="PDU" width="180"><template #default="{ row }"><span data-testid="machine-pdu">{{ row.pdu_id ? `${pduName.get(row.pdu_id) ?? row.pdu_id} #${row.pdu_outlet}` : '—' }}</span></template></el-table-column>
     </el-table>
     <div class="pager-row">

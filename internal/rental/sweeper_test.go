@@ -149,7 +149,7 @@ func TestOfflineMachinePausesLeaseAndResumes(t *testing.T) {
 	if err != nil || !came {
 		t.Fatalf("heartbeat came=%v err=%v", came, err)
 	}
-	n, err := e.svc.ResumeMachine(e.ctx, e.machines[0])
+	n, err := e.svc.ResumeMachine(e.ctx, e.machines[0], []string{inst.ID})
 	mustCount(t, n, err, 1, "resumed")
 	got = e.get(inst.ID)
 	if got.Suspended() || got.ExpiresAt == nil || !got.ExpiresAt.Equal(e.clock.Now().Add(frozen)) {
@@ -254,12 +254,201 @@ func TestSweepResumesOnlineSuspended(t *testing.T) {
 	mustCount(t, n, err, 1, "suspended")
 	e.clock.Advance(2 * time.Hour)
 	e.heartbeatAll()
+	// 没有 StateReport：清扫器不恢复（不知道容器是否正常）
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("resumed without state report: %+v", got)
+	}
+	e.reportRunning(e.machines[0], inst.ID)
 	if err := e.svc.Sweep(e.ctx); err != nil {
 		t.Fatal(err)
 	}
 	got := e.get(inst.ID)
 	if got.Suspended() || got.ExpiresAt == nil || !got.ExpiresAt.Equal(e.clock.Now().Add(frozen)) {
 		t.Fatalf("after sweep = %+v", got)
+	}
+}
+
+// 容器不在（报告为空）→ 保持暂停并告警一次；第二次报告变 running 才恢复。
+func TestResumeMachineKeepsPausedWhenContainerDown(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(time.Hour)
+	mustCount(t, firstOf(e.svc.SuspendMachines(e.ctx, e.machines)), nil, 1, "suspended")
+	for i := 0; i < 2; i++ {
+		n, err := e.svc.ResumeMachine(e.ctx, e.machines[0], nil)
+		mustCount(t, n, err, 0, "resumed with container down")
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("must stay suspended: %+v", got)
+	}
+	var alerts int
+	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM alerts WHERE kind = 'container_down' AND instance_id = $1 AND message = $2`,
+		inst.ID, rental.AlertContainerDown("SN000", inst.ID)).Scan(&alerts)
+	if alerts != 1 {
+		t.Fatalf("container_down alerts = %d, want exactly 1", alerts)
+	}
+	n, err := e.svc.ResumeMachine(e.ctx, e.machines[0], []string{"ins-other000", inst.ID})
+	mustCount(t, n, err, 1, "resumed when running")
+	if got := e.get(inst.ID); got.Suspended() {
+		t.Fatalf("not resumed: %+v", got)
+	}
+}
+
+// 清扫器兜底：用 last_state_report 里 running 的实例列表恢复；报告里没有的保持暂停并告警。
+func TestSweepResumeUsesLastStateReport(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(time.Hour)
+	mustCount(t, firstOf(e.svc.SuspendMachines(e.ctx, e.machines)), nil, 1, "suspended")
+	e.heartbeatAll()
+	if err := e.fleet.AttachAgentConn(e.ctx, e.machines[0], "c1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.fleet.RecordStateReport(e.ctx, e.machines[0], fleet.StateReport{Instances: []fleet.InstanceState{{InstanceID: inst.ID, Phase: fleet.PhaseStopped}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("stopped container must not resume: %+v", got)
+	}
+	var alerts int
+	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM alerts WHERE kind = 'container_down'`).Scan(&alerts)
+	if alerts != 1 {
+		t.Fatalf("container_down alerts = %d", alerts)
+	}
+	e.reportRunning(e.machines[0], inst.ID)
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); got.Suspended() {
+		t.Fatalf("not resumed: %+v", got)
+	}
+}
+
+func TestFailTimedOutCommands(t *testing.T) {
+	e := newEnv(t, 2)
+	_, inst := e.place(catalog.D1d)
+	if err := e.fleet.AttachAgentConn(e.ctx, e.machines[0], "c1"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := e.fleet.ClaimPending(e.ctx, []string{"c1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim = %+v, %v", claimed, err)
+	}
+	e.clock.Advance(rental.CreateCommandTimeout - time.Second)
+	e.heartbeatAll()
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 0, "before timeout")
+	e.clock.Advance(time.Second)
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 1, "at timeout")
+	got := e.get(inst.ID)
+	if got.State != rental.StateFailed || e.balance(e.userID) != startFunds || e.machineState(e.machines[0]) != fleet.StateFaulty {
+		t.Fatalf("after timeout: state=%s balance=%d machine=%s", got.State, e.balance(e.userID), e.machineState(e.machines[0]))
+	}
+	cmds, _ := e.fleet.CommandsForInstance(e.ctx, inst.ID, 10)
+	if cmds[0].Status != "failed" || cmds[0].Result != "timeout after 15m0s" {
+		t.Fatalf("command = %+v", cmds[0])
+	}
+	var reason string
+	_ = e.pool.QueryRow(e.ctx, `SELECT reason FROM instance_events WHERE instance_id = $1 AND to_state = 'failed'`, inst.ID).Scan(&reason)
+	if reason != "开通失败: timeout after 15m0s" {
+		t.Fatalf("event reason = %q", reason)
+	}
+
+	// 离线机器的 sent 指令不计时；stop 超时 5 分钟 → stop_failed 告警
+	_, inst2 := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(24 * time.Hour)
+	e.heartbeatAll()
+	mustCount(t, firstOf(e.svc.ExpireDue(e.ctx)), nil, 1, "expired")
+	_ = e.fleet.AttachAgentConn(e.ctx, e.machines[1], "c2")
+	if claimed, _ := e.fleet.ClaimPending(e.ctx, []string{"c2"}); len(claimed) != 1 || claimed[0].Type != fleet.CmdStopInstance {
+		t.Fatalf("claimed stop = %+v", claimed)
+	}
+	e.clock.Advance(rental.StopCommandTimeout + time.Minute)
+	if _, err := e.fleet.MarkOfflineStale(e.ctx, rental.OfflineTimeout); err != nil {
+		t.Fatal(err)
+	}
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 0, "offline machine must not time out")
+	e.heartbeatAll()
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 1, "stop timed out once online")
+	var alerts int
+	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM alerts WHERE kind = 'stop_failed' AND instance_id = $1`, inst2.ID).Scan(&alerts)
+	if alerts != 1 || e.get(inst2.ID).State != rental.StateStopped {
+		t.Fatalf("stop timeout: alerts=%d state=%s", alerts, e.get(inst2.ID).State)
+	}
+	if got := rental.CommandTimeout(fleet.CmdWipeInstance); got != 30*time.Minute {
+		t.Fatalf("wipe timeout = %v", got)
+	}
+	if got := rental.CommandTimeout(fleet.CmdPullImage); got != 60*time.Minute {
+		t.Fatalf("pull timeout = %v", got)
+	}
+}
+
+// 指令 sent 后机器离线超过超时时长再重连：重连（AttachAgentConn）重启超时计时，补推之前清扫不得判超时（规格 §3.1.5）。
+func TestReconnectRestartsCommandTimeout(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	if err := e.fleet.AttachAgentConn(e.ctx, e.machines[0], "c1"); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := e.fleet.ClaimPending(e.ctx, []string{"c1"}); err != nil || len(claimed) != 1 {
+		t.Fatalf("claim = %+v, %v", claimed, err)
+	}
+	e.clock.Advance(rental.CreateCommandTimeout + time.Hour)
+	if _, err := e.fleet.MarkOfflineStale(e.ctx, rental.OfflineTimeout); err != nil {
+		t.Fatal(err)
+	}
+	// 重连：先登记归属，再心跳上线（与网关 Connect 顺序一致），补推尚未发生
+	if err := e.fleet.AttachAgentConn(e.ctx, e.machines[0], "c2"); err != nil {
+		t.Fatal(err)
+	}
+	e.heartbeatAll()
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 0, "reconnect window")
+	e.clock.Advance(rental.CreateCommandTimeout - time.Second)
+	e.heartbeatAll()
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 0, "before timeout counted from reconnect")
+	e.clock.Advance(time.Second)
+	mustCount(t, firstOf(e.svc.FailTimedOutCommands(e.ctx)), nil, 1, "timeout counted from reconnect")
+	if got := e.get(inst.ID); got.State != rental.StateFailed {
+		t.Fatalf("state = %s", got.State)
+	}
+}
+
+// 流在离线期间没断（未重连）：离线前的 StateReport 不能被清扫器用来恢复计时。
+func TestSweepDoesNotResumeFromPreOfflineReport(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.reportRunning(e.machines[0], inst.ID)
+	e.clock.Advance(rental.OfflineTimeout + time.Minute)
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("must be suspended while offline: %+v", got)
+	}
+	e.heartbeatAll() // 同一条流恢复心跳，尚未发来新的 StateReport
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("resumed from a pre-offline report: %+v", got)
+	}
+	if err := e.fleet.RecordStateReport(e.ctx, e.machines[0], fleet.StateReport{Instances: []fleet.InstanceState{{InstanceID: inst.ID, Phase: fleet.PhaseRunning}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); got.Suspended() {
+		t.Fatalf("fresh report must resume: %+v", got)
 	}
 }
 
@@ -277,7 +466,7 @@ func TestRenewWhileSuspendedResetsReminders(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.heartbeatAll()
-	n, err = e.svc.ResumeMachine(e.ctx, e.machines[0])
+	n, err = e.svc.ResumeMachine(e.ctx, e.machines[0], []string{inst.ID})
 	mustCount(t, n, err, 1, "resumed")
 	got := e.get(inst.ID)
 	if want := e.clock.Now().Add(30*24*time.Hour + time.Hour); !got.ExpiresAt.Equal(want) {

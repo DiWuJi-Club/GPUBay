@@ -3,6 +3,7 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"strings"
@@ -36,6 +37,16 @@ type Machine struct {
 	PDUID       *int64     `json:"pdu_id"`
 	PDUOutlet   *int       `json:"pdu_outlet"`
 	CreatedAt   time.Time  `json:"created_at"`
+
+	// 计划 2：Agent 接入与连接状态。指纹全文不输出，只给前 16 位。
+	CertFingerprint   string          `json:"-"`
+	Enrolled          bool            `json:"enrolled"`
+	FingerprintPrefix string          `json:"fingerprint_prefix"`
+	Connected         bool            `json:"connected"`
+	AgentVersion      string          `json:"agent_version"`
+	AgentConnectedAt  *time.Time      `json:"agent_connected_at"`
+	StateReportedAt   *time.Time      `json:"state_reported_at"`
+	LastMetrics       json.RawMessage `json:"last_metrics"`
 }
 
 type NewMachine struct {
@@ -58,14 +69,25 @@ func NewService(pool *pgxpool.Pool, clk clock.Clock) *Service {
 	return &Service{pool: pool, clock: clk}
 }
 
-const machineCols = `id, serial, rack, slot, lan_ip, product_id, state, agent_online, last_seen_at, pdu_id, pdu_outlet, created_at`
+const machineCols = `id, serial, rack, slot, lan_ip, product_id, state, agent_online, last_seen_at, pdu_id, pdu_outlet, created_at,
+	cert_fingerprint, agent_conn_id, agent_version, agent_connected_at, state_reported_at, last_metrics`
 
 func scanMachine(row pgx.Row) (Machine, error) {
 	var m Machine
+	var connID *string
+	var metrics []byte
 	err := row.Scan(&m.ID, &m.Serial, &m.Rack, &m.Slot, &m.LanIP, &m.ProductID, &m.State, &m.AgentOnline, &m.LastSeenAt,
-		&m.PDUID, &m.PDUOutlet, &m.CreatedAt)
+		&m.PDUID, &m.PDUOutlet, &m.CreatedAt, &m.CertFingerprint, &connID, &m.AgentVersion, &m.AgentConnectedAt, &m.StateReportedAt, &metrics)
 	if db.IsNoRows(err) {
 		return Machine{}, apperr.ErrNotFound
+	}
+	m.Enrolled = m.CertFingerprint != ""
+	if len(m.CertFingerprint) >= 16 {
+		m.FingerprintPrefix = m.CertFingerprint[:16]
+	}
+	m.Connected = connID != nil
+	if metrics != nil {
+		m.LastMetrics = json.RawMessage(metrics)
 	}
 	return m, err
 }
@@ -191,9 +213,10 @@ func (s *Service) Heartbeat(ctx context.Context, machineID int64) (bool, error) 
 }
 
 // MarkOfflineStale 把超过 timeout 没有心跳的在线机器标记为离线，返回这些机器的 ID。
+// 同时清空 state_reported_at：流若撑过了离线期（未重连），清扫器不能拿离线前的报告恢复计时，须等新的 StateReport。
 func (s *Service) MarkOfflineStale(ctx context.Context, timeout time.Duration) ([]int64, error) {
 	now := s.clock.Now()
-	rows, err := s.pool.Query(ctx, `UPDATE machines SET agent_online = false, updated_at = $1
+	rows, err := s.pool.Query(ctx, `UPDATE machines SET agent_online = false, state_reported_at = NULL, updated_at = $1
 		WHERE agent_online AND (last_seen_at IS NULL OR last_seen_at < $2) RETURNING id`, now, now.Add(-timeout))
 	if err != nil {
 		return nil, err

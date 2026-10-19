@@ -27,6 +27,7 @@ var expectedRoutes = []struct {
 
 	{"GET", "/machines", ops}, {"POST", "/machines", ops}, {"POST", "/machines/import", ops}, {"GET", "/machines/{id}", ops},
 	{"POST", "/machines/{id}/maintenance", ops}, {"POST", "/machines/{id}/power-cycle", ops},
+	{"POST", "/machines/{id}/enroll-command", ops}, {"POST", "/machines/{id}/revoke-enrollment", ops},
 	{"GET", "/pdus", ops}, {"POST", "/pdus", ops}, {"PUT", "/pdus/{id}", ops},
 	{"GET", "/alerts", all}, {"POST", "/alerts/{id}/resolve", all},
 

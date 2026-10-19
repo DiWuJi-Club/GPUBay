@@ -1,9 +1,13 @@
 package adminapi_test
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/dbtest"
 )
 
@@ -77,5 +81,57 @@ func TestAuditEndpoint(t *testing.T) {
 	}
 	if code, out := fin.do("POST", "/images", map[string]any{"name": "x", "ref": "r", "enabled": true, "sort": 1}); code != 403 || codeOf(out) != "forbidden" {
 		t.Fatalf("finance create image = %d %v, want forbidden", code, out)
+	}
+}
+
+func TestImageEnableBroadcastsPull(t *testing.T) {
+	e := newEnv(t)
+	root := e.loginAs("root", admin.RoleSuper)
+	online := e.machine("SN-ON")
+	off := e.machine("SN-OFF")
+	_, _ = e.pool.Exec(e.ctx, `UPDATE machines SET agent_online = false WHERE id = $1`, off)
+	code, out := root.do("POST", "/images", map[string]any{"name": "cuda", "ref": "nvcr.io/x/cuda:13", "enabled": true, "sort": 1})
+	if code != 201 {
+		t.Fatalf("create = %d %v", code, out)
+	}
+	cmds, err := e.fleet.PendingCommands(e.ctx, online)
+	if err != nil || len(cmds) != 1 || cmds[0].Type != fleet.CmdPullImage || !strings.Contains(string(cmds[0].Payload), "nvcr.io/x/cuda:13") {
+		t.Fatalf("pull = %+v", cmds)
+	}
+	if cmds, err := e.fleet.PendingCommands(e.ctx, off); err != nil || len(cmds) != 0 {
+		t.Fatal("offline machine got pull")
+	}
+	id := int64(out["id"].(float64))
+	// 停用不广播；再启用广播
+	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda", "ref": "nvcr.io/x/cuda:13", "enabled": false, "sort": 1}); code != 200 {
+		t.Fatal(code)
+	}
+	if cmds, err := e.fleet.PendingCommands(e.ctx, online); err != nil || len(cmds) != 1 {
+		t.Fatalf("disable broadcast: %+v %v", cmds, err)
+	}
+	// 重新启用（false→true）广播；随后无变化的 PUT 不再广播
+	e.clk.Advance(time.Second) // 命令按 created_at, uuid 排序；固定时钟下同刻并列会乱序
+	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda", "ref": "nvcr.io/x/cuda:13", "enabled": true, "sort": 1}); code != 200 {
+		t.Fatal(code)
+	}
+	cmds, err = e.fleet.PendingCommands(e.ctx, online)
+	if err != nil || len(cmds) != 2 || !strings.Contains(string(cmds[1].Payload), "cuda:13") {
+		t.Fatalf("re-enable broadcast: %+v %v", cmds, err)
+	}
+	// 启用状态下只改名称：不广播
+	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda2", "ref": "nvcr.io/x/cuda:13", "enabled": true, "sort": 2}); code != 200 {
+		t.Fatal(code)
+	}
+	if cmds, err := e.fleet.PendingCommands(e.ctx, online); err != nil || len(cmds) != 2 {
+		t.Fatalf("unchanged PUT broadcast: %+v %v", cmds, err)
+	}
+	// 启用状态下改 ref：广播新 ref
+	e.clk.Advance(time.Second)
+	if code, _ := root.do("PUT", fmt.Sprintf("/images/%d", id), map[string]any{"name": "cuda2", "ref": "nvcr.io/x/cuda:14", "enabled": true, "sort": 2}); code != 200 {
+		t.Fatal(code)
+	}
+	cmds, err = e.fleet.PendingCommands(e.ctx, online)
+	if err != nil || len(cmds) != 3 || !strings.Contains(string(cmds[2].Payload), "cuda:14") {
+		t.Fatalf("ref change broadcast: %+v %v", cmds, err)
 	}
 }

@@ -125,3 +125,38 @@ func TestConcurrentAckAndReleaseDoNotDeadlock(t *testing.T) {
 		}
 	}
 }
+
+func TestOrphanWipeFailureRaisesAlert(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	if err := e.svc.Release(e.ctx, e.userID, inst.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.ack(true) // 洗机完成 → released
+	if got := e.get(inst.ID); got.State != rental.StateReleased {
+		t.Fatalf("state = %s", got.State)
+	}
+	// 对账对已释放实例入队的孤儿清理失败 → orphan_wipe_failed，且机器不转 faulty
+	id, _ := e.fleet.Enqueue(e.ctx, e.pool, e.machines[0], inst.ID, fleet.CmdWipeInstance, nil)
+	if err := e.svc.HandleCommandResult(e.ctx, id, false, "rm failed"); err != nil {
+		t.Fatal(err)
+	}
+	id2, _ := e.fleet.Enqueue(e.ctx, e.pool, e.machines[0], inst.ID, fleet.CmdWipeInstance, nil)
+	if err := e.svc.HandleCommandResult(e.ctx, id2, false, "rm failed again"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM alerts WHERE kind = 'orphan_wipe_failed' AND message = $1`, rental.AlertOrphanWipeFailed("SN000", inst.ID)).Scan(&n)
+	if n != 1 || e.machineState(e.machines[0]) != fleet.StateIdle {
+		t.Fatalf("orphan alert = %d machine = %s", n, e.machineState(e.machines[0]))
+	}
+	// 平台从未见过的实例 ID 也能回报，不报错
+	id3, _ := e.fleet.Enqueue(e.ctx, e.pool, e.machines[0], "ins-zzzzzzzz", fleet.CmdWipeInstance, nil)
+	if err := e.svc.HandleCommandResult(e.ctx, id3, true, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if cmds, _ := e.fleet.CommandsForInstance(e.ctx, "ins-zzzzzzzz", 1); cmds[0].Status != "done" {
+		t.Fatalf("unknown instance wipe = %+v", cmds)
+	}
+}

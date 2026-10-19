@@ -38,6 +38,9 @@ func main() {
 
 // adminMain 执行 `platform admin ...`：使用与服务相同的配置连接数据库（会先执行迁移）。
 func adminMain(args []string) error {
+	if len(args) > 0 && args[0] == "gen-upstream-key" { // 不需要数据库
+		return runAdmin(context.Background(), nil, args, os.Stdout, nil)
+	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		return err
@@ -99,16 +102,27 @@ func run(log *slog.Logger) error {
 		log.Info("admin api listening", "addr", cfg.AdminAddr)
 		serverErr <- adminSrv.ListenAndServe()
 	}()
+	gatewayErr := make(chan error, 1)
+	go func() { // Serve 内含投递循环与每日服务端证书轮换检查，随 ctx 结束
+		log.Info("agent gateway listening", "addr", cfg.AgentAddr, "hosts", cfg.AgentHosts)
+		gatewayErr <- a.Gateway.ListenAndServe(ctx, cfg.AgentAddr)
+	}()
 
 	var runErr error
+	gatewayExited := false
 	select {
 	case <-ctx.Done():
 	case err := <-serverErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			runErr = err
 		}
+	case err := <-gatewayErr:
+		gatewayExited = true
+		if err != nil {
+			runErr = err
+		}
 	}
-	stop() // 确保清扫器退出
+	stop() // 确保清扫器与网关退出
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, s := range []*http.Server{srv, adminSrv} {
@@ -117,6 +131,11 @@ func run(log *slog.Logger) error {
 		}
 	}
 	<-sweeperDone
+	if !gatewayExited { // 等网关的 Serve 随 ctx 返回（断开所有流、停止 gRPC）
+		if err := <-gatewayErr; err != nil && runErr == nil {
+			runErr = err
+		}
+	}
 	return runErr
 }
 

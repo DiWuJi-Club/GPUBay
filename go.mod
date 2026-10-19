@@ -15,6 +15,8 @@ require (
 	github.com/wechatpay-apiv3/wechatpay-go v0.2.21
 	golang.org/x/crypto v0.58.0
 	golang.org/x/term v0.47.0
+	google.golang.org/grpc v1.84.0
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
@@ -28,8 +30,10 @@ require (
 	github.com/smartwalle/ngx v1.1.2 // indirect
 	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
+	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261005182115-fad411399dd8 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )

@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/agentgw"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
@@ -43,6 +44,7 @@ type Server struct {
 	Rental       *rental.Service
 	Billing      *billing.Service
 	Uploads      *storage.Service
+	Gateway      *agentgw.Server // 机器接入命令与撤销（计划 2）
 	Clock        clock.Clock
 	Log          *slog.Logger
 	SecureCookie bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送

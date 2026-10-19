@@ -23,6 +23,9 @@ export const alertLevelLabel: LabelMap = { warning: '警告', critical: '严重'
 export const alertKindLabel: LabelMap = {
   machine_offline: '机器失联', create_failed: '开通失败', start_failed: '启动失败', stop_failed: '停机失败',
   wipe_failed: '洗机失败', recharge_amount_mismatch: '支付金额不符', recharge_paid_after_close: '关单后到账',
+  lan_ip_mismatch: '内网 IP 不一致', container_down: '容器未运行', container_missing: '容器不存在', data_disk_missing: '数据盘未挂载',
+  orphan_container: '残留容器', orphan_wipe_failed: '残留容器清理失败', root_disk_high: '根分区空间不足', gpu_temp_high: 'GPU 温度过高',
+  invalid_report: '上报数据异常',
 }
 export const roleLabel: LabelMap = { super: '超级管理员', ops: '运维', finance: '财务' }
 export const adminStatusLabel: LabelMap = { active: '正常', disabled: '已停用' }
@@ -32,14 +35,14 @@ export const kycStatusLabel: LabelMap = { none: '未认证', pending: '审核中
 export const kycResultLabel: LabelMap = { pending: '审核中', verified: '已通过', rejected: '未通过', error: '核验出错' }
 export const durationLabel: LabelMap = { '1d': '1 天', '1w': '1 周', '1m': '1 月' }
 export const commandTypeLabel: LabelMap = {
-  create_instance: '开通实例', start_instance: '启动实例', stop_instance: '停止实例', wipe_instance: '洗机',
+  create_instance: '开通实例', start_instance: '启动实例', stop_instance: '停止实例', wipe_instance: '洗机', pull_image: '预拉取镜像',
 }
 export const commandStatusLabel: LabelMap = { pending: '待执行', sent: '已下发', done: '已完成', failed: '失败' }
 
 /** 后台审计动作（与后端写入值一致，顺序按模块）。 */
 export const auditActions: readonly string[] = [
   'admin.create', 'admin.update', 'admin.reset_totp', 'admin.login', 'admin.login_recovery_code', 'admin.totp_bind', 'admin.password_change',
-  'machine.register', 'machine.import', 'machine.maintenance', 'machine.power_cycle',
+  'machine.register', 'machine.import', 'machine.maintenance', 'machine.power_cycle', 'machine.enroll_token', 'machine.enrolled', 'machine.revoke_enrollment',
   'pdu.create', 'pdu.update',
   'alert.resolve',
   'instance.extend', 'instance.migrate', 'instance.rewipe', 'instance.refund_release',

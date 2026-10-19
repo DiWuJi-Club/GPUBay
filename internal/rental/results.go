@@ -10,6 +10,7 @@ import (
 
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/wallet"
 )
@@ -24,7 +25,8 @@ func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok 
 		}
 		var inst Instance
 		if instanceID != "" {
-			if inst, err = lockInstance(ctx, tx, instanceID); err != nil {
+			inst, err = lockInstance(ctx, tx, instanceID)
+			if err != nil && !errors.Is(err, apperr.ErrNotFound) { // 孤儿清理的实例可能从未在平台登记
 				return err
 			}
 		}
@@ -60,8 +62,19 @@ func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok 
 					MachineID: inst.MachineID, InstanceID: inst.ID, Message: result})
 			}
 		case fleet.CmdWipeInstance:
-			if inst.State != StateWiping {
-				return nil
+			// 非 wiping，或者指令不在实例所属机器上（别的机器上报了该实例的容器）：都是孤儿清理，
+			// 不改实例状态、不释放机器——否则原机器没洗就会被放给下一个租户。
+			if inst.State != StateWiping || cmd.MachineID != inst.MachineID {
+				if ok {
+					return nil
+				}
+				m, err := s.d.Fleet.Get(ctx, tx, cmd.MachineID)
+				if err != nil {
+					return err
+				}
+				// 对账入队的孤儿清理失败：机器上留着别人的容器与数据盘，必须让运维知道
+				return s.d.Fleet.RaiseAlertOnce(ctx, tx, fleet.Alert{Level: "critical", Kind: "orphan_wipe_failed",
+					MachineID: cmd.MachineID, InstanceID: cmd.InstanceID, Message: AlertOrphanWipeFailed(m.Serial, cmd.InstanceID)})
 			}
 			if !ok {
 				if err := s.d.Fleet.MarkFaulty(ctx, tx, inst.MachineID); err != nil {

@@ -1,11 +1,17 @@
 package adminapi_test
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/adminapi"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/dbtest"
 )
 
@@ -135,5 +141,84 @@ func TestAlertsEndpoints(t *testing.T) {
 	}
 	if code, out := fin.do("GET", "/alerts?resolved=true", nil); code != 200 || out["total"].(float64) != 1 {
 		t.Fatalf("resolved alerts = %d %v", code, out)
+	}
+}
+
+func TestEnrollCommandAndRevoke(t *testing.T) {
+	e := newEnv(t)
+	ops := e.loginAs("ops", admin.RoleOps)
+	mid := e.machine("SN-ENR")
+	path := fmt.Sprintf("/machines/%d/enroll-command", mid)
+	if code, out := ops.do("POST", path, map[string]any{}); code != 403 || codeOf(out) != "totp_required" {
+		t.Fatalf("without totp = %d %v", code, out)
+	}
+	code, out := ops.do("POST", path, map[string]any{"totp": ops.totp()})
+	if code != 200 {
+		t.Fatalf("enroll-command = %d %v", code, out)
+	}
+	cmd := out["command"].(string)
+	want := "curl -fsSL http://files.test/agent/install.sh | sudo sh -s -- --platform agent.test:9443 --token spk1_"
+	if !strings.HasPrefix(cmd, want) || !strings.Contains(cmd, "--ca-sha256 "+e.gw.CAFingerprint()+" --binary-sha256 beef") {
+		t.Fatalf("command = %s", cmd)
+	}
+	if out["token_id"].(float64) <= 0 || out["expires_at"] == nil {
+		t.Fatalf("meta = %v", out)
+	}
+	// 审计不含令牌明文
+	var diff string
+	_ = e.pool.QueryRow(e.ctx, `SELECT diff::text FROM audit_logs WHERE action = 'machine.enroll_token'`).Scan(&diff)
+	token := strings.Fields(strings.SplitN(cmd, "--token ", 2)[1])[0]
+	if strings.Contains(diff, strings.TrimPrefix(token, "spk1_")) {
+		t.Fatalf("audit leaks token: %s", diff)
+	}
+	// 未接入但有未用令牌：撤销成功并使令牌作废；再撤销无物可撤 → invalid_state
+	if code, out := ops.do("POST", fmt.Sprintf("/machines/%d/revoke-enrollment", mid), map[string]any{}); code != 200 || out["enrolled"] != false {
+		t.Fatalf("revoke token-only = %d %v", code, out)
+	}
+	if err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+		_, err := e.fleet.ConsumeEnrollToken(e.ctx, tx, token)
+		return err
+	}); !errors.Is(err, fleet.ErrEnrollToken) {
+		t.Fatalf("token issued before revoke still usable: %v", err)
+	}
+	if code, out := ops.do("POST", fmt.Sprintf("/machines/%d/revoke-enrollment", mid), map[string]any{}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("revoke nothing = %d %v", code, out)
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE machines SET cert_fingerprint = repeat('ab', 32), agent_conn_id = 'c1', agent_version = '0.1.0', last_metrics = '{"gpu_temp_c":55}' WHERE id = $1`, mid); err != nil {
+		t.Fatal(err)
+	}
+	code, out = ops.do("GET", fmt.Sprintf("/machines/%d", mid), nil)
+	if code != 200 {
+		t.Fatalf("get machine = %d %v", code, out)
+	}
+	m := out["machine"].(map[string]any)
+	if m["enrolled"] != true || m["fingerprint_prefix"] != "abababababababab" || m["connected"] != true || m["agent_version"] != "0.1.0" || m["last_metrics"].(map[string]any)["gpu_temp_c"].(float64) != 55 {
+		t.Fatalf("machine view = %v", m)
+	}
+	if _, has := m["cert_fingerprint"]; has {
+		t.Fatal("full fingerprint must not be exposed")
+	}
+	code, out = ops.do("POST", fmt.Sprintf("/machines/%d/revoke-enrollment", mid), map[string]any{})
+	if code != 200 || out["enrolled"] != false || out["connected"] != false {
+		t.Fatalf("revoke = %d %v", code, out)
+	}
+	var n int
+	_ = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM audit_logs WHERE action = 'machine.revoke_enrollment'`).Scan(&n)
+	if n != 2 {
+		t.Fatalf("revoke audit = %d", n)
+	}
+	fin := e.loginAs("fin", admin.RoleFinance)
+	if code, out := fin.do("POST", path, map[string]any{}); code != 403 || codeOf(out) != "forbidden" {
+		t.Fatalf("finance = %d %v", code, out)
+	}
+}
+
+func TestEnrollCommandWithoutGateway(t *testing.T) {
+	e := newEnvWith(t, func(s *adminapi.Server) { s.Gateway = nil })
+	ops := e.loginAs("ops", admin.RoleOps)
+	mid := e.machine("SN-NG")
+	code, out := ops.do("POST", fmt.Sprintf("/machines/%d/enroll-command", mid), map[string]any{"totp": ops.totp()})
+	if code != 500 || out["message"] != "未配置 Agent 网关" {
+		t.Fatalf("no gateway = %d %v", code, out)
 	}
 }
