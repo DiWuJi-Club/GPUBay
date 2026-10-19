@@ -16,6 +16,7 @@ import (
 	"golang.org/x/term"
 
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
@@ -27,13 +28,14 @@ const adminUsage = `用法：
   platform admin create --username <用户名> [--role super|ops|finance]
   platform admin reset-totp --username <用户名>
   platform admin gen-upstream-key --path <私钥文件>
-  platform admin ssh-host-key`
+  platform admin ssh-host-key
+  platform admin app import <目录>`
 
 // prompter 读取一行输入；secret 为 true 时不回显（用于密码）。
 type prompter func(label string, secret bool) (string, error)
 
 // runAdmin 处理 `platform admin ...` 子命令。
-func runAdmin(ctx context.Context, svc *admin.Service, args []string, out io.Writer, prompt prompter) error {
+func runAdmin(ctx context.Context, svc *admin.Service, cat *appdeploy.Catalog, args []string, out io.Writer, prompt prompter) error {
 	if len(args) == 0 {
 		return errors.New(adminUsage)
 	}
@@ -44,6 +46,8 @@ func runAdmin(ctx context.Context, svc *admin.Service, args []string, out io.Wri
 		return adminResetTOTP(ctx, svc, args[1:], out)
 	case "gen-upstream-key":
 		return adminGenUpstreamKey(args[1:], out)
+	case "app":
+		return appImport(ctx, cat, args[1:], out)
 	}
 	return errors.New(adminUsage)
 }

@@ -15,6 +15,9 @@ import (
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/app"
+	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/db"
@@ -39,7 +42,7 @@ func main() {
 // adminMain 执行 `platform admin ...`：使用与服务相同的配置连接数据库（会先执行迁移）。
 func adminMain(args []string) error {
 	if len(args) > 0 && args[0] == "gen-upstream-key" { // 不需要数据库
-		return runAdmin(context.Background(), nil, args, os.Stdout, nil)
+		return runAdmin(context.Background(), nil, nil, args, os.Stdout, nil)
 	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -62,7 +65,9 @@ func adminMain(args []string) error {
 		return adminSSHHostKey(ctx, pool, box, os.Stdout)
 	}
 	svc := admin.NewService(admin.Deps{Pool: pool, Clock: clock.Real{}, Box: box})
-	return runAdmin(ctx, svc, args, os.Stdout, terminalPrompter(os.Stdin, os.Stdout))
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	cat := appdeploy.NewCatalog(pool, clock.Real{}, fleet.NewService(pool, clock.Real{}), catalog.NewService(pool), log)
+	return runAdmin(ctx, svc, cat, args, os.Stdout, terminalPrompter(os.Stdin, os.Stdout))
 }
 
 func run(log *slog.Logger) error {
