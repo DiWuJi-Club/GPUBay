@@ -2,6 +2,7 @@ package referral
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,7 +37,8 @@ func (s *Service) ProcessRowForTest(ctx context.Context, l ledgerRow) error {
 
 // DiscoverFromForTest 以给定水位跑一轮发现（模拟在 Rescan 拨回水位之前就读到旧水位的清扫轮）。
 func (s *Service) DiscoverFromForTest(ctx context.Context, since time.Time) (int, error) {
-	return s.discoverFrom(ctx, since)
+	n, failed, err := s.discoverRound(ctx, since)
+	return n, errors.Join(err, failedRows(failed))
 }
 
 // SetDiscoverMaxPages 改发现每轮翻页上限；返回恢复函数。

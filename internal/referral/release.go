@@ -281,6 +281,8 @@ func (s *Service) sameIdentityAtRelease(ctx context.Context, tx pgx.Tx, cache fp
 // kycCheckUnresolved 报告邀请人或被邀请人是否有晚于 since（绑定的 reviewed_at，未复核时取 bound_at）的
 // referral.kyc_check_failed 审计——实名同身份判定失败、尚待人工核查。绑定之前的失败与该绑定无关；
 // 命中时 releaseOne 把绑定转 held（hold_reason=kyc_check_failed），后台裁决（通过 / 撤销）写 reviewed_at，之后同一条审计不再触发。
+// 后台列表的 kyc_check_unresolved（admin.go bindingSelect）是同一判定的 SQL 版本：改这里须同步那边，
+// TestKYCCheckUnresolvedPredicatesAgree 用同一组用例钉住两者。
 func kycCheckUnresolved(ctx context.Context, q db.Querier, inviterID, inviteeID int64, since time.Time) (bool, error) {
 	var held bool
 	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM audit_logs WHERE target_type = 'user' AND target_id IN ($1, $2)

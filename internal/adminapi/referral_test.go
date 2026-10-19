@@ -96,7 +96,8 @@ func TestReferralAdminEndpoints(t *testing.T) {
 	}
 	resp, out := fin.send("GET", fmt.Sprintf("/referral/inviters/%d", inviter), nil)
 	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 || out["account"].(map[string]any)["status"] != "frozen" || len(out["bindings"].([]any)) != 1 {
+	if resp.StatusCode != 200 || out["account"].(map[string]any)["status"] != "frozen" || len(out["bindings"].([]any)) != 1 ||
+		out["bindings_total"] != float64(1) || out["rewards_total"] != float64(0) {
 		t.Fatalf("detail = %d %v", resp.StatusCode, out)
 	}
 	if s := strings.ToLower(string(raw)); strings.Contains(s, "fingerprint") || strings.Contains(s, "id_number") {
@@ -141,12 +142,20 @@ func TestReferralAdminEndpoints(t *testing.T) {
 	if code, _ := fin.do("POST", "/referral/rescan", map[string]any{"days": 3}); code != 403 {
 		t.Fatal("finance cannot rescan")
 	}
+	// 一条处理必然失败的流水（正数 order_pay）：重扫照常执行，200 + failed=1，验证窗口打开
+	if _, err := e.pool.Exec(e.ctx, `INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, remark, created_at)
+		VALUES ($1, 100, 100, 'order_pay', 'order', 'ord-bad', '', $2)`, invitee, e.clk.Now()); err != nil {
+		t.Fatal(err)
+	}
 	rtotp := sup.totp()
 	if code, out := sup.do("POST", "/referral/rescan", map[string]any{"days": 99, "totp": rtotp}); code != 400 {
 		t.Fatalf("rescan days range = %d %v", code, out)
 	}
-	if code, out := sup.do("POST", "/referral/rescan", map[string]any{"days": 3, "totp": rtotp}); code != 200 {
+	if code, out := sup.do("POST", "/referral/rescan", map[string]any{"days": 3, "totp": rtotp}); code != 200 || out["failed"] != float64(1) || out["incomplete"] != false {
 		t.Fatalf("rescan = %d %v", code, out)
+	}
+	if code, out := sup.do("POST", "/referral/rescan", map[string]any{"days": 2}); code != 200 || out["failed"] != float64(1) {
+		t.Fatalf("rescan within step-up window = %d %v", code, out)
 	}
 	var n int
 	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM audit_logs WHERE action = 'referral.rescan' AND actor_id = $1 AND diff->>'days' = '3'`, sup.admin.ID).Scan(&n); err != nil || n != 1 {
@@ -161,5 +170,35 @@ func TestReferralAdminEndpoints(t *testing.T) {
 	}
 	if code, out := ops.do("GET", "/dashboard", nil); code != 200 || out["referral_month_settled"] != float64(0) {
 		t.Fatalf("dashboard = %d %v", code, out)
+	}
+}
+
+// 仪表盘与概览的本月返利：只算本月（北京时间）的 referral_rebate / referral_clawback 流水。
+func TestReferralDashboardMonthSettled(t *testing.T) {
+	e := newEnv(t)
+	fin := e.loginAs("fin", admin.RoleFinance)
+	uid := e.renter("13812345678")
+	local := e.clk.Now().In(time.FixedZone("CST", 8*3600))
+	monthStart := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, local.Location())
+	for _, l := range []struct {
+		kind   string
+		amount int64
+		at     time.Time
+	}{
+		{"referral_rebate", 690, e.clk.Now()},
+		{"referral_rebate", 310, monthStart},
+		{"referral_clawback", -100, e.clk.Now()},
+		{"referral_rebate", 5000, monthStart.Add(-time.Second)}, // 上月
+	} {
+		if _, err := e.pool.Exec(e.ctx, `INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, remark, created_at)
+			VALUES ($1, $2, 0, $3, 'referral', $4, '', $5)`, uid, l.amount, l.kind, fmt.Sprintf("%s-%d", l.kind, l.amount), l.at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code, out := fin.do("GET", "/dashboard", nil); code != 200 || out["referral_month_settled"] != float64(900) {
+		t.Fatalf("dashboard = %d %v", code, out["referral_month_settled"])
+	}
+	if code, out := fin.do("GET", "/referral/summary", nil); code != 200 || out["month_settled"] != float64(1000) {
+		t.Fatalf("summary = %d %v", code, out)
 	}
 }

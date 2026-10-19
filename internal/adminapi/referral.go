@@ -311,6 +311,7 @@ func (s *Server) handleReferralExportRewards(w http.ResponseWriter, r *http.Requ
 }
 
 // handleReferralRescan 把扫描水位拨回 days 天并立刻跑一轮发现 + 发放（Rescan 以拨回后的水位显式调用发现，裁定 Q10）。
+// 拨回提交之后的失败（failed 行数、incomplete）不算操作失败：返回 200 与 RescanResult，验证窗口照常打开。
 func (s *Server) handleReferralRescan(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Days int    `json:"days"`
@@ -324,9 +325,13 @@ func (s *Server) handleReferralRescan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	if err := s.withStepUp(r, req.TOTP, func() error { return s.Referral.Rescan(r.Context(), s.actor(r), req.Days) }); err != nil {
+	var res referral.RescanResult
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		res, err = s.Referral.Rescan(r.Context(), s.actor(r), req.Days)
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	httpx.OK(w)
+	httpx.WriteJSON(w, http.StatusOK, res)
 }

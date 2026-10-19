@@ -88,7 +88,7 @@ func TestDiscoverProcessesOnlyBoundUsersAndAdvancesWatermark(t *testing.T) {
 		t.Fatalf("old=%v late=%v", e.events("ord-old"), e.events("ord-late"))
 	}
 	// Rescan 拨回 1 天：ord-old 被补上；已处理的不重复
-	if err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, 1); err != nil {
+	if _, err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, 1); err != nil {
 		t.Fatal(err)
 	}
 	if len(e.events("ord-old")) != 1 || len(e.events("ord-late")) != 1 || len(e.events("ord-b")) != 1 {
@@ -99,7 +99,7 @@ func TestDiscoverProcessesOnlyBoundUsersAndAdvancesWatermark(t *testing.T) {
 		t.Fatalf("rescan audit rows = %d %v", audits, err)
 	}
 	for _, d := range []int{0, 31} {
-		if err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, d); err == nil {
+		if _, err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, d); err == nil {
 			t.Fatalf("days %d must be rejected", d)
 		}
 	}
@@ -393,7 +393,7 @@ func TestRescanNotUndoneByStaleDiscover(t *testing.T) {
 	}
 	restore := referral.SetDiscoverMaxPages(1) // 积压超过一轮的页数上限
 	defer restore()
-	if err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, 1); err != nil {
+	if _, err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, 1); err != nil {
 		t.Fatal(err)
 	}
 	target := e.clk.Now().Add(-24 * time.Hour)

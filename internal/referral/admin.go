@@ -197,6 +197,8 @@ type InviterRow struct {
 }
 
 var (
+	// likeEscaper 转义 LIKE 的通配符（PostgreSQL 默认转义符为反斜杠）。
+	likeEscaper  = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 	flagValues   = []string{FlagSameIP, FlagSameDevice, FlagBurst, FlagSameIdentity}
 	inviterSorts = map[string]string{
 		"":         "x.settled_net DESC, x.user_id",
@@ -229,10 +231,11 @@ func (s *Service) AdminListInviters(ctx context.Context, f InviterFilter, p pagi
 	}
 	var w db.Where
 	if q := strings.TrimSpace(f.Q); q != "" {
+		tail := "%" + likeEscaper.Replace(q) // 尾号匹配；q 里的 % _ \ 按字面匹配
 		if id, err := strconv.ParseInt(q, 10, 64); err == nil && len(q) < 11 {
-			w.Add("(x.user_id = ? OR x.phone LIKE ?)", id, "%"+q)
+			w.Add("(x.user_id = ? OR x.phone LIKE ?)", id, tail)
 		} else {
-			w.Add("x.phone LIKE ?", "%"+q)
+			w.Add("x.phone LIKE ?", tail)
 		}
 	}
 	if f.Status != "" {
@@ -261,7 +264,9 @@ func (s *Service) AdminListInviters(ctx context.Context, f InviterFilter, p pagi
 }
 
 // Binding 是后台视角的绑定（JSON 标签与列同名）。KYCCheckUnresolved：邀请人或被邀请人有晚于 COALESCE(reviewed_at, bound_at)
-// 的 referral.kyc_check_failed 审计（实名同身份判定失败、尚待人工核查；与发放的 kycCheckUnresolved 同一判定），审核前须先核查。
+// 的 referral.kyc_check_failed 审计（实名同身份判定失败、尚待人工核查），审核前须先核查。
+// 判定与发放的 kycCheckUnresolved（release.go）必须一致：bindingSelect 里是它的 SQL 版本，
+// 改任何一边都要同步另一边；TestKYCCheckUnresolvedPredicatesAgree 用同一组用例钉住两者。
 type Binding struct {
 	ID                 int64      `json:"id"`
 	InviterID          int64      `json:"inviter_id"`
@@ -290,6 +295,7 @@ const bindingSelect = `SELECT b.id, b.inviter_id, b.invitee_id, iu.phone, eu.pho
 		b.ip, b.device_id, b.user_agent, b.reviewed_by, b.reviewed_at, b.review_note,
 		COALESCE((SELECT sum(reward) FROM referral_rewards r WHERE r.binding_id = b.id AND r.status = 'pending'), 0),
 		COALESCE((SELECT sum(reward) FROM referral_rewards r WHERE r.binding_id = b.id AND r.status <> 'void'), 0),
+		-- 与 release.go 的 kycCheckUnresolved 同一判定（见 Binding 注释）
 		EXISTS (SELECT 1 FROM audit_logs al WHERE al.target_type = 'user' AND al.target_id IN (b.inviter_id::text, b.invitee_id::text)
 			AND al.action = 'referral.kyc_check_failed' AND al.created_at > COALESCE(b.reviewed_at, b.bound_at))
 	FROM referral_bindings b JOIN users iu ON iu.id = b.inviter_id JOIN users eu ON eu.id = b.invitee_id`
@@ -409,13 +415,19 @@ type Event struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// InviterDetail 只带最近 InviterDetailRows 条绑定 / 返利；BindingsTotal / RewardsTotal 是全量条数，
+// 超过时后台跳转分页列表（/referral/bindings?inviter_id=、/referral/rewards?inviter_id=）。
 type InviterDetail struct {
-	Account  Account       `json:"account"`
-	Phone    string        `json:"phone"`
-	Bindings []Binding     `json:"bindings"`
-	Rewards  []AdminReward `json:"rewards"` // 最近 100 条
-	Events   []Event       `json:"events"`  // 最近 50 条
+	Account       Account       `json:"account"`
+	Phone         string        `json:"phone"`
+	Bindings      []Binding     `json:"bindings"`
+	BindingsTotal int           `json:"bindings_total"`
+	Rewards       []AdminReward `json:"rewards"`
+	RewardsTotal  int           `json:"rewards_total"`
+	Events        []Event       `json:"events"` // 最近 50 条
 }
+
+const InviterDetailRows = 100
 
 // AdminInviter 邀请人详情；没有账户行（从未生成过邀请码）→ apperr.ErrNotFound。
 func (s *Service) AdminInviter(ctx context.Context, userID int64) (InviterDetail, error) {
@@ -433,10 +445,10 @@ func (s *Service) AdminInviter(ctx context.Context, userID int64) (InviterDetail
 		return d, err
 	}
 	d.Phone = u.Phone
-	if d.Bindings, _, err = s.AdminListBindings(ctx, BindingFilter{InviterID: userID}, paging.Page{Number: 1, Size: 100}); err != nil {
+	if d.Bindings, d.BindingsTotal, err = s.AdminListBindings(ctx, BindingFilter{InviterID: userID}, paging.Page{Number: 1, Size: InviterDetailRows}); err != nil {
 		return d, err
 	}
-	if d.Rewards, _, err = s.AdminListRewards(ctx, RewardFilter{InviterID: userID}, paging.Page{Number: 1, Size: 100}); err != nil {
+	if d.Rewards, d.RewardsTotal, err = s.AdminListRewards(ctx, RewardFilter{InviterID: userID}, paging.Page{Number: 1, Size: InviterDetailRows}); err != nil {
 		return d, err
 	}
 	rows, err := s.d.Pool.Query(ctx, `SELECT e.id, e.order_id, e.binding_id, e.kind, e.source_ledger_id, e.wallet_ledger_id, e.amount, e.detail, e.created_at

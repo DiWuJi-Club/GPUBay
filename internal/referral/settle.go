@@ -14,13 +14,19 @@ import (
 )
 
 // Discover 扫描 wallet_ledger 中新的 order 流水（规格 §5.1）：时间水位 + 1 小时回看 + source_ledger_id 幂等；
-// 每行独立事务。返回成功处理（含占位）的行数。水位规则见 discoverFrom。
+// 每行独立事务。返回成功处理（含占位）的行数；有行失败时错误里汇总失败行数。水位规则见 discoverRound。
 func (s *Service) Discover(ctx context.Context) (int, error) {
+	n, failed, err := s.discoverCurrent(ctx)
+	return n, errors.Join(err, failedRows(failed))
+}
+
+// discoverCurrent 以当前水位跑一轮 discoverRound。
+func (s *Service) discoverCurrent(ctx context.Context) (processed, failed int, err error) {
 	var since time.Time
 	if err := s.d.Pool.QueryRow(ctx, `SELECT watermark FROM referral_state WHERE id = 1`).Scan(&since); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return s.discoverFrom(ctx, since)
+	return s.discoverRound(ctx, since)
 }
 
 // DiscoverMaxPages：每轮最多翻 DiscoverMaxPages 页（每页 ScanBatch 行）。测试可经 export_test.go 改小。
@@ -39,7 +45,7 @@ const (
 		"修复后在后台「邀请返利」执行重扫（重扫天数覆盖卡住的流水）"
 )
 
-// discoverFrom 扫描 created_at ≥ since − ScanLookback 的未处理 order 流水（扣款先于退款，同类按 id）。
+// discoverRound 扫描 created_at ≥ since − ScanLookback 的未处理 order 流水（扣款先于退款，同类按 id）。
 // 按 ((kind = 'refund'), id) 游标翻页，每页 ScanBatch 行、每轮最多 discoverMaxPages 页：被跳过 / 失败的行留在原处，
 // 不会让后面的新流水饿死。
 //
@@ -51,10 +57,10 @@ const (
 //   - 被钉在 now − StuckAfter 之前时告警一次（referral_scan_stuck）。
 //
 // ctx 到期（Settle 给发现单独的超时）时立即停止，不推进水位。
-// 单行失败已由 processRow 逐行记日志；返回的错误只汇总失败行数，避免清扫器再把每行错误打一遍。
-func (s *Service) discoverFrom(ctx context.Context, since time.Time) (int, error) {
+// 单行失败已由 processRow 逐行记日志，这里只计数（failed）；err 只含行处理以外的错误（查询、ctx 到期、推进水位、告警），
+// 由调用方决定如何汇总（Discover / Settle 并入错误，Rescan 作为结果返回）。
+func (s *Service) discoverRound(ctx context.Context, since time.Time) (processed, failed int, err error) {
 	now := s.d.Clock.Now()
-	processed, failed := 0, 0
 	var errs []error
 	next := now.Add(-ScanLag)
 	pinned := false
@@ -69,7 +75,7 @@ func (s *Service) discoverFrom(ctx context.Context, since time.Time) (int, error
 			  AND ((l.kind = 'refund'), l.id) > ($3::bool, $4::bigint)
 			ORDER BY (l.kind = 'refund'), l.id LIMIT $5`, since, ScanLookback.Seconds(), afterRefund, afterID, ScanBatch)
 		if err != nil {
-			return processed, errors.Join(append(errs, err)...)
+			return processed, failed, errors.Join(append(errs, err)...)
 		}
 		list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (ledgerRow, error) {
 			var l ledgerRow
@@ -77,11 +83,11 @@ func (s *Service) discoverFrom(ctx context.Context, since time.Time) (int, error
 			return l, err
 		})
 		if err != nil {
-			return processed, errors.Join(append(errs, err)...)
+			return processed, failed, errors.Join(append(errs, err)...)
 		}
 		for _, l := range list {
 			if err := ctx.Err(); err != nil {
-				return processed, errors.Join(append(errs, failedRows(failed), err)...)
+				return processed, failed, errors.Join(append(errs, err)...)
 			}
 			err := s.processRow(ctx, l)
 			if err == nil {
@@ -100,7 +106,6 @@ func (s *Service) discoverFrom(ctx context.Context, since time.Time) (int, error
 			afterRefund, afterID = list[n-1].Kind == "refund", list[n-1].ID
 		}
 	}
-	errs = append(errs, failedRows(failed))
 	if drained {
 		if _, err := s.d.Pool.Exec(ctx, `UPDATE referral_state SET watermark = $1 WHERE id = 1 AND watermark = $2`, next, since); err != nil {
 			errs = append(errs, fmt.Errorf("advance watermark: %w", err))
@@ -112,7 +117,7 @@ func (s *Service) discoverFrom(ctx context.Context, since time.Time) (int, error
 			errs = append(errs, fmt.Errorf("raise %s alert: %w", AlertScanStuck, err))
 		}
 	}
-	return processed, errors.Join(errs...)
+	return processed, failed, errors.Join(errs...)
 }
 
 // failedRows 汇总本轮失败行数（逐行详情已在 processRow 的日志里）；0 返回 nil。
@@ -150,7 +155,8 @@ func (s *Service) processRow(ctx context.Context, l ledgerRow) error {
 // Settle 是清扫附加任务：先发现（计提 / 退款处理）再发放。两步各有自己的超时、互相独立：
 // 发现慢（或失败）不会把发放饿死，任一失败不阻止另一步。
 func (s *Service) Settle(ctx context.Context) error {
-	return s.settle(ctx, s.Discover)
+	r := s.settle(ctx, s.discoverCurrent)
+	return errors.Join(r.discoverErr, failedRows(r.failed), r.releaseErr)
 }
 
 // 发现 / 发放各自的超时；两者之和小于清扫器给附加任务的总超时（rental extraTaskTimeout，2 分钟）。
@@ -159,22 +165,42 @@ var (
 	releaseTimeout  = 50 * time.Second
 )
 
-func (s *Service) settle(ctx context.Context, discover func(context.Context) (int, error)) error {
+// settleResult 是一轮发现 + 发放的结果：失败行数单独计（discoverErr 不含行处理失败）。
+type settleResult struct {
+	processed, failed, released int
+	discoverErr, releaseErr     error
+}
+
+func (s *Service) settle(ctx context.Context, discover func(context.Context) (processed, failed int, err error)) settleResult {
+	var r settleResult
 	dctx, cancel := context.WithTimeout(ctx, discoverTimeout)
-	_, derr := discover(dctx)
+	r.processed, r.failed, r.discoverErr = discover(dctx)
 	cancel()
 	rctx, cancel := context.WithTimeout(ctx, releaseTimeout)
 	defer cancel()
-	_, rerr := s.Release(rctx)
-	return errors.Join(derr, rerr)
+	r.released, r.releaseErr = s.Release(rctx)
+	return r
+}
+
+// RescanResult 是一次重扫的结果。水位拨回（及审计）提交之后，发现 / 发放中的失败不再作为错误返回——拨回已生效、
+// 重扫已执行——而是记在结果里：Failed 为处理失败的流水行数（逐行详情见日志「referral: process ledger failed」，
+// 这些行钉住水位，之后每轮清扫重试）；Incomplete 表示发现或发放本身出错 / 超时（详情见日志），之后的清扫轮会继续。
+type RescanResult struct {
+	Watermark  time.Time `json:"watermark"` // 拨回后的水位（本次发现的下界）
+	Processed  int       `json:"processed"` // 本次发现处理成功（含占位）的流水行数
+	Failed     int       `json:"failed"`
+	Released   int       `json:"released"` // 本次发放的返利笔数
+	Incomplete bool      `json:"incomplete"`
 }
 
 // Rescan 把水位拨回 days 天并立刻用拨回后的水位跑一轮发现 + 发放；已处理的流水因 source_ledger_id 唯一不会重复计提。
 // 发现的下界显式传入（裁定 Q10），不重读水位：并发的清扫轮无法让本次重扫落空；一轮处理不完（积压 ≥ ScanBatch）时
 // 水位停在拨回处，之后的清扫轮继续补（清扫轮按「读到的水位」比较后才更新，不会覆盖拨回）。
-func (s *Service) Rescan(ctx context.Context, actor audit.Actor, days int) error {
+//
+// 只有参数错误与拨回水位的事务失败返回错误（此时什么都没发生）；之后的失败见 RescanResult。
+func (s *Service) Rescan(ctx context.Context, actor audit.Actor, days int) (RescanResult, error) {
 	if err := CheckRescanDays(days); err != nil {
-		return err
+		return RescanResult{}, err
 	}
 	now := s.d.Clock.Now()
 	target := now.Add(-time.Duration(days) * 24 * time.Hour)
@@ -185,7 +211,16 @@ func (s *Service) Rescan(ctx context.Context, actor audit.Actor, days int) error
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("referral.rescan", "referral_state", "1", map[string]any{"days": days, "watermark": since}))
 	}); err != nil {
-		return err
+		return RescanResult{}, err
 	}
-	return s.settle(ctx, func(ctx context.Context) (int, error) { return s.discoverFrom(ctx, since) })
+	r := s.settle(ctx, func(ctx context.Context) (int, int, error) { return s.discoverRound(ctx, since) })
+	res := RescanResult{Watermark: since, Processed: r.processed, Failed: r.failed, Released: r.released}
+	if err := errors.Join(r.discoverErr, r.releaseErr); err != nil {
+		res.Incomplete = true
+		s.d.Log.Error("referral: rescan incomplete", "days", days, "err", err)
+	}
+	if r.failed > 0 {
+		s.d.Log.Warn("referral: rescan left failed ledger rows", "days", days, "failed", r.failed)
+	}
+	return res, nil
 }

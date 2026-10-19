@@ -2,6 +2,7 @@ package referral_test
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -322,6 +323,12 @@ func TestAdminListsSummaryAndExports(t *testing.T) {
 	if _, total, _ := e.svc.AdminListInviters(e.ctx, referral.InviterFilter{Q: "5678"}, paging.Page{Number: 1, Size: 10}); total != 1 {
 		t.Fatal("q by phone tail")
 	}
+	// LIKE 通配符按字面匹配：未转义时 "%" 匹配全部、"_678" 匹配 5678
+	for _, q := range []string{"%", "_678", `\`} {
+		if _, total, err := e.svc.AdminListInviters(e.ctx, referral.InviterFilter{Q: q}, paging.Page{Number: 1, Size: 10}); err != nil || total != 0 {
+			t.Fatalf("q %q = %d %v, want 0 (wildcards must be escaped)", q, total, err)
+		}
+	}
 	if l, total, _ := e.svc.AdminListInviters(e.ctx, referral.InviterFilter{Q: strconv.FormatInt(x, 10)}, paging.Page{Number: 1, Size: 10}); total != 1 || l[0].UserID != x {
 		t.Fatal("q by id")
 	}
@@ -337,7 +344,7 @@ func TestAdminListsSummaryAndExports(t *testing.T) {
 		}
 	}
 	det, err := e.svc.AdminInviter(e.ctx, a)
-	if err != nil || det.Phone != "13812345678" || len(det.Bindings) != 2 || len(det.Rewards) != 2 || len(det.Events) < 6 {
+	if err != nil || det.Phone != "13812345678" || len(det.Bindings) != 2 || det.BindingsTotal != 2 || len(det.Rewards) != 2 || det.RewardsTotal != 2 || len(det.Events) < 6 {
 		t.Fatalf("detail = %+v %v", det, err)
 	}
 	if _, err := e.svc.AdminInviter(e.ctx, b); !errors.Is(err, apperr.ErrNotFound) {
@@ -422,5 +429,137 @@ func TestHeldQueueShowsUnresolvedKYCCheck(t *testing.T) {
 	list, _, _ := e.svc.AdminListBindings(e.ctx, referral.BindingFilter{InviteeID: b}, paging.Page{Number: 1, Size: 10})
 	if len(list) != 1 || list[0].KYCCheckUnresolved {
 		t.Fatalf("after approve = %+v", list)
+	}
+}
+
+// 后台列表的 kyc_check_unresolved（SQL）与发放的 kycCheckUnresolved（Go）是同一判定的两份实现：同一组用例钉住两者。
+func TestKYCCheckUnresolvedPredicatesAgree(t *testing.T) {
+	e := newEnv(t)
+	t0 := e.clk.Now()
+	sec := func(n int) time.Time { return t0.Add(time.Duration(n) * time.Second) }
+	type audit struct {
+		inviter            bool // 审计目标是邀请人（否则被邀请人）
+		targetType, action string
+		at                 time.Time
+	}
+	kyc := func(inviter bool, at time.Time) audit { return audit{inviter, "user", "referral.kyc_check_failed", at} }
+	cases := []struct {
+		name     string
+		audits   []audit
+		reviewed *time.Time
+		want     bool
+	}{
+		{"none", nil, nil, false},
+		{"before bind", []audit{kyc(false, sec(-1))}, nil, false},
+		{"at bind (strictly after only)", []audit{kyc(false, t0)}, nil, false},
+		{"invitee after bind", []audit{kyc(false, sec(1))}, nil, true},
+		{"inviter after bind", []audit{kyc(true, sec(1))}, nil, true},
+		{"reviewed after audit", []audit{kyc(false, sec(1))}, ptr(sec(2)), false},
+		{"audit after review", []audit{kyc(false, sec(2))}, ptr(sec(1)), true},
+		{"other action", []audit{{false, "user", "referral.freeze", sec(1)}}, nil, false},
+		{"other target type", []audit{{false, "kyc_record", "referral.kyc_check_failed", sec(1)}}, nil, false},
+	}
+	ids := map[int64]int{}
+	for i, c := range cases {
+		inviter := e.user(fmt.Sprintf("1380000%04d", i), true)
+		invitee := e.user(fmt.Sprintf("1390000%04d", i), true)
+		bid := e.bind(inviter, invitee)
+		ids[bid] = i
+		if c.reviewed != nil {
+			e.bindExec(`UPDATE referral_bindings SET reviewed_at = $2 WHERE id = $1`, bid, *c.reviewed)
+		}
+		for _, a := range c.audits {
+			target := invitee
+			if a.inviter {
+				target = inviter
+			}
+			e.bindExec(`INSERT INTO audit_logs (actor_type, action, target_type, target_id, diff, created_at) VALUES ('system', $1, $2, $3, '{}', $4)`,
+				a.action, a.targetType, strconv.FormatInt(target, 10), a.at)
+		}
+	}
+	list, total, err := e.svc.AdminListBindings(e.ctx, referral.BindingFilter{}, paging.Page{Number: 1, Size: 100})
+	if err != nil || total != len(cases) {
+		t.Fatalf("list = %d %v", total, err)
+	}
+	for _, b := range list {
+		c := cases[ids[b.ID]]
+		since := b.BoundAt
+		if b.ReviewedAt != nil {
+			since = *b.ReviewedAt
+		}
+		release, err := referral.KYCCheckUnresolvedForTest(e.ctx, e.pool, b.InviterID, b.InviteeID, since)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.KYCCheckUnresolved != c.want || release != c.want {
+			t.Errorf("%s: admin list = %v, release = %v, want %v", c.name, b.KYCCheckUnresolved, release, c.want)
+		}
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// 待审核队列：标记多的在前，同数量先到先审；不含非 held 的绑定。
+func TestHeldQueueOrderedByFlagCount(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	flags := []string{"{same_ip}", "{same_ip,same_device,burst}", "{same_ip,same_device}", "{same_device,burst}", "{}"}
+	var bids []int64
+	for i, f := range flags {
+		bid := e.bind(a, e.user(fmt.Sprintf("1390000%04d", i), true))
+		e.bindExec(`UPDATE referral_bindings SET status = 'held', hold_reason = 'same_device', risk_flags = $2 WHERE id = $1`, bid, f)
+		bids = append(bids, bid)
+		e.clk.Advance(time.Minute)
+	}
+	e.bind(a, e.user("13900009999", true)) // active，含 0 个标记，不应出现
+	list, total, err := e.svc.AdminListBindings(e.ctx, referral.BindingFilter{Status: "held"}, paging.Page{Number: 1, Size: 10})
+	if err != nil || total != len(flags) {
+		t.Fatalf("held = %d %v", total, err)
+	}
+	want := []int64{bids[1], bids[2], bids[3], bids[0], bids[4]}
+	for i, b := range list {
+		if b.ID != want[i] {
+			t.Fatalf("held order[%d] = %d (%v), want %d; full %v", i, b.ID, b.RiskFlags, want[i], list)
+		}
+	}
+	// 不限状态时按绑定时间倒序
+	all, _, _ := e.svc.AdminListBindings(e.ctx, referral.BindingFilter{InviterID: a}, paging.Page{Number: 1, Size: 10})
+	if len(all) != len(flags)+1 || all[len(all)-1].ID != bids[0] {
+		t.Fatalf("all order = %v", all)
+	}
+}
+
+// 裁定：水位拨回提交之后，发现 / 发放中的失败不再是 Rescan 的错误，而是结果里的 failed / incomplete。
+func TestRescanReportsFailedRowsInResult(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	e.pay(b, "ord-ok", 6900)
+	e.pay(b, "ord-fail", 6900)
+	e.orders.fail["ord-fail"] = errors.New("orders db down")
+	res, err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, 1)
+	if err != nil || res.Failed != 1 || res.Processed != 1 || res.Incomplete || res.Watermark.IsZero() {
+		t.Fatalf("rescan = %+v %v", res, err)
+	}
+	if len(e.events("ord-ok")) != 1 || len(e.events("ord-fail")) != 0 {
+		t.Fatalf("events ok=%v fail=%v", e.events("ord-ok"), e.events("ord-fail"))
+	}
+	// 发现超时：incomplete，仍不是错误（拨回与审计已提交）
+	restore := referral.SetSettleTimeouts(50*time.Millisecond, time.Second)
+	defer restore()
+	e.pay(b, "ord-hang", 6900)
+	e.orders.hang["ord-hang"] = true
+	res, err = e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, 1)
+	if err != nil || !res.Incomplete {
+		t.Fatalf("rescan with hang = %+v %v", res, err)
+	}
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM audit_logs WHERE action = 'referral.rescan'`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("rescan audits = %d %v", n, err)
+	}
+	// 参数错误：什么都不做
+	if _, err := e.svc.Rescan(e.ctx, audit.Actor{AdminID: 1}, 31); err == nil {
+		t.Fatal("days 31 accepted")
 	}
 }
