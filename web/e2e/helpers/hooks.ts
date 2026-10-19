@@ -54,8 +54,14 @@ export const hooks = {
     if (!r.ok()) throw new Error(`hook /hooks/agent/status -> ${r.status()} ${await r.text()}`)
     return (await r.json()) as { connected: boolean }
   },
-  users(opts: { phone?: string; verified?: boolean; balance?: number; ledger_rows?: number } = {}) {
-    return post<{ id: number; phone: string }>('/hooks/users', opts)
+  /** 造用户。带 invite_code / device_id / ip 任一时走真实注册路径（发码 + 登录，ip 缺省 127.0.0.1），invite 为绑定结果；
+   *  手机号已存在时只是再登录一次（记设备），不改实名、不入账。 */
+  users(opts: { phone?: string; verified?: boolean; balance?: number; ledger_rows?: number; invite_code?: string; device_id?: string; ip?: string } = {}) {
+    return post<{ id: number; phone: string; invite?: { bound: boolean; reason: string; inviter?: string } | null }>('/hooks/users', opts)
+  },
+  /** 插一版费率（生效时间 = 现在），未给的字段沿用当前版本。费率是全局的，改了要在 finally 里恢复（helpers/referral.ts restoreRate）。 */
+  referralConfig(opts: { rate_bp?: number; max_per_invitee?: number; max_per_inviter_30d?: number; hold_days?: number; period_days?: number }) {
+    return post<{ id: number }>('/hooks/referral/config', opts)
   },
   admins(opts: { username: string; role: Role; bind_totp: boolean }) {
     return post<{ id: number; password: string; totp_secret?: string; recovery_codes?: string[] }>('/hooks/admins', opts)

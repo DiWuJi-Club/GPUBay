@@ -8,10 +8,12 @@ const table = JSON.parse(readFileSync(join(__dirname, '..', 'coverage.json'), 'u
 describe('coverage.json', () => {
   it('与设计 §7.5 的数量一致且无重复', () => {
     // + 计划 3 的 C-DET-11～16、C-KEY-01～05、C-ING-01～06；+ 计划 6 的 C-BKG-01～11、C-DET-17～25、C-INS-05～07
-    expect(table.console).toHaveLength(93)
+    // + 计划 8 的 C-REF-01～08、C-ACC-03、C-WAL-05
+    expect(table.console).toHaveLength(103)
     // 计划 5 的 50 个 + 计划 2 追加 A-MCH-07～09 + 计划 3 追加 A-INS-10～12、A-USR-07；+ 计划 6 的 A-GRP-01～05、A-BKG-01～06、A-INS-13
-    expect(table.admin).toHaveLength(69)
-    expect(new Set([...table.console, ...table.admin]).size).toBe(162)
+    // + 计划 8 的 A-REF-01～07、A-FIN-05
+    expect(table.admin).toHaveLength(77)
+    expect(new Set([...table.console, ...table.admin]).size).toBe(180)
   })
 })
 

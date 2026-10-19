@@ -57,6 +57,10 @@ export default defineConfig({
   // 每个用例最多推进约 1 天（C-DET-22 / 23 推进 23 小时，C-BKG-08 推进 3 小时，到点开通的用例推进 2～3 小时；没有用例推进到 3 天以上），
   // 预订都下在自己新建的机组（helpers/booking.ts privateGroup）里的新机器上，不依赖共享机器池；C-BKG-11 与 C-MKT-06 一样用
   // drainIdleMachines 把当时所有空闲机器置为维护（构造旧接口 /orders 的 no_capacity）。
+  // 计划 8 的返利用例（C-REF-07 / 08、C-ACC-03、C-WAL-05、A-REF-01～06、A-FIN-05）都只用自己新造的邀请人 / 被邀请人与新登记的机器；
+  // 其中 C-REF-07、C-ACC-03、A-REF-03 / 05 / 06、A-FIN-05 各推进 7 天让返利到期（C-REF-08 / C-WAL-05 临时改为 0 天发放延迟）；
+  // A-REF-03 冻结 / 解冻只作用于自己的邀请人。费率是全局的：C-REF-08、C-WAL-05、A-REF-04 改费率后在 finally 里恢复初始版本
+  // （helpers/referral.ts restoreRate）；A-REF-01 留下一条自己的搁置绑定（待审核队列按 ID 精确定位，不受影响）。
   projects: [
     {
       name: 'console-desktop',

@@ -606,7 +606,7 @@ func runConcurrentFunds(t *testing.T, base int64) {
 	// （真实时钟下这段间隔远小于发现的 ScanLag + 回看窗口），操作之间仍完全并发。
 	var gate sync.RWMutex
 	var agentMu sync.Mutex // 每台机器只有一个 Agent：回报串行
-	// 租用清扫在生产里互斥（sweeperLockKey 咨询锁）；两个 Sweep 并发时 MarkOfflineStale 的多行 UPDATE 会互相死锁（真实环境不会发生），
+	// 租用清扫在生产里互斥（rental.SweeperLockKey 咨询锁）；两个 Sweep 并发时 MarkOfflineStale 的多行 UPDATE 会互相死锁（真实环境不会发生），
 	// 所以这里同样互斥。返利清扫 Settle 不互斥：后台重扫 Rescan 会与清扫器里的 Settle 并发。
 	var sweepMu sync.Mutex
 	var mu sync.Mutex
