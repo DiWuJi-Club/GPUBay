@@ -206,7 +206,7 @@ func (s *Service) Heartbeat(ctx context.Context, machineID int64) (bool, error) 
 	now := s.clock.Now()
 	var wasOnline bool
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `SELECT agent_online FROM machines WHERE id = $1 FOR UPDATE`, machineID).Scan(&wasOnline)
+		err := tx.QueryRow(ctx, `SELECT agent_online FROM machines WHERE id = $1 FOR NO KEY UPDATE`, machineID).Scan(&wasOnline)
 		if db.IsNoRows(err) {
 			return apperr.ErrNotFound
 		}

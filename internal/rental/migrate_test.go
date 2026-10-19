@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"spark-cloud/internal/audit"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
@@ -113,11 +114,19 @@ func TestAdminMigrateWorksWithDisabledImage(t *testing.T) {
 	}
 }
 
-func TestAdminMigrateCopiesAutoRenewAndGroup(t *testing.T) {
+func TestAdminMigrateCopiesAutoRenewTakesNewMachineGroup(t *testing.T) {
 	e := newEnv(t, 2)
 	gid := e.group("A", true)
+	target := e.group("B", true)
 	_, old := e.place(catalog.D1d)
 	e.ack(true)
+	for _, mid := range e.machines {
+		if mid == old.MachineID {
+			e.setGroup(mid, gid)
+		} else {
+			e.setGroup(mid, target)
+		}
+	}
 	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET auto_renew = true, auto_renew_duration = '1w', group_id = $2 WHERE id = $1`, old.ID, gid); err != nil {
 		t.Fatal(err)
 	}
@@ -126,11 +135,36 @@ func TestAdminMigrateCopiesAutoRenewAndGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := e.get(moved.ID)
-	if !got.AutoRenew || got.AutoRenewDuration != catalog.D1w || got.GroupID == nil || *got.GroupID != gid || got.Booked() || got.ProvisionedAt != nil || got.BatchID != nil {
+	if !got.AutoRenew || got.AutoRenewDuration != catalog.D1w || got.GroupID == nil || *got.GroupID != target || got.Booked() || got.ProvisionedAt != nil || got.BatchID != nil {
 		t.Fatalf("moved = %+v", got)
 	}
 	lower, upper, status := e.lease(moved.ID)
 	if status != "active" || !lower.Equal(e.clock.Now()) || !upper.Equal(e.clock.Now().Add(rental.CreateTimeout+24*time.Hour+rental.Tail)) {
 		t.Fatalf("lease = [%v, %v) %s", lower, upper, status)
+	}
+}
+
+func TestAdminMigrateToUngroupedMachineClearsGroup(t *testing.T) {
+	e := newEnv(t, 2)
+	actor := audit.Actor{AdminID: 1, IP: "127.0.0.1"}
+	gid := e.group("A", true)
+	_, old := e.place(catalog.D1d)
+	e.ack(true)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET group_id = $2 WHERE id = $1`, old.ID, gid); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "GPU 报错")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(moved.ID); got.GroupID != nil {
+		t.Fatalf("moved group_id = %v, want nil", *got.GroupID)
+	}
+	e.ack(true) // 新实例开通完成，旧实例洗机完成
+	if got := e.get(old.ID); got.State != rental.StateReleased {
+		t.Fatalf("old state = %s", got.State)
+	}
+	if err := e.svc.AdminDeleteGroup(e.ctx, actor, gid); err != nil {
+		t.Fatalf("delete old group after migrate = %v", err)
 	}
 }

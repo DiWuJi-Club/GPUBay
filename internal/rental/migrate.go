@@ -57,7 +57,7 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 				 auto_renew, auto_renew_duration, group_id, created_at, updated_at)
 				VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $12, $13, $14, $14) RETURNING `+instanceCols,
 				id, old.UserID, m.ID, old.ProductID, old.ImageID, remaining, s.d.Box.Seal([]byte(randx.Password(16))), old.PasswordAuth, hostPub, s.d.Box.Seal(hostPEM),
-				old.AutoRenew, string(old.AutoRenewDuration), old.GroupID, now))
+				old.AutoRenew, string(old.AutoRenewDuration), m.GroupID, now))
 			if err != nil {
 				return err
 			}
