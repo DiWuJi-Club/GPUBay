@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  durationLabel, fmtTime, fmtYuan, isApiError, labelOf, useIdempotencyKey,
+  durationLabel, fmtTime, fmtYuan, isApiError, labelOf,
   type AppCatalogItem, type Availability, type BookingResult, type CalendarDay, type CalendarPeriod, type Duration, type Group, type GroupMachine, type Image, type Instance, type Listed, type Order, type Product,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
@@ -8,9 +8,10 @@ import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { useGuide } from '../composables/useGuide'
-import { appConfirmText, appOptionLabel, compatibleImages, envDefaults, stripEmpty } from '../logic/apps'
+import { appConfirmText, appOptionLabel, compatibleImages, envDefaults } from '../logic/apps'
 import { cstDay, describeDuration, earliestStart, hourOptions, isLegacyImmediate, latestStart, MAX_COUNT, MAX_QUANTITY, startAtISO, totalPrice } from '../logic/booking'
 import { notifyError } from '../logic/notify'
+import { bookingBody, orderBody, useRentKey } from '../logic/rent'
 import { refreshBalance, session } from '../store/session'
 import AppDialog from './AppDialog.vue'
 import AppEnvForm from './AppEnvForm.vue'
@@ -76,7 +77,6 @@ const appSel = computed({ get: () => form.appId ?? NO_APP, set: (v: number) => {
 const selectedApp = computed(() => props.apps.find((a) => a.id === form.appId) ?? null)
 const imageOptions = computed(() => (selectedApp.value ? compatibleImages(selectedApp.value, props.images) : props.images))
 const envValues = ref<Record<string, string>>({})
-const appEnv = computed(() => stripEmpty(envValues.value)) // 空值交给服务器补默认
 const envForm = ref<InstanceType<typeof AppEnvForm> | null>(null)
 const appError = ref('') // 后端 app_* 错误文案，显示在表单里
 /** 按所选应用重置镜像与变量；取消预装时镜像恢复为打开时的选择。 */
@@ -104,7 +104,8 @@ const dayMax = computed(() => cstDay(latestStart(nowServer())))
 const canSpecifyMachine = computed(() => form.count === 1 && form.groupId !== null)
 const notEnough = computed(() => availability.value != null && availability.value.available < form.count)
 const legacy = computed(() => isLegacyImmediate({ immediate: form.immediate, count: form.count, quantity: form.quantity, groupId: form.groupId, machineId: form.machineId, autoRenew: form.autoRenew }))
-const key = useIdempotencyKey(() => [props.product.id, form.groupId, form.count, form.immediate, form.day, form.hour, form.duration, form.quantity, form.imageId, form.machineId, form.autoRenew, form.autoRenewDuration, form.appId, JSON.stringify(appEnv.value)])
+// 派生参数（含应用与去掉空值的变量）的值变了才换键；同参数重试复用
+const key = useRentKey(() => props.product.id, form, () => envValues.value)
 
 watch(() => form.duration, (d) => {
   if (form.quantity > MAX_QUANTITY[d]) form.quantity = MAX_QUANTITY[d]
@@ -247,10 +248,8 @@ function toConfirm() {
   step.value = 'confirm'
 }
 
-/** 不预装时请求体不带 app_id / app_env（与计划 6 一致）。 */
-function appBody() {
-  return selectedApp.value ? { app_id: selectedApp.value.id, app_env: appEnv.value } : {}
-}
+/** 预装的应用 ID：不预装（或应用不在目录里）时为 null，请求体不带 app_id / app_env（与计划 6 一致）。 */
+const appIdForBody = () => selectedApp.value?.id ?? null
 
 async function submit() {
   if (submitting.value || form.imageId == null) return
@@ -263,14 +262,10 @@ async function submit() {
   try {
     let placed: PlacedResult
     if (legacy.value) {
-      const out = await api.post<{ order: Order; instance: Instance }>('/orders', { product_id: props.product.id, duration: form.duration, image_id: form.imageId, ...appBody() }, { idempotencyKey: key.current() })
+      const out = await api.post<{ order: Order; instance: Instance }>('/orders', orderBody(props.product.id, form, appIdForBody(), envValues.value), { idempotencyKey: key.current() })
       placed = { instances: [out.instance], batchId: null, immediate: true }
     } else {
-      const out = await api.post<BookingResult>('/bookings', {
-        product_id: props.product.id, image_id: form.imageId, group_id: form.groupId, machine_id: form.machineId, count: form.count,
-        duration: form.duration, quantity: form.quantity, start_at: startAt.value ?? undefined, auto_renew: form.autoRenew, auto_renew_duration: form.autoRenewDuration,
-        ...appBody(),
-      }, { idempotencyKey: key.current() })
+      const out = await api.post<BookingResult>('/bookings', bookingBody(props.product.id, form, startAt.value, appIdForBody(), envValues.value), { idempotencyKey: key.current() })
       placed = { instances: out.instances, batchId: out.batch?.id ?? null, immediate: form.immediate }
     }
     key.rotate()
@@ -347,7 +342,7 @@ async function submit() {
         </el-form-item>
         <template v-if="selectedApp">
           <el-alert v-if="appError" type="error" :title="appError" :closable="false" show-icon data-testid="rent-app-error" />
-          <AppEnvForm v-if="selectedApp.version.env.length" ref="envForm" v-model="envValues" :spec="selectedApp.version.env" />
+          <AppEnvForm v-if="selectedApp.version.env.length" :key="selectedApp.id" ref="envForm" v-model="envValues" :spec="selectedApp.version.env" />
         </template>
         <el-form-item v-if="canSpecifyMachine" label="指定机器（可选）">
           <el-select v-model="form.machineId" clearable placeholder="由系统分配" data-testid="rent-machine">

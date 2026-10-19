@@ -1,7 +1,8 @@
 import type { AppCatalogItem, Deployment, DeploymentEvent, UserEvent } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  addPickReason, appOpBlockReason, canAddApp, deploymentActions, deploymentBusy, instanceAppHint, mergeTimeline, redeployForm, summaryTag,
+  addPickReason, appOpBlockReason, canAddApp, deploymentActions, deploymentBusy, instanceAppHint, mergeTimeline, redeployEnv, redeployForm,
+  redeployVersions, summaryTag,
 } from '../apps'
 
 const dep = (over: Partial<Deployment> = {}): Deployment => ({
@@ -63,13 +64,18 @@ describe('addPickReason', () => {
 })
 
 describe('summaryTag', () => {
-  const s = (state: Deployment['state'], progress = 0) => summaryTag({ id: 'd', name: 'vLLM', state, progress, url: null })
+  const s = (state: Deployment['state'], progress = 0) => summaryTag({ id: 'd', name: 'vLLM', state, progress, url: null }, 'running')
   it('部署中带百分比（蓝），运行中绿，失败红，已停止灰', () => {
     expect(s('installing', 45)).toEqual({ text: '部署中 45%', type: 'primary' })
     expect(s('running')).toEqual({ text: '运行中', type: 'success' })
     expect(s('failed')).toEqual({ text: '失败', type: 'danger' })
     expect(s('stopped')).toEqual({ text: '已停止', type: 'info' })
     expect(s('queued')).toEqual({ text: '等待部署', type: 'info' })
+  })
+  it('停机实例上仍是运行中的部署显示灰色「已停机」', () => {
+    const a = { id: 'd', name: 'vLLM', state: 'running' as const, progress: 100, url: 'https://x/' }
+    expect(summaryTag(a, 'stopped')).toEqual({ text: '已停机', type: 'info' })
+    expect(summaryTag({ ...a, state: 'failed' }, 'stopped')).toEqual({ text: '失败', type: 'danger' })
   })
 })
 
@@ -101,5 +107,41 @@ describe('mergeTimeline', () => {
       { at: '2026-10-20T01:00:00Z', kind: 'created', text: '开通' },
       { at: '2026-10-20T00:30:00Z', kind: 'app', text: 'vLLM：创建部署' },
     ])
+  })
+})
+
+describe('redeployEnv', () => {
+  it('空值不发送（secret 沿用、普通变量补默认）；明确「清除」的 secret 发送空串', () => {
+    const values = { MODEL_ID: 'b', MAX: '', API_KEY: '', TOKEN: '', NEWKEY: 'n12345678' }
+    expect(redeployEnv(values, {})).toEqual({ MODEL_ID: 'b', NEWKEY: 'n12345678' })
+    expect(redeployEnv(values, { API_KEY: true, TOKEN: false })).toEqual({ MODEL_ID: 'b', NEWKEY: 'n12345678', API_KEY: '' })
+  })
+  it('勾了清除又填了新值：发送新值', () => {
+    expect(redeployEnv({ API_KEY: 'k12345678' }, { API_KEY: true })).toEqual({ API_KEY: 'k12345678' })
+  })
+})
+
+describe('redeployVersions', () => {
+  const curEnv = [{ name: 'A', type: 'string' as const }]
+  const newEnv = [{ name: 'A', type: 'string' as const }, { name: 'B', type: 'string' as const }]
+  const d = dep({ version_id: 10, version: '1.0.0', latest_version_id: 11, latest_version: '1.1.0', update_available: true, spec: { ports: [], env: curEnv } })
+  const cat = (id: number, version: string) => [{ id: 1, version: { id, version, env: newEnv } }] as unknown as AppCatalogItem[]
+  it('没有新版本：只有当前版本', () => {
+    expect(redeployVersions({ ...d, update_available: false }, cat(11, '1.1.0'))).toEqual([{ id: 10, label: 'v1.0.0（当前）', env: curEnv, disabled: false }])
+  })
+  it('最新版本取应用目录（提交的就是这个版本），变量按它渲染', () => {
+    expect(redeployVersions(d, cat(11, '1.1.0'))).toEqual([
+      { id: 10, label: 'v1.0.0（当前）', env: curEnv, disabled: false },
+      { id: 11, label: 'v1.1.0（最新）', env: newEnv, disabled: false },
+    ])
+  })
+  it('目录里的最新版本与部署视图不一致：以目录为准', () => {
+    expect(redeployVersions(d, cat(12, '1.2.0'))[1]).toEqual({ id: 12, label: 'v1.2.0（最新）', env: newEnv, disabled: false })
+  })
+  it('目录说当前就是最新：不提供「最新」', () => {
+    expect(redeployVersions(d, cat(10, '1.0.0'))).toHaveLength(1)
+  })
+  it('应用目录没加载到：「最新」不可选', () => {
+    expect(redeployVersions(d, [])[1]).toEqual({ id: 11, label: 'v1.1.0（最新，应用目录加载失败，暂不可选）', env: [], disabled: true })
   })
 })

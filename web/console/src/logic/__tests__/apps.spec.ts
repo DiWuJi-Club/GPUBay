@@ -56,6 +56,11 @@ describe('validateEnvValue（与 Go checkValue / ValidateEnv 一致）', () => {
     ['pattern 全匹配', s({ pattern: '0\\.[3-9]' }), '0.7', null],
     ['pattern 不是前缀匹配', s({ pattern: '0\\.[3-9]' }), '0.75', '格式不正确'],
     ['非法 pattern 交给服务器', s({ pattern: '(?P<x>a)' }), 'zzz', null],
+    // RE2 专有语法：u 模式下编译失败 → 跳过前端校验（不带 u 会编译成别的含义而误拦合法值）
+    ['RE2 \\z 交给服务器', s({ pattern: '[a-z]+\\z' }), 'abc', null],
+    ['RE2 \\A 交给服务器', s({ pattern: '\\A[a-z]+' }), 'abc', null],
+    ['RE2 [[:alpha:]] 交给服务器', s({ pattern: '[[:alpha:]]+' }), 'abc', null],
+    ['RE2 \\pL 交给服务器', s({ pattern: '\\pL+' }), 'abc', null],
     ['secret 少于 8', s({ type: 'secret' }), 'abc1234', '至少 8 个字符'],
     ['secret 8 位', s({ type: 'secret' }), 'abc12345', null],
     ['secret pattern', s({ type: 'secret', pattern: '^[A-Za-z0-9]{16,64}$' }), 'abcdefgh', '格式不正确'],

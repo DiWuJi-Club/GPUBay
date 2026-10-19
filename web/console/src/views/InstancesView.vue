@@ -51,7 +51,7 @@ const shown = computed(() => (batchFilter.value ? items.value.filter((i) => i.ba
 const rows = computed(() =>
   shown.value.map((i) => {
     const remaining = remainingNow(i, fetchedAt.value, now.value)
-    const apps = (i.apps_summary ?? []).map((a) => ({ ...a, tag: summaryTag(a), clickable: i.state === 'running' && a.state === 'running' && !!a.url }))
+    const apps = (i.apps_summary ?? []).map((a) => ({ ...a, tag: summaryTag(a, i.state), clickable: i.state === 'running' && a.state === 'running' && !!a.url }))
     return { ...i, remaining, timeText: instanceTimeText(i, remaining), cancellable: canCancel(i, fetchedAt.value, now.value), apps }
   }),
 )

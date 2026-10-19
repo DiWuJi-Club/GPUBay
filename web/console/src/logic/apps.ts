@@ -31,16 +31,17 @@ export function stripEmpty(values: Record<string, string>): Record<string, strin
 const envLabel = (e: AppEnvSpec) => e.label || e.name
 const byteLen = (v: string) => new TextEncoder().encode(v).length
 
-/** pattern 编译为全匹配（Go：`^(?:pattern)$`）；JS 无法编译的 RE2 语法返回 null，由服务器校验。 */
+/**
+ * pattern 编译为全匹配（Go：`^(?:pattern)$`），只用 u 模式：u 模式对未知转义与孤立括号报错，
+ * RE2 专有语法（`\z`、`\A`、`[[:alpha:]]`、`\pL` 等）因此编译失败 → 返回 null，跳过前端校验交给服务器；
+ * 不带 u 时这些语法会被 JS 编译成别的含义（`\z` = 字母 z），误拦合法值。
+ */
 function fullMatch(pattern: string): RegExp | null {
-  for (const flags of ['u', '']) {
-    try {
-      return new RegExp(`^(?:${pattern})$`, flags)
-    } catch {
-      // 换不带 u 再试
-    }
+  try {
+    return new RegExp(`^(?:${pattern})$`, 'u')
+  } catch {
+    return null
   }
-  return null
 }
 
 /**
@@ -170,8 +171,12 @@ export function addPickReason(app: AppCatalogItem, imageId: number, deployed: Pi
   return null
 }
 
-/** 实例列表的应用摘要标签：部署中 45%（蓝）/ 运行中（绿）/ 失败（红）/ 已停止（灰），其余按状态文案。 */
-export function summaryTag(a: AppsSummaryItem): { text: string; type: string } {
+/**
+ * 实例列表的应用摘要标签：部署中 45%（蓝）/ 运行中（绿）/ 失败（红）/ 已停止（灰），其余按状态文案。
+ * 实例停机时容器里的进程已不在，仍记为 running 的部署显示灰色「已停机」（续费后自动恢复）。
+ */
+export function summaryTag(a: AppsSummaryItem, instanceState: InstanceState): { text: string; type: string } {
+  if (instanceState === 'stopped' && a.state === 'running') return { text: '已停机', type: 'info' }
   if (a.state === 'installing') return { text: `部署中 ${a.progress}%`, type: 'primary' }
   return { text: labelOf(deploymentStateLabel, a.state), type: labelOf(deploymentStateType, a.state) }
 }
@@ -191,6 +196,34 @@ export function redeployForm(d: Pick<Deployment, 'env' | 'secret_env'>, spec: Ap
     } else values[e.name] = d.env[e.name] ?? defaults[e.name]
   }
   return { values, secretSet }
+}
+
+/**
+ * 重新部署提交的 env（规格 §8）：空值不发送——普通变量由服务器补默认，留空的 secret 沿用旧值；
+ * 用户明确勾了「清除」且没填新值的 secret 发送空串（服务器清除）。
+ */
+export function redeployEnv(values: Record<string, string>, cleared: Record<string, boolean>): Record<string, string> {
+  const env = stripEmpty(values)
+  for (const [name, on] of Object.entries(cleared)) if (on && !(name in env)) env[name] = ''
+  return env
+}
+
+export interface RedeployVersion { id: number; label: string; env: AppEnvSpec[]; disabled: boolean }
+
+/**
+ * 重新部署可选的版本。「当前」用部署自带的 spec；「最新」取应用目录里的最新已发布版本——提交的就是这个版本 ID，
+ * 变量表单也按它渲染（部署视图的 latest_version 可能与目录不一致时以目录为准）。目录里没有该应用（加载失败）时「最新」不可选。
+ */
+export function redeployVersions(d: Deployment, catalog: AppCatalogItem[]): RedeployVersion[] {
+  const out: RedeployVersion[] = [{ id: d.version_id, label: `v${d.version}（当前）`, env: d.spec.env ?? [], disabled: false }]
+  if (!d.update_available) return out
+  const cat = catalog.find((a) => a.id === d.app_id)
+  if (cat) {
+    if (cat.version.id !== d.version_id) out.push({ id: cat.version.id, label: `v${cat.version.version}（最新）`, env: cat.version.env, disabled: false })
+  } else if (d.latest_version_id != null) {
+    out.push({ id: d.latest_version_id, label: `v${d.latest_version}（最新，应用目录加载失败，暂不可选）`, env: [], disabled: true })
+  }
+  return out
 }
 
 export interface TimelineItem { at: string; kind: string; text: string }
