@@ -38,7 +38,6 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 		return Order{}, err
 	}
 	now := s.d.Clock.Now()
-	secs := seconds(d) * int64(quantity)
 	var ord Order
 	// 同一用户并发下批次（先锁钱包再锁机器）与续费可能死锁（40P01）：整个事务重试一次
 	err := withRetry(func() error {
@@ -64,25 +63,9 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 			if inst.State != StateReserved && inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped {
 				return apperr.ErrInvalidState
 			}
-			if err := s.renewFits(ctx, tx, inst, secs, now); err != nil {
-				return err
-			}
-			if renewHook != nil {
-				renewHook()
-			}
-			if ord, err = s.charge(ctx, tx, userID, "renew", inst.ID, inst.ProductID, d, quantity, false, nil, idempotencyKey, now); err != nil {
-				return err
-			}
-			if err := s.addTime(ctx, tx, inst, secs, now); err != nil {
-				return err
-			}
-			if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, "renew "+ord.ID, now); err != nil {
-				return err
-			}
-			if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
-				return err
-			}
-			return s.verifyLeaseFits(ctx, tx, inst.ID, now)
+			ord, err = s.applyRenew(ctx, tx, inst, d, quantity, false, idempotencyKey, now,
+				func(o Order) string { return "renew " + o.ID })
+			return err
 		})
 	})
 	if isIdempotencyViolation(err) {
@@ -96,6 +79,36 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 		}
 	}
 	if err != nil {
+		return Order{}, err
+	}
+	return ord, nil
+}
+
+// applyRenew 续费的共用核心（手动续费与自动续费都走这里）：renewFits → 扣款建单 → addTime → 事件 → refreshLease → verifyLeaseFits。
+// 调用方已锁住实例行并校验过状态；任一步失败调用方须回滚整个事务（或 savepoint），不会出现扣了款却没加时。
+func (s *Service) applyRenew(ctx context.Context, tx pgx.Tx, inst Instance, d catalog.Duration, quantity int, auto bool,
+	idempotencyKey string, now time.Time, event func(Order) string) (Order, error) {
+	secs := seconds(d) * int64(quantity)
+	if err := s.renewFits(ctx, tx, inst, secs, now); err != nil {
+		return Order{}, err
+	}
+	if renewHook != nil {
+		renewHook()
+	}
+	ord, err := s.charge(ctx, tx, inst.UserID, "renew", inst.ID, inst.ProductID, d, quantity, auto, nil, idempotencyKey, now)
+	if err != nil {
+		return Order{}, err
+	}
+	if err := s.addTime(ctx, tx, inst, secs, now); err != nil {
+		return Order{}, err
+	}
+	if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, event(ord), now); err != nil {
+		return Order{}, err
+	}
+	if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
+		return Order{}, err
+	}
+	if err := s.verifyLeaseFits(ctx, tx, inst.ID, now); err != nil {
 		return Order{}, err
 	}
 	return ord, nil
