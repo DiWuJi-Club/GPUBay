@@ -21,3 +21,6 @@ func (s *Service) MarkFailed(ctx context.Context, q db.Querier, cur Deployment, 
 func (s *Service) MarkRemoved(ctx context.Context, q db.Querier, cur Deployment, code, detail string, now time.Time) error {
 	return s.markRemoved(ctx, q, cur, code, detail, now)
 }
+
+// SetBeforeWriteback 设置 Runner 的测试钩子（exec 之后、回写事务之前调用）；nil 清除。
+func SetBeforeWriteback(r *Runner, fn func(Deployment)) { r.beforeWriteback = fn }

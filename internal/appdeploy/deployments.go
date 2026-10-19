@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"spark-cloud/internal/appdeploy/runtime"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
@@ -216,4 +217,47 @@ func (s *Service) setRemoved(ctx context.Context, q db.Querier, cur Deployment, 
 		return err
 	}
 	return addEvent(ctx, q, cur.ID, cur.State, StateRemoved, detail, now)
+}
+
+// ---- Runner 用 ----
+
+// bundleError 部署包无法生成（版本 / 变量数据问题，或敏感变量无法解密；重试无用）：Runner 把部署标为 upload_failed。
+type bundleError struct{ err error }
+
+func (e *bundleError) Error() string { return e.err.Error() }
+func (e *bundleError) Unwrap() error { return e.err }
+
+// appAndVersion 取部署的应用与版本（含脚本）。
+func (s *Service) appAndVersion(ctx context.Context, d Deployment) (App, Version, error) {
+	app, err := s.d.Catalog.GetApp(ctx, d.AppID)
+	if err != nil {
+		return App{}, Version{}, fmt.Errorf("app %d: %w", d.AppID, err)
+	}
+	ver, err := s.d.Catalog.GetVersion(ctx, d.AppVersionID)
+	if err != nil {
+		return App{}, Version{}, fmt.Errorf("app version %d: %w", d.AppVersionID, err)
+	}
+	return app, ver, nil
+}
+
+// bundleFor 生成部署的部署包（run.sh + app.sh + spec.json + env）。healthAddr 非 nil 时覆盖 run.sh 的健康检查地址（测试）。
+func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, healthAddr func(port int) string) ([]byte, App, error) {
+	app, ver, err := s.appAndVersion(ctx, d)
+	if err != nil {
+		return nil, App{}, err
+	}
+	secret, err := openSecrets(s.d.Box, d.SecretEnvEnc)
+	if err != nil {
+		return nil, app, &bundleError{err}
+	}
+	in := BundleInput{Slug: app.Slug, InstanceID: d.InstanceID, AppRoot: appRoot, SpecHash: d.SpecHash, Spec: ver.Spec, Script: ver.Script,
+		Env: d.Env, Secret: secret, HFEndpoint: s.d.HFEndpoint, PipIndexURL: s.d.PipIndexURL}
+	if healthAddr != nil && len(ver.Spec.Ports) > 0 {
+		in.HealthAddr = healthAddr(ver.Spec.Ports[0].Port)
+	}
+	b, err := Bundle(in, runtime.RunSH)
+	if err != nil {
+		return nil, app, &bundleError{err}
+	}
+	return b, app, nil
 }

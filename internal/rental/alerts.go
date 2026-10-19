@@ -36,3 +36,6 @@ func AlertBookingUnfulfilled(instanceID string) string {
 func AlertBookingCancelFailed(instanceID string) string {
 	return fmt.Sprintf("实例 %s 的预订取消失败，详情见日志", instanceID)
 }
+func AlertAppDeployUnreachable(instanceID string) string {
+	return fmt.Sprintf("实例 %s 的应用部署无法连接容器，详情见日志", instanceID)
+}
