@@ -1,3 +1,4 @@
+import type { InstancePort, SshKey } from './access'
 import type { Duration } from './catalog'
 import type { InstanceState, OrderKind, OrderStatus } from './instance'
 import type { KycResult } from './kyc'
@@ -85,6 +86,7 @@ export interface AdminInstance {
   remaining_seconds: number
   expires_at: string | null
   stopped_at: string | null
+  password_auth: boolean
   created_at: string
 }
 
@@ -169,6 +171,8 @@ export interface AdminInstanceDetail {
   events: InstanceEvent[]
   orders: AdminOrder[]
   commands: CommandRow[]
+  ports: InstancePort[]
+  ssh_host_pubkey_fingerprint: string
 }
 
 export interface RefundQuote {
@@ -222,6 +226,7 @@ export interface UserDetail {
   orders: AdminOrder[]
   ledger: LedgerRow[]
   kyc: AdminKYCRecord[]
+  ssh_keys: SshKey[]
 }
 
 export interface AdminPrice {
@@ -280,4 +285,5 @@ export interface Dashboard {
   order_today: number
   order_month: number
   utilization: { date: string; rate: number }[]
+  ssh_sessions_open: number
 }

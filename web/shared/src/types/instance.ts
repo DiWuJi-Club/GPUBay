@@ -15,6 +15,10 @@ export interface Instance {
   pending_seconds: number
   retain_until: string | null
   ssh_command: string
+  password_auth: boolean
+  ssh_host: string
+  ssh_port: number
+  ports_count: number
   created_at: string
 }
 

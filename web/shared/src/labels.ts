@@ -26,6 +26,7 @@ export const alertKindLabel: LabelMap = {
   lan_ip_mismatch: '内网 IP 不一致', container_down: '容器未运行', container_missing: '容器不存在', data_disk_missing: '数据盘未挂载',
   orphan_container: '残留容器', orphan_wipe_failed: '残留容器清理失败', root_disk_high: '根分区空间不足', gpu_temp_high: 'GPU 温度过高',
   invalid_report: '上报数据异常',
+  ssh_bruteforce: 'SSH 暴力破解', upstream_unreachable: '实例 SSH 上游不可达', tls_cert_reload_failed: 'TLS 证书加载失败', tls_cert_expiring: 'TLS 证书即将到期',
 }
 export const roleLabel: LabelMap = { super: '超级管理员', ops: '运维', finance: '财务' }
 export const adminStatusLabel: LabelMap = { active: '正常', disabled: '已停用' }
@@ -37,6 +38,7 @@ export const durationLabel: LabelMap = { '1d': '1 天', '1w': '1 周', '1m': '1 
 export const commandTypeLabel: LabelMap = {
   create_instance: '开通实例', start_instance: '启动实例', stop_instance: '停止实例', wipe_instance: '洗机', pull_image: '预拉取镜像',
 }
+export const portVisibilityLabel: LabelMap = { private: '私有', public: '公开' }
 export const commandStatusLabel: LabelMap = { pending: '待执行', sent: '已下发', done: '已完成', failed: '失败' }
 
 /** 后台审计动作（与后端写入值一致，顺序按模块）。 */
@@ -46,6 +48,8 @@ export const auditActions: readonly string[] = [
   'pdu.create', 'pdu.update',
   'alert.resolve',
   'instance.extend', 'instance.migrate', 'instance.rewipe', 'instance.refund_release',
+  'instance.password_reset', 'instance.password_auth', 'instance.port_add', 'instance.port_update', 'instance.port_delete', 'instance.port_force_private',
+  'ssh_key.add', 'ssh_key.delete',
   'user.ban', 'user.unban',
   'kyc.review',
   'wallet.adjust', 'wallet.manual_recharge',

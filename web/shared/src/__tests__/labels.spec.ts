@@ -17,7 +17,10 @@ describe('labels', () => {
     expect(labelOf(alertKindLabel, 'container_down')).toBe('容器未运行')
   })
   it('审计动作列表与后端写入值一致', () => {
-    expect(auditActions).toHaveLength(29)
+    expect(auditActions).toHaveLength(37)
+    expect(new Set(auditActions).size).toBe(auditActions.length)
+    expect(auditActions).toContain('instance.port_force_private')
+    expect(auditActions).toContain('ssh_key.delete')
     expect(auditActions).toContain('instance.refund_release')
     expect(auditActions).toContain('wallet.manual_recharge')
   })
