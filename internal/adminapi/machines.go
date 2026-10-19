@@ -315,16 +315,15 @@ func (s *Server) handleEnrollCommand(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	if err := s.stepUp(r, req.TOTP); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
 	if s.Gateway == nil {
 		s.writeError(w, r, apperr.New("gateway_unavailable", "未配置 Agent 网关", http.StatusInternalServerError))
 		return
 	}
-	tok, err := s.Fleet.IssueEnrollToken(r.Context(), s.actor(r), id)
-	if err != nil {
+	var tok fleet.EnrollToken
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		tok, err = s.Fleet.IssueEnrollToken(r.Context(), s.actor(r), id)
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
@@ -344,11 +343,7 @@ func (s *Server) handleRevokeEnrollment(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, r, err)
 		return
 	}
-	if err := s.stepUp(r, req.TOTP); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	if err := s.Fleet.RevokeEnrollment(r.Context(), s.actor(r), id); err != nil {
+	if err := s.withStepUp(r, req.TOTP, func() error { return s.Fleet.RevokeEnrollment(r.Context(), s.actor(r), id) }); err != nil {
 		s.writeError(w, r, err)
 		return
 	}

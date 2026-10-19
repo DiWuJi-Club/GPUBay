@@ -44,12 +44,11 @@ func (s *Server) handleSetPrice(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	if err := s.stepUp(r, req.TOTP); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	p, err := s.Catalog.SetPrice(r.Context(), s.actor(r), id, catalog.Duration(chi.URLParam(r, "duration")), req.Amount, req.Enabled)
-	if err != nil {
+	var p any
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		p, err = s.Catalog.SetPrice(r.Context(), s.actor(r), id, catalog.Duration(chi.URLParam(r, "duration")), req.Amount, req.Enabled)
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}

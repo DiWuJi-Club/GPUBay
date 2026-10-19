@@ -157,7 +157,7 @@ func TestBookingLifecycleHTTP(t *testing.T) {
 	e.clk.Advance(5 * time.Minute)
 	e.agent()
 	st := e.state(id)
-	if st["state"] != "running" || st["remaining_seconds"].(float64) != 86400 || st["ssh_command"] == "" {
+	if cmd, _ := st["ssh_command"].(string); st["state"] != "running" || st["remaining_seconds"].(float64) != 86400 || cmd == "" {
 		t.Fatalf("after create = %v", st)
 	}
 	// 到 S：剩余仍是 24h（早开通不计费）

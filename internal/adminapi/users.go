@@ -198,15 +198,13 @@ type moneyRequest struct {
 	TOTP   string `json:"totp"`
 }
 
-// decodeMoney 解析调账 / 入账请求并完成二次验证。
+// decodeMoney 解析调账 / 入账请求（二次验证由调用方经 withStepUp 与操作一起完成）。
 func (s *Server) decodeMoney(w http.ResponseWriter, r *http.Request) (int64, moneyRequest, bool) {
 	id, err := pathID(r, "id")
 	if err == nil {
 		var req moneyRequest
 		if err = httpx.DecodeJSON(r, &req); err == nil {
-			if err = s.stepUp(r, req.TOTP); err == nil {
-				return id, req, true
-			}
+			return id, req, true
 		}
 	}
 	s.writeError(w, r, err)
@@ -218,8 +216,11 @@ func (s *Server) handleAdjust(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	after, err := s.Wallet.AdminAdjust(r.Context(), currentSession(r).Admin.ID, id, req.Amount, req.Remark, s.actor(r).IP)
-	if err != nil {
+	var after int64
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		after, err = s.Wallet.AdminAdjust(r.Context(), currentSession(r).Admin.ID, id, req.Amount, req.Remark, s.actor(r).IP)
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
@@ -231,8 +232,11 @@ func (s *Server) handleManualRecharge(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rch, err := s.Billing.ManualRecharge(r.Context(), s.actor(r), id, req.Amount, req.Remark)
-	if err != nil {
+	var rch any
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		rch, err = s.Billing.ManualRecharge(r.Context(), s.actor(r), id, req.Amount, req.Remark)
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}

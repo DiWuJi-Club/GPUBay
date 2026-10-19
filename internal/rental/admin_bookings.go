@@ -127,7 +127,7 @@ func (s *Service) AdminReassign(ctx context.Context, actor audit.Actor, id strin
 			if err != nil {
 				return err
 			}
-			from := inst.MachineID
+			from, fromGroup := inst.MachineID, inst.GroupID
 			if machineID == nil {
 				moved, err := s.reassign(ctx, tx, &inst, &lease, "admin: "+reason, false, now)
 				if err != nil {
@@ -140,7 +140,7 @@ func (s *Service) AdminReassign(ctx context.Context, actor audit.Actor, id strin
 				return err
 			}
 			if err := audit.Record(ctx, tx, now, actor.Entry("booking.reassign", "instance", inst.ID,
-				map[string]any{"from_machine": from, "to_machine": inst.MachineID, "reason": reason})); err != nil {
+				map[string]any{"from_machine": from, "to_machine": inst.MachineID, "from_group": fromGroup, "to_group": inst.GroupID, "reason": reason})); err != nil {
 				return err
 			}
 			out, err = lockInstance(ctx, tx, inst.ID)

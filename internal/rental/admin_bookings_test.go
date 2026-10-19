@@ -116,6 +116,11 @@ func TestAdminReassignToTakesTargetGroupAndLocksTarget(t *testing.T) {
 	if g := e.get(inst.ID).GroupID; g == nil || *g != gh {
 		t.Fatalf("stored group_id = %v", g)
 	}
+	var fromGroup, toGroup int64
+	if err := e.pool.QueryRow(e.ctx, `SELECT (diff->>'from_group')::bigint, (diff->>'to_group')::bigint FROM audit_logs
+		WHERE action = 'booking.reassign' AND target_id = $1 ORDER BY id DESC LIMIT 1`, inst.ID).Scan(&fromGroup, &toGroup); err != nil || fromGroup != ga || toGroup != gh {
+		t.Fatalf("audit groups = %d -> %d, %v", fromGroup, toGroup, err)
+	}
 	// 新机组里没有别的机器：自动改派无候选（旧机组 A 的两台不再是候选）
 	if _, err := e.svc.AdminReassign(e.ctx, actor, inst.ID, nil, "自动"); !errors.Is(err, apperr.ErrMachineUnavailable) {
 		t.Fatalf("auto reassign after group change = %v", err)

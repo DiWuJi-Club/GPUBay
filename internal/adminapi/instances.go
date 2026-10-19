@@ -157,12 +157,11 @@ func (s *Server) handleRefundRelease(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	if err := s.stepUp(r, req.TOTP); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	refunded, err := s.Rental.RefundRelease(r.Context(), s.actor(r), chi.URLParam(r, "id"), req.Amount, req.Reason)
-	if err != nil {
+	var refunded int64
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		refunded, err = s.Rental.RefundRelease(r.Context(), s.actor(r), chi.URLParam(r, "id"), req.Amount, req.Reason)
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
