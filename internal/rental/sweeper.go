@@ -371,6 +371,15 @@ func (s *Service) Sweep(ctx context.Context) error {
 	if err := s.resumeOnline(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("resume: %w", err))
 	}
+	if _, err := s.RefreshCappedLeases(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("refresh capped leases: %w", err))
+	}
+	if _, err := s.ProvisionDue(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("provision: %w", err))
+	}
+	if _, err := s.AutoRenewDue(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("auto renew: %w", err))
+	}
 	if _, err := s.ExpireDue(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("expire: %w", err))
 	}

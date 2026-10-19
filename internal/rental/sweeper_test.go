@@ -624,3 +624,23 @@ func TestResumeMachineCapsExpiryAtNextBooking(t *testing.T) {
 		t.Fatalf("lease upper = %v", upper)
 	}
 }
+
+// 同一轮 Sweep：到期前 1 小时的自动续费先于到期停机；到点的预订在同一轮里开通。
+func TestSweepOrderProvisionsAndAutoRenewsBeforeExpiry(t *testing.T) {
+	e := newEnv(t, 2)
+	_, running := e.place(catalog.D1d)
+	e.ack(true)
+	e.autoRenewOn(running.ID, catalog.D1d)
+	booked := e.book(dbtest.T0.Add(25 * time.Hour)) // 开通时刻 T0 + 24h
+	e.clock.Advance(24 * time.Hour)                   // running 恰好到期；自动续费本该在 1 小时前触发，这里让两者同一轮
+	e.heartbeatAll()
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(running.ID); got.State != rental.StateRunning || !got.ExpiresAt.Equal(dbtest.T0.Add(48*time.Hour)) {
+		t.Fatalf("auto renew must run before expiry: %+v", got)
+	}
+	if got := e.get(booked.ID); got.State != rental.StateCreating {
+		t.Fatalf("booking must be provisioned in the same sweep: %+v", got)
+	}
+}

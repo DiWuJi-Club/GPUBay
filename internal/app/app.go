@@ -130,8 +130,10 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 				Client:   aliyunClient(cfg, cfg.Aliyun.SMSEndpoint),
 				SignName: cfg.Aliyun.SMSSign,
 				Templates: map[string]string{
-					sms.TemplateLoginCode:      cfg.Aliyun.SMSTplLogin,
-					sms.TemplateExpiryReminder: cfg.Aliyun.SMSTplExpiry,
+					sms.TemplateLoginCode:        cfg.Aliyun.SMSTplLogin,
+					sms.TemplateExpiryReminder:   cfg.Aliyun.SMSTplExpiry,
+					sms.TemplateAutoRenewFailed:  cfg.Aliyun.SMSTplAutoRenewFailed,
+					sms.TemplateBookingCancelled: cfg.Aliyun.SMSTplBookingCancelled,
 				},
 			}
 		default:

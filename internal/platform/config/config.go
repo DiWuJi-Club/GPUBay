@@ -61,14 +61,16 @@ type Config struct {
 
 // AliyunConfig 阿里云短信与号码百科（三要素核验）共用一组 AccessKey。
 type AliyunConfig struct {
-	AccessKeyID     string
-	AccessKeySecret string
-	SMSSign         string
-	SMSTplLogin     string
-	SMSTplExpiry    string
-	KYCAuthCode     string
-	SMSEndpoint     string
-	KYCEndpoint     string
+	AccessKeyID            string
+	AccessKeySecret        string
+	SMSSign                string
+	SMSTplLogin            string
+	SMSTplExpiry           string
+	SMSTplAutoRenewFailed  string
+	SMSTplBookingCancelled string
+	KYCAuthCode            string
+	SMSEndpoint            string
+	KYCEndpoint            string
 }
 
 // WechatConfig 微信支付 APIv3 Native 扫码，使用「微信支付公钥」验签。MchID 非空即视为启用。
@@ -114,14 +116,16 @@ func Load(getenv func(string) string) (Config, error) {
 		PDUDriver:     or("SPARK_PDU_DRIVER", "mock"),
 		UploadDir:     or("SPARK_UPLOAD_DIR", "./.devdata/uploads"),
 		Aliyun: AliyunConfig{
-			AccessKeyID:     getenv("SPARK_ALIYUN_ACCESS_KEY_ID"),
-			AccessKeySecret: getenv("SPARK_ALIYUN_ACCESS_KEY_SECRET"),
-			SMSSign:         getenv("SPARK_SMS_SIGN"),
-			SMSTplLogin:     getenv("SPARK_SMS_TPL_LOGIN"),
-			SMSTplExpiry:    getenv("SPARK_SMS_TPL_EXPIRY"),
-			KYCAuthCode:     getenv("SPARK_KYC_AUTH_CODE"),
-			SMSEndpoint:     or("SPARK_ALIYUN_SMS_ENDPOINT", "https://dysmsapi.aliyuncs.com"),
-			KYCEndpoint:     or("SPARK_ALIYUN_KYC_ENDPOINT", "https://dytnsapi.aliyuncs.com"),
+			AccessKeyID:            getenv("SPARK_ALIYUN_ACCESS_KEY_ID"),
+			AccessKeySecret:        getenv("SPARK_ALIYUN_ACCESS_KEY_SECRET"),
+			SMSSign:                getenv("SPARK_SMS_SIGN"),
+			SMSTplLogin:            getenv("SPARK_SMS_TPL_LOGIN"),
+			SMSTplExpiry:           getenv("SPARK_SMS_TPL_EXPIRY"),
+			SMSTplAutoRenewFailed:  getenv("SPARK_SMS_TPL_AUTO_RENEW_FAILED"),
+			SMSTplBookingCancelled: getenv("SPARK_SMS_TPL_BOOKING_CANCELLED"),
+			KYCAuthCode:            getenv("SPARK_KYC_AUTH_CODE"),
+			SMSEndpoint:            or("SPARK_ALIYUN_SMS_ENDPOINT", "https://dysmsapi.aliyuncs.com"),
+			KYCEndpoint:            or("SPARK_ALIYUN_KYC_ENDPOINT", "https://dytnsapi.aliyuncs.com"),
 		},
 		Wechat: WechatConfig{
 			MchID:          getenv("SPARK_WECHAT_MCH_ID"),
@@ -206,7 +210,8 @@ func (c Config) checkPlugins() error {
 	if c.SMSDriver == "aliyun" {
 		if err := requireAll("SPARK_SMS_DRIVER=aliyun",
 			"SPARK_ALIYUN_ACCESS_KEY_ID", a.AccessKeyID, "SPARK_ALIYUN_ACCESS_KEY_SECRET", a.AccessKeySecret,
-			"SPARK_SMS_SIGN", a.SMSSign, "SPARK_SMS_TPL_LOGIN", a.SMSTplLogin, "SPARK_SMS_TPL_EXPIRY", a.SMSTplExpiry); err != nil {
+			"SPARK_SMS_SIGN", a.SMSSign, "SPARK_SMS_TPL_LOGIN", a.SMSTplLogin, "SPARK_SMS_TPL_EXPIRY", a.SMSTplExpiry,
+			"SPARK_SMS_TPL_AUTO_RENEW_FAILED", a.SMSTplAutoRenewFailed, "SPARK_SMS_TPL_BOOKING_CANCELLED", a.SMSTplBookingCancelled); err != nil {
 			return err
 		}
 	}
