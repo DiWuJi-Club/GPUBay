@@ -316,8 +316,10 @@ switch r.status:
 
 ### 4.4 发放（`Release`）
 候选：`referral_rewards WHERE status='pending' AND settle_after <= now` 按 `settle_after` 每轮最多 200 行，逐行独立事务：
-1. `referral_accounts(邀请人) FOR UPDATE` → `referral_rewards(order) FOR UPDATE` 复核 `status='pending' AND settle_after <= now`。
+1. `users(邀请人, 被邀请人) FOR KEY SHARE` → `referral_accounts(邀请人) FOR UPDATE` → `referral_rewards(order) FOR UPDATE SKIP LOCKED` 复核 `status='pending' AND settle_after <= now`。
 2. 门槛（任一不满足 → 跳过，本轮不动，下轮再看）：绑定 `status='active'`；邀请人账户 `status='active'`；邀请人 `users.status='active' AND kyc_status='verified'`（`identity.UserState` 接口）。
+   - 同身份复查（纵深防御：实名钩子失败只留审计 `referral.kyc_check_failed`，可能漏撤销）：被邀请人的任一 verified 指纹等于邀请人或同邀请人其它未撤销被邀请人的任一 verified 指纹 → 按 §3.3 同样撤销绑定（`same_identity`，待发放全部 void，审计 `referral.auto_revoke`），本行计入作废。
+   - 邀请人或被邀请人有晚于绑定 `reviewed_at`（NULL 视为从未复核）的 `referral.kyc_check_failed` 审计 → 搁置：保持 pending、本轮跳过；后台对该绑定的裁决即视为已解决。
 3. `reward == 0` → `status='void'`，事件 `void(detail='zero after refund')`。
 4. 抵欠账：`offset := min(debt, reward)`；`debt −= offset`；事件 `debt_offset(amount=offset)`（不写钱包流水）。
 5. `credit := reward − offset`；`credit > 0` → `Wallet.Apply(Entry{inviter, +credit, referral_rebate, ref('referral', order), remark="邀请返利 138****1234 订单 ord-…"})`；事件 `settle(amount=reward, wallet_ledger_id)`。
@@ -514,7 +516,7 @@ func (s *Service) Admin*(...)                                                // 
   |---|---|
   | Bind（在 identity 事务内） | users(被邀请人, INSERT 持有) → users(码主) FOR KEY SHARE → referral_accounts(码主) FOR SHARE → 插 referral_bindings |
   | 计提 / 退款处理 | users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → [幂等复查 `alreadyProcessed`] → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回] |
-  | 发放 | referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → wallet_accounts(邀请人) |
+  | 发放 | users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → [同身份复查命中：referral_bindings → referral_rewards 批量 void] → wallet_accounts(邀请人) |
   | 冻结 / 解冻 / 撤销 / 通过 | referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards（撤销时批量 void） |
   | OnKYCVerified（在 identity 事务内） | users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards |
   | rental 的扣款 / 退款事务 | 不碰 referral 任何表（只写 wallet），与上面互不等待 |
@@ -527,6 +529,7 @@ func (s *Service) Admin*(...)                                                // 
   3. `refunded_amount(order) == Σ refund 流水(order)`（已处理部分）且 `≤ orders.amount`。
   4. 每条 `order_pay` 流水（被邀请人、绑定非 revoked、在返利期内）恰有一条 `accrue` 或 `capped(period_over)` 事件；每条 `refund` 流水（订单有 reward）恰有一条 `refund` 事件。
   5. 任一邀请人 30 天 `Σ settled_amount − clawed_amount ≤ max_per_inviter_30d`（按发放时版本）；任一绑定 `Σ reward ≤ max_per_invitee`。
+  6. 每个 `pending` / `settled` reward：`reward == min(reward_cap, floor((order_amount − refunded_amount) × rate_bp / 10000))`。
 - **时钟**：全部用注入的 `clock.Clock`；`hold_days` 与 30 天窗口按 UTC 时刻差，不按自然日。
 - **重试**：处理单行遇 `40P01 / 40001` 整行重试一次；再失败记日志，下轮 `NOT EXISTS` 兜底。
 

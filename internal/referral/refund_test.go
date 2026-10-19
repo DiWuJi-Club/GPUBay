@@ -222,6 +222,64 @@ func TestRefundZeroBalanceReplayNoDoubleDebt(t *testing.T) {
 	e.invariantsOK()
 }
 
+// 余额充足时的重放：钱包唯一索引（-c<n>）与 referral_events 的复查都在；顺序重放与并发重放都只扣一次。
+func TestRefundNonZeroBalanceReplayClawsOnce(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	e.accrueOK(e.pay(b, "ord-1", 6900))
+	e.markSettled("ord-1", a)
+	dbtest.Fund(e.t, e.pool, a, 1000) // 余额 1690
+	l := e.ledgerOf(e.refund(b, "ord-1-r1", 3000))
+	if err := e.refundTx(l); err != nil {
+		t.Fatal(err)
+	}
+	if e.ledgerSum(a, "referral_clawback") != -300 || e.debt(a) != 0 || len(e.events("ord-1")) != 3 {
+		t.Fatalf("first: clawback = %d debt = %d events = %v", e.ledgerSum(a, "referral_clawback"), e.debt(a), e.events("ord-1"))
+	}
+	// 顺序重放
+	if err := e.refundTx(l); err != nil {
+		t.Fatal(err)
+	}
+	if e.ledgerSum(a, "referral_clawback") != -300 || e.reward("ord-1")["clawed"] != int64(300) || len(e.events("ord-1")) != 3 {
+		t.Fatalf("sequential replay: clawback = %d reward = %v events = %v", e.ledgerSum(a, "referral_clawback"), e.reward("ord-1"), e.events("ord-1"))
+	}
+	e.invariantsOK()
+
+	// 并发重放一条新退款：target 190，excess 200
+	l2 := e.ledgerOf(e.refund(b, "ord-1-r2", 2000))
+	hold, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hold.Rollback(e.ctx) }()
+	if _, err := hold.Exec(e.ctx, `SELECT 1 FROM referral_accounts WHERE user_id = $1 FOR UPDATE`, a); err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- e.refundTx(l2) }()
+	}
+	e.waitLockWaiters(2)
+	if err := hold.Commit(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent refund = %v", err)
+		}
+	}
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM wallet_ledger WHERE kind = 'referral_clawback' AND ref_id = 'ord-1-c2'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("-c2 rows = %d %v", n, err)
+	}
+	if e.ledgerSum(a, "referral_clawback") != -500 || e.debt(a) != 0 || e.reward("ord-1")["clawed"] != int64(500) || len(e.events("ord-1")) != 5 {
+		t.Fatalf("concurrent replay: clawback = %d debt = %d reward = %v events = %v", e.ledgerSum(a, "referral_clawback"), e.debt(a), e.reward("ord-1"), e.events("ord-1"))
+	}
+	e.invariantsOK()
+}
+
 // Review Focus 3：计提后费率版本改为 20%，退款重算仍按存的 10% 与 reward_cap。
 func TestRefundUsesStoredRateNotCurrentVersion(t *testing.T) {
 	e := newEnv(t)
@@ -306,6 +364,11 @@ func TestRefundVoidRewardAndClamp(t *testing.T) {
 	if r := e.reward("ord-1"); r["status"] != "void" || r["reward"] != int64(690) || r["refunded"] != int64(3000) {
 		t.Fatalf("void after refund = %v", r)
 	}
+	// void 行不再欠也不再付：refund 事件金额记 0，而不是累计差额
+	var amt int64
+	if err := e.pool.QueryRow(e.ctx, `SELECT amount FROM referral_events WHERE order_id = 'ord-1' AND kind = 'refund'`).Scan(&amt); err != nil || amt != 0 {
+		t.Fatalf("void refund event amount = %d %v", amt, err)
+	}
 	e.accrueOK(e.pay(b, "ord-2", 6900))
 	e.refundOK(e.refund(b, "ord-2-r1", 5000))
 	e.refundOK(e.refund(b, "ord-2-r2", 5000))
@@ -346,6 +409,9 @@ func TestCheckInvariantsDetectsViolations(t *testing.T) {
 		{"inv4 unprocessed order_pay", `INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, remark, created_at) SELECT invitee_id, -1, 0, 'order_pay', 'order', 'ord-x', '', now() FROM referral_bindings`},
 		{"inv4 unprocessed refund", `INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, remark, created_at) SELECT invitee_id, 1, 0, 'refund', 'order', 'ord-2-r1', '', now() FROM referral_bindings`},
 		{"inv4 event kind", `UPDATE referral_events SET kind = 'settle' WHERE kind = 'accrue' AND order_id = 'ord-2'`},
+		{"inv6 reward formula", `UPDATE referral_rewards SET reward = reward - 1 WHERE order_id = 'ord-2'`},
+		{"inv6 reward formula", `UPDATE referral_rewards SET reward_cap = 1 WHERE order_id = 'ord-2'`},
+		{"inv6 reward formula", `UPDATE referral_rewards SET refunded_amount = 0 WHERE order_id = 'ord-1'`},
 		{"inv5 per-invitee", `UPDATE referral_rate_versions SET max_per_invitee = 1`},
 		{"inv5 per-inviter", `UPDATE referral_rate_versions SET max_per_inviter_30d = 1`},
 	} {
@@ -354,11 +420,15 @@ func TestCheckInvariantsDetectsViolations(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := tx.Exec(e.ctx, c.sql); err != nil {
-			tx.Rollback(e.ctx)
+			if rerr := tx.Rollback(e.ctx); rerr != nil {
+				t.Errorf("rollback: %v", rerr)
+			}
 			t.Fatalf("%s: %v", c.sql, err)
 		}
 		err = e.svc.CheckInvariants(e.ctx, tx)
-		tx.Rollback(e.ctx)
+		if rerr := tx.Rollback(e.ctx); rerr != nil {
+			t.Fatalf("%s: rollback: %v", c.sql, rerr)
+		}
 		if err == nil || !strings.Contains(err.Error(), c.name) {
 			t.Errorf("%s: want violation %q, got %v", c.sql, c.name, err)
 		}

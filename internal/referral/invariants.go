@@ -67,6 +67,10 @@ func (s *Service) CheckInvariants(ctx context.Context, q db.Querier) error {
 	check("inv5 per-inviter 30d cap exceeded", `
 		SELECT r.inviter_id, sum(r.settled_amount - r.clawed_amount), max(v.max_per_inviter_30d) FROM referral_rewards r JOIN referral_rate_versions v ON v.id = r.rate_version_id
 		WHERE r.status = 'settled' AND r.settled_at > $1 GROUP BY r.inviter_id HAVING sum(r.settled_amount - r.clawed_amount) > max(v.max_per_inviter_30d)`, s.d.Clock.Now().Add(-InviterWindow))
+	// 6. 未作废的行：reward == min(reward_cap, floor((order_amount − refunded_amount) × rate_bp / 10000))（整数除法，金额非负即向下取整）
+	check("inv6 reward formula", `
+		SELECT order_id, status, reward, reward_cap, order_amount, refunded_amount, rate_bp FROM referral_rewards
+		WHERE status IN ('pending', 'settled') AND reward <> least(reward_cap, (order_amount - refunded_amount) * rate_bp / 10000)`)
 	check("balance negative", `SELECT user_id, balance FROM wallet_accounts WHERE balance < 0`)
 	if len(problems) > 0 {
 		return errors.New("referral invariants violated:\n" + strings.Join(problems, "\n"))

@@ -96,20 +96,30 @@ func (s *Service) checkInvitee(ctx context.Context, tx pgx.Tx, now time.Time, bi
 		}
 		return err
 	}
-	others, err := s.siblingInvitees(ctx, tx, inviterID, self)
-	if err != nil {
+	hit, err := s.inviterSideMatches(ctx, tx, inviterID, self, matches)
+	if err != nil || !hit {
 		return err
 	}
-	fps, err := s.d.Users.VerifiedFingerprints(ctx, tx, append(others, inviterID))
+	return s.autoRevoke(ctx, tx, now, bindingID)
+}
+
+// inviterSideMatches 报告邀请人或同邀请人其它未撤销被邀请人（不含 self）的任一 verified 指纹是否满足 matches。
+// 调用方须已持有 referral_accounts(邀请人) 锁（绑定状态只在该锁下改，兄弟列表才稳定）。
+func (s *Service) inviterSideMatches(ctx context.Context, q db.Querier, inviterID, self int64, matches func([]string) bool) (bool, error) {
+	others, err := s.siblingInvitees(ctx, q, inviterID, self)
 	if err != nil {
-		return err
+		return false, err
+	}
+	fps, err := s.d.Users.VerifiedFingerprints(ctx, q, append(others, inviterID))
+	if err != nil {
+		return false, err
 	}
 	for _, list := range fps {
 		if matches(list) {
-			return s.autoRevoke(ctx, tx, now, bindingID)
+			return true, nil
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // autoRevoke 以系统身份撤销；绑定在读取后、加锁前已被（后台）撤销时按已处理跳过。

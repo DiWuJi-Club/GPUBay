@@ -66,7 +66,11 @@ func (s *Service) applyRefund(ctx context.Context, tx pgx.Tx, now time.Time, l l
 		refunded = r.OrderAmount
 	}
 	target := min(r.RewardCap, (r.OrderAmount-refunded)*int64(r.RateBP)/10000)
-	if err := addEvent(ctx, tx, now, order, r.BindingID, EventRefund, l.ID, 0, r.RewardAmt-target, fmt.Sprintf("refund=%d target=%d", l.Amount, target)); err != nil {
+	delta := r.RewardAmt - target
+	if r.Status == StatusVoid {
+		delta = 0 // void 行既不再付也不扣回，reward 保持原值；事件金额记 0 而不是累计差额
+	}
+	if err := addEvent(ctx, tx, now, order, r.BindingID, EventRefund, l.ID, 0, delta, fmt.Sprintf("refund=%d target=%d", l.Amount, target)); err != nil {
 		return err
 	}
 	switch r.Status {

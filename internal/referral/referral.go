@@ -11,7 +11,9 @@
 //	计提 / 退款处理：users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → [幂等复查] → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回]
 //	  （users 同理须先于 accounts：插 referral_rewards / wallet_ledger 的外键检查会对 users 取 KEY SHARE。
 //	  alreadyProcessed 在账户锁之后复查，并发处理同一行的后来者看到已处理即返回，不撞唯一约束。）
-//	发放：referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → wallet_accounts(邀请人)
+//	发放：users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED →
+//	  [同身份复查命中：referral_bindings → referral_rewards(该绑定其余 pending) 作废] → wallet_accounts(邀请人)
+//	  （users 同计提：写 wallet_ledger 的外键检查会对 users(邀请人) 取 KEY SHARE，须先于账户锁。）
 //	冻结 / 解冻 / 撤销 / 通过：referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
 //	OnKYCVerified（identity 事务内）：users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
 //	  （可能锁两行 referral_accounts：先本人的邀请人，再本人自己的账户。安全，因为邀请关系是无环的森林
