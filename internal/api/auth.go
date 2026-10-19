@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"spark-cloud/internal/identity"
 )
 
 func (s *Server) setSession(w http.ResponseWriter, token string, maxAge int) {
@@ -30,20 +32,23 @@ func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Phone string `json:"phone"`
-		Code  string `json:"code"`
+		Phone      string `json:"phone"`
+		Code       string `json:"code"`
+		InviteCode string `json:"invite_code"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	token, u, err := s.Identity.Login(r.Context(), req.Phone, req.Code)
+	// X-Device-Id 原样传入（identity 只认 UUID 形态，其余视同未提供）；UA 由 Bind 清洗。
+	token, res, err := s.Identity.LoginWith(r.Context(), identity.LoginRequest{Phone: req.Phone, Code: req.Code, InviteCode: sanitizeInviteCode(req.InviteCode),
+		IP: clientIP(r), DeviceID: r.Header.Get("X-Device-Id"), UserAgent: r.UserAgent()})
 	if err != nil {
 		s.writeError(w, r, err)
 		return
 	}
 	s.setSession(w, token, 30*24*3600)
-	writeJSON(w, http.StatusOK, u)
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -57,8 +62,23 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	ok(w)
 }
 
+type meView struct {
+	identity.User
+	ReferralMonthSettled int64 `json:"referral_month_settled,omitempty"` // 计划 8：「我的」页入口小字；0 时省略
+}
+
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, currentUser(r))
+	u := currentUser(r)
+	v := meView{User: u}
+	if s.Referral != nil {
+		n, err := s.Referral.MonthSettledFor(r.Context(), u.ID)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		v.ReferralMonthSettled = n
+	}
+	writeJSON(w, http.StatusOK, v)
 }
 
 func (s *Server) handleKYCPersonal(w http.ResponseWriter, r *http.Request) {

@@ -33,7 +33,7 @@ type Server struct {
 	Rental           *rental.Service
 	Uploads          *storage.Service
 	Billing          *billing.Service
-	Referral         *referral.Service // 计划 8：邀请返利（路由由 Task 12 注册）
+	Referral         *referral.Service // 计划 8：邀请返利；nil 时不注册 /referral 路由
 	DevPay           bool              // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
 	Clock            clock.Clock
 	Log              *slog.Logger
@@ -48,9 +48,11 @@ type Server struct {
 	Ingress          *ingress.Auth // Web 入口鉴权；nil 时不注册 authorize 端点
 	AuthorizeLimit   int           // authorize 每用户每分钟上限；零值 60
 	CalendarLimit    int           // 匿名机组 / 日历 / 可用性端点按 IP 每分钟上限；零值 120
+	ReferralLimit    int           // 匿名邀请码查询按 IP 每分钟上限；零值 60
 
 	authorizeLim *authorizeLimiter
 	calendarLim  *ipLimiter
+	referralLim  *ipLimiter
 }
 
 const sessionCookie = "sc_session"
@@ -76,6 +78,11 @@ func (s *Server) Router() http.Handler {
 		climit = defaultCalendarLimit
 	}
 	s.calendarLim = &ipLimiter{limit: climit}
+	rlimit := s.ReferralLimit
+	if rlimit <= 0 {
+		rlimit = defaultReferralLimit
+	}
+	s.referralLim = &ipLimiter{limit: rlimit}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -113,6 +120,9 @@ func (s *Server) Router() http.Handler {
 		if s.Ingress != nil {
 			r.With(httpx.NoStore).Get("/ingress/authorize", s.handleIngressAuthorize) // 组外：未登录要 302 到登录页而不是 JSON 401
 		}
+		if s.Referral != nil {
+			r.With(httpx.NoStore, s.referralRateLimit).Get("/referral/codes/{code}", s.handleReferralCode) // 匿名：登录页显示邀请人
+		}
 
 		r.Group(func(r chi.Router) {
 			r.Use(httpx.NoStore, s.requireUser)
@@ -149,6 +159,11 @@ func (s *Server) Router() http.Handler {
 			r.Get("/recharges", s.handleRecharges)
 			r.Post("/recharges", s.handleCreateRecharge)
 			r.Get("/recharges/{id}", s.handleRecharge)
+			if s.Referral != nil {
+				r.Get("/referral/me", s.handleReferralMe)
+				r.Get("/referral/invitees", s.handleReferralInvitees)
+				r.Get("/referral/rewards", s.handleReferralRewards)
+			}
 			if s.DevPay {
 				r.Post("/dev/recharges/{id}/pay", s.handleDevPay)
 			}
