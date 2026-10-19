@@ -189,14 +189,25 @@ func (s *Server) handleListVersions(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	// 覆盖率只对草稿 / 已发布版本有意义（已下线的不再部署），一次批量算完
+	active := make([]appdeploy.Version, 0, len(list))
+	for _, v := range list {
+		if v.Status != appdeploy.StatusRetired {
+			active = append(active, v)
+		}
+	}
+	cov, err := s.AppCatalog.VersionsCoverage(r.Context(), active)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	views := make([]versionView, 0, len(list))
 	for _, v := range list {
-		cov, err := s.AppCatalog.VersionCoverage(r.Context(), v)
-		if err != nil {
-			s.writeError(w, r, err)
-			return
+		c := cov[v.ID]
+		if c == nil {
+			c = []appdeploy.Coverage{}
 		}
-		views = append(views, versionView{Version: v, Coverage: cov})
+		views = append(views, versionView{Version: v, Coverage: c})
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.List(views))
 }
@@ -255,8 +266,8 @@ func (s *Server) handleUpdateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in := req.input(&cur)
-	if validateOnly(r) {
-		hash, err := s.AppCatalog.ValidateVersion(r.Context(), id, in)
+	if validateOnly(r) { // 与真正修改同一规则：已发布版本改冻结字段 / 已下线版本 → app_version_frozen
+		hash, err := s.AppCatalog.ValidateVersionUpdate(r.Context(), id, cur.ID, in)
 		s.writeValidated(w, r, hash, err)
 		return
 	}

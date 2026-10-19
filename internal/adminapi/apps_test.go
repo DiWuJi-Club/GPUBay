@@ -210,6 +210,14 @@ func TestAdminVersionValidateAndPublish(t *testing.T) {
 		t.Fatalf("script under wrong app = %d", code)
 	}
 
+	// 草稿不能经 PUT 改成 published（发布要走动态码）
+	if code, out := root.do("PUT", vpath, map[string]any{"status": "published"}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("put draft→published = %d %v", code, out)
+	}
+	if code, out := root.do("PUT", vpath+"?validate=1", map[string]any{"status": "published"}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("validate draft→published = %d %v", code, out)
+	}
+
 	// 发布：没有动态码 → totp_required；ops 无权
 	if code, out := root.do("POST", vpath+"/publish", map[string]any{}); code != 403 || codeOf(out) != "totp_required" {
 		t.Fatalf("publish without totp = %d %v", code, out)
@@ -247,6 +255,17 @@ func TestAdminVersionValidateAndPublish(t *testing.T) {
 	frozen := map[string]any{"version": "1.0", "image_ids": []int64{imageID}, "script": appScript + "# v2\n", "spec": appSpecJSON(8001)}
 	if code, out := root.do("PUT", vpath, frozen); code != 409 || codeOf(out) != "app_version_frozen" {
 		t.Fatalf("put published spec = %d %v", code, out)
+	}
+	// ?validate=1 与真正修改同一规则
+	if code, out := root.do("PUT", vpath+"?validate=1", frozen); code != 409 || codeOf(out) != "app_version_frozen" {
+		t.Fatalf("validate published spec = %d %v", code, out)
+	}
+	if code, out := root.do("PUT", vpath+"?validate=1", map[string]any{"changelog": "仅改说明"}); code != 200 || out["ok"] != true ||
+		out["spec_hash"] != ver["spec_hash"] {
+		t.Fatalf("validate published changelog = %d %v", code, out)
+	}
+	if code, out := root.do("PUT", vpath, map[string]any{"status": "draft"}); code != 409 || codeOf(out) != "app_version_frozen" {
+		t.Fatalf("put published→draft = %d %v", code, out)
 	}
 	if code, out := root.do("PUT", vpath, map[string]any{"changelog": "修正说明"}); code != 200 || out["changelog"] != "修正说明" || out["status"] != "published" {
 		t.Fatalf("put published changelog = %d %v", code, out)
@@ -298,6 +317,17 @@ func TestAdminVersionValidateAndPublish(t *testing.T) {
 	}
 	if code, out := root.do("PUT", vpath, map[string]any{"changelog": "x"}); code != 409 || codeOf(out) != "app_version_frozen" {
 		t.Fatalf("put retired = %d %v", code, out)
+	}
+	if code, out := root.do("PUT", vpath+"?validate=1", map[string]any{"changelog": "x"}); code != 409 || codeOf(out) != "app_version_frozen" {
+		t.Fatalf("validate retired = %d %v", code, out)
+	}
+	// 已下线版本不算覆盖率；草稿照算（同一镜像只统计一次）
+	_, out = fin.do("GET", base, nil)
+	items := out["items"].([]any)
+	draft, retired := items[0].(map[string]any), items[1].(map[string]any)
+	if len(items) != 2 || draft["status"] != "draft" || retired["status"] != "retired" || len(retired["coverage"].([]any)) != 0 ||
+		draft["coverage"].([]any)[0].(map[string]any)["cached"].(float64) != 1 {
+		t.Fatalf("versions after retire = %v", items)
 	}
 	for _, action := range []string{"app.version.create", "app.version.update", "app.version.prepull"} {
 		if n := e.count(`SELECT count(*) FROM audit_logs WHERE action = $1 AND actor_type = 'admin'`, action); n == 0 {
@@ -356,7 +386,7 @@ func TestAdminDeploymentsListAndForceRemove(t *testing.T) {
 	}
 	dep := out["deployment"].(map[string]any)
 	if dep["id"] != d1.ID || dep["secret_env"].(map[string]any)["API_KEY"] != true || dep["env"].(map[string]any)["API_KEY"] != nil ||
-		out["log_tail"] != "serving with api-key ***" || len(out["events"].([]any)) != 1 {
+		dep["log_tail"] != "serving with api-key ***" || out["log_tail"] != nil || len(out["events"].([]any)) != 1 {
 		t.Fatalf("detail = %v", out)
 	}
 	if code, _ := fin.do("GET", "/deployments/dep-missing", nil); code != 404 {
@@ -368,6 +398,9 @@ func TestAdminDeploymentsListAndForceRemove(t *testing.T) {
 	}
 	if code, out := ops.do("POST", "/deployments/"+d1.ID+"/force-remove", map[string]any{"reason": "  "}); code != 400 {
 		t.Fatalf("force-remove without reason = %d %v", code, out)
+	}
+	if code, out := ops.do("POST", "/deployments/"+d1.ID+"/force-remove", map[string]any{"reason": strings.Repeat("长", 201)}); code != 400 {
+		t.Fatalf("force-remove reason too long = %d %v", code, out)
 	}
 	code, out = ops.do("POST", "/deployments/"+d1.ID+"/force-remove", map[string]any{"reason": "挖矿"})
 	if code != 200 || out["state"] != "removing" || out["desired"] != "removed" {

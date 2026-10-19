@@ -581,7 +581,7 @@ func (s *Service) Counts(ctx context.Context, now time.Time) (installing, runnin
 		count(*) FILTER (WHERE state IN ('queued', 'installing')),
 		count(*) FILTER (WHERE state = 'running'),
 		count(*) FILTER (WHERE state = 'failed' AND finished_at >= $1)
-		FROM app_deployments WHERE state IN ('queued', 'installing', 'running', 'failed')`, now.Add(-24*time.Hour)).
+		FROM app_deployments WHERE state IN ('queued', 'installing', 'running') OR (state = 'failed' AND finished_at >= $1)`, now.Add(-24*time.Hour)).
 		Scan(&installing, &running, &failed24h)
 	return installing, running, failed24h, err
 }

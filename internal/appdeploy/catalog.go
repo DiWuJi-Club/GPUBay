@@ -456,19 +456,9 @@ func (c *Catalog) UpdateVersion(ctx context.Context, actor audit.Actor, appID, v
 				return err
 			}
 		case StatusPublished:
-			if in.Version != cur.Version || !slices.Equal(in.ImageIDs, cur.ImageIDs) || in.Script != cur.Script || canonical(in.Spec) != canonical(cur.Spec) {
-				return apperr.ErrAppVersionFrozen
-			}
-			status := cur.Status
-			switch in.Status {
-			case "":
-			case StatusRetired:
-				status = StatusRetired
-			default:
-				return apperr.ErrAppVersionFrozen
-			}
-			if runeLen(in.Changelog) > MaxChangelogLen {
-				return invalid("changelog", "最多 1000 个字符")
+			status, err := publishedEdit(cur, in)
+			if err != nil {
+				return err
 			}
 			v, err = scanVersion(tx.QueryRow(ctx, `UPDATE app_versions SET changelog = $2, status = $3, updated_at = $4 WHERE id = $1 RETURNING `+versionCols,
 				vid, in.Changelog, status, now))
@@ -486,6 +476,50 @@ func (c *Catalog) UpdateVersion(ctx context.Context, actor audit.Actor, appID, v
 		}))
 	})
 	return out, err
+}
+
+// publishedEdit 是已发布版本的修改规则：version / image_ids / script / spec 与当前值不同 → app_version_frozen；
+// Status 只能为空（不改）或 retired；返回修改后的状态。
+func publishedEdit(cur Version, in VersionInput) (string, error) {
+	if in.Version != cur.Version || !slices.Equal(in.ImageIDs, cur.ImageIDs) || in.Script != cur.Script || canonical(in.Spec) != canonical(cur.Spec) {
+		return "", apperr.ErrAppVersionFrozen
+	}
+	status := cur.Status
+	switch in.Status {
+	case "":
+	case StatusRetired:
+		status = StatusRetired
+	default:
+		return "", apperr.ErrAppVersionFrozen
+	}
+	if runeLen(in.Changelog) > MaxChangelogLen {
+		return "", invalid("changelog", "最多 1000 个字符")
+	}
+	return status, nil
+}
+
+// ValidateVersionUpdate 只校验不保存（后台 PUT `?validate=1`），与 UpdateVersion 同一规则：草稿完整校验并返回将写入的 spec_hash；
+// 已发布版本按冻结规则（publishedEdit）判断并返回当前 spec_hash；已下线版本 → app_version_frozen。
+func (c *Catalog) ValidateVersionUpdate(ctx context.Context, appID, vid int64, in VersionInput) (string, error) {
+	cur, err := c.version(ctx, c.pool, appID, vid, false)
+	if err != nil {
+		return "", err
+	}
+	switch cur.Status {
+	case StatusDraft:
+		if in.Status != "" && in.Status != StatusDraft {
+			return "", apperr.ErrInvalidState
+		}
+		_, hash, err := c.validateVersionInput(ctx, c.pool, &in)
+		return hash, err
+	case StatusPublished:
+		if _, err := publishedEdit(cur, in); err != nil {
+			return "", err
+		}
+		return cur.SpecHash, nil
+	default:
+		return "", apperr.ErrAppVersionFrozen
+	}
 }
 
 // imageRefs 按 ids 的顺序返回镜像 ref（不存在的跳过）。
