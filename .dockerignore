@@ -16,6 +16,7 @@ internal/web/dist/admin
 coverage.out
 # 密钥与本地配置：上游私钥、证书、compose 的 .env 都不进镜像（运行时挂载）
 **/.env
+**/acme.env
 **/.env.*
 !deploy/compose/.env.example
 **/*.key

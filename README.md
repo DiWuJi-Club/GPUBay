@@ -106,7 +106,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - 后台端口不要暴露到公网；如必须经过反向代理，请限制来源 IP。
 - `SPARK_UPLOAD_DIR` 存放用户上传的营业执照，需要纳入备份。
 - 支付回调地址需在微信支付商户平台、支付宝开放平台中配置为 `SPARK_PUBLIC_BASE_URL` 下的对应路径。
-- 用户控制台与用户 API 同在 `:8080`（`/` 为页面，`/api/*` 为接口），前面的反向代理不需要额外路由规则；管理后台与后台 API 同在 `:8081`（`/admin/`），仍只监听内网地址。
+- 用户控制台与用户 API 同在 `SPARK_HTTP_ADDR`（默认 `:8080`；compose 部署为容器内 `:8443`、对外 443）（`/` 为页面，`/api/*` 为接口），前面的反向代理不需要额外路由规则；管理后台与后台 API 同在 `:8081`（`/admin/`），仍只监听内网地址。
 - `make build` 会先构建前端再编译后端，二进制内含页面；`index.html` 以 `Cache-Control: no-cache` 返回（浏览器每次加载都向服务器校验，发布后刷新即生效），`assets/` 文件名带内容哈希，缓存一年（`immutable`），其余不带哈希的文件（favicon、`brand/` 等）缓存 1 小时。
 - `SPARK_ENV=staging` 与 `prod` 都会给 Cookie 加 `Secure`，所以 staging 必须走 HTTPS。
 - `SPARK_SECRET_KEY` 同时加密内置 CA 的私钥：**轮换该密钥会使 CA 不可解密，所有机器都要重新接入**；轮换前先导出 `platform_pki` 表备份。
@@ -114,10 +114,11 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - 容器化部署：`make platform-image` 构建 `spark-cloud/platform:<version>`（distroless nonroot），`deploy/compose/` 是 platform + postgres（+ 可选 acme.sh 证书侧车）的 compose，步骤见 `deploy/compose/README.md`。
 - 接入层：用户 SSH 经 `ssh.<domain>:22`（平台自研网关，`SPARK_SSH_ADDR`），Web 端口经 `https://ins-<id>-<port>.<ingress_domain>`；DNS 需要 `<domain>`、`ssh.<domain>`、`*.<ingress_domain>` 三条记录都指向控制面。**生产推荐 `SPARK_INGRESS_DOMAIN` 用与 `SPARK_DOMAIN` 不同的注册域（eTLD+1），子域不算**（或让 ingress 域进入公共后缀列表 PSL）：租户页面的 JS 能在父域上设置 Cookie。
 - 控制面宿主机自己的 sshd 要先挪到别的端口，22 留给网关（`deploy/compose/README.md`）。
-- 公网端口（22 / 443 / 80）都是面向互联网、未认证即可连接的服务；9443 只对机房内网开放，后台端口不暴露。
+- 公网端口（22 / 443 / 80）都是面向互联网、未认证即可连接的服务；9443 只对机房内网开放，后台端口不暴露。Docker 发布的端口不受 ufw 控制，compose 里靠绑定地址（9443 绑内网地址、后台绑 127.0.0.1）限制来源。
+- compose 只在 IPv4 发布公网端口，DNS 不要加 AAAA 记录（或先给 compose 网络启用 IPv6）：否则 IPv6 客户端经 docker-proxy 全部变成同一个源地址，按 IP 的暴力破解限额与限流失效。
 - 不要用裸 TCP 连接对 SSH 端口做健康检查：未认证的连接计入按 IP 的暴力破解限额，会把监控机自己的 IP 封掉；监控请探 HTTPS（如 `https://ins-monitor0-80.<ingress_domain>/.spark/healthz`，返回 `ok`）。
 - TLS 两种方式：`SPARK_TLS_CERT_FILE` / `SPARK_TLS_KEY_FILE`（需覆盖 `<domain>` 与 `*.<ingress_domain>` 的泛域名证书：acme.sh DNS-01 侧车或商业证书，平台每分钟热加载文件）；或前置反向代理终止 TLS 并 `SPARK_TRUST_PROXY=true`（代理须原样转发 Host，apex 与泛域名都指到 platform）。客户端 IP 取 `X-Forwarded-For` 自右数第 `SPARK_TRUSTED_PROXY_HOPS` 项（默认 1，多层代理设为层数）。platform 自己终止 TLS 时（默认 compose）保持 `SPARK_TRUST_PROXY=false`。
-- 发布顺序：**先升级全部 Agent，再发布 platform**（新 platform 固定校验平台下发的容器主机密钥，旧 Agent 会自行生成另一把）。platform 重启会断开 SSH 会话（drain 最多 `SPARK_SSH_DRAIN_TIMEOUT`，默认 30s）；停机总耗时约 30～40s，compose 的 `stop_grace_period` 与 systemd 的 `TimeoutStopSec` 都设 60s。
+- 发布顺序：**先升级全部 Agent，再发布 platform**（新 platform 固定校验平台下发的容器主机密钥，旧 Agent 会自行生成另一把）。platform 重启会断开 SSH 会话（drain 最多 `SPARK_SSH_DRAIN_TIMEOUT`，默认 30s）；停机总耗时约 30～40s，compose 的 `stop_grace_period` 为 60s；如果自己写 systemd unit 来管理 platform，设 `TimeoutStopSec=60`。
 - 本次升级把 staging / prod 的会话 Cookie 改名为 `__Host-…`：升级后用户与管理员都需要重新登录一次。
 - `platform admin ssh-host-key` 打印网关主机密钥指纹，填进帮助页 `brand.sshHostKeyFingerprint`；`SPARK_SECRET_KEY` 轮换会连带丢失网关主机密钥与实例主机私钥（用户会看到主机密钥变更警告，存量实例首连重新信任）。
 - 本地开发测 ingress：`SPARK_PUBLIC_BASE_URL` 默认 `http://spark.local:8080`，在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或用 sslip.io 域（如 `SPARK_DOMAIN=192-168-1-218.sslip.io`）。
