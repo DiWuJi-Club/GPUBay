@@ -8,7 +8,9 @@
 //	Bind（identity 事务内）：users(被邀请人, INSERT 持有) → users(码主) FOR KEY SHARE → referral_accounts(码主) FOR SHARE → 插 referral_bindings
 //	  （users(码主) 必须先于 referral_accounts 显式加锁：否则插绑定时的外键检查才对码主取 KEY SHARE，
 //	  成了 accounts → users，与码主本人 OnKYCVerified 的 users FOR UPDATE → accounts FOR UPDATE 反向，会死锁。）
-//	计提 / 退款处理：referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回]
+//	计提 / 退款处理：users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → [幂等复查] → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回]
+//	  （users 同理须先于 accounts：插 referral_rewards / wallet_ledger 的外键检查会对 users 取 KEY SHARE。
+//	  alreadyProcessed 在账户锁之后复查，并发处理同一行的后来者看到已处理即返回，不撞唯一约束。）
 //	发放：referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → wallet_accounts(邀请人)
 //	冻结 / 解冻 / 撤销 / 通过：referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
 //	OnKYCVerified（identity 事务内）：users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
