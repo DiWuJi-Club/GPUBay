@@ -54,7 +54,7 @@ async function load() {
 }
 onMounted(() => {
   // 商品价格依赖实例的 product_id：实例加载后再拉；失败不提示（续费对话框打开时会再拉一次并提示）
-  void load().then(() => loadProduct().catch(() => undefined))
+  void load().then(() => loadProduct().catch(() => (productError.value = true)))
   void loadEvents()
 })
 const nowMs = ref(Date.now())
@@ -220,20 +220,27 @@ const renewKey = useIdempotencyKey(() => [id.value, renewDuration.value, renewQu
 const renewUnit = computed(() => product.value?.prices.find((p) => p.duration === renewDuration.value)?.amount ?? null)
 const renewPrice = computed(() => (renewUnit.value == null ? null : renewUnit.value * renewQuantity.value))
 const renewMax = computed(() => (inst.value ? renewQuantityMax(inst.value, renewDuration.value) : 1))
-watch(renewDuration, () => {
-  renewQuantity.value = Math.min(Math.max(renewQuantity.value, 1), Math.max(renewMax.value, 1))
+// 档位切换或实例刷新导致上限变化时，把数量夹回 [1, 上限]
+watch([renewDuration, renewMax], () => {
+  renewQuantity.value = Math.min(Math.max(renewQuantity.value || 1, 1), Math.max(renewMax.value, 1))
 })
 const balance = computed(() => session.balance ?? 0)
 const renewAfter = computed(() => (renewPrice.value == null ? null : balance.value - renewPrice.value))
 const renewInsufficient = computed(() => renewPrice.value != null && balance.value < renewPrice.value)
 
 /** 商品价格：续费对话框与自动续费档位下拉共用。 */
+const productError = ref(false) // 商品价格加载失败：自动续费档位只显示当前值，不能改
 async function loadProduct() {
   if (!inst.value) return
   const pid = inst.value.product_id
   const { items } = await api.get<Listed<Product>>('/products')
   product.value = items.find((p) => p.id === pid) ?? null
+  productError.value = false
 }
+/** 自动续费档位选项：价格没加载到时只列当前值，下拉仍能显示它。 */
+const autoRenewDurations = computed<Duration[]>(() =>
+  product.value ? product.value.prices.map((p) => p.duration) : inst.value ? [inst.value.auto_renew_duration] : [],
+)
 async function openRenew() {
   try {
     await Promise.all([loadProduct(), refreshBalance()])
@@ -303,16 +310,28 @@ const cancelling = ref(false)
 async function openCancel() {
   try {
     cancelQuote.value = await api.get<CancelQuote>(`/instances/${id.value}/cancel-quote`)
+    cancelQuoteChanged.value = false
     cancelVisible.value = true
   } catch (e) {
     notifyError(e)
   }
 }
+const cancelQuoteChanged = ref(false)
 async function confirmCancel() {
   if (cancelling.value) return // 双击保护
   cancelling.value = true
   try {
-    inst.value = await api.post<Instance>(`/instances/${id.value}/cancel`, {})
+    // 确认时重新报价：跨过冷静期 / 24 小时档位后金额会变，变了就更新显示并请用户再确认一次
+    const shown = cancelQuote.value
+    const latest = await api.get<CancelQuote>(`/instances/${id.value}/cancel-quote`)
+    if (!shown || latest.refund !== shown.refund || latest.percent !== shown.percent) {
+      cancelQuote.value = latest
+      cancelQuoteChanged.value = true
+      return
+    }
+    const next = await api.post<Instance>(`/instances/${id.value}/cancel`, {})
+    seq++ // 作废进行中的轮询，避免旧的 reserved 响应覆盖取消结果
+    inst.value = next
     cancelVisible.value = false
     ElMessage.success('已取消预订，退款已退回余额')
     await Promise.all([refreshBalance(), loadEvents()])
@@ -331,7 +350,9 @@ async function setAutoRenew(enabled: boolean, duration?: Duration) {
   if (togglingAutoRenew.value || !inst.value) return
   togglingAutoRenew.value = true
   try {
-    inst.value = await api.put<Instance>(`/instances/${id.value}/auto-renew`, { enabled, duration: duration ?? inst.value.auto_renew_duration })
+    const next = await api.put<Instance>(`/instances/${id.value}/auto-renew`, { enabled, duration: duration ?? inst.value.auto_renew_duration })
+    seq++ // 作废进行中的轮询，避免旧响应把开关拨回去
+    inst.value = next
     ElMessage.success(enabled ? '已开启自动续费' : '已关闭自动续费')
   } catch (e) {
     notifyError(e)
@@ -486,14 +507,15 @@ watch(id, () => {
           <el-switch :model-value="inst.auto_renew" :loading="togglingAutoRenew" data-testid="detail-auto-renew" @change="(v: string | number | boolean) => setAutoRenew(v === true)" />
           <el-select
             :model-value="inst.auto_renew_duration"
-            :disabled="!inst.auto_renew || togglingAutoRenew"
+            :disabled="!inst.auto_renew || togglingAutoRenew || !product"
             data-testid="detail-auto-renew-duration"
             style="width: 110px"
             @change="(d: Duration) => setAutoRenew(true, d)"
           >
-            <el-option v-for="p in product?.prices ?? []" :key="p.duration" :value="p.duration" :label="labelOf(durationLabel, p.duration)" />
+            <el-option v-for="d in autoRenewDurations" :key="d" :value="d" :label="labelOf(durationLabel, d)" />
           </el-select>
         </div>
+        <p v-if="productError" class="warn small" data-testid="detail-auto-renew-product-error">档位价格加载失败，暂时只能开关自动续费，刷新页面后可修改档位。</p>
         <p class="muted small">到期前 1 小时自动扣款续 1 个单位；余额不足会重试到到期，被后续预订挡住时按能放下的档位办理；停机后不自动续。</p>
       </el-card>
 
@@ -526,7 +548,14 @@ watch(id, () => {
         </el-form-item>
         <el-form-item label="数量">
           <div class="row">
-            <el-input-number v-model="renewQuantity" :min="1" :max="Math.max(renewMax, 1)" :disabled="renewMax === 0" data-testid="detail-renew-quantity" />
+            <el-input-number
+              v-model="renewQuantity"
+              :min="1"
+              :max="Math.max(renewMax, 1)"
+              :value-on-clear="1"
+              :disabled="renewMax === 0"
+              data-testid="detail-renew-quantity"
+            />
             <span class="muted">{{ describeDuration(renewDuration, renewQuantity) }}</span>
           </div>
         </el-form-item>
@@ -540,7 +569,7 @@ watch(id, () => {
       </el-form>
       <template #footer>
         <el-button data-testid="detail-renew-cancel" @click="renewVisible = false">取消</el-button>
-        <el-button type="primary" :loading="renewing" :disabled="renewMax === 0" data-testid="detail-renew-ok" @click="confirmRenew">{{ renewInsufficient ? '去充值' : '确认续费' }}</el-button>
+        <el-button type="primary" :loading="renewing" :disabled="renewMax === 0 || !renewQuantity" data-testid="detail-renew-ok" @click="confirmRenew">{{ renewInsufficient ? '去充值' : '确认续费' }}</el-button>
       </template>
     </AppDialog>
 
@@ -553,6 +582,7 @@ watch(id, () => {
       </template>
     </AppDialog>
     <AppDialog v-model="cancelVisible" kind="confirm" title="取消预订" data-testid="detail-cancel-dialog">
+      <p v-if="cancelQuoteChanged" class="warn" data-testid="detail-cancel-changed">退款金额已按最新规则更新，请确认后再次点击。</p>
       <p v-if="cancelQuote" data-testid="detail-cancel-text">将退款 {{ fmtYuan(cancelQuote.refund) }}（{{ cancelQuote.percent }}%），可取消至 {{ fmtTime(cancelQuote.deadline) }}。开通后将不能取消。</p>
       <template #footer>
         <el-button data-testid="detail-cancel-cancel" @click="cancelVisible = false">再想想</el-button>

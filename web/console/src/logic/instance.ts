@@ -1,4 +1,4 @@
-import { fmtDuration, fmtTime, type Duration, type Instance, type InstanceState } from '@spark/shared'
+import { fmtDuration, fmtTime, type CancelQuote, type Duration, type Instance, type InstanceState } from '@spark/shared'
 import { MAX_QUANTITY } from './booking'
 
 /** 以拿到数据的本地时刻为基准递减；暂停中与非运行状态不递减。 */
@@ -41,4 +41,9 @@ export function autoRenewFailureText(i: Instance): string {
   if (i.auto_renew_failed_reason === 'insufficient_balance') return '自动续费失败：余额不足，请充值后系统会自动重试'
   if (i.auto_renew_failed_reason === 'renew_blocked') return `自动续费失败：机器已有后续预订，可续至 ${i.renewable_until ? fmtTime(i.renewable_until) : '—'}`
   return ''
+}
+
+/** 批次「取消全部未开通」确认框：台数与退款合计（分）。 */
+export function sumCancelQuotes(quotes: CancelQuote[]): { count: number; refund: number } {
+  return { count: quotes.length, refund: quotes.reduce((s, q) => s + q.refund, 0) }
 }

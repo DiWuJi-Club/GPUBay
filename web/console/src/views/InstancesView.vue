@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { instanceStateLabel, instanceStateType, labelOf, messageOf, useMobile, type Instance, type Listed } from '@spark/shared'
+import { fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf, useMobile, type CancelQuote, type Instance, type Listed } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api'
+import AppDialog from '../components/AppDialog.vue'
 import { usePolling } from '../composables/usePolling'
 import { useTicker } from '../composables/useTicker'
-import { canCancel, instanceTimeText, remainingNow } from '../logic/instance'
+import { canCancel, instanceTimeText, remainingNow, sumCancelQuotes } from '../logic/instance'
 import { notifyError } from '../logic/notify'
 
 const route = useRoute()
@@ -54,21 +55,42 @@ const rows = computed(() =>
 )
 const cancellableCount = computed(() => rows.value.filter((r) => r.cancellable).length)
 const cancelling = ref(false)
-/** 取消本批次全部未开通实例：逐台调用，成功 / 失败各自提示。 */
+const cancelAllVisible = ref(false)
+const cancelTargets = ref<string[]>([]) // 确认框打开时取到报价的实例，确认后只取消这些
+const cancelSummary = ref({ count: 0, refund: 0 })
+/** 先逐台取报价，弹确认框显示台数与退款合计；任一报价失败则不弹框。 */
+async function openCancelAll() {
+  if (cancelling.value) return
+  const ids = rows.value.filter((x) => x.cancellable).map((x) => x.id)
+  if (!ids.length) return
+  cancelling.value = true
+  try {
+    const quotes = await Promise.all(ids.map((id) => api.get<CancelQuote>(`/instances/${id}/cancel-quote`)))
+    cancelTargets.value = ids
+    cancelSummary.value = sumCancelQuotes(quotes)
+    cancelAllVisible.value = true
+  } catch (e) {
+    notifyError(e)
+  } finally {
+    cancelling.value = false
+  }
+}
+/** 确认后逐台调用取消，成功 / 失败各自提示。 */
 async function cancelAll() {
   if (cancelling.value) return
   cancelling.value = true
   let ok = 0
   const failed: string[] = []
-  for (const r of rows.value.filter((x) => x.cancellable)) {
+  for (const id of cancelTargets.value) {
     try {
-      await api.post(`/instances/${r.id}/cancel`, {})
+      await api.post(`/instances/${id}/cancel`, {})
       ok++
     } catch (e) {
-      failed.push(`${r.id}：${messageOf(e)}`)
+      failed.push(`${id}：${messageOf(e)}`)
     }
   }
   cancelling.value = false
+  cancelAllVisible.value = false
   if (ok) ElMessage.success(`已取消 ${ok} 台`)
   for (const f of failed) ElMessage.error(f)
   await load()
@@ -82,7 +104,7 @@ async function cancelAll() {
         <span>批次 <code class="mono">{{ batchFilter }}</code> · {{ rows.length }} 台</span>
         <span class="grow" />
         <router-link to="/instances"><el-button size="small">查看全部实例</el-button></router-link>
-        <el-button v-if="cancellableCount" size="small" type="danger" plain :loading="cancelling" data-testid="instances-cancel-all" @click="cancelAll">取消全部未开通（{{ cancellableCount }}）</el-button>
+        <el-button v-if="cancellableCount" size="small" type="danger" plain :loading="cancelling" data-testid="instances-cancel-all" @click="openCancelAll">取消全部未开通（{{ cancellableCount }}）</el-button>
       </div>
     </el-card>
     <el-alert v-if="loadError" type="error" :title="loadError" show-icon :closable="false" data-testid="instances-error">
@@ -132,6 +154,14 @@ async function cancelAll() {
         </template>
       </el-table-column>
     </el-table>
+
+    <AppDialog v-model="cancelAllVisible" kind="confirm" title="取消全部未开通" data-testid="instances-cancel-all-dialog">
+      <p data-testid="instances-cancel-all-text">将取消 {{ cancelSummary.count }} 台未开通的预订，共退款 {{ fmtYuan(cancelSummary.refund) }}（按各台当前取消规则计算）。</p>
+      <template #footer>
+        <el-button data-testid="instances-cancel-all-cancel" @click="cancelAllVisible = false">再想想</el-button>
+        <el-button type="danger" :loading="cancelling" data-testid="instances-cancel-all-ok" @click="cancelAll">确定取消</el-button>
+      </template>
+    </AppDialog>
   </div>
 </template>
 

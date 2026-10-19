@@ -1,6 +1,6 @@
 import type { Instance } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { autoRenewFailureText, canCancel, canRelease, canRenew, canSetAutoRenew, instanceTimeText, releaseWarning, remainingNow, renewQuantityMax } from '../instance'
+import { autoRenewFailureText, canCancel, sumCancelQuotes, canRelease, canRenew, canSetAutoRenew, instanceTimeText, releaseWarning, remainingNow, renewQuantityMax } from '../instance'
 
 const base: Instance = {
   id: 'ins-abc12345', state: 'running', product_id: 1, image_id: 1, product_name: 'DGX Spark 整机', image_name: 'PyTorch', suspended: false,
@@ -79,5 +79,13 @@ describe('booking states (U-21)', () => {
     expect(canRenew('cancelled')).toBe(false)
     expect(canSetAutoRenew('reserved')).toBe(true)
     expect(canSetAutoRenew('released')).toBe(false)
+  })
+})
+
+describe('批次取消汇总', () => {
+  it('台数与退款合计', () => {
+    const q = (refund: number, percent: number) => ({ refund, percent, deadline: '2026-10-20T01:00:00Z', max: refund })
+    expect(sumCancelQuotes([q(10000, 100), q(5000, 50), q(0, 0)])).toEqual({ count: 3, refund: 15000 })
+    expect(sumCancelQuotes([])).toEqual({ count: 0, refund: 0 })
   })
 })
