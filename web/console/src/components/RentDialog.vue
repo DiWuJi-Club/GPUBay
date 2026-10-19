@@ -4,7 +4,7 @@ import {
   type Availability, type BookingResult, type CalendarDay, type CalendarPeriod, type Duration, type Group, type GroupMachine, type Image, type Instance, type Listed, type Order, type Product,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { useGuide } from '../composables/useGuide'
@@ -16,7 +16,8 @@ import GuideDialog from './GuideDialog.vue'
 
 const props = defineProps<{ product: Product; images: Image[]; mode: 'immediate' | 'booking'; duration: Duration; imageId: number | null }>()
 const visible = defineModel<boolean>({ required: true })
-const emit = defineEmits<{ placed: [result: { instances: { id: string }[]; batchId: string | null }] }>()
+export interface PlacedResult { instances: { id: string }[]; batchId: string | null; immediate: boolean }
+const emit = defineEmits<{ placed: [result: PlacedResult]; noCapacity: [] }>()
 
 const route = useRoute()
 const router = useRouter()
@@ -40,11 +41,22 @@ const step = ref<'form' | 'confirm'>(props.mode === 'immediate' ? 'confirm' : 'f
 const expanded = ref(props.mode === 'booking')
 const groups = ref<Group[]>([])
 const serverOffset = ref(0) // 服务器时间 − 浏览器时间：最早 / 最晚整点按服务器时间算
-const nowServer = () => new Date(Date.now() + serverOffset.value)
+// 每分钟走一格：hours / dayMin / dayMax / 日历可选天依赖它，对话框久开也不会给出已过期的整点
+const tick = ref(0)
+const ticker = setInterval(() => {
+  tick.value++
+  revalidateStart()
+}, 60_000)
+onUnmounted(() => clearInterval(ticker))
+const nowServer = () => {
+  void tick.value
+  return new Date(Date.now() + serverOffset.value)
+}
 const machines = ref<GroupMachine[]>([])
 const machinePeriods = ref<CalendarPeriod[]>([])
 const calendar = ref<CalendarDay[]>([])
 const availability = ref<Availability | null>(null)
+const availError = ref('') // 可用性查询失败的提示；空 = 无错误
 const submitting = ref(false)
 
 const NO_GROUP = 0 // el-option 的 value 不能是 null：0 作为「不限机组」哨兵，提交时映射回 null
@@ -77,6 +89,7 @@ watch(() => form.count, () => {
 watch(() => form.groupId, () => {
   form.machineId = null
   machines.value = []
+  calendar.value = []
   if (form.groupId !== null) void loadGroupDetails()
 })
 watch(() => form.immediate, (imm) => {
@@ -101,14 +114,23 @@ async function loadGroups() {
     groups.value = out.items
     serverOffset.value = Date.parse(out.now) - Date.now()
     // 用户可能在 /groups 返回前就切到「指定时间」（当时按旧偏移算）：按服务器时间重新校验
-    if (!form.immediate && (!form.day || form.hour == null || !hourOptions(form.day, nowServer()).includes(form.hour))) {
-      const e = earliestStart(nowServer())
-      form.day = cstDay(e)
-      form.hour = hourOptions(form.day, nowServer())[0] ?? null
-    }
+    revalidateStart()
   } catch (e) {
     notifyError(e)
   }
+}
+/** 指定时间模式下，当前开始时刻为空或已不在可选范围内 → 改为最早整点。 */
+function revalidateStart() {
+  if (form.immediate) return
+  if (form.day && form.hour != null && hourOptions(form.day, nowServer()).includes(form.hour)) return
+  const e = earliestStart(nowServer())
+  form.day = cstDay(e)
+  form.hour = hourOptions(form.day, nowServer())[0] ?? null
+}
+/** 回到表单步：重新拿服务器时间，校验开始时刻。 */
+function backToForm() {
+  step.value = 'form'
+  void loadGroups()
 }
 async function loadGroupDetails() {
   const gid = form.groupId
@@ -141,13 +163,24 @@ async function loadAvailability() {
       product_id: props.product.id, group_id: form.groupId ?? undefined, machine_id: form.machineId ?? undefined,
       start_at: startAt.value ?? undefined, duration: form.duration, quantity: form.quantity,
     })
-    if (mine === availSeq) availability.value = out
+    if (mine === availSeq) {
+      availability.value = out
+      availError.value = ''
+    }
   } catch (e) {
-    if (mine === availSeq) availability.value = null
-    if (!(isApiError(e) && e.code.startsWith('booking_'))) notifyError(e)
+    if (mine !== availSeq) return
+    availability.value = null
+    // booking_* 是对所选时间 / 租期的校验，直接展示后端文案；其余错误给通用提示 + 重试
+    availError.value = isApiError(e) && e.code.startsWith('booking_') ? e.message : '查询可用机器失败'
   }
 }
+function retryAvailability() {
+  availError.value = ''
+  void loadAvailability()
+}
 watch([() => form.groupId, () => form.machineId, () => form.immediate, startAt, () => form.duration, () => form.quantity], () => {
+  availability.value = null // 旧结果不再对应当前参数
+  availError.value = ''
   clearTimeout(availTimer)
   availTimer = setTimeout(() => void loadAvailability(), 300)
 })
@@ -158,14 +191,19 @@ watch(visible, (v) => {
   expanded.value = props.mode === 'booking'
   Object.assign(form, { groupId: null, count: 1, immediate: props.mode === 'immediate', duration: props.duration, quantity: 1, imageId: props.imageId, machineId: null, autoRenew: false, autoRenewDuration: props.duration })
   availability.value = null
+  availError.value = ''
   form.day = ''
   form.hour = null
   void loadGroups() // 拿到服务器时间后再填默认开始时刻
   void loadAvailability()
 }, { immediate: true })
 
+/** 日历上不可选的天：没有空闲机器，或当天没有落在 [最早, 最晚] 内的整点。 */
+function dayDisabled(d: CalendarDay): boolean {
+  return d.free === 0 || hourOptions(d.date, nowServer()).length === 0
+}
 function pickDay(d: CalendarDay) {
-  if (d.free === 0) return
+  if (dayDisabled(d)) return
   form.day = d.date
 }
 
@@ -183,16 +221,16 @@ async function submit() {
   }
   submitting.value = true
   try {
-    let placed: { instances: { id: string }[]; batchId: string | null }
+    let placed: PlacedResult
     if (legacy.value) {
       const out = await api.post<{ order: Order; instance: Instance }>('/orders', { product_id: props.product.id, duration: form.duration, image_id: form.imageId }, { idempotencyKey: key.current() })
-      placed = { instances: [out.instance], batchId: null }
+      placed = { instances: [out.instance], batchId: null, immediate: true }
     } else {
       const out = await api.post<BookingResult>('/bookings', {
         product_id: props.product.id, image_id: form.imageId, group_id: form.groupId, machine_id: form.machineId, count: form.count,
         duration: form.duration, quantity: form.quantity, start_at: startAt.value ?? undefined, auto_renew: form.autoRenew, auto_renew_duration: form.autoRenewDuration,
       }, { idempotencyKey: key.current() })
-      placed = { instances: out.instances, batchId: out.batch?.id ?? null }
+      placed = { instances: out.instances, batchId: out.batch?.id ?? null, immediate: form.immediate }
     }
     key.rotate()
     visible.value = false
@@ -200,11 +238,12 @@ async function submit() {
   } catch (e) {
     if (isApiError(e) && (e.code === 'no_capacity' || e.code === 'machine_unavailable')) {
       ElMessage.warning(e.message)
-      step.value = 'form'
+      if (legacy.value && e.code === 'no_capacity') emit('noCapacity') // 市场页刷新「现在可租」台数
+      backToForm()
       void loadAvailability()
     } else if (isApiError(e) && e.code.startsWith('booking_')) {
       ElMessage.warning(e.message)
-      step.value = 'form'
+      backToForm() // 多半是开始时间过近 / 过远：刷新服务器时间并校正默认开始时刻
     } else {
       if (isApiError(e) && ['kyc_required', 'insufficient_balance', 'banned'].includes(e.code)) visible.value = false
       guide.handle(e)
@@ -270,12 +309,13 @@ async function submit() {
           <span class="muted">到期前 1 小时自动扣款；被后续预订挡住时按能放下的档位办理</span>
         </el-form-item>
       </el-form>
-      <p class="avail" :class="{ warn: notEnough }" data-testid="rent-availability">
-        <template v-if="availability">该时段可{{ form.immediate ? '租' : '预订' }} {{ availability.available }} 台<template v-if="notEnough">，不足 {{ form.count }} 台，请减少数量或更换时段</template></template>
+      <p class="avail" :class="{ warn: notEnough || availError }" data-testid="rent-availability">
+        <template v-if="availError">{{ availError }} <el-button link type="primary" data-testid="rent-availability-retry" @click="retryAvailability">重试</el-button></template>
+        <template v-else-if="availability">该时段可{{ form.immediate ? '租' : '预订' }} {{ availability.available }} 台<template v-if="notEnough">，不足 {{ form.count }} 台，请减少数量或更换时段</template></template>
         <template v-else>正在查询可用机器…</template>
       </p>
       <div v-if="!form.immediate && form.groupId !== null && calendar.length" class="calendar" data-testid="rent-calendar">
-        <button v-for="d in calendar" :key="d.date" type="button" class="day" :class="{ full: d.free === 0, picked: d.date === form.day }" :data-testid="`rent-day-${d.date}`" :disabled="d.free === 0" @click="pickDay(d)">
+        <button v-for="d in calendar" :key="d.date" type="button" class="day" :class="{ full: dayDisabled(d), picked: d.date === form.day }" :data-testid="`rent-day-${d.date}`" :disabled="dayDisabled(d)" @click="pickDay(d)">
           <span class="date">{{ d.date.slice(5) }}</span><span class="free">{{ d.free }}/{{ d.total }}</span>
         </button>
       </div>
@@ -296,16 +336,16 @@ async function submit() {
           <span data-testid="market-confirm-after" :class="{ warn: insufficient }">{{ after == null ? '—' : fmtYuan(after) }}<template v-if="insufficient">（余额不足）</template></span>
         </el-descriptions-item>
       </el-descriptions>
-      <el-button v-if="!expanded" link type="primary" data-testid="market-confirm-more" @click="expanded = true; step = 'form'">更多选项（机组 / 多台 / 预订 / 自动续费）</el-button>
+      <el-button v-if="!expanded" link type="primary" data-testid="market-confirm-more" @click="expanded = true; backToForm()">更多选项（机组 / 多台 / 预订 / 自动续费）</el-button>
     </template>
     <!-- 具名插槽只能放在组件的直接子级：按步骤切换按钮 -->
     <template #footer>
       <template v-if="step === 'form'">
         <el-button data-testid="rent-cancel" @click="visible = false">取消</el-button>
-        <el-button type="primary" :disabled="notEnough || !availability" data-testid="rent-next" @click="toConfirm">下一步</el-button>
+        <el-button type="primary" :disabled="notEnough" data-testid="rent-next" @click="toConfirm">下一步</el-button>
       </template>
       <template v-else>
-        <el-button v-if="expanded" data-testid="market-confirm-back" @click="step = 'form'">上一步</el-button>
+        <el-button v-if="expanded" data-testid="market-confirm-back" @click="backToForm">上一步</el-button>
         <el-button data-testid="market-confirm-cancel" @click="visible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" data-testid="market-confirm-ok" @click="submit">{{ insufficient ? '去充值' : '确认下单' }}</el-button>
       </template>

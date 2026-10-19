@@ -5,7 +5,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import GuideDialog from '../components/GuideDialog.vue'
-import RentDialog from '../components/RentDialog.vue'
+import RentDialog, { type PlacedResult } from '../components/RentDialog.vue'
 import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
 import { notifyError } from '../logic/notify'
@@ -85,13 +85,13 @@ async function open(p: Product, mode: 'immediate' | 'booking') {
 const rent = (p: Product) => open(p, 'immediate')
 const book = (p: Product) => open(p, 'booking')
 
-async function onPlaced(r: { instances: { id: string }[]; batchId: string | null }) {
+async function onPlaced(r: PlacedResult) {
   if (r.batchId && r.instances.length > 1) {
     ElMessage.success(`已下单 ${r.instances.length} 台`)
     await router.push({ path: '/instances', query: { batch: r.batchId } })
     return
   }
-  ElMessage.success(dialog.mode === 'booking' ? '预订成功' : '下单成功，正在开通')
+  ElMessage.success(r.immediate ? '下单成功，正在开通' : '预订成功') // 按实际提交的开始方式，不按打开按钮
   await router.push(`/instances/${r.instances[0].id}`)
 }
 </script>
@@ -136,7 +136,7 @@ async function onPlaced(r: { instances: { id: string }[]; batchId: string | null
       </el-card>
     </div>
 
-    <RentDialog v-if="dialog.product" v-model="dialog.visible" :product="dialog.product" :images="images" :mode="dialog.mode" :duration="sel[dialog.product.id].duration" :image-id="sel[dialog.product.id].imageId" @placed="onPlaced" />
+    <RentDialog v-if="dialog.product" v-model="dialog.visible" :product="dialog.product" :images="images" :mode="dialog.mode" :duration="sel[dialog.product.id].duration" :image-id="sel[dialog.product.id].imageId" @placed="onPlaced" @no-capacity="load" />
     <GuideDialog :guide="guide" />
   </div>
 </template>
