@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/platform/apperr"
@@ -77,6 +78,25 @@ func TestValidateEnvMatrix(t *testing.T) {
 	_, _, err = appdeploy.ValidateEnv(s2, nil)
 	if ae := apperr.As(err); ae == nil || ae.Code != "app_env_required" || !strings.Contains(ae.Message, "模型") {
 		t.Fatalf("required = %v", err)
+	}
+}
+
+// 未声明的变量名来自用户输入：回显进错误消息前截到 64 字节，且不切断 UTF-8 字符。
+func TestValidateEnvTruncatesUnknownName(t *testing.T) {
+	sp := goodSpec()
+	if err := appdeploy.ValidateSpec(&sp); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{strings.Repeat("A", 5000), strings.Repeat("模", 30)} {
+		_, _, err := appdeploy.ValidateEnv(sp, map[string]string{name: "x"})
+		ae := apperr.As(err)
+		if ae == nil || ae.Code != "app_env_invalid" || len(ae.Message) > 64+len("…：不是该应用声明的变量") || !utf8.ValidString(ae.Message) ||
+			!strings.Contains(ae.Message, "…") {
+			t.Fatalf("unknown name %d bytes → %v", len(name), err)
+		}
+	}
+	if _, _, err := appdeploy.ValidateEnv(sp, map[string]string{"SHORT": "x"}); apperr.As(err) == nil || apperr.As(err).Message != "SHORT：不是该应用声明的变量" {
+		t.Fatalf("short name = %v", err)
 	}
 }
 

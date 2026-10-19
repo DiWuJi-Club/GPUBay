@@ -81,8 +81,13 @@ type latestBrief struct {
 	version string
 }
 
-// Views 批量组装部署视图：应用、版本、各应用最新已发布版本、部署名下的端口行各一次查询。
+// Views 批量组装部署视图：应用、版本、各应用最新已发布版本、部署名下的端口行各一次查询。每个部署恰好一个视图、顺序不变（AdminViews 依赖）。
 func (s *Service) Views(ctx context.Context, deps []Deployment) ([]View, error) {
+	return s.views(ctx, deps, true)
+}
+
+// views：withSecrets 为 false 时不解密、不填 secret_env（摘要用不到，免得每次列表都解密）。
+func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool) ([]View, error) {
 	out := make([]View, 0, len(deps))
 	if len(deps) == 0 {
 		return out, nil
@@ -178,20 +183,16 @@ func (s *Service) Views(ctx context.Context, deps []Deployment) ([]View, error) 
 
 	for _, d := range deps {
 		a, ver := apps[d.AppID], vers[d.AppVersionID]
-		secrets, err := openSecrets(s.d.Box, d.SecretEnvEnc)
-		if err != nil {
-			return nil, err
-		}
 		v := View{ID: d.ID, InstanceID: d.InstanceID, AppID: d.AppID, AppSlug: a.slug, AppName: a.name, AppIcon: a.icon,
 			VersionID: d.AppVersionID, Version: ver.version, State: d.State, Desired: d.Desired, Phase: d.Phase, Progress: d.Progress,
 			Message: d.Message, Health: d.Health, ErrorCode: d.ErrorCode, Env: map[string]string{}, SecretEnv: map[string]bool{},
-			Spec: ver.spec, Port: d.Port, Links: []LinkView{}, Attempt: d.Attempt, CleanupPending: d.CleanupPending,
+			Spec: normalizeSpec(ver.spec), Port: d.Port, Links: []LinkView{}, Attempt: d.Attempt, CleanupPending: d.CleanupPending,
 			StartedAt: d.StartedAt, FinishedAt: d.FinishedAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
 		for k, val := range d.Env {
 			v.Env[k] = val
 		}
-		for k := range secrets {
-			v.SecretEnv[k] = true
+		if withSecrets {
+			v.SecretEnv = s.secretNames(d, ver.spec)
 		}
 		if l, ok := latest[d.AppID]; ok {
 			id := l.id
@@ -209,6 +210,40 @@ func (s *Service) Views(ctx context.Context, deps []Deployment) ([]View, error) 
 	return out, nil
 }
 
+// normalizeSpec 把视图里 spec 的 nil 切片换成空切片（前端按数组处理）。返回副本，不改调用方的 spec。
+func normalizeSpec(sp Spec) Spec {
+	if sp.Ports == nil {
+		sp.Ports = []PortSpec{}
+	}
+	if sp.Env == nil {
+		sp.Env = []EnvSpec{}
+	}
+	if sp.Links == nil {
+		sp.Links = []LinkSpec{}
+	}
+	return sp
+}
+
+// secretNames 返回已设置的敏感变量名（值恒为 true，从不返回值）。密文解不开（密钥轮换 / 数据损坏）时不让整个列表失败：
+// 记 Warn（只带部署 ID），按版本 spec 里 type=secret 的变量名一律显示为「已设置」——重新部署时留空即沿用，传新值即覆盖。
+func (s *Service) secretNames(d Deployment, spec Spec) map[string]bool {
+	out := map[string]bool{}
+	secrets, err := openSecrets(s.d.Box, d.SecretEnvEnc)
+	if err != nil {
+		s.d.Log.Warn("app deployment secrets unreadable, showing declared secrets as set", "deployment", d.ID)
+		for _, e := range spec.Env {
+			if e.Type == "secret" {
+				out[e.Name] = true
+			}
+		}
+		return out
+	}
+	for k := range secrets {
+		out[k] = true
+	}
+	return out
+}
+
 // Summaries 返回各实例非终态部署的摘要（实例列表一行显示用）；没有部署的实例不在 map 里。
 func (s *Service) Summaries(ctx context.Context, instanceIDs []string) (map[string][]Summary, error) {
 	byInst, err := s.LiveByInstances(ctx, instanceIDs)
@@ -220,7 +255,7 @@ func (s *Service) Summaries(ctx context.Context, instanceIDs []string) (map[stri
 		all = append(all, byInst[id]...)
 		delete(byInst, id) // 重复的实例 ID 只取一次
 	}
-	views, err := s.Views(ctx, all)
+	views, err := s.views(ctx, all, false)
 	if err != nil {
 		return nil, err
 	}

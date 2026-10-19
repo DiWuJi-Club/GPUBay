@@ -49,6 +49,8 @@ func (s *Server) ownedDeployment(r *http.Request) (appdeploy.Deployment, error) 
 }
 
 // allowAppWrite 部署类写操作的每用户限流（规格 §6.2：每小时 60 次）；超限已写 rate_limited。
+// 有意在解析请求体与业务校验之前计数：失败的请求（格式错、状态不允许、别人的实例）同样计入，
+// 限的是写接口的调用频率，也防止用错误请求探测。读接口不计数。
 func (s *Server) allowAppWrite(w http.ResponseWriter, r *http.Request) bool {
 	if !s.appsLim.allow(currentUser(r).ID, s.Clock.Now()) {
 		s.writeError(w, r, apperr.ErrRateLimited)

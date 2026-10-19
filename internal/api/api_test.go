@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -57,6 +58,25 @@ type testEnv struct {
 	ingress *ingress.Auth
 	apps    *appdeploy.Service // 只有 newAppsTestEnv 组装；其余为 nil（Server.Apps 也为 nil）
 	appCat  *appdeploy.Catalog
+	appLog  *lockedBuffer // 应用部署服务的日志（newAppsTestEnv）
+}
+
+// lockedBuffer 是可并发写的日志缓冲（服务端处理请求的 goroutine 写、测试读）。
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func newTestEnv(t *testing.T) *testEnv { return newTestEnvWith(t, nil) }
@@ -103,10 +123,11 @@ func buildTestEnv(t *testing.T, withApps bool, tweak func(*api.Server)) *testEnv
 		Billing: bill, DevPay: true, Ingress: auth}
 	var apps *appdeploy.Service
 	var appCat *appdeploy.Catalog
+	appLog := &lockedBuffer{}
 	if withApps {
 		quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 		appCat = appdeploy.NewCatalog(pool, clk, f, c, quiet)
-		apps = appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: quiet, Catalog: appCat, Images: c, Rental: r, Fleet: f,
+		apps = appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: slog.New(slog.NewTextHandler(appLog, nil)), Catalog: appCat, Images: c, Rental: r, Fleet: f,
 			PortURL: auth.PortURL})
 		r.SetAppHooks(apps)
 		srv.Apps = apps
@@ -116,7 +137,7 @@ func buildTestEnv(t *testing.T, withApps bool, tweak func(*api.Server)) *testEnv
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
-	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, fleet: f, ingress: auth, apps: apps, appCat: appCat}
+	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, fleet: f, ingress: auth, apps: apps, appCat: appCat, appLog: appLog}
 }
 
 type client struct {

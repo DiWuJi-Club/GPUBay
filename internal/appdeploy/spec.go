@@ -245,7 +245,7 @@ func ValidateEnv(s Spec, values map[string]string) (plain, secret map[string]str
 	}
 	for name := range values {
 		if _, ok := known[name]; !ok {
-			return nil, nil, apperr.AppEnvInvalid(name, "不是该应用声明的变量")
+			return nil, nil, apperr.AppEnvInvalid(truncBytes(name, maxEchoNameBytes), "不是该应用声明的变量") // 名字来自用户输入，回显前截断
 		}
 	}
 	plain, secret = map[string]string{}, map[string]string{}
@@ -280,4 +280,19 @@ func SpecHash(s Spec, script string) string {
 	h.Write([]byte("\n"))
 	h.Write([]byte(script))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// maxEchoNameBytes 错误消息里回显用户提供的变量名的上限（字节）。
+const maxEchoNameBytes = 64
+
+// truncBytes 截到最多 n 字节，不切断 UTF-8 字符；截断时加「…」。
+func truncBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	i := n
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i] + "…"
 }

@@ -357,6 +357,60 @@ func TestInstanceAppsLogAndEvents(t *testing.T) {
 	}
 }
 
+// 密文解不开（密钥轮换 / 数据损坏）时列表不能 500：secret_env 按版本声明的 secret 显示为已设置，只记 Warn（带部署 ID、不带值）；
+// 摘要（实例列表 / 详情）根本不解密。
+func TestInstanceAppsUnreadableSecrets(t *testing.T) {
+	e := newAppsTestEnv(t, nil)
+	apps := e.seedApps()
+	c := e.client()
+	id := c.runningInstance(t, e, "13800000151")
+	_, vdep := c.do("POST", "/instances/"+id+"/apps", map[string]any{"app_id": apps.vllm.ID}) // API_KEY 未设置
+	_, jdep := c.do("POST", "/instances/"+id+"/apps", map[string]any{"app_id": apps.jupyter.ID, "env": map[string]string{"JUPYTER_TOKEN": "abcdefgh12"}})
+	if vdep["secret_env"] == nil || len(vdep["secret_env"].(map[string]any)) != 0 {
+		t.Fatalf("unset secret = %v", vdep["secret_env"])
+	}
+	// 没有 links 的 spec：links 省略（AppSpec.links?），不会是 null
+	if spec := jdep["spec"].(map[string]any); len(spec["ports"].([]any)) != 1 {
+		t.Fatalf("spec = %v", spec)
+	} else if v, has := spec["links"]; has && v == nil {
+		t.Fatalf("spec.links = null: %v", spec)
+	}
+	e.exec(`UPDATE app_deployments SET secret_env_enc = $2 WHERE instance_id = $1`, id, []byte("not a secretbox ciphertext"))
+
+	for _, p := range []string{"/instances", "/instances/" + id} {
+		code, out := c.do("GET", p, nil)
+		if code != 200 {
+			t.Fatalf("GET %s with unreadable secrets = %d %v", p, code, out)
+		}
+	}
+	if strings.Contains(e.appLog.String(), "unreadable") {
+		t.Fatalf("summaries decrypted secrets: %s", e.appLog.String())
+	}
+	code, out := c.do("GET", "/instances/"+id+"/apps", nil)
+	items := out["items"].([]any)
+	if code != 200 || len(items) != 2 {
+		t.Fatalf("list with unreadable secrets = %d %v", code, out)
+	}
+	byID := map[string]map[string]any{}
+	for _, it := range items {
+		byID[it.(map[string]any)["id"].(string)] = it.(map[string]any)
+	}
+	if se := byID[vdep["id"].(string)]["secret_env"].(map[string]any); len(se) != 1 || se["API_KEY"] != true {
+		t.Fatalf("vllm fallback secret_env = %v", se)
+	}
+	if se := byID[jdep["id"].(string)]["secret_env"].(map[string]any); len(se) != 1 || se["JUPYTER_TOKEN"] != true {
+		t.Fatalf("jupyter fallback secret_env = %v", se)
+	}
+	logs := e.appLog.String()
+	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, vdep["id"].(string)) || !strings.Contains(logs, jdep["id"].(string)) ||
+		strings.Contains(logs, "abcdefgh12") {
+		t.Fatalf("warn log = %s", logs)
+	}
+	if code, out := c.do("GET", "/instances/"+id+"/apps/"+vdep["id"].(string), nil); code != 200 || out["state"] != "queued" {
+		t.Fatalf("get with unreadable secrets = %d %v", code, out)
+	}
+}
+
 func TestOrderWithApp(t *testing.T) {
 	e := newAppsTestEnv(t, nil)
 	apps := e.seedApps()
