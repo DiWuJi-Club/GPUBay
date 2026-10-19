@@ -27,6 +27,12 @@ const fetchedAt = ref(0) // 拿到 inst 的本地时刻：cancellable_seconds �
 const loadError = ref('')
 // 运行中倒计时归零：后端此时已（或即将）停机，刷新一次显示新状态
 const countdown = useCountdown({ onZero: () => void load() })
+// 预订提前开通、未到开始时刻：剩余时长不动，到开始时刻刷新一次再开始倒计时（验收 B-1）
+let startTimer: ReturnType<typeof setTimeout> | undefined
+function clearStartTimer() {
+  if (startTimer !== undefined) clearTimeout(startTimer)
+  startTimer = undefined
+}
 let seq = 0 // 查询序号：只采用最后发出的那次查询的结果
 let failing = false
 
@@ -42,7 +48,12 @@ async function load() {
     if (prevState !== undefined && prevState !== next.state) void loadEvents() // 状态变化时刷新时间线（首次由 onMounted 拉）
     loadError.value = ''
     failing = false
-    if (next.state === 'running' && !next.suspended) countdown.start(next.remaining_seconds)
+    clearStartTimer()
+    if (next.state === 'running' && !next.suspended && next.starts_in_seconds > 0) {
+      countdown.stop()
+      countdown.remaining.value = next.remaining_seconds
+      startTimer = setTimeout(() => void load(), next.starts_in_seconds * 1000 + 1000)
+    } else if (next.state === 'running' && !next.suspended) countdown.start(next.remaining_seconds)
     else {
       countdown.stop()
       countdown.remaining.value = next.remaining_seconds
@@ -61,7 +72,10 @@ onMounted(() => {
 })
 const nowMs = ref(Date.now())
 const ticker = setInterval(() => (nowMs.value = Date.now()), 1000)
-onUnmounted(() => clearInterval(ticker))
+onUnmounted(() => {
+  clearInterval(ticker)
+  clearStartTimer()
+})
 // 已预订 / 开通中 / 洗机中每 10 秒刷新一次（预订到开通时刻自动变为开通中）（页面不可见时暂停，卸载自动停止）。
 // 运行中且服务器已报剩余 0 秒：到期停机由后端每分钟的清扫执行，归零那次刷新多半还是「运行中」，同样每 10 秒再查，状态变了就停
 const awaitingExpiry = () => inst.value?.state === 'running' && !inst.value.suspended && inst.value.remaining_seconds === 0
@@ -391,6 +405,7 @@ watch(id, () => {
   loadError.value = ''
   failing = false
   countdown.stop()
+  clearStartTimer()
   void load()
   void loadEvents()
 })

@@ -212,7 +212,7 @@
 
 | 编号 | 现象 | 原因（初判） | 严重度 | 修复 |
 |---|---|---|---|---|
-| B-1 | 预订实例提前开通后、尚未到 S 时，控制台实例详情「剩余时长」按本地时钟逐秒递减（22:01 显示 23 小时 59 分并持续下降），而接口 `remaining_seconds` 固定为 `expires − S`（86400）。页面不刷新时一直偏小，到 S 时少显示约 1 小时，刷新后才纠正。 | `InstanceDetailView.vue` 的 `load()` 对 `running && !suspended` 一律 `countdown.start(remaining_seconds)`，没有判断 `scheduled_start_at` 是否还在未来；running 状态也不轮询，所以不会被服务端纠正。 | 低（只影响显示，刷新即正确） | 待修 |
+| B-1 | 预订实例提前开通后、尚未到 S 时，控制台实例详情「剩余时长」按本地时钟逐秒递减（22:01 显示 23 小时 59 分并持续下降），而接口 `remaining_seconds` 固定为 `expires − S`（86400）。页面不刷新时一直偏小，到 S 时少显示约 1 小时，刷新后才纠正。 | `InstanceDetailView.vue` 的 `load()` 对 `running && !suspended` 一律 `countdown.start(remaining_seconds)`，没有判断 `scheduled_start_at` 是否还在未来；running 状态也不轮询，所以不会被服务端纠正。 | 低（只影响显示，刷新即正确） | 已修（实例视图新增 `starts_in_seconds`，控制台在开始时刻前不递减、到点刷新；Go + vitest 用例） |
 
 ### 观察（列入遗留）
 

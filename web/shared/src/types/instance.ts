@@ -29,6 +29,8 @@ export interface Instance {
   cancellable_until: string | null
   /** 按服务器时钟距取消截止的秒数（0 = 不可取消）；前端按拿到数据的时刻递减 */
   cancellable_seconds: number
+  /** 预订已开机但未到开始时刻：按服务器时钟距开始的秒数，在此之前剩余时长不递减；其余为 0 */
+  starts_in_seconds: number
   group_id: number | null
   group_name: string
   machine_label: string

@@ -38,6 +38,7 @@ type instanceView struct {
 	ScheduledStartAt      *time.Time           `json:"scheduled_start_at"`
 	ScheduledEndAt        *time.Time           `json:"scheduled_end_at"`
 	CancellableUntil      *time.Time           `json:"cancellable_until"`
+	StartsInSeconds       int64                `json:"starts_in_seconds"`   // 预订已开机但未到开始时刻：按服务器时钟距开始的秒数，此前剩余时长不递减（验收 B-1）；其余为 0
 	CancellableSeconds    int64                `json:"cancellable_seconds"` // 按服务器时钟距取消截止的秒数（0 = 不可取消）；前端按拿到数据的时刻递减（终审 M3）
 	GroupID               *int64               `json:"group_id"`
 	GroupName             string               `json:"group_name"`
@@ -78,6 +79,9 @@ func (s *Server) view(i rental.Instance) instanceView {
 		} else {
 			end := i.ScheduledStartAt.Add(time.Duration(i.PendingSeconds) * time.Second)
 			v.ScheduledEndAt = &end
+		}
+		if i.State != rental.StateReserved {
+			v.StartsInSeconds = max(0, int64(i.ScheduledStartAt.Sub(now)/time.Second))
 		}
 		if i.State == rental.StateReserved {
 			until := i.ScheduledStartAt.Add(-rental.PrepLead)

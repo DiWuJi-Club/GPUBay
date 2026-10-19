@@ -293,7 +293,10 @@ func TestGroupEndpointsFilterByProduct(t *testing.T) {
 			t.Fatalf("calendar%s = %d %v", tc.q, code, out)
 		}
 	}
-	if items := func() []any { _, out := anon.do("GET", "/groups/"+itoa(g.ID)+"/machines?product_id="+itoa(p1), nil); return out["items"].([]any) }(); items[0].(map[string]any)["id"].(float64) != float64(m1) {
+	if items := func() []any {
+		_, out := anon.do("GET", "/groups/"+itoa(g.ID)+"/machines?product_id="+itoa(p1), nil)
+		return out["items"].([]any)
+	}(); items[0].(map[string]any)["id"].(float64) != float64(m1) {
 		t.Fatalf("machines of p1 = %v", items)
 	}
 	for _, p := range []string{"/groups?product_id=x", "/groups/" + itoa(g.ID) + "/machines?product_id=0", "/groups/" + itoa(g.ID) + "/calendar?product_id=-1"} {

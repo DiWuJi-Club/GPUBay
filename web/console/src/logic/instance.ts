@@ -1,10 +1,11 @@
 import { fmtDuration, fmtTime, type CancelQuote, type Duration, type Instance, type InstanceState } from '@spark/shared'
 import { MAX_QUANTITY } from './booking'
 
-/** 以拿到数据的本地时刻为基准递减；暂停中与非运行状态不递减。 */
+/** 以拿到数据的本地时刻为基准递减；暂停中与非运行状态不递减；预订提前开通的，到开始时刻（starts_in_seconds 之后）才递减。 */
 export function remainingNow(i: Instance, fetchedAt: number, now: number): number {
   if (i.state !== 'running' || i.suspended) return i.remaining_seconds
-  return Math.max(0, i.remaining_seconds - Math.floor((now - fetchedAt) / 1000))
+  const elapsed = Math.max(0, Math.floor((now - fetchedAt) / 1000) - (i.starts_in_seconds ?? 0))
+  return Math.max(0, i.remaining_seconds - elapsed)
 }
 
 export function instanceTimeText(i: Instance, remaining: number): string {

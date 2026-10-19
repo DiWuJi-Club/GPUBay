@@ -46,3 +46,22 @@ func TestViewCancellableSeconds(t *testing.T) {
 		t.Fatalf("creating = %d", v.CancellableSeconds)
 	}
 }
+
+// 验收 B-1：预订提前开通（running）但未到 S 时，starts_in_seconds 给出按服务器时钟距 S 的秒数，前端在此之前不递减剩余时长；
+// 到了 S 或非预订实例为 0。
+func TestViewStartsInSeconds(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := &Server{Clock: clock.NewFake(now)}
+	start := now.Add(40 * time.Minute)
+	expires := start.Add(24 * time.Hour)
+	if v := s.view(rental.Instance{ID: "a", State: rental.StateRunning, ScheduledStartAt: &start, ExpiresAt: &expires}); v.StartsInSeconds != 40*60 {
+		t.Fatalf("running before S = %d", v.StartsInSeconds)
+	}
+	past := now.Add(-time.Minute)
+	if v := s.view(rental.Instance{ID: "a", State: rental.StateRunning, ScheduledStartAt: &past, ExpiresAt: &expires}); v.StartsInSeconds != 0 {
+		t.Fatalf("running after S = %d", v.StartsInSeconds)
+	}
+	if v := s.view(rental.Instance{ID: "a", State: rental.StateRunning, ExpiresAt: &expires}); v.StartsInSeconds != 0 {
+		t.Fatalf("immediate = %d", v.StartsInSeconds)
+	}
+}
