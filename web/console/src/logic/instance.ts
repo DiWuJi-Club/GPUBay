@@ -47,3 +47,15 @@ export function autoRenewFailureText(i: Instance): string {
 export function sumCancelQuotes(quotes: CancelQuote[]): { count: number; refund: number } {
   return { count: quotes.length, refund: quotes.reduce((s, q) => s + q.refund, 0) }
 }
+
+/** allSettled 的报价结果按实例拆开：报价失败的实例不进入本次批量取消。 */
+export function partitionQuotes(ids: string[], results: PromiseSettledResult<CancelQuote>[]): { ids: string[]; quotes: CancelQuote[]; failed: string[] } {
+  const out = { ids: [] as string[], quotes: [] as CancelQuote[], failed: [] as string[] }
+  results.forEach((r, k) => {
+    if (r.status === 'fulfilled') {
+      out.ids.push(ids[k])
+      out.quotes.push(r.value)
+    } else out.failed.push(ids[k])
+  })
+  return out
+}

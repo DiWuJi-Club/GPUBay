@@ -7,7 +7,7 @@ import { api } from '../api'
 import AppDialog from '../components/AppDialog.vue'
 import { usePolling } from '../composables/usePolling'
 import { useTicker } from '../composables/useTicker'
-import { canCancel, instanceTimeText, remainingNow, sumCancelQuotes } from '../logic/instance'
+import { canCancel, instanceTimeText, partitionQuotes, remainingNow, sumCancelQuotes } from '../logic/instance'
 import { notifyError } from '../logic/notify'
 
 const route = useRoute()
@@ -56,21 +56,35 @@ const rows = computed(() =>
 const cancellableCount = computed(() => rows.value.filter((r) => r.cancellable).length)
 const cancelling = ref(false)
 const cancelAllVisible = ref(false)
-const cancelTargets = ref<string[]>([]) // 确认框打开时取到报价的实例，确认后只取消这些
+const cancelTargets = ref<string[]>([]) // 确认框里报价成功的实例，确认后只取消这些
+const cancelExcluded = ref<string[]>([]) // 报价失败、不在本次取消范围内的实例
 const cancelSummary = ref({ count: 0, refund: 0 })
-/** 先逐台取报价，弹确认框显示台数与退款合计；任一报价失败则不弹框。 */
+const cancelSummaryChanged = ref(false)
+/** 逐台取报价（allSettled）：失败的实例排除并告知。 */
+async function quoteAll(ids: string[]) {
+  const results = await Promise.allSettled(ids.map((id) => api.get<CancelQuote>(`/instances/${id}/cancel-quote`)))
+  return partitionQuotes(ids, results)
+}
+function applyQuotes(q: ReturnType<typeof partitionQuotes>, excludedBefore: string[]) {
+  cancelTargets.value = q.ids
+  cancelExcluded.value = [...excludedBefore, ...q.failed]
+  cancelSummary.value = sumCancelQuotes(q.quotes)
+}
+/** 先取报价，弹确认框显示台数与退款合计。 */
 async function openCancelAll() {
   if (cancelling.value) return
   const ids = rows.value.filter((x) => x.cancellable).map((x) => x.id)
   if (!ids.length) return
   cancelling.value = true
   try {
-    const quotes = await Promise.all(ids.map((id) => api.get<CancelQuote>(`/instances/${id}/cancel-quote`)))
-    cancelTargets.value = ids
-    cancelSummary.value = sumCancelQuotes(quotes)
+    const q = await quoteAll(ids)
+    if (!q.ids.length) {
+      ElMessage.error('获取取消报价失败，请稍后重试')
+      return
+    }
+    applyQuotes(q, [])
+    cancelSummaryChanged.value = false
     cancelAllVisible.value = true
-  } catch (e) {
-    notifyError(e)
   } finally {
     cancelling.value = false
   }
@@ -79,6 +93,19 @@ async function openCancelAll() {
 async function cancelAll() {
   if (cancelling.value) return
   cancelling.value = true
+  // 确认时重新报价：合计变了（跨档位 / 有实例报价失败）就更新显示，请用户再确认一次
+  const q = await quoteAll(cancelTargets.value)
+  const next = sumCancelQuotes(q.quotes)
+  if (q.failed.length || next.count !== cancelSummary.value.count || next.refund !== cancelSummary.value.refund) {
+    applyQuotes(q, cancelExcluded.value)
+    cancelSummaryChanged.value = true
+    cancelling.value = false
+    if (!q.ids.length) {
+      cancelAllVisible.value = false
+      ElMessage.error('获取取消报价失败，请稍后重试')
+    }
+    return
+  }
   let ok = 0
   const failed: string[] = []
   for (const id of cancelTargets.value) {
@@ -156,9 +183,11 @@ async function cancelAll() {
     </el-table>
 
     <AppDialog v-model="cancelAllVisible" kind="confirm" title="取消全部未开通" data-testid="instances-cancel-all-dialog">
+      <p v-if="cancelSummaryChanged" class="warn" data-testid="instances-cancel-all-changed">退款合计已按最新报价更新，请确认后再次点击。</p>
       <p data-testid="instances-cancel-all-text">将取消 {{ cancelSummary.count }} 台未开通的预订，共退款 {{ fmtYuan(cancelSummary.refund) }}（按各台当前取消规则计算）。</p>
+      <p v-if="cancelExcluded.length" class="warn" data-testid="instances-cancel-all-excluded">以下实例获取报价失败，本次不取消：{{ cancelExcluded.join('、') }}</p>
       <template #footer>
-        <el-button data-testid="instances-cancel-all-cancel" @click="cancelAllVisible = false">再想想</el-button>
+        <el-button :disabled="cancelling" data-testid="instances-cancel-all-cancel" @click="cancelAllVisible = false">再想想</el-button>
         <el-button type="danger" :loading="cancelling" data-testid="instances-cancel-all-ok" @click="cancelAll">确定取消</el-button>
       </template>
     </AppDialog>

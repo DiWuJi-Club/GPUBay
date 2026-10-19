@@ -585,7 +585,7 @@ watch(id, () => {
       <p v-if="cancelQuoteChanged" class="warn" data-testid="detail-cancel-changed">退款金额已按最新规则更新，请确认后再次点击。</p>
       <p v-if="cancelQuote" data-testid="detail-cancel-text">将退款 {{ fmtYuan(cancelQuote.refund) }}（{{ cancelQuote.percent }}%），可取消至 {{ fmtTime(cancelQuote.deadline) }}。开通后将不能取消。</p>
       <template #footer>
-        <el-button data-testid="detail-cancel-cancel" @click="cancelVisible = false">再想想</el-button>
+        <el-button :disabled="cancelling" data-testid="detail-cancel-cancel" @click="cancelVisible = false">再想想</el-button>
         <el-button type="danger" :loading="cancelling" data-testid="detail-cancel-ok" @click="confirmCancel">确定取消</el-button>
       </template>
     </AppDialog>

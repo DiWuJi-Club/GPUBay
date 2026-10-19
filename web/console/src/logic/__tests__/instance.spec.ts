@@ -1,6 +1,6 @@
 import type { Instance } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { autoRenewFailureText, canCancel, sumCancelQuotes, canRelease, canRenew, canSetAutoRenew, instanceTimeText, releaseWarning, remainingNow, renewQuantityMax } from '../instance'
+import { autoRenewFailureText, canCancel, partitionQuotes, sumCancelQuotes, canRelease, canRenew, canSetAutoRenew, instanceTimeText, releaseWarning, remainingNow, renewQuantityMax } from '../instance'
 
 const base: Instance = {
   id: 'ins-abc12345', state: 'running', product_id: 1, image_id: 1, product_name: 'DGX Spark 整机', image_name: 'PyTorch', suspended: false,
@@ -87,5 +87,15 @@ describe('批次取消汇总', () => {
     const q = (refund: number, percent: number) => ({ refund, percent, deadline: '2026-10-20T01:00:00Z', max: refund })
     expect(sumCancelQuotes([q(10000, 100), q(5000, 50), q(0, 0)])).toEqual({ count: 3, refund: 15000 })
     expect(sumCancelQuotes([])).toEqual({ count: 0, refund: 0 })
+  })
+})
+
+describe('批次报价部分失败', () => {
+  it('报价失败的实例被排除', () => {
+    const q = { refund: 100, percent: 100, deadline: '2026-10-20T01:00:00Z', max: 100 }
+    const out = partitionQuotes(['a', 'b', 'c'], [
+      { status: 'fulfilled', value: q }, { status: 'rejected', reason: new Error('x') }, { status: 'fulfilled', value: { ...q, refund: 50 } },
+    ])
+    expect(out).toEqual({ ids: ['a', 'c'], quotes: [q, { ...q, refund: 50 }], failed: ['b'] })
   })
 })
