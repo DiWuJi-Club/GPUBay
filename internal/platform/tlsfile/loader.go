@@ -16,7 +16,7 @@ type Loader struct {
 	KeyFile  string
 	Interval time.Duration    // 检查 mtime 的最小间隔，零值 1 分钟
 	Now      func() time.Time // 零值 time.Now；app 传入 clock.Clock.Now
-	// OnReloadError：连续两次检查都加载失败（保留旧证书）时回调，之后每次失败都回调；第一次失败只记日志——
+	// OnReloadError：连续失败次数恰好到 2 时回调一次（一轮连续失败只告警一次，成功加载后清零）；其余失败只记日志——
 	// 证书与私钥分两次替换时，中间那次检查会看到不配对的一对，下一次就好了。可能在 TLS 握手路径上被调用，不应阻塞。
 	// OnExpiring：CheckExpiry 发现剩余不足阈值时回调。
 	OnReloadError func(err error)
@@ -85,7 +85,7 @@ func (l *Loader) load() error {
 	return nil
 }
 
-// CheckNow 立即检查文件是否变化并重新加载；上次检查失败时不看 mtime 直接重试。失败保留旧证书，连续两次失败起回调 OnReloadError。
+// CheckNow 立即检查文件是否变化并重新加载；上次检查失败时不看 mtime 直接重试。失败保留旧证书，连续失败第 2 次时回调 OnReloadError。
 func (l *Loader) CheckNow() {
 	l.reload.Lock()
 	defer l.reload.Unlock()
@@ -111,17 +111,15 @@ func (l *Loader) reloadFailed(err error) {
 	l.failures++
 	n := l.failures
 	l.mu.Unlock()
-	if n < 2 {
-		log := l.Log
-		if log == nil {
-			log = slog.Default()
-		}
-		log.Warn("tls certificate reload failed, keeping previous certificate; will retry", "err", err)
+	if n == 2 && l.OnReloadError != nil {
+		l.OnReloadError(err)
 		return
 	}
-	if l.OnReloadError != nil {
-		l.OnReloadError(err)
+	log := l.Log
+	if log == nil {
+		log = slog.Default()
 	}
+	log.Warn("tls certificate reload failed, keeping previous certificate; will retry", "err", err, "consecutive_failures", n)
 }
 
 func (l *Loader) current() (*tls.Certificate, time.Time) {

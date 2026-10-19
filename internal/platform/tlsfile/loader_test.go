@@ -142,3 +142,35 @@ func TestLoaderCertThenKeyUpdateNoAlert(t *testing.T) {
 		t.Fatalf("failure count not reset after successful reload: errs %d", reloadErrs)
 	}
 }
+
+// 一轮连续失败只回调一次（第 2 次）；成功加载后清零，下一轮连续失败再回调一次。
+func TestLoaderReloadErrorOncePerFailureStreak(t *testing.T) {
+	dir := t.TempDir()
+	certFile, keyFile := writeCert(t, dir, time.Now().Add(90*24*time.Hour), 1)
+	var reloadErrs int
+	l := &tlsfile.Loader{CertFile: certFile, KeyFile: keyFile, OnReloadError: func(error) { reloadErrs++ }}
+	if err := l.Load(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	os.WriteFile(certFile, []byte("garbage"), 0o644)
+	for i := 0; i < 5; i++ {
+		l.CheckNow()
+	}
+	if reloadErrs != 1 || l.NotAfter().IsZero() {
+		t.Fatalf("first streak: errs %d (want 1), not_after %v", reloadErrs, l.NotAfter())
+	}
+	writeCert(t, dir, time.Now().Add(90*24*time.Hour), 2)
+	l.CheckNow()
+	if c, _ := l.GetCertificate(&tls.ClientHelloInfo{}); c.Leaf.SerialNumber.Int64() != 2 {
+		t.Fatalf("not recovered: serial %d", c.Leaf.SerialNumber.Int64())
+	}
+	time.Sleep(20 * time.Millisecond)
+	os.WriteFile(certFile, []byte("garbage"), 0o644)
+	for i := 0; i < 4; i++ {
+		l.CheckNow()
+	}
+	if reloadErrs != 2 {
+		t.Fatalf("second streak: errs %d (want 2)", reloadErrs)
+	}
+}
