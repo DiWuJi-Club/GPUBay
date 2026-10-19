@@ -31,10 +31,14 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 		if old.State != StateRunning {
 			return apperr.ErrInvalidState
 		}
-		remaining := int64(old.Remaining(now) / time.Second)
-		if remaining <= 0 {
+		paid := int64(old.Remaining(now) / time.Second)
+		if paid <= 0 {
 			return apperr.New("invalid_state", "该实例已没有剩余时长，无需换机", 409)
 		}
+		// 新实例不是预订，开通后从 now 起算 pending_seconds。早开通的预订在 S 之前换机时，已付时长从 S 才开始计，
+		// 所以把 now → S 这段（resumeBase）也给新实例，到期不早于 S + 已付时长（终审 M4）；
+		// instance_transfers 只记已付的 paid（新实例开通失败按它退款，早开通的免费时段不折现）。
+		remaining := int64(old.resumeBase(now).Sub(now)/time.Second) + paid
 		ref, err := s.d.Catalog.ImageRef(ctx, tx, old.ImageID)
 		if err != nil {
 			return err
@@ -77,7 +81,7 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO instance_transfers (from_instance_id, to_instance_id, seconds, reason, admin_id, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`, old.ID, id, remaining, reason, actor.AdminID, now); err != nil {
+			VALUES ($1, $2, $3, $4, $5, $6)`, old.ID, id, paid, reason, actor.AdminID, now); err != nil {
 			return err
 		}
 		if _, err := s.d.Fleet.Enqueue(ctx, tx, newMachine, id, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref}); err != nil {
@@ -87,7 +91,7 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			return err
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("instance.migrate", "instance", old.ID, map[string]any{
-			"to_instance": id, "from_machine": old.MachineID, "to_machine": newMachine, "seconds": remaining, "reason": reason,
+			"to_instance": id, "from_machine": old.MachineID, "to_machine": newMachine, "seconds": paid, "pending_seconds": remaining, "reason": reason,
 		}))
 	})
 	return moved, err

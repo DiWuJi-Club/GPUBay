@@ -385,7 +385,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 |---|---|
 | 即时租用 | 走 `PlaceBatch` 即时分支：候选只要 `idle AND agent_online` 且 `[now, now+D+Tail)` 无重叠；一台机器若在 D+7h 内有预订就不会被分给这单（用户看到的 `idle_count` 改为「此刻可即时租用」= 同一查询的 count，而不是单纯 idle 台数） |
 | 维护模式 | 进入维护只允许 `idle / faulty`（现状）；机器上有未开通预订时后台提示（B12），预订在开通时改派。结束维护的检查不变 |
-| 换机（`AdminMigrate`） | 新机器用 §4.2 即时分支（period 与 `openLease` 对 creating 的估算一致：`[now, now + CreateTimeout + 剩余 + Tail)`），不会挑到放不下的机器；新实例**复制** `auto_renew`、`auto_renew_duration`（否则用户开了自动续费换一次机就静默失效）；`group_id` 取**新机器的机组**（实施中裁定，见 `followups-plan6.md`：展示名与机组保持一致，删除机组的检查也以实际机器为准）；`batch_id` 不复制，`scheduled_*` / `provisioned_at` 为 NULL；旧实例 lease 由 `beginWipe → refreshLease` 处理（上界封顶）。预订实例不可换机（§5.6） |
+| 换机（`AdminMigrate`） | 新机器用 §4.2 即时分支（period 与 `openLease` 对 creating 的估算一致：`[now, now + CreateTimeout + 剩余 + Tail)`），不会挑到放不下的机器；新实例**复制** `auto_renew`、`auto_renew_duration`（否则用户开了自动续费换一次机就静默失效）；`group_id` 取**新机器的机组**（实施中裁定，见 `followups-plan6.md`：展示名与机组保持一致，删除机组的检查也以实际机器为准）；`batch_id` 不复制，`scheduled_*` / `provisioned_at` 为 NULL；旧实例 lease 由 `beginWipe → refreshLease` 处理（上界封顶）。预订实例不可换机（§5.6）。早开通的预订实例（running 且 now < S）换机：新实例 `pending_seconds = (resumeBase(now) − now) + 剩余`，即到原到期 S + D 为止的全部时长，新实例开通后到期不早于 S + D（不少算已付时长）；`instance_transfers.seconds` 与审计 `seconds` 只记已付的剩余（新实例开通失败按它退款，早开通的免费时段不折现），审计另记 `pending_seconds`（终审 M4） |
 | 机器失联（暂停） | 上界每轮推进并封顶（§4.3）；若封顶导致到预订开通时刻机器仍被占 → 预订改派，老租户不动（第 11 条决策） |
 | 到期停机 + 6h 保留 | 尾段已计入时段；停机期间续费受 §7.1 约束（用户若想续但被挡 → 控制台提示可续至，或等数据保留结束） |
 | 用户释放（不退款） | 不变；释放后 `beginWipe` 上界封顶为洗机估算 |
