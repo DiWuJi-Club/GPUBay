@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/api"
+	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
@@ -54,12 +55,25 @@ type testEnv struct {
 	rental  *rental.Service
 	fleet   *fleet.Service
 	ingress *ingress.Auth
+	apps    *appdeploy.Service // 只有 newAppsTestEnv 组装；其余为 nil（Server.Apps 也为 nil）
+	appCat  *appdeploy.Catalog
 }
 
 func newTestEnv(t *testing.T) *testEnv { return newTestEnvWith(t, nil) }
 
 // newTestEnvWith 在构建路由前允许调整 Server 字段（例如 Static）。
 func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
+	t.Helper()
+	return buildTestEnv(t, false, tweak)
+}
+
+// newAppsTestEnv 额外组装应用部署服务（Server.Apps + rental 钩子）。
+func newAppsTestEnv(t *testing.T, tweak func(*api.Server)) *testEnv {
+	t.Helper()
+	return buildTestEnv(t, true, tweak)
+}
+
+func buildTestEnv(t *testing.T, withApps bool, tweak func(*api.Server)) *testEnv {
 	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
@@ -87,12 +101,22 @@ func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test", SSHHost: "ssh.spark.test", PublicBaseURL: "http://spark.test",
 		Billing: bill, DevPay: true, Ingress: auth}
+	var apps *appdeploy.Service
+	var appCat *appdeploy.Catalog
+	if withApps {
+		quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+		appCat = appdeploy.NewCatalog(pool, clk, f, c, quiet)
+		apps = appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: quiet, Catalog: appCat, Images: c, Rental: r, Fleet: f,
+			PortURL: auth.PortURL})
+		r.SetAppHooks(apps)
+		srv.Apps = apps
+	}
 	if tweak != nil {
 		tweak(srv)
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
-	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, fleet: f, ingress: auth}
+	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, fleet: f, ingress: auth, apps: apps, appCat: appCat}
 }
 
 type client struct {
