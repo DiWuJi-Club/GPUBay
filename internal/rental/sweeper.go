@@ -233,7 +233,8 @@ func (s *Service) FailTimedOutCommands(ctx context.Context) (int, error) {
 	return n, errors.Join(errs...)
 }
 
-// ResumeMachine 机器恢复在线后，只对容器确实在运行（runningIDs）的暂停实例补回时长并重算提醒标记；
+// ResumeMachine 机器恢复在线后，只对容器确实在运行（runningIDs）的暂停实例补回时长并重算提醒标记
+// （到期 = resumeBase + 冻结的剩余时长：预订实例在开始时刻前恢复，仍到 S + 已付时长）；
 // 其余暂停实例保持暂停并告警 container_down，由管理员换机或退款。
 func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs []string) (int, error) {
 	now := s.d.Clock.Now()
@@ -260,10 +261,11 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs
 			if inst.PausedRemaining != nil {
 				remaining = time.Duration(*inst.PausedRemaining) * time.Second
 			}
-			r24, r1 := reminderFlags(remaining)
+			expires := inst.resumeBase(now).Add(remaining)
+			r24, r1 := reminderFlags(expires.Sub(now))
 			if _, err := tx.Exec(ctx, `UPDATE instances SET expires_at = $2, suspended_at = NULL, paused_remaining = NULL,
 					reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
-				inst.ID, now.Add(remaining), r24, r1, now); err != nil {
+				inst.ID, expires, r24, r1, now); err != nil {
 				return err
 			}
 			if err := recordEvent(ctx, tx, inst.ID, StateRunning, StateRunning, "machine online: lease resumed", now); err != nil {

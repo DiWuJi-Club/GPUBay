@@ -84,7 +84,7 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 	return ord, nil
 }
 
-// applyRenew 续费的共用核心（手动续费与自动续费都走这里）：renewFits → 扣款建单 → addTime → 事件 → refreshLease → verifyLeaseFits。
+// applyRenew 续费的共用核心（手动续费与自动续费都走这里）：renewFits → 扣款建单 → addTime → 清自动续费失败标记 → 事件 → refreshLease → verifyLeaseFits。
 // 调用方已锁住实例行并校验过状态；任一步失败调用方须回滚整个事务（或 savepoint），不会出现扣了款却没加时。
 func (s *Service) applyRenew(ctx context.Context, tx pgx.Tx, inst Instance, d catalog.Duration, quantity int, auto bool,
 	idempotencyKey string, now time.Time, event func(Order) string) (Order, error) {
@@ -100,6 +100,9 @@ func (s *Service) applyRenew(ctx context.Context, tx pgx.Tx, inst Instance, d ca
 		return Order{}, err
 	}
 	if err := s.addTime(ctx, tx, inst, secs, now); err != nil {
+		return Order{}, err
+	}
+	if err := clearAutoRenewFailure(ctx, tx, inst, now); err != nil {
 		return Order{}, err
 	}
 	if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, event(ord), now); err != nil {
@@ -212,13 +215,9 @@ type RenewInfo struct {
 func renewBase(inst Instance, now time.Time) time.Time {
 	pending := time.Duration(inst.PendingSeconds) * time.Second
 	switch {
-	case inst.State == StateRunning && inst.Suspended():
-		var paused int64
-		if inst.PausedRemaining != nil {
-			paused = *inst.PausedRemaining
-		}
-		return now.Add(time.Duration(paused) * time.Second)
-	case inst.State == StateRunning:
+	case inst.State == StateRunning && inst.Suspended() && inst.PausedRemaining != nil: // 与 occupiedUntil 一致
+		return inst.resumeBase(now).Add(time.Duration(*inst.PausedRemaining) * time.Second)
+	case inst.State == StateRunning: // 含暂停但缺 paused_remaining：occupiedUntil 同样按 expires_at 估算
 		if inst.ExpiresAt != nil && inst.ExpiresAt.After(now) {
 			return *inst.ExpiresAt
 		}
@@ -238,27 +237,27 @@ func (s *Service) renewInfo(ctx context.Context, q db.Querier, inst Instance, no
 	}
 	info := RenewInfo{}
 	if lower != nil {
-		cap, ok, err := nextReservedLower(ctx, q, inst.MachineID, inst.ID, *lower)
+		nextLower, ok, err := nextReservedLower(ctx, q, inst.MachineID, inst.ID, *lower)
 		if err != nil {
 			return RenewInfo{}, err
 		}
 		if ok {
-			until := cap.Add(-Tail)
+			until := nextLower.Add(-Tail)
 			info.RenewableUntil = &until
 		}
 	}
 	base := renewBase(inst, now)
 	for _, d := range []catalog.Duration{catalog.D1d, catalog.D1w, catalog.D1m} {
-		max := MaxQuantity(d)
+		qmax := MaxQuantity(d)
 		if info.RenewableUntil != nil {
 			room := info.RenewableUntil.Sub(base)
 			if room < d.Length() {
-				max = 0
-			} else if n := int(room / d.Length()); n < max {
-				max = n
+				qmax = 0
+			} else if n := int(room / d.Length()); n < qmax {
+				qmax = n
 			}
 		}
-		info.Options = append(info.Options, RenewOption{Duration: d, QuantityMax: max})
+		info.Options = append(info.Options, RenewOption{Duration: d, QuantityMax: qmax})
 	}
 	return info, nil
 }

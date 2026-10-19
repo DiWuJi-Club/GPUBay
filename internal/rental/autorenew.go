@@ -15,9 +15,9 @@ import (
 	"spark-cloud/internal/platform/db"
 )
 
-// SetAutoRenew 用户开关自动续费并设档位；开关时清掉上次的失败标记。
+// SetAutoRenew 用户开关自动续费并设档位；开关时清掉上次的失败标记。关闭时档位可留空（保留原档位）。
 func (s *Service) SetAutoRenew(ctx context.Context, userID int64, id string, enabled bool, d catalog.Duration, ip string) (Instance, error) {
-	if !d.Valid() {
+	if !d.Valid() && (enabled || d != "") {
 		return Instance{}, apperr.BadRequest("自动续费档位不正确")
 	}
 	now := s.d.Clock.Now()
@@ -35,7 +35,7 @@ func (s *Service) SetAutoRenew(ctx context.Context, userID int64, id string, ena
 		default:
 			return apperr.ErrInvalidState
 		}
-		out, err = scanInstance(tx.QueryRow(ctx, `UPDATE instances SET auto_renew = $2, auto_renew_duration = $3,
+		out, err = scanInstance(tx.QueryRow(ctx, `UPDATE instances SET auto_renew = $2, auto_renew_duration = COALESCE(NULLIF($3, ''), auto_renew_duration),
 			auto_renew_failed_at = NULL, auto_renew_failed_reason = '', updated_at = $4 WHERE id = $1 RETURNING `+instanceCols, id, enabled, string(d), now))
 		if err != nil {
 			return err
@@ -90,20 +90,22 @@ func (s *Service) autoRenewOne(ctx context.Context, tx pgx.Tx, inst Instance, no
 		}
 		return s.markAutoRenewFailed(ctx, tx, inst, failReason, now)
 	}
-	if _, err := sp.Exec(ctx, `UPDATE instances SET auto_renew_failed_at = NULL, auto_renew_failed_reason = '', updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
-		return nil, errors.Join(err, sp.Rollback(ctx))
+	return nil, sp.Commit(ctx) // 失败标记已由 applyRenew 清掉
+}
+
+// autoRenewTiers 从配置档位起按 1m → 1w → 1d 降档的序列；未知档位只试最便宜的 1d（绝不默认成 1m 多扣款）。
+func autoRenewTiers(d catalog.Duration) []catalog.Duration {
+	order := []catalog.Duration{catalog.D1m, catalog.D1w, catalog.D1d}
+	start := slices.Index(order, d)
+	if start < 0 {
+		start = len(order) - 1
 	}
-	return nil, sp.Commit(ctx)
+	return order[start:]
 }
 
 // autoRenewDuration 从配置档位起按 1m → 1w → 1d 找第一个放得下的档位（只降不升）；都放不下返回空串。
 func (s *Service) autoRenewDuration(ctx context.Context, q db.Querier, inst Instance, now time.Time) (catalog.Duration, error) {
-	order := []catalog.Duration{catalog.D1m, catalog.D1w, catalog.D1d}
-	start := slices.Index(order, inst.AutoRenewDuration)
-	if start < 0 {
-		start = 0
-	}
-	for _, d := range order[start:] {
+	for _, d := range autoRenewTiers(inst.AutoRenewDuration) {
 		err := s.renewFits(ctx, q, inst, seconds(d), now)
 		if err == nil {
 			return d, nil
@@ -132,8 +134,19 @@ func (s *Service) markAutoRenewFailed(ctx context.Context, tx pgx.Tx, inst Insta
 	}
 	text := autoRenewFailText[reason]
 	return func() {
-		if err := s.d.Notifier.NotifyAutoRenewFailed(context.Background(), inst.UserID, inst.ID, text); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.d.Notifier.NotifyAutoRenewFailed(ctx, inst.UserID, inst.ID, text); err != nil {
 			s.d.Log.Warn("auto renew failed sms", "instance", inst.ID, "err", err)
 		}
 	}, nil
+}
+
+// clearAutoRenewFailure 加时成功（手动续费、自动续费、后台延长）后清掉自动续费失败标记：下次再失败按首次失败重发短信。
+func clearAutoRenewFailure(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
+	if inst.AutoRenewFailedAt == nil && inst.AutoRenewFailedReason == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `UPDATE instances SET auto_renew_failed_at = NULL, auto_renew_failed_reason = '', updated_at = $2 WHERE id = $1`, inst.ID, now)
+	return err
 }

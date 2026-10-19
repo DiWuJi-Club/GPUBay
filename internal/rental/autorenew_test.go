@@ -235,3 +235,70 @@ func TestAutoRenewRaceWithNewReservationRollsBackChargeAndMarksBlocked(t *testin
 		t.Fatalf("calls = %v", e.notifier.Calls())
 	}
 }
+
+// Task 10 评审：手动续费 / 后台延长成功后清掉自动续费失败标记；之后再失败会重新发短信。
+func TestManualRenewClearsAutoRenewFailure(t *testing.T) {
+	e := newEnv(t, 1)
+	poor := e.newUser("13600000002", 7000)
+	e.userID = poor
+	_, inst := e.place(catalog.D1d) // 余额剩 100
+	e.ack(true)
+	e.autoRenewOn(inst.ID, catalog.D1d)
+	sms := func() int {
+		n := 0
+		for _, c := range e.notifier.Calls() {
+			if strings.HasPrefix(c, "auto_renew_failed:"+inst.ID+":") {
+				n++
+			}
+		}
+		return n
+	}
+	e.clock.Advance(23 * time.Hour)
+	if _, err := e.svc.AutoRenewDue(e.ctx); err != nil || e.get(inst.ID).AutoRenewFailedAt == nil || sms() != 1 {
+		t.Fatalf("first failure: err=%v inst=%+v sms=%d", err, e.get(inst.ID), sms())
+	}
+	dbtest.Fund(t, e.pool, poor, 7000)
+	if _, err := e.svc.RenewQuantity(e.ctx, poor, inst.ID, catalog.D1d, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); got.AutoRenewFailedAt != nil || got.AutoRenewFailedReason != "" {
+		t.Fatalf("manual renew must clear marker: %+v", got)
+	}
+	// 余额 200，下一次到期前 1 小时再失败 → 视为首次失败，重发短信
+	e.clock.Advance(24 * time.Hour)
+	if _, err := e.svc.AutoRenewDue(e.ctx); err != nil || e.get(inst.ID).AutoRenewFailedReason != "insufficient_balance" || sms() != 2 {
+		t.Fatalf("second failure: err=%v inst=%+v sms=%d", err, e.get(inst.ID), sms())
+	}
+	if _, err := e.svc.AdminExtend(e.ctx, opsActor, inst.ID, 3600, "补偿"); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); got.AutoRenewFailedAt != nil || got.AutoRenewFailedReason != "" {
+		t.Fatalf("admin extend must clear marker: %+v", got)
+	}
+}
+
+func TestSetAutoRenewOffKeepsTier(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	e.autoRenewOn(inst.ID, catalog.D1w)
+	got, err := e.svc.SetAutoRenew(e.ctx, e.userID, inst.ID, false, "", "1.1.1.1")
+	if err != nil || got.AutoRenew || got.AutoRenewDuration != catalog.D1w {
+		t.Fatalf("off without tier = %+v, %v", got, err)
+	}
+	if _, err := e.svc.SetAutoRenew(e.ctx, e.userID, inst.ID, true, "", "1.1.1.1"); codeOf(err) != "bad_request" {
+		t.Fatalf("on without tier = %v", err)
+	}
+	if _, err := e.svc.SetAutoRenew(e.ctx, e.userID, inst.ID, false, "2d", "1.1.1.1"); codeOf(err) != "bad_request" {
+		t.Fatalf("off with bad tier = %v", err)
+	}
+}
+
+func TestAutoRenewTiersUnknownDefaultsToCheapest(t *testing.T) {
+	if got := rental.AutoRenewTiers(""); !slices.Equal(got, []catalog.Duration{catalog.D1d}) {
+		t.Fatalf("unknown tier = %v", got)
+	}
+	if got := rental.AutoRenewTiers(catalog.D1w); !slices.Equal(got, []catalog.Duration{catalog.D1w, catalog.D1d}) {
+		t.Fatalf("1w = %v", got)
+	}
+}

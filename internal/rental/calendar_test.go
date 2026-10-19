@@ -2,11 +2,15 @@ package rental_test
 
 import (
 	"errors"
+	"math/rand/v2"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/rental"
 )
@@ -105,5 +109,99 @@ func TestAvailabilityMatchesPlacement(t *testing.T) {
 	imm.Quantity = 91
 	if _, err := e.svc.Availability(e.ctx, imm); !errors.Is(err, apperr.ErrBookingTooLong) {
 		t.Fatalf("quantity 91 = %v", err)
+	}
+}
+
+var errRollback = errors.New("rollback")
+
+// placeable 在一个回滚的事务里真正放置：先放 want 台必须成功，再放 want+1 台必须 no_capacity（D24）。
+func placeable(t *testing.T, e *env, spec rental.PickSpec, want int) {
+	t.Helper()
+	try := func(n int) error {
+		err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+			_, err := rental.PlaceOnMachines(e.ctx, tx, spec, n, func(sp pgx.Tx, mid int64) error {
+				id, err := insertRawInstance(e.ctx, sp, e, mid)
+				if err != nil {
+					return err
+				}
+				_, err = rental.InsertLease(e.ctx, sp, mid, id, spec.Lower, spec.Upper, "reserved", e.clock.Now())
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			return errRollback
+		})
+		if errors.Is(err, errRollback) {
+			return nil
+		}
+		return err
+	}
+	if want > 0 {
+		if err := try(want); err != nil {
+			t.Fatalf("placing %d (available) failed: %v", want, err)
+		}
+	}
+	if err := try(want + 1); codeOf(err) != "no_capacity" {
+		t.Fatalf("placing %d (available+1) = %v, want no_capacity", want+1, err)
+	}
+}
+
+// D24 性质测试：随机预订 / 机器状态 / 机组下，Availability 的台数 = pickMachines 真正能放下的台数。
+func TestAvailabilityPropertyMatchesPlacement(t *testing.T) {
+	e := newEnv(t, 6)
+	rng := rand.New(rand.NewPCG(24, 2026))
+	visible, hidden := e.group("A", true), e.group("留池", false)
+	states := []string{"idle", "idle", "idle", "allocated", "maintenance"}
+	durations := []catalog.Duration{catalog.D1d, catalog.D1w}
+	for round := 0; round < 25; round++ {
+		// 打乱机器：状态、在线、机组
+		for _, m := range e.machines {
+			e.setMachine(m, states[rng.IntN(len(states))], rng.IntN(4) != 0)
+			switch rng.IntN(3) {
+			case 0:
+				e.setGroup(m, visible)
+			case 1:
+				e.setGroup(m, hidden)
+			default:
+				if _, err := e.pool.Exec(e.ctx, `UPDATE machines SET group_id = NULL WHERE id = $1`, m); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		// 再随机加几条预订（与已有时段冲突的跳过）
+		for k := 0; k < 3; k++ {
+			m := e.machines[rng.IntN(len(e.machines))]
+			start := dbtest.T0.Add(time.Duration(2+rng.IntN(20*24)) * time.Hour)
+			secs := int64(86400 * (1 + rng.IntN(3)))
+			var free bool
+			if err := e.pool.QueryRow(e.ctx, `SELECT NOT EXISTS (SELECT 1 FROM machine_leases WHERE machine_id = $1 AND status IN ('reserved', 'active')
+				AND period && tstzrange($2, $3))`, m, start.Add(-rental.PrepLead), start.Add(time.Duration(secs)*time.Second+rental.Tail)).Scan(&free); err != nil {
+				t.Fatal(err)
+			}
+			if free {
+				e.reserveRaw(m, start, secs)
+			}
+		}
+		for probe := 0; probe < 4; probe++ {
+			q := rental.AvailabilityQuery{ProductID: e.productID, Duration: durations[rng.IntN(len(durations))], Quantity: 1 + rng.IntN(2)}
+			if rng.IntN(3) != 0 {
+				s := dbtest.T0.Add(time.Duration(2+rng.IntN(20*24)) * time.Hour)
+				q.StartAt = &s
+			}
+			if rng.IntN(2) == 0 {
+				q.GroupID = &visible
+			}
+			av, err := e.svc.Availability(e.ctx, q)
+			if err != nil {
+				t.Fatalf("round %d: availability(%+v) = %v", round, q, err)
+			}
+			spec := rental.PickSpec{ProductID: q.ProductID, GroupID: q.GroupID, Immediate: q.StartAt == nil, Lower: av.Lower, Upper: av.Upper}
+			ids, err := rental.PickMachines(e.ctx, e.pool, spec, 100, false)
+			if err != nil || len(ids) != av.Available {
+				t.Fatalf("round %d: pick = %v, %v; available = %d", round, ids, err, av.Available)
+			}
+			placeable(t, e, spec, av.Available)
+		}
 	}
 }

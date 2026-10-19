@@ -38,3 +38,6 @@ func SetRenewHookForTest(f func()) func() {
 	renewHook = f
 	return func() { renewHook = nil }
 }
+
+// AutoRenewTiers 导出自动续费的降档序列。
+var AutoRenewTiers = autoRenewTiers

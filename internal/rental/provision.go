@@ -95,7 +95,9 @@ func (s *Service) cancelUnfulfilled(ctx context.Context, tx pgx.Tx, inst Instanc
 
 func (s *Service) smsCancelled(inst Instance, reason string) func() {
 	return func() {
-		if err := s.d.Notifier.NotifyBookingCancelled(context.Background(), inst.UserID, inst.ID, reason); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.d.Notifier.NotifyBookingCancelled(ctx, inst.UserID, inst.ID, reason); err != nil {
 			s.d.Log.Warn("booking cancelled sms failed", "instance", inst.ID, "err", err)
 		}
 	}

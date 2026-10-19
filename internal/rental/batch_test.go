@@ -3,6 +3,7 @@ package rental_test
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -291,5 +292,40 @@ func TestRenewReservedExtendsPendingAndLease(t *testing.T) {
 	lower, upper, status := e.lease(id)
 	if status != "reserved" || !lower.Equal(start.Add(-rental.PrepLead)) || !upper.Equal(start.Add(3*24*time.Hour+rental.Tail)) {
 		t.Fatalf("lease = [%v, %v) %s", lower, upper, status)
+	}
+}
+
+// Task 5 评审：同一键并发提交两次 PlaceBatch，只建一个批次、扣一次款。
+func TestConcurrentPlaceBatchSameKey(t *testing.T) {
+	e := newEnv(t, 4)
+	start := dbtest.T0.Add(3 * time.Hour)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	batches, insts := map[string]bool{}, map[string]bool{}
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := e.batchReq(2, &start)
+			req.IdempotencyKey = "batch-key"
+			res, err := e.svc.PlaceBatch(e.ctx, req)
+			if err != nil {
+				t.Errorf("PlaceBatch: %v", err)
+				return
+			}
+			mu.Lock()
+			batches[res.Batch.ID] = true
+			for _, in := range res.Instances {
+				insts[in.ID] = true
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(batches) != 1 || len(insts) != 2 {
+		t.Fatalf("batches = %v, instances = %v", batches, insts)
+	}
+	if b := e.balance(e.userID); b != startFunds-2*6900 {
+		t.Fatalf("balance = %d, want charged once per machine", b)
 	}
 }

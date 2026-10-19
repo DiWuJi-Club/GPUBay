@@ -8,6 +8,9 @@
 //   Renew / AdminExtend / 自动续费：[idem] → instance → 自己的 lease(读 cap) → orders → wallet → 更新 lease（不锁机器）
 //   取消：instance → lease → agent_commands（CancelCommands）→ orders → wallet
 //   HandleCommandResult：instance → agent_commands → lease(refreshLease) → machine(Release)
+//     预订首次开通成功（startBooked）：instance → agent_commands → [迟开通补偿：orders → wallet] → lease(refreshLease)
+//     预订 Create 失败 / 超时（reassignAfterCreateFailure）：instance → [agent_commands] → 自己的 lease → 旧机器(MarkFaulty)
+//       → 候选 machines(SKIP LOCKED) → agent_commands；过宽限期则平台取消：→ agent_commands → orders → wallet
 //   ExpireDue / WipeStale / Suspend / Resume / RefreshCapped / beginWipe：instance → lease → agent_commands
 //   AdminDeleteGroup：machine_groups(FOR UPDATE) → instances(清 group_id) → machines(只读计数) → 删机组
 //     下单插实例取机组行 KEY SHARE：先插的一方先拿到锁，另一方等它提交；删除方不锁机器，与下单不成环
@@ -135,6 +138,14 @@ type Instance struct {
 func (i Instance) Booked() bool { return i.ScheduledStartAt != nil }
 
 func (i Instance) Suspended() bool { return i.SuspendedAt != nil }
+
+// resumeBase 暂停实例恢复计时的起点：预订实例在开始时刻之前恢复仍从开始时刻起算（早开通不计费，已付时段不被缩短）。
+func (i Instance) resumeBase(now time.Time) time.Time {
+	if i.Booked() && now.Before(*i.ScheduledStartAt) {
+		return *i.ScheduledStartAt
+	}
+	return now
+}
 
 // Remaining 返回剩余可用时长；暂停中返回冻结的剩余时长；预订实例在开始时刻之前返回整段预订时长（早开通不计费）；非运行状态返回 0。
 func (i Instance) Remaining(now time.Time) time.Duration {

@@ -22,9 +22,8 @@ type pickSpec struct {
 	Exclude   []int64
 }
 
-// pickSQL：候选 = 商品匹配 ∩ 机组条件 ∩ 状态允许 ∩ 与 reserved / active 时段无重叠；
-// 按「最紧贴前一档期的机器优先」排序（减少碎片），再按 id。
-const pickSQL = `SELECT m.id FROM machines m
+// pickWhereSQL：候选 = 商品匹配 ∩ 机组条件 ∩ 状态允许 ∩ 与 reserved / active 时段无重叠。
+const pickWhereSQL = `SELECT m.id FROM machines m
 	LEFT JOIN machine_groups g ON g.id = m.group_id
 	WHERE m.product_id = $1
 	  AND (($2::bigint IS NULL AND (m.group_id IS NULL OR g.visible)) OR m.group_id = $2::bigint)
@@ -32,7 +31,10 @@ const pickSQL = `SELECT m.id FROM machines m
 	  AND NOT (m.id = ANY($6::bigint[]))
 	  AND (CASE WHEN $7::boolean THEN m.state = 'idle' AND m.agent_online ELSE m.state IN ('idle', 'allocated') END)
 	  AND NOT EXISTS (SELECT 1 FROM machine_leases l
-	                  WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND l.period && tstzrange($4::timestamptz, $5::timestamptz))
+	                  WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND l.period && tstzrange($4::timestamptz, $5::timestamptz))`
+
+// pickOrderSQL：「最紧贴前一档期的机器优先」（减少碎片），再按 id。计数不需要排序，countAvailable 不带它。
+const pickOrderSQL = `
 	ORDER BY (SELECT max(upper(l.period)) FROM machine_leases l
 	          WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active', 'ended') AND upper(l.period) <= $4::timestamptz) DESC NULLS LAST,
 	         m.id`
@@ -47,7 +49,7 @@ func pickArgs(spec pickSpec) []any {
 
 // pickMachines 返回最多 limit 台候选机器；lock 为 true 时锁行（SKIP LOCKED：并发分配互不等待）。
 func pickMachines(ctx context.Context, q db.Querier, spec pickSpec, limit int, lock bool) ([]int64, error) {
-	sql := pickSQL + ` LIMIT $8`
+	sql := pickWhereSQL + pickOrderSQL + ` LIMIT $8`
 	if lock {
 		sql += ` FOR NO KEY UPDATE OF m SKIP LOCKED` // 不用 FOR UPDATE：与外键插入的 KEY SHARE 互斥
 	}
@@ -61,7 +63,7 @@ func pickMachines(ctx context.Context, q db.Querier, spec pickSpec, limit int, l
 // countAvailable 返回候选台数（只读，供可用性查询与错误消息）。
 func countAvailable(ctx context.Context, q db.Querier, spec pickSpec) (int, error) {
 	var n int
-	err := q.QueryRow(ctx, `SELECT count(*) FROM (`+pickSQL+`) x`, pickArgs(spec)...).Scan(&n)
+	err := q.QueryRow(ctx, `SELECT count(*) FROM (`+pickWhereSQL+`) x`, pickArgs(spec)...).Scan(&n)
 	return n, err
 }
 

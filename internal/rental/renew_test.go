@@ -2,7 +2,6 @@ package rental_test
 
 import (
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -453,37 +452,39 @@ func TestRenewQuantityNegativeIsBadRequest(t *testing.T) {
 	}
 }
 
-// Task 5 评审：同一键并发提交两次 PlaceBatch，只建一个批次、扣一次款。
-func TestConcurrentPlaceBatchSameKey(t *testing.T) {
-	e := newEnv(t, 4)
-	start := dbtest.T0.Add(3 * time.Hour)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	batches, insts := map[string]bool{}, map[string]bool{}
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			req := e.batchReq(2, &start)
-			req.IdempotencyKey = "batch-key"
-			res, err := e.svc.PlaceBatch(e.ctx, req)
-			if err != nil {
-				t.Errorf("PlaceBatch: %v", err)
-				return
-			}
-			mu.Lock()
-			batches[res.Batch.ID] = true
-			for _, in := range res.Instances {
-				insts[in.ID] = true
-			}
-			mu.Unlock()
-		}()
+// 恰好续到可续至（cap − Tail）：允许；再往后哪怕 1 分钟（后台延长的最小值）就挡。
+func TestRenewExactlyAtCapAllowed(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true) // expires = T0 + 24h
+	// 下一预订 S = T0 + 2d + 1h + Tail → 可续至 = S − 1h − Tail = T0 + 48h：续 1d 正好到可续至
+	e.reserveRaw(e.machines[0], dbtest.T0.Add(49*time.Hour+rental.Tail), 86400)
+	info, _ := e.svc.RenewInfoFor(e.ctx, e.get(inst.ID))
+	if info.RenewableUntil == nil || !info.RenewableUntil.Equal(dbtest.T0.Add(48*time.Hour)) || info.Options[0].QuantityMax != 1 {
+		t.Fatalf("info = %+v", info)
 	}
-	wg.Wait()
-	if len(batches) != 1 || len(insts) != 2 {
-		t.Fatalf("batches = %v, instances = %v", batches, insts)
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); err != nil {
+		t.Fatalf("renew exactly at cap = %v", err)
 	}
-	if b := e.balance(e.userID); b != startFunds-2*6900 {
-		t.Fatalf("balance = %d, want charged once per machine", b)
+	if got := e.get(inst.ID); !got.ExpiresAt.Equal(dbtest.T0.Add(48 * time.Hour)) {
+		t.Fatalf("expires = %v", got.ExpiresAt)
+	}
+	if _, err := e.svc.AdminExtend(e.ctx, opsActor, inst.ID, 60, "补偿"); apperr.As(err) == nil || apperr.As(err).Code != "renew_blocked" {
+		t.Fatalf("one minute past cap = %v", err)
+	}
+}
+
+// 暂停中但 paused_remaining 缺失：renewBase 与 occupiedUntil 一样按 expires_at 估算（而不是 now）。
+func TestRenewInfoSuspendedWithoutPausedRemaining(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true) // expires = T0 + 24h
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET suspended_at = $2, paused_remaining = NULL WHERE id = $1`, inst.ID, dbtest.T0); err != nil {
+		t.Fatal(err)
+	}
+	e.reserveRaw(e.machines[0], dbtest.T0.Add(49*time.Hour+rental.Tail), 86400) // 可续至 T0 + 48h
+	info, _ := e.svc.RenewInfoFor(e.ctx, e.get(inst.ID))
+	if info.Options[0].QuantityMax != 1 { // base = T0 + 24h → 余量 24h；按 now 估算会得 2
+		t.Fatalf("options = %+v", info.Options)
 	}
 }

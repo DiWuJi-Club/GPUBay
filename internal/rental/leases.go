@@ -65,7 +65,7 @@ func occupiedUntil(inst Instance, now time.Time) time.Time {
 		end = now.Add(CreateTimeout + pending + Tail)
 	case StateRunning:
 		if inst.Suspended() && inst.PausedRemaining != nil {
-			end = now.Add(time.Duration(*inst.PausedRemaining)*time.Second + Tail)
+			end = inst.resumeBase(now).Add(time.Duration(*inst.PausedRemaining)*time.Second + Tail)
 		} else if inst.ExpiresAt != nil {
 			end = inst.ExpiresAt.Add(Tail)
 		}

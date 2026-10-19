@@ -421,3 +421,43 @@ func TestCreateFailureCancelFailureRaisesAlert(t *testing.T) {
 		t.Fatal("alert must be raised once")
 	}
 }
+
+// 早开通窗口内失联又恢复：从 max(now, S) 恢复计时，已付时段不被缩短；暂停期间 lease 上界也不收缩。
+func TestBookedSuspendResumeKeepsPaidWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		resumeAt time.Duration // 相对 S
+	}{{"resume before S", -20 * time.Minute}, {"resume after S", 2 * time.Hour}} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, 1)
+			start := dbtest.T0.Add(3 * time.Hour)
+			inst := e.book(start)
+			e.clock.Advance(2 * time.Hour) // S − 1h
+			e.heartbeatAll()
+			mustCount(t, firstOf(e.svc.ProvisionDue(e.ctx)), nil, 1, "provision")
+			e.ack(true)
+			e.clock.Advance(10 * time.Minute) // S − 50m
+			mustCount(t, firstOf(e.svc.SuspendMachines(e.ctx, e.machines)), nil, 1, "suspended")
+			paid := start.Add(24 * time.Hour)
+			if got := e.get(inst.ID); got.PausedRemaining == nil || *got.PausedRemaining != 86400 {
+				t.Fatalf("paused = %+v", got)
+			}
+			if _, upper, _ := e.lease(inst.ID); !upper.Equal(paid.Add(rental.Tail)) {
+				t.Fatalf("lease upper while suspended = %v, want %v", upper, paid.Add(rental.Tail))
+			}
+			e.clock.Advance(start.Add(tc.resumeAt).Sub(e.clock.Now()))
+			n, err := e.svc.ResumeMachine(e.ctx, e.machines[0], []string{inst.ID})
+			mustCount(t, n, err, 1, "resumed")
+			want := paid
+			if tc.resumeAt > 0 {
+				want = e.clock.Now().Add(24 * time.Hour)
+			}
+			if got := e.get(inst.ID); !got.ExpiresAt.Equal(want) {
+				t.Fatalf("expires = %v, want %v", got.ExpiresAt, want)
+			}
+			if _, upper, _ := e.lease(inst.ID); !upper.Equal(want.Add(rental.Tail)) {
+				t.Fatalf("lease upper = %v", upper)
+			}
+		})
+	}
+}
