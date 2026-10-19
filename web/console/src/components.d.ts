@@ -12,6 +12,8 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AppDialog: typeof import('./components/AppDialog.vue')['default']
+    AppEnvForm: typeof import('./components/AppEnvForm.vue')['default']
+    AppPicker: typeof import('./components/AppPicker.vue')['default']
     ElAlert: typeof import('element-plus/es')['ElAlert']
     ElButton: typeof import('element-plus/es')['ElButton']
     ElCard: typeof import('element-plus/es')['ElCard']

@@ -1,20 +1,26 @@
 <script setup lang="ts">
 import {
   durationLabel, fmtTime, fmtYuan, isApiError, labelOf, useIdempotencyKey,
-  type Availability, type BookingResult, type CalendarDay, type CalendarPeriod, type Duration, type Group, type GroupMachine, type Image, type Instance, type Listed, type Order, type Product,
+  type AppCatalogItem, type Availability, type BookingResult, type CalendarDay, type CalendarPeriod, type Duration, type Group, type GroupMachine, type Image, type Instance, type Listed, type Order, type Product,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { useGuide } from '../composables/useGuide'
+import { appConfirmText, appOptionLabel, compatibleImages, envDefaults, stripEmpty } from '../logic/apps'
 import { cstDay, describeDuration, earliestStart, hourOptions, isLegacyImmediate, latestStart, MAX_COUNT, MAX_QUANTITY, startAtISO, totalPrice } from '../logic/booking'
 import { notifyError } from '../logic/notify'
 import { refreshBalance, session } from '../store/session'
 import AppDialog from './AppDialog.vue'
+import AppEnvForm from './AppEnvForm.vue'
 import GuideDialog from './GuideDialog.vue'
 
-const props = defineProps<{ product: Product; images: Image[]; mode: 'immediate' | 'booking'; duration: Duration; imageId: number | null }>()
+// apps：可预装的应用（GET /apps）；appId：市场页应用卡片预选的应用
+const props = withDefaults(defineProps<{ product: Product; images: Image[]; mode: 'immediate' | 'booking'; duration: Duration; imageId: number | null; apps?: AppCatalogItem[]; appId?: number | null }>(), {
+  apps: () => [],
+  appId: null,
+})
 const visible = defineModel<boolean>({ required: true })
 export interface PlacedResult { instances: { id: string }[]; batchId: string | null; immediate: boolean }
 const emit = defineEmits<{ placed: [result: PlacedResult]; noCapacity: [] }>()
@@ -36,9 +42,11 @@ const form = reactive({
   machineId: null as number | null,
   autoRenew: false,
   autoRenewDuration: props.duration,
+  appId: props.appId,
 })
-const step = ref<'form' | 'confirm'>(props.mode === 'immediate' ? 'confirm' : 'form')
-const expanded = ref(props.mode === 'booking')
+// 预选了应用时先停在表单步：要锁定镜像、填变量（如 JupyterLab 必填令牌）
+const step = ref<'form' | 'confirm'>(props.mode === 'immediate' && props.appId == null ? 'confirm' : 'form')
+const expanded = ref(props.mode === 'booking' || props.appId != null)
 const groups = ref<Group[]>([])
 const serverOffset = ref(0) // 服务器时间 − 浏览器时间：最早 / 最晚整点按服务器时间算
 // 每分钟走一格：hours / dayMin / dayMax / 日历可选天依赖它，对话框久开也不会给出已过期的整点
@@ -61,6 +69,25 @@ const submitting = ref(false)
 
 const NO_GROUP = 0 // el-option 的 value 不能是 null：0 作为「不限机组」哨兵，提交时映射回 null
 const groupSel = computed({ get: () => form.groupId ?? NO_GROUP, set: (v: number) => { form.groupId = v === NO_GROUP ? null : v } })
+
+// ---- 预装应用：选了应用后镜像只剩兼容镜像（默认第一个），下方展开变量表单 ----
+const NO_APP = 0 // 同 NO_GROUP：「不预装」
+const appSel = computed({ get: () => form.appId ?? NO_APP, set: (v: number) => { form.appId = v === NO_APP ? null : v } })
+const selectedApp = computed(() => props.apps.find((a) => a.id === form.appId) ?? null)
+const imageOptions = computed(() => (selectedApp.value ? compatibleImages(selectedApp.value, props.images) : props.images))
+const envValues = ref<Record<string, string>>({})
+const appEnv = computed(() => stripEmpty(envValues.value)) // 空值交给服务器补默认
+const envForm = ref<InstanceType<typeof AppEnvForm> | null>(null)
+const appError = ref('') // 后端 app_* 错误文案，显示在表单里
+/** 按所选应用重置镜像与变量；取消预装时镜像恢复为打开时的选择。 */
+function applyApp() {
+  const app = selectedApp.value
+  appError.value = ''
+  form.imageId = app ? (compatibleImages(app, props.images)[0]?.id ?? null) : props.imageId
+  envValues.value = app ? envDefaults(app.version.env) : {}
+}
+watch(() => form.appId, applyApp)
+watch(envValues, () => { appError.value = '' })
 const unitPrice = computed(() => props.product.prices.find((p) => p.duration === form.duration)?.amount ?? null)
 const quantityMax = computed(() => MAX_QUANTITY[form.duration])
 const total = computed(() => (unitPrice.value == null ? null : totalPrice(unitPrice.value, form.quantity, form.count)))
@@ -77,7 +104,7 @@ const dayMax = computed(() => cstDay(latestStart(nowServer())))
 const canSpecifyMachine = computed(() => form.count === 1 && form.groupId !== null)
 const notEnough = computed(() => availability.value != null && availability.value.available < form.count)
 const legacy = computed(() => isLegacyImmediate({ immediate: form.immediate, count: form.count, quantity: form.quantity, groupId: form.groupId, machineId: form.machineId, autoRenew: form.autoRenew }))
-const key = useIdempotencyKey(() => [props.product.id, form.groupId, form.count, form.immediate, form.day, form.hour, form.duration, form.quantity, form.imageId, form.machineId, form.autoRenew, form.autoRenewDuration])
+const key = useIdempotencyKey(() => [props.product.id, form.groupId, form.count, form.immediate, form.day, form.hour, form.duration, form.quantity, form.imageId, form.machineId, form.autoRenew, form.autoRenewDuration, form.appId, JSON.stringify(appEnv.value)])
 
 watch(() => form.duration, (d) => {
   if (form.quantity > MAX_QUANTITY[d]) form.quantity = MAX_QUANTITY[d]
@@ -192,9 +219,10 @@ watch([() => form.groupId, () => form.machineId, () => form.immediate, startAt, 
 
 watch(visible, (v) => {
   if (!v) return
-  step.value = props.mode === 'immediate' ? 'confirm' : 'form'
-  expanded.value = props.mode === 'booking'
-  Object.assign(form, { groupId: null, count: 1, immediate: props.mode === 'immediate', duration: props.duration, quantity: 1, imageId: props.imageId, machineId: null, autoRenew: false, autoRenewDuration: props.duration })
+  step.value = props.mode === 'immediate' && props.appId == null ? 'confirm' : 'form'
+  expanded.value = props.mode === 'booking' || props.appId != null
+  Object.assign(form, { groupId: null, count: 1, immediate: props.mode === 'immediate', duration: props.duration, quantity: 1, imageId: props.imageId, machineId: null, autoRenew: false, autoRenewDuration: props.duration, appId: props.appId })
+  applyApp() // appId 与上次相同时 watch 不触发：显式重置镜像与变量
   availability.value = null
   availError.value = ''
   form.day = ''
@@ -214,7 +242,14 @@ function pickDay(d: CalendarDay) {
 
 function toConfirm() {
   if (!form.immediate && !startAt.value) return void ElMessage.warning('请选择开始时间')
+  if (selectedApp.value && form.imageId == null) return void ElMessage.warning('暂无该应用可用的镜像')
+  if (envForm.value && !envForm.value.validate()) return
   step.value = 'confirm'
+}
+
+/** 不预装时请求体不带 app_id / app_env（与计划 6 一致）。 */
+function appBody() {
+  return selectedApp.value ? { app_id: selectedApp.value.id, app_env: appEnv.value } : {}
 }
 
 async function submit() {
@@ -228,12 +263,13 @@ async function submit() {
   try {
     let placed: PlacedResult
     if (legacy.value) {
-      const out = await api.post<{ order: Order; instance: Instance }>('/orders', { product_id: props.product.id, duration: form.duration, image_id: form.imageId }, { idempotencyKey: key.current() })
+      const out = await api.post<{ order: Order; instance: Instance }>('/orders', { product_id: props.product.id, duration: form.duration, image_id: form.imageId, ...appBody() }, { idempotencyKey: key.current() })
       placed = { instances: [out.instance], batchId: null, immediate: true }
     } else {
       const out = await api.post<BookingResult>('/bookings', {
         product_id: props.product.id, image_id: form.imageId, group_id: form.groupId, machine_id: form.machineId, count: form.count,
         duration: form.duration, quantity: form.quantity, start_at: startAt.value ?? undefined, auto_renew: form.autoRenew, auto_renew_duration: form.autoRenewDuration,
+        ...appBody(),
       }, { idempotencyKey: key.current() })
       placed = { instances: out.instances, batchId: out.batch?.id ?? null, immediate: form.immediate }
     }
@@ -246,6 +282,11 @@ async function submit() {
       if (legacy.value && e.code === 'no_capacity') emit('noCapacity') // 市场页刷新「现在可租」台数
       backToForm()
       void loadAvailability()
+    } else if (isApiError(e) && e.code.startsWith('app_')) {
+      // app_image_mismatch / app_env_* / app_not_found / app_unavailable：显示后端文案，回到表单改
+      ElMessage.warning(e.message)
+      backToForm()
+      appError.value = e.message
     } else if (isApiError(e) && e.code.startsWith('booking_')) {
       ElMessage.warning(e.message)
       backToForm() // 多半是开始时间过近 / 过远：刷新服务器时间并校正默认开始时刻
@@ -294,9 +335,20 @@ async function submit() {
             <span class="muted" data-testid="rent-duration-text">{{ describeDuration(form.duration, form.quantity) }}（单次最长 90 天）</span>
           </div>
         </el-form-item>
-        <el-form-item label="镜像">
-          <el-select v-model="form.imageId" data-testid="rent-image"><el-option v-for="img in images" :key="img.id" :label="img.name" :value="img.id" /></el-select>
+        <el-form-item v-if="apps.length" label="预装应用">
+          <el-select v-model="appSel" data-testid="rent-app">
+            <el-option :value="NO_APP" label="不预装" />
+            <el-option v-for="a in apps" :key="a.id" :value="a.id" :label="appOptionLabel(a)" :disabled="!compatibleImages(a, images).length" />
+          </el-select>
         </el-form-item>
+        <el-form-item label="镜像">
+          <el-select v-model="form.imageId" data-testid="rent-image"><el-option v-for="img in imageOptions" :key="img.id" :label="img.name" :value="img.id" /></el-select>
+          <div v-if="selectedApp" class="muted" data-testid="rent-image-locked">该应用需要此镜像</div>
+        </el-form-item>
+        <template v-if="selectedApp">
+          <el-alert v-if="appError" type="error" :title="appError" :closable="false" show-icon data-testid="rent-app-error" />
+          <AppEnvForm v-if="selectedApp.version.env.length" ref="envForm" v-model="envValues" :spec="selectedApp.version.env" />
+        </template>
         <el-form-item v-if="canSpecifyMachine" label="指定机器（可选）">
           <el-select v-model="form.machineId" clearable placeholder="由系统分配" data-testid="rent-machine">
             <el-option v-for="m in machines" :key="m.id" :value="m.id" :label="m.busy_until ? `${m.label}（占用至 ${fmtTime(m.busy_until)}）` : m.label" />
@@ -334,6 +386,7 @@ async function submit() {
         <el-descriptions-item label="开始"><span data-testid="market-confirm-start">{{ form.immediate ? '立即' : `${form.day} ${String(form.hour ?? 0).padStart(2, '0')}:00` }}</span></el-descriptions-item>
         <el-descriptions-item label="租期"><span data-testid="market-confirm-duration">{{ form.quantity === 1 ? labelOf(durationLabel, form.duration) : describeDuration(form.duration, form.quantity) }}</span></el-descriptions-item>
         <el-descriptions-item label="镜像"><span data-testid="market-confirm-image">{{ imageName }}</span></el-descriptions-item>
+        <el-descriptions-item v-if="selectedApp" label="预装应用"><span data-testid="market-confirm-app">{{ appConfirmText(selectedApp, envValues) }}</span></el-descriptions-item>
         <el-descriptions-item v-if="form.count > 1" label="单台价"><span data-testid="market-confirm-unit">{{ unitPrice == null ? '—' : fmtYuan(unitPrice * form.quantity) }}</span></el-descriptions-item>
         <el-descriptions-item :label="form.count > 1 ? '总价' : '价格'"><span data-testid="market-confirm-price">{{ total == null ? '—' : fmtYuan(total) }}</span></el-descriptions-item>
         <el-descriptions-item label="当前余额"><span data-testid="market-confirm-balance">{{ fmtYuan(balance) }}</span></el-descriptions-item>
@@ -341,7 +394,7 @@ async function submit() {
           <span data-testid="market-confirm-after" :class="{ warn: insufficient }">{{ after == null ? '—' : fmtYuan(after) }}<template v-if="insufficient">（余额不足）</template></span>
         </el-descriptions-item>
       </el-descriptions>
-      <el-button v-if="!expanded" link type="primary" data-testid="market-confirm-more" @click="expanded = true; backToForm()">更多选项（机组 / 多台 / 预订 / 自动续费）</el-button>
+      <el-button v-if="!expanded" link type="primary" data-testid="market-confirm-more" @click="expanded = true; backToForm()">更多选项（机组 / 多台 / 预订 / 自动续费{{ apps.length ? ' / 预装应用' : '' }}）</el-button>
     </template>
     <!-- 具名插槽只能放在组件的直接子级：按步骤切换按钮 -->
     <template #footer>
