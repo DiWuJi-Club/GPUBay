@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/identity"
@@ -15,6 +17,7 @@ import (
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/plugins/sms"
+	"spark-cloud/internal/referral"
 )
 
 func TestMain(m *testing.M) { dbtest.Main(m) }
@@ -395,5 +398,178 @@ func TestSessionUserIDBannedAndExpired(t *testing.T) {
 	e.clock.Advance(time.Second)
 	if _, err := e.svc.SessionUserID(ctx, h); !errors.Is(err, apperr.ErrUnauthorized) {
 		t.Fatalf("expired = %v", err)
+	}
+}
+
+type hookRec struct {
+	calls []referral.BindRequest
+	res   referral.BindResult
+	err   error
+	kyc   []string // fingerprints seen
+}
+
+func (h *hookRec) Bind(_ context.Context, _ pgx.Tx, req referral.BindRequest) (referral.BindResult, error) {
+	h.calls = append(h.calls, req)
+	return h.res, h.err
+}
+func (h *hookRec) OnKYCVerified(_ context.Context, _ pgx.Tx, _ int64, fp string) error {
+	h.kyc = append(h.kyc, fp)
+	return nil
+}
+
+const devA = "11111111-2222-4333-8444-555555555555"
+
+func TestLoginWithIsNewDeviceAndLastLogin(t *testing.T) {
+	e := newEnv(t, "000000")
+	hook := &hookRec{res: referral.BindResult{Bound: true, Reason: "ok", Inviter: "138****0000"}}
+	e.svc.SetReferral(hook)
+	ctx := context.Background()
+	send := func(phone string) {
+		t.Helper()
+		// 本测试对同一手机号发 16 次验证码，超过每日 10 条上限，故每次推进一天多一点。
+		e.clock.Advance(24*time.Hour + time.Second)
+		if err := e.svc.SendLoginCode(ctx, phone, "9.9.9.9"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send("13800000011")
+	_, r, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000", InviteCode: "ABCDEFGH", IP: "1.2.3.4", DeviceID: devA, UserAgent: "ua"})
+	if err != nil || !r.IsNew || r.Invite == nil || !r.Invite.Bound || r.Invite.Inviter != "138****0000" {
+		t.Fatalf("first login = %+v %v", r, err)
+	}
+	if len(hook.calls) != 1 || hook.calls[0].Code != "ABCDEFGH" || hook.calls[0].InviteeID != r.ID || hook.calls[0].IP != "1.2.3.4" || hook.calls[0].DeviceID != devA || !hook.calls[0].Now.Equal(e.clock.Now()) {
+		t.Fatalf("bind req = %+v", hook.calls)
+	}
+	var ip string
+	var at *time.Time
+	if err := e.pool.QueryRow(ctx, `SELECT last_login_ip, last_login_at FROM users WHERE id = $1`, r.ID).Scan(&ip, &at); err != nil || ip != "1.2.3.4" || at == nil || !at.Equal(e.clock.Now()) {
+		t.Fatalf("last login = %q %v %v", ip, at, err)
+	}
+	var devs int
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM user_devices WHERE user_id = $1 AND device_id = $2`, r.ID, devA).Scan(&devs); err != nil || devs != 1 {
+		t.Fatalf("devices = %d %v", devs, err)
+	}
+	// 老用户带码：不调用 Bind，reason existing_user；最近登录更新
+	send("13800000011")
+	_, r2, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000", InviteCode: "ABCDEFGH", IP: "5.6.7.8"})
+	if err != nil || r2.IsNew || r2.ID != r.ID || r2.Invite == nil || r2.Invite.Bound || r2.Invite.Reason != "existing_user" || len(hook.calls) != 1 {
+		t.Fatalf("second login = %+v %v calls=%d", r2, err, len(hook.calls))
+	}
+	if err := e.pool.QueryRow(ctx, `SELECT last_login_ip FROM users WHERE id = $1`, r.ID).Scan(&ip); err != nil || ip != "5.6.7.8" {
+		t.Fatalf("last ip = %q", ip)
+	}
+	// 不带码：Invite 为 nil
+	send("13800000011")
+	if _, r3, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000"}); err != nil || r3.Invite != nil {
+		t.Fatalf("no code = %+v %v", r3, err)
+	}
+	// 非 UUID 的设备 ID 不写；设备上限 10 台（删最旧）
+	send("13800000011")
+	e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000", DeviceID: "not-a-uuid"})
+	for i := 0; i < 11; i++ {
+		send("13800000011")
+		e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000", DeviceID: fmt.Sprintf("00000000-0000-4000-8000-%012d", i)})
+	}
+	var n int
+	var oldest bool
+	e.pool.QueryRow(ctx, `SELECT count(*), bool_or(device_id = $2) FROM user_devices WHERE user_id = $1`, r.ID, devA).Scan(&n, &oldest)
+	if n != 10 || oldest {
+		t.Fatalf("devices after 12 logins = %d (oldest kept=%v)", n, oldest)
+	}
+	// 旧签名 Login 仍可用
+	send("13800000011")
+	if _, u, err := e.svc.Login(ctx, "13800000011", "000000"); err != nil || u.ID != r.ID {
+		t.Fatalf("Login = %+v %v", u, err)
+	}
+}
+
+// 裁定 Q15：非 UUID 的 X-Device-Id 视同未提供——不写 user_devices，也不转给 Bind；UUID 大写时按小写存与转发。
+func TestLoginWithNonUUIDDeviceIgnored(t *testing.T) {
+	e := newEnv(t, "000000")
+	hook := &hookRec{res: referral.BindResult{Bound: true, Reason: "ok"}}
+	e.svc.SetReferral(hook)
+	ctx := context.Background()
+	if err := e.svc.SendLoginCode(ctx, "13800000016", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	_, r, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000016", Code: "000000", InviteCode: "ABCDEFGH", DeviceID: "Not-A-UUID"})
+	if err != nil || !r.IsNew || len(hook.calls) != 1 || hook.calls[0].DeviceID != "" {
+		t.Fatalf("non-uuid login = %+v %v calls=%+v", r, err, hook.calls)
+	}
+	var n int
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM user_devices WHERE user_id = $1`, r.ID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("devices = %d %v", n, err)
+	}
+	e.clock.Advance(61 * time.Second)
+	if err := e.svc.SendLoginCode(ctx, "13800000017", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	upper := "AAAAAAAA-2222-4333-8444-555555555555"
+	_, r2, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000017", Code: "000000", InviteCode: "ABCDEFGH", DeviceID: upper})
+	if err != nil || len(hook.calls) != 2 || hook.calls[1].DeviceID != strings.ToLower(upper) {
+		t.Fatalf("uuid login = %+v %v calls=%+v", r2, err, hook.calls)
+	}
+	if has, err := e.svc.HasDevice(ctx, e.pool, r2.ID, strings.ToLower(upper)); err != nil || !has {
+		t.Fatalf("uuid device stored = %v %v", has, err)
+	}
+}
+
+func TestLoginWithBindBusinessFailureKeepsRegistration(t *testing.T) {
+	e := newEnv(t, "000000")
+	hook := &hookRec{res: referral.BindResult{Bound: false, Reason: "invalid_code"}}
+	e.svc.SetReferral(hook)
+	ctx := context.Background()
+	e.svc.SendLoginCode(ctx, "13800000012", "1.1.1.1")
+	_, r, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000012", Code: "000000", InviteCode: "ZZZZZZZZ"})
+	if err != nil || !r.IsNew || r.Invite == nil || r.Invite.Bound || r.Invite.Reason != "invalid_code" {
+		t.Fatalf("= %+v %v", r, err)
+	}
+	if _, err := e.svc.GetUser(ctx, r.ID); err != nil {
+		t.Fatalf("user must exist: %v", err)
+	}
+	// 数据库错误回滚注册
+	hook.err = errors.New("boom")
+	e.clock.Advance(61 * time.Second)
+	e.svc.SendLoginCode(ctx, "13800000013", "1.1.1.1")
+	if _, _, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000013", Code: "000000", InviteCode: "ZZZZZZZZ"}); err == nil {
+		t.Fatal("db error must propagate")
+	}
+	var n int
+	e.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE phone = '13800000013'`).Scan(&n)
+	if n != 0 {
+		t.Fatal("registration must be rolled back")
+	}
+	// 没装 hook 时带码：invalid_code，注册成功
+	e.svc.SetReferral(nil)
+	e.clock.Advance(61 * time.Second)
+	e.svc.SendLoginCode(ctx, "13800000014", "1.1.1.1")
+	if _, r, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000014", Code: "000000", InviteCode: "ABCDEFGH"}); err != nil || r.Invite == nil || r.Invite.Reason != "invalid_code" {
+		t.Fatalf("no hook = %+v %v", r, err)
+	}
+}
+
+func TestUserLookupImplementation(t *testing.T) {
+	e := newEnv(t, "000000")
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, e.pool, "13800000015", true)
+	e.pool.Exec(ctx, `INSERT INTO user_devices (user_id, device_id, first_seen_at, last_seen_at) VALUES ($1, $2, $3, $3)`, uid, devA, dbtest.T0)
+	e.pool.Exec(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, result, fingerprint, created_at, updated_at) VALUES ($1, 'personal', 'x', 'verified', 'fp-old', $2, $2), ($1, 'personal', 'x', 'verified', 'fp-new', $2, $2)`, uid, dbtest.T0)
+	var lookup referral.UserLookup = e.svc
+	st, err := lookup.UserState(ctx, e.pool, uid)
+	if err != nil || st.Status != "active" || st.KYCStatus != "verified" || st.Phone != "13800000015" || st.LastLoginAt != nil {
+		t.Fatalf("state = %+v %v", st, err)
+	}
+	if _, err := lookup.UserState(ctx, e.pool, 999999); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("missing = %v", err)
+	}
+	if has, _ := lookup.HasDevice(ctx, e.pool, uid, devA); !has {
+		t.Fatal("HasDevice")
+	}
+	if has, _ := lookup.HasDevice(ctx, e.pool, uid, "other"); has {
+		t.Fatal("HasDevice other")
+	}
+	fps, err := lookup.VerifiedFingerprints(ctx, e.pool, []int64{uid, 999999})
+	if err != nil || len(fps) != 1 || fps[uid] != "fp-new" {
+		t.Fatalf("fps = %v %v", fps, err)
 	}
 }

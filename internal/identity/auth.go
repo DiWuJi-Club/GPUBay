@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,7 @@ import (
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/plugins/sms"
+	"spark-cloud/internal/referral"
 )
 
 const (
@@ -80,12 +82,41 @@ func (s *Service) SendLoginCode(ctx context.Context, phone, ip string) error {
 	return nil
 }
 
-// Login 校验验证码，不存在则创建用户，返回新的会话 token。
+type LoginRequest struct {
+	Phone, Code string
+	InviteCode  string // 计划 8：仅新用户生效
+	IP          string
+	DeviceID    string // 请求头 X-Device-Id；非 UUID 形态视同未提供（不记设备、不转给 Bind）
+	UserAgent   string
+}
+
+// LoginResult 是登录响应：用户字段平铺，invite 仅在本次带了 invite_code 时出现。
+type LoginResult struct {
+	User
+	IsNew  bool                 `json:"-"`
+	Invite *referral.BindResult `json:"invite,omitempty"`
+}
+
+var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// Login 校验验证码，不存在则创建用户，返回新的会话 token（计划 8 之前的签名，等价于不带邀请码 / 设备的 LoginWith）。
 func (s *Service) Login(ctx context.Context, phone, code string) (string, User, error) {
+	token, r, err := s.LoginWith(ctx, LoginRequest{Phone: phone, Code: code})
+	return token, r.User, err
+}
+
+// LoginWith 校验验证码；首次登录即注册（is_new 由 INSERT … ON CONFLICT 的 xmax = 0 判断），新用户带邀请码时在同一事务里绑定。
+// Bind 的业务失败（码无效 / 码主冻结）只体现在响应里，不影响注册；数据库错误回滚整个登录。
+func (s *Service) LoginWith(ctx context.Context, req LoginRequest) (string, LoginResult, error) {
 	now := s.d.Clock.Now()
+	// 裁定 Q15：只有 UUID 形态才算设备 ID，其余视同未提供。
+	deviceID := ""
+	if uuidRe.MatchString(req.DeviceID) {
+		deviceID = strings.ToLower(req.DeviceID)
+	}
 	var (
 		bizErr error // 需要提交事务（记录试错次数）后再返回的业务错误
-		user   User
+		res    LoginResult
 		token  string
 	)
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
@@ -94,7 +125,7 @@ func (s *Service) Login(ctx context.Context, phone, code string) (string, User, 
 		var attempts int
 		err := tx.QueryRow(ctx, `SELECT id, code_hash, attempts FROM sms_codes
 			WHERE phone = $1 AND used_at IS NULL AND expires_at > $2
-			ORDER BY id DESC LIMIT 1 FOR UPDATE`, phone, now).Scan(&id, &hash, &attempts)
+			ORDER BY id DESC LIMIT 1 FOR UPDATE`, req.Phone, now).Scan(&id, &hash, &attempts)
 		if db.IsNoRows(err) {
 			bizErr = apperr.ErrInvalidCode
 			return nil
@@ -106,7 +137,7 @@ func (s *Service) Login(ctx context.Context, phone, code string) (string, User, 
 			bizErr = apperr.ErrInvalidCode
 			return nil
 		}
-		if subtle.ConstantTimeCompare([]byte(hash), []byte(hashSecret(phone+":"+code))) != 1 {
+		if subtle.ConstantTimeCompare([]byte(hash), []byte(hashSecret(req.Phone+":"+req.Code))) != 1 {
 			bizErr = apperr.ErrInvalidCode
 			_, err := tx.Exec(ctx, `UPDATE sms_codes SET attempts = attempts + 1 WHERE id = $1`, id)
 			return err
@@ -114,28 +145,64 @@ func (s *Service) Login(ctx context.Context, phone, code string) (string, User, 
 		if _, err := tx.Exec(ctx, `UPDATE sms_codes SET used_at = $2 WHERE id = $1`, id, now); err != nil {
 			return err
 		}
-		user, err = scanUser(tx.QueryRow(ctx, `INSERT INTO users (phone, created_at, updated_at) VALUES ($1, $2, $2)
-			ON CONFLICT (phone) DO UPDATE SET updated_at = EXCLUDED.updated_at
-			RETURNING `+userCols, phone, now))
-		if err != nil {
+		row := tx.QueryRow(ctx, `INSERT INTO users (phone, created_at, updated_at, last_login_ip, last_login_at) VALUES ($1, $2, $2, $3, $2)
+			ON CONFLICT (phone) DO UPDATE SET updated_at = EXCLUDED.updated_at, last_login_ip = EXCLUDED.last_login_ip, last_login_at = EXCLUDED.last_login_at
+			RETURNING `+userCols+`, (xmax = 0) AS is_new`, req.Phone, now, req.IP)
+		var u User
+		if err := row.Scan(&u.ID, &u.Phone, &u.Kind, &u.KYCStatus, &u.Status, &u.CreatedAt, &res.IsNew); err != nil {
 			return err
 		}
-		if user.Status == "banned" {
+		res.User = u
+		if u.Status == "banned" {
 			bizErr = apperr.ErrBanned
 			return nil
 		}
+		if deviceID != "" {
+			if err := s.touchDevice(ctx, tx, u.ID, deviceID, now); err != nil {
+				return err
+			}
+		}
+		if req.InviteCode != "" {
+			switch {
+			case !res.IsNew:
+				res.Invite = &referral.BindResult{Bound: false, Reason: referral.ReasonExistingUser}
+			case s.d.Referral == nil:
+				res.Invite = &referral.BindResult{Bound: false, Reason: referral.ReasonInvalidCode}
+			default:
+				ua := req.UserAgent
+				if len(ua) > referral.MaxUserAgent {
+					ua = ua[:referral.MaxUserAgent]
+				}
+				r, err := s.d.Referral.Bind(ctx, tx, referral.BindRequest{Code: req.InviteCode, InviteeID: u.ID, IP: req.IP, DeviceID: deviceID, UserAgent: ua, Now: now})
+				if err != nil {
+					return err
+				}
+				res.Invite = &r
+			}
+		}
 		token = randx.Token()
 		_, err = tx.Exec(ctx, `INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)`,
-			hashSecret(token), user.ID, now, now.Add(sessionTTL))
+			hashSecret(token), u.ID, now, now.Add(sessionTTL))
 		return err
 	})
 	if err != nil {
-		return "", User{}, err
+		return "", LoginResult{}, err
 	}
 	if bizErr != nil {
-		return "", User{}, bizErr
+		return "", LoginResult{}, bizErr
 	}
-	return token, user, nil
+	return token, res, nil
+}
+
+// touchDevice 记录设备；每用户最多 MaxDevicesPerUser 台，超出删最旧。
+func (s *Service) touchDevice(ctx context.Context, tx pgx.Tx, userID int64, deviceID string, now time.Time) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO user_devices (user_id, device_id, first_seen_at, last_seen_at) VALUES ($1, $2, $3, $3)
+		ON CONFLICT (user_id, device_id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at`, userID, deviceID, now); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM user_devices WHERE user_id = $1 AND device_id NOT IN
+		(SELECT device_id FROM user_devices WHERE user_id = $1 ORDER BY last_seen_at DESC, device_id LIMIT $2)`, userID, referral.MaxDevicesPerUser)
+	return err
 }
 
 func (s *Service) Authenticate(ctx context.Context, token string) (User, error) {
