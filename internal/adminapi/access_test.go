@@ -24,7 +24,10 @@ func TestAdminAccessViewsAndPortActions(t *testing.T) {
 	if _, err := e.identity.AddSSHKey(e.ctx, uid, "mac", pubLineAdmin(t), ""); err != nil {
 		t.Fatal(err)
 	}
-	sid, _ := e.rental.OpenSSHSession(e.ctx, rental.SSHSessionStart{InstanceID: inst.ID, UserID: uid, MachineID: inst.MachineID, AuthMethod: "password", ClientIP: "203.0.113.1"})
+	sid, err := e.rental.OpenSSHSession(e.ctx, rental.SSHSessionStart{InstanceID: inst.ID, UserID: uid, MachineID: inst.MachineID, AuthMethod: "password", ClientIP: "203.0.113.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	fin := e.loginAs("fin", admin.RoleFinance)
 	code, out := fin.do("GET", "/instances/"+inst.ID, nil)
 	ports := out["ports"].([]any)
@@ -60,7 +63,9 @@ func TestAdminAccessViewsAndPortActions(t *testing.T) {
 		t.Fatalf("delete twice = %d", code)
 	}
 	var n int
-	e.pool.QueryRow(e.ctx, `SELECT count(*) FROM audit_logs WHERE action IN ('instance.port_force_private', 'instance.port_delete') AND actor_type = 'admin'`).Scan(&n)
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM audit_logs WHERE action IN ('instance.port_force_private', 'instance.port_delete') AND actor_type = 'admin'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
 	if n != 2 {
 		t.Fatalf("audit = %d", n)
 	}

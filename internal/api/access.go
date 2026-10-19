@@ -78,13 +78,17 @@ func (s *Server) handleResetPassword(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSetAccess(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PasswordAuth bool `json:"password_auth"`
+		PasswordAuth *bool `json:"password_auth"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	inst, err := s.Rental.SetPasswordAuth(r.Context(), currentUser(r).ID, chi.URLParam(r, "id"), req.PasswordAuth, clientIP(r))
+	if req.PasswordAuth == nil { // 缺字段不能被当成 false 关掉密码登录
+		s.writeError(w, r, apperr.BadRequest("缺少 password_auth"))
+		return
+	}
+	inst, err := s.Rental.SetPasswordAuth(r.Context(), currentUser(r).ID, chi.URLParam(r, "id"), *req.PasswordAuth, clientIP(r))
 	if err != nil {
 		s.writeError(w, r, err)
 		return

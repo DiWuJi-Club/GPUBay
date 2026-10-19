@@ -93,6 +93,12 @@ func TestInstanceAccessEndpoints(t *testing.T) {
 	if code, out := c.do("PUT", "/instances/"+id+"/access", map[string]bool{"password_auth": false}); code != 200 || out["password_auth"] != false {
 		t.Fatalf("disable = %d %v", code, out)
 	}
+	if code, out := c.do("PUT", "/instances/"+id+"/access", map[string]any{}); code != 400 || out["code"] != "bad_request" {
+		t.Fatalf("missing password_auth = %d %v", code, out)
+	}
+	if _, inst := c.do("GET", "/instances/"+id, nil); inst["password_auth"] != false {
+		t.Fatalf("missing field changed password_auth: %v", inst["password_auth"])
+	}
 	// 端口
 	code, out = c.do("POST", "/instances/"+id+"/ports", map[string]any{"port": 8888, "note": "lab"})
 	if code != 201 || out["visibility"] != "private" || out["url"] != "http://"+id+"-8888.spark.test/" || out["note"] != "lab" {
@@ -105,7 +111,9 @@ func TestInstanceAccessEndpoints(t *testing.T) {
 		t.Fatalf("update = %d %v", code, out)
 	}
 	for p := 8001; p <= 8004; p++ {
-		c.do("POST", "/instances/"+id+"/ports", map[string]any{"port": p})
+		if code, out := c.do("POST", "/instances/"+id+"/ports", map[string]any{"port": p}); code != 201 {
+			t.Fatalf("add port %d = %d %v", p, code, out)
+		}
 	}
 	if code, out := c.do("POST", "/instances/"+id+"/ports", map[string]any{"port": 8005}); code != 409 || out["code"] != "port_limit" {
 		t.Fatalf("limit = %d %v", code, out)
@@ -123,16 +131,36 @@ func TestInstanceAccessEndpoints(t *testing.T) {
 	if code, out := c.do("GET", "/instances/"+id+"/ssh-sessions", nil); code != 200 || len(out["items"].([]any)) != 0 {
 		t.Fatalf("sessions = %d %v", code, out)
 	}
-	// 别人的实例一律 404
+	// 别人的实例一律 404，且不产生任何副作用
+	_, ownerPw := c.do("GET", "/instances/"+id+"/password", nil)
 	other := e.client()
 	other.login("13800000044")
-	for _, req := range []struct{ m, p string }{{"POST", "/instances/" + id + "/password/reset"}, {"GET", "/instances/" + id + "/ports"}, {"PUT", "/instances/" + id + "/access"}} {
-		var body any
-		if req.m != "GET" {
-			body = map[string]any{"password_auth": true}
+	for _, req := range []struct {
+		m, p string
+		body any
+	}{
+		{"POST", "/instances/" + id + "/password/reset", map[string]any{}},
+		{"PUT", "/instances/" + id + "/access", map[string]any{"password_auth": true}},
+		{"GET", "/instances/" + id + "/ports", nil},
+		{"POST", "/instances/" + id + "/ports", map[string]any{"port": 9000}},
+		{"PUT", "/instances/" + id + "/ports/8888", map[string]any{"visibility": "private"}},
+		{"DELETE", "/instances/" + id + "/ports/8888", map[string]any{}},
+		{"GET", "/instances/" + id + "/ssh-sessions", nil},
+	} {
+		if code, out := other.do(req.m, req.p, req.body); code != 404 {
+			t.Fatalf("%s %s by other = %d %v", req.m, req.p, code, out)
 		}
-		if code, _ := other.do(req.m, req.p, body); code != 404 {
-			t.Fatalf("%s %s by other = %d", req.m, req.p, code)
+	}
+	if _, pw := c.do("GET", "/instances/"+id+"/password", nil); pw["password"] == nil || pw["password"] != ownerPw["password"] {
+		t.Fatalf("owner password changed by other: %v -> %v", ownerPw["password"], pw["password"])
+	}
+	code, out = c.do("GET", "/instances/"+id+"/ports", nil)
+	if code != 200 || len(out["items"].([]any)) != 4 {
+		t.Fatalf("ports after other = %d %v", code, out)
+	}
+	for _, it := range out["items"].([]any) {
+		if p := it.(map[string]any); p["port"].(float64) == 8888 && p["visibility"] != "public" {
+			t.Fatalf("port 8888 changed by other: %v", p)
 		}
 	}
 }
