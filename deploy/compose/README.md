@@ -2,6 +2,8 @@
 
 platform 镜像以 distroless nonroot（uid/gid 65532）运行，没有 shell。凡是挂进容器的文件（上游私钥、证书、支付密钥）都要让 65532 可读。
 
+需要 Docker Compose ≥ v2.24（acme 服务的 `env_file` 用了带 `required: false` 的长格式）。
+
 1. 宿主机：把自己的 OpenSSH 挪到别的端口（例如 `/etc/ssh/sshd_config` 里 `Port 2200`，先在新端口验证登录再 `systemctl restart ssh`），22 留给平台 SSH 网关。
 2. DNS：`<domain>`、`ssh.<domain>`、`*.<ingress_domain>` 都指向控制面公网 **IPv4** 地址（A 记录）；`agent.<domain>`（或内网 IP）给 Agent 用。生产强烈建议 ingress 域用与 `<domain>` 不同的注册域（或已进 PSL 的域）：租户页面的 JS 能在父域上种 Cookie。
    **不要加 AAAA 记录**：compose 只把端口发布在 IPv4（`0.0.0.0:…`）。默认 compose 网络没有 IPv6，IPv6 客户端要经 docker-proxy 转发，到 platform 时全都变成同一个网桥地址，按 IP 的 SSH 暴力破解限额与限流会把所有 IPv6 用户当成一个人（一人触发、全体被封）。确需 IPv6 时先给 compose 网络启用 IPv6（`enable_ipv6: true` + dockerd 的 `ip6tables`），让源地址原样到达，再发布 `[::]` 端口、加 AAAA。
@@ -15,7 +17,7 @@ platform 镜像以 distroless nonroot（uid/gid 65532）运行，没有 shell。
      --reloadcmd 'chown 65532:65532 /certs/fullchain.pem /certs/privkey.pem'
    ```
 
-   一张证书同时覆盖 `<domain>` 与 `*.<ingress_domain>`；`--fullchain-file` / `--key-file` / `--reloadcmd` 会记进续签配置，daemon 续签后自动重新写文件并 chown（让 nonroot 的 platform 能读私钥）。想用 ZeroSSL（acme.sh 默认 CA）：先 `acme.sh --register-account -m <邮箱> --server zerossl`，再把 `--server letsencrypt` 换成 `--server zerossl`。
+   一张证书同时覆盖 `<domain>` 与 `*.<ingress_domain>`；`--fullchain-file` / `--key-file` / `--reloadcmd` 会记进续签配置，daemon 续签后自动重新写文件并 chown（让 nonroot 的 platform 能读私钥）。想用 ZeroSSL（acme.sh 默认 CA）：先 `docker compose exec acme acme.sh --register-account -m <邮箱> --server zerossl`，再把 `--server letsencrypt` 换成 `--server zerossl`。
    或用商业泛域名证书：把 `certs` 卷换成宿主机目录（`- /opt/spark/certs:/certs:ro`），放入同名文件并 `chown 65532:65532`。platform 每分钟检查文件变化，续签后不用重启。
 6. 上游密钥：`sudo mkdir -p /opt/spark && docker run --rm --user 0 -v /opt/spark:/out spark-cloud/platform:latest admin gen-upstream-key --path /out/upstream.key && sudo chown 65532:65532 /opt/spark/upstream.key*`（文件须 0600，platform 会拒绝权限过宽的私钥）；路径填进 `.env` 的 `SPARK_UPSTREAM_SSH_KEY_HOST_PATH`。
 7. 支付（`SPARK_PAY_DRIVER=real`）：把微信 / 支付宝的密钥文件放到宿主机目录（例如 `/opt/spark/pay`，`chown -R 65532:65532`），打开 `docker-compose.yml` 里注释掉的 `/secrets/pay` 挂载，`.env` 里的 `*_PATH` 写容器内路径。缺这些时 prod 启动校验不通过。
@@ -29,3 +31,27 @@ platform 镜像以 distroless nonroot（uid/gid 65532）运行，没有 shell。
 防火墙：Docker 发布的端口直接写 iptables 的 DOCKER 链，**不受 ufw 控制**；9443 靠绑定内网地址（`AGENT_BIND_IP`）、后台靠绑定 `127.0.0.1` 限制来源，不要指望 ufw 规则。
 
 本 compose 由 platform 直接终止 TLS，所以 `SPARK_TRUST_PROXY=false`。若改为前置反向代理终止 TLS：去掉 `SPARK_TLS_*` 与 `SPARK_HTTP_REDIRECT_ADDR`，设 `SPARK_TRUST_PROXY=true`（多层代理再设 `SPARK_TRUSTED_PROXY_HOPS=N`，客户端 IP 取 `X-Forwarded-For` 自右数第 N 项），代理须原样转发 Host 头。
+
+## 大陆网络
+
+Docker Hub、gcr.io、proxy.golang.org 在大陆机房通常不可达；goproxy.cn、registry.npmmirror.com 与镜像站可用。
+
+- 基础镜像：给 dockerd 配 `registry-mirrors`（`/etc/docker/daemon.json` 里 `{"registry-mirrors": ["https://docker.m.daocloud.io"]}` 后 `systemctl restart docker`，只对 Docker Hub 生效），或按全名从镜像站拉取再打回原标签：
+
+  ```
+  docker pull docker.m.daocloud.io/library/postgres:16.15-bookworm && docker tag docker.m.daocloud.io/library/postgres:16.15-bookworm postgres:16.15-bookworm
+  docker pull docker.m.daocloud.io/library/node:22.23.1-bookworm-slim && docker tag docker.m.daocloud.io/library/node:22.23.1-bookworm-slim node:22.23.1-bookworm-slim
+  docker pull docker.m.daocloud.io/library/golang:1.27.2-bookworm && docker tag docker.m.daocloud.io/library/golang:1.27.2-bookworm golang:1.27.2-bookworm
+  docker pull docker.m.daocloud.io/neilpang/acme.sh:3.1.1 && docker tag docker.m.daocloud.io/neilpang/acme.sh:3.1.1 neilpang/acme.sh:3.1.1
+  ```
+
+  distroless 在 Dockerfile 里按 digest 引用，`registry-mirrors` 管不到 gcr.io，也不能把镜像打成带 digest 的标签：构建时直接用镜像站全名（digest 不变，内容照样校验），见下一条的 `DISTROLESS`。
+- 构建（`DISTROLESS` 的 digest 与 `deploy/platform/Dockerfile` 里的保持一致）：
+
+  ```
+  GOPROXY=https://goproxy.cn,direct NPM_REGISTRY=https://registry.npmmirror.com/ \
+  DISTROLESS=m.daocloud.io/gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab \
+    make platform-image
+  ```
+
+  （Go 模块与 npm 依赖走国内源；`go.sum` 与 `package-lock.json` 的校验和照常生效）。

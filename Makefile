@@ -47,7 +47,14 @@ build: web
 	$(MAKE) agent
 
 # platform 容器镜像（前端 + 后端多阶段构建，部署见 deploy/compose/README.md）；只在本地打标签，不推送
+# 大陆网络：GOPROXY=https://goproxy.cn,direct NPM_REGISTRY=https://registry.npmmirror.com/ make platform-image
+# 为空时不传 --build-arg（传空值会覆盖 Dockerfile 里的默认值）；DISTROLESS 可换成镜像站全名（digest 不变），见 deploy/compose/README.md
+GOPROXY ?=
+NPM_REGISTRY ?=
+DISTROLESS ?=
 platform-image:
-	docker build -f deploy/platform/Dockerfile --build-arg VERSION=$(VERSION) -t spark-cloud/platform:$(VERSION) -t spark-cloud/platform:latest .
+	docker build -f deploy/platform/Dockerfile --build-arg VERSION=$(VERSION) \
+		$(if $(GOPROXY),--build-arg GOPROXY=$(GOPROXY)) $(if $(NPM_REGISTRY),--build-arg NPM_REGISTRY=$(NPM_REGISTRY)) $(if $(DISTROLESS),--build-arg DISTROLESS=$(DISTROLESS)) \
+		-t spark-cloud/platform:$(VERSION) -t spark-cloud/platform:latest .
 
 check: test e2e
