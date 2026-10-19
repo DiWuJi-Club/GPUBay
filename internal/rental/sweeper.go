@@ -22,6 +22,14 @@ const (
 // extraTaskTimeout 限制每个附加任务的执行时间，避免外部调用卡住后一直占着清扫咨询锁（测试可调小）。
 var extraTaskTimeout = 2 * time.Minute
 
+// RefreshCappedLeases 让停机、洗机中与失联暂停实例的占用上界随时间推进（并封顶于下一条预订）：
+// 这些实例的 occupiedUntil 以 now 为基准，不刷新的话上界会「过期」，后来的预订会把机器当空闲挑走。
+func (s *Service) RefreshCappedLeases(ctx context.Context) (int, error) {
+	now := s.d.Clock.Now()
+	return s.sweepEach(ctx, `(state IN ('stopped', 'wiping') OR (state = 'running' AND suspended_at IS NOT NULL)) AND created_at <= $1`, now, "updated_at",
+		func(tx pgx.Tx, inst Instance) error { return s.refreshLease(ctx, tx, inst.ID, now) })
+}
+
 // ExpireDue 把已到期、未暂停的运行中实例转为停机并下发停止指令。
 func (s *Service) ExpireDue(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()

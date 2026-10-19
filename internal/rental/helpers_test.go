@@ -14,6 +14,7 @@ import (
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
+	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/platform/secretbox"
 	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/sms"
@@ -201,5 +202,26 @@ func (e *env) newMachine(serial string) int64 {
 	e.t.Helper()
 	id := dbtest.CreateMachine(e.t, e.pool, serial)
 	e.machines = append(e.machines, id)
+	return id
+}
+
+// reserveRaw 直接写库造一个预订（Task 5 之前没有 PlaceBatch，之后也用于绕过参数校验）：
+// reserved 实例 + reserved lease，period 按规格 §4.1 = [start − PrepLead, start + secs + Tail)。
+// 第三参数是秒（int64），调用方写 86400 / 3600 这类字面量；不要用 time.Duration，无类型常量会被当成纳秒。
+func (e *env) reserveRaw(machineID int64, start time.Time, secs int64) string {
+	e.t.Helper()
+	d := time.Duration(secs) * time.Second
+	id := randx.ID("ins-", 8)
+	now := e.clock.Now()
+	if _, err := e.pool.Exec(e.ctx, `INSERT INTO instances (id, user_id, machine_id, product_id, image_id, state, pending_seconds,
+			ssh_password_enc, scheduled_start_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, 'reserved', $6, $7, $8, $9, $9)`,
+		id, e.userID, machineID, e.productID, e.imageID, int64(d/time.Second), []byte("x"), start, now); err != nil {
+		e.t.Fatalf("reserveRaw instance: %v", err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `INSERT INTO machine_leases (machine_id, instance_id, period, status, created_at, updated_at)
+		VALUES ($1, $2, tstzrange($3, $4), 'reserved', $5, $5)`, machineID, id, start.Add(-rental.PrepLead), start.Add(d+rental.Tail), now); err != nil {
+		e.t.Fatalf("reserveRaw lease: %v", err)
+	}
 	return id
 }
