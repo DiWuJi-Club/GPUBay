@@ -13,6 +13,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/tz"
 	"spark-cloud/internal/rental"
 )
 
@@ -22,6 +23,7 @@ const (
 	BannerCreating         = "实例正在开通，请稍后再试"
 	BannerStoppedFmt       = "实例已到期停机，数据保留至 %s，续费后可继续使用"
 	BannerReleased         = "实例已释放"
+	BannerReservedFmt      = "实例预订于 %s 开始，开始前 1 小时自动开通"
 	MsgTooManySessions     = "连接数过多"
 	MsgUpstreamUnreachable = "无法连接到实例，请稍后重试"
 	MsgDisconnected        = "实例已停机 / 已释放，连接已断开"
@@ -31,7 +33,6 @@ const (
 var (
 	instanceIDRe = regexp.MustCompile(`^ins-[a-z0-9]{8}$`)
 	errAuth      = errors.New("authentication failed")
-	cst          = time.FixedZone("CST", 8*3600)
 )
 
 const lookupTimeout = 5 * time.Second
@@ -100,12 +101,18 @@ func stateBanner(info rental.AccessInfo) string {
 		return BannerSuspended
 	case inst.State == rental.StateRunning:
 		return ""
+	case inst.State == rental.StateReserved:
+		when := "—"
+		if inst.ScheduledStartAt != nil {
+			when = tz.Format(*inst.ScheduledStartAt)
+		}
+		return fmt.Sprintf(BannerReservedFmt, when)
 	case inst.State == rental.StateCreating:
 		return BannerCreating
 	case inst.State == rental.StateStopped:
 		until := "—"
 		if info.RetainUntil != nil {
-			until = info.RetainUntil.In(cst).Format("2006-01-02 15:04")
+			until = tz.Format(*info.RetainUntil)
 		}
 		return fmt.Sprintf(BannerStoppedFmt, until)
 	default:
