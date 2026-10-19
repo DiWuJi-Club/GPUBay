@@ -4,32 +4,22 @@ import {
   type AdminApp, type AdminDeployment, type AdminDeploymentDetail, type DeploymentState, type Listed, type Paged,
 } from '@spark/shared'
 import { computed, onMounted, reactive, ref } from 'vue'
-import { onBeforeRouteUpdate, useRoute, useRouter, type LocationQuery } from 'vue-router'
+import { onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import ForceRemoveDialog from '../components/ForceRemoveDialog.vue'
 import IdLink from '../components/IdLink.vue'
 import { usePaged } from '../composables/usePaged'
-import { deploymentDesiredLabel, deploymentHealthLabel, envRows, progressText, showForceRemove } from '../logic/deployments'
+import {
+  deploymentDesiredLabel, deploymentHealthLabel, digits, envRows, filterFromQuery, firstOf, onlyDepChanged, progressText, showForceRemove,
+} from '../logic/deployments'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
-
-const digits = (v: string) => v.replace(/\D/g, '')
-const first = (v: LocationQuery[string]) => String((Array.isArray(v) ? v[0] : v) ?? '')
-/** ?state=&app_id=&user_id=&instance_id= 预填（来自实例详情「应用」卡片等跳转）；?dep= 直接打开该部署的详情抽屉。 */
-function fromQuery(q: LocationQuery) {
-  const state = first(q.state)
-  return {
-    state: state in deploymentStateLabel ? state : '',
-    app_id: digits(first(q.app_id)),
-    user_id: digits(first(q.user_id)),
-    instance_id: first(q.instance_id).trim(),
-  }
-}
 
 const route = useRoute()
 const router = useRouter()
 const role = computed(() => session.admin?.role ?? 'finance')
-const filter = reactive(fromQuery(route.query))
+// ?state=&app_id=&user_id=&instance_id= 预填（来自实例详情「应用」卡片等跳转）；?dep= 直接打开该部署的详情抽屉
+const filter = reactive(filterFromQuery(route.query))
 const list = usePaged<AdminDeployment>((page, size) =>
   api.get<Paged<AdminDeployment>>('/deployments', {
     state: filter.state, app_id: filter.app_id, user_id: filter.user_id, instance_id: filter.instance_id.trim(), page, page_size: size,
@@ -47,14 +37,17 @@ async function loadApps() {
 onMounted(() => {
   void list.load()
   void loadApps()
-  const dep = first(route.query.dep)
+  const dep = firstOf(route.query.dep)
   if (dep) void openDetail(dep)
 })
-onBeforeRouteUpdate((to) => {
-  if (to.path !== route.path) return
-  Object.assign(filter, fromQuery(to.query))
-  list.reset()
-  const dep = first(to.query.dep)
+onBeforeRouteUpdate((to, from) => {
+  if (to.path !== from.path) return
+  // 只是 dep 变了（关抽屉时去掉 ?dep=、或打开某个部署的链接）：保留当前筛选、页码与列表，不重新加载
+  if (!onlyDepChanged(from.query, to.query)) {
+    Object.assign(filter, filterFromQuery(to.query))
+    list.reset()
+  }
+  const dep = firstOf(to.query.dep)
   if (dep && dep !== detail.id) void openDetail(dep)
 })
 function resetFilter() {

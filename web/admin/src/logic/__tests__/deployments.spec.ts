@@ -2,7 +2,7 @@ import { deploymentErrorLabel, type AppSpec, type DeploymentState, type Role } f
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { envRows, FORCE_REMOVE_REASON_MAX, progressText, runeCount, showForceRemove, validateForceRemoveReason } from '../deployments'
+import { envRows, filterFromQuery, FORCE_REMOVE_REASON_MAX, onlyDepChanged, progressText, runeCount, showForceRemove, validateForceRemoveReason } from '../deployments'
 
 describe('强制卸载原因', () => {
   it('必填（去首尾空白）', () => {
@@ -93,5 +93,24 @@ describe('错误码文案与后端一致', () => {
   })
   it('每个错误码都有中文', () => {
     for (const c of codes) expect(deploymentErrorLabel[c], c).toBeTruthy()
+  })
+})
+
+describe('部署列表查询串', () => {
+  it('预填：未知状态忽略、ID 只留数字、实例 ID 去空白、数组取第一个', () => {
+    expect(filterFromQuery({ state: 'failed', app_id: '3x', user_id: ['7', '8'], instance_id: ' ins-a ', dep: 'dep-1' }))
+      .toEqual({ state: 'failed', app_id: '3', user_id: '7', instance_id: 'ins-a' })
+    expect(filterFromQuery({ state: 'bogus' })).toEqual({ state: '', app_id: '', user_id: '', instance_id: '' })
+  })
+  it('只有 dep 变化（开 / 关抽屉）不算筛选变化', () => {
+    expect(onlyDepChanged({ instance_id: 'ins-a', dep: 'dep-1' }, { instance_id: 'ins-a' })).toBe(true)
+    expect(onlyDepChanged({ state: 'failed' }, { dep: 'dep-2', state: 'failed' })).toBe(true)
+    expect(onlyDepChanged({}, {})).toBe(true)
+  })
+  it('其它参数变化都算筛选变化', () => {
+    expect(onlyDepChanged({ instance_id: 'ins-a', dep: 'dep-1' }, { instance_id: 'ins-b' })).toBe(false)
+    expect(onlyDepChanged({ dep: 'dep-1' }, { state: 'running' })).toBe(false)
+    expect(onlyDepChanged({ state: 'running' }, {})).toBe(false)
+    expect(onlyDepChanged({ user_id: '1' }, { user_id: ['1', '2'] })).toBe(false)
   })
 })

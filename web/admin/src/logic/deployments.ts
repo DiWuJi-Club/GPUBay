@@ -1,4 +1,5 @@
-import { deploymentPhaseLabel, labelOf, type Deployment, type DeploymentState, type Role } from '@spark/shared'
+import { deploymentPhaseLabel, deploymentStateLabel, labelOf, type Deployment, type DeploymentState, type Role } from '@spark/shared'
+import type { LocationQuery } from 'vue-router'
 
 /** 与后端 adminapi.maxForceRemoveReason 一致（去首尾空白后按字符计，不按 UTF-16 单元）。 */
 export const FORCE_REMOVE_REASON_MAX = 200
@@ -51,4 +52,33 @@ export function envRows(d: Pick<Deployment, 'env' | 'secret_env' | 'spec'>): Env
   for (const name of Object.keys(secrets).sort()) if (!seen.has(name)) { seen.add(name); rows.push(secretRow(name, '')) }
   for (const name of Object.keys(env).sort()) if (!seen.has(name)) { seen.add(name); rows.push(plainRow(name, '')) }
   return rows
+}
+
+export const digits = (v: string) => v.replace(/\D/g, '')
+export const firstOf = (v: LocationQuery[string] | undefined) => String((Array.isArray(v) ? v[0] : v) ?? '')
+
+/** 部署列表的 ?state=&app_id=&user_id=&instance_id= 预填；ID 只留数字（实例 ID 去首尾空白），未知状态忽略。 */
+export function filterFromQuery(q: LocationQuery) {
+  const state = firstOf(q.state)
+  return {
+    state: state in deploymentStateLabel ? state : '',
+    app_id: digits(firstOf(q.app_id)),
+    user_id: digits(firstOf(q.user_id)),
+    instance_id: firstOf(q.instance_id).trim(),
+  }
+}
+
+/**
+ * 两个查询串除 dep（详情抽屉）外完全相同：只是打开 / 关闭抽屉，列表不该重新加载、也不该回到第一页。
+ * 比较原始查询串而不是 filterFromQuery 的结果，page 等将来加入的参数也算筛选变化。
+ */
+export function onlyDepChanged(from: LocationQuery, to: LocationQuery): boolean {
+  const rest = (q: LocationQuery) =>
+    JSON.stringify(
+      Object.keys(q)
+        .filter((k) => k !== 'dep' && q[k] !== undefined)
+        .sort()
+        .map((k) => [k, q[k]]),
+    )
+  return rest(from) === rest(to)
 }
