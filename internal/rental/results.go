@@ -141,7 +141,7 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 // 若它是换机得到的新实例，再退还转入的剩余时长（以换机记录的秒数为上限，见 refundTransferred）。
 // inst 须为加锁时读到的实例快照（state = creating，含 pending_seconds）。
 func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now time.Time) error {
-	rows, err := tx.Query(ctx, `SELECT id, amount - refunded_amount, duration FROM orders
+	rows, err := tx.Query(ctx, `SELECT id, amount - refunded_amount, duration, quantity FROM orders
 		WHERE instance_id = $1 AND status IN ('paid', 'partially_refunded') ORDER BY created_at, id FOR UPDATE`, inst.ID)
 	if err != nil {
 		return err
@@ -150,10 +150,11 @@ func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now t
 		id       string
 		amount   int64
 		duration catalog.Duration
+		quantity int
 	}
 	orders, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (paid, error) {
 		var p paid
-		err := r.Scan(&p.id, &p.amount, &p.duration)
+		err := r.Scan(&p.id, &p.amount, &p.duration, &p.quantity)
 		return p, err
 	})
 	if err != nil {
@@ -161,7 +162,7 @@ func (s *Service) refundAll(ctx context.Context, tx pgx.Tx, inst Instance, now t
 	}
 	var ownSecs int64
 	for _, o := range orders {
-		ownSecs += seconds(o.duration)
+		ownSecs += seconds(o.duration) * int64(max(o.quantity, 1))
 		if o.amount > 0 {
 			if _, err := s.d.Wallet.Apply(ctx, tx, wallet.Entry{
 				UserID: inst.UserID, Amount: o.amount, Kind: wallet.KindRefund, RefType: "order", RefID: o.id,

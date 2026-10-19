@@ -264,3 +264,20 @@ func TestCreateFailureAfterMigrationDoesNotRefundFreeExtension(t *testing.T) {
 		t.Fatalf("original order = %s %d", s, r)
 	}
 }
+
+func TestRefundQuoteUsesQuantity(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)
+	renew, err := e.svc.RenewQuantity(e.ctx, e.userID, inst.ID, catalog.D1d, 3, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(12 * time.Hour)
+	q, _ := e.svc.RefundQuote(e.ctx, inst.ID)
+	remaining := int64(4*86400 - 12*3600)
+	// 单价按最新订单：20700 分 / (3 × 86400 秒)
+	if q.UnitOrderID != renew.ID || q.RemainingSeconds != remaining || q.Suggested != remaining*20700/(3*86400) || q.Max != 6900+20700 {
+		t.Fatalf("quote = %+v", q)
+	}
+}
