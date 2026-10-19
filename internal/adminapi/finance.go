@@ -117,7 +117,7 @@ func (s *Server) orderFilter(r *http.Request) (rental.OrderFilter, error) {
 		return rental.OrderFilter{}, err
 	}
 	q := r.URL.Query()
-	return rental.OrderFilter{UserID: uid, Kind: q.Get("kind"), Status: q.Get("status"), From: from, To: to}, nil
+	return rental.OrderFilter{UserID: uid, Kind: q.Get("kind"), Status: q.Get("status"), From: from, To: to, BatchID: q.Get("batch_id")}, nil
 }
 
 func (s *Server) handleListOrders(w http.ResponseWriter, r *http.Request) {
@@ -145,11 +145,19 @@ func (s *Server) handleExportOrders(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	s.csvExport(w, r, "orders", []string{"订单号", "用户ID", "类型", "实例", "租期", "金额(元)", "已退(元)", "状态", "下单时间"},
+	s.csvExport(w, r, "orders", []string{"订单号", "用户ID", "类型", "实例", "租期", "数量", "金额(元)", "已退(元)", "状态", "批次", "自动续费", "下单时间"},
 		func(write func([]string) error) error {
 			return s.Rental.ExportOrders(r.Context(), f, func(o rental.Order) error {
-				return write([]string{o.ID, strconv.FormatInt(o.UserID, 10), o.Kind, o.InstanceID, string(o.Duration),
-					csvx.Yuan(o.Amount), csvx.Yuan(o.RefundedAmount), o.Status, csvx.Time(o.CreatedAt)})
+				batch := ""
+				if o.BatchID != nil {
+					batch = *o.BatchID
+				}
+				auto := ""
+				if o.Auto {
+					auto = "是"
+				}
+				return write([]string{o.ID, strconv.FormatInt(o.UserID, 10), o.Kind, o.InstanceID, string(o.Duration), strconv.Itoa(o.Quantity),
+					csvx.Yuan(o.Amount), csvx.Yuan(o.RefundedAmount), o.Status, batch, auto, csvx.Time(o.CreatedAt)})
 			})
 		})
 }

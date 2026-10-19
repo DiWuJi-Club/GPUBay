@@ -12,6 +12,7 @@
 //     预订 Create 失败 / 超时（reassignAfterCreateFailure）：instance → [agent_commands] → 自己的 lease → 旧机器(MarkFaulty)
 //       → 候选 machines(SKIP LOCKED) → agent_commands；过宽限期则平台取消：→ agent_commands → orders → wallet
 //   ExpireDue / WipeStale / Suspend / Resume / RefreshCapped / beginWipe：instance → lease → agent_commands
+//     Resume 被下一条预订封顶时补偿：instance → lease(refreshLease) → orders → wallet
 //   AdminDeleteGroup：machine_groups(FOR UPDATE) → instances(清 group_id) → machines(只读计数) → 删机组
 //     下单插实例取机组行 KEY SHARE：先插的一方先拿到锁，另一方等它提交；删除方不锁机器，与下单不成环
 //   AdminMigrate：原实例 → machines(SKIP LOCKED) → 新 lease → agent_commands → 旧 lease 收缩

@@ -61,7 +61,15 @@ func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	list, total, err := s.Fleet.ListMachines(r.Context(), fleet.MachineFilter{State: q.Get("state"), Online: online, Rack: q.Get("rack")}, p)
+	f := fleet.MachineFilter{State: q.Get("state"), Online: online, Rack: q.Get("rack")}
+	// group_id=none 是未分组机器（不能交给 queryInt）；其余必须是正整数
+	if q.Get("group_id") == "none" {
+		f.Ungrouped = true
+	} else if f.GroupID, err = queryInt(r, "group_id"); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	list, total, err := s.Fleet.ListMachines(r.Context(), f, p)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -216,13 +224,35 @@ func (s *Server) handleMachine(w http.ResponseWriter, r *http.Request) {
 	for _, i := range insts {
 		v := s.instanceView(i)
 		switch {
-		case current == nil && i.State != rental.StateReleased && i.State != rental.StateFailed:
+		case current == nil && i.State != rental.StateReleased && i.State != rental.StateFailed && i.State != rental.StateCancelled:
 			current = &v
 		case len(history) < 20:
 			history = append(history, v)
 		}
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"machine": m, "current_instance": current, "history": history})
+	var group *fleet.Group
+	if m.GroupID != nil {
+		g, err := s.Fleet.GetGroup(r.Context(), s.Fleet.Pool(), *m.GroupID)
+		if err != nil && !errors.Is(err, apperr.ErrNotFound) {
+			s.writeError(w, r, err)
+			return
+		}
+		if err == nil {
+			group = &g
+		}
+	}
+	leases, err := s.Rental.MachineLeases(r.Context(), id, s.Clock.Now(), 60)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	upcoming, err := s.Rental.UpcomingBookingsForMachine(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"machine": m, "current_instance": current, "history": history,
+		"group": group, "leases": leases, "upcoming_bookings": upcoming})
 }
 
 func (s *Server) handleMaintenance(w http.ResponseWriter, r *http.Request) {
@@ -247,7 +277,15 @@ func (s *Server) handleMaintenance(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, m)
+	upcoming, err := s.Rental.UpcomingBookingsForMachine(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, struct {
+		fleet.Machine
+		UpcomingBookings int `json:"upcoming_bookings"`
+	}{m, upcoming})
 }
 
 func (s *Server) handlePowerCycle(w http.ResponseWriter, r *http.Request) {

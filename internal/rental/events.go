@@ -38,6 +38,8 @@ func userEventOf(e Event) (UserEvent, bool) {
 		}
 	case strings.HasPrefix(r, "late start compensated"):
 		out.Kind, out.Detail = "compensated", "迟开通补偿已退回余额"
+	case strings.HasPrefix(r, "resume capped compensated"):
+		out.Kind, out.Detail = "compensated", "故障恢复后可用时长不足，补偿已退回余额"
 	case strings.HasPrefix(r, "reassigned "):
 		out.Kind, out.Detail = "reassigned", "已为您更换机器"
 	case strings.HasPrefix(r, "create failed, waiting"):

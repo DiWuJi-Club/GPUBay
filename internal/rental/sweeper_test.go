@@ -602,10 +602,21 @@ func TestResumeMachineCapsExpiryAtNextBooking(t *testing.T) {
 	if _, err := e.fleet.Heartbeat(e.ctx, e.machines[0]); err != nil {
 		t.Fatal(err)
 	}
+	balance := e.balance(e.userID)
 	n, err := e.svc.ResumeMachine(e.ctx, e.machines[0], []string{inst.ID})
 	mustCount(t, n, err, 1, "resumed")
 	got := e.get(inst.ID)
 	wantExpiry := dbtest.T0.Add(32*time.Hour - rental.Tail)
+	// 封顶吃掉 T0+29h − T0+25h = 4h：故障停机是平台原因，按单价补偿退回余额
+	if refund := int64(4*3600) * 6900 / 86400; e.balance(e.userID) != balance+refund {
+		t.Fatalf("balance = %d, want compensation %d", e.balance(e.userID), refund)
+	}
+	if ev := e.lastEvent(inst.ID); ev.Reason != "resume capped compensated: 14400s refund 1150" {
+		t.Fatalf("last event = %q", ev.Reason)
+	}
+	if evs, err := e.svc.UserEvents(e.ctx, e.userID, inst.ID); err != nil || evs[0].Kind != "compensated" || evs[0].Detail != "故障恢复后可用时长不足，补偿已退回余额" {
+		t.Fatalf("user events = %+v, %v", evs, err)
+	}
 	if got.Suspended() || got.ExpiresAt == nil || !got.ExpiresAt.Equal(wantExpiry) {
 		t.Fatalf("expires_at = %v, want %v", got.ExpiresAt, wantExpiry)
 	}

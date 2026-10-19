@@ -88,6 +88,8 @@ type OrderFilter struct {
 	Status string // paid / refunded / partially_refunded
 	From   *time.Time
 	To     *time.Time // 不含
+	// BatchID 一次多台的批次号（精确匹配）
+	BatchID string
 }
 
 func (f OrderFilter) where() (db.Where, error) {
@@ -112,6 +114,9 @@ func (f OrderFilter) where() (db.Where, error) {
 	}
 	if f.To != nil {
 		w.Add("created_at < ?", *f.To)
+	}
+	if f.BatchID != "" {
+		w.Add("batch_id = ?", f.BatchID)
 	}
 	return w, nil
 }

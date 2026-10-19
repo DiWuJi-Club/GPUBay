@@ -27,6 +27,20 @@ func TestGroupAPI(t *testing.T) {
 	if code, _ := ops.do("POST", "/groups/"+itoa(gid)+"/machines", map[string]any{"machine_ids": []int64{m1, m2}}); code != 200 {
 		t.Fatalf("assign = %d", code)
 	}
+	m3 := e.machine("SN3") // 未分组
+	if code, out := ops.do("GET", "/machines?group_id="+itoa(gid)+"&page=1&page_size=50", nil); code != 200 || out["total"].(float64) != 2 {
+		t.Fatalf("machines in group = %d %v", code, out)
+	}
+	code, out = ops.do("GET", "/machines?group_id=none&page_size=50", nil)
+	if code != 200 || out["total"].(float64) != 1 || out["items"].([]any)[0].(map[string]any)["id"].(float64) != float64(m3) {
+		t.Fatalf("ungrouped machines = %d %v", code, out)
+	}
+	if code, out := ops.do("GET", "/machines?group_id=none&rack=NOPE", nil); code != 200 || out["total"].(float64) != 0 {
+		t.Fatalf("ungrouped + rack = %d %v", code, out)
+	}
+	if code, out := ops.do("GET", "/machines?group_id=abc", nil); code != 400 || codeOf(out) != "bad_request" {
+		t.Fatalf("bad group_id = %d %v", code, out)
+	}
 	code, out = fin.do("GET", "/groups", nil)
 	items := out["items"].([]any)
 	if code != 200 || len(items) != 1 {

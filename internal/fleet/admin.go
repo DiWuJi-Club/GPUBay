@@ -17,9 +17,11 @@ import (
 )
 
 type MachineFilter struct {
-	State  string
-	Online *bool
-	Rack   string
+	State     string
+	Online    *bool
+	Rack      string
+	GroupID   int64 // > 0：只看该机组
+	Ungrouped bool  // 只看未分组机器（与 GroupID 互斥）
 }
 
 var machineStates = []string{StateIdle, StateAllocated, StateMaintenance, StateFaulty}
@@ -38,6 +40,12 @@ func (s *Service) ListMachines(ctx context.Context, f MachineFilter, p paging.Pa
 	}
 	if f.Rack != "" {
 		w.Add("rack = ?", f.Rack)
+	}
+	if f.GroupID > 0 {
+		w.Add("group_id = ?", f.GroupID)
+	}
+	if f.Ungrouped {
+		w.Add("group_id IS NULL")
 	}
 	var total int
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM machines WHERE `+w.SQL(), w.Args...).Scan(&total); err != nil {

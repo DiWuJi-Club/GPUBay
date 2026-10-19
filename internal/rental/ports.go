@@ -69,7 +69,7 @@ func lockOwned(ctx context.Context, tx pgx.Tx, userID int64, id string) (Instanc
 	if inst.UserID != userID {
 		return Instance{}, apperr.ErrNotFound
 	}
-	if inst.State == StateReleased || inst.State == StateFailed {
+	if inst.State == StateReleased || inst.State == StateFailed || inst.State == StateCancelled {
 		return Instance{}, apperr.ErrInvalidState
 	}
 	return inst, nil

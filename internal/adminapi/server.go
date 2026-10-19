@@ -112,6 +112,7 @@ func (s *Server) Router() http.Handler {
 			s.accountRoutes(g)
 			s.machineRoutes(g)
 			s.groupRoutes(g)
+			s.bookingRoutes(g)
 			s.instanceRoutes(g)
 			s.userRoutes(g)
 			s.financeRoutes(g)

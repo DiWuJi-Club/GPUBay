@@ -274,8 +274,15 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs
 			if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
 				return err
 			}
-			if err := capExpiryToLease(ctx, tx, inst.ID, expires, now); err != nil {
+			short, err := capExpiryToLease(ctx, tx, inst.ID, expires, now)
+			if err != nil {
 				return err
+			}
+			// 故障停机是平台原因：恢复后被下一条预订封顶吃掉的时长按单价补偿（同迟开通补偿）
+			if short > 0 {
+				if err := s.compensateShortfall(ctx, tx, inst, int64(short/time.Second), "故障恢复补偿 ", "resume capped compensated", now); err != nil {
+					return err
+				}
 			}
 			n++
 		}
@@ -285,22 +292,22 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs
 }
 
 // capExpiryToLease 恢复后 refreshLease 可能把上界封顶在同机下一条预订的下界：到期随之封顶为上界 − Tail（规格 §4.3），
-// 不能让到期越过别人已付的预订。
-func capExpiryToLease(ctx context.Context, tx pgx.Tx, id string, expires, now time.Time) error {
+// 不能让到期越过别人已付的预订。返回被封顶吃掉的时长（没有封顶为 0）。
+func capExpiryToLease(ctx context.Context, tx pgx.Tx, id string, expires, now time.Time) (time.Duration, error) {
 	var upper time.Time
 	if err := tx.QueryRow(ctx, `SELECT upper(period) FROM machine_leases WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`, id).Scan(&upper); err != nil {
 		if db.IsNoRows(err) {
-			return nil
+			return 0, nil
 		}
-		return err
+		return 0, err
 	}
 	capped := upper.Add(-Tail)
 	if !expires.After(capped) {
-		return nil
+		return 0, nil
 	}
 	r24, r1 := reminderFlags(capped.Sub(now))
 	_, err := tx.Exec(ctx, `UPDATE instances SET expires_at = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`, id, capped, r24, r1, now)
-	return err
+	return expires.Sub(capped), err
 }
 
 type reminder struct {

@@ -171,17 +171,22 @@ func (s *Service) startBooked(ctx context.Context, tx pgx.Tx, inst Instance, now
 		return err
 	}
 	if short := want.Sub(expires); short > 0 {
-		if err := s.compensateShortfall(ctx, tx, inst, int64(short/time.Second), now); err != nil {
+		if err := s.compensateShortfall(ctx, tx, inst, int64(short/time.Second), "迟开通补偿 ", "late start compensated", now); err != nil {
 			return err
 		}
 	}
 	return s.refreshLease(ctx, tx, inst.ID, now)
 }
 
-// compensateShortfall 迟开通被封顶吃掉的 secs 秒按最新可退订单的单价退款（不足 1 分不退）。
+// compensateShortfall 平台原因（迟开通、故障恢复）被同机下一条预订封顶吃掉的 secs 秒，按最新可退订单的单价退款（不足 1 分不退）。
 // 金额只经 refund.go 的 quote 计算（与 refundTransferred 相同：快照的 pending_seconds = secs），不另写价格公式。
-func (s *Service) compensateShortfall(ctx context.Context, tx pgx.Tx, inst Instance, secs int64, now time.Time) error {
-	orders, err := refundableOrders(ctx, tx, []string{inst.ID}, true)
+// 订单取换机链路上的全部可退订单（换机后的实例自身可能没有订单）。remark 为流水备注前缀，event 为事件原因前缀。
+func (s *Service) compensateShortfall(ctx context.Context, tx pgx.Tx, inst Instance, secs int64, remark, event string, now time.Time) error {
+	chain, err := instanceChain(ctx, tx, inst.ID)
+	if err != nil {
+		return err
+	}
+	orders, err := refundableOrders(ctx, tx, chain, true)
 	if err != nil || len(orders) == 0 {
 		return err
 	}
@@ -191,10 +196,10 @@ func (s *Service) compensateShortfall(ctx context.Context, tx pgx.Tx, inst Insta
 	if amount < 1 {
 		return nil
 	}
-	if _, err := s.refundAcross(ctx, tx, inst.UserID, orders, amount, 0, "迟开通补偿 "+inst.ID, now); err != nil {
+	if _, err := s.refundAcross(ctx, tx, inst.UserID, orders, amount, 0, remark+inst.ID, now); err != nil {
 		return err
 	}
-	return recordEvent(ctx, tx, inst.ID, StateRunning, StateRunning, fmt.Sprintf("late start compensated: %ds refund %d", secs, amount), now)
+	return recordEvent(ctx, tx, inst.ID, StateRunning, StateRunning, fmt.Sprintf("%s: %ds refund %d", event, secs, amount), now)
 }
 
 // failCreating 开通失败：实例失败、退款、机器隔离为故障、取消剩余指令并告警。

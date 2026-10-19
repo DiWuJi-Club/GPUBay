@@ -25,13 +25,39 @@ type instanceView struct {
 	StoppedAt        *time.Time `json:"stopped_at"`
 	CreatedAt        time.Time  `json:"created_at"`
 	PasswordAuth     bool       `json:"password_auth"`
+	// 计划 6：预订与自动续费
+	ScheduledStartAt      *time.Time `json:"scheduled_start_at"`
+	ScheduledEndAt        *time.Time `json:"scheduled_end_at"`
+	GroupID               *int64     `json:"group_id"`
+	BatchID               *string    `json:"batch_id"`
+	ReassignCount         int        `json:"reassign_count"`
+	AutoRenew             bool       `json:"auto_renew"`
+	AutoRenewDuration     string     `json:"auto_renew_duration"`
+	AutoRenewFailedReason string     `json:"auto_renew_failed_reason"`
+	ProvisionedAt         *time.Time `json:"provisioned_at"`
+	CancelledAt           *time.Time `json:"cancelled_at"`
 }
 
 func (s *Server) instanceView(i rental.Instance) instanceView {
-	return instanceView{ID: i.ID, UserID: i.UserID, MachineID: i.MachineID, ProductID: i.ProductID, ImageID: i.ImageID,
+	v := instanceView{ID: i.ID, UserID: i.UserID, MachineID: i.MachineID, ProductID: i.ProductID, ImageID: i.ImageID,
 		State: i.State, Suspended: i.Suspended(), PendingSeconds: i.PendingSeconds,
 		RemainingSeconds: int64(i.Remaining(s.Clock.Now()) / time.Second), ExpiresAt: i.ExpiresAt, StoppedAt: i.StoppedAt, CreatedAt: i.CreatedAt,
 		PasswordAuth: i.PasswordAuth}
+	v.ScheduledStartAt, v.GroupID, v.BatchID, v.ReassignCount = i.ScheduledStartAt, i.GroupID, i.BatchID, i.ReassignCount
+	v.AutoRenew, v.AutoRenewDuration, v.AutoRenewFailedReason = i.AutoRenew, string(i.AutoRenewDuration), i.AutoRenewFailedReason
+	v.ProvisionedAt, v.CancelledAt = i.ProvisionedAt, i.CancelledAt
+	if i.ScheduledStartAt != nil {
+		switch i.State {
+		case rental.StateReserved, rental.StateCreating, rental.StateCancelled:
+			// 尚未开始计时：开始时刻 + 已付时长
+			end := i.ScheduledStartAt.Add(time.Duration(i.PendingSeconds) * time.Second)
+			v.ScheduledEndAt = &end
+		default:
+			// 已开始计时（running / stopped 及之后）：以实际到期为准（迟开通、续费、补偿、故障封顶都反映在 expires_at）
+			v.ScheduledEndAt = i.ExpiresAt
+		}
+	}
+	return v
 }
 
 func (s *Server) instanceViews(list []rental.Instance) []instanceView {
@@ -54,11 +80,15 @@ type orderView struct {
 	RefundedAmount int64            `json:"refunded_amount"`
 	Status         string           `json:"status"`
 	CreatedAt      time.Time        `json:"created_at"`
+	Quantity       int              `json:"quantity"`
+	BatchID        *string          `json:"batch_id"`
+	Auto           bool             `json:"auto"`
 }
 
 func toOrderView(o rental.Order) orderView {
 	return orderView{ID: o.ID, UserID: o.UserID, Kind: o.Kind, InstanceID: o.InstanceID, ProductID: o.ProductID, Duration: o.Duration,
-		Amount: o.Amount, RefundedAmount: o.RefundedAmount, Status: o.Status, CreatedAt: o.CreatedAt}
+		Amount: o.Amount, RefundedAmount: o.RefundedAmount, Status: o.Status, CreatedAt: o.CreatedAt,
+		Quantity: o.Quantity, BatchID: o.BatchID, Auto: o.Auto}
 }
 
 func orderViews(list []rental.Order) []orderView {
