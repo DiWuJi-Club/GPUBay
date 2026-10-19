@@ -18,6 +18,7 @@ func (s *Service) reassign(ctx context.Context, tx pgx.Tx, inst *Instance, lease
 	spec := pickSpec{ProductID: inst.ProductID, GroupID: inst.GroupID, Lower: lease.Lower, Upper: lease.Upper,
 		Immediate: needOnline, Exclude: []int64{inst.MachineID}}
 	var newLease, newMachine int64
+	// placeOnMachines 遇到被短暂锁住的候选会退避重挑（合计 ≤ 约 240ms），期间一直持有调用方锁住的实例行与 lease 行；有界，可接受。
 	_, err := placeOnMachines(ctx, tx, spec, 1, func(sp pgx.Tx, mid int64) error {
 		id, err := insertLease(ctx, sp, mid, inst.ID, lease.Lower, lease.Upper, "reserved", now)
 		if err != nil {

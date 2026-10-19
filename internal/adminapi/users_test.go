@@ -103,7 +103,7 @@ func TestAdjustAndManualRecharge(t *testing.T) {
 	// 参数错误的请求带着正确动态码也只得 400，且不打开二次验证窗口：紧接着的请求不带动态码仍要求动态码
 	for _, bad := range []map[string]any{{"amount": 0, "remark": "补偿"}, {"amount": 5000, "remark": " "}} {
 		bad["totp"] = fin.totp()
-		if code, out := fin.do("POST", "/users/"+itoa(uid)+"/adjust", bad); code != 400 {
+		if code, out := fin.do("POST", "/users/"+itoa(uid)+"/adjust", bad); code != 400 || codeOf(out) != "bad_request" {
 			t.Fatalf("adjust %v = %d %v", bad, code, out)
 		}
 	}

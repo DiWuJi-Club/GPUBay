@@ -111,6 +111,7 @@ describe('http 基本行为 (U-06)', () => {
 
 const totpRequired = () => json(403, { code: 'totp_required', message: '该操作需要输入动态码' })
 const invalidTotp = () => json(400, { code: 'invalid_totp', message: '动态码错误或已使用过' })
+const totpUsed = () => json(400, { code: 'totp_used', message: '该动态码已使用，请等待下一个动态码' })
 
 describe('http 动态码重发 (U-07)', () => {
   it('totp_required → promptTotp → 重发时请求体含 totp', async () => {
@@ -222,6 +223,58 @@ describe('http 动态码重发 (U-07)', () => {
     const resend = f.calls.filter((c) => c.url.endsWith('/alerts'))
     expect(resend).toHaveLength(2)
     expect(resend.map((c) => c.init.body)).toEqual([undefined, undefined])
+  })
+
+  it('totp_used：带提示重新弹框，且不计入 3 次输错上限', async () => {
+    const promptTotp = vi.fn(async (message?: string) => (message ? 'next' : 'first'))
+    const f = fakeFetch(totpRequired(), totpUsed(), totpUsed(), totpUsed(), json(200, { ok: true }))
+    const http = createHttp({ base: '/admin/api/v1', onUnauthorized: vi.fn(), promptTotp, fetch: f.fn })
+    await expect(http.post('/users/1/adjust', { amount: 1 })).resolves.toEqual({ ok: true })
+    expect(promptTotp).toHaveBeenCalledTimes(4)
+    expect(promptTotp.mock.calls[1][0]).toBe('该动态码已使用，请等待下一个动态码')
+    expect(f.calls[4].body).toEqual({ amount: 1, totp: 'next' })
+  })
+
+  it('等待者重发又收到 totp_required（首个请求操作失败、窗口没打开）：重新弹框并带新码重发', async () => {
+    // 假后端：带码时码被消耗；/users/1 的操作本身失败（不开窗口），/users/2 成功后开窗口
+    let stepped = false
+    const serve = (c: Call) => {
+      const totp = (c.body as { totp?: string } | undefined)?.totp
+      if (c.url.endsWith('/users/1/adjust') && totp) return json(409, { code: 'insufficient_balance', message: '余额不足' })
+      if (totp) stepped = true
+      if (!stepped && !totp) return totpRequired()
+      return json(200, { ok: c.url })
+    }
+    const codes = ['111111', '222222']
+    const promptTotp = vi.fn(() => new Promise<string | null>((resolve) => setTimeout(() => resolve(codes.shift()!), 10)))
+    const f = fakeFetch(...Array.from({ length: 8 }, () => serve))
+    const http = createHttp({ base: '/admin/api/v1', onUnauthorized: vi.fn(), promptTotp, fetch: f.fn })
+    const [a, b] = await Promise.allSettled([http.post('/users/1/adjust', { amount: 1 }), http.post('/users/2/adjust', { amount: 2 })])
+    expect(a).toMatchObject({ status: 'rejected', reason: { code: 'insufficient_balance' } })
+    expect(b).toMatchObject({ status: 'fulfilled', value: { ok: '/admin/api/v1/users/2/adjust' } })
+    expect(promptTotp).toHaveBeenCalledTimes(2)
+    const second = f.calls.filter((c) => c.url.endsWith('/users/2/adjust')).map((c) => c.body)
+    expect(second).toEqual([{ amount: 2 }, { amount: 2 }, { amount: 2, totp: '222222' }])
+  })
+
+  it('GET 等待者重发又收到 totp_required 且没有进行中的二次验证：原样抛出，不弹框', async () => {
+    const serve = (c: Call) => {
+      if ((c.body as { totp?: string } | undefined)?.totp) return json(409, { code: 'insufficient_balance', message: '余额不足' })
+      return totpRequired()
+    }
+    let release!: (v: string) => void
+    const promptTotp = vi.fn(() => new Promise<string | null>((resolve) => (release = resolve)))
+    const f = fakeFetch(serve, serve, serve, serve)
+    const http = createHttp({ base: '/admin/api/v1', onUnauthorized: vi.fn(), promptTotp, fetch: f.fn })
+    const post = http.post('/users/1/adjust', { amount: 1 })
+    await vi.waitFor(() => expect(promptTotp).toHaveBeenCalledTimes(1))
+    const get = http.get('/alerts')
+    await vi.waitFor(() => expect(f.calls).toHaveLength(2))
+    release('123456')
+    await expect(post).rejects.toMatchObject({ code: 'insufficient_balance' })
+    await expect(get).rejects.toMatchObject({ code: 'totp_required', status: 403 })
+    expect(promptTotp).toHaveBeenCalledTimes(1)
+    expect(f.calls).toHaveLength(4)
   })
 
   it('没有配置 promptTotp（控制台）时 totp_required 原样抛出', async () => {

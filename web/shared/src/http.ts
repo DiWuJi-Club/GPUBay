@@ -12,7 +12,7 @@ export interface HttpConfig {
   base: string
   /** 401：清会话并跳登录 */
   onUnauthorized: () => void
-  /** 后台：弹出动态码输入框；取消返回 null。message 为上一次 invalid_totp 的文案。 */
+  /** 后台：弹出动态码输入框；取消返回 null。message 为上一次 invalid_totp / totp_used 的文案。 */
   promptTotp?: (message?: string) => Promise<string | null>
   /** 后台：403 totp_setup_required → 跳登录页的绑定步骤 */
   onTotpSetupRequired?: () => void
@@ -34,6 +34,7 @@ export interface Http {
 
 export const REQUEST_TIMEOUT_MS = 30_000
 export const TRANSFER_TIMEOUT_MS = 120_000
+/** 连续输错（invalid_totp）的上限；totp_used（码正确但已被消耗）不计入，后端也不计失败 */
 const TOTP_MAX_ATTEMPTS = 3
 
 /** 查询参数值为 undefined / null / '' 时不拼入（后台列表筛选留空即「不筛选」）。 */
@@ -88,6 +89,10 @@ export function createHttp(cfg: HttpConfig): Http {
   // 正在进行的二次验证（含首个请求的重发）；并发收到 totp_required 的其他请求等它完成后直接重发
   let stepUp: Promise<unknown> | null = null
 
+  const isTotpRequired = (e: unknown): e is ApiError => e instanceof ApiError && e.status === 403 && e.code === 'totp_required'
+  /** 收到 totp_required 后能否走二次验证：动态码随请求体发送，GET / HEAD 不能带请求体，只能等别的请求进行中的二次验证 */
+  const canStepUp = (method: string) => !!cfg.promptTotp && (stepUp !== null || (method !== 'GET' && method !== 'HEAD'))
+
   async function raw<T>(method: string, path: string, body: unknown, opt: HttpOptions): Promise<T> {
     const headers: Record<string, string> = { Accept: 'application/json' }
     if (body !== undefined) headers['Content-Type'] = 'application/json'
@@ -136,18 +141,26 @@ export function createHttp(cfg: HttpConfig): Http {
       } catch (e) {
         if (e instanceof ApiError && e.code === 'cancelled') throw e // 首个被取消则一起取消
       }
-      return rawAuthed<T>(method, path, body, opt) // 后端 5 分钟窗口已打开，不再需要 totp
+      try {
+        return await rawAuthed<T>(method, path, body, opt) // 首个请求成功时后端 5 分钟窗口已打开，不再需要 totp
+      } catch (e) {
+        // 窗口只在操作成功后打开：首个请求的操作失败（它的码也已被消耗）时窗口没开，重新弹框输入新码
+        if (isTotpRequired(e) && canStepUp(method)) return retryWithTotp<T>(method, path, body, opt)
+        throw e
+      }
     }
     const run = (async () => {
       let message: string | undefined
-      for (let attempt = 1; ; attempt++) {
+      let wrong = 0
+      for (;;) {
         const code = await cfg.promptTotp!(message)
         if (code === null) throw cancelledError()
         const base = body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
         try {
           return await rawAuthed<T>(method, path, { ...base, totp: code }, opt)
         } catch (e) {
-          if (e instanceof ApiError && e.code === 'invalid_totp' && attempt < TOTP_MAX_ATTEMPTS) {
+          // totp_used：码正确但已被上一次（失败的）操作消耗，提示等下一个码再输
+          if (e instanceof ApiError && (e.code === 'totp_used' || (e.code === 'invalid_totp' && ++wrong < TOTP_MAX_ATTEMPTS))) {
             message = e.message
             continue
           }
@@ -168,12 +181,9 @@ export function createHttp(cfg: HttpConfig): Http {
     } catch (e) {
       if (!(e instanceof ApiError)) throw e
       handleAuth(e, opt)
-      if (e.status === 403 && e.code === 'totp_required' && cfg.promptTotp) {
-        // 动态码随请求体发送，GET / HEAD 不能带请求体：不能由它发起二次验证，原样抛出 totp_required（而不是伪装成网络错误）；
-        // 别的请求的二次验证进行中时可以等它完成后原样（不带体）重发
-        if ((method === 'GET' || method === 'HEAD') && !stepUp) throw e
-        return retryWithTotp<T>(method, path, body, opt)
-      }
+      // GET / HEAD 不能由自己发起二次验证：原样抛出 totp_required（而不是伪装成网络错误）；
+      // 别的请求的二次验证进行中时可以等它完成后原样（不带体）重发
+      if (isTotpRequired(e) && canStepUp(method)) return retryWithTotp<T>(method, path, body, opt)
       throw e
     }
   }

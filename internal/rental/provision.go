@@ -66,6 +66,7 @@ func (s *Service) provision(ctx context.Context, tx pgx.Tx, inst Instance, now t
 		return nil, err
 	}
 	if !ready {
+		// reassign 可能退避重挑（合计 ≤ 约 240ms，见 pickLocked），期间持有实例行锁与 lease 行锁；有界，可接受。
 		moved, err := s.reassign(ctx, tx, &inst, &lease, "machine unavailable at start", true, now)
 		if err != nil {
 			return nil, err

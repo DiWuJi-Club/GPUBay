@@ -160,6 +160,8 @@ func pickLocked(ctx context.Context, tx pgx.Tx, spec pickSpec, need int, retries
 				if lockRetryHook != nil {
 					lockRetryHook()
 				}
+				// 退避在外层事务里睡，调用方已持有的锁不放：下单 / 预订路径持有每用户咨询锁（idem:、booking:），
+				// 开通与改派路径持有实例行锁与 lease 行锁（及旧机器行锁）。总时长有界（maxLockRetries × ≤80ms ≈ ≤240ms），可接受。
 				if err := sleepCtx(ctx, lockRetryBackoff()); err != nil {
 					return nil, err
 				}

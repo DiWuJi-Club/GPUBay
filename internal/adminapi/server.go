@@ -198,7 +198,6 @@ func (s *Server) actor(r *http.Request) audit.Actor {
 	return audit.Actor{AdminID: currentSession(r).Admin.ID, IP: httpx.ClientIP(r)}
 }
 
-// stepUp 校验高风险操作的动态码（请求体 totp 字段；5 分钟内验证过可留空）。
 // withStepUp 高风险操作：先校验动态码（或 5 分钟窗口），再执行 op；只有 op 成功且本次带了动态码时才打开验证窗口。
 // 参数错误、业务失败的请求即使带着正确的动态码也不会打开窗口（否则随后的敏感操作可以免动态码）。
 func (s *Server) withStepUp(r *http.Request, code string, op func() error) error {
