@@ -15,7 +15,7 @@ export const instanceStateType: LabelMap = {
 }
 export const orderKindLabel: LabelMap = { new: '新购', renew: '续费' }
 export const orderStatusLabel: LabelMap = { paid: '已支付', refunded: '已退款', partially_refunded: '部分退款' }
-export const ledgerKindLabel: LabelMap = { recharge: '充值', order_pay: '扣款', refund: '退款', admin_adjust: '调账' }
+export const ledgerKindLabel: LabelMap = { recharge: '充值', order_pay: '扣款', refund: '退款', admin_adjust: '调账', referral_rebate: '邀请返利', referral_clawback: '返利扣回' }
 export const rechargeStatusLabel: LabelMap = { pending: '待支付', paid: '已支付', closed: '已关闭' }
 export const rechargeChannelLabel: LabelMap = { wechat: '微信支付', alipay: '支付宝', manual: '手动' }
 export const machineStateLabel: LabelMap = { idle: '空闲', allocated: '已分配', maintenance: '维护中', faulty: '故障' }
@@ -58,4 +58,5 @@ export const auditActions: readonly string[] = [
   'image.create', 'image.update',
   'group.create', 'group.update', 'group.delete', 'group.assign', 'group.unassign', 'machine.update',
   'booking.cancel', 'booking.admin_cancel', 'booking.reassign', 'instance.auto_renew',
+  'referral.bind', 'referral.auto_revoke', 'referral.config', 'referral.freeze', 'referral.unfreeze', 'referral.approve', 'referral.revoke', 'referral.rescan',
 ]

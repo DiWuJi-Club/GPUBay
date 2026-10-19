@@ -52,6 +52,10 @@ var (
 	ErrGroupNotEmpty        = New("group_not_empty", "机组内还有机器或未结束的实例", 409)
 	ErrDuplicateGroupName   = New("duplicate_group_name", "机组名称已存在", 409)
 	ErrDuplicateDisplayName = New("duplicate_display_name", "展示名已被其他机器使用", 409)
+	// 计划 8
+	ErrInviteCodeInvalid    = New("invite_code_invalid", "邀请码无效", 400)
+	ErrReferralFrozen       = New("referral_frozen", "邀请功能已暂停", 409)
+	ErrReferralBindingState = New("referral_binding_state", "该绑定当前状态不允许此操作", 409)
 )
 
 // As 取出错误链中的 *Error；不是业务错误时返回 nil。

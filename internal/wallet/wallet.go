@@ -23,6 +23,9 @@ const (
 	KindAdminAdjust Kind = "admin_adjust"
 	KindOrderPay    Kind = "order_pay"
 	KindRefund      Kind = "refund"
+	// 计划 8：邀请返利发放 / 扣回（ref_type='referral'，ref_id=<订单号> / <订单号>-c<n>）
+	KindReferralRebate   Kind = "referral_rebate"
+	KindReferralClawback Kind = "referral_clawback"
 )
 
 const MaxAdjust = 100_000_000 // 单次调账上限（分）
