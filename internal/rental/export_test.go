@@ -39,5 +39,11 @@ func SetRenewHookForTest(f func()) func() {
 	return func() { renewHook = nil }
 }
 
+// SetLockRetryHookForTest 设置 pickLocked 决定重挑时（退避前）的钩子，返回恢复函数。
+func SetLockRetryHookForTest(f func()) func() {
+	lockRetryHook = f
+	return func() { lockRetryHook = nil }
+}
+
 // AutoRenewTiers 导出自动续费的降档序列。
 var AutoRenewTiers = autoRenewTiers

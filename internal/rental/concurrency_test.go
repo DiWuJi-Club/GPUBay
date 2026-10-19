@@ -14,32 +14,41 @@ import (
 	"spark-cloud/internal/rental"
 )
 
-// TestConcurrentBatchesConsistent：20 台机器、50 个并发批次（每批 1～3 台、开始时刻在 3 天内的随机整点、1d × 1～2；五分之一即时）。
-// 机器数取 20 而不是 10：并发分配用 SKIP LOCKED，10 台时实测成功批次 5～11 个，检出力不稳定；20 台稳定在 14～22 个（含 -race）。
-// 窗口收窄到 3 天，让大量批次争同一批机器：既有足够多的成功批次（≥ 10）检查一致性，也必然有 no_capacity。
-// 事后：同机 reserved / active 时段两两不交；批次内机器两两不同；台数 = 订单数 = count；
+// TestConcurrentBatchesConsistent：10 台机器、51 个并发批次，分三组争三个互不重叠的时段，每组需求都远超容量：
+//   - 第 0 组：即时订单，每批 1 台（17 批，需求 17 台）；
+//   - 第 1 组：T0+3d 开始的预订，每批 2 台（17 批，需求 34 台）；
+//   - 第 2 组：T0+6d 开始的预订，每批 3 台（17 批，需求 51 台）。
+//
+// 每批 1d × 1～2：组内任意两批的时段都包含 [开始, 开始+1d)，两两重叠；三组之间不重叠（即时最晚到 T0+55h20m，
+// 第 1 组最早 T0+71h、最晚到 T0+127h，第 2 组最早 T0+143h）。所以每组能放下的台数恰好是 ⌊10/count⌋×count。
+// 修复前（SKIP LOCKED 跳过别人只是短暂锁住的空闲机器就报 no_capacity）同样的争用下成功批次远低于容量；
+// 修复后每组成功批次 × count 必须恰好等于 min(容量, 需求)（一台假的 no_capacity 都不允许）。
+// 其余不变式：同机 reserved / active 时段两两不交；批次内机器两两不同；台数 = 订单数 = count；
 // 失败批次不留任何实例 / 订单 / 批次行且余额不变；成功批次余额恰好扣 6900 × count × quantity；
 // reserved 实例恰有一条 reserved lease；失败只允许 no_capacity；整体在 60 秒内完成（没有死锁）。
 func TestConcurrentBatchesConsistent(t *testing.T) {
 	const funds = 100_000_000
-	e := newEnv(t, 20)
+	const machines = 10
+	e := newEnv(t, machines)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	rng := rand.New(rand.NewSource(42))
 	type job struct {
-		uid int64
-		req rental.BatchRequest
+		uid   int64
+		group int
+		req   rental.BatchRequest
 	}
-	jobs := make([]job, 50)
+	groupCount := [3]int{1, 2, 3}
+	groupStart := [3]*time.Time{nil, ptr(dbtest.T0.Add(3 * 24 * time.Hour)), ptr(dbtest.T0.Add(6 * 24 * time.Hour))}
+	jobs := make([]job, 51)
+	var demand [3]int
 	for i := range jobs {
+		g := i % 3
 		uid := e.newUser(fmt.Sprintf("1370000%04d", i), funds)
-		start := dbtest.T0.Add(time.Duration(3+rng.Intn(3*24)) * time.Hour)
-		req := rental.BatchRequest{UserID: uid, ProductID: e.productID, ImageID: e.imageID, Count: 1 + rng.Intn(3),
-			Duration: catalog.D1d, Quantity: 1 + rng.Intn(2), StartAt: &start, IdempotencyKey: fmt.Sprintf("c-%d", i)}
-		if i%5 == 0 { // 五分之一是即时订单
-			req.StartAt = nil
-		}
-		jobs[i] = job{uid: uid, req: req}
+		req := rental.BatchRequest{UserID: uid, ProductID: e.productID, ImageID: e.imageID, Count: groupCount[g],
+			Duration: catalog.D1d, Quantity: 1 + rng.Intn(2), StartAt: groupStart[g], IdempotencyKey: fmt.Sprintf("c-%d", i)}
+		demand[g] += req.Count
+		jobs[i] = job{uid: uid, group: g, req: req}
 	}
 	type outcome struct {
 		res rental.BatchResult
@@ -61,6 +70,7 @@ func TestConcurrentBatchesConsistent(t *testing.T) {
 	}
 
 	okCount, failCodes := 0, map[string]int{}
+	var placed [3]int
 	for i, r := range results {
 		j := jobs[i]
 		var instances, orders, batches int
@@ -81,6 +91,7 @@ func TestConcurrentBatchesConsistent(t *testing.T) {
 			continue
 		}
 		okCount++
+		placed[j.group] += j.req.Count
 		res := r.res
 		seen := map[int64]bool{}
 		for _, inst := range res.Instances {
@@ -103,9 +114,13 @@ func TestConcurrentBatchesConsistent(t *testing.T) {
 			t.Fatalf("unexpected failure code %s: %v", code, failCodes)
 		}
 	}
-	// 争用必须真实存在：成功足够多（一致性检查有对象），失败也必须出现（否则窗口没挤到）
-	if okCount < 10 || failCodes["no_capacity"] == 0 {
-		t.Fatalf("contention not meaningful: ok=%d fails=%v", okCount, failCodes)
+	// 每组：成功台数 = min(容量, 需求)。容量 = ⌊机器数/count⌋×count（组内两两重叠、组间不重叠，见函数注释）。
+	for g, c := range groupCount {
+		capacity := machines / c * c
+		if want := min(capacity, demand[g]); placed[g] != want {
+			t.Errorf("group %d (count %d): placed %d machines, want min(capacity %d, demand %d) = %d (ok=%d fails=%v)",
+				g, c, placed[g], capacity, demand[g], want, okCount, failCodes)
+		}
 	}
 	var overlaps, badBatches, badReserved int
 	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM machine_leases a JOIN machine_leases b ON a.machine_id = b.machine_id AND a.id < b.id
@@ -124,5 +139,5 @@ func TestConcurrentBatchesConsistent(t *testing.T) {
 	if overlaps != 0 || badBatches != 0 || badReserved != 0 {
 		t.Fatalf("overlaps=%d badBatches=%d badReserved=%d (ok=%d fails=%v)", overlaps, badBatches, badReserved, okCount, failCodes)
 	}
-	t.Logf("ok=%d fails=%v", okCount, failCodes)
+	t.Logf("ok=%d fails=%v placed=%v", okCount, failCodes, placed)
 }

@@ -362,3 +362,135 @@ func TestBookingNoCapacityMessage(t *testing.T) {
 		t.Fatalf("none = %#v", ae)
 	}
 }
+
+// SKIP LOCKED 跳过的机器其实空闲时要重挑，而不是报 no_capacity：只有 1 台机器，事务 A 在它上面放一个 T0+5d 的预订
+// （持有行锁、未提交），B 要同一台机器上另一个不重叠的时段（T0+12h 的预订 / 即时 Place）。B 第一次挑选被跳过 →
+// 不加锁计数显示有空 → 进入重挑（钩子在此时让 A 提交或回滚）→ 退避后重挑成功。修复前 B 直接 no_capacity。
+func TestPlaceRetriesWhenFreeMachineOnlyBrieflyLocked(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		immediate bool
+		commitA   bool
+	}{
+		{"booking/A commits", false, true},
+		{"booking/A rolls back", false, false},
+		{"immediate Place/A commits", true, true},
+		{"immediate Place/A rolls back", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, 1)
+			mid := e.machines[0]
+			txA, err := e.pool.Begin(e.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer txA.Rollback(e.ctx) //nolint:errcheck
+			far := rental.PickSpec{ProductID: e.productID}
+			far.Lower, far.Upper = rental.BookingPeriod(dbtest.T0.Add(5*24*time.Hour), 86400)
+			if _, err := rental.PlaceOnMachines(e.ctx, txA, far, 1, func(sp pgx.Tx, m int64) error {
+				id, err := insertRawInstance(e.ctx, sp, e, m)
+				if err != nil {
+					return err
+				}
+				_, err = rental.InsertLease(e.ctx, sp, m, id, far.Lower, far.Upper, "reserved", e.clock.Now())
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			retried := make(chan struct{})
+			aDone := make(chan struct{})
+			var once bool
+			defer rental.SetLockRetryHookForTest(func() {
+				if !once { // 只在第一次重挑时让 A 结束；之后的重挑（不该发生）直接放行
+					once = true
+					close(retried)
+					<-aDone
+				}
+			})()
+			type result struct {
+				machine int64
+				err     error
+			}
+			bDone := make(chan result, 1)
+			go func() {
+				if tc.immediate {
+					_, inst, err := e.svc.Place(e.ctx, rental.PlaceRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Duration: catalog.D1d})
+					bDone <- result{inst.MachineID, err}
+					return
+				}
+				start := dbtest.T0.Add(12 * time.Hour)
+				res, err := e.svc.PlaceBatch(e.ctx, e.batchReq(1, &start))
+				var m int64
+				if err == nil {
+					m = res.Instances[0].MachineID
+				}
+				bDone <- result{m, err}
+			}()
+
+			select {
+			case <-retried:
+			case r := <-bDone:
+				t.Fatalf("B finished while A still held the row lock (no retry): machine=%d err=%v", r.machine, r.err)
+			case <-time.After(30 * time.Second):
+				t.Fatal("B neither retried nor finished")
+			}
+			if tc.commitA {
+				err = txA.Commit(e.ctx)
+			} else {
+				err = txA.Rollback(e.ctx)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(aDone)
+			r := <-bDone
+			if r.err != nil || r.machine != mid {
+				t.Fatalf("B after A ended: machine=%d err=%v, want machine %d", r.machine, r.err, mid)
+			}
+			var leases int
+			if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM machine_leases WHERE machine_id = $1 AND status IN ('reserved', 'active')`, mid).Scan(&leases); err != nil {
+				t.Fatal(err)
+			}
+			want := 1 // B 的
+			if tc.commitA {
+				want = 2 // A 的 + B 的
+			}
+			if leases != want {
+				t.Fatalf("leases on machine = %d, want %d", leases, want)
+			}
+		})
+	}
+}
+
+// 重挑有界、且只在「其实有空」时发生：A 一直不结束 → B 恰好重挑 3 次后 no_capacity（不会无限等）；
+// 机器真被占了（不加锁计数也不够）→ 一次都不重挑，直接 no_capacity。
+func TestPlaceLockRetryBounds(t *testing.T) {
+	e := newEnv(t, 1)
+	retries := 0
+	defer rental.SetLockRetryHookForTest(func() { retries++ })()
+	start := dbtest.T0.Add(12 * time.Hour)
+
+	txA, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback(e.ctx) //nolint:errcheck
+	if _, err := txA.Exec(e.ctx, `SELECT id FROM machines WHERE id = $1 FOR NO KEY UPDATE`, e.machines[0]); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.PlaceBatch(e.ctx, e.batchReq(1, &start))
+	if codeOf(err) != "no_capacity" || retries != 3 {
+		t.Fatalf("lock never released: err=%v retries=%d, want no_capacity after 3 retries", err, retries)
+	}
+	if err := txA.Rollback(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	retries = 0
+	e.reserveRaw(e.machines[0], start, 86400)
+	_, err = e.svc.PlaceBatch(e.ctx, e.batchReq(1, &start))
+	if codeOf(err) != "no_capacity" || retries != 0 {
+		t.Fatalf("machine really taken: err=%v retries=%d, want no_capacity without retry", err, retries)
+	}
+}

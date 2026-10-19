@@ -3,6 +3,7 @@ package rental
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -47,7 +48,7 @@ func pickArgs(spec pickSpec) []any {
 	return []any{spec.ProductID, spec.GroupID, spec.MachineID, spec.Lower, spec.Upper, exclude, spec.Immediate}
 }
 
-// pickMachines 返回最多 limit 台候选机器；lock 为 true 时锁行（SKIP LOCKED：并发分配互不等待）。
+// pickMachines 返回最多 limit 台候选机器；lock 为 true 时锁行（SKIP LOCKED：并发分配互不等待；跳过的机器可能其实空闲，分配走 pickLocked 重挑）。
 func pickMachines(ctx context.Context, q db.Querier, spec pickSpec, limit int, lock bool) ([]int64, error) {
 	sql := pickWhereSQL + pickOrderSQL + ` LIMIT $8`
 	if lock {
@@ -80,15 +81,17 @@ func noCapacity(spec pickSpec, got int) error {
 
 // placeOnMachines 挑出 want 台机器，对每台在 savepoint 内执行 fn（插实例 + lease [+ 标记 allocated]）：
 // 排他约束冲突（并发事务刚提交了重叠时段，预筛的快照没看到）→ 回滚 savepoint、剔除这台、补取；最多补取 3 轮。
-// 机器行锁（NO KEY UPDATE）在外层事务里取（SKIP LOCKED），savepoint 回滚不释放它，并发批次不会互相等待。
+// 机器行锁（NO KEY UPDATE，SKIP LOCKED）在挑选用的 savepoint 里取、挑选结束后 RELEASE 归外层事务，fn 的 savepoint 回滚不释放它，并发批次不会互相等待。
+// 挑到的台数不足时先排除「被别的事务短暂锁住而跳过」的情况（见 pickLocked），再判定不足。
 // 不足 want 台 → 返回 no_capacity，调用方回滚整个事务（没有部分成功）。
 func placeOnMachines(ctx context.Context, tx pgx.Tx, spec pickSpec, want int, fn func(sp pgx.Tx, machineID int64) error) ([]int64, error) {
 	var done []int64
 	tried := append([]int64(nil), spec.Exclude...)
+	lockRetries := maxLockRetries
 	for round := 0; round <= 3 && len(done) < want; round++ {
 		s := spec
 		s.Exclude = tried
-		ids, err := pickMachines(ctx, tx, s, want-len(done), true)
+		ids, err := pickLocked(ctx, tx, s, want-len(done), &lockRetries)
 		if err != nil {
 			return nil, err
 		}
@@ -118,6 +121,70 @@ func placeOnMachines(ctx context.Context, tx pgx.Tx, spec pickSpec, want int, fn
 		return nil, noCapacity(spec, len(done))
 	}
 	return done, nil
+}
+
+// maxLockRetries：一次分配里因「空闲机器被别的事务短暂锁住」而重挑的总次数上限。
+const maxLockRetries = 3
+
+// lockRetryBackoff 重挑前的退避：20～80ms 随机抖动，让争同一批机器的事务错开。
+func lockRetryBackoff() time.Duration {
+	return 20*time.Millisecond + rand.N(61*time.Millisecond)
+}
+
+// pickLocked 加锁挑最多 need 台（pickMachines，锁序与 SKIP LOCKED 不变），挑选在一个 savepoint 里做。
+// SKIP LOCKED 会跳过别的事务只是短暂锁住、该时段其实空闲的机器：挑到不足 need 台时，用同一 pickWhereSQL 不加锁计数，
+// 计数够 need 台 → 回滚这个 savepoint（放掉刚加的行锁：两个多台批次各攥一部分、互相等到重试用完就都失败了）、
+// 退避后重挑，消耗 *retries；计数也不够或 *retries 用完 → 释放 savepoint（行锁归外层事务）并返回已挑到的，由调用方判定不足。
+func pickLocked(ctx context.Context, tx pgx.Tx, spec pickSpec, need int, retries *int) ([]int64, error) {
+	for {
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		ids, err := pickMachines(ctx, sp, spec, need, true)
+		if err != nil {
+			_ = sp.Rollback(ctx)
+			return nil, err
+		}
+		if len(ids) < need && *retries > 0 {
+			n, err := countAvailable(ctx, sp, spec)
+			if err != nil {
+				_ = sp.Rollback(ctx)
+				return nil, err
+			}
+			if n >= need {
+				*retries--
+				if err := sp.Rollback(ctx); err != nil {
+					return nil, err
+				}
+				if lockRetryHook != nil {
+					lockRetryHook()
+				}
+				if err := sleepCtx(ctx, lockRetryBackoff()); err != nil {
+					return nil, err
+				}
+				continue
+			}
+		}
+		if err := sp.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return ids, nil
+	}
+}
+
+// lockRetryHook 测试钩子：pickLocked 决定重挑、放掉本次行锁之后、退避之前调用；生产为 nil。
+var lockRetryHook func()
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // immediatePeriod 即时订单的占用时段：开通估算 + 租期 + 尾段（规格 §4.1）。
