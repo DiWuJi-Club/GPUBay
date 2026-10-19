@@ -29,9 +29,11 @@ type Config struct {
 	UploadDir     string
 	SweepInterval time.Duration
 	TrustProxy    bool // 仅当部署在会改写 X-Forwarded-For 的反向代理之后才设为 true
-	Aliyun        AliyunConfig
-	Wechat        WechatConfig
-	Alipay        AlipayConfig
+	// TrustedProxyHops：TrustProxy 时我们自己的反向代理层数；客户端 IP 取 X-Forwarded-For 自右数第 N 项。默认 1。
+	TrustedProxyHops int
+	Aliyun           AliyunConfig
+	Wechat           WechatConfig
+	Alipay           AlipayConfig
 
 	// 计划 2：Agent 网关
 	AgentAddr          string   // gRPC 监听地址，只对机房内网开放
@@ -430,6 +432,12 @@ func (c *Config) loadAccess(getenv func(string) string, or func(key, def string)
 	if c.Env == "prod" && u.Scheme != "https" {
 		return errors.New("生产环境的 SPARK_PUBLIC_BASE_URL 必须以 https:// 开头")
 	}
+	if c.TLSEnabled() && u.Scheme != "https" {
+		return errors.New("配置了 TLS 证书时 SPARK_PUBLIC_BASE_URL 必须以 https:// 开头")
+	}
+	if c.TrustedProxyHops, err = positiveInt("SPARK_TRUSTED_PROXY_HOPS", or("SPARK_TRUSTED_PROXY_HOPS", "1")); err != nil {
+		return err
+	}
 	c.AdminPublicBaseURL = strings.TrimRight(strings.TrimSpace(getenv("SPARK_ADMIN_PUBLIC_BASE_URL")), "/")
 	if c.AdminPublicBaseURL != "" {
 		au, err := url.Parse(c.AdminPublicBaseURL)
@@ -473,6 +481,9 @@ func (c Config) FillAccessDefaults() Config {
 	}
 	if c.SSHDrainTimeout == 0 {
 		c.SSHDrainTimeout = 30 * time.Second
+	}
+	if c.TrustedProxyHops == 0 {
+		c.TrustedProxyHops = 1
 	}
 	if c.UpstreamSSHPort == 0 {
 		c.UpstreamSSHPort = 2222

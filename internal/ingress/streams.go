@@ -24,9 +24,23 @@ type stream struct {
 	sessHash string
 	cancel   context.CancelFunc
 
-	mu      sync.Mutex
-	conn    net.Conn // 被劫持的客户端连接（WebSocket）
-	revoked bool
+	mu        sync.Mutex
+	conn      net.Conn // 被劫持的客户端连接（WebSocket）
+	streaming bool     // 上游回了 SSE（text/event-stream）或 101：停机时不给宽限
+	revoked   bool
+}
+
+// long 报告这是长连接（WebSocket / SSE）。
+func (st *stream) long() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.conn != nil || st.streaming
+}
+
+func (st *stream) isRevoked() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.revoked
 }
 
 // revoke 取消请求 ctx（流式响应随之中断，ReverseProxy 也会关闭上游）并关闭被劫持的客户端连接。
@@ -87,19 +101,57 @@ func (s *Server) isClosing() bool {
 	return s.closing
 }
 
-// Shutdown 撤销所有活动流（含被劫持的 WebSocket 连接，http.Server.Shutdown 不管它们），之后的转发请求返回 503。
-// 平台停机时与 http.Server.Shutdown 一起调用，SSE / 长轮询不会把 Shutdown 拖到超时。
-func (s *Server) Shutdown() {
+// shutdownTick：停机宽限期内检查活动流的间隔。
+const shutdownTick = 50 * time.Millisecond
+
+// Shutdown 优雅停止转发，与 http.Server.Shutdown 并发调用：之后的转发请求返回 503；
+// WebSocket（被劫持的连接，http.Server.Shutdown 不管）与 SSE 立即撤销；普通请求最多再给 grace，期满（或 ctx 结束）撤销剩下的。
+// 所有普通请求结束即返回。
+func (s *Server) Shutdown(ctx context.Context, grace time.Duration) {
 	s.mu.Lock()
 	s.closing = true
+	s.mu.Unlock()
+	expired := time.NewTimer(grace)
+	defer expired.Stop()
+	tk := time.NewTicker(shutdownTick)
+	defer tk.Stop()
+	for {
+		short := 0
+		for _, st := range s.activeStreams() {
+			switch {
+			case st.isRevoked():
+			case st.long():
+				s.revokeStream(st, "platform shutdown")
+			default:
+				short++
+			}
+		}
+		if short == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+		case <-expired.C:
+		case <-tk.C:
+			continue
+		}
+		for _, st := range s.activeStreams() {
+			if !st.isRevoked() {
+				s.revokeStream(st, "platform shutdown grace expired")
+			}
+		}
+		return
+	}
+}
+
+func (s *Server) activeStreams() []*stream {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	all := make([]*stream, 0, len(s.streams))
 	for st := range s.streams {
 		all = append(all, st)
 	}
-	s.mu.Unlock()
-	for _, st := range all {
-		s.revokeStream(st, "platform shutdown")
-	}
+	return all
 }
 
 func (s *Server) removeStream(st *stream) {

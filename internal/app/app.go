@@ -191,7 +191,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	srv := &api.Server{
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
-		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, PublicBaseURL: cfg.PublicBaseURL,
+		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, TrustedProxyHops: cfg.TrustedProxyHops, PublicBaseURL: cfg.PublicBaseURL,
 		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit,
 	}
 	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
@@ -241,10 +241,10 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	var loader *tlsfile.Loader
 	if cfg.TLSEnabled() {
-		loader = &tlsfile.Loader{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Now: clk.Now,
+		loader = &tlsfile.Loader{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Now: clk.Now, Log: log,
 			OnReloadError: func(err error) {
-				log.Error("tls certificate reload failed, keeping previous certificate", "err", err)
-				go alertOnce(f, log, "critical", "tls_cert_reload_failed", "TLS 证书文件重新加载失败（仍在使用旧证书），详情见日志") // 在 TLS 握手路径上：不等数据库
+				log.Error("tls certificate reload failed repeatedly, keeping previous certificate", "err", err)
+				go alertOnce(f, log, "critical", "tls_cert_reload_failed", "TLS 证书文件重新加载失败，详情见日志") // 在 TLS 握手路径上：不等数据库
 			},
 			OnExpiring: func(na time.Time) {
 				log.Warn("tls certificate expiring", "not_after", na)
@@ -257,7 +257,11 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	upstreamPool := upstream.New(upstream.Config{Signer: upstreamSigner, Port: cfg.UpstreamSSHPort, Log: log}, r)
 	routes := ingress.NewTable(r, log)
 	ingSrv := ingress.NewServer(ingressAuth, routes, ids, upstreamPool, r, clk, log)
-	handler := ingress.Front(cfg.IngressDomain, cfg.TrustProxy, ingSrv, srv.Router())
+	proxyHops := 0 // 不信任代理：入口不看任何转发头
+	if cfg.TrustProxy {
+		proxyHops = cfg.TrustedProxyHops
+	}
+	handler := ingress.Front(cfg.IngressDomain, proxyHops, ingSrv, srv.Router())
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
 		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner}, nil

@@ -123,10 +123,11 @@ type env struct {
 }
 
 // newEnvWith 用给定 Dialer 起一个 ingress（nil → fakeDialer）。
-func newEnvWith(t *testing.T, dialer ingress.Dialer) *env { return newEnvFull(t, dialer, nil) }
+func newEnvWith(t *testing.T, dialer ingress.Dialer) *env { return newEnvFull(t, dialer, nil, false) }
 
-// newEnvFull 同 newEnvWith；wrap 非 nil 时 http.Server 的 Handler 是 wrap(ingress.Server)（例如公网完整中间件栈）。
-func newEnvFull(t *testing.T, dialer ingress.Dialer, wrap func(*ingress.Server) http.Handler) *env {
+// newEnvFull 同 newEnvWith；wrap 非 nil 时 http.Server 的 Handler 是 wrap(ingress.Server)（例如公网完整中间件栈）；
+// useTLS 时监听器为 HTTPS（与生产一样开启 HTTP/2 ALPN），对外地址为 https。
+func newEnvFull(t *testing.T, dialer ingress.Dialer, wrap func(*ingress.Server) http.Handler, useTLS bool) *env {
 	t.Helper()
 	clk := clock.NewFake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	ts := httptest.NewUnstartedServer(nil)
@@ -134,7 +135,11 @@ func newEnvFull(t *testing.T, dialer ingress.Dialer, wrap func(*ingress.Server) 
 	ts.Config.ReadTimeout = 2 * time.Second
 	host := ts.Listener.Addr().String()
 	_, port, _ := net.SplitHostPort(host)
-	auth, err := ingress.NewAuth(secret, "http://spark.test:"+port, "spark.test", false, clk)
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+	auth, err := ingress.NewAuth(secret, scheme+"://spark.test:"+port, "spark.test", false, clk)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +156,12 @@ func newEnvFull(t *testing.T, dialer ingress.Dialer, wrap func(*ingress.Server) 
 	if wrap != nil {
 		ts.Config.Handler = wrap(e.srv)
 	}
-	ts.Start()
+	if useTLS {
+		ts.EnableHTTP2 = true
+		ts.StartTLS()
+	} else {
+		ts.Start()
+	}
 	t.Cleanup(ts.Close)
 	return e
 }
@@ -216,9 +226,10 @@ func (e *env) cookie(id string, port int, userID int64, sess string) *http.Cooki
 }
 
 func echo(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "method=%s host=%s path=%s cookie=%s xff=%s xfp=%s xfh=%s xport=%s",
+	fmt.Fprintf(w, "method=%s host=%s path=%s cookie=%s xff=%s xfp=%s xfh=%s xport=%s ipheaders=%s%s%s%s",
 		r.Method, r.Host, r.URL.RequestURI(), r.Header.Get("Cookie"), strings.Join(r.Header.Values("X-Forwarded-For"), ","),
-		r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Forwarded-Port"))
+		r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Forwarded-Port"),
+		r.Header.Get("X-Real-IP"), r.Header.Get("True-Client-IP"), r.Header.Get("CF-Connecting-IP"), r.Header.Get("X-Client-IP"))
 }
 
 func waitUntil(t *testing.T, what string, cond func() bool) {
@@ -272,6 +283,9 @@ func TestForwardedHeadersReplaceClientSupplied(t *testing.T) {
 	req.Header.Set("X-Forwarded-Host", "evil.test")
 	req.Header.Set("X-Forwarded-Port", "443")
 	req.Header.Set("Forwarded", "for=6.6.6.6")
+	for _, h := range []string{"X-Real-IP", "True-Client-IP", "CF-Connecting-IP", "X-Client-IP"} {
+		req.Header.Set(h, "6.6.6.6")
+	}
 	b := body(e.do(req))
 	if !strings.Contains(b, "xff=127.0.0.1 ") || !strings.Contains(b, "xfp=http ") || !strings.Contains(b, "xfh="+h+" ") || !strings.Contains(b, "xport=") || strings.Contains(b, "6.6.6.6") || strings.Contains(b, "evil") || strings.Contains(b, "xport=443") {
 		t.Fatalf("forwarded headers = %q", b)
@@ -617,6 +631,11 @@ func wsRoundTrip(t *testing.T, addr, host string, wait time.Duration) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wsRoundTripConn(t, nc, host, wait)
+}
+
+func wsRoundTripConn(t *testing.T, nc net.Conn, host string, wait time.Duration) {
+	t.Helper()
 	defer nc.Close()
 	fmt.Fprintf(nc, "GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: x\r\nSec-WebSocket-Version: 13\r\n\r\n", host)
 	br := bufio.NewReader(nc)

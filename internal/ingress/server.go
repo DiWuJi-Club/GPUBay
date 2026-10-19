@@ -76,6 +76,8 @@ type cachedSession struct {
 
 type ctxKey struct{}
 
+type streamKey struct{}
+
 func NewServer(auth *Auth, routes *Table, sessions SessionChecker, dialer Dialer, alerts Alerts, clk clock.Clock, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
@@ -96,12 +98,21 @@ func NewServer(auth *Auth, routes *Table, sessions SessionChecker, dialer Dialer
 	}
 	s.proxy = &httputil.ReverseProxy{
 		// Rewrite（而非 Director）：调用前已删除客户端带来的 Forwarded / X-Forwarded-For/Host/Proto 与逐跳头。
-		Rewrite:        s.rewrite,
-		ModifyResponse: func(res *http.Response) error { rewriteSetCookies(res.Header); return nil },
-		Transport:      s.tr,
-		FlushInterval:  -1,
-		ErrorHandler:   s.proxyError,
-		ErrorLog:       slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		Rewrite: s.rewrite,
+		ModifyResponse: func(res *http.Response) error {
+			rewriteSetCookies(res.Header)
+			if st, ok := res.Request.Context().Value(streamKey{}).(*stream); ok &&
+				(res.StatusCode == http.StatusSwitchingProtocols || strings.HasPrefix(strings.ToLower(res.Header.Get("Content-Type")), "text/event-stream")) {
+				st.mu.Lock()
+				st.streaming = true
+				st.mu.Unlock()
+			}
+			return nil
+		},
+		Transport:     s.tr,
+		FlushInterval: -1,
+		ErrorHandler:  s.proxyError,
+		ErrorLog:      slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	return s
 }
@@ -166,7 +177,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.deadlineOnce.Do(func() { s.log.Warn("ingress cannot clear request deadlines", "err", err) })
 	}
 	// 登记为活动流：访问权限变化（端口改私有 / 删除、停机、登出）时由 Sweep 撤销
-	ctx, cancel := context.WithCancel(context.WithValue(r.Context(), ctxKey{}, route))
+	ctx, cancel := context.WithCancel(context.WithValue(context.WithValue(r.Context(), ctxKey{}, route), streamKey{}, st))
 	defer cancel()
 	st.cancel = cancel
 	if !s.addStream(st) { // 与 Shutdown 并发：没登记上就不转发
@@ -229,15 +240,20 @@ func (s *Server) noteTarget(r rental.IngressRoute) {
 	}
 }
 
+// spoofableClientIPHeaders：客户端可以自带、租户应用可能误信为真实 IP 的头；转发前删除（真实 IP 只在 X-Forwarded-For 里）。
+var spoofableClientIPHeaders = []string{"X-Real-Ip", "True-Client-Ip", "Cf-Connecting-Ip", "X-Client-Ip"}
+
 func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	route := pr.In.Context().Value(ctxKey{}).(rental.IngressRoute)
-	// 客户端自带的转发头一律不信（Rewrite 已删 X-Forwarded-For/Host/Proto，这里补删其余 X-Forwarded-* 与 X-Real-IP）
+	// 客户端自带的转发头一律不信（Rewrite 已删 X-Forwarded-For/Host/Proto，这里补删其余 X-Forwarded-* 与各种「客户端 IP」头）
 	for k := range pr.Out.Header {
 		if strings.HasPrefix(k, "X-Forwarded-") {
 			delete(pr.Out.Header, k)
 		}
 	}
-	pr.Out.Header.Del("X-Real-Ip")
+	for _, h := range spoofableClientIPHeaders {
+		pr.Out.Header.Del(h)
+	}
 	pr.SetXForwarded()
 	// 协议取对外地址的配置值：TLS 可能在前置代理终止，In.TLS 不可信
 	pr.Out.Header.Set("X-Forwarded-Proto", s.auth.BaseURL.Scheme)

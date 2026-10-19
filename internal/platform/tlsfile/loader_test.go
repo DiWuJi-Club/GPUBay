@@ -56,12 +56,16 @@ func TestLoaderHotReloadKeepsOldOnError(t *testing.T) {
 	if c, _ := l.GetCertificate(&tls.ClientHelloInfo{}); c.Leaf.SerialNumber.Int64() != 2 {
 		t.Fatalf("not reloaded after interval: serial %d", c.Leaf.SerialNumber.Int64())
 	}
-	// 坏文件：保留旧证书，回调一次
+	// 坏文件：保留旧证书；第一次失败不回调，mtime 不变也在下次检查重试，连续第二次失败回调
 	time.Sleep(20 * time.Millisecond)
 	os.WriteFile(certFile, []byte("garbage"), 0o644)
 	l.CheckNow()
+	if c, _ := l.GetCertificate(&tls.ClientHelloInfo{}); c.Leaf.SerialNumber.Int64() != 2 || reloadErrs != 0 {
+		t.Fatalf("first bad reload: serial %d errs %d", c.Leaf.SerialNumber.Int64(), reloadErrs)
+	}
+	l.CheckNow()
 	if c, _ := l.GetCertificate(&tls.ClientHelloInfo{}); c.Leaf.SerialNumber.Int64() != 2 || reloadErrs != 1 {
-		t.Fatalf("bad reload: serial %d errs %d", c.Leaf.SerialNumber.Int64(), reloadErrs)
+		t.Fatalf("second bad reload: serial %d errs %d", c.Leaf.SerialNumber.Int64(), reloadErrs)
 	}
 	if l.TLSConfig().MinVersion != tls.VersionTLS12 || l.TLSConfig().GetCertificate == nil {
 		t.Fatal("tls config")
@@ -98,5 +102,43 @@ func TestLoaderLoadFailsOnMissingOrMismatchedFiles(t *testing.T) {
 	_, otherKey := writeCert(t, t.TempDir(), time.Now().Add(90*24*time.Hour), 6)
 	if err := (&tlsfile.Loader{CertFile: certFile, KeyFile: otherKey}).Load(); err == nil {
 		t.Fatal("mismatched key accepted")
+	}
+}
+
+// 续期工具先写证书、再写私钥：中间那次检查看到不配对的一对，不告警；私钥到位后的下一次检查加载新的一对。
+func TestLoaderCertThenKeyUpdateNoAlert(t *testing.T) {
+	dir := t.TempDir()
+	certFile, keyFile := writeCert(t, dir, time.Now().Add(90*24*time.Hour), 1)
+	var reloadErrs int
+	now := time.Now()
+	l := &tlsfile.Loader{CertFile: certFile, KeyFile: keyFile, Now: func() time.Time { return now }, OnReloadError: func(error) { reloadErrs++ }}
+	if err := l.Load(); err != nil {
+		t.Fatal(err)
+	}
+	newCert, newKey := writeCert(t, t.TempDir(), time.Now().Add(90*24*time.Hour), 7)
+	copyFile := func(src, dst string) {
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.WriteFile(dst, b, 0o600)
+	}
+	time.Sleep(20 * time.Millisecond)
+	copyFile(newCert, certFile) // 证书先到
+	now = now.Add(2 * time.Minute)
+	if c, _ := l.GetCertificate(&tls.ClientHelloInfo{}); c.Leaf.SerialNumber.Int64() != 1 || reloadErrs != 0 {
+		t.Fatalf("mismatched pair: serial %d errs %d", c.Leaf.SerialNumber.Int64(), reloadErrs)
+	}
+	copyFile(newKey, keyFile) // 私钥随后到（mtime 可能与上次相同：失败后不看 mtime 也会重试）
+	now = now.Add(2 * time.Minute)
+	if c, _ := l.GetCertificate(&tls.ClientHelloInfo{}); c.Leaf.SerialNumber.Int64() != 7 || reloadErrs != 0 {
+		t.Fatalf("after key update: serial %d errs %d", c.Leaf.SerialNumber.Int64(), reloadErrs)
+	}
+	// 恢复后计数清零：再坏一次也只记日志
+	time.Sleep(20 * time.Millisecond)
+	os.WriteFile(certFile, []byte("garbage"), 0o644)
+	l.CheckNow()
+	if reloadErrs != 0 {
+		t.Fatalf("failure count not reset after successful reload: errs %d", reloadErrs)
 	}
 }

@@ -233,7 +233,7 @@ func TestLoadAccessDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.SSHAddr != ":2222" || c.SSHPublicPort != 22 || c.SSHMaxSessions != 16 || c.SSHDrainTimeout != 30*time.Second || c.UpstreamSSHPort != 2222 ||
-		c.IngressDomain != "spark.local" || c.AdminPublicBaseURL != "" || c.PublicBaseURL != "http://spark.local:8080" || c.TLSEnabled() || c.HTTPRedirectAddr != "" {
+		c.IngressDomain != "spark.local" || c.AdminPublicBaseURL != "" || c.PublicBaseURL != "http://spark.local:8080" || c.TLSEnabled() || c.HTTPRedirectAddr != "" || c.TrustedProxyHops != 1 {
 		t.Fatalf("access defaults = %+v", c)
 	}
 	if c.PublicURL().Host != "spark.local:8080" || c.SSHHost() != "ssh.spark.local" {
@@ -241,7 +241,7 @@ func TestLoadAccessDefaults(t *testing.T) {
 	}
 	// 字面量（测试 / e2e-server）补默认值
 	lit := config.Config{Domain: "spark.test"}.FillAccessDefaults()
-	if lit.UpstreamSSHPort != 2222 || lit.IngressDomain != "spark.test" || lit.PublicBaseURL != "http://spark.test:8080" || lit.SSHMaxSessions != 16 || lit.SSHDrainTimeout != 30*time.Second {
+	if lit.UpstreamSSHPort != 2222 || lit.IngressDomain != "spark.test" || lit.PublicBaseURL != "http://spark.test:8080" || lit.SSHMaxSessions != 16 || lit.SSHDrainTimeout != 30*time.Second || lit.TrustedProxyHops != 1 {
 		t.Fatalf("literal defaults = %+v", lit)
 	}
 }
@@ -251,13 +251,13 @@ func TestLoadAccessValues(t *testing.T) {
 		"SPARK_DOMAIN": "spark.example", "SPARK_PUBLIC_BASE_URL": "https://spark.example/", "SPARK_INGRESS_DOMAIN": "sparkapp.example",
 		"SPARK_SSH_ADDR": "0.0.0.0:2200", "SPARK_SSH_PUBLIC_PORT": "2200", "SPARK_SSH_MAX_SESSIONS_PER_INSTANCE": "4", "SPARK_SSH_DRAIN_TIMEOUT": "5s",
 		"SPARK_UPSTREAM_SSH_PORT": "2223", "SPARK_ADMIN_PUBLIC_BASE_URL": "https://admin.spark.example/", "SPARK_TLS_CERT_FILE": "/etc/spark/tls.crt",
-		"SPARK_TLS_KEY_FILE": "/etc/spark/tls.key", "SPARK_HTTP_REDIRECT_ADDR": ":8088"}))
+		"SPARK_TLS_KEY_FILE": "/etc/spark/tls.key", "SPARK_HTTP_REDIRECT_ADDR": ":8088", "SPARK_TRUSTED_PROXY_HOPS": "2"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.SSHAddr != "0.0.0.0:2200" || c.SSHPublicPort != 2200 || c.SSHMaxSessions != 4 || c.SSHDrainTimeout != 5*time.Second || c.UpstreamSSHPort != 2223 ||
 		c.IngressDomain != "sparkapp.example" || c.AdminPublicBaseURL != "https://admin.spark.example" || c.PublicBaseURL != "https://spark.example" ||
-		!c.TLSEnabled() || c.HTTPRedirectAddr != ":8088" {
+		!c.TLSEnabled() || c.HTTPRedirectAddr != ":8088" || c.TrustedProxyHops != 2 {
 		t.Fatalf("access values = %+v", c)
 	}
 }
@@ -291,6 +291,9 @@ func TestLoadAccessErrors(t *testing.T) {
 		{"redirect equals http", map[string]string{"SPARK_TLS_CERT_FILE": "/a.crt", "SPARK_TLS_KEY_FILE": "/a.key", "SPARK_HTTP_REDIRECT_ADDR": ":8080"}, "SPARK_HTTP_REDIRECT_ADDR"},
 		{"redirect equals ssh", map[string]string{"SPARK_TLS_CERT_FILE": "/a.crt", "SPARK_TLS_KEY_FILE": "/a.key", "SPARK_HTTP_REDIRECT_ADDR": ":2222"}, "SPARK_HTTP_REDIRECT_ADDR"},
 		{"redirect without tls", map[string]string{"SPARK_HTTP_REDIRECT_ADDR": ":80"}, "SPARK_HTTP_REDIRECT_ADDR"},
+		{"tls with http base url", map[string]string{"SPARK_TLS_CERT_FILE": "/a.crt", "SPARK_TLS_KEY_FILE": "/a.key", "SPARK_PUBLIC_BASE_URL": "http://spark.local:8080"}, "https://"},
+		{"proxy hops 0", map[string]string{"SPARK_TRUSTED_PROXY_HOPS": "0"}, "SPARK_TRUSTED_PROXY_HOPS"},
+		{"proxy hops bad", map[string]string{"SPARK_TRUSTED_PROXY_HOPS": "x"}, "SPARK_TRUSTED_PROXY_HOPS"},
 	}
 	for _, c := range cases {
 		m := base()
