@@ -9,13 +9,19 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"spark-cloud/internal/access/upstream"
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/secretbox"
+	"spark-cloud/internal/plugins/kyc"
+	"spark-cloud/internal/plugins/sms"
+	"spark-cloud/internal/rental"
+	"spark-cloud/internal/wallet"
 )
 
 func TestMain(m *testing.M) { dbtest.Main(m) }
@@ -30,6 +36,8 @@ type env struct {
 	catalog   *catalog.Service
 	box       *secretbox.Box
 	cat       *appdeploy.Catalog
+	rental    *rental.Service
+	svc       *appdeploy.Service
 	imageID   int64
 	userID    int64
 	productID int64
@@ -54,7 +62,17 @@ func newEnv(t *testing.T, machines int) *env {
 		e.machines = append(e.machines, dbtest.CreateMachine(t, pool, fmt.Sprintf("SN%03d", i)))
 	}
 	e.exec(`UPDATE machines SET agent_online = true`)
+	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: box})
+	e.rental = rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: wallet.NewService(pool, clk), Catalog: c, Fleet: f})
+	e.svc = e.newService(nil, "")
 	return e
+}
+
+// newService 用给定的上游连接池与 AppRoot 组装部署服务（nil / 空 = 无上游 / DefaultAppRoot）。
+func (e *env) newService(up *upstream.Pool, appRoot string) *appdeploy.Service {
+	return appdeploy.NewService(appdeploy.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet, Upstream: up, AppRoot: appRoot,
+		PortURL: func(id string, port int) string { return fmt.Sprintf("https://%s-%d.apps.test/", id, port) }})
 }
 
 func (e *env) actor() audit.Actor { return audit.Actor{AdminID: 1} }
