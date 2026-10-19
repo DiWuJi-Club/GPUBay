@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -256,6 +257,7 @@ func TestApplyUpToTakesMinOfAmountAndBalance(t *testing.T) {
 		{UserID: uid, Amount: 10, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "x"},
 		{UserID: uid, Amount: 0, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "x"},
 		{UserID: uid, Amount: -10, Kind: wallet.KindReferralClawback},
+		{UserID: uid, Amount: math.MinInt64, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "x"}, // 取反溢出
 	} {
 		if _, _, err := applyUpTo(ctx, pool, svc, e); apperr.As(err) == nil || apperr.As(err).Code != "bad_request" {
 			t.Fatalf("entry %+v: want bad_request, got %v", e, err)
@@ -265,6 +267,13 @@ func TestApplyUpToTakesMinOfAmountAndBalance(t *testing.T) {
 	uid2 := dbtest.CreateUser(t, pool, "13800000082", true)
 	if applied, after, err := applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid2, Amount: -10, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "ord-2-c1"}); err != nil || applied != 0 || after != 0 {
 		t.Fatalf("no account = %d %d %v", applied, after, err)
+	}
+	var ledgerRows, accountRows int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM wallet_ledger WHERE user_id = $1), (SELECT count(*) FROM wallet_accounts WHERE user_id = $1)`, uid2).Scan(&ledgerRows, &accountRows); err != nil {
+		t.Fatal(err)
+	}
+	if ledgerRows != 0 || accountRows != 0 {
+		t.Fatalf("no account: ledger rows %d, account rows %d; want 0, 0", ledgerRows, accountRows)
 	}
 }
 
@@ -279,14 +288,25 @@ func TestApplyUpToConcurrentWithDebitsNeverOverdraws(t *testing.T) {
 		wg.Add(2)
 		go func(i int) {
 			defer wg.Done()
-			_, _ = apply(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -90, Kind: wallet.KindOrderPay, RefType: "order", RefID: fmt.Sprintf("ord-%d", i)})
+			if _, err := apply(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -90, Kind: wallet.KindOrderPay, RefType: "order", RefID: fmt.Sprintf("ord-%d", i)}); err != nil && !errors.Is(err, apperr.ErrInsufficientBalance) {
+				t.Errorf("apply ord-%d: %v", i, err)
+			}
 		}(i)
 		go func(i int) {
 			defer wg.Done()
-			_, _, _ = applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -70, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: fmt.Sprintf("ord-%d-c1", i)})
+			if _, _, err := applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -70, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: fmt.Sprintf("ord-%d-c1", i)}); err != nil {
+				t.Errorf("applyUpTo ord-%d-c1: %v", i, err)
+			}
 		}(i)
 	}
 	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+	var clawbacks int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM wallet_ledger WHERE user_id = $1 AND kind = 'referral_clawback'`, uid).Scan(&clawbacks); err != nil || clawbacks < 1 {
+		t.Fatalf("clawback rows = %d %v; want >= 1", clawbacks, err)
+	}
 	bal, err := svc.Balance(ctx, uid)
 	if err != nil || bal < 0 {
 		t.Fatalf("balance = %d %v", bal, err)
