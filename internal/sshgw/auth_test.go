@@ -278,3 +278,64 @@ func TestLookupErrorLooksLikeUnknown(t *testing.T) {
 		t.Fatalf("password in logs:\n%s", logs)
 	}
 }
+
+// 停机 / 暂停 / 开通中的实例在此状态下猜什么都不可能成功：IDE 反复重连不能把用户的 IP 封掉。
+func TestRefusalsForNonLoginableInstancesNotCounted(t *testing.T) {
+	e := newEnv(t)
+	userKey := newSigner(t)
+	e.keys.add(7, userKey.PublicKey())
+	retain := time.Date(2026, 3, 4, 5, 6, 0, 0, time.UTC)
+	stopped := runningInfo(e, instA, 7, "pw-correct-16chr")
+	stopped.Instance.State = rental.StateStopped
+	stopped.RetainUntil = &retain
+	e.store.set(instA, stopped)
+	for i := 0; i < 15; i++ {
+		if _, banner, err := e.dial(instA, ssh.PublicKeys(userKey)); err == nil || !strings.HasPrefix(banner, "实例已到期停机") {
+			t.Fatalf("dial %d to stopped: banner=%q err=%v", i, banner, err)
+		}
+	}
+	suspended := runningInfo(e, instA, 7, "pw-correct-16chr")
+	now := e.clk.Now()
+	suspended.Instance.SuspendedAt = &now
+	e.store.set(instA, suspended)
+	for i := 0; i < 5; i++ {
+		e.dial(instA, ssh.Password("pw-correct-16chr"))
+		e.dial(instA, ssh.PublicKeys(userKey))
+	}
+	creating := runningInfo(e, instA, 7, "pw-correct-16chr")
+	creating.Instance.State = rental.StateCreating
+	e.store.set(instA, creating)
+	for i := 0; i < 5; i++ {
+		e.dial(instA, ssh.Password("wrong"))
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 0 || sshgw.BlockedForTest(e.srv, "127.0.0.1") {
+		t.Fatalf("refusals for non-loginable instance counted: fails=%d blocked=%v", n, sshgw.BlockedForTest(e.srv, "127.0.0.1"))
+	}
+	if _, instF, _ := sshgw.LimiterSizesForTest(e.srv); instF != 0 {
+		t.Fatalf("instance failure table grew: %d", instF)
+	}
+	// 实例恢复 running：照常登录
+	e.store.set(instA, runningInfo(e, instA, 7, "pw-correct-16chr"))
+	e.mustDial(instA, ssh.PublicKeys(userKey))
+}
+
+// 对 running 实例的错误密码、以及形如实例 ID 却不存在的用户名，仍按默认阈值（10 次）封 IP。
+func TestWrongPasswordsAndUnknownInstancesStillBlock(t *testing.T) {
+	e := newEnv(t)
+	for i := 0; i < 9; i++ {
+		e.dial(instA, ssh.Password("wrong"))
+	}
+	waitFor(t, "9 failures", func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") == 9 })
+	if sshgw.BlockedForTest(e.srv, "127.0.0.1") {
+		t.Fatal("blocked before 10")
+	}
+	e.dial(instA, ssh.Password("wrong"))
+	waitFor(t, "ip blocked at 10", func() bool { return sshgw.BlockedForTest(e.srv, "127.0.0.1") })
+
+	u := newEnv(t)
+	for i := 0; i < 10; i++ {
+		u.dial(fmt.Sprintf("ins-zzzzzz%02d", i), ssh.Password("wrong"))
+	}
+	waitFor(t, "unknown ids block ip", func() bool { return sshgw.BlockedForTest(u.srv, "127.0.0.1") })
+}

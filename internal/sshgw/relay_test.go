@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
+	"spark-cloud/internal/rental"
 	"spark-cloud/internal/sshgw"
 )
 
@@ -398,6 +399,8 @@ func TestUpstreamDropEndsSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var stderr syncBuffer
+	sess.Stderr = &stderr
 	in, _ := sess.StdinPipe()
 	out, _ := sess.StdoutPipe()
 	if err := sess.Start("cat"); err != nil {
@@ -419,10 +422,60 @@ func TestUpstreamDropEndsSession(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("session did not end after upstream drop")
 	}
+	if strings.Contains(stderr.String(), sshgw.MsgDisconnected) { // 实例仍 running：上游故障不是停机，不提示停机
+		t.Fatalf("stderr = %q", stderr.String())
+	}
 	waitFor(t, "session record closed", func() bool { _, closed, _ := e.store.snapshot(); return len(closed) == 1 && e.srv.Sessions() == 0 })
 	_, closed, _ := e.store.snapshot()
 	if closed[1][0] != 4 || closed[1][1] != 4 {
 		t.Fatalf("bytes = %v", closed[1])
+	}
+}
+
+// 到期停机时 agent 立即停容器，上游连接在 10 秒扫描之前就断了：网关复查状态，已停机则先写提示再断开（§10.4.9）。
+func TestUpstreamDropAfterStopNotifies(t *testing.T) {
+	for _, state := range []string{rental.StateStopped, rental.StateReleased, "missing"} {
+		t.Run(state, func(t *testing.T) {
+			e := newEnv(t)
+			c := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+			sess, err := c.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stderr syncBuffer
+			sess.Stderr = &stderr
+			in, _ := sess.StdinPipe()
+			out, _ := sess.StdoutPipe()
+			if err := sess.Start("cat"); err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprint(in, "live")
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(out, buf); err != nil || string(buf) != "live" {
+				t.Fatalf("cat echo = %q %v", buf, err)
+			}
+			if state == "missing" {
+				e.store.mu.Lock()
+				delete(e.store.infos, instA)
+				e.store.mu.Unlock()
+			} else {
+				info := runningInfo(e, instA, 7, "pw-correct-16chr")
+				info.Instance.State = state
+				e.store.set(instA, info)
+			}
+			e.upstream.DropAll()
+			done := make(chan error, 1)
+			go func() { done <- sess.Wait() }()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("session did not end after upstream drop")
+			}
+			if !strings.Contains(stderr.String(), sshgw.MsgDisconnected) {
+				t.Fatalf("stderr = %q", stderr.String())
+			}
+			waitFor(t, "session record closed", func() bool { _, closed, _ := e.store.snapshot(); return len(closed) == 1 && e.srv.Sessions() == 0 })
+		})
 	}
 }
 

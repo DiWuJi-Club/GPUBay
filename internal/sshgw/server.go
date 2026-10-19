@@ -82,6 +82,9 @@ type session struct {
 	pipes      sync.WaitGroup // 通道拷贝 goroutine：全部结束后字节数才是终值
 	mu         sync.Mutex
 	shells     []ssh.Channel // 已打开的 session 通道：强制断开时在这里写提示
+	closing    atomic.Bool   // 网关主动断开中（扫描、drain、上游断开后复查）：上游随之结束不再复查
+	upDead     chan struct{} // 上游底层连接读出错时关闭：早于 x/crypto 关闭上游通道
+	verdict    chan struct{} // relay 判定完「上游断开是否因停机」（需要时已写好提示）后关闭
 }
 
 func (x *session) addShell(ch ssh.Channel) {
@@ -107,6 +110,7 @@ const disconnectWriteWait = time.Second
 // disconnect 向所有 session 通道的 stderr 写提示（最多等 disconnectWriteWait）后关闭两端连接。
 // x/crypto 不支持带消息的 SSH_MSG_DISCONNECT，提示只能经通道 stderr 送达。
 func (x *session) disconnect(msg string) {
+	x.closing.Store(true)
 	x.mu.Lock()
 	shells := append([]ssh.Channel(nil), x.shells...)
 	x.mu.Unlock()
@@ -248,6 +252,7 @@ func remoteIP(addr net.Addr) string {
 }
 
 // attempt 记录一条连接在握手期间的认证尝试（只由 password / publickey 回调写入，Banner 不算）。
+// 只有凭据真正被校验（实例可登录）或用户名查不到实例时才算尝试；实例存在但停机 / 暂停 / 开通中 / 关闭了密码登录时不算。
 type attempt struct {
 	mu       sync.Mutex
 	tried    bool
@@ -363,7 +368,8 @@ func (s *Server) serve(ctx context.Context, down *ssh.ServerConn, chans <-chan s
 	}
 	dialCtx, cancelDial := context.WithCancel(ctx)
 	go func() { down.Wait(); cancelDial() }() // 用户在拨号期间断开：中止拨号
-	up, upChans, upReqs, err := s.dialUpstream(dialCtx, info)
+	upDead := make(chan struct{})
+	up, upChans, upReqs, err := s.dialUpstream(dialCtx, info, upDead)
 	cancelled := dialCtx.Err() != nil
 	cancelDial()
 	if err != nil {
@@ -377,7 +383,7 @@ func (s *Server) serve(ctx context.Context, down *ssh.ServerConn, chans <-chan s
 		reject(MsgUpstreamUnreachable)
 		return
 	}
-	sess := &session{instanceID: instanceID, userID: userID, ip: ip, down: down, up: up}
+	sess := &session{instanceID: instanceID, userID: userID, ip: ip, down: down, up: up, upDead: upDead, verdict: make(chan struct{})}
 	rctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
 	start := rental.SSHSessionStart{InstanceID: instanceID, UserID: userID, MachineID: info.Instance.MachineID, AuthMethod: method, ClientIP: ip}
 	if method == "publickey" && keyID != 0 {
@@ -413,7 +419,8 @@ func (s *Server) serve(ctx context.Context, down *ssh.ServerConn, chans <-chan s
 
 // dialUpstream 用平台上游私钥连容器 sshd，主机密钥固定为 instances.ssh_host_pubkey（为空时首连信任写回）。
 // TCP 拨号与 SSH 握手共用 UpstreamTimeout 截止时间，且 ctx 结束即中止（ClientConfig.Timeout 不覆盖已建立 TCP 上的握手）。
-func (s *Server) dialUpstream(ctx context.Context, info rental.AccessInfo) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+// dead 在建立后的底层连接首次读出错时关闭（见 deathConn）。
+func (s *Server) dialUpstream(ctx context.Context, info rental.AccessInfo, dead chan struct{}) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	if net.ParseIP(info.MachineLanIP) == nil { // 不拨任何不是 IP 的地址（空值、主机名）
 		return nil, nil, nil, fmt.Errorf("机器内网地址无效 %q", info.MachineLanIP)
 	}
@@ -449,7 +456,7 @@ func (s *Server) dialUpstream(ctx context.Context, info rental.AccessInfo) (ssh.
 	stopAfter := context.AfterFunc(ctx, func() { nc.Close() })
 	cfg := upstream.ClientConfig(s.cfg.Upstream, upstream.HostKeyCallback(info.Instance.SSHHostPubkey, tofu), timeout)
 	cfg.HostKeyAlgorithms = upstream.HostKeyAlgorithms(info.Instance.SSHHostPubkey)
-	up, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
+	up, chans, reqs, err := ssh.NewClientConn(&deathConn{Conn: nc, dead: dead}, addr, cfg)
 	if !stopAfter() && err == nil { // ctx 已结束、底层连接已被关闭
 		up.Close()
 		err = ctx.Err()
@@ -460,6 +467,22 @@ func (s *Server) dialUpstream(ctx context.Context, info rental.AccessInfo) (ssh.
 	}
 	nc.SetDeadline(time.Time{})
 	return up, chans, reqs, nil
+}
+
+// deathConn 在 Read 首次出错时关闭 dead。x/crypto 读出错后才关闭全部通道、再让 Wait 返回，
+// 所以通道看到 EOF 时 dead 一定已关闭：pipeChannels 据此区分「容器正常结束通道」与「上游连接断了」。
+type deathConn struct {
+	net.Conn
+	dead chan struct{}
+	once sync.Once
+}
+
+func (c *deathConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err != nil {
+		c.once.Do(func() { close(c.dead) })
+	}
+	return n, err
 }
 
 // fingerprintLine 返回 authorized_keys 一行的 SHA256 指纹；无法解析时返回占位文本。

@@ -97,8 +97,11 @@ func perms(info rental.AccessInfo, method string, keyID int64) *ssh.Permissions 
 
 func (s *Server) passwordCallback(c ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
 	info, ok := s.lookup(c.User())
+	if ok && (!allowed(info) || !info.Instance.PasswordAuth) {
+		return nil, errAuth // 不校验凭据、猜也不可能成功：不计失败（停机实例的 IDE 反复重连不能封用户 IP）
+	}
 	s.noteAttempt(c, ok)
-	if !ok || !allowed(info) || !info.Instance.PasswordAuth {
+	if !ok {
 		return nil, errAuth
 	}
 	// 先各取 SHA-256 再比较：ConstantTimeCompare 在长度不同时会提前返回，摘要定长可避免泄露密码长度
@@ -111,8 +114,11 @@ func (s *Server) passwordCallback(c ssh.ConnMetadata, pw []byte) (*ssh.Permissio
 
 func (s *Server) publicKeyCallback(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 	info, ok := s.lookup(c.User())
+	if ok && !allowed(info) {
+		return nil, errAuth // 同上：不可登录状态下不查钥匙、不计失败
+	}
 	s.noteAttempt(c, ok)
-	if !ok || !allowed(info) {
+	if !ok {
 		return nil, errAuth
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)

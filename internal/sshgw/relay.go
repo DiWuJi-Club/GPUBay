@@ -1,6 +1,7 @@
 package sshgw
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -50,14 +51,40 @@ func (s *Server) relay(sess *session, down *ssh.ServerConn, downChans <-chan ssh
 	stop := make(chan struct{})
 	go s.keepalive(down, stop)
 	go s.keepalive(up, stop)
-	ended := make(chan struct{}, 2)
-	go func() { down.Wait(); ended <- struct{}{} }()
-	go func() { up.Wait(); ended <- struct{}{} }()
-	<-ended
+	ended := make(chan bool, 2) // true：上游先结束
+	go func() { down.Wait(); ended <- false }()
+	go func() { up.Wait(); ended <- true }()
+	if <-ended && !sess.closing.Load() {
+		s.checkUpstreamDrop(sess)
+	}
+	close(sess.verdict)
 	close(stop)
 	down.Close()
 	up.Close()
 	wg.Wait()
+}
+
+// dropCheckTimeout：上游意外断开后复查实例状态的时限（期间客户端的 session 通道保持未关闭）。
+const dropCheckTimeout = 2 * time.Second
+
+// checkUpstreamDrop：用户没断、上游却断了。到期停机时 agent 立即停容器，上游会在 10 秒扫描之前断开，
+// 所以在这里复查状态：已不在 running（停机、清盘、释放、失败、不存在）→ 先写 MsgDisconnected 再断开（§10.4.9）。
+// 仍是 running 或查询出错：按上游故障处理，照旧直接断开。
+func (s *Server) checkUpstreamDrop(sess *session) {
+	ctx, cancel := context.WithTimeout(context.Background(), dropCheckTimeout)
+	defer cancel()
+	states, err := s.d.Store.SessionStates(ctx, []string{sess.instanceID})
+	if err != nil {
+		s.d.Log.Error("ssh upstream drop state check", "instance", sess.instanceID, "err", err)
+		return
+	}
+	st, ok := states[sess.instanceID]
+	if ok && !terminalState(st.State) {
+		s.d.Log.Info("ssh upstream dropped", "instance", sess.instanceID, "user", sess.userID)
+		return
+	}
+	s.d.Log.Info("ssh session disconnected: instance no longer running", "instance", sess.instanceID, "user", sess.userID, "found", ok)
+	sess.disconnect(MsgDisconnected)
 }
 
 // forwardGlobal 转发全局请求；不在白名单的回 false（onDrop 用于计数）。
@@ -131,9 +158,13 @@ func (s *Server) openOn(sess *session, nc ssh.NewChannel, other ssh.Conn, fromCl
 	go func() {
 		defer sess.pipes.Done()
 		if fromClient {
-			pipeChannels(ch, reqs, och, oreqs, &sess.bytesUp, &sess.bytesDown)
+			var hold func()
+			if t == "session" {
+				hold = sess.holdIfUpstreamDead
+			}
+			pipeChannels(ch, reqs, och, oreqs, &sess.bytesUp, &sess.bytesDown, hold)
 		} else { // 上游发起（-R 的 forwarded-tcpip、agent）：och 才是客户端侧，用户 → 容器 仍计 up（裁定 D24）
-			pipeChannels(och, oreqs, ch, reqs, &sess.bytesUp, &sess.bytesDown)
+			pipeChannels(och, oreqs, ch, reqs, &sess.bytesUp, &sess.bytesDown, nil)
 		}
 		if fromClient && t == "session" {
 			sess.removeShell(ch) // ControlMaster 长连接会开关成百上千个 session，不能只增不减
@@ -141,10 +172,20 @@ func (s *Server) openOn(sess *session, nc ssh.NewChannel, other ssh.Conn, fromCl
 	}()
 }
 
-// pipeChannels：a 是客户端侧、b 是容器侧。数据与 stderr 双向拷贝，通道内请求双向转发（含 exit-status、eow）。
+// holdIfUpstreamDead：容器侧通道结束时若上游连接已断，等 relay 复查完状态（可能要往本通道 stderr 写停机提示）
+// 再让 pipeChannels 给客户端侧发 EOF / Close。容器正常结束通道时上游仍活着，不等待。
+func (x *session) holdIfUpstreamDead() {
+	select {
+	case <-x.upDead:
+		<-x.verdict
+	default:
+	}
+}
+
+// pipeChannels：a 是客户端侧、b 是容器侧。hold 非空时在 b 结束、关闭 a 的写端之前调用。数据与 stderr 双向拷贝，通道内请求双向转发（含 exit-status、eow）。
 // 关闭顺序：一侧的请求流结束（该侧通道已被对端关闭）后，先等「从该侧读出的数据」全部写到另一侧（io.Copy 返回），
 // 再 Close 另一侧——否则 Close 发出 channelCloseMsg 后 x/crypto 对后续写入直接返回 io.EOF，`cat 大文件` 的尾部会被截断。
-func pipeChannels(a ssh.Channel, aReqs <-chan *ssh.Request, b ssh.Channel, bReqs <-chan *ssh.Request, up, down *atomic.Int64) {
+func pipeChannels(a ssh.Channel, aReqs <-chan *ssh.Request, b ssh.Channel, bReqs <-chan *ssh.Request, up, down *atomic.Int64, hold func()) {
 	aToB := make(chan struct{}) // a → b 的 stdout + stderr 拷贝都结束
 	bToA := make(chan struct{})
 	go func() {
@@ -162,6 +203,9 @@ func pipeChannels(a ssh.Channel, aReqs <-chan *ssh.Request, b ssh.Channel, bReqs
 		go func() { defer inner.Done(); n, _ := io.Copy(a, b); down.Add(n) }()
 		go func() { defer inner.Done(); n, _ := io.Copy(a.Stderr(), b.Stderr()); down.Add(n) }()
 		inner.Wait()
+		if hold != nil {
+			hold()
+		}
 		a.CloseWrite()
 		close(bToA)
 	}()
