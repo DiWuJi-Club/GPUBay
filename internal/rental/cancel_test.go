@@ -119,6 +119,16 @@ func TestCancelRefundsPreStartRenewalNewestFirst(t *testing.T) {
 	if status, refunded := e.orderState(renew.ID); status != "refunded" || refunded != 6900 {
 		t.Fatalf("renew order = %s %d", status, refunded)
 	}
+	var orig string
+	var origStatus string
+	var origRefunded int64
+	if err := e.pool.QueryRow(e.ctx, `SELECT id, status, refunded_amount FROM orders WHERE instance_id = $1 AND kind = 'new'`, inst.ID).
+		Scan(&orig, &origStatus, &origRefunded); err != nil {
+		t.Fatal(err)
+	}
+	if origStatus != "paid" || origRefunded != 0 {
+		t.Fatalf("original booking order %s = %s %d, want untouched", orig, origStatus, origRefunded)
+	}
 	if b := e.balance(e.userID); b != startFunds-13800+6900 {
 		t.Fatalf("balance = %d", b)
 	}
@@ -164,5 +174,41 @@ func TestCancelQuantityBookingRefundsPercentOfPaid(t *testing.T) {
 	}
 	if b := e.balance(e.userID); b != startFunds-3*6900+10350 {
 		t.Fatalf("balance = %d", b)
+	}
+}
+
+func TestCancelQuoteNotAllowedAtDeadline(t *testing.T) {
+	e := newEnv(t, 1)
+	inst := e.book(dbtest.T0.Add(3 * time.Hour))
+	e.clock.Advance(2*time.Hour - time.Second)
+	if _, err := e.svc.CancelQuote(e.ctx, e.userID, inst.ID); err != nil {
+		t.Fatalf("just before deadline = %v", err)
+	}
+	e.clock.Advance(time.Second) // 正好到开通时刻（S − 1h）
+	if _, err := e.svc.CancelQuote(e.ctx, e.userID, inst.ID); !errors.Is(err, apperr.ErrCancelNotAllowed) {
+		t.Fatalf("at deadline = %v", err)
+	}
+}
+
+func TestCancelPercentBoundaries(t *testing.T) {
+	e := newEnv(t, 2)
+	// 冷静期边界：下单后正好 15 分钟已不在冷静期（距开始 < 24h）→ 50%
+	near := e.book(dbtest.T0.Add(3 * time.Hour))
+	e.clock.Advance(15 * time.Minute)
+	if q, err := e.svc.CancelQuote(e.ctx, e.userID, near.ID); err != nil || q.Percent != 50 || q.Refund != 3450 {
+		t.Fatalf("cool-off boundary = %+v, %v", q, err)
+	}
+	// 24h 边界：开始须为整点，所以在 T0 + 44m 下单 S = T0 + 25h（= 下单时刻 + 24h16m），16 分钟后（已过冷静期）距开始正好 24h → 100%
+	e.clock.Advance(29 * time.Minute)
+	far := e.book(dbtest.T0.Add(25 * time.Hour))
+	e.clock.Advance(16 * time.Minute)
+	if q, err := e.svc.CancelQuote(e.ctx, e.userID, far.ID); err != nil || q.Percent != 100 || q.Refund != 6900 {
+		t.Fatalf("24h boundary = %+v, %v", q, err)
+	}
+	if _, err := e.svc.Cancel(e.ctx, e.userID, far.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if b := e.balance(e.userID); b != startFunds-6900 {
+		t.Fatalf("balance = %d, want only the near booking charged", b)
 	}
 }

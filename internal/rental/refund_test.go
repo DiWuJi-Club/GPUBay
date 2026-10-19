@@ -274,10 +274,47 @@ func TestRefundQuoteUsesQuantity(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.clock.Advance(12 * time.Hour)
-	q, _ := e.svc.RefundQuote(e.ctx, inst.ID)
+	q, err := e.svc.RefundQuote(e.ctx, inst.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	remaining := int64(4*86400 - 12*3600)
 	// 单价按最新订单：20700 分 / (3 × 86400 秒)
 	if q.UnitOrderID != renew.ID || q.RemainingSeconds != remaining || q.Suggested != remaining*20700/(3*86400) || q.Max != 6900+20700 {
 		t.Fatalf("quote = %+v", q)
+	}
+}
+
+// refundAll 的 ownSecs 必须按 duration × quantity 计：新实例自己的 3 单位续费若只算 1 天，
+// pending − ownSecs 会多出 2 天，被当成「转入时长」按前身订单单价多退。
+func TestCreateFailureAfterMigrationCountsOwnQuantity(t *testing.T) {
+	e := newEnv(t, 2)
+	ord, old := e.place(catalog.D1d)
+	e.ack(true)
+	e.clock.Advance(12 * time.Hour)
+	moved, err := e.svc.AdminMigrate(e.ctx, opsActor, old.ID, "换机")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renew, err := e.svc.RenewQuantity(e.ctx, e.userID, moved.ID, catalog.D1d, 3, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 换机记录的秒数是退款上限，正常数据下它恰好遮住 ownSecs 的错误；把它调大（模拟上限不起作用），
+	// 让结果只取决于 pending − ownSecs：正确 = 12h，漏乘 quantity = 12h + 2d。
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instance_transfers SET seconds = seconds + 2 * 86400 WHERE to_instance_id = $1`, moved.ID); err != nil {
+		t.Fatal(err)
+	}
+	before := e.balance(e.userID)
+	e.ack(false)
+	// 自己的续费单全退 20700；前身只退转入的 12 小时 = 3450
+	if got := e.balance(e.userID); got != before+20700+3450 {
+		t.Fatalf("balance = %d, want %d", got, before+20700+3450)
+	}
+	if s, r := e.orderState(renew.ID); s != "refunded" || r != 20700 {
+		t.Fatalf("renew order = %s %d", s, r)
+	}
+	if s, r := e.orderState(ord.ID); s != "partially_refunded" || r != 3450 {
+		t.Fatalf("predecessor order = %s %d", s, r)
 	}
 }

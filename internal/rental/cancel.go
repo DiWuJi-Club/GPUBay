@@ -32,7 +32,7 @@ func cancelPercent(inst Instance, now time.Time) int {
 	return LateCancelRefundPercent
 }
 
-// CancelQuote 不修改任何数据；只对 reserved 实例有意义。
+// CancelQuote 不修改任何数据；只对 reserved 实例、且在开通时刻（S − PrepLead）之前有意义。
 func (s *Service) CancelQuote(ctx context.Context, userID int64, id string) (CancelQuote, error) {
 	inst, err := s.GetForUser(ctx, userID, id)
 	if err != nil {
@@ -41,11 +41,14 @@ func (s *Service) CancelQuote(ctx context.Context, userID int64, id string) (Can
 	if inst.State != StateReserved || !inst.Booked() {
 		return CancelQuote{}, apperr.ErrInvalidState
 	}
+	now := s.d.Clock.Now()
+	if !now.Before(inst.ScheduledStartAt.Add(-PrepLead)) { // 与 Cancel 的截止判断一致：开通时刻起不再给报价
+		return CancelQuote{}, apperr.ErrCancelNotAllowed
+	}
 	orders, err := refundableOrders(ctx, s.d.Pool, []string{inst.ID}, false)
 	if err != nil {
 		return CancelQuote{}, err
 	}
-	now := s.d.Clock.Now()
 	pct := cancelPercent(inst, now)
 	max := quote(inst, orders, now).Max // 退款基数沿用 refund.go 的 quote（已含数量与多笔订单），不另写价格公式
 	return CancelQuote{Refund: max * int64(pct) / 100, Percent: pct, Deadline: inst.ScheduledStartAt.Add(-PrepLead), Max: max}, nil
@@ -127,6 +130,8 @@ func (s *Service) cancelInstance(ctx context.Context, tx pgx.Tx, inst Instance, 
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'cancelled', cancelled_at = $2, ssh_host_key_enc = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 		return 0, err
 	}
+	// agent_commands 在 lease 之后、orders 之前锁：与 ExpireDue / beginWipe（instance → lease → agent_commands）
+	// 和 RefundRelease（instance → agent_commands → orders → wallet）同序，不与它们成环
 	if err := s.d.Fleet.CancelCommands(ctx, tx, inst.ID, "booking cancelled"); err != nil {
 		return 0, err
 	}

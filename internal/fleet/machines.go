@@ -206,6 +206,7 @@ func (s *Service) Heartbeat(ctx context.Context, machineID int64) (bool, error) 
 	now := s.clock.Now()
 	var wasOnline bool
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		// NO KEY UPDATE 而非 FOR UPDATE：只改非键列；FOR UPDATE 会与并发插入 instances / leases / agent_commands 的外键 KEY SHARE 互斥而阻塞心跳
 		err := tx.QueryRow(ctx, `SELECT agent_online FROM machines WHERE id = $1 FOR NO KEY UPDATE`, machineID).Scan(&wasOnline)
 		if db.IsNoRows(err) {
 			return apperr.ErrNotFound
