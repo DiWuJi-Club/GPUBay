@@ -402,6 +402,7 @@ func TestSessionUserIDBannedAndExpired(t *testing.T) {
 }
 
 type hookRec struct {
+	mu    sync.Mutex
 	calls []referral.BindRequest
 	res   referral.BindResult
 	err   error
@@ -409,10 +410,14 @@ type hookRec struct {
 }
 
 func (h *hookRec) Bind(_ context.Context, _ pgx.Tx, req referral.BindRequest) (referral.BindResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.calls = append(h.calls, req)
 	return h.res, h.err
 }
 func (h *hookRec) OnKYCVerified(_ context.Context, _ pgx.Tx, _ int64, fp string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.kyc = append(h.kyc, fp)
 	return nil
 }
@@ -465,14 +470,20 @@ func TestLoginWithIsNewDeviceAndLastLogin(t *testing.T) {
 	}
 	// 非 UUID 的设备 ID 不写；设备上限 10 台（删最旧）
 	send("13800000011")
-	e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000", DeviceID: "not-a-uuid"})
+	if _, _, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000", DeviceID: "not-a-uuid"}); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 11; i++ {
 		send("13800000011")
-		e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000", DeviceID: fmt.Sprintf("00000000-0000-4000-8000-%012d", i)})
+		if _, _, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000011", Code: "000000", DeviceID: fmt.Sprintf("00000000-0000-4000-8000-%012d", i)}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var n int
 	var oldest bool
-	e.pool.QueryRow(ctx, `SELECT count(*), bool_or(device_id = $2) FROM user_devices WHERE user_id = $1`, r.ID, devA).Scan(&n, &oldest)
+	if err := e.pool.QueryRow(ctx, `SELECT count(*), bool_or(device_id = $2) FROM user_devices WHERE user_id = $1`, r.ID, devA).Scan(&n, &oldest); err != nil {
+		t.Fatal(err)
+	}
 	if n != 10 || oldest {
 		t.Fatalf("devices after 12 logins = %d (oldest kept=%v)", n, oldest)
 	}
@@ -519,7 +530,9 @@ func TestLoginWithBindBusinessFailureKeepsRegistration(t *testing.T) {
 	hook := &hookRec{res: referral.BindResult{Bound: false, Reason: "invalid_code"}}
 	e.svc.SetReferral(hook)
 	ctx := context.Background()
-	e.svc.SendLoginCode(ctx, "13800000012", "1.1.1.1")
+	if err := e.svc.SendLoginCode(ctx, "13800000012", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
 	_, r, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000012", Code: "000000", InviteCode: "ZZZZZZZZ"})
 	if err != nil || !r.IsNew || r.Invite == nil || r.Invite.Bound || r.Invite.Reason != "invalid_code" {
 		t.Fatalf("= %+v %v", r, err)
@@ -530,19 +543,25 @@ func TestLoginWithBindBusinessFailureKeepsRegistration(t *testing.T) {
 	// 数据库错误回滚注册
 	hook.err = errors.New("boom")
 	e.clock.Advance(61 * time.Second)
-	e.svc.SendLoginCode(ctx, "13800000013", "1.1.1.1")
+	if err := e.svc.SendLoginCode(ctx, "13800000013", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000013", Code: "000000", InviteCode: "ZZZZZZZZ"}); err == nil {
 		t.Fatal("db error must propagate")
 	}
 	var n int
-	e.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE phone = '13800000013'`).Scan(&n)
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE phone = '13800000013'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
 	if n != 0 {
 		t.Fatal("registration must be rolled back")
 	}
 	// 没装 hook 时带码：invalid_code，注册成功
 	e.svc.SetReferral(nil)
 	e.clock.Advance(61 * time.Second)
-	e.svc.SendLoginCode(ctx, "13800000014", "1.1.1.1")
+	if err := e.svc.SendLoginCode(ctx, "13800000014", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
 	if _, r, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000014", Code: "000000", InviteCode: "ABCDEFGH"}); err != nil || r.Invite == nil || r.Invite.Reason != "invalid_code" {
 		t.Fatalf("no hook = %+v %v", r, err)
 	}
@@ -552,8 +571,12 @@ func TestUserLookupImplementation(t *testing.T) {
 	e := newEnv(t, "000000")
 	ctx := context.Background()
 	uid := dbtest.CreateUser(t, e.pool, "13800000015", true)
-	e.pool.Exec(ctx, `INSERT INTO user_devices (user_id, device_id, first_seen_at, last_seen_at) VALUES ($1, $2, $3, $3)`, uid, devA, dbtest.T0)
-	e.pool.Exec(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, result, fingerprint, created_at, updated_at) VALUES ($1, 'personal', 'x', 'verified', 'fp-old', $2, $2), ($1, 'personal', 'x', 'verified', 'fp-new', $2, $2)`, uid, dbtest.T0)
+	if _, err := e.pool.Exec(ctx, `INSERT INTO user_devices (user_id, device_id, first_seen_at, last_seen_at) VALUES ($1, $2, $3, $3)`, uid, devA, dbtest.T0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(ctx, `INSERT INTO kyc_records (user_id, kind, real_name, result, fingerprint, created_at, updated_at) VALUES ($1, 'personal', 'x', 'verified', 'fp-old', $2, $2), ($1, 'personal', 'x', 'verified', 'fp-new', $2, $2)`, uid, dbtest.T0); err != nil {
+		t.Fatal(err)
+	}
 	var lookup referral.UserLookup = e.svc
 	st, err := lookup.UserState(ctx, e.pool, uid)
 	if err != nil || st.Status != "active" || st.KYCStatus != "verified" || st.Phone != "13800000015" || st.LastLoginAt != nil {
@@ -562,14 +585,105 @@ func TestUserLookupImplementation(t *testing.T) {
 	if _, err := lookup.UserState(ctx, e.pool, 999999); !errors.Is(err, apperr.ErrNotFound) {
 		t.Fatalf("missing = %v", err)
 	}
-	if has, _ := lookup.HasDevice(ctx, e.pool, uid, devA); !has {
-		t.Fatal("HasDevice")
+	if has, err := lookup.HasDevice(ctx, e.pool, uid, devA); err != nil || !has {
+		t.Fatalf("HasDevice = %v %v", has, err)
 	}
-	if has, _ := lookup.HasDevice(ctx, e.pool, uid, "other"); has {
-		t.Fatal("HasDevice other")
+	if has, err := lookup.HasDevice(ctx, e.pool, uid, "other"); err != nil || has {
+		t.Fatalf("HasDevice other = %v %v", has, err)
 	}
 	fps, err := lookup.VerifiedFingerprints(ctx, e.pool, []int64{uid, 999999})
 	if err != nil || len(fps) != 1 || fps[uid] != "fp-new" {
 		t.Fatalf("fps = %v %v", fps, err)
+	}
+}
+
+// 封禁用户登录被拒：不更新 last_login_*，也不记设备。
+func TestLoginWithBannedKeepsLastLogin(t *testing.T) {
+	e := newEnv(t, "000000")
+	ctx := context.Background()
+	if err := e.svc.SendLoginCode(ctx, "13800000018", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	_, r, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000018", Code: "000000", IP: "1.2.3.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAt := e.clock.Now()
+	if _, err := e.pool.Exec(ctx, `UPDATE users SET status = 'banned' WHERE id = $1`, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(61 * time.Second)
+	if err := e.svc.SendLoginCode(ctx, "13800000018", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000018", Code: "000000", IP: "5.6.7.8", DeviceID: devA}); !errors.Is(err, apperr.ErrBanned) {
+		t.Fatalf("banned login = %v", err)
+	}
+	var ip string
+	var at *time.Time
+	var devs int
+	if err := e.pool.QueryRow(ctx, `SELECT last_login_ip, last_login_at, (SELECT count(*) FROM user_devices WHERE user_id = $1) FROM users WHERE id = $1`, r.ID).Scan(&ip, &at, &devs); err != nil {
+		t.Fatal(err)
+	}
+	if ip != "1.2.3.4" || at == nil || !at.Equal(firstAt) || devs != 0 {
+		t.Fatalf("after banned login: ip=%q at=%v devices=%d", ip, at, devs)
+	}
+}
+
+// User-Agent 原样交给 Bind（清洗与截断由 referral 负责）。
+func TestLoginWithPassesRawUserAgent(t *testing.T) {
+	e := newEnv(t, "000000")
+	hook := &hookRec{res: referral.BindResult{Bound: true, Reason: "ok"}}
+	e.svc.SetReferral(hook)
+	ctx := context.Background()
+	if err := e.svc.SendLoginCode(ctx, "13800000019", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	ua := strings.Repeat("中", referral.MaxUserAgent) + "\xff"
+	if _, _, err := e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000019", Code: "000000", InviteCode: "ABCDEFGH", UserAgent: ua}); err != nil {
+		t.Fatal(err)
+	}
+	if len(hook.calls) != 1 || hook.calls[0].UserAgent != ua {
+		t.Fatalf("bind ua len = %d, want raw %d", len(hook.calls[0].UserAgent), len(ua))
+	}
+}
+
+// 同一新手机号并发首登：验证码行的 FOR UPDATE 把两次登录串行化，只有一次成功注册并调用 Bind。
+func TestLoginWithConcurrentFirstLoginBindsOnce(t *testing.T) {
+	e := newEnv(t, "000000")
+	hook := &hookRec{res: referral.BindResult{Bound: true, Reason: "ok"}}
+	e.svc.SetReferral(hook)
+	ctx := context.Background()
+	if err := e.svc.SendLoginCode(ctx, "13800000020", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	results := make([]identity.LoginResult, 2)
+	errs := make([]error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, results[i], errs[i] = e.svc.LoginWith(ctx, identity.LoginRequest{Phone: "13800000020", Code: "000000", InviteCode: "ABCDEFGH"})
+		}()
+	}
+	wg.Wait()
+	ok, isNew := 0, 0
+	for i := range 2 {
+		if errs[i] == nil {
+			ok++
+			if results[i].IsNew {
+				isNew++
+			}
+		} else if !errors.Is(errs[i], apperr.ErrInvalidCode) {
+			t.Fatalf("unexpected error: %v", errs[i])
+		}
+	}
+	var users int
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE phone = '13800000020'`).Scan(&users); err != nil {
+		t.Fatal(err)
+	}
+	if ok != 1 || isNew != 1 || len(hook.calls) != 1 || users != 1 {
+		t.Fatalf("ok=%d isNew=%d binds=%d users=%d", ok, isNew, len(hook.calls), users)
 	}
 }

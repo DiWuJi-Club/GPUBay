@@ -145,8 +145,13 @@ func (s *Service) LoginWith(ctx context.Context, req LoginRequest) (string, Logi
 		if _, err := tx.Exec(ctx, `UPDATE sms_codes SET used_at = $2 WHERE id = $1`, id, now); err != nil {
 			return err
 		}
+		// is_new：INSERT 新写入的行版本 xmax = 0；走 ON CONFLICT DO UPDATE 时新版本的 xmax 是本事务的 ID（行被锁过），
+		// 因此 xmax = 0 当且仅当本次是插入（PostgreSQL 的实现细节，是 upsert 判断新旧的常用做法）。
+		// 封禁用户登录会被拒绝，不更新其 last_login_*（新插入的行不可能是封禁状态）。
 		row := tx.QueryRow(ctx, `INSERT INTO users (phone, created_at, updated_at, last_login_ip, last_login_at) VALUES ($1, $2, $2, $3, $2)
-			ON CONFLICT (phone) DO UPDATE SET updated_at = EXCLUDED.updated_at, last_login_ip = EXCLUDED.last_login_ip, last_login_at = EXCLUDED.last_login_at
+			ON CONFLICT (phone) DO UPDATE SET updated_at = EXCLUDED.updated_at,
+				last_login_ip = CASE WHEN users.status = 'banned' THEN users.last_login_ip ELSE EXCLUDED.last_login_ip END,
+				last_login_at = CASE WHEN users.status = 'banned' THEN users.last_login_at ELSE EXCLUDED.last_login_at END
 			RETURNING `+userCols+`, (xmax = 0) AS is_new`, req.Phone, now, req.IP)
 		var u User
 		if err := row.Scan(&u.ID, &u.Phone, &u.Kind, &u.KYCStatus, &u.Status, &u.CreatedAt, &res.IsNew); err != nil {
@@ -169,11 +174,8 @@ func (s *Service) LoginWith(ctx context.Context, req LoginRequest) (string, Logi
 			case s.d.Referral == nil:
 				res.Invite = &referral.BindResult{Bound: false, Reason: referral.ReasonInvalidCode}
 			default:
-				ua := req.UserAgent
-				if len(ua) > referral.MaxUserAgent {
-					ua = ua[:referral.MaxUserAgent]
-				}
-				r, err := s.d.Referral.Bind(ctx, tx, referral.BindRequest{Code: req.InviteCode, InviteeID: u.ID, IP: req.IP, DeviceID: deviceID, UserAgent: ua, Now: now})
+				// UA 原样传入，由 Bind 负责清洗（非法 UTF-8、按字符截断）。
+				r, err := s.d.Referral.Bind(ctx, tx, referral.BindRequest{Code: req.InviteCode, InviteeID: u.ID, IP: req.IP, DeviceID: deviceID, UserAgent: req.UserAgent, Now: now})
 				if err != nil {
 					return err
 				}
