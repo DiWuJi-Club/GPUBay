@@ -4,6 +4,7 @@ import { pauseClock } from '../helpers/clock'
 import { dialog, loginConsole, placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { instanceOf, runningInstance } from '../helpers/instances'
+import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
 
 const clipboard = (page: Page) => page.evaluate(() => navigator.clipboard.readText())
 
@@ -342,4 +343,140 @@ test('C-DET-10 详情页自动刷新：开通中 / 洗机中 10 秒轮询，倒�
     expect(getsOf(late)).toBe(c0 + 2)
     expect(navigations).toBe(navBase)
   })
+})
+
+test('C-DET-11 重置密码：新密码只在确认框显示一次、关闭即清除；新密码能登录，旧密码不能', async ({ page }) => {
+  const u = await seedUser()
+  const { id } = await runningInstance(u.phone)
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await page.getByTestId('detail-password-show').click()
+  await expect(page.getByTestId('detail-password')).toHaveText(/^[A-Za-z0-9]{16}$/)
+  const old = (await page.getByTestId('detail-password').textContent())!
+  expect((await hooks.ssh({ instance_id: id, password: old, command: 'echo ok' })).output).toBe('ok\n')
+  await page.getByTestId('detail-password-reset').click()
+  await expect(page.getByTestId('detail-reset-password')).toHaveCount(0) // 确认前只有说明文字
+  await page.getByTestId('detail-reset-ok').click()
+  await toast(page, '密码已重置，请复制保存')
+  await expect(page.getByTestId('detail-reset-password')).toHaveText(/^[A-Za-z0-9]{16}$/)
+  const fresh = (await page.getByTestId('detail-reset-password').textContent())!
+  expect(fresh).not.toBe(old)
+  await expect(page.getByTestId('detail-password')).toHaveText('••••••••') // 页面上显示过的旧密码已清掉
+  await page.getByTestId('detail-reset-done').click()
+  await expect(page.getByTestId('detail-reset-password')).toHaveCount(0)
+  // 再次打开：回到确认步骤，上次的新密码不再出现
+  await page.getByTestId('detail-password-reset').click()
+  await expect(page.getByTestId('detail-reset-ok')).toBeVisible()
+  await expect(page.getByTestId('detail-reset-password')).toHaveCount(0)
+  await page.getByTestId('detail-reset-cancel').click()
+  await expect(page.getByTestId('detail-reset-ok')).toHaveCount(0)
+  expect((await hooks.ssh({ instance_id: id, password: fresh, command: 'echo ok' })).output).toBe('ok\n')
+  const denied = await hooks.ssh({ instance_id: id, password: old, command: 'echo ok' })
+  expect(denied.error).not.toBe('')
+  // 「显示」取到的是新密码
+  await page.getByTestId('detail-password-show').click()
+  await expect(page.getByTestId('detail-password')).toHaveText(fresh)
+})
+
+test('C-DET-12 关闭密码登录：无公钥时提示且开关回弹；有公钥后关闭成功且密码被拒', async ({ page }) => {
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  const sw = page.getByTestId('detail-password-auth').getByRole('switch')
+  await expect(sw).toHaveAttribute('aria-checked', 'true')
+  await page.getByTestId('detail-password-auth').click()
+  await toast(page, '关闭密码登录前请先在「我的 → SSH 公钥」添加公钥')
+  await expect(sw).toHaveAttribute('aria-checked', 'true')
+  expect((await instanceOf(api, id)).password_auth).toBe(true)
+  const added = await api.post('/api/v1/ssh-keys', { data: { public_key: freshPublicKey('e2e') } })
+  expect(added.status()).toBe(201)
+  await page.getByTestId('detail-password-show').click()
+  await expect(page.getByTestId('detail-password')).toHaveText(/^[A-Za-z0-9]{16}$/)
+  const pw = (await page.getByTestId('detail-password').textContent())!
+  await page.getByTestId('detail-password-auth').click()
+  await toast(page, '已关闭密码登录')
+  await expect(sw).toHaveAttribute('aria-checked', 'false')
+  const denied = await hooks.ssh({ instance_id: id, password: pw, command: 'echo ok' })
+  expect(denied.error).not.toBe('')
+  // 再打开：密码又能登录
+  await page.getByTestId('detail-password-auth').click()
+  await toast(page, '已打开密码登录')
+  await expect(sw).toHaveAttribute('aria-checked', 'true')
+  expect((await hooks.ssh({ instance_id: id, password: pw, command: 'echo ok' })).output).toBe('ok\n')
+})
+
+test('C-DET-13 添加端口显示网址与备注（HTML 按文本显示）；非法端口与 22 被拦截', async ({ page }) => {
+  const u = await seedUser()
+  const { id } = await runningInstance(u.phone)
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await page.getByTestId('detail-port-input').fill('22')
+  await page.getByTestId('detail-port-add').click()
+  await expect(page.getByTestId('detail-port-error')).toContainText('22 端口')
+  await page.getByTestId('detail-port-input').fill('70000')
+  await page.getByTestId('detail-port-add').click()
+  await expect(page.getByTestId('detail-port-error')).toHaveText('端口必须是 1～65535 之间的整数')
+  await expect(page.getByTestId('detail-port-row')).toHaveCount(0)
+  await page.getByTestId('detail-port-input').fill('8888')
+  await page.getByTestId('detail-port-note').fill(XSS)
+  await page.getByTestId('detail-port-add').click()
+  await expect(page.getByTestId('detail-port-row')).toHaveCount(1)
+  await expect(page.getByTestId('detail-port-error')).toHaveCount(0)
+  await expect(page.getByTestId('detail-port-url')).toHaveText(`http://${id}-8888.spark.test:18080/`)
+  await expect(page.getByTestId('detail-port-visibility')).toHaveText('私有')
+  await expect(page.getByTestId('detail-port-row')).toContainText(XSS)
+  await expect(page.getByTestId('detail-port-row').locator('img')).toHaveCount(0)
+  expect(await xssFired(page)).toBe(false)
+  await expect(page.getByTestId('detail-port-public-warn')).toHaveCount(0)
+  // 重复添加：后端拒绝，原因显示在输入框下
+  await page.getByTestId('detail-port-input').fill('8888')
+  await page.getByTestId('detail-port-add').click()
+  await expect(page.getByTestId('detail-port-error')).toHaveText('该端口已添加')
+})
+
+test('C-DET-14 设为公开需二次确认（含警告文案）；取消不改；公开后显示公开警告', async ({ page }) => {
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  await api.post(`/api/v1/instances/${id}/ports`, { data: { port: 8888 } })
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await page.getByTestId('detail-port-toggle').click()
+  await expect(page.getByTestId('detail-port-public-text')).toContainText('任何人')
+  await page.getByTestId('detail-port-public-cancel').click()
+  await expect(page.getByTestId('detail-port-visibility')).toHaveText('私有')
+  await expect(page.getByTestId('detail-port-public-warn')).toHaveCount(0)
+  await page.getByTestId('detail-port-toggle').click()
+  await page.getByTestId('detail-port-public-ok').click()
+  await expect(page.getByTestId('detail-port-visibility')).toHaveText('公开')
+  await expect(page.getByTestId('detail-port-toggle')).toHaveText('设为私有')
+  await expect(page.getByTestId('detail-port-public-warn')).toContainText('任何人都能访问')
+  // 改回私有不需要确认
+  await page.getByTestId('detail-port-toggle').click()
+  await expect(page.getByTestId('detail-port-visibility')).toHaveText('私有')
+  await expect(page.getByTestId('detail-port-public-warn')).toHaveCount(0)
+})
+
+test('C-DET-15 端口上限 5 个：输入框消失并提示', async ({ page }) => {
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  for (const p of [8001, 8002, 8003, 8004, 8005]) expect((await api.post(`/api/v1/instances/${id}/ports`, { data: { port: p } })).status()).toBe(201)
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await expect(page.getByTestId('detail-port-row')).toHaveCount(5)
+  await expect(page.getByTestId('detail-port-input')).toHaveCount(0)
+  await expect(page.getByTestId('detail-port-limit')).toHaveText('每个实例最多开放 5 个端口')
+})
+
+test('C-DET-16 删除端口', async ({ page }) => {
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  await api.post(`/api/v1/instances/${id}/ports`, { data: { port: 8888 } })
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  await expect(page.getByTestId('detail-port-row')).toHaveCount(1)
+  await page.getByTestId('detail-port-delete').click()
+  await expect(page.getByTestId('detail-port-row')).toHaveCount(0)
+  const list = (await (await api.get(`/api/v1/instances/${id}/ports`)).json()) as { items: unknown[] }
+  expect(list.items).toHaveLength(0)
 })

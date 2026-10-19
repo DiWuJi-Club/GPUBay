@@ -19,6 +19,9 @@ import (
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 
+	"golang.org/x/crypto/ssh"
+
+	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/e2ehooks"
 	"spark-cloud/internal/pki"
@@ -32,6 +35,7 @@ const (
 	adminAddr  = "127.0.0.1:18081"
 	hooksAddr  = "127.0.0.1:18090"
 	agentAddr  = "127.0.0.1:18443" // 真实 Agent 网关（gRPC + mTLS）；进程内的步进式 fake Agent 连到这里
+	sshAddr    = "127.0.0.1:18022" // SSH 网关；/hooks/ssh 用进程内 ssh 客户端经它登录实例
 )
 
 func main() {
@@ -76,16 +80,37 @@ func run() error {
 	if err := pki.GenerateUpstreamKey(keyFile); err != nil {
 		return err
 	}
+	// 进程内假「容器 sshd」：e2e 机器的 lan_ip 都是 127.0.0.1，网关与 Web 入口按 UpstreamSSHPort 拨到它。
+	// 所有 e2e 实例共用这把主机密钥（HostKeyGen 注入），网关拨上游的 FixedHostKey 校验照常生效。
+	upSigner, err := pki.LoadUpstreamSigner(keyFile)
+	if err != nil {
+		return err
+	}
+	hostPub, hostPEM, err := pki.GenerateInstanceHostKey()
+	if err != nil {
+		return err
+	}
+	hostSigner, err := ssh.ParsePrivateKey(hostPEM)
+	if err != nil {
+		return err
+	}
+	upstream, err := sshtest.New(sshtest.Options{AuthorizedKey: upSigner.PublicKey(), HostKey: hostSigner})
+	if err != nil {
+		return err
+	}
+	defer upstream.Close()
 	cfg := config.Config{
 		Env: "dev", HTTPAddr: publicAddr, AdminAddr: adminAddr, DatabaseURL: dbURL, Domain: "spark.test",
 		SecretKey: bytes.Repeat([]byte("e"), 32), SMSDriver: "mock", KYCDriver: "mock", PayDriver: "mock", PDUDriver: "mock",
 		UploadDir: filepath.Join(dir, "uploads"), SweepInterval: time.Minute,
 		AgentAddr: agentAddr, AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200,
 		AgentDNSServers: []string{"223.5.5.5", "119.29.29.29"}, UpstreamSSHKeyFile: keyFile,
+		IngressDomain: "spark.test", PublicBaseURL: "http://spark.test:18080", SSHAddr: sshAddr, SSHPublicPort: 22, UpstreamSSHPort: upstream.Port(),
 	}
 	clk := clock.NewFake(time.Now())
 	kycSwitch := &e2ehooks.SwitchableKYC{}
-	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: kycSwitch, DisableRateLimits: true, AgentTick: 50 * time.Millisecond})
+	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: kycSwitch, DisableRateLimits: true, AgentTick: 50 * time.Millisecond,
+		HostKeyGen: func() (string, []byte, error) { return hostPub, hostPEM, nil }})
 	if err != nil {
 		return err
 	}
@@ -98,8 +123,19 @@ func run() error {
 	gwCtx, stopGW := context.WithCancel(context.Background())
 	gwErr := make(chan error, 1)
 	go func() { gwErr <- a.Gateway.Serve(gwCtx, gwLis) }()
-	defer func() { stopGW(); <-gwErr }() // 在 fake Agent 停掉之后再关网关（defer 逆序）
-	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr}
+	sshLis, err := net.Listen("tcp", sshAddr)
+	if err != nil {
+		stopGW()
+		<-gwErr
+		return fmt.Errorf("ssh gateway: %w", err)
+	}
+	sshErr := make(chan error, 1)
+	go func() { sshErr <- a.SSH.Serve(gwCtx, sshLis) }()
+	loopsDone := make(chan struct{})
+	go func() { defer close(loopsDone); a.RunAccessLoops(gwCtx) }() // 路由表 2 秒刷新、活动流撤销
+	// 在 fake Agent 停掉之后（defer 逆序）先取消 gwCtx，再等 Agent 网关、SSH 网关与接入层循环全部退出
+	defer func() { stopGW(); <-gwErr; <-sshErr; <-loopsDone; a.Upstream.Close() }()
+	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr, SSHAddr: sshAddr, Upstream: upstream}
 	defer hooksSrv.Close()
 
 	public, adminSrv := a.Servers(cfg) // 与 cmd/platform 完全相同的监听与路由；不启动定时清扫器，清扫由钩子触发
@@ -134,11 +170,14 @@ func run() error {
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	ingressDone := make(chan struct{})
+	go func() { defer close(ingressDone); a.Ingress.Shutdown(shutdownCtx, time.Second) }() // 先撤销租户长连接，HTTP Shutdown 才不被拖住
 	for _, s := range servers {
 		if err := s.Shutdown(shutdownCtx); err != nil && runErr == nil {
 			runErr = err
 		}
 	}
+	<-ingressDone
 	return runErr
 }
 

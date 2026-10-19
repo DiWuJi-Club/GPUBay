@@ -175,6 +175,16 @@ func TestBuildRejectsMockPluginsInProd(t *testing.T) {
 	}
 }
 
+// 测试注入的主机密钥生成（所有实例共用一把）绝不能用于生产。
+func TestBuildRejectsHostKeyGenInProd(t *testing.T) {
+	cfg := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key}
+	gen := func() (string, []byte, error) { return "", nil, nil }
+	_, err := app.Build(cfg, nil, discardLog(), app.Options{HostKeyGen: gen})
+	if err == nil || !strings.Contains(err.Error(), "主机密钥") {
+		t.Fatalf("err = %v, want host key gen rejection", err)
+	}
+}
+
 // TestBuildWiresAliyunPlugins 验证 aliyun 驱动按配置的 endpoint 与凭证发出请求。
 func TestBuildWiresAliyunPlugins(t *testing.T) {
 	ctx := context.Background()

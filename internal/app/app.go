@@ -59,6 +59,8 @@ type Options struct {
 	// 两个限流器都按注入的时钟计窗口，假时钟下窗口永不滑过。没有任何配置项或环境变量能打开它，
 	// 并且生产环境设置为 true 时 Build 直接报错。
 	DisableRateLimits bool
+	// HostKeyGen 是测试注入的实例主机密钥生成；nil → pki.GenerateInstanceHostKey。Go 集成测试与 e2e-server 让所有实例共用假上游的主机密钥。
+	HostKeyGen func() (pub string, pem []byte, err error)
 }
 
 const noRateLimit = 1_000_000
@@ -94,6 +96,9 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	cfg = cfg.FillAccessDefaults() // 测试里的 Config 字面量没有接入层字段
 	if opt.DisableRateLimits && cfg.Env == "prod" {
 		return nil, errors.New("生产环境禁止关闭速率限制")
+	}
+	if opt.HostKeyGen != nil && cfg.Env == "prod" {
+		return nil, errors.New("生产环境禁止注入实例主机密钥生成")
 	}
 	ipHourLimit, loginLimit := 0, 0
 	if opt.DisableRateLimits {
@@ -157,7 +162,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
-		Notifier: expiryNotifier{ids: ids, sms: smsSender},
+		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen,
 	})
 	providers := opt.Pay
 	devPay := false

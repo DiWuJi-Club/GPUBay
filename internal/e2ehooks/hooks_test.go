@@ -11,9 +11,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
+	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/e2ehooks"
@@ -25,6 +29,7 @@ import (
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/paging"
 	"spark-cloud/internal/rental"
+	"spark-cloud/internal/sshgw"
 )
 
 func TestMain(m *testing.M) { dbtest.Main(m) }
@@ -34,6 +39,7 @@ type env struct {
 	a   *app.App
 	clk *clock.Fake
 	ts  *httptest.Server
+	up  *sshtest.Server
 }
 
 func newEnv(t *testing.T) *env {
@@ -46,9 +52,28 @@ func newEnv(t *testing.T) *env {
 	if err := pki.GenerateUpstreamKey(keyFile); err != nil {
 		t.Fatal(err)
 	}
+	// 与 cmd/e2e-server 相同：进程内假容器 sshd 作为所有实例的上游（共用一把主机密钥），SSH 网关监听随机端口
+	upSigner, err := pki.LoadUpstreamSigner(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPub, hostPEM, err := pki.GenerateInstanceHostKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostSigner, err := ssh.ParsePrivateKey(hostPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, err := sshtest.New(sshtest.Options{AuthorizedKey: upSigner.PublicKey(), HostKey: hostSigner})
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(),
-		AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200, AgentDNSServers: []string{"223.5.5.5"}, UpstreamSSHKeyFile: keyFile}
-	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: k, DisableRateLimits: true, AgentTick: 20 * time.Millisecond})
+		AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200, AgentDNSServers: []string{"223.5.5.5"}, UpstreamSSHKeyFile: keyFile,
+		UpstreamSSHPort: up.Port()}
+	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: k, DisableRateLimits: true, AgentTick: 20 * time.Millisecond,
+		HostKeyGen: func() (string, []byte, error) { return hostPub, hostPEM, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,13 +81,27 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sshLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); _ = a.Gateway.Serve(ctx, lis) }()
-	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String()}
+	sshDone := make(chan struct{})
+	go func() { defer close(sshDone); _ = a.SSH.Serve(ctx, sshLis) }()
+	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String(), SSHAddr: sshLis.Addr().String(), Upstream: up}
 	ts := httptest.NewServer(hooks.Handler())
-	t.Cleanup(func() { ts.Close(); hooks.Close(); cancel(); <-done })
-	return &env{t: t, a: a, clk: clk, ts: ts}
+	t.Cleanup(func() {
+		ts.Close()
+		hooks.Close()
+		cancel()
+		<-done
+		<-sshDone
+		a.Upstream.Close()
+		up.Close()
+	})
+	return &env{t: t, a: a, clk: clk, ts: ts, up: up}
 }
 
 func (e *env) call(method, path string, body any) (int, map[string]any) {
@@ -332,5 +371,72 @@ func TestUsersHookRejectsLedgerRowsAboveBalance(t *testing.T) {
 	}
 	if code, _ := e.call("POST", "/hooks/users", map[string]any{"balance": -1}); code != 400 {
 		t.Fatalf("negative balance = %d, want 400", code)
+	}
+}
+
+// 造的机器 lan_ip 为 127.0.0.1（网关与 Web 入口拨进程内假容器 sshd）；/hooks/ssh 经真实网关登录：
+// 不存在的实例 → error 非空、output 带 Banner；正确密码 → 执行命令；错误密码 → error 非空。
+// /hooks/ingress-upstream 登记回显服务并立即刷新路由表。
+func TestSSHAndIngressUpstreamHooks(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	ids := e.must("POST", "/hooks/machines", map[string]any{"count": 1})["ids"].([]any)
+	m, err := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), int64(ids[0].(float64)))
+	if err != nil || m.LanIP != "127.0.0.1" {
+		t.Fatalf("machine lan_ip = %q, %v", m.LanIP, err)
+	}
+	out := e.must("POST", "/hooks/ssh", map[string]any{"instance_id": "ins-zzzzzzzz", "password": "x", "command": "echo hi"})
+	if out["error"] == "" || !strings.Contains(out["output"].(string), sshgw.BannerUnknown) || out["exit_status"].(float64) != -1 {
+		t.Fatalf("unknown instance = %v", out)
+	}
+	if code, _ := e.call("POST", "/hooks/ssh", map[string]any{"instance_id": "ins-zzzzzzzz", "key_pem": "garbage", "command": "echo"}); code != 400 {
+		t.Fatalf("bad key_pem = %d, want 400", code)
+	}
+
+	u := e.must("POST", "/hooks/users", map[string]any{"verified": true, "balance": 100000})
+	uid := int64(u["id"].(float64))
+	_, inst, err := e.a.Rental.Place(ctx, rental.PlaceRequest{UserID: uid, ProductID: dbtest.ProductID(t, e.a.Fleet.Pool()),
+		ImageID: dbtest.ImageID(t, e.a.Fleet.Pool()), Duration: catalog.D1d})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.must("POST", "/hooks/agent", map[string]any{})
+	pw, err := e.a.Rental.ResetPassword(ctx, uid, inst.ID, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := e.must("POST", "/hooks/ssh", map[string]any{"instance_id": inst.ID, "password": pw, "command": "echo hi"}); out["error"] != "" || out["output"] != "hi\n" || out["exit_status"].(float64) != 0 {
+		t.Fatalf("password login = %v", out)
+	}
+	if out := e.must("POST", "/hooks/ssh", map[string]any{"instance_id": inst.ID, "password": "wrong", "command": "echo hi"}); out["error"] == "" {
+		t.Fatalf("wrong password accepted: %v", out)
+	}
+
+	if _, err := e.a.Rental.AddPort(ctx, uid, inst.ID, 8888, "public", "", "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.a.Routes.Lookup(inst.ID, 8888); ok {
+		t.Fatal("route present before refresh (test premise)")
+	}
+	e.must("POST", "/hooks/ingress-upstream", map[string]any{"port": 8888, "body": "first"})
+	if _, ok := e.a.Routes.Lookup(inst.ID, 8888); !ok {
+		t.Fatal("ingress-upstream hook must refresh the route table")
+	}
+	e.must("POST", "/hooks/ingress-upstream", map[string]any{"port": 8888, "body": "second"}) // 再次登记同一端口：替换回显内容
+	front := httptest.NewServer(e.a.Handler)
+	defer front.Close()
+	req, _ := http.NewRequest("GET", front.URL+"/x?y=1", nil)
+	req.Host = inst.ID + "-8888.spark.test"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if want := "second|host=" + inst.ID + "-8888.spark.test|path=/x?y=1"; resp.StatusCode != 200 || string(b) != want {
+		t.Fatalf("ingress = %d %q, want %q", resp.StatusCode, b, want)
+	}
+	if code, _ := e.call("POST", "/hooks/ingress-upstream", map[string]any{"port": 0, "body": "x"}); code != 400 {
+		t.Fatalf("port 0 = %d, want 400", code)
 	}
 }

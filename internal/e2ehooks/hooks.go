@@ -3,6 +3,7 @@
 package e2ehooks
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,12 +14,15 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/ssh"
 
+	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/agent/fakeagent"
 	"spark-cloud/internal/agent/metrics"
@@ -42,10 +46,13 @@ type Server struct {
 	Clock     *clock.Fake
 	KYC       *SwitchableKYC
 	Log       *slog.Logger
-	AgentAddr string // 真实网关监听地址；fake Agent 连到这里
+	AgentAddr string          // 真实网关监听地址；fake Agent 连到这里
+	SSHAddr   string          // SSH 网关监听地址；/hooks/ssh 经它登录实例
+	Upstream  *sshtest.Server // 假「容器 sshd」（所有 e2e 机器的 lan_ip 都是 127.0.0.1）；/hooks/ingress-upstream 在它上面登记端口
 
-	mu     sync.Mutex
-	agents map[int64]*fakeagent.Agent
+	mu            sync.Mutex
+	agents        map[int64]*fakeagent.Agent
+	upstreamStops map[int]func() // ingress-upstream 起的回显服务，按端口
 }
 
 // Close 停掉全部 fake Agent。
@@ -56,6 +63,10 @@ func (s *Server) Close() {
 		a.Stop()
 	}
 	s.agents = nil
+	for _, stop := range s.upstreamStops {
+		stop()
+	}
+	s.upstreamStops = nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -70,6 +81,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/users", s.handle(s.users))
 	mux.HandleFunc("POST /hooks/admins", s.handle(s.admins))
 	mux.HandleFunc("POST /hooks/kyc", s.handle(s.kyc))
+	mux.HandleFunc("POST /hooks/ssh", s.handle(s.ssh))
+	mux.HandleFunc("POST /hooks/ingress-upstream", s.handle(s.ingressUpstream))
 	return loopbackOnly(mux)
 }
 
@@ -375,7 +388,7 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 	ids := make([]int64, 0, req.Count)
 	for i := 1; i <= req.Count; i++ {
 		m, err := s.App.Fleet.Register(ctx, fleet.NewMachine{Serial: fmt.Sprintf("%s%d", prefix, i), Rack: req.Rack, Slot: fmt.Sprint(i),
-			LanIP: fmt.Sprintf("10.99.%d.%d", (len(ids)/250)%250, len(ids)%250+1), ProductID: pid})
+			LanIP: "127.0.0.1", ProductID: pid}) // 网关与 Web 入口拨 lan_ip:UpstreamSSHPort，即进程内的假容器 sshd
 		if err != nil {
 			return nil, err
 		}
@@ -479,5 +492,102 @@ func (s *Server) kyc(_ context.Context, body json.RawMessage) (any, error) {
 		return nil, err
 	}
 	s.KYC.SetReject(req.Reject)
+	return map[string]bool{"ok": true}, nil
+}
+
+// ssh 用进程内 ssh 客户端经网关执行命令（验证页面上显示的密码 / 公钥真的能登录）。
+// 连接或认证失败不算钩子错误：返回 200，error 为失败原因，output 里带网关的 Banner。
+func (s *Server) ssh(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := decode[struct {
+		InstanceID string `json:"instance_id"`
+		Password   string `json:"password"`
+		KeyPEM     string `json:"key_pem"`
+		Command    string `json:"command"`
+	}](body)
+	if err != nil {
+		return nil, err
+	}
+	if s.SSHAddr == "" {
+		return nil, errors.New("ssh gateway not configured")
+	}
+	var auth ssh.AuthMethod
+	if req.KeyPEM != "" {
+		signer, err := ssh.ParsePrivateKey([]byte(req.KeyPEM))
+		if err != nil {
+			return nil, badRequest("key_pem 无法解析: " + err.Error())
+		}
+		auth = ssh.PublicKeys(signer)
+	} else {
+		auth = ssh.Password(req.Password)
+	}
+	var banner strings.Builder
+	d := net.Dialer{Timeout: 5 * time.Second}
+	nc, err := d.DialContext(ctx, "tcp", s.SSHAddr)
+	if err != nil {
+		return map[string]any{"output": "", "exit_status": -1, "error": err.Error()}, nil
+	}
+	_ = nc.SetDeadline(time.Now().Add(hookWait))
+	conn, chans, reqs, err := ssh.NewClientConn(nc, s.SSHAddr, &ssh.ClientConfig{User: req.InstanceID, Auth: []ssh.AuthMethod{auth},
+		HostKeyCallback: ssh.FixedHostKey(s.App.SSHHostKey.PublicKey()),
+		BannerCallback:  func(m string) error { banner.WriteString(m); return nil }})
+	if err != nil {
+		nc.Close()
+		return map[string]any{"output": banner.String(), "exit_status": -1, "error": err.Error()}, nil
+	}
+	cl := ssh.NewClient(conn, chans, reqs)
+	defer cl.Close()
+	sess, err := cl.NewSession()
+	if err != nil {
+		return map[string]any{"output": banner.String(), "exit_status": -1, "error": err.Error()}, nil
+	}
+	defer sess.Close()
+	var out, stderr bytes.Buffer // 分开收：ssh 包用两个 goroutine 分别拷贝 stdout / stderr
+	sess.Stdout, sess.Stderr = &out, &stderr
+	status, errText := 0, ""
+	var exitErr *ssh.ExitError
+	if err := sess.Run(req.Command); errors.As(err, &exitErr) {
+		status = exitErr.ExitStatus()
+	} else if err != nil {
+		status, errText = -1, err.Error()
+	}
+	return map[string]any{"output": banner.String() + out.String() + stderr.String(), "exit_status": status, "error": errText}, nil
+}
+
+// ingressUpstream 让假容器 sshd 把到容器内 127.0.0.1:<port> 的 direct-tcpip 转到一个回显服务：
+// 响应体形如 `body|host=<Host>|path=<RequestURI>`（断言域名与路径原样透传）。
+// 之后立即刷新入口路由表：用例先经 API 加端口、再调本钩子，就不必等 2 秒的定时刷新。
+func (s *Server) ingressUpstream(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := decode[struct {
+		Port int    `json:"port"`
+		Body string `json:"body"`
+	}](body)
+	if err != nil {
+		return nil, err
+	}
+	if req.Port <= 0 || req.Port > 65535 {
+		return nil, badRequest("port 不正确")
+	}
+	if s.Upstream == nil {
+		return nil, errors.New("fake upstream not configured")
+	}
+	// 同一端口再次登记：先关掉上一个回显服务（它的 stop 会删掉该端口的目标，必须在登记新服务之前调用）
+	s.mu.Lock()
+	prev := s.upstreamStops[req.Port]
+	s.mu.Unlock()
+	if prev != nil {
+		prev()
+	}
+	s.mu.Lock()
+	if s.upstreamStops == nil {
+		s.upstreamStops = map[int]func(){}
+	}
+	s.upstreamStops[req.Port] = s.Upstream.ServeHTTP(req.Port, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintf(w, "%s|host=%s|path=%s", req.Body, r.Host, r.URL.RequestURI())
+	}))
+	s.mu.Unlock()
+	if err := s.App.Routes.Refresh(ctx); err != nil {
+		return nil, fmt.Errorf("refresh routes: %w", err)
+	}
 	return map[string]bool{"ok": true}, nil
 }
