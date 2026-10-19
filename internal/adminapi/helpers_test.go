@@ -105,7 +105,8 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 		t.Fatal(err)
 	}
 	srv := &adminapi.Server{Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: b,
-		Uploads: uploads, Gateway: gw, Clock: clk, Log: log}
+		Uploads: uploads, Gateway: gw, Clock: clk, Log: log,
+		PortURL: func(id string, port int) string { return fmt.Sprintf("http://%s-%d.spark.test/", id, port) }}
 	if tweak != nil {
 		tweak(srv)
 	}

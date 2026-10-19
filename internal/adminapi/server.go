@@ -63,10 +63,11 @@ type Server struct {
 	Gateway       *agentgw.Server // 机器接入命令与撤销（计划 2）
 	Clock         clock.Clock
 	Log           *slog.Logger
-	SecureCookie  bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送
-	Static        http.Handler // 后台静态文件；nil 时使用 web.Admin()
-	LoginLimit    int          // 同一 IP 每分钟登录相关请求上限；零值表示默认 20。只有端到端测试服务会调大它
-	PublicBaseURL string       // 后台对外地址（SPARK_ADMIN_PUBLIC_BASE_URL），用于同站防护的 Origin 比对；空表示有 Origin 就拒绝
+	SecureCookie  bool                                     // 生产环境为 true：Cookie 仅经 HTTPS 发送
+	Static        http.Handler                             // 后台静态文件；nil 时使用 web.Admin()
+	LoginLimit    int                                      // 同一 IP 每分钟登录相关请求上限；零值表示默认 20。只有端到端测试服务会调大它
+	PortURL       func(instanceID string, port int) string // Web 入口端口地址（app 传 ingress.Auth.PortURL）；nil 时 url 为空
+	PublicBaseURL string                                   // 后台对外地址（SPARK_ADMIN_PUBLIC_BASE_URL），用于同站防护的 Origin 比对；空表示有 Origin 就拒绝
 
 	limiter *ipLimiter
 	routes  []Route

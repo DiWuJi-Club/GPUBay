@@ -3,6 +3,8 @@ package adminapi
 import (
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/rental"
@@ -22,12 +24,14 @@ type instanceView struct {
 	ExpiresAt        *time.Time `json:"expires_at"`
 	StoppedAt        *time.Time `json:"stopped_at"`
 	CreatedAt        time.Time  `json:"created_at"`
+	PasswordAuth     bool       `json:"password_auth"`
 }
 
 func (s *Server) instanceView(i rental.Instance) instanceView {
 	return instanceView{ID: i.ID, UserID: i.UserID, MachineID: i.MachineID, ProductID: i.ProductID, ImageID: i.ImageID,
 		State: i.State, Suspended: i.Suspended(), PendingSeconds: i.PendingSeconds,
-		RemainingSeconds: int64(i.Remaining(s.Clock.Now()) / time.Second), ExpiresAt: i.ExpiresAt, StoppedAt: i.StoppedAt, CreatedAt: i.CreatedAt}
+		RemainingSeconds: int64(i.Remaining(s.Clock.Now()) / time.Second), ExpiresAt: i.ExpiresAt, StoppedAt: i.StoppedAt, CreatedAt: i.CreatedAt,
+		PasswordAuth: i.PasswordAuth}
 }
 
 func (s *Server) instanceViews(list []rental.Instance) []instanceView {
@@ -82,4 +86,37 @@ func commandViews(list []fleet.Command) []commandView {
 			Attempts: c.Attempts, CreatedAt: c.CreatedAt})
 	}
 	return out
+}
+
+type portView struct {
+	Port          int       `json:"port"`
+	Visibility    string    `json:"visibility"`
+	ForcedPrivate bool      `json:"forced_private"`
+	Note          string    `json:"note"`
+	URL           string    `json:"url"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+func (s *Server) portViews(instanceID string, list []rental.Port) []portView {
+	out := make([]portView, 0, len(list))
+	for _, p := range list {
+		url := ""
+		if s.PortURL != nil {
+			url = s.PortURL(instanceID, p.Port)
+		}
+		out = append(out, portView{Port: p.Port, Visibility: p.Visibility, ForcedPrivate: p.ForcedPrivate, Note: p.Note, URL: url, CreatedAt: p.CreatedAt})
+	}
+	return out
+}
+
+// hostKeyFingerprint 返回容器主机公钥的 SHA256 指纹；为空（存量实例未首连）返回空串。
+func hostKeyFingerprint(pubLine string) string {
+	if pubLine == "" {
+		return ""
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pubLine))
+	if err != nil {
+		return ""
+	}
+	return ssh.FingerprintSHA256(pub)
 }

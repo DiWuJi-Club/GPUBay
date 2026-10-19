@@ -237,3 +237,25 @@ func (s *Service) ListIngressRoutes(ctx context.Context) ([]IngressRoute, error)
 		return x, err
 	})
 }
+
+// PortCounts 批量返回实例的端口数（列表视图用，避免 N+1）。
+func (s *Service) PortCounts(ctx context.Context, instanceIDs []string) (map[string]int, error) {
+	out := map[string]int{}
+	if len(instanceIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.d.Pool.Query(ctx, `SELECT instance_id, count(*) FROM instance_ports WHERE instance_id = ANY($1) GROUP BY instance_id`, instanceIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}

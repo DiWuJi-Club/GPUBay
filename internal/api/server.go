@@ -35,7 +35,9 @@ type Server struct {
 	DevPay           bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
 	Clock            clock.Clock
 	Log              *slog.Logger
-	Domain           string        // 用于生成 SSH 命令，例如 spark.example.com
+	Domain           string        // 主域名，例如 spark.example.com
+	SSHHost          string        // SSH 命令里的主机名：ssh.<domain>
+	SSHPort          int           // SPARK_SSH_PUBLIC_PORT；非 22 时 SSH 命令带 -p；零值 = 22
 	SecureCookie     bool          // 生产环境为 true：Cookie 仅经 HTTPS 发送
 	TrustProxy       bool          // 仅当部署在会改写转发头的反向代理之后才设为 true
 	TrustedProxyHops int           // TrustProxy 时自己的代理层数：客户端 IP 取 X-Forwarded-For 自右数第 N 项（零值 = 1）
@@ -111,6 +113,16 @@ func (s *Server) Router() http.Handler {
 			r.Get("/instances/{id}/password", s.handlePassword)
 			r.Post("/instances/{id}/renew", s.handleRenew)
 			r.Post("/instances/{id}/release", s.handleRelease)
+			r.Get("/ssh-keys", s.handleListSSHKeys)
+			r.Post("/ssh-keys", s.handleAddSSHKey)
+			r.Delete("/ssh-keys/{id}", s.handleDeleteSSHKey)
+			r.Post("/instances/{id}/password/reset", s.handleResetPassword)
+			r.Put("/instances/{id}/access", s.handleSetAccess)
+			r.Get("/instances/{id}/ports", s.handleListPorts)
+			r.Post("/instances/{id}/ports", s.handleAddPort)
+			r.Put("/instances/{id}/ports/{port}", s.handleUpdatePort)
+			r.Delete("/instances/{id}/ports/{port}", s.handleDeletePort)
+			r.Get("/instances/{id}/ssh-sessions", s.handleSSHSessions)
 			r.Get("/recharges", s.handleRecharges)
 			r.Post("/recharges", s.handleCreateRecharge)
 			r.Get("/recharges/{id}", s.handleRecharge)

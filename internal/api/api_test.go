@@ -50,6 +50,7 @@ type testEnv struct {
 	pay     *pay.Mock
 	clk     *clock.Fake
 	rental  *rental.Service
+	fleet   *fleet.Service
 	ingress *ingress.Auth
 }
 
@@ -65,7 +66,7 @@ func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 	w := wallet.NewService(pool, clk)
 	c := catalog.NewService(pool)
 	f := fleet.NewService(pool, clk)
-	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: w, Catalog: c, Fleet: f, Notifier: rentalNoop{}})
+	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: w, Catalog: c, Fleet: f, Notifier: rentalNoop{}, Keys: ids})
 	disk, err := storage.NewLocalDisk(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -82,14 +83,14 @@ func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 		t.Fatal(err)
 	}
 	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test", PublicBaseURL: "http://spark.test",
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test", SSHHost: "ssh.spark.test", PublicBaseURL: "http://spark.test",
 		Billing: bill, DevPay: true, Ingress: auth}
 	if tweak != nil {
 		tweak(srv)
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
-	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, ingress: auth}
+	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, fleet: f, ingress: auth}
 }
 
 type client struct {

@@ -191,7 +191,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	srv := &api.Server{
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
-		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, TrustedProxyHops: cfg.TrustedProxyHops, PublicBaseURL: cfg.PublicBaseURL,
+		Domain: cfg.Domain, SSHHost: cfg.SSHHost(), SSHPort: cfg.SSHPublicPort, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, TrustedProxyHops: cfg.TrustedProxyHops, PublicBaseURL: cfg.PublicBaseURL,
 		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit,
 	}
 	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
@@ -238,6 +238,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	adminSrv := &adminapi.Server{
 		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Gateway: gw,
 		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit, PublicBaseURL: cfg.AdminPublicBaseURL,
+		PortURL: ingressAuth.PortURL,
 	}
 	var loader *tlsfile.Loader
 	if cfg.TLSEnabled() {

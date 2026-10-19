@@ -32,6 +32,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	sshOpen, err := s.Rental.OpenSSHSessionCount(ctx)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	var firstErr error
 	sum := func(f func(context.Context, time.Time, time.Time) (int64, error), from, to time.Time) int64 {
 		if firstErr != nil {
@@ -74,6 +79,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"machines": machines, "instances": instances,
 		"recharge_today": rechargeToday, "recharge_month": rechargeMonth, "order_today": orderToday, "order_month": orderMonth,
-		"utilization": util,
+		"utilization": util, "ssh_sessions_open": sshOpen,
 	})
 }

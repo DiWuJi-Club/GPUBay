@@ -19,6 +19,9 @@ func (s *Server) instanceRoutes(g chi.Router) {
 	s.handle(g, http.MethodPost, "/instances/{id}/migrate", opsRoles, s.handleMigrate)
 	s.handle(g, http.MethodPost, "/instances/{id}/rewipe", opsRoles, s.handleRewipe)
 	s.handle(g, http.MethodPost, "/instances/{id}/refund-release", financeRoles, s.handleRefundRelease)
+	s.handle(g, http.MethodGet, "/instances/{id}/ssh-sessions", allRoles, s.handleInstanceSSHSessions)
+	s.handle(g, http.MethodPost, "/instances/{id}/ports/{port}/force-private", opsRoles, s.handleForcePortPrivate)
+	s.handle(g, http.MethodDelete, "/instances/{id}/ports/{port}", opsRoles, s.handleAdminDeletePort)
 }
 
 // queryInt 解析可选的正整数查询参数；缺省返回 0。
@@ -80,11 +83,17 @@ func (s *Server) handleInstance(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	ports, err := s.Rental.ListPorts(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	if events == nil {
 		events = []rental.Event{}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"instance": s.instanceView(inst), "events": events, "orders": orderViews(orders), "commands": commandViews(cmds),
+		"ports": s.portViews(id, ports), "ssh_host_pubkey_fingerprint": hostKeyFingerprint(inst.SSHHostPubkey),
 	})
 }
 

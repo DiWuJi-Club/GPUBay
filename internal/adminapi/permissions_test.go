@@ -34,6 +34,8 @@ var expectedRoutes = []struct {
 	{"GET", "/instances", all}, {"GET", "/instances/{id}", all}, {"GET", "/instances/{id}/refund-quote", all},
 	{"POST", "/instances/{id}/extend", ops}, {"POST", "/instances/{id}/migrate", ops}, {"POST", "/instances/{id}/rewipe", ops},
 	{"POST", "/instances/{id}/refund-release", finance},
+	{"GET", "/instances/{id}/ssh-sessions", all}, {"POST", "/instances/{id}/ports/{port}/force-private", ops},
+	{"DELETE", "/instances/{id}/ports/{port}", ops},
 
 	{"GET", "/users", all}, {"GET", "/users/{id}", all},
 	{"POST", "/users/{id}/ban", ops}, {"POST", "/users/{id}/unban", ops},
