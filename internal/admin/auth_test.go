@@ -244,6 +244,17 @@ func TestStepUp(t *testing.T) {
 	if err := e.svc.StepUp(e.ctx, sess, e.code(secret, 0)); err != nil {
 		t.Fatalf("right code = %v", err)
 	}
+	// 只校验不开窗口：窗口由 RecordStepUp 在操作成功后打开
+	sess, _ = e.svc.Authenticate(e.ctx, token)
+	if sess.StepUpAt != nil {
+		t.Fatal("StepUp must not record the window by itself")
+	}
+	if err := e.svc.StepUp(e.ctx, sess, ""); codeOf(err) != "totp_required" {
+		t.Fatalf("verified but not recorded = %v", err)
+	}
+	if err := e.svc.RecordStepUp(e.ctx, sess); err != nil {
+		t.Fatal(err)
+	}
 	sess, _ = e.svc.Authenticate(e.ctx, token)
 	if sess.StepUpAt == nil {
 		t.Fatal("StepUpAt not recorded")

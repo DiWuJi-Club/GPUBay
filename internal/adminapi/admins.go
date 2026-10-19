@@ -58,12 +58,11 @@ func (s *Server) handleCreateAdmin(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	if err := s.stepUp(r, req.TOTP); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	a, err := s.Admins.Create(r.Context(), s.actor(r), req.Username, req.Password, admin.Role(req.Role))
-	if err != nil {
+	var a admin.Admin
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		a, err = s.Admins.Create(r.Context(), s.actor(r), req.Username, req.Password, admin.Role(req.Role))
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
@@ -85,17 +84,16 @@ func (s *Server) handleUpdateAdmin(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	if err := s.stepUp(r, req.TOTP); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
 	var role *admin.Role
 	if req.Role != nil {
 		v := admin.Role(*req.Role)
 		role = &v
 	}
-	a, err := s.Admins.Update(r.Context(), s.actor(r), id, role, req.Status)
-	if err != nil {
+	var a admin.Admin
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		a, err = s.Admins.Update(r.Context(), s.actor(r), id, role, req.Status)
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
@@ -115,11 +113,7 @@ func (s *Server) handleResetTOTP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	if err := s.stepUp(r, req.TOTP); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	if err := s.Admins.ResetTOTP(r.Context(), s.actor(r), id); err != nil {
+	if err := s.withStepUp(r, req.TOTP, func() error { return s.Admins.ResetTOTP(r.Context(), s.actor(r), id) }); err != nil {
 		s.writeError(w, r, err)
 		return
 	}

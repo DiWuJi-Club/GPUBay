@@ -250,7 +250,8 @@ func (s *Service) Authenticate(ctx context.Context, token string) (Session, erro
 	return sess, nil
 }
 
-// StepUp 高风险操作的二次验证：code 非空时校验动态码并记录验证时间；为空时要求 5 分钟内验证过。
+// StepUp 高风险操作的二次验证：code 非空时只校验动态码（不记录验证时间）；为空时要求 5 分钟内验证过。
+// 验证窗口由 RecordStepUp 在操作成功之后打开：参数错误、业务失败的请求不能借一个正确的动态码打开窗口。
 func (s *Service) StepUp(ctx context.Context, sess Session, code string) error {
 	now := s.d.Clock.Now()
 	if NormalizeCode(code) == "" {
@@ -277,16 +278,19 @@ func (s *Service) StepUp(ctx context.Context, sess Session, code string) error {
 			bizErr = ErrInvalidTOTP
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `UPDATE admins SET failed_attempts = 0, updated_at = $2 WHERE id = $1`, a.ID, now); err != nil {
-			return err
-		}
-		_, err = tx.Exec(ctx, `UPDATE admin_sessions SET stepup_at = $2 WHERE token_hash = $1`, sess.TokenHash, now)
+		_, err = tx.Exec(ctx, `UPDATE admins SET failed_attempts = 0, updated_at = $2 WHERE id = $1`, a.ID, now)
 		return err
 	})
 	if err != nil {
 		return err
 	}
 	return bizErr
+}
+
+// RecordStepUp 打开会话的二次验证窗口（StepUpWindow）；调用方在带动态码的高风险操作成功之后调用。
+func (s *Service) RecordStepUp(ctx context.Context, sess Session) error {
+	_, err := s.d.Pool.Exec(ctx, `UPDATE admin_sessions SET stepup_at = $2 WHERE token_hash = $1`, sess.TokenHash, s.d.Clock.Now())
+	return err
 }
 
 func (s *Service) Logout(ctx context.Context, token string) error {

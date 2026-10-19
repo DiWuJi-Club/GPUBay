@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -132,17 +131,11 @@ func (s *Server) handleCancelBooking(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	// 先校验原因再验动态码：空原因的请求不能打开 stepUp 窗口（窗口内后续敏感操作免动态码）
-	if strings.TrimSpace(req.Reason) == "" {
-		s.writeError(w, r, apperr.BadRequest("请填写取消原因"))
-		return
-	}
-	if err := s.stepUp(r, req.TOTP); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	refunded, err := s.Rental.AdminCancelBooking(r.Context(), s.actor(r), chi.URLParam(r, "id"), req.Reason)
-	if err != nil {
+	var refunded int64
+	if err := s.withStepUp(r, req.TOTP, func() (err error) {
+		refunded, err = s.Rental.AdminCancelBooking(r.Context(), s.actor(r), chi.URLParam(r, "id"), req.Reason)
+		return err
+	}); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
