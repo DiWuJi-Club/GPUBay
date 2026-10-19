@@ -9,6 +9,7 @@ Agent 创建容器时用 `--entrypoint /.spark/init.sh` 覆盖镜像入口：`in
 - **不要在镜像里写入任何密钥、口令或 `authorized_keys`**。登录只靠平台注入的 `/.spark/authorized_keys`（平台上游公钥）；`PasswordAuthentication` 被关闭。主机密钥由平台按实例生成、Agent 写入 `/.spark/hostkeys/`，镜像里的 `/etc/ssh/ssh_host_*` 不会被使用，而且**镜像不得包含 SSH 主机密钥**（否则同一镜像的所有容器共用同一把私钥）：`openssh-server` 的安装脚本会生成它们，构建时必须 `rm -f /etc/ssh/ssh_host_*`（参考 Dockerfile 已处理）。
 - 不依赖 `--ipc=host`、`--privileged`、宿主机网络；容器只额外获得 `IPC_LOCK`、`SYS_NICE`、`SYS_PTRACE`。
 - 建议预装 `ca-certificates`、`curl`、`iproute2`。
+- **应用镜像（一键部署，计划 7）**另须自带 `curl`、`tar`、`setsid`（`util-linux`）、`python3`、`git`，以及 `modelscope` 命令与 `jupyterlab`；`PIP_INDEX_URL` 作为构建参数并写进镜像环境（脚本若需装小包走它）。平台把应用部署包放进 `/root/data/.spark-apps/<slug>/`，用 `/bin/sh` 执行固定的 `run.sh`，应用以普通进程运行（容器内没有 init / Docker）。模型缓存目录 `/root/data/models`。参考 Dockerfile：`deploy/image/apps/{llm-serving,comfyui,pytorch}`，`LABEL spark.image.spec="2"`。
 
 ## 运行时环境（由 Agent 提供）
 - `/root/data`：实例数据盘（ext4，大小见后台配置，默认 2TiB），持久化，用户大文件放这里；容器可写层（`/` 下其它路径）不持久，也没有限额，不要往里写大文件。
@@ -28,3 +29,5 @@ Agent 创建容器时用 `--entrypoint /.spark/init.sh` 覆盖镜像入口：`in
 ```bash
 docker build -t spark/cuda-ssh:13.0.1 deploy/image
 ```
+
+应用镜像：`make app-images`（或 `deploy/image/apps/README.md` 的大陆构建命令）。
