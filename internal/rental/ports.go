@@ -222,18 +222,20 @@ type IngressRoute struct {
 	Suspended  bool
 	LanIP      string
 	HostPubkey string
+	// ScheduledStartAt 仅预订（reserved）实例有值，入口状态页用来显示开始时间。
+	ScheduledStartAt *time.Time
 }
 
 func (s *Service) ListIngressRoutes(ctx context.Context) ([]IngressRoute, error) {
-	rows, err := s.d.Pool.Query(ctx, `SELECT p.instance_id, i.user_id, p.port, p.visibility, i.state, i.suspended_at IS NOT NULL, m.lan_ip, i.ssh_host_pubkey
+	rows, err := s.d.Pool.Query(ctx, `SELECT p.instance_id, i.user_id, p.port, p.visibility, i.state, i.suspended_at IS NOT NULL, m.lan_ip, i.ssh_host_pubkey, i.scheduled_start_at
 		FROM instance_ports p JOIN instances i ON i.id = p.instance_id JOIN machines m ON m.id = i.machine_id
-		WHERE i.state IN ('creating', 'running', 'stopped') ORDER BY p.instance_id, p.port`)
+		WHERE i.state IN ('reserved', 'creating', 'running', 'stopped') ORDER BY p.instance_id, p.port`)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (IngressRoute, error) {
 		var x IngressRoute
-		err := r.Scan(&x.InstanceID, &x.UserID, &x.Port, &x.Visibility, &x.State, &x.Suspended, &x.LanIP, &x.HostPubkey)
+		err := r.Scan(&x.InstanceID, &x.UserID, &x.Port, &x.Visibility, &x.State, &x.Suspended, &x.LanIP, &x.HostPubkey, &x.ScheduledStartAt)
 		return x, err
 	})
 }

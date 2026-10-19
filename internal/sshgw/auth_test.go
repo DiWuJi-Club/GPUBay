@@ -102,6 +102,12 @@ func TestBannerByState(t *testing.T) {
 		{"wiping", func(i *rental.AccessInfo) { i.Instance.State = rental.StateWiping }, sshgw.BannerReleased},
 		{"released", func(i *rental.AccessInfo) { i.Instance.State = rental.StateReleased }, sshgw.BannerReleased},
 		{"failed", func(i *rental.AccessInfo) { i.Instance.State = rental.StateFailed }, sshgw.BannerReleased},
+		{"reserved", func(i *rental.AccessInfo) {
+			i.Instance.State = rental.StateReserved
+			s := time.Date(2026, 3, 4, 3, 0, 0, 0, time.UTC)
+			i.Instance.ScheduledStartAt = &s
+		}, "实例预订于 2026-03-04 11:00 开始，开始前 1 小时自动开通"},
+		{"cancelled", func(i *rental.AccessInfo) { i.Instance.State = rental.StateCancelled }, sshgw.BannerReleased},
 	}
 	for _, c := range cases {
 		info := runningInfo(e, instA, 7, "pw-correct-16chr")

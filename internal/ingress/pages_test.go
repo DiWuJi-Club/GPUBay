@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"spark-cloud/internal/ingress"
 	"spark-cloud/internal/rental"
@@ -65,6 +66,9 @@ func TestNotRunningPage(t *testing.T) {
 		{rental.IngressRoute{State: rental.StateWiping}, ingress.PageReleased},
 		{rental.IngressRoute{State: rental.StateFailed}, ingress.PageReleased},
 		{rental.IngressRoute{State: rental.StateRunning}, ingress.PageReleased}, // 调用方只在非可用时调用；兜底文案
+		{rental.IngressRoute{State: rental.StateReserved, ScheduledStartAt: ptrTime(time.Date(2026, 3, 4, 3, 0, 0, 0, time.UTC))}, "实例预订于 2026-03-04 11:00 开始，开始前 1 小时自动开通"},
+		{rental.IngressRoute{State: rental.StateReserved}, "实例预订于 — 开始，开始前 1 小时自动开通"},
+		{rental.IngressRoute{State: rental.StateCancelled}, ingress.PageReleased},
 	}
 	for _, c := range cases {
 		if got := ingress.NotRunningPage(c.r); got != c.want {
@@ -72,3 +76,5 @@ func TestNotRunningPage(t *testing.T) {
 		}
 	}
 }
+
+func ptrTime(t time.Time) *time.Time { return &t }
