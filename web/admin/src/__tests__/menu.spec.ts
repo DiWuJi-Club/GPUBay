@@ -4,9 +4,9 @@ import { routes } from '../router'
 
 describe('menuFor (U-12)', () => {
   it.each([
-    ['super', 15, []],
-    ['ops', 10, ['orders', 'ledger', 'recharges', 'catalog', 'admins']],
-    ['finance', 9, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
+    ['super', 16, []],
+    ['ops', 11, ['orders', 'ledger', 'recharges', 'catalog', 'admins']],
+    ['finance', 10, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
   ] as const)('%s 有 %d 项', (role, count, missing) => {
     const items = menuFor(role)
     expect(items).toHaveLength(count)
@@ -19,5 +19,15 @@ describe('menuFor (U-12)', () => {
       expect(route, item.path).toBeDefined()
       expect([...(route!.meta?.roles ?? [])].sort()).toEqual([...item.roles].sort())
     }
+  })
+
+  it.each([
+    ['/apps', ['super', 'ops', 'finance']],
+    ['/apps/:id', ['super', 'ops', 'finance']],
+    ['/apps/:id/versions/:vid', ['super', 'ops', 'finance']],
+  ] as const)('应用页 %s 对所有角色开放（写按钮按角色显示）', (path, roles) => {
+    const route = routes.find((r) => r.path === path)
+    expect(route, path).toBeDefined()
+    expect([...(route!.meta?.roles ?? [])].sort()).toEqual([...roles].sort())
   })
 })

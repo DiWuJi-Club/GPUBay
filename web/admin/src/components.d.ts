@@ -11,6 +11,7 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AppFormDialog: typeof import('./components/AppFormDialog.vue')['default']
     BatchLink: typeof import('./components/BatchLink.vue')['default']
     BookingOpsDialogs: typeof import('./components/BookingOpsDialogs.vue')['default']
     DateRange: typeof import('./components/DateRange.vue')['default']
