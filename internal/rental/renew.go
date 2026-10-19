@@ -2,6 +2,7 @@ package rental
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -10,6 +11,7 @@ import (
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/platform/tz"
 )
 
 // Renew 续费一个单位；见 RenewQuantity。
@@ -26,7 +28,10 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 	if quantity == 0 {
 		quantity = 1
 	}
-	if quantity < 1 || quantity > MaxQuantity(d) {
+	if quantity < 1 {
+		return Order{}, apperr.BadRequest("数量不正确")
+	}
+	if quantity > MaxQuantity(d) {
 		return Order{}, apperr.ErrBookingTooLong
 	}
 	if err := checkIdempotencyKey(idempotencyKey); err != nil {
@@ -35,40 +40,50 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 	now := s.d.Clock.Now()
 	secs := seconds(d) * int64(quantity)
 	var ord Order
-	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		if idempotencyKey != "" {
-			prev, found, err := lockIdempotencyKey(ctx, tx, userID, idempotencyKey)
+	// 同一用户并发下批次（先锁钱包再锁机器）与续费可能死锁（40P01）：整个事务重试一次
+	err := withRetry(func() error {
+		return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+			ord = Order{}
+			if idempotencyKey != "" {
+				prev, found, err := lockIdempotencyKey(ctx, tx, userID, idempotencyKey)
+				if err != nil {
+					return err
+				}
+				if found {
+					ord, err = replayRenew(prev, instanceID)
+					return err
+				}
+			}
+			inst, err := lockInstance(ctx, tx, instanceID)
 			if err != nil {
 				return err
 			}
-			if found {
-				ord, err = replayRenew(prev, instanceID)
+			if inst.UserID != userID {
+				return apperr.ErrNotFound
+			}
+			if inst.State != StateReserved && inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped {
+				return apperr.ErrInvalidState
+			}
+			if err := s.renewFits(ctx, tx, inst, secs, now); err != nil {
 				return err
 			}
-		}
-		inst, err := lockInstance(ctx, tx, instanceID)
-		if err != nil {
-			return err
-		}
-		if inst.UserID != userID {
-			return apperr.ErrNotFound
-		}
-		if inst.State != StateReserved && inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped {
-			return apperr.ErrInvalidState
-		}
-		if ord, err = s.charge(ctx, tx, userID, "renew", inst.ID, inst.ProductID, d, quantity, false, nil, idempotencyKey, now); err != nil {
-			return err
-		}
-		if err := s.addTime(ctx, tx, inst, secs, now); err != nil {
-			return err
-		}
-		if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, "renew "+ord.ID, now); err != nil {
-			return err
-		}
-		if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
-			return err
-		}
-		return nil // T9: verifyLeaseFits(ctx, tx, inst.ID, now)
+			if renewHook != nil {
+				renewHook()
+			}
+			if ord, err = s.charge(ctx, tx, userID, "renew", inst.ID, inst.ProductID, d, quantity, false, nil, idempotencyKey, now); err != nil {
+				return err
+			}
+			if err := s.addTime(ctx, tx, inst, secs, now); err != nil {
+				return err
+			}
+			if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, "renew "+ord.ID, now); err != nil {
+				return err
+			}
+			if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
+				return err
+			}
+			return s.verifyLeaseFits(ctx, tx, inst.ID, now)
+		})
 	})
 	if isIdempotencyViolation(err) {
 		// 并发的重复请求已先提交：本事务已回滚，返回先提交的那笔订单。
@@ -118,12 +133,23 @@ func (s *Service) Release(ctx context.Context, userID int64, instanceID string) 
 func (s *Service) addTime(ctx context.Context, tx pgx.Tx, inst Instance, secs int64, now time.Time) error {
 	var err error
 	switch {
-	case inst.State == StateReserved:
-		_, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
-		if err == nil { // 预订的占用时段按新时长推后（refreshLease 对 reserved 不动，这里直接改）
-			_, err = tx.Exec(ctx, `UPDATE machine_leases SET period = tstzrange(lower(period), upper(period) + ($2::bigint * interval '1 second')), updated_at = $3
-				WHERE instance_id = $1 AND status = 'reserved'`, inst.ID, secs, now)
+	case inst.State == StateReserved || (inst.Booked() && inst.State == StateCreating):
+		// 预订（含已开通、尚未 running）的占用时段在下单时定死、refreshLease 不动：按新时长直接推后上界
+		if _, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now); err != nil {
+			return err
 		}
+		tag, uerr := tx.Exec(ctx, `UPDATE machine_leases SET period = tstzrange(lower(period), upper(period) + ($2::bigint * interval '1 second')), updated_at = $3
+			WHERE id = (SELECT id FROM machine_leases WHERE instance_id = $1 AND status IN ('reserved', 'active') ORDER BY id DESC LIMIT 1)`, inst.ID, secs, now)
+		if db.IsExclusionViolation(uerr) { // renewFits 之后同机紧随的预订才提交
+			return errRenewBlockedGeneric
+		}
+		if uerr != nil {
+			return uerr
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("addTime %s: booked lease not found", inst.ID)
+		}
+		return nil
 	case inst.State == StateCreating:
 		_, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
 	case inst.State == StateRunning && inst.Suspended():
@@ -155,4 +181,116 @@ func (s *Service) addTime(ctx context.Context, tx pgx.Tx, inst Instance, secs in
 		return apperr.ErrInvalidState
 	}
 	return err
+}
+
+// RenewOption 续费表单的一个档位：在可续时间与 90 天上限下最多能买的单位数（0 = 不可选）。
+type RenewOption struct {
+	Duration    catalog.Duration `json:"duration"`
+	QuantityMax int              `json:"quantity_max"`
+}
+
+// RenewInfo 实例视图里的续费约束（规格 §7.1）。
+type RenewInfo struct {
+	RenewableUntil *time.Time    `json:"renewable_until"` // 同机下一条预订的 cap − Tail；无预订为 nil
+	Options        []RenewOption `json:"renew_options"`
+}
+
+// renewBase 加时前的到期基准：新上界 = base + secs + Tail（规格 §7.1 表）。
+func renewBase(inst Instance, now time.Time) time.Time {
+	pending := time.Duration(inst.PendingSeconds) * time.Second
+	switch {
+	case inst.State == StateRunning && inst.Suspended():
+		var paused int64
+		if inst.PausedRemaining != nil {
+			paused = *inst.PausedRemaining
+		}
+		return now.Add(time.Duration(paused) * time.Second)
+	case inst.State == StateRunning:
+		if inst.ExpiresAt != nil && inst.ExpiresAt.After(now) {
+			return *inst.ExpiresAt
+		}
+		return now
+	case inst.Booked() && (inst.State == StateReserved || inst.State == StateCreating):
+		return inst.ScheduledStartAt.Add(pending)
+	default: // 即时 creating / stopped：与 occupiedUntil 的估算一致
+		return now.Add(CreateTimeout + pending)
+	}
+}
+
+// renewInfo 读取同机下一条预订并算出各档位最多能买的单位数（不加锁；q 可以是事务）。
+func (s *Service) renewInfo(ctx context.Context, q db.Querier, inst Instance, now time.Time) (RenewInfo, error) {
+	var lower *time.Time
+	if err := q.QueryRow(ctx, `SELECT lower(period) FROM machine_leases WHERE instance_id = $1 AND status IN ('reserved', 'active') ORDER BY id DESC LIMIT 1`, inst.ID).Scan(&lower); err != nil && !db.IsNoRows(err) {
+		return RenewInfo{}, err
+	}
+	info := RenewInfo{}
+	if lower != nil {
+		cap, ok, err := nextReservedLower(ctx, q, inst.MachineID, inst.ID, *lower)
+		if err != nil {
+			return RenewInfo{}, err
+		}
+		if ok {
+			until := cap.Add(-Tail)
+			info.RenewableUntil = &until
+		}
+	}
+	base := renewBase(inst, now)
+	for _, d := range []catalog.Duration{catalog.D1d, catalog.D1w, catalog.D1m} {
+		max := MaxQuantity(d)
+		if info.RenewableUntil != nil {
+			room := info.RenewableUntil.Sub(base)
+			if room < d.Length() {
+				max = 0
+			} else if n := int(room / d.Length()); n < max {
+				max = n
+			}
+		}
+		info.Options = append(info.Options, RenewOption{Duration: d, QuantityMax: max})
+	}
+	return info, nil
+}
+
+// RenewInfoFor 实例视图用。
+func (s *Service) RenewInfoFor(ctx context.Context, inst Instance) (RenewInfo, error) {
+	return s.renewInfo(ctx, s.d.Pool, inst, s.d.Clock.Now())
+}
+
+// renewFits 所有加时路径共用：加 secs 秒后的到期不得越过同机下一条预订（规格 §7.1）。
+func (s *Service) renewFits(ctx context.Context, q db.Querier, inst Instance, secs int64, now time.Time) error {
+	info, err := s.renewInfo(ctx, q, inst, now)
+	if err != nil {
+		return err
+	}
+	if info.RenewableUntil == nil || !renewBase(inst, now).Add(time.Duration(secs)*time.Second).After(*info.RenewableUntil) {
+		return nil
+	}
+	nextStart := info.RenewableUntil.Add(Tail + PrepLead)
+	return apperr.New("renew_blocked", fmt.Sprintf("该机器自 %s 起已有预订，本次最多可续至 %s", tz.Format(nextStart), tz.Format(*info.RenewableUntil)), 409)
+}
+
+var errRenewBlockedGeneric = apperr.New("renew_blocked", "该机器已有后续预订，无法续费", 409)
+
+// renewHook 测试钩子：在 renewFits 通过后、扣款前调用（制造「并发预订刚提交」的竞态）；生产为 nil。
+var renewHook func()
+
+// verifyLeaseFits 加时并 refreshLease 之后复核：lease 上界若被同机新提交的预订封顶（小于按新状态算出的 occupiedUntil），
+// 说明 renewFits 读到的 cap 已过期——返回 renew_blocked 让事务回滚，不能既扣款又让到期越过别人已付的预订。
+func (s *Service) verifyLeaseFits(ctx context.Context, tx pgx.Tx, id string, now time.Time) error {
+	inst, err := lockInstance(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	// 预订（reserved / 已开通未 running）的 lease 由 addTime 直接推后，撞约束时已经报错；refreshLease 不动它，
+	// occupiedUntil 的即时估算也不适用，复核会误报
+	if inst.Booked() && (inst.State == StateReserved || inst.State == StateCreating) {
+		return nil
+	}
+	var upper time.Time
+	if err := tx.QueryRow(ctx, `SELECT upper(period) FROM machine_leases WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`, id).Scan(&upper); err != nil {
+		return err
+	}
+	if upper.Before(occupiedUntil(inst, now)) {
+		return errRenewBlockedGeneric
+	}
+	return nil
 }

@@ -32,3 +32,9 @@ var (
 	CountAvailable  = countAvailable
 	InsertLease     = insertLease
 )
+
+// SetRenewHookForTest 设置 renewFits 之后的钩子，返回恢复函数。
+func SetRenewHookForTest(f func()) func() {
+	renewHook = f
+	return func() { renewHook = nil }
+}
