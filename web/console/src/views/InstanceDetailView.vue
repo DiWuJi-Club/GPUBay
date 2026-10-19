@@ -23,6 +23,7 @@ const router = useRouter()
 const guide = useGuide()
 const id = computed(() => String(route.params.id))
 const inst = ref<Instance | null>(null)
+const fetchedAt = ref(0) // 拿到 inst 的本地时刻：cancellable_seconds 从这里起递减
 const loadError = ref('')
 // 运行中倒计时归零：后端此时已（或即将）停机，刷新一次显示新状态
 const countdown = useCountdown({ onZero: () => void load() })
@@ -36,6 +37,7 @@ async function load() {
     if (mine !== seq) return // 之后又发出过查询（轮询 / 操作后刷新 / 换实例）：丢弃迟到的旧响应
     const prevState = inst.value?.state
     inst.value = next
+    fetchedAt.value = Date.now()
     if (canManagePorts(next.state) && prevState !== next.state) void loadPorts() // 首次加载与状态变化时拉端口，轮询不重复拉
     if (prevState !== undefined && prevState !== next.state) void loadEvents() // 状态变化时刷新时间线（首次由 onMounted 拉）
     loadError.value = ''
@@ -332,6 +334,7 @@ async function confirmCancel() {
     const next = await api.post<Instance>(`/instances/${id.value}/cancel`, {})
     seq++ // 作废进行中的轮询，避免旧的 reserved 响应覆盖取消结果
     inst.value = next
+    fetchedAt.value = Date.now()
     cancelVisible.value = false
     ElMessage.success('已取消预订，退款已退回余额')
     await Promise.all([refreshBalance(), loadEvents()])
@@ -353,6 +356,7 @@ async function setAutoRenew(enabled: boolean, duration?: Duration) {
     const next = await api.put<Instance>(`/instances/${id.value}/auto-renew`, { enabled, duration: duration ?? inst.value.auto_renew_duration })
     seq++ // 作废进行中的轮询，避免旧响应把开关拨回去
     inst.value = next
+    fetchedAt.value = Date.now()
     ElMessage.success(enabled ? '已开启自动续费' : '已关闭自动续费')
   } catch (e) {
     notifyError(e)
@@ -436,7 +440,7 @@ watch(id, () => {
         </el-descriptions>
         <div class="actions">
           <el-button v-if="canRenew(inst.state)" type="primary" data-testid="detail-renew-btn" @click="openRenew">{{ inst.state === 'reserved' ? '续费（加时）' : '续费' }}</el-button>
-          <el-button v-if="canCancel(inst, nowMs)" type="danger" plain data-testid="detail-cancel-btn" @click="openCancel">取消预订</el-button>
+          <el-button v-if="canCancel(inst, fetchedAt, nowMs)" type="danger" plain data-testid="detail-cancel-btn" @click="openCancel">取消预订</el-button>
           <el-button v-if="canRelease(inst.state)" type="danger" plain data-testid="detail-release-btn" @click="releaseVisible = true">释放</el-button>
         </div>
       </el-card>

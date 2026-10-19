@@ -27,6 +27,8 @@ export interface Instance {
   scheduled_start_at: string | null
   scheduled_end_at: string | null
   cancellable_until: string | null
+  /** 按服务器时钟距取消截止的秒数（0 = 不可取消）；前端按拿到数据的时刻递减 */
+  cancellable_seconds: number
   group_id: number | null
   group_name: string
   machine_label: string

@@ -431,7 +431,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 | POST | `/instances/{id}/renew` | body 增加 `quantity?`（默认 1）；错误新增 `renew_blocked` |
 | GET | `/instances/{id}/events` | `{items:[{to_state,reason_kind,at,detail}]}` 最近 20 条，只输出白名单种类（下单 / 开通 / 改派 / 自动续费 / 取消 / 到期 / 释放），`detail` 为可展示文案（不透出机器 ID、序列号） |
 
-`instanceView` 新增字段：`scheduled_start_at`、`scheduled_end_at`、`cancellable_until`、`group_id`、`group_name`、`machine_label`、`batch_id`、`reassign_count`、`auto_renew`、`auto_renew_duration`、`auto_renew_failed_reason`、`renewable_until`、`renew_options`。`Order` 视图新增 `quantity`、`batch_id`、`auto`。`productView.idle_count` 语义改为「此刻可即时租用台数」（§8 第 1 行）。
+`instanceView` 新增字段：`scheduled_start_at`、`scheduled_end_at`、`cancellable_until`、`cancellable_seconds`（按服务器时钟距取消截止的秒数，非 reserved 或已过截止为 0；终审 M3）、`group_id`、`group_name`、`machine_label`、`batch_id`、`reassign_count`、`auto_renew`、`auto_renew_duration`、`auto_renew_failed_reason`、`renewable_until`、`renew_options`。`Order` 视图新增 `quantity`、`batch_id`、`auto`。`productView.idle_count` 语义改为「此刻可即时租用台数」（§8 第 1 行）。
 
 ### 10.2 后台（`/admin/api/v1`）
 
@@ -475,7 +475,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 
 ### 11.2 我的实例 `/instances`
 - 新状态标签：`已预订`（青色）、`已取消`（灰）。
-- 预订卡片时间文案：`<S> 开始 · 共 <D>`；`cancellable_until` 之前显示「可取消」小字；`reassign_count > 0` 显示「已更换机器」标记。
+- 预订卡片时间文案：`<S> 开始 · 共 <D>`；取消截止之前显示「可取消」小字（列表与详情的「取消预订」按钮同口径：`cancellable_seconds` 从拿到数据的本地时刻起递减，与 `remaining_seconds` 一样不依赖浏览器时钟；终审 M3）；`reassign_count > 0` 显示「已更换机器」标记。
 - 同批次卡片折叠显示批次头（`批次 bat-xxx · N 台`），`?batch=` 参数时只显示该批次并有「取消全部未开通」按钮（逐台调用 `/cancel`，成功 / 失败各自提示）。
 - 有 `reserved` 实例时与 creating 一样每 10 秒刷新（开通时刻会自动变为开通中）。
 

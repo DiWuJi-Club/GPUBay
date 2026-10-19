@@ -28,8 +28,9 @@ export function releaseWarning(i: Instance): string | null {
 export const canRenew = (s: InstanceState) => s === 'reserved' || s === 'creating' || s === 'running' || s === 'stopped'
 export const canRelease = (s: InstanceState) => s === 'running' || s === 'stopped'
 export const canSetAutoRenew = (s: InstanceState) => s === 'reserved' || s === 'creating' || s === 'running' || s === 'stopped'
-/** 预订开通前（开始前 1 小时）可取消。 */
-export const canCancel = (i: Instance, nowMs: number) => i.state === 'reserved' && !!i.cancellable_until && nowMs < Date.parse(i.cancellable_until)
+/** 预订开通前（开始前 1 小时）可取消：用服务器给的 cancellable_seconds 从拿到数据的本地时刻起递减，不拿浏览器时钟比 cancellable_until。 */
+export const canCancel = (i: Instance, fetchedAt: number, nowMs: number) =>
+  i.state === 'reserved' && nowMs - fetchedAt < i.cancellable_seconds * 1000
 
 /** 某档位最多能买的单位数：后端 renew_options 为准，没有时按 90 天上限。 */
 export function renewQuantityMax(i: Instance, d: Duration): number {

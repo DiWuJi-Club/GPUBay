@@ -6,7 +6,7 @@ const base: Instance = {
   id: 'ins-abc12345', state: 'running', product_id: 1, image_id: 1, product_name: 'DGX Spark 整机', image_name: 'PyTorch', suspended: false,
   expires_at: '2026-10-18T06:00:00Z', remaining_seconds: 86399, pending_seconds: 0, retain_until: null, ssh_command: 'ssh ins-abc12345@ssh.spark.test',
   password_auth: true, ssh_host: 'ssh.spark.test', ssh_port: 22, ports_count: 0,
-  scheduled_start_at: null, scheduled_end_at: null, cancellable_until: null, group_id: null, group_name: '', machine_label: '', batch_id: null,
+  scheduled_start_at: null, scheduled_end_at: null, cancellable_until: null, cancellable_seconds: 0, group_id: null, group_name: '', machine_label: '', batch_id: null,
   reassign_count: 0, auto_renew: false, auto_renew_duration: '1d', auto_renew_failed_reason: '', renewable_until: null, renew_options: [],
   created_at: '2026-10-17T06:00:00Z',
 }
@@ -52,16 +52,19 @@ describe('按钮与状态匹配 (C-DET-09 的逻辑)', () => {
 
 describe('booking states (U-21)', () => {
   const reserved: Instance = { ...base, state: 'reserved', expires_at: null, remaining_seconds: 0, pending_seconds: 86400, ssh_command: '',
-    scheduled_start_at: '2026-10-20T02:00:00Z', scheduled_end_at: '2026-10-21T02:00:00Z', cancellable_until: '2026-10-20T01:00:00Z',
+    scheduled_start_at: '2026-10-20T02:00:00Z', scheduled_end_at: '2026-10-21T02:00:00Z', cancellable_until: '2026-10-20T01:00:00Z', cancellable_seconds: 120,
     renewable_until: '2026-10-25T00:00:00Z', renew_options: [{ duration: '1d', quantity_max: 3 }, { duration: '1w', quantity_max: 0 }, { duration: '1m', quantity_max: 0 }] }
   it('预订 / 取消的时间文案', () => {
     expect(instanceTimeText(reserved, 0)).toBe('2026-10-20 10:00 开始 · 共 1 天')
     expect(instanceTimeText({ ...base, state: 'cancelled' }, 0)).toBe('已取消')
   })
-  it('可取消：reserved 且未过截止', () => {
-    expect(canCancel(reserved, Date.parse('2026-10-20T00:59:00Z'))).toBe(true)
-    expect(canCancel(reserved, Date.parse('2026-10-20T01:00:00Z'))).toBe(false)
-    expect(canCancel({ ...reserved, state: 'creating' }, 0)).toBe(false)
+  it('可取消：reserved 且按服务器给的 cancellable_seconds 从拿到数据时起算未过截止（不看浏览器时钟与 cancellable_until 的差）', () => {
+    const fetchedAt = Date.parse('2030-01-01T00:00:00Z') // 浏览器时钟比服务器快好几年也不影响
+    expect(canCancel(reserved, fetchedAt, fetchedAt)).toBe(true)
+    expect(canCancel(reserved, fetchedAt, fetchedAt + 119_999)).toBe(true)
+    expect(canCancel(reserved, fetchedAt, fetchedAt + 120_000)).toBe(false)
+    expect(canCancel({ ...reserved, cancellable_seconds: 0 }, fetchedAt, fetchedAt)).toBe(false)
+    expect(canCancel({ ...reserved, state: 'creating' }, fetchedAt, fetchedAt)).toBe(false)
   })
   it('续费数量上限来自 renew_options', () => {
     expect(renewQuantityMax(reserved, '1d')).toBe(3)
