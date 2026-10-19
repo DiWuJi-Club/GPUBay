@@ -160,8 +160,19 @@ func (s *Service) checkImage(ctx context.Context, q db.Querier, ver Version, ima
 	return apperr.AppImageMismatch(need, have)
 }
 
-// insert 插入一条 queued 部署（attempt 0，next_poll_at = now）。
+// cancelStaleCleanup：同一实例上同一应用的旧部署若还等着清理目录（停机时卸载），新部署会用同一个目录：
+// 取消清理，免得 Runner 删掉新部署的文件。每条新建部署的路径（创建 / 预装 / 换机复制）在插入前调用。
+func cancelStaleCleanup(ctx context.Context, q db.Querier, instanceID string, appID int64, now time.Time) error {
+	_, err := q.Exec(ctx, `UPDATE app_deployments SET cleanup_pending = false, updated_at = $3, row_version = row_version + 1
+		WHERE instance_id = $1 AND app_id = $2 AND state = 'removed' AND cleanup_pending`, instanceID, appID, now)
+	return err
+}
+
+// insert 插入一条 queued 部署（attempt 0，next_poll_at = now），先取消同一应用旧部署的待清理（cancelStaleCleanup）。
 func (s *Service) insert(ctx context.Context, q db.Querier, inst rental.Instance, userID int64, app App, ver Version, plain, secret map[string]string, now time.Time) (Deployment, error) {
+	if err := cancelStaleCleanup(ctx, q, inst.ID, app.ID, now); err != nil {
+		return Deployment{}, err
+	}
 	id := randx.ID("dep-", 12)
 	return scanDeployment(q.QueryRow(ctx, `INSERT INTO app_deployments (id, instance_id, user_id, app_id, app_version_id, state, desired, env, secret_env_enc, port, spec_hash, next_poll_at, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, 'queued', 'running', $6, $7, $8, $9, $10, $10, $10) RETURNING `+depCols,

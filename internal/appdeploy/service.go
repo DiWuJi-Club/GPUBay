@@ -127,11 +127,6 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Deployment, er
 		if err != nil {
 			return err
 		}
-		// 同一应用的旧部署若还等着清理目录（停机时卸载），新部署会用同一个目录：取消清理，免得 Runner 删掉新部署的文件
-		if _, err := tx.Exec(ctx, `UPDATE app_deployments SET cleanup_pending = false, updated_at = $3, row_version = row_version + 1
-			WHERE instance_id = $1 AND app_id = $2 AND state = 'removed' AND cleanup_pending`, inst.ID, app.ID, now); err != nil {
-			return err
-		}
 		if out, err = s.insert(ctx, tx, inst, req.UserID, app, ver, plain, secret, now); err != nil {
 			return err
 		}

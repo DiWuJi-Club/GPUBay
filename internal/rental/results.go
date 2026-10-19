@@ -138,6 +138,9 @@ func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from
 	if err := recordEvent(ctx, tx, inst.ID, from, StateRunning, reason, now); err != nil {
 		return err
 	}
+	if err := s.apps().OnInstanceRunning(ctx, tx, inst.ID, now); err != nil {
+		return err
+	}
 	return s.refreshLease(ctx, tx, inst.ID, now)
 }
 
@@ -168,6 +171,9 @@ func (s *Service) startBooked(ctx context.Context, tx pgx.Tx, inst Instance, now
 		reason = fmt.Sprintf("agent: created (scheduled %s, late by %s)", tz.Format(start), now.Sub(start).Round(time.Second))
 	}
 	if err := recordEvent(ctx, tx, inst.ID, StateCreating, StateRunning, reason, now); err != nil {
+		return err
+	}
+	if err := s.apps().OnInstanceRunning(ctx, tx, inst.ID, now); err != nil {
 		return err
 	}
 	if short := want.Sub(expires); short > 0 {
@@ -208,6 +214,9 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 		return err
 	}
 	if err := recordEvent(ctx, tx, inst.ID, StateCreating, StateFailed, reason, now); err != nil {
+		return err
+	}
+	if err := s.apps().OnInstanceGone(ctx, tx, inst.ID, "开通失败", now); err != nil {
 		return err
 	}
 	if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
