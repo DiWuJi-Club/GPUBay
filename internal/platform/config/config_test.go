@@ -375,3 +375,49 @@ func TestAliyunRequiresBookingTemplates(t *testing.T) {
 		t.Fatalf("load = %+v, %v", cfg.Aliyun, err)
 	}
 }
+
+func TestLoadAppDefaultsAndValues(t *testing.T) {
+	base := func(kv ...string) map[string]string {
+		m := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	c, err := config.Load(env(base()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AppHFEndpoint != "https://hf-mirror.com" || c.AppPipIndexURL != "https://pypi.tuna.tsinghua.edu.cn/simple" || !c.AppRunner {
+		t.Fatalf("app defaults = %q %q %v", c.AppHFEndpoint, c.AppPipIndexURL, c.AppRunner)
+	}
+	c, err = config.Load(env(base("SPARK_APP_HF_ENDPOINT", "http://hf.internal:8080", "SPARK_APP_PIP_INDEX_URL", "http://pypi.internal/simple",
+		"SPARK_APP_RUNNER", "off")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AppHFEndpoint != "http://hf.internal:8080" || c.AppPipIndexURL != "http://pypi.internal/simple" || c.AppRunner {
+		t.Fatalf("app values = %q %q %v", c.AppHFEndpoint, c.AppPipIndexURL, c.AppRunner)
+	}
+	if c, err = config.Load(env(base("SPARK_APP_RUNNER", "on"))); err != nil || !c.AppRunner {
+		t.Fatalf("SPARK_APP_RUNNER=on: %v %v", c.AppRunner, err)
+	}
+	for _, bad := range []map[string]string{
+		base("SPARK_APP_RUNNER", "true"),
+		base("SPARK_APP_RUNNER", "yes"),
+		base("SPARK_APP_HF_ENDPOINT", "hf-mirror.com"),
+		base("SPARK_APP_PIP_INDEX_URL", "ftp://pypi/simple"),
+	} {
+		if _, err := config.Load(env(bad)); err == nil || !strings.Contains(err.Error(), "SPARK_APP_") {
+			t.Fatalf("%v: err = %v, want SPARK_APP_* error", bad, err)
+		}
+	}
+	// 字面量（测试 / e2e-server）补默认值；已设置的不覆盖
+	lit := config.Config{}.FillAppDefaults()
+	if lit.AppHFEndpoint != "https://hf-mirror.com" || lit.AppPipIndexURL != "https://pypi.tuna.tsinghua.edu.cn/simple" {
+		t.Fatalf("literal app defaults = %+v", lit)
+	}
+	if got := (config.Config{AppHFEndpoint: "http://x"}).FillAppDefaults().AppHFEndpoint; got != "http://x" {
+		t.Fatalf("FillAppDefaults overwrote %q", got)
+	}
+}
