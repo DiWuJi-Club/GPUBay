@@ -7,7 +7,8 @@ import { api } from '../api'
 import AppDialog from '../components/AppDialog.vue'
 import { usePolling } from '../composables/usePolling'
 import { useTicker } from '../composables/useTicker'
-import { canCancel, instanceTimeText, partitionQuotes, remainingNow, sumCancelQuotes } from '../logic/instance'
+import { summaryTag } from '../logic/apps'
+import { canCancel, instanceTimeText, needsRefresh, partitionQuotes, remainingNow, sumCancelQuotes } from '../logic/instance'
 import { notifyError } from '../logic/notify'
 
 const route = useRoute()
@@ -41,8 +42,8 @@ async function retry() {
   await load()
 }
 
-// 有开通中 / 洗机中 / 已预订的实例时每 10 秒刷新（预订到开通时刻会自动变为开通中）
-const busy = computed(() => items.value.some((i) => i.state === 'creating' || i.state === 'wiping' || i.state === 'reserved'))
+// 有开通中 / 洗机中 / 已预订的实例，或运行中的实例有排队 / 部署中的应用时每 10 秒刷新（预订到开通时刻会自动变为开通中）
+const busy = computed(() => items.value.some(needsRefresh))
 usePolling(load, 10_000, { enabled: () => busy.value })
 onMounted(load)
 
@@ -50,9 +51,14 @@ const shown = computed(() => (batchFilter.value ? items.value.filter((i) => i.ba
 const rows = computed(() =>
   shown.value.map((i) => {
     const remaining = remainingNow(i, fetchedAt.value, now.value)
-    return { ...i, remaining, timeText: instanceTimeText(i, remaining), cancellable: canCancel(i, fetchedAt.value, now.value) }
+    const apps = (i.apps_summary ?? []).map((a) => ({ ...a, tag: summaryTag(a), clickable: i.state === 'running' && a.state === 'running' && !!a.url }))
+    return { ...i, remaining, timeText: instanceTimeText(i, remaining), cancellable: canCancel(i, fetchedAt.value, now.value), apps }
   }),
 )
+/** 运行中的应用标签可点：新窗口打开应用网址（私有端口由实例域名跳控制台 authorize 换票据）。 */
+function openApp(url: string | null) {
+  if (url) window.open(url, '_blank', 'noopener')
+}
 const cancellableCount = computed(() => rows.value.filter((r) => r.cancellable).length)
 const cancelling = ref(false)
 const cancelAllVisible = ref(false)
@@ -151,6 +157,12 @@ async function cancelAll() {
         <div class="muted" data-testid="instance-image">{{ i.image_name }}</div>
         <div v-if="i.batch_id" class="muted"><router-link :to="{ path: '/instances', query: { batch: i.batch_id } }" data-testid="instance-batch">批次 {{ i.batch_id }}</router-link></div>
         <div data-testid="instance-time" :data-remaining="i.remaining">{{ i.timeText }}</div>
+        <div v-if="i.apps.length" class="apps">
+          <el-tag
+            v-for="a in i.apps" :key="a.id" :type="a.tag.type as 'primary'" size="small" :class="{ link: a.clickable }"
+            data-testid="instance-app" :data-dep="a.id" :data-state="a.state" @click="a.clickable && openApp(a.url)"
+          >{{ a.name }} · {{ a.tag.text }}</el-tag>
+        </div>
         <div v-if="i.reassign_count > 0" class="muted" data-testid="instance-reassigned">已更换机器</div>
         <div v-if="i.cancellable" class="muted" data-testid="instance-cancellable">可取消</div>
         <div v-if="i.suspended" class="warn" data-testid="instance-suspended">计时已暂停（机器维护中）</div>
@@ -171,7 +183,15 @@ async function cancelAll() {
         </template>
       </el-table-column>
       <el-table-column label="时长" min-width="220">
-        <template #default="{ row }"><span data-testid="instance-time" :data-remaining="row.remaining">{{ row.timeText }}</span></template>
+        <template #default="{ row }">
+          <span data-testid="instance-time" :data-remaining="row.remaining">{{ row.timeText }}</span>
+          <div v-if="row.apps.length" class="apps">
+            <el-tag
+              v-for="a in row.apps" :key="a.id" :type="a.tag.type as 'primary'" size="small" :class="{ link: a.clickable }"
+              data-testid="instance-app" :data-dep="a.id" :data-state="a.state" @click="a.clickable && openApp(a.url)"
+            >{{ a.name }} · {{ a.tag.text }}</el-tag>
+          </div>
+        </template>
       </el-table-column>
       <el-table-column label="批次 / 备注" min-width="200">
         <template #default="{ row }">
@@ -203,4 +223,6 @@ async function cancelAll() {
 .batch-head { margin-bottom: 12px; }
 .batch-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .grow { flex: 1; }
+.apps { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.apps .link { cursor: pointer; }
 </style>

@@ -6,8 +6,8 @@ import {
 import type { AppCategory, DeploymentState } from '../types'
 
 const states: DeploymentState[] = ['queued', 'installing', 'running', 'stopped', 'failed', 'removing', 'removed', 'lost']
-const errorCodes = ['script_failed', 'timeout', 'health_failed', 'upload_failed', 'unreachable', 'port_conflict', 'port_limit', 'instance_gone', 'crashed', 'disk']
-const phases = ['prepare', 'download', 'install', 'start', 'health']
+const errorCodes = ['script_failed', 'timeout', 'health_failed', 'upload_failed', 'unreachable', 'port_conflict', 'port_limit', 'instance_gone', 'crashed', 'disk', 'deploy_busy']
+const phases = ['prepare', 'download', 'install', 'start', 'health', 'busy']
 const categories: AppCategory[] = ['llm', 'image', 'notebook', 'tool']
 
 describe('应用部署文案', () => {
@@ -20,11 +20,12 @@ describe('应用部署文案', () => {
     expect(labelOf(deploymentStateLabel, 'installing')).toBe('部署中')
     expect(labelOf(deploymentStateType, 'failed')).toBe('danger')
   })
-  it('10 个错误码都有中文', () => {
+  it('11 个错误码都有中文', () => {
     expect(Object.keys(deploymentErrorLabel).sort()).toEqual([...errorCodes].sort())
     for (const c of errorCodes) expect(deploymentErrorLabel[c]).toBeTruthy()
+    expect(labelOf(deploymentErrorLabel, 'deploy_busy')).toBe('上一次部署长时间未结束')
   })
-  it('5 个阶段都有中文', () => {
+  it('6 个阶段都有中文', () => {
     expect(Object.keys(deploymentPhaseLabel).sort()).toEqual([...phases].sort())
     for (const p of phases) expect(deploymentPhaseLabel[p]).toBeTruthy()
   })

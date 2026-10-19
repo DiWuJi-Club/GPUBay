@@ -1,6 +1,6 @@
 import type { Instance } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { autoRenewFailureText, canCancel, partitionQuotes, sumCancelQuotes, canRelease, canRenew, canSetAutoRenew, instanceTimeText, releaseWarning, remainingNow, renewQuantityMax } from '../instance'
+import { autoRenewFailureText, canCancel, needsRefresh, partitionQuotes, sumCancelQuotes, canRelease, canRenew, canSetAutoRenew, instanceTimeText, releaseWarning, remainingNow, renewQuantityMax } from '../instance'
 
 const base: Instance = {
   id: 'ins-abc12345', state: 'running', product_id: 1, image_id: 1, product_name: 'DGX Spark 整机', image_name: 'PyTorch', suspended: false,
@@ -106,5 +106,23 @@ describe('批次报价部分失败', () => {
       { status: 'fulfilled', value: q }, { status: 'rejected', reason: new Error('x') }, { status: 'fulfilled', value: { ...q, refund: 50 } },
     ])
     expect(out).toEqual({ ids: ['a', 'c'], quotes: [q, { ...q, refund: 50 }], failed: ['b'] })
+  })
+})
+
+describe('needsRefresh（列表每 10 秒刷新）', () => {
+  const summary = (state: 'queued' | 'installing' | 'running' | 'failed' | 'removing') => [{ id: 'd', name: 'vLLM', state, progress: 0, url: null }]
+  it('开通中 / 洗机中 / 已预订刷新', () => {
+    for (const s of ['creating', 'wiping', 'reserved'] as const) expect(needsRefresh({ ...base, state: s })).toBe(true)
+    expect(needsRefresh(base)).toBe(false)
+  })
+  it('运行中且有排队 / 部署中 / 卸载中的应用时刷新', () => {
+    expect(needsRefresh({ ...base, apps_summary: summary('installing') })).toBe(true)
+    expect(needsRefresh({ ...base, apps_summary: summary('queued') })).toBe(true)
+    expect(needsRefresh({ ...base, apps_summary: summary('removing') })).toBe(true)
+    expect(needsRefresh({ ...base, apps_summary: summary('running') })).toBe(false)
+    expect(needsRefresh({ ...base, apps_summary: summary('failed') })).toBe(false)
+  })
+  it('停机实例上排队的应用要等续费，不轮询', () => {
+    expect(needsRefresh({ ...base, state: 'stopped', apps_summary: summary('queued') })).toBe(false)
   })
 })

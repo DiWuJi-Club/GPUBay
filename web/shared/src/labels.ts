@@ -70,10 +70,12 @@ export const deploymentStateLabel: LabelMap = {
 export const deploymentStateType: LabelMap = {
   queued: 'info', installing: 'primary', running: 'success', stopped: 'info', failed: 'danger', removing: 'warning', removed: 'info', lost: 'info',
 }
-export const deploymentPhaseLabel: LabelMap = { prepare: '准备', download: '下载模型', install: '安装', start: '启动', health: '健康检查' }
+// busy：queued 期间上一次部署仍在容器里进行（run.sh 部署锁），Runner 30 秒后自动重试
+export const deploymentPhaseLabel: LabelMap = { prepare: '准备', download: '下载模型', install: '安装', start: '启动', health: '健康检查', busy: '等待上一次部署结束' }
 export const deploymentErrorLabel: LabelMap = {
   script_failed: '脚本执行失败', timeout: '部署超时', health_failed: '健康检查未通过', upload_failed: '部署包上传失败', unreachable: '无法连接容器',
   port_conflict: '端口冲突', port_limit: '端口数量超限', instance_gone: '实例已不存在', crashed: '服务进程已退出', disk: '数据盘空间不足',
+  deploy_busy: '上一次部署长时间未结束',
 }
 export const appCategoryLabel: LabelMap = { llm: '大模型', image: '图像生成', notebook: 'Notebook', tool: '工具' }
 export const appStatusLabel: LabelMap = { draft: '草稿', published: '已发布', retired: '已退役' }

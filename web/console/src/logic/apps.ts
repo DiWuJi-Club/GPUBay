@@ -1,6 +1,6 @@
 import {
   deploymentErrorLabel, deploymentPhaseLabel, deploymentStateLabel, deploymentStateType, labelOf,
-  type AppCatalogItem, type AppEnvSpec, type Deployment, type Image, type InstanceState,
+  type AppCatalogItem, type AppEnvSpec, type AppsSummaryItem, type Deployment, type DeploymentEvent, type Image, type InstanceState, type UserEvent,
 } from '@spark/shared'
 
 // 与 internal/appdeploy 保持一致：MinSecretLen、max_len 缺省值
@@ -125,4 +125,80 @@ export function deploymentStatusText(d: Deployment, instanceState: InstanceState
   }
   if (d.state === 'failed') return { text: d.error_code ? `失败：${labelOf(deploymentErrorLabel, d.error_code)}` : '失败', type: 'danger' }
   return { text: labelOf(deploymentStateLabel, d.state), type: labelOf(deploymentStateType, d.state) }
+}
+
+/** 每个实例最多部署的应用数（与 internal/appdeploy.MaxAppsPerInstance 一致）。 */
+export const MAX_APPS = 3
+
+/** 实例这些状态下可添加应用（非 running 时建 queued，开通 / 恢复后自动部署）。 */
+export const canAddApp = (s: InstanceState) => s === 'reserved' || s === 'creating' || s === 'running' || s === 'stopped'
+
+/** 实例不在运行时，每行部署下的提示；running 返回 null。 */
+export function instanceAppHint(s: InstanceState): string | null {
+  if (s === 'stopped') return '实例已停机，续费后自动恢复'
+  if (s === 'reserved' || s === 'creating') return '将在开通后自动部署'
+  return null
+}
+
+/** 重新部署 / 停止 / 启动只在实例运行中可用；返回不可用原因（null = 可用）。查看日志、卸载不受限。 */
+export function appOpBlockReason(s: InstanceState): string | null {
+  if (s === 'running') return null
+  if (s === 'stopped') return '实例已停机，续费后可操作'
+  if (s === 'reserved' || s === 'creating') return '实例开通后可操作'
+  return '实例未运行'
+}
+
+/** 操作菜单按规格 §6.2 的允许状态显示。 */
+export function deploymentActions(d: Pick<Deployment, 'state' | 'desired'>): { redeploy: boolean; stop: boolean; start: boolean; remove: boolean } {
+  const live = d.state !== 'removed' && d.state !== 'lost'
+  return {
+    redeploy: d.state === 'running' || d.state === 'stopped' || d.state === 'failed',
+    stop: (d.state === 'installing' || d.state === 'running') && d.desired === 'running',
+    start: d.state === 'stopped',
+    remove: live && d.state !== 'removing',
+  }
+}
+
+/** 部署行需要较快刷新：Runner 正在推进（排队 / 部署中 / 卸载中 / 已请求停止）。 */
+export const deploymentBusy = (d: Pick<Deployment, 'state' | 'desired'>) =>
+  d.state === 'queued' || d.state === 'installing' || d.state === 'removing' || (d.state === 'running' && d.desired !== 'running')
+
+/** 「添加应用」弹窗里应用卡片的灰显原因：已部署 / 实例镜像不兼容（null = 可选）。 */
+export function addPickReason(app: AppCatalogItem, imageId: number, deployed: Pick<Deployment, 'app_id'>[]): string | null {
+  if (deployed.some((d) => d.app_id === app.id)) return '已部署'
+  if (!app.images.some((i) => i.id === imageId)) return `需要镜像：${app.images.map((i) => i.name).join('、') || '—'}`
+  return null
+}
+
+/** 实例列表的应用摘要标签：部署中 45%（蓝）/ 运行中（绿）/ 失败（红）/ 已停止（灰），其余按状态文案。 */
+export function summaryTag(a: AppsSummaryItem): { text: string; type: string } {
+  if (a.state === 'installing') return { text: `部署中 ${a.progress}%`, type: 'primary' }
+  return { text: labelOf(deploymentStateLabel, a.state), type: labelOf(deploymentStateType, a.state) }
+}
+
+/**
+ * 重新部署弹窗的变量初值：目标版本 spec 声明的普通变量取当前部署的值（没有则取默认值）；secret 一律空串（从不回显，留空沿用）。
+ * secretSet 只保留目标版本里仍是 secret 的已设置项。
+ */
+export function redeployForm(d: Pick<Deployment, 'env' | 'secret_env'>, spec: AppEnvSpec[]): { values: Record<string, string>; secretSet: Record<string, boolean> } {
+  const defaults = envDefaults(spec)
+  const values: Record<string, string> = {}
+  const secretSet: Record<string, boolean> = {}
+  for (const e of spec) {
+    if (e.type === 'secret') {
+      values[e.name] = d.secret_env[e.name] ? '' : defaults[e.name]
+      if (d.secret_env[e.name]) secretSet[e.name] = true
+    } else values[e.name] = d.env[e.name] ?? defaults[e.name]
+  }
+  return { values, secretSet }
+}
+
+export interface TimelineItem { at: string; kind: string; text: string }
+
+/** 「动态」卡片：实例事件与各部署事件合并，新到旧；部署事件 kind = app，文本前缀应用名。 */
+export function mergeTimeline(inst: UserEvent[], apps: { name: string; events: DeploymentEvent[] }[]): TimelineItem[] {
+  const out: TimelineItem[] = inst.map((e) => ({ at: e.at, kind: e.reason_kind, text: e.detail }))
+  for (const a of apps) for (const e of [...a.events].reverse()) out.push({ at: e.at, kind: 'app', text: `${a.name}：${e.detail}` })
+  // 稳定排序：同一时刻保持原顺序（实例事件本就新到旧，部署事件已反转为新到旧）
+  return out.map((x, i) => ({ x, i, t: Date.parse(x.at) })).sort((a, b) => b.t - a.t || a.i - b.i).map((y) => y.x)
 }
