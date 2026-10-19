@@ -4,7 +4,10 @@ platform 镜像以 distroless nonroot（uid/gid 65532）运行，没有 shell。
 
 需要 Docker Compose ≥ v2.24（acme 服务的 `env_file` 用了带 `required: false` 的长格式）。
 
-1. 宿主机：把自己的 OpenSSH 挪到别的端口（例如 `/etc/ssh/sshd_config` 里 `Port 2200`，先在新端口验证登录再 `systemctl restart ssh`），22 留给平台 SSH 网关。
+1. 宿主机：把自己的 OpenSSH 挪到别的端口，22 留给平台 SSH 网关。Ubuntu 22.10 及以后默认用 `ssh.socket` 套接字激活，只改配置再 `systemctl restart ssh` **不会**换端口，必须 `daemon-reload` 并重启 `ssh.socket`。为防把自己锁在外面，分两步：
+   - 先同时监听两个端口：`printf 'Port 22\nPort 2200\n' | sudo tee /etc/ssh/sshd_config.d/10-ports.conf && sudo sshd -t && sudo systemctl daemon-reload && sudo systemctl restart ssh.socket`，另开终端 `ssh -p 2200 <用户>@<宿主机> true` 确认能登录；
+   - 再只留新端口：`printf 'Port 2200\n' | sudo tee /etc/ssh/sshd_config.d/10-ports.conf && sudo sshd -t && sudo systemctl daemon-reload && sudo systemctl restart ssh.socket`，`ss -lnt | grep :22` 应为空。
+   （未启用 `ssh.socket` 的系统改完配置 `systemctl restart ssh` 即可。）
 2. DNS：`<domain>`、`ssh.<domain>`、`*.<ingress_domain>` 都指向控制面公网 **IPv4** 地址（A 记录）；`agent.<domain>`（或内网 IP）给 Agent 用。生产强烈建议 ingress 域用与 `<domain>` 不同的注册域（或已进 PSL 的域）：租户页面的 JS 能在父域上种 Cookie。
    **不要加 AAAA 记录**：compose 只把端口发布在 IPv4（`0.0.0.0:…`）。默认 compose 网络没有 IPv6，IPv6 客户端要经 docker-proxy 转发，到 platform 时全都变成同一个网桥地址，按 IP 的 SSH 暴力破解限额与限流会把所有 IPv6 用户当成一个人（一人触发、全体被封）。确需 IPv6 时先给 compose 网络启用 IPv6（`enable_ipv6: true` + dockerd 的 `ip6tables`），让源地址原样到达，再发布 `[::]` 端口、加 AAAA。
 3. 配置：`cp .env.example .env` 填写（`POSTGRES_PASSWORD`、`SPARK_SECRET_KEY`、`AGENT_BIND_IP`、各插件变量）。`POSTGRES_PASSWORD` 只在 `pgdata` 卷首次初始化时生效，之后改它要先在库里 `ALTER ROLE spark PASSWORD ...`。
