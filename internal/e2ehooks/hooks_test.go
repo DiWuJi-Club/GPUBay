@@ -427,13 +427,14 @@ func TestSSHAndIngressUpstreamHooks(t *testing.T) {
 	defer front.Close()
 	req, _ := http.NewRequest("GET", front.URL+"/x?y=1", nil)
 	req.Host = inst.ID + "-8888.spark.test"
+	req.Header.Set("Cookie", "app=1; sc_ingress=forged")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	b, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if want := "second|host=" + inst.ID + "-8888.spark.test|path=/x?y=1"; resp.StatusCode != 200 || string(b) != want {
+	if want := "second|host=" + inst.ID + "-8888.spark.test|path=/x?y=1|cookie=app=1"; resp.StatusCode != 200 || string(b) != want {
 		t.Fatalf("ingress = %d %q, want %q", resp.StatusCode, b, want)
 	}
 	if code, _ := e.call("POST", "/hooks/ingress-upstream", map[string]any{"port": 0, "body": "x"}); code != 400 {

@@ -554,7 +554,7 @@ func (s *Server) ssh(ctx context.Context, body json.RawMessage) (any, error) {
 }
 
 // ingressUpstream 让假容器 sshd 把到容器内 127.0.0.1:<port> 的 direct-tcpip 转到一个回显服务：
-// 响应体形如 `body|host=<Host>|path=<RequestURI>`（断言域名与路径原样透传）。
+// 响应体形如 `body|host=<Host>|path=<RequestURI>|cookie=<到达容器的 Cookie 头>`（断言域名、路径原样透传，sc_ingress 被剥掉）。
 // 之后立即刷新入口路由表：用例先经 API 加端口、再调本钩子，就不必等 2 秒的定时刷新。
 func (s *Server) ingressUpstream(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := decode[struct {
@@ -570,22 +570,19 @@ func (s *Server) ingressUpstream(ctx context.Context, body json.RawMessage) (any
 	if s.Upstream == nil {
 		return nil, errors.New("fake upstream not configured")
 	}
-	// 同一端口再次登记：先关掉上一个回显服务（它的 stop 会删掉该端口的目标，必须在登记新服务之前调用）
+	// 整个替换在 s.mu 内完成：并发的同端口登记不会交错。旧服务的 stop 会删掉该端口的目标，必须在登记新服务之前调用
 	s.mu.Lock()
-	prev := s.upstreamStops[req.Port]
-	s.mu.Unlock()
-	if prev != nil {
+	defer s.mu.Unlock()
+	if prev := s.upstreamStops[req.Port]; prev != nil {
 		prev()
 	}
-	s.mu.Lock()
 	if s.upstreamStops == nil {
 		s.upstreamStops = map[int]func(){}
 	}
 	s.upstreamStops[req.Port] = s.Upstream.ServeHTTP(req.Port, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "%s|host=%s|path=%s", req.Body, r.Host, r.URL.RequestURI())
+		fmt.Fprintf(w, "%s|host=%s|path=%s|cookie=%s", req.Body, r.Host, r.URL.RequestURI(), strings.Join(r.Header.Values("Cookie"), "; "))
 	}))
-	s.mu.Unlock()
 	if err := s.App.Routes.Refresh(ctx); err != nil {
 		return nil, fmt.Errorf("refresh routes: %w", err)
 	}

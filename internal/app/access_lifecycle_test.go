@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -57,26 +58,45 @@ func TestAccessLifecycle(t *testing.T) {
 	gwDone := make(chan struct{})
 	go func() { defer close(gwDone); a.SSH.Serve(gwCtx, sshLis) }()
 	defer func() { stopGW(); <-gwDone }()
-	loopCtx, stopLoops := context.WithCancel(ctx)
-	go a.RunAccessLoops(loopCtx)
-	defer stopLoops()
+	// 不启动 RunAccessLoops：它的 2 秒定时刷新可能在显式 refresh() 之后写回更早读到的路由快照；本测试每次变更后自己刷新
 	ts := httptest.NewServer(a.Handler)
 	defer ts.Close()
 	// 对外地址按 FillAccessDefaults 是 http://spark.test:8080；Cookie / 跳转校验只看 scheme 与域名格式，这里用 Host 头模拟
 	jar, _ := cookiejar.New(nil)
 	c := &client{t: t, base: ts.URL + "/api/v1", http: &http.Client{Jar: jar}}
-	mid := dbtest.CreateMachine(t, pool, "SN001")
-	pool.Exec(ctx, `UPDATE machines SET lan_ip = '127.0.0.1' WHERE id = $1`, mid)
-	agent := func() {
+	machine := func(serial string) int64 {
 		t.Helper()
-		a.Fleet.Heartbeat(ctx, mid)
-		cmds, _ := a.Fleet.PendingCommands(ctx, mid)
+		m := dbtest.CreateMachine(t, pool, serial)
+		if _, err := pool.Exec(ctx, `UPDATE machines SET lan_ip = '127.0.0.1' WHERE id = $1`, m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	// agentOn 模拟机器上的 Agent：心跳并成功执行全部待处理指令
+	agentOn := func(m int64) {
+		t.Helper()
+		if _, err := a.Fleet.Heartbeat(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+		cmds, err := a.Fleet.PendingCommands(ctx, m)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for _, cmd := range cmds {
 			if err := a.Rental.HandleCommandResult(ctx, cmd.ID, true, "ok"); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
+	// refresh 立即重载入口路由表（生产由 RunAccessLoops 每 2 秒刷新；这里不依赖真实时间）
+	refresh := func() {
+		t.Helper()
+		if err := a.Routes.Refresh(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mid := machine("SN001")
+	agent := func() { t.Helper(); agentOn(mid) }
 	c.do("POST", "/auth/sms-code", map[string]string{"phone": "13800005678"})
 	c.do("POST", "/auth/login", map[string]string{"phone": "13800005678", "code": "000000"})
 	c.do("POST", "/kyc/personal", map[string]string{"name": "王五", "id_number": "110101199001011234"})
@@ -127,7 +147,7 @@ func TestAccessLifecycle(t *testing.T) {
 	}
 	// 端口：私有 → 302 到 authorize → callback → 200；公开 → 直接 200
 	c.do("POST", "/instances/"+id+"/ports", map[string]any{"port": 8888, "note": "lab"})
-	time.Sleep(2500 * time.Millisecond) // 路由表 2 秒刷新
+	refresh()
 	host := id + "-8888.spark.test"
 	noFollow := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	tsURL, _ := url.Parse(ts.URL)
@@ -169,11 +189,22 @@ func TestAccessLifecycle(t *testing.T) {
 		t.Fatalf("callback = %d %s cookies=%v", r3.StatusCode, r3.Header.Get("Location"), r3.Cookies())
 	}
 	withCookie := func(h, path string) *http.Response {
+		t.Helper()
 		req, _ := http.NewRequest("GET", ts.URL+path, nil)
 		req.Host = h
 		req.AddCookie(ingressCookie)
-		resp, _ := noFollow.Do(req)
+		resp, err := noFollow.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		return resp
+	}
+	// status 发请求后关闭响应体，只返回状态码
+	status := func(resp *http.Response) int {
+		t.Helper()
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode
 	}
 	r4 := withCookie(host, "/lab")
 	b4, _ := io.ReadAll(r4.Body)
@@ -182,31 +213,36 @@ func TestAccessLifecycle(t *testing.T) {
 		t.Fatalf("private with cookie = %d %q", r4.StatusCode, b4)
 	}
 	c.do("PUT", "/instances/"+id+"/ports/8888", map[string]string{"visibility": "public"})
-	time.Sleep(2500 * time.Millisecond)
-	if r := getHost(http.DefaultClient, host, "/"); r.StatusCode != 200 {
-		t.Fatalf("public = %d", r.StatusCode)
+	refresh()
+	if code := status(getHost(http.DefaultClient, host, "/")); code != 200 {
+		t.Fatalf("public = %d", code)
 	}
 	// 登出控制台 → 私有端口 Cookie 失效
 	c.do("PUT", "/instances/"+id+"/ports/8888", map[string]string{"visibility": "private"})
 	c.do("POST", "/auth/logout", map[string]any{})
-	clk.Advance(61 * time.Second) // 越过验证码 60 秒限流（仍大于会话 2 秒缓存）
-	time.Sleep(2500 * time.Millisecond)
-	if r := withCookie(host, "/lab"); r.StatusCode != 302 {
-		t.Fatalf("after logout = %d", r.StatusCode)
+	refresh()
+	// 越过验证码 60 秒限流；入口的会话缓存（2 秒）按注入的时钟计时，推进假时钟即失效，不需要真实等待
+	clk.Advance(61 * time.Second)
+	if code := status(withCookie(host, "/lab")); code != 302 {
+		t.Fatalf("after logout = %d", code)
 	}
 	c.do("POST", "/auth/sms-code", map[string]string{"phone": "13800005678"})
 	c.do("POST", "/auth/login", map[string]string{"phone": "13800005678", "code": "000000"})
 	// 到期停机 → SSH 拒绝、Web 503 → 续费恢复
 	clk.Advance(25 * time.Hour)
-	a.Fleet.Heartbeat(ctx, mid)
-	a.Rental.Sweep(ctx)
+	if _, err := a.Fleet.Heartbeat(ctx, mid); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Rental.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
 	agent()
 	if _, err := sshExec(ssh.PublicKeys(userSigner), "echo x"); err == nil {
 		t.Fatal("ssh allowed while stopped")
 	}
-	time.Sleep(2500 * time.Millisecond)
-	if r := getHost(http.DefaultClient, host, "/"); r.StatusCode != 503 {
-		t.Fatalf("stopped web = %d", r.StatusCode)
+	refresh()
+	if code := status(getHost(http.DefaultClient, host, "/")); code != 503 {
+		t.Fatalf("stopped web = %d", code)
 	}
 	c.do("POST", "/instances/"+id+"/renew", map[string]string{"duration": "1d"})
 	agent()
@@ -214,54 +250,47 @@ func TestAccessLifecycle(t *testing.T) {
 		t.Fatalf("after renew = %q %v", out, err)
 	}
 	// 换机：新实例保留端口与 password_auth、能用公钥登录；旧 ID 的 Web 走 404、SSH 被拒
-	mid2 := dbtest.CreateMachine(t, pool, "SN002")
-	pool.Exec(ctx, `UPDATE machines SET lan_ip = '127.0.0.1' WHERE id = $1`, mid2)
+	mid2 := machine("SN002")
 	moved, err := a.Rental.AdminMigrate(ctx, audit.Actor{AdminID: 1}, id, "bad gpu")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, m := range []int64{mid, mid2} {
-		a.Fleet.Heartbeat(ctx, m)
-		cmds, _ := a.Fleet.PendingCommands(ctx, m)
-		for _, cmd := range cmds {
-			a.Rental.HandleCommandResult(ctx, cmd.ID, true, "ok")
-		}
-	}
+	agentOn(mid)
+	agentOn(mid2)
 	ports := c.do("GET", "/instances/"+moved.ID+"/ports", nil)["items"].([]any)
 	newInst := c.do("GET", "/instances/"+moved.ID, nil)
 	if len(ports) != 1 || ports[0].(map[string]any)["port"].(float64) != 8888 || newInst["password_auth"] != false || newInst["state"] != "running" {
 		t.Fatalf("migrated instance = %v ports=%v", newInst, ports)
 	}
-	time.Sleep(2500 * time.Millisecond)
-	if r := getHost(http.DefaultClient, host, "/"); r.StatusCode != 404 {
-		t.Fatalf("old instance web after migrate = %d", r.StatusCode)
+	refresh()
+	if code := status(getHost(http.DefaultClient, host, "/")); code != 404 {
+		t.Fatalf("old instance web after migrate = %d", code)
 	}
 	if _, err := sshExec(ssh.PublicKeys(userSigner), "echo x"); err == nil {
 		t.Fatal("old instance ssh allowed after migrate")
 	}
+	firstID := id
 	id = moved.ID
 	if out, err := sshExec(ssh.PublicKeys(userSigner), "echo moved"); err != nil || out != "moved\n" {
 		t.Fatalf("new instance ssh = %q %v", out, err)
 	}
 	// 释放 → 拒绝、主机私钥清空
 	c.do("POST", "/instances/"+id+"/release", map[string]any{})
-	agent2 := func() {
-		a.Fleet.Heartbeat(ctx, mid2)
-		cmds, _ := a.Fleet.PendingCommands(ctx, mid2)
-		for _, cmd := range cmds {
-			a.Rental.HandleCommandResult(ctx, cmd.ID, true, "ok")
-		}
-	}
-	agent2()
+	agentOn(mid2)
 	if _, err := sshExec(ssh.PublicKeys(userSigner), "echo x"); err == nil {
 		t.Fatal("ssh allowed after release")
 	}
-	if pem, _ := a.Rental.HostKeyPEM(ctx, id); pem != "" {
-		t.Fatal("host key not cleared after release")
+	if pem, err := a.Rental.HostKeyPEM(ctx, id); err != nil || pem != "" {
+		t.Fatalf("host key not cleared after release: %q %v", pem, err)
 	}
-	var payload string
-	pool.QueryRow(ctx, `SELECT payload::text FROM agent_commands WHERE instance_id = $1 AND type = 'create_instance'`, id).Scan(&payload)
-	if strings.Contains(payload, "PRIVATE") {
-		t.Fatal("host key leaked into command payload")
+	// 主机私钥不进任何 Agent 指令（两个实例的开通 / 停机 / 启动 / 洗机）：PEM 原文、PEM 正文、整段 base64（JSON 里 bytes 的编码）都不能出现
+	var payloads string
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(payload::text, E'\n'), ''), count(*) FROM agent_commands WHERE instance_id IN ($1, $2)`, firstID, id).Scan(&payloads, &n); err != nil {
+		t.Fatal(err)
+	}
+	pemBody := strings.Join(strings.Split(strings.TrimSpace(string(hostPEM)), "\n")[1:2], "")
+	if n < 4 || strings.Contains(payloads, "PRIVATE") || strings.Contains(payloads, pemBody) || strings.Contains(payloads, base64.StdEncoding.EncodeToString(hostPEM)) {
+		t.Fatalf("host key leaked into command payloads (%d commands)", n)
 	}
 }

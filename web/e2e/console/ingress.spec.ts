@@ -22,11 +22,14 @@ test('C-ING-01 私有端口：未登录 → 登录页 → 回到目标页，内�
   await page.getByTestId('login-code').fill('000000')
   await page.getByTestId('login-submit').click()
   await expect(page).toHaveURL(`${portUrl(id, 8888)}/lab/tree?x=1`)
-  await expect(page.locator('body')).toHaveText(`hello-lab|host=${id}-8888.spark.test:18080|path=/lab/tree?x=1`)
+  await expect(page.locator('body')).toHaveText(`hello-lab|host=${id}-8888.spark.test:18080|path=/lab/tree?x=1|cookie=`)
+  // 应用自己的 Cookie 原样到达容器；平台的 sc_ingress 浏览器带着，但转发前被剥掉
+  await page.context().addCookies([{ name: 'app', value: '1', domain: `${id}-8888.spark.test`, path: '/' }])
   const resp = await page.goto(`${portUrl(id, 8888)}/again`)
   expect(resp!.url()).toBe(`${portUrl(id, 8888)}/again`)
   expect(resp!.request().redirectedFrom()).toBeNull()
-  await expect(page.locator('body')).toHaveText(`hello-lab|host=${id}-8888.spark.test:18080|path=/again`)
+  expect(await resp!.request().headerValue('cookie')).toMatch(/(^|; )sc_ingress=/)
+  await expect(page.locator('body')).toHaveText(`hello-lab|host=${id}-8888.spark.test:18080|path=/again|cookie=app=1`)
 })
 
 test('C-ING-02 非主人访问私有端口 → 无权访问，看不到内容', async ({ page }) => {
@@ -49,7 +52,7 @@ test('C-ING-03 公开端口免登录直接访问', async ({ page }) => {
   await hooks.ingressUpstream(7860, 'gradio')
   const resp = await page.goto(`${portUrl(id, 7860)}/`)
   expect(resp!.status()).toBe(200)
-  await expect(page.locator('body')).toHaveText(`gradio|host=${id}-7860.spark.test:18080|path=/`)
+  await expect(page.locator('body')).toHaveText(`gradio|host=${id}-7860.spark.test:18080|path=/|cookie=`)
 })
 
 test('C-ING-04 实例停机后显示 503 页', async ({ page }) => {

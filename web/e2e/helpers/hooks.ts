@@ -64,7 +64,7 @@ export const hooks = {
   ssh(opts: { instance_id: string; password?: string; key_pem?: string; command: string }) {
     return post<{ output: string; exit_status: number; error: string }>('/hooks/ssh', opts)
   },
-  /** 让假容器 sshd 在容器内 127.0.0.1:<port> 回显 `body|host=<Host>|path=<RequestURI>`，并立即刷新入口路由表。
+  /** 让假容器 sshd 在容器内 127.0.0.1:<port> 回显 `body|host=<Host>|path=<RequestURI>|cookie=<到达容器的 Cookie 头>`，并立即刷新入口路由表。
    *  先经 API 加端口、再调本钩子（路由表只收录已登记的端口）。所有实例共用同一个假容器：同一端口后登记的覆盖先登记的。 */
   async ingressUpstream(port: number, body: string): Promise<void> {
     await post('/hooks/ingress-upstream', { port, body })

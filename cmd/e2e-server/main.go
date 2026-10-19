@@ -48,7 +48,7 @@ func main() {
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	log := slog.New(quietExpected{slog.NewTextHandler(os.Stderr, nil)})
 
 	dir, err := os.MkdirTemp("", "spark-e2e-")
 	if err != nil {
@@ -106,6 +106,7 @@ func run() error {
 		AgentAddr: agentAddr, AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200,
 		AgentDNSServers: []string{"223.5.5.5", "119.29.29.29"}, UpstreamSSHKeyFile: keyFile,
 		IngressDomain: "spark.test", PublicBaseURL: "http://spark.test:18080", SSHAddr: sshAddr, SSHPublicPort: 22, UpstreamSSHPort: upstream.Port(),
+		SSHDrainTimeout: time.Second, // 停机时不为残留会话等 30 秒（Playwright 的 gracefulShutdown 只给 20 秒）
 	}
 	clk := clock.NewFake(time.Now())
 	kycSwitch := &e2ehooks.SwitchableKYC{}
@@ -167,6 +168,9 @@ func run() error {
 	case err := <-gwErr:
 		gwErr <- err // 留给 defer 读取
 		runErr = fmt.Errorf("agent gateway stopped: %v", err)
+	case err := <-sshErr:
+		sshErr <- err // 留给 defer 读取
+		runErr = fmt.Errorf("ssh gateway stopped: %v", err)
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -205,4 +209,23 @@ func waitListening(ctx context.Context, addr string) error {
 		}
 	}
 	return fmt.Errorf("%s 未在 10 秒内开始监听", addr)
+}
+
+// quietExpected 丢掉端到端用例里预期会大量出现的日志（用错误密码 / 已删除的公钥登录是断言的一部分），
+// 让 Playwright 输出里只剩真正的问题。只在 e2e-server 使用；生产日志不受影响。
+type quietExpected struct{ slog.Handler }
+
+func (q quietExpected) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == "ssh auth failed" {
+		return nil
+	}
+	return q.Handler.Handle(ctx, r)
+}
+
+func (q quietExpected) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return quietExpected{q.Handler.WithAttrs(attrs)}
+}
+
+func (q quietExpected) WithGroup(name string) slog.Handler {
+	return quietExpected{q.Handler.WithGroup(name)}
 }
