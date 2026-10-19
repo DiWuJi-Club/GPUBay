@@ -1,4 +1,5 @@
 import { watch } from 'vue'
+import { uuid } from './uuid'
 
 export interface IdempotencyKey {
   current(): string
@@ -6,7 +7,7 @@ export interface IdempotencyKey {
 }
 
 /** 打开确认框时生成一个键；同一次确认的重复点击、网络错误后的再次点击都复用它；成功后调用 rotate()。 */
-export function createIdempotencyKey(gen: () => string = () => crypto.randomUUID()): IdempotencyKey {
+export function createIdempotencyKey(gen: () => string = () => uuid()): IdempotencyKey {
   let key = gen()
   return {
     current: () => key,

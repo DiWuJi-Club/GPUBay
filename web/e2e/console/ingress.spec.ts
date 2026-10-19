@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { adminApi, adminPost, createAdmin } from '../helpers/admin'
-import { loginConsole, loginConsoleAt, seedUser } from '../helpers/console'
+import { loginConsoleAt, seedUser } from '../helpers/console'
 import { CONSOLE_SITE_URL, hooks } from '../helpers/hooks'
 import { instanceOf, runningInstance } from '../helpers/instances'
 
@@ -82,9 +82,9 @@ test('C-ING-06 被后台强制私有后：详情页显示锁定、无切换按�
   const admin = await createAdmin('ops')
   const ctx = await adminApi(admin)
   await adminPost(ctx, admin, `/admin/api/v1/instances/${id}/ports/8888/force-private`, { reason: 'e2e' })
-  // 详情页在 baseURL（127.0.0.1，安全上下文）上看：http://spark.test 不是安全上下文，crypto.randomUUID 不可用，页面的幂等键初始化会失败
-  await loginConsole(page, u.phone)
-  await page.goto(`/instances/${id}`)
+  // 在控制台对外地址（http，非安全上下文）上看详情页：也覆盖幂等键在没有 crypto.randomUUID 时的回退
+  await loginConsoleAt(page, CONSOLE_SITE_URL, u.phone)
+  await page.goto(`${CONSOLE_SITE_URL}/instances/${id}`)
   await expect(page.getByTestId('detail-port-row')).toHaveCount(1)
   await expect(page.getByTestId('detail-port-visibility')).toHaveText('私有')
   await expect(page.getByTestId('detail-port-forced')).toBeVisible()
