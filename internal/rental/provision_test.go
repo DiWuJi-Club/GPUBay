@@ -3,6 +3,7 @@ package rental_test
 import (
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -459,5 +460,57 @@ func TestBookedSuspendResumeKeepsPaidWindow(t *testing.T) {
 				t.Fatalf("lease upper = %v", upper)
 			}
 		})
+	}
+}
+
+// 两个 ProvisionDue 并发（多实例部署 / 清扫重叠）：每个到点预订恰好开通一次（-race 下跑）。
+// 其中一台预订机器进维护，触发并发下的改派：只能改派到唯一的空闲机器、且只改派一次。
+func TestConcurrentProvisionDueProvisionsOnce(t *testing.T) {
+	e := newEnv(t, 6)
+	start := dbtest.T0.Add(3 * time.Hour)
+	var ids []string
+	for i := 0; i < 5; i++ {
+		ids = append(ids, e.book(start).ID)
+	}
+	e.setMachine(e.get(ids[0]).MachineID, "maintenance", true)
+	e.clock.Advance(2 * time.Hour)
+	e.heartbeatAll()
+	var wg sync.WaitGroup
+	counts := make([]int, 2)
+	errs := make([]error, 2)
+	for g := range counts {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			counts[g], errs[g] = e.svc.ProvisionDue(e.ctx)
+		}(g)
+	}
+	wg.Wait()
+	if errs[0] != nil || errs[1] != nil || counts[0]+counts[1] != len(ids) {
+		t.Fatalf("provision counts = %v, errs = %v", counts, errs)
+	}
+	machines := map[int64]bool{}
+	reassigned := 0
+	for _, id := range ids {
+		got := e.get(id)
+		if got.State != rental.StateCreating || machines[got.MachineID] {
+			t.Fatalf("instance %s = %s on %d (machines so far %v)", id, got.State, got.MachineID, machines)
+		}
+		machines[got.MachineID] = true
+		reassigned += got.ReassignCount
+		var creates, live int
+		if err := e.pool.QueryRow(e.ctx, `SELECT (SELECT count(*) FROM agent_commands WHERE instance_id = $1 AND type = 'create_instance'),
+			(SELECT count(*) FROM machine_leases WHERE instance_id = $1 AND status IN ('reserved', 'active'))`, id).Scan(&creates, &live); err != nil {
+			t.Fatal(err)
+		}
+		if creates != 1 || live != 1 {
+			t.Fatalf("instance %s: create commands = %d, live leases = %d", id, creates, live)
+		}
+	}
+	if reassigned != 1 {
+		t.Fatalf("reassign_count total = %d, want 1", reassigned)
+	}
+	if n, err := e.svc.ProvisionDue(e.ctx); err != nil || n != 0 {
+		t.Fatalf("third run = %d, %v", n, err)
 	}
 }

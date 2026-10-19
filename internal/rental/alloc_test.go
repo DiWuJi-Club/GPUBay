@@ -3,6 +3,7 @@ package rental_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -249,5 +250,115 @@ func TestAvailableNowIsLeaseAware(t *testing.T) {
 	e.reserveRaw(e.machines[0], dbtest.T0.Add(10*time.Hour), 86400)
 	if n, _ := e.svc.AvailableNow(e.ctx, e.productID); n != 1 {
 		t.Fatalf("available with near reservation = %d, want 1", n)
+	}
+}
+
+// 即时分支：savepoint 里先 MarkAllocated 再插 lease，撞排他约束回滚 savepoint 后机器回到 idle（不会卡在 allocated）；
+// 外层事务对这台机器的行锁不随 savepoint 回滚释放：提交前另一个连接 pickMachines(lock=true) 看不到它，提交后才看得到。
+func TestPlaceOnMachinesImmediateRetryRevertsMachineAndKeepsRowLock(t *testing.T) {
+	e := newEnv(t, 2)
+	spec := rental.PickSpec{ProductID: e.productID, Immediate: true}
+	spec.Lower, spec.Upper = rental.ImmediatePeriod(e.clock.Now(), 86400)
+	var collided int64
+	// 另一个连接对 collided 加锁探测：窗口远在 10 天后（与任何时段都不冲突），只有行锁能让它看不到这台机器
+	probe := func() []int64 {
+		t.Helper()
+		far := rental.PickSpec{ProductID: e.productID, MachineID: &collided}
+		far.Lower, far.Upper = rental.BookingPeriod(dbtest.T0.Add(10*24*time.Hour), 86400)
+		var got []int64
+		if err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+			var err error
+			got, err = rental.PickMachines(e.ctx, tx, far, 10, true)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	var placed []int64
+	err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+		ids, err := rental.PlaceOnMachines(e.ctx, tx, spec, 1, func(sp pgx.Tx, mid int64) error {
+			if _, err := e.fleet.MarkAllocated(e.ctx, sp, mid); err != nil {
+				return err
+			}
+			id, err := insertRawInstance(e.ctx, sp, e, mid)
+			if err != nil {
+				return err
+			}
+			if collided == 0 { // 预筛之后另一个连接在这台机器上提交了重叠的预订
+				collided = mid
+				e.reserveRaw(mid, dbtest.T0.Add(5*time.Hour), 3600)
+			}
+			_, err = rental.InsertLease(e.ctx, sp, mid, id, spec.Lower, spec.Upper, "active", e.clock.Now())
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		placed = ids
+		if got := probe(); len(got) != 0 {
+			return fmt.Errorf("row lock on machine %d released by savepoint rollback: probe saw %v", collided, got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placed) != 1 || placed[0] == collided {
+		t.Fatalf("placed = %v, collided = %d", placed, collided)
+	}
+	if st := e.machineState(collided); st != "idle" {
+		t.Fatalf("collided machine = %s, want idle (MarkAllocated rolled back with the savepoint)", st)
+	}
+	if st := e.machineState(placed[0]); st != "allocated" {
+		t.Fatalf("placed machine = %s", st)
+	}
+	if got := probe(); !slices.Equal(got, []int64{collided}) { // 对照：外层事务提交后锁释放，探测能看到
+		t.Fatalf("probe after commit = %v", got)
+	}
+}
+
+// 补取有上限：首轮 + 3 轮补取，每次都撞约束 → 恰好尝试 4 台后 no_capacity（机器再多也不继续）。
+func TestPlaceOnMachinesRefillBound(t *testing.T) {
+	e := newEnv(t, 6)
+	start := dbtest.T0.Add(12 * time.Hour)
+	spec := rental.PickSpec{ProductID: e.productID}
+	spec.Lower, spec.Upper = rental.BookingPeriod(start, 86400)
+	var tried []int64
+	err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+		_, err := rental.PlaceOnMachines(e.ctx, tx, spec, 1, func(sp pgx.Tx, mid int64) error {
+			tried = append(tried, mid)
+			id, err := insertRawInstance(e.ctx, sp, e, mid)
+			if err != nil {
+				return err
+			}
+			e.reserveRaw(mid, start.Add(2*time.Hour), 3600)
+			_, err = rental.InsertLease(e.ctx, sp, mid, id, spec.Lower, spec.Upper, "reserved", e.clock.Now())
+			return err
+		})
+		return err
+	})
+	if codeOf(err) != "no_capacity" {
+		t.Fatalf("want no_capacity, got %v", err)
+	}
+	if len(tried) != 4 || len(sortedCopy(tried)) != len(slices.Compact(sortedCopy(tried))) {
+		t.Fatalf("tried %v, want 4 distinct machines (1 + 3 refills)", tried)
+	}
+}
+
+// 预订分支的 no_capacity 消息：一台都没有 / 只有部分台数（即时分支保持旧的 ErrNoCapacity，见上）。
+func TestBookingNoCapacityMessage(t *testing.T) {
+	e := newEnv(t, 2)
+	start := dbtest.T0.Add(12 * time.Hour)
+	_, err := e.svc.PlaceBatch(e.ctx, e.batchReq(3, &start))
+	if ae := apperr.As(err); ae == nil || ae.Code != "no_capacity" || ae.Status != 409 || ae.Message != "该时段只有 2 台可用，请减少数量或更换时段" {
+		t.Fatalf("partial = %#v", ae)
+	}
+	if _, err := e.svc.PlaceBatch(e.ctx, e.batchReq(2, &start)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.PlaceBatch(e.ctx, e.batchReq(1, &start))
+	if ae := apperr.As(err); ae == nil || ae.Code != "no_capacity" || ae.Message != "该时段暂无可用机器" {
+		t.Fatalf("none = %#v", ae)
 	}
 }
