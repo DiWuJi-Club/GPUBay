@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -163,5 +164,28 @@ func TestBuildWithTLSFilesAndRedirect(t *testing.T) {
 	os.Remove(certFile)
 	if _, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0)}); err == nil || !strings.Contains(err.Error(), "TLS") {
 		t.Fatalf("missing cert accepted: %v", err)
+	}
+}
+
+// M-5：staging / prod 未设置 SPARK_ADMIN_PUBLIC_BASE_URL 时启动告警（不带 Sec-Fetch-Site 的客户端后台写请求会 403）。
+func TestBuildWarnsWithoutAdminPublicBaseURL(t *testing.T) {
+	pool := dbtest.New(t)
+	for _, tc := range []struct {
+		env, adminURL string
+		warn          bool
+	}{
+		{"staging", "", true},
+		{"staging", "https://admin.spark.test", false},
+		{"dev", "", false},
+	} {
+		var buf strings.Builder
+		cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: tc.env, Domain: "spark.test", PublicBaseURL: "https://spark.test", SecretKey: dbtest.Key,
+			SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(), AdminPublicBaseURL: tc.adminURL}
+		if _, err := app.Build(cfg, pool, slog.New(slog.NewTextHandler(&buf, nil)), app.Options{Clock: clock.NewFake(dbtest.T0)}); err != nil {
+			t.Fatalf("%s/%q: %v", tc.env, tc.adminURL, err)
+		}
+		if got := strings.Contains(buf.String(), "SPARK_ADMIN_PUBLIC_BASE_URL 未设置"); got != tc.warn {
+			t.Errorf("%s/%q: warned=%v, want %v", tc.env, tc.adminURL, got, tc.warn)
+		}
 	}
 }

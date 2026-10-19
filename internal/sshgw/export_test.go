@@ -37,3 +37,6 @@ func DisconnectConcurrentlyForTest(s *Server, msg string, n int) {
 	close(start)
 	wg.Wait()
 }
+
+// UnauthForTest 返回握手中的连接数。
+func UnauthForTest(s *Server) int64 { return s.unauth.Load() }

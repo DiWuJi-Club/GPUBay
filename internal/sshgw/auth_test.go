@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -361,5 +362,84 @@ func TestPasswordAuthDisabledRefusalsNotCounted(t *testing.T) {
 	}
 	if strings.Contains(logs, "guess-") || strings.Contains(logs, "pw-correct-16chr") {
 		t.Fatalf("password in logs:\n%s", logs)
+	}
+}
+
+// M-2：同一连接的多次认证尝试共用一次实例查询（含密码解密）；认证通过后 serve 再复核一次。
+func TestAuthLookupCachedPerConnection(t *testing.T) {
+	e := newEnv(t)
+	var signers []ssh.Signer
+	for i := 0; i < 4; i++ {
+		signers = append(signers, newSigner(t)) // 未登记的钥匙：逐把被拒
+	}
+	good := newSigner(t)
+	e.keys.add(7, good.PublicKey())
+	signers = append(signers, good)
+	e.store.mu.Lock()
+	before := e.store.accessed
+	e.store.mu.Unlock()
+	c := e.mustDial(instA, ssh.PublicKeys(signers...))
+	if out, _, err := run(t, c, "echo hi"); err != nil || !strings.Contains(out, "hi") {
+		t.Fatalf("run: %q %v", out, err)
+	}
+	e.store.mu.Lock()
+	n := e.store.accessed - before
+	e.store.mu.Unlock()
+	if n > 2 {
+		t.Fatalf("Access called %d times for 5 pubkey attempts on one connection, want ≤ 2", n)
+	}
+	// 全部失败的连接：只查一次
+	e.store.mu.Lock()
+	before = e.store.accessed
+	e.store.mu.Unlock()
+	if _, _, err := e.dial(instA, ssh.PublicKeys(signers[:4]...)); err == nil {
+		t.Fatal("unregistered keys authenticated")
+	}
+	e.store.mu.Lock()
+	n = e.store.accessed - before
+	e.store.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("Access called %d times for a failed connection, want 1", n)
+	}
+}
+
+// M-3：全进程握手中连接上限；超出的连接立即关闭，不计暴力破解失败；名额释放后恢复。
+func TestUnauthConnCap(t *testing.T) {
+	e := newEnvWith(t, func(c *sshgw.Config) { c.MaxUnauthConns = 2 })
+	var held []net.Conn
+	for i := 0; i < 2; i++ {
+		nc, err := net.Dial("tcp", e.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, nc)
+	}
+	waitFor(t, "2 in handshake", func() bool { return sshgw.UnauthForTest(e.srv) == 2 })
+	over, err := net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer over.Close()
+	over.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := over.Read(make([]byte, 64)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("over-cap connection not closed: n=%d err=%v", n, err)
+	}
+	if got := sshgw.FailCountForTest(e.srv, "127.0.0.1"); got != 0 {
+		t.Fatalf("over-cap close counted as auth failure: %d", got)
+	}
+	for _, nc := range held {
+		nc.Close()
+	}
+	waitFor(t, "handshake slots released", func() bool { return sshgw.UnauthForTest(e.srv) == 0 })
+	c := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	// 已认证会话不占握手名额
+	if got := sshgw.UnauthForTest(e.srv); got != 0 {
+		t.Fatalf("authenticated session still counted: %d", got)
+	}
+	if out, _, err := run(t, c, "echo ok"); err != nil || out != "ok\n" {
+		t.Fatalf("run after cap: %q %v", out, err)
+	}
+	if !strings.Contains(e.logs.String(), "ssh unauthenticated connection limit reached") {
+		t.Fatal("no warning logged when cap reached")
 	}
 }

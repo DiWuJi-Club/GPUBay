@@ -60,3 +60,34 @@ func TestEnsureSSHHostKeyPersistsAndIsUnique(t *testing.T) {
 		t.Fatal("reload returned a different key")
 	}
 }
+
+// SPARK_SECRET_KEY 轮换后不静默重新生成（会触发所有客户端的 known_hosts 警告），失败并给出可操作的恢复步骤。
+func TestEnsureSSHHostKeyWrongSecretFailsClosed(t *testing.T) {
+	pool := dbtest.New(t)
+	box, _ := secretbox.New(dbtest.Key)
+	ctx := context.Background()
+	if _, err := pki.EnsureCA(ctx, pool, box, clock.NewFake(dbtest.T0)); err != nil {
+		t.Fatal(err)
+	}
+	orig, err := pki.EnsureSSHHostKey(ctx, pool, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := make([]byte, len(dbtest.Key))
+	copy(other, dbtest.Key)
+	other[0] ^= 0xff
+	box2, _ := secretbox.New(other)
+	_, err = pki.EnsureSSHHostKey(ctx, pool, box2)
+	if err == nil {
+		t.Fatal("expected decrypt failure with a different SPARK_SECRET_KEY")
+	}
+	for _, want := range []string{"SPARK_SECRET_KEY", "platform_pki.ssh_host_key_enc", "UPDATE platform_pki SET ssh_host_key_enc = NULL"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+	again, err := pki.EnsureSSHHostKey(ctx, pool, box)
+	if err != nil || pki.SSHFingerprint(again.PublicKey()) != pki.SSHFingerprint(orig.PublicKey()) {
+		t.Fatalf("stored key changed after failed load: %v", err)
+	}
+}

@@ -76,6 +76,7 @@
 - 保持一个会话（每 20 秒输出一次时间），然后 `sudo systemctl stop spark-agent`。
 - 约 5 分钟后实例暂停（`suspended_at` 非空），**已有会话一直在输出**（裁定 5）。新连接显示 Banner「实例所在机器暂时失联，计时已暂停，请稍后重试」。
 - `sudo systemctl start spark-agent` 后暂停解除，新连接恢复，旧会话仍在。
+- 补记（终审 I-1）：本项只验证了 SSH 会话与 Web 新请求 503。当时 Web 入口会在暂停后撤销已有 WebSocket / SSE 并丢弃上游连接池，违反裁定 5；终审修复后由单元测试覆盖（`TestWebSocketSurvivesSuspend`、`TestPoolKeepIgnoresSuspend`），真机复测列入 followups。
 
 ### 9. 隔离未削弱（§10.4.11）——通过
 

@@ -30,6 +30,8 @@ const (
 	limiterSweepEvery = time.Minute
 	acceptBackoffMin  = 5 * time.Millisecond
 	acceptBackoffMax  = time.Second
+	maxUnauthConns    = 256
+	unauthWarnEvery   = time.Minute
 )
 
 type Store interface {
@@ -56,6 +58,7 @@ type Config struct {
 	UpstreamTimeout        time.Duration // 0 → 10s：拨上游 TCP + SSH 握手的总时限
 	MaxSessionsPerInstance int           // 0 → 16
 	MaxConnsPerIP          int           // 0 → 32
+	MaxUnauthConns         int           // 0 → 256：全进程握手中（未认证）连接上限，超出直接关闭（同 OpenSSH MaxStartups 的兜底）
 	DrainTimeout           time.Duration // 0 → 30s
 	KeepaliveInterval      time.Duration // 0 → 60s；测试调短（必须经 Config 传入，Serve 之后不可改）
 	KeepaliveTimeout       time.Duration // 0 → 15s
@@ -150,6 +153,8 @@ type Server struct {
 
 	wg              sync.WaitGroup
 	hostkeysDropped atomic.Int64
+	unauth          atomic.Int64 // 握手中的连接数
+	unauthWarned    atomic.Int64 // 上次「握手中连接已满」告警的 UnixNano（节流）
 }
 
 func New(cfg Config, d Deps) (*Server, error) {
@@ -161,6 +166,9 @@ func New(cfg Config, d Deps) (*Server, error) {
 	}
 	if d.Log == nil {
 		d.Log = slog.Default()
+	}
+	if cfg.MaxUnauthConns <= 0 {
+		cfg.MaxUnauthConns = maxUnauthConns
 	}
 	if cfg.MaxSessionsPerInstance <= 0 {
 		cfg.MaxSessionsPerInstance = 16
@@ -260,6 +268,19 @@ type attempt struct {
 	mu       sync.Mutex
 	tried    bool
 	instance string // 最近一次查到的实例 ID；查不到的用户名不计入实例失败
+
+	// connLookup 的握手期缓存（含解密后的实例密码）：握手结束即清空
+	cached     bool
+	cachedUser string
+	cachedInfo rental.AccessInfo
+	cachedOK   bool
+}
+
+// dropCache 清掉握手期缓存，不让解密后的密码在会话期间留在内存里。
+func (a *attempt) dropCache() {
+	a.mu.Lock()
+	a.cached, a.cachedUser, a.cachedInfo, a.cachedOK = false, "", rental.AccessInfo{}, false
+	a.mu.Unlock()
 }
 
 // noteAttempt 在 password / publickey 回调里调用：found 表示用户名对应的实例存在。
@@ -281,7 +302,15 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	defer s.wg.Done()
 	defer s.trackConn(nc, false)
 	ip := remoteIP(nc.RemoteAddr())
+	// 全进程握手中连接上限：超出直接关闭，不计暴力破解失败（还没有任何认证尝试）
+	if s.unauth.Add(1) > int64(s.cfg.MaxUnauthConns) {
+		s.unauth.Add(-1)
+		nc.Close()
+		s.warnUnauthFull()
+		return
+	}
 	if !s.lim.acquireConn(ip) {
+		s.unauth.Add(-1)
 		nc.Close()
 		return
 	}
@@ -292,6 +321,8 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	defer s.pending.Delete(key)
 	nc.SetDeadline(time.Now().Add(handshakeTimeout))
 	down, chans, reqs, err := ssh.NewServerConn(nc, s.sshCfg)
+	att.dropCache()
+	s.unauth.Add(-1) // 握手结束（成功或失败）：已认证会话不占名额
 	if err != nil {
 		nc.Close()
 		att.mu.Lock()
@@ -305,6 +336,16 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	nc.SetDeadline(time.Time{})
 	defer down.Close()
 	s.serve(ctx, down, chans, reqs, ip)
+}
+
+// warnUnauthFull 记录握手中连接已满（每分钟最多一条，避免被洪泛刷屏）。
+func (s *Server) warnUnauthFull() {
+	now := time.Now().UnixNano()
+	last := s.unauthWarned.Load()
+	if now-last < int64(unauthWarnEvery) || !s.unauthWarned.CompareAndSwap(last, now) {
+		return
+	}
+	s.d.Log.Warn("ssh unauthenticated connection limit reached, closing new connections", "limit", s.cfg.MaxUnauthConns)
 }
 
 // authFailed：一条做过认证尝试的连接关闭时仍未认证成功 → 按 IP 计 1 次；instance 非空（实例存在）时也按实例计 1 次。
@@ -360,6 +401,7 @@ func (s *Server) serve(ctx context.Context, down *ssh.ServerConn, chans <-chan s
 		return
 	}
 	defer s.releaseInstance(instanceID)
+	// 认证用的是握手期缓存：这里重新查库复核（状态可能在握手期间变了）
 	info, ok := s.lookup(instanceID)
 	if !ok || !allowed(info) {
 		msg := BannerReleased
@@ -367,6 +409,10 @@ func (s *Server) serve(ctx context.Context, down *ssh.ServerConn, chans <-chan s
 			msg = stateBanner(info)
 		}
 		reject(msg)
+		return
+	}
+	if method == "password" && !info.Instance.PasswordAuth { // 握手期间关闭了密码登录
+		reject(MsgPasswordAuthOff)
 		return
 	}
 	dialCtx, cancelDial := context.WithCancel(ctx)

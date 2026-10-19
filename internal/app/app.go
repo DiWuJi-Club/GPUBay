@@ -108,6 +108,10 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		(opt.Pay == nil && cfg.PayDriver != "real") || (opt.PDU == nil && cfg.PDUDriver != "snmp")) {
 		return nil, errors.New("生产环境禁止使用 mock 插件")
 	}
+	if cfg.Env != "dev" && cfg.AdminPublicBaseURL == "" {
+		log.Warn("SPARK_ADMIN_PUBLIC_BASE_URL 未设置：后台写请求若带 Origin 而不带 Sec-Fetch-Site（旧版 Safari、部分内嵌 WebView 等）将一律返回 403；" +
+			"经反向代理或 ssh -L 隧道访问后台时请把它设为浏览器地址栏里的后台地址")
+	}
 	clk := opt.Clock
 	if clk == nil {
 		clk = clock.Real{}
@@ -441,6 +445,17 @@ func (a *App) RedirectServer(cfg config.Config) *http.Server {
 // accessSweepInterval：活动流复核间隔。加上路由表 2 秒刷新，访问权限变化后最迟约 7 秒断开（≤ ingress.MaxRevokeInterval）。
 const accessSweepInterval = 5 * time.Second
 
+// poolKeep：上游连接池应保留的实例。暂停（机器失联）仍算 running，不丢池（裁定 5）；上游真断了由池的 keepalive 自行丢弃。
+func poolKeep(routes []rental.IngressRoute) map[string]bool {
+	keep := map[string]bool{}
+	for _, r := range routes {
+		if r.State == rental.StateRunning {
+			keep[r.InstanceID] = true
+		}
+	}
+	return keep
+}
+
 // RunAccessLoops：路由表每 2 秒刷新、活动流（WebSocket / SSE）按访问权限变化撤销、离开 running 的实例从上游连接池丢弃、
 // TLS 到期每日检查；ctx 结束后等所有子循环退出再返回。连接池不在这里关闭：停机时 HTTP / ingress 关闭之后由 cmd/platform 关。
 func (a *App) RunAccessLoops(ctx context.Context) {
@@ -459,12 +474,7 @@ func (a *App) RunAccessLoops(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			now := map[string]bool{}
-			for _, r := range a.Routes.Routes() {
-				if r.State == rental.StateRunning && !r.Suspended {
-					now[r.InstanceID] = true
-				}
-			}
+			now := poolKeep(a.Routes.Routes())
 			for id := range running {
 				if !now[id] {
 					a.Upstream.Drop(id)

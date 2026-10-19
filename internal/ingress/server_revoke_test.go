@@ -172,7 +172,6 @@ func TestWebSocketRevokedWhenAccessChanges(t *testing.T) {
 		{"port turned private", func(r *rental.IngressRoute) { r.Visibility = "private" }},
 		{"port deleted", nil},
 		{"instance stopped", func(r *rental.IngressRoute) { r.State = rental.StateStopped }},
-		{"instance suspended", func(r *rental.IngressRoute) { r.Suspended = true }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
@@ -186,6 +185,29 @@ func TestWebSocketRevokedWhenAccessChanges(t *testing.T) {
 			waitUntil(t, "stream unregistered", func() bool { return e.srv.ActiveStreams() == 0 })
 		})
 	}
+}
+
+// 裁定 5 / 规格 §4.1：机器失联（实例暂停）时已建立的 WebSocket 不主动断，新请求仍返回 503 页
+func TestWebSocketSurvivesSuspend(t *testing.T) {
+	e := newEnv(t)
+	startSweeper(t, e)
+	e.route("ins-a1b2c3d4", 7, 8888, "public", rental.StateRunning, http.HandlerFunc(wsEchoHandler))
+	nc, br := openWS(t, e, "ins-a1b2c3d4-8888.spark.test")
+	wsEcho(t, nc, br, "before-suspend")
+	e.setRoute("ins-a1b2c3d4", 8888, func(r *rental.IngressRoute) { r.Suspended = true })
+	time.Sleep(200 * time.Millisecond) // 几轮扫描
+	wsEcho(t, nc, br, "while-suspended")
+	if n := e.srv.ActiveStreams(); n != 1 {
+		t.Fatalf("active streams = %d, want 1", n)
+	}
+	resp := e.get("ins-a1b2c3d4-8888.spark.test", "/")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("new request while suspended = %d, want 503", resp.StatusCode)
+	}
+	// 暂停中停机：照常撤销
+	e.setRoute("ins-a1b2c3d4", 8888, func(r *rental.IngressRoute) { r.State = rental.StateStopped })
+	expectClosed(t, nc, br, time.Second)
 }
 
 func TestAuthenticatedWebSocketSurvivesPublicFlip(t *testing.T) {

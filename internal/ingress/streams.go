@@ -260,13 +260,13 @@ func (s *Server) needsSessionCheck(st *stream) bool {
 	return ok && r.Visibility != "public"
 }
 
-// routeRevokeReason 只依据路由表判断（不查库）。
+// routeRevokeReason 只依据路由表判断（不查库）。暂停（机器失联）不撤销已建立的流（裁定 5、规格 §4.1），与 SSH 一致。
 func (s *Server) routeRevokeReason(st *stream) string {
 	r, ok := s.routes.Lookup(st.instance, st.port)
 	switch {
 	case !ok:
 		return "port removed"
-	case r.State != rental.StateRunning || r.Suspended:
+	case r.State != rental.StateRunning:
 		return "instance not running"
 	case r.Visibility == "public":
 		return ""

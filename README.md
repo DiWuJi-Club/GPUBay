@@ -80,7 +80,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的端口（Create 指令的 `ssh_port` 与网关上游拨号共用） | 2222 |
 | `SPARK_INGRESS_DOMAIN` | 租户 Web 子域的父域（`ins-<id>-<port>.<此域>`）；生产推荐用与 `SPARK_DOMAIN` **不同的注册域（eTLD+1）**，子域不算；「不是 SPARK_DOMAIN 子域」的启动校验只防误配 | = SPARK_DOMAIN |
 | `SPARK_PUBLIC_BASE_URL` | 对外地址，支付回调为 `<地址>/api/v1/pay/notify/{wechat,alipay}`（real 支付必填，须 https）；域名必须等于 `SPARK_DOMAIN`；prod 必填且 https；dev 默认 `http://spark.local:8080`。本地测 ingress 需在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或改用 sslip.io 域 | 见左 |
-| `SPARK_ADMIN_PUBLIC_BASE_URL` | 后台对外地址（经反向代理暴露时填写），用于后台写请求的 Origin 校验 | 空 |
+| `SPARK_ADMIN_PUBLIC_BASE_URL` | 后台对外地址（经反向代理或 `ssh -L` 隧道访问时填浏览器地址栏里的后台地址），用于后台写请求的 Origin 校验。为空时只认 `Sec-Fetch-Site`：带 `Origin` 而不带 `Sec-Fetch-Site` 的客户端（旧版 Safari、部分内嵌 WebView）后台写请求一律 403；staging / prod 为空时启动日志会打 WARN | 空 |
 | `SPARK_TLS_CERT_FILE` / `SPARK_TLS_KEY_FILE` | 证书与私钥（PEM，覆盖 `<domain>` 与 `*.<ingress_domain>`）；设置后公网监听器为 HTTPS 并每分钟检查文件变化热加载 | 空 |
 | `SPARK_HTTP_REDIRECT_ADDR` | 纯 HTTP 301 到 https 的监听地址（仅 TLS 开启时有效） | 空 |
 
@@ -121,7 +121,8 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - TLS 两种方式：`SPARK_TLS_CERT_FILE` / `SPARK_TLS_KEY_FILE`（需覆盖 `<domain>` 与 `*.<ingress_domain>` 的泛域名证书：acme.sh DNS-01 侧车或商业证书，平台每分钟热加载文件）；或前置反向代理终止 TLS 并 `SPARK_TRUST_PROXY=true`（代理须原样转发 Host，apex 与泛域名都指到 platform）。客户端 IP 取 `X-Forwarded-For` 自右数第 `SPARK_TRUSTED_PROXY_HOPS` 项（默认 1，多层代理设为层数）。platform 自己终止 TLS 时（默认 compose）保持 `SPARK_TRUST_PROXY=false`。
 - 发布顺序：**先升级全部 Agent，再发布 platform**（新 platform 固定校验平台下发的容器主机密钥，旧 Agent 会自行生成另一把）。platform 重启会断开 SSH 会话（drain 最多 `SPARK_SSH_DRAIN_TIMEOUT`，默认 30s）；停机总耗时约 30～40s，compose 的 `stop_grace_period` 为 60s；如果自己写 systemd unit 来管理 platform，设 `TimeoutStopSec=60`。
 - 本次升级把 staging / prod 的会话 Cookie 改名为 `__Host-…`：升级后用户与管理员都需要重新登录一次。
-- `platform admin ssh-host-key` 打印网关主机密钥指纹，填进帮助页 `brand.sshHostKeyFingerprint`；`SPARK_SECRET_KEY` 轮换会连带丢失网关主机密钥与实例主机私钥（用户会看到主机密钥变更警告，存量实例首连重新信任）。
+- `platform admin ssh-host-key` 打印网关主机密钥指纹，填进帮助页 `brand.sshHostKeyFingerprint`。
+- `SPARK_SECRET_KEY` 轮换后网关主机密钥（`platform_pki.ssh_host_key_enc`）不可解密，**平台启动直接失败，不会自动重新生成**（静默换钥会让所有用户的 `known_hosts` 报警）。恢复二选一：换回原来的密钥；或有意接受网关主机密钥变更——执行 `UPDATE platform_pki SET ssh_host_key_enc = NULL WHERE id = 1;` 后启动，平台生成新钥，用户会看到主机密钥变更警告，需用 `platform admin ssh-host-key` 更新帮助页指纹（CA 私钥同样不可解密，见上一条）。已运行实例的主机密钥固定不受影响（`ssh_host_pubkey` 是明文列）；轮换时仍在开通中的实例按开通失败退款。
 - 本地开发测 ingress：`SPARK_PUBLIC_BASE_URL` 默认 `http://spark.local:8080`，在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或用 sslip.io 域（如 `SPARK_DOMAIN=192-168-1-218.sslip.io`）。
 - 控制台与后台的写请求有同站防护：经浏览器从其它子域 / 站点提交会得到 `forbidden`；curl 等不带 `Origin` 的客户端不受影响。
 

@@ -16,8 +16,9 @@
 - `brand.sshHostKeyFingerprint` 填 `platform admin ssh-host-key` 的指纹并重新构建前端。
 - VS Code Remote-SSH 的图形界面没有实测（开发 Mac 没装 VS Code）；它依赖的 exec + stdin、sftp、`-L` 已逐项通过，上线前请用图形界面补测一次（验收观察）。
 - 公开端口是无鉴权的公网 HTTP 服务：使用条款 / 禁止事项由负责人决定（不进代码）；后台处置手段是强制私有、删端口、封禁用户。
-- `SPARK_SECRET_KEY` 轮换：除 CA 外还会丢失网关主机密钥与实例主机私钥。
-- 后台若经反向代理暴露到兄弟子域，设置 `SPARK_ADMIN_PUBLIC_BASE_URL`，否则浏览器带 `Origin` 的写请求全部被拒。
+- `SPARK_SECRET_KEY` 轮换：CA 私钥与网关主机密钥都不可解密，平台启动直接失败（不自动重新生成）；恢复步骤见 README「部署注意」（终审 M-1）。
+- 后台若经反向代理暴露到兄弟子域，设置 `SPARK_ADMIN_PUBLIC_BASE_URL`，否则浏览器带 `Origin` 的写请求全部被拒；staging / prod 未设置时启动日志有 WARN（终审 M-5）。
+- 机器失联时 Web 长连接（JupyterLab 终端 / 内核 WebSocket）不断开：终审 I-1 修复后只有单元测试，真机验收 §10.4.10 只验证过 SSH 会话与新请求 503，上线前补测一次。
 - prod 一定要显式设置 `SPARK_PUBLIC_BASE_URL`（https）：代码在为空时会按 `SPARK_HTTP_ADDR` 的端口推导（compose 下会得到 `:8443`，对外是 443），README 写的是「prod 必填」（Task 5 审查）。
 
 ## 规格列出的遗留（本计划不做）
@@ -38,6 +39,7 @@
 - sshgw 的失败连接计数 / IP 封禁 / 并发上限都在进程内。
 - `ssh_sessions` 只记录会话级字节数；按时间段统计需另建表。
 - Agent 写主机密钥的日志限流用 `time.Now`（不走注入时钟）；写入中途崩溃会留下临时密钥文件（Task 12 审查）。
+- Agent 漏升级（未按「先 Agent 后 platform」）时，新 platform 在该机开通的实例固定的是平台生成的主机公钥，旧 Agent 本地生成另一把，网关与入口永久 `upstream_unreachable`，目前只能改库或换机（终审 M-4，`.superpowers` 终审记录 plan3-final-review.md）。建议：后台实例详情加 ops 操作「重置实例主机密钥信任」，把 `ssh_host_pubkey` 置空、下次拨号走首连信任写回，记审计（操作人、实例、旧指纹）；可选再让 Create 结果带回容器实际主机公钥，不一致时立即告警并提示 Agent 版本。
 - `CountSSHKeys` 在关闭密码登录的事务外检查，并发删公钥时可能出现「没有公钥且密码关闭」，用户可自己重新打开密码登录（Task 3 审查，接受）。
 
 ### Web 入口
@@ -85,7 +87,7 @@
 - 客户端 IP 取 `X-Forwarded-For` 自右数第 N 项（`SPARK_TRUSTED_PROXY_HOPS`，默认 1），只在 `SPARK_TRUST_PROXY=true` 时生效；控制台改用 `httpx.ProxyRealIP`，不再信任 `X-Real-IP` / `True-Client-IP`：最左项可由客户端伪造（Task 18）。
 - 后台强制私有 / 删除端口不要求 TOTP 二次验证：不涉及资金、可撤销，规格 §7.2 已定接口（Task 21）。
 - 被强制私有的端口在控制台只显示通用的锁定提示，后台填写的原因只进审计：避免把处置细节暴露给滥用者，代价是用户要联系客服才知道原因（Task 20）。
-- 长连接 Web 流（WebSocket、SSE 等）在访问权限变化后约 10 秒内断开（路由消失、实例不在运行、端口改为私有后的匿名流、控制台会话失效），与 SSH 的 10 秒规则一致（Task 17）。
+- 长连接 Web 流（WebSocket、SSE 等）在访问权限变化后约 10 秒内断开（路由消失、实例不在运行、端口改为私有后的匿名流、控制台会话失效），与 SSH 的 10 秒规则一致（Task 17）。暂停（机器失联）不算「不在运行」：不撤销长连接、不丢上游连接池，新请求返回 503 页（裁定 5，终审 I-1）。
 - 上游 `Set-Cookie` 的 `Domain` 属性被去掉（变成 host-only），上游下发的 `sc_ingress` 被丢弃：防止租户应用给兄弟实例或控制台种 Cookie；依赖父域 Cookie 的应用不受支持（Task 17）。
 - 私有端口上 `Sec-Fetch-Site: same-site` 的非 GET/HEAD/OPTIONS 请求被拒，私有端口的 WebSocket 升级必须同源：入口子域彼此同站，防兄弟租户 CSRF（Task 17）。
 - 公开端口的 authorize 直接 302、不发票据；非属主 / 不存在 / 未登记端口一律同一个 403，终态实例 410，属主访问未登记端口 404：不泄露实例是否存在（Task 16）。

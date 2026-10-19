@@ -50,7 +50,10 @@ func EnsureSSHHostKey(ctx context.Context, pool *pgxpool.Pool, box *secretbox.Bo
 		}
 		raw, err := box.Open(enc)
 		if err != nil {
-			return nil, false, fmt.Errorf("解密 SSH 网关主机密钥失败（SPARK_SECRET_KEY 是否被更换？）: %w", err)
+			// 不静默重新生成：网关主机密钥一变，所有用户的 known_hosts 都会报警。由运维二选一
+			return nil, false, fmt.Errorf("解密 SSH 网关主机密钥（platform_pki.ssh_host_key_enc）失败，SPARK_SECRET_KEY 是否被更换？"+
+				"恢复：换回原来的 SPARK_SECRET_KEY；或确认接受网关主机密钥变更（所有用户会看到主机密钥变更警告，需更新帮助页指纹）后执行 "+
+				"`UPDATE platform_pki SET ssh_host_key_enc = NULL WHERE id = 1;` 再启动以重新生成: %w", err)
 		}
 		s, err := ssh.ParsePrivateKey(raw)
 		return s, true, err

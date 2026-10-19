@@ -25,6 +25,7 @@ const (
 	MsgTooManySessions     = "连接数过多"
 	MsgUpstreamUnreachable = "无法连接到实例，请稍后重试"
 	MsgDisconnected        = "实例已停机 / 已释放，连接已断开"
+	MsgPasswordAuthOff     = "实例已关闭密码登录，请使用公钥登录"
 )
 
 var (
@@ -37,8 +38,14 @@ const lookupTimeout = 5 * time.Second
 
 // lookup 按用户名查实例；用户名不合法或实例不存在返回 ok=false（二者对客户端不可区分）。
 func (s *Server) lookup(user string) (rental.AccessInfo, bool) {
+	info, ok, _ := s.lookupDefinitive(user)
+	return info, ok
+}
+
+// lookupDefinitive 同 lookup；definitive=false 表示数据库瞬时错误（结果不可缓存）。
+func (s *Server) lookupDefinitive(user string) (info rental.AccessInfo, ok, definitive bool) {
 	if !instanceIDRe.MatchString(user) {
-		return rental.AccessInfo{}, false
+		return rental.AccessInfo{}, false, true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
 	defer cancel()
@@ -46,10 +53,38 @@ func (s *Server) lookup(user string) (rental.AccessInfo, bool) {
 	if err != nil {
 		if !errors.Is(err, apperr.ErrNotFound) {
 			s.d.Log.Error("ssh access lookup", "instance", user, "err", err)
+			return rental.AccessInfo{}, false, false
 		}
-		return rental.AccessInfo{}, false
+		return rental.AccessInfo{}, false, true
 	}
-	return info, true
+	return info, true, true
+}
+
+// connLookup：握手期间（banner 与各次 password / publickey 回调）按连接缓存 lookup 结果，
+// 同一连接同一用户名只查一次库、只解密一次实例密码（OpenSSH 会把 agent 里每把钥匙各试一次）。
+// 缓存只活到握手结束（handleConn 随后清空）；认证通过后 serve 仍会重新 lookup 复核状态。
+// 数据库瞬时错误不缓存：下一次回调重查。
+func (s *Server) connLookup(c ssh.ConnMetadata) (rental.AccessInfo, bool) {
+	v, found := s.pending.Load(c.RemoteAddr().String())
+	if !found {
+		return s.lookup(c.User())
+	}
+	a := v.(*attempt)
+	user := c.User()
+	a.mu.Lock()
+	if a.cached && a.cachedUser == user {
+		info, ok := a.cachedInfo, a.cachedOK
+		a.mu.Unlock()
+		return info, ok
+	}
+	a.mu.Unlock()
+	info, ok, definitive := s.lookupDefinitive(user)
+	if definitive {
+		a.mu.Lock()
+		a.cached, a.cachedUser, a.cachedInfo, a.cachedOK = true, user, info, ok
+		a.mu.Unlock()
+	}
+	return info, ok
 }
 
 // allowed：只有 running 且未暂停的实例可以认证。
@@ -79,7 +114,7 @@ func stateBanner(info rental.AccessInfo) string {
 }
 
 func (s *Server) banner(c ssh.ConnMetadata) string {
-	info, ok := s.lookup(c.User())
+	info, ok := s.connLookup(c)
 	if !ok {
 		return BannerUnknown + "\r\n"
 	}
@@ -96,7 +131,7 @@ func perms(info rental.AccessInfo, method string, keyID int64) *ssh.Permissions 
 }
 
 func (s *Server) passwordCallback(c ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
-	info, ok := s.lookup(c.User())
+	info, ok := s.connLookup(c)
 	if ok && !allowed(info) {
 		return nil, errAuth // 不校验凭据、猜也不可能成功：不计失败（停机实例的 IDE 反复重连不能封用户 IP）
 	}
@@ -117,7 +152,7 @@ func (s *Server) passwordCallback(c ssh.ConnMetadata, pw []byte) (*ssh.Permissio
 }
 
 func (s *Server) publicKeyCallback(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-	info, ok := s.lookup(c.User())
+	info, ok := s.connLookup(c)
 	if ok && !allowed(info) {
 		return nil, errAuth // 同上：不可登录状态下不查钥匙、不计失败
 	}
