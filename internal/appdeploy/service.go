@@ -575,6 +575,17 @@ func (s *Service) AdminList(ctx context.Context, f ListFilter, p paging.Page) ([
 	return list, total, err
 }
 
+// Counts 仪表盘数字：部署中（queued / installing）、运行中、最近 24 小时内失败（finished_at ≥ now − 24h）的部署数。
+func (s *Service) Counts(ctx context.Context, now time.Time) (installing, running, failed24h int, err error) {
+	err = s.d.Pool.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE state IN ('queued', 'installing')),
+		count(*) FILTER (WHERE state = 'running'),
+		count(*) FILTER (WHERE state = 'failed' AND finished_at >= $1)
+		FROM app_deployments WHERE state IN ('queued', 'installing', 'running', 'failed')`, now.Add(-24*time.Hour)).
+		Scan(&installing, &running, &failed24h)
+	return installing, running, failed24h, err
+}
+
 // ---- 日志 ----
 
 type LogResult struct {
