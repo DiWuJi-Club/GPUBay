@@ -3,7 +3,9 @@ package referral
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -26,6 +28,20 @@ type BindResult struct {
 	Inviter string `json:"inviter,omitempty"` // 脱敏手机号
 }
 
+// SanitizeUA 把任意 User-Agent 变成可安全写入 PG TEXT 的值：丢弃非法 UTF-8 字节与 NUL（两者都会让 INSERT 报 22021
+// 并回滚整个注册事务），再截到至多 MaxUserAgent 字节、且不切断多字节字符。
+func SanitizeUA(ua string) string {
+	ua = strings.ReplaceAll(strings.ToValidUTF8(ua, ""), "\x00", "")
+	if len(ua) <= MaxUserAgent {
+		return ua
+	}
+	cut := MaxUserAgent
+	for cut > 0 && !utf8.RuneStart(ua[cut]) {
+		cut--
+	}
+	return ua[:cut]
+}
+
 const (
 	ReasonOK            = "ok"
 	ReasonInvalidCode   = "invalid_code"
@@ -36,7 +52,7 @@ const (
 // Bind 在 identity 的注册事务内把新用户绑定到邀请码的主人。业务上不可绑定（码无效 / 码主冻结或封禁 / 已绑定）返回 Bound=false，
 // 不返回 error（注册不能被邀请码问题挡住）；数据库错误照常返回让调用方回滚。
 func (s *Service) Bind(ctx context.Context, tx pgx.Tx, req BindRequest) (BindResult, error) {
-	code, ok := NormalizeCode(req.Code)
+	code, ok := NormalizeCode(req.Code) // 只放行 8 位 ASCII 字母表字符：非法 UTF-8 / 乱码在查库前就落到 invalid_code
 	if !ok {
 		return BindResult{Reason: ReasonInvalidCode}, nil
 	}
@@ -99,10 +115,7 @@ func (s *Service) Bind(ctx context.Context, tx pgx.Tx, req BindRequest) (BindRes
 			status, hold = BindingHeld, FlagSameDevice
 		}
 	}
-	ua := req.UserAgent
-	if len(ua) > MaxUserAgent {
-		ua = ua[:MaxUserAgent]
-	}
+	ua := SanitizeUA(req.UserAgent) // UA 只在这里落库；identity 原样透传
 	var id int64
 	err = tx.QueryRow(ctx, `INSERT INTO referral_bindings (inviter_id, invitee_id, code, status, risk_flags, hold_reason, rate_version_id, bound_at, rebate_until, ip, device_id, user_agent, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8::timestamptz + make_interval(days => $9), $10, $11, $12, $8, $8) RETURNING id`,

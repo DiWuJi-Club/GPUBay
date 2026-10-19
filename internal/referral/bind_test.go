@@ -2,8 +2,10 @@ package referral_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -142,4 +144,52 @@ func TestBindRiskFlagsMatrix(t *testing.T) {
 		t.Fatalf("after window = %v", flags)
 	}
 	_ = dbtest.T0
+}
+
+func TestSanitizeUA(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"Mozilla/5.0", "Mozilla/5.0"},
+		{"a\xffb\xc3", "ab"}, // 非法 UTF-8 字节丢弃
+		{"a\x00b", "ab"},     // NUL：合法 UTF-8 但 PG TEXT 不收
+		{strings.Repeat("a", 250), strings.Repeat("a", referral.MaxUserAgent)},
+		{strings.Repeat("a", 199) + "中", strings.Repeat("a", 199)}, // 多字节字符跨截断点：整字丢弃
+		{strings.Repeat("中", 100), strings.Repeat("中", 66)},        // 198 字节
+	}
+	for _, c := range cases {
+		got := referral.SanitizeUA(c.in)
+		if got != c.want || !utf8.ValidString(got) || len(got) > referral.MaxUserAgent {
+			t.Errorf("SanitizeUA(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// 坏 User-Agent / 坏邀请码都不能让注册事务报错（R7）。
+func TestBindBadUserAgentAndGarbageCode(t *testing.T) {
+	e := newEnv(t)
+	inviter := e.user("13812345678", true)
+	a, _ := e.svc.EnsureCode(e.ctx, inviter)
+	now := e.clk.Now()
+
+	// 非法 UTF-8 + NUL + 截断点上的多字节字符：照常绑定，存的是清洗后的值
+	b := e.user("13900000001", false)
+	ua := "\xff\x00" + strings.Repeat("a", 198) + "中\xfe"
+	if r := e.doBind(referral.BindRequest{Code: a.Code, InviteeID: b, UserAgent: ua, Now: now}); !r.Bound || r.Reason != referral.ReasonOK {
+		t.Fatalf("bad ua = %+v", r)
+	}
+	var stored string
+	if err := e.pool.QueryRow(e.ctx, `SELECT user_agent FROM referral_bindings WHERE invitee_id = $1`, b).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != strings.Repeat("a", 198) {
+		t.Fatalf("stored ua = %q", stored)
+	}
+
+	// 非法 UTF-8 / 控制字符的邀请码：invalid_code，不报错（doBind 遇 error 会 Fatal）
+	for i, c := range []string{"\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8", a.Code[:7] + "\xff", "\x00\x00\x00\x00\x00\x00\x00\x00", a.Code + "\xc3", "中文邀请码中文邀请"} {
+		u := e.user(fmt.Sprintf("1390000%04d", 200+i), false)
+		if r := e.doBind(referral.BindRequest{Code: c, InviteeID: u, UserAgent: "\xff", Now: now}); r.Bound || r.Reason != referral.ReasonInvalidCode {
+			t.Fatalf("code %q = %+v", c, r)
+		}
+	}
 }
