@@ -49,6 +49,14 @@ var expectedRoutes = []struct {
 	{"GET", "/orders", finance}, {"GET", "/orders/export", finance}, {"GET", "/ledger", finance}, {"GET", "/ledger/export", finance},
 	{"GET", "/recharges", finance}, {"GET", "/recharges/export", finance},
 
+	{"GET", "/referral/summary", finance}, {"GET", "/referral/config", finance}, {"POST", "/referral/config", super},
+	{"GET", "/referral/inviters", finance}, {"GET", "/referral/inviters/{id}", finance},
+	{"POST", "/referral/inviters/{id}/freeze", finance}, {"POST", "/referral/inviters/{id}/unfreeze", finance},
+	{"GET", "/referral/bindings", finance}, {"GET", "/referral/bindings/export", finance},
+	{"POST", "/referral/bindings/{id}/approve", finance}, {"POST", "/referral/bindings/{id}/revoke", finance},
+	{"GET", "/referral/rewards", finance}, {"GET", "/referral/rewards/export", finance},
+	{"POST", "/referral/rescan", super},
+
 	{"GET", "/products", all}, {"PUT", "/products/{id}/prices/{duration}", super},
 	{"GET", "/images", all}, {"POST", "/images", super}, {"PUT", "/images/{id}", super},
 	{"GET", "/audit", all}, {"GET", "/dashboard", all},

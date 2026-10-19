@@ -62,7 +62,7 @@ type Server struct {
 	Billing       *billing.Service
 	Uploads       *storage.Service
 	Gateway       *agentgw.Server   // 机器接入命令与撤销（计划 2）
-	Referral      *referral.Service // 计划 8：邀请返利（路由由 Task 13 注册）
+	Referral      *referral.Service // 计划 8：邀请返利（referralRoutes、用户详情 referral 区块、仪表盘本月返利净额）
 	Clock         clock.Clock
 	Log           *slog.Logger
 	SecureCookie  bool                                     // 生产环境为 true：Cookie 仅经 HTTPS 发送
@@ -118,6 +118,7 @@ func (s *Server) Router() http.Handler {
 			s.instanceRoutes(g)
 			s.userRoutes(g)
 			s.financeRoutes(g)
+			s.referralRoutes(g)
 			s.catalogRoutes(g)
 		})
 	})

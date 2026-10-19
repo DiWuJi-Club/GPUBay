@@ -9,6 +9,8 @@ import (
 
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/paging"
+	"spark-cloud/internal/referral"
 )
 
 func (e *env) lastAudit() string {
@@ -282,5 +284,143 @@ func TestFreezeCommittedWhileReleaseWaitsBlocksPayment(t *testing.T) {
 	r := <-done
 	if r.err != nil || r.n != 0 || e.reward("ord-1")["status"] != "pending" || e.ledgerSum(a, "referral_rebate") != 0 {
 		t.Fatalf("release during freeze = %d %v %v", r.n, r.err, e.reward("ord-1"))
+	}
+}
+
+func TestAdminListsSummaryAndExports(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	x := e.user("13700000000", true)
+	b := e.user("13900000001", true)
+	c := e.user("13900000002", false)
+	e.bind(a, b)
+	cb := e.bind(a, c)
+	e.bindExec(`UPDATE referral_bindings SET status = 'held', hold_reason = 'same_device', risk_flags = '{same_ip,same_device}' WHERE id = $1`, cb)
+	e.bind(x, e.user("13900000003", false))
+	e.accrueOK(e.pay(b, "ord-1", 6900))
+	e.accrueOK(e.pay(b, "ord-2", 6900))
+	e.clk.Advance(8 * 24 * time.Hour)
+	if n := e.release(); n != 2 {
+		t.Fatalf("release = %d", n)
+	}
+	e.refundOK(e.refund(b, "ord-2-r1", 6900)) // 扣回 690：A 1380 → 690
+	e.spend(a, 690)                           // 花光再退一次 → 欠账 690
+	e.refundOK(e.refund(b, "ord-1-r1", 6900))
+
+	sum, err := e.svc.Summary(e.ctx)
+	if err != nil || sum.Pending != 0 || sum.SettledNet != 0 || sum.Debt != 690 || sum.HeldCount != 1 || sum.MonthSettled != 1380 {
+		t.Fatalf("summary = %+v %v", sum, err)
+	}
+	net, err := e.svc.MonthSettledNet(e.ctx)
+	if err != nil || net != 1380-690 {
+		t.Fatalf("month net = %d %v", net, err)
+	}
+	list, total, err := e.svc.AdminListInviters(e.ctx, referral.InviterFilter{}, paging.Page{Number: 1, Size: 10})
+	if err != nil || total != 2 || list[0].UserID != a || list[0].Invitees != 2 || list[0].HeldCount != 1 || list[0].Debt != 690 || list[0].Phone != "13812345678" {
+		t.Fatalf("inviters = %+v %d %v", list, total, err)
+	}
+	if _, total, _ := e.svc.AdminListInviters(e.ctx, referral.InviterFilter{Q: "5678"}, paging.Page{Number: 1, Size: 10}); total != 1 {
+		t.Fatal("q by phone tail")
+	}
+	if l, total, _ := e.svc.AdminListInviters(e.ctx, referral.InviterFilter{Q: strconv.FormatInt(x, 10)}, paging.Page{Number: 1, Size: 10}); total != 1 || l[0].UserID != x {
+		t.Fatal("q by id")
+	}
+	if _, total, _ := e.svc.AdminListInviters(e.ctx, referral.InviterFilter{Flag: "same_device"}, paging.Page{Number: 1, Size: 10}); total != 1 {
+		t.Fatal("flag filter")
+	}
+	if l, _, err := e.svc.AdminListInviters(e.ctx, referral.InviterFilter{Sort: "invitees"}, paging.Page{Number: 1, Size: 10}); err != nil || l[0].UserID != a {
+		t.Fatalf("sort invitees = %+v %v", l, err)
+	}
+	for _, f := range []referral.InviterFilter{{Sort: "bogus"}, {Status: "bogus"}, {Flag: "bogus"}} {
+		if _, _, err := e.svc.AdminListInviters(e.ctx, f, paging.Page{Number: 1, Size: 10}); err == nil {
+			t.Fatalf("bogus filter %+v accepted", f)
+		}
+	}
+	det, err := e.svc.AdminInviter(e.ctx, a)
+	if err != nil || det.Phone != "13812345678" || len(det.Bindings) != 2 || len(det.Rewards) != 2 || len(det.Events) < 6 {
+		t.Fatalf("detail = %+v %v", det, err)
+	}
+	if _, err := e.svc.AdminInviter(e.ctx, b); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("non-inviter = %v", err)
+	}
+	held, total, _ := e.svc.AdminListBindings(e.ctx, referral.BindingFilter{Status: "held"}, paging.Page{Number: 1, Size: 10})
+	if total != 1 || held[0].InviteeID != c || held[0].InviteePhone != "13900000002" || len(held[0].RiskFlags) != 2 || held[0].KYCCheckUnresolved {
+		t.Fatalf("held = %+v", held)
+	}
+	if _, _, err := e.svc.AdminListBindings(e.ctx, referral.BindingFilter{Status: "bogus"}, paging.Page{Number: 1, Size: 10}); err == nil {
+		t.Fatal("bogus binding status accepted")
+	}
+	var rows []referral.Binding
+	if err := e.svc.ExportBindings(e.ctx, referral.BindingFilter{InviterID: a}, func(b referral.Binding) error { rows = append(rows, b); return nil }); err != nil || len(rows) != 2 {
+		t.Fatalf("export bindings = %d %v", len(rows), err)
+	}
+	rw, total, _ := e.svc.AdminListRewards(e.ctx, referral.RewardFilter{InviteeID: b, Status: "settled"}, paging.Page{Number: 1, Size: 10})
+	if total != 2 || rw[0].InviterPhone != "13812345678" || rw[0].InviteePhone != "13900000001" || rw[0].ClawedAmount != 690 {
+		t.Fatalf("rewards = %+v", rw)
+	}
+	var exported []referral.AdminReward
+	if err := e.svc.ExportRewards(e.ctx, referral.RewardFilter{InviterID: a}, func(v referral.AdminReward) error { exported = append(exported, v); return nil }); err != nil || len(exported) != 2 {
+		t.Fatalf("export rewards = %d %v", len(exported), err)
+	}
+	us, err := e.svc.UserSummary(e.ctx, b)
+	if err != nil || us.Inviter == nil || us.Inviter.UserID != a || us.Inviter.BindingStatus != "active" || us.Account != nil {
+		t.Fatalf("user summary invitee = %+v %v", us, err)
+	}
+	us, _ = e.svc.UserSummary(e.ctx, a)
+	if us.Inviter != nil || us.Account == nil || us.Account.Invitees != 2 || us.Account.Debt != 690 {
+		t.Fatalf("user summary inviter = %+v", us)
+	}
+}
+
+// 待审核队列标出每条绑定是否有晚于 COALESCE(reviewed_at, bound_at) 的未解决 referral.kyc_check_failed 审计；
+// Approve 把这一事实写进审计 diff。绑定之前的失败不算。
+func TestHeldQueueShowsUnresolvedKYCCheck(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	c := e.user("13900000002", true)
+	e.kycCheckFailed(c) // 绑定之前：与绑定无关
+	e.clk.Advance(time.Second)
+	bb := e.bind(a, b)
+	cb := e.bind(a, c)
+	e.bindExec(`UPDATE referral_bindings SET status = 'held', hold_reason = 'kyc_check_failed' WHERE id = ANY($1)`, []int64{bb, cb})
+	e.clk.Advance(time.Second)
+	e.kycCheckFailed(b)
+
+	held, _, err := e.svc.AdminListBindings(e.ctx, referral.BindingFilter{Status: "held"}, paging.Page{Number: 1, Size: 10})
+	if err != nil || len(held) != 2 {
+		t.Fatalf("held = %+v %v", held, err)
+	}
+	got := map[int64]bool{}
+	for _, h := range held {
+		got[h.ID] = h.KYCCheckUnresolved
+	}
+	if !got[bb] || got[cb] {
+		t.Fatalf("kyc_check_unresolved = %v (want %d true, %d false)", got, bb, cb)
+	}
+	diffOf := func(id int64) string {
+		var d string
+		if err := e.pool.QueryRow(e.ctx, `SELECT diff::text FROM audit_logs WHERE action = 'referral.approve' AND target_id = $1`, strconv.FormatInt(id, 10)).Scan(&d); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	e.clk.Advance(time.Second)
+	if err := e.svc.Approve(e.ctx, audit.Actor{AdminID: 9}, bb, "核实"); err != nil {
+		t.Fatal(err)
+	}
+	if d := diffOf(bb); !strings.Contains(d, `"kyc_check_unresolved": true`) {
+		t.Fatalf("approve diff = %s", d)
+	}
+	if err := e.svc.Approve(e.ctx, audit.Actor{AdminID: 9}, cb, "核实"); err != nil {
+		t.Fatal(err)
+	}
+	if d := diffOf(cb); !strings.Contains(d, `"kyc_check_unresolved": false`) {
+		t.Fatalf("approve diff = %s", d)
+	}
+	// 通过后 reviewed_at 晚于该审计：不再显示未解决
+	list, _, _ := e.svc.AdminListBindings(e.ctx, referral.BindingFilter{InviteeID: b}, paging.Page{Number: 1, Size: 10})
+	if len(list) != 1 || list[0].KYCCheckUnresolved {
+		t.Fatalf("after approve = %+v", list)
 	}
 }

@@ -10,7 +10,6 @@ import (
 
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/fleet"
-	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 )
 
@@ -174,8 +173,8 @@ func (s *Service) settle(ctx context.Context, discover func(context.Context) (in
 // 发现的下界显式传入（裁定 Q10），不重读水位：并发的清扫轮无法让本次重扫落空；一轮处理不完（积压 ≥ ScanBatch）时
 // 水位停在拨回处，之后的清扫轮继续补（清扫轮按「读到的水位」比较后才更新，不会覆盖拨回）。
 func (s *Service) Rescan(ctx context.Context, actor audit.Actor, days int) error {
-	if days < 1 || days > 30 {
-		return apperr.BadRequest("重扫天数需在 1～30 之间")
+	if err := CheckRescanDays(days); err != nil {
+		return err
 	}
 	now := s.d.Clock.Now()
 	target := now.Add(-time.Duration(days) * 24 * time.Hour)

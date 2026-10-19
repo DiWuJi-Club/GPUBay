@@ -64,27 +64,35 @@ func configInvalid(format string, a ...any) error {
 	return apperr.New("referral_config_invalid", fmt.Sprintf(format, a...), 400)
 }
 
+// Validate 校验费率版本输入（now 用于判定追溯生效）。后台接口在二次验证之前先调用它，参数错误不消耗动态码；
+// AddRateVersion 自己也会再校验一次。
+func (in RateInput) Validate(now time.Time) error {
+	switch {
+	case in.RateBP < 0 || in.RateBP > 5000:
+		return configInvalid("返利比例需在 0%%～50%% 之间")
+	case in.MaxPerInvitee < 0:
+		return configInvalid("单个被邀请人上限不能为负")
+	case in.MaxPerInviter30d < 0:
+		return configInvalid("单个邀请人 30 天上限不能为负")
+	case in.HoldDays < 0 || in.HoldDays > 90:
+		return configInvalid("发放延迟需在 0～90 天之间")
+	case in.PeriodDays < 1 || in.PeriodDays > 3650:
+		return configInvalid("返利期需在 1～3650 天之间")
+	case in.EffectiveFrom != nil && in.EffectiveFrom.Before(now.Add(-EffectiveTolerance)):
+		return configInvalid("生效时间不能早于当前时间")
+	}
+	return nil
+}
+
 // AddRateVersion 新增一个费率版本（R14：不能追溯生效）；写审计 referral.config（含旧版本与新版本全部字段）。
 func (s *Service) AddRateVersion(ctx context.Context, actor audit.Actor, in RateInput) (RateVersion, error) {
 	now := s.d.Clock.Now()
-	switch {
-	case in.RateBP < 0 || in.RateBP > 5000:
-		return RateVersion{}, configInvalid("返利比例需在 0%%～50%% 之间")
-	case in.MaxPerInvitee < 0:
-		return RateVersion{}, configInvalid("单个被邀请人上限不能为负")
-	case in.MaxPerInviter30d < 0:
-		return RateVersion{}, configInvalid("单个邀请人 30 天上限不能为负")
-	case in.HoldDays < 0 || in.HoldDays > 90:
-		return RateVersion{}, configInvalid("发放延迟需在 0～90 天之间")
-	case in.PeriodDays < 1 || in.PeriodDays > 3650:
-		return RateVersion{}, configInvalid("返利期需在 1～3650 天之间")
+	if err := in.Validate(now); err != nil {
+		return RateVersion{}, err
 	}
 	from := now
 	if in.EffectiveFrom != nil {
 		from = in.EffectiveFrom.UTC()
-		if from.Before(now.Add(-EffectiveTolerance)) {
-			return RateVersion{}, configInvalid("生效时间不能早于当前时间")
-		}
 		// 容差只是输入宽限：落库时钳到 now，任何版本都不会早于提交时刻生效（R14）
 		if from.Before(now) {
 			from = now

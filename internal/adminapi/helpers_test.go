@@ -33,6 +33,7 @@ import (
 	"spark-cloud/internal/plugins/pay"
 	"spark-cloud/internal/plugins/pdu"
 	"spark-cloud/internal/plugins/sms"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
@@ -93,6 +94,8 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, AllowMock: true, Open: func(fleet.PDUConn) (pdu.Driver, error) { return pduMock, nil }})
 	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f,
 		Notifier: noopNotifier{}})
+	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r})
+	ids.SetReferral(ref)
 	payMock := pay.NewMock("s")
 	b := billing.NewService(billing.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Alerts: f,
 		Providers: map[string]pay.Provider{pay.ChannelWechat: payMock}, NotifyBaseURL: "https://spark.test"})
@@ -107,7 +110,7 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 		t.Fatal(err)
 	}
 	srv := &adminapi.Server{Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: b,
-		Uploads: uploads, Gateway: gw, Clock: clk, Log: log,
+		Uploads: uploads, Gateway: gw, Referral: ref, Clock: clk, Log: log,
 		PortURL: func(id string, port int) string { return fmt.Sprintf("http://%s-%d.spark.test/", id, port) }}
 	if tweak != nil {
 		tweak(srv)
