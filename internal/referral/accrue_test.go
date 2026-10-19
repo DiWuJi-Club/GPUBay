@@ -1,8 +1,12 @@
 package referral_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -278,5 +282,91 @@ func TestAccrueLocksUsersBeforeAccount(t *testing.T) {
 	}
 	if e.reward("ord-1")["reward"] != int64(690) {
 		t.Fatalf("reward = %v", e.reward("ord-1"))
+	}
+}
+
+// accrue 只接受 order_pay 且金额为负的流水；其他行是调用方的错误，不能静默写事件。
+func TestAccrueRejectsNonOrderPayRow(t *testing.T) {
+	e := newEnv(t)
+	for _, l := range []referral.LedgerRowForTest{
+		referral.LedgerRowOf(1, 1, "refund", 100, "ord-1", e.clk.Now()),
+		referral.LedgerRowOf(1, 1, "order_pay", 100, "ord-1", e.clk.Now()),
+	} {
+		if err := e.accrueTx(l); err == nil || errors.Is(err, referral.ErrSkip) {
+			t.Fatalf("%+v: want error, got %v", l, err)
+		}
+	}
+}
+
+// R2 边界：created_at == rebate_until 已过返利期（capped period_over）；rebate_until − 1ns 仍计提。
+func TestAccrueRebateUntilBoundary(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	bid := e.bind(a, b)
+	e.clk.Advance(time.Hour)
+	l := e.ledgerOf(e.pay(b, "ord-eq", 6900))
+	e.bindExec(`UPDATE referral_bindings SET rebate_until = $2 WHERE id = $1`, bid, l.CreatedAt)
+	if err := e.accrueTx(l); err != nil {
+		t.Fatal(err)
+	}
+	if ev := e.events("ord-eq"); len(ev) != 1 || ev[0] != "capped" || e.rewardCount("ord-eq") != 0 {
+		t.Fatalf("created_at == rebate_until: events = %v", ev)
+	}
+	var detail string
+	if err := e.pool.QueryRow(e.ctx, `SELECT detail FROM referral_events WHERE order_id = 'ord-eq'`).Scan(&detail); err != nil || detail != "period_over" {
+		t.Fatalf("detail = %q (%v)", detail, err)
+	}
+	l2 := e.ledgerOf(e.pay(b, "ord-before", 6900))
+	l2.CreatedAt = l.CreatedAt.Add(-time.Nanosecond)
+	if err := e.accrueTx(l2); err != nil {
+		t.Fatal(err)
+	}
+	if e.reward("ord-before")["reward"] != int64(690) {
+		t.Fatalf("rebate_until − 1ns must accrue: %v", e.reward("ord-before"))
+	}
+}
+
+// void 的 reward 不占被邀请人上限：作废后空出的额度下次计提可用。
+func TestAccrueVoidRewardFreesInviteeRoom(t *testing.T) {
+	e := newEnv(t)
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	e.bindExec(`UPDATE referral_rate_versions SET max_per_invitee = 1000`)
+	e.accrueOK(e.pay(b, "ord-1", 6900)) // 690
+	e.accrueOK(e.pay(b, "ord-2", 6900)) // room 310
+	if e.reward("ord-2")["reward"] != int64(310) {
+		t.Fatalf("ord-2 = %v", e.reward("ord-2"))
+	}
+	e.bindExec(`UPDATE referral_rewards SET status = 'void' WHERE order_id = 'ord-1'`)
+	e.accrueOK(e.pay(b, "ord-3", 6900)) // room 1000 − 310 = 690
+	if e.reward("ord-3")["reward"] != int64(690) {
+		t.Fatalf("void must free room: ord-3 = %v", e.reward("ord-3"))
+	}
+}
+
+// 跳过时的错误日志区分「订单不存在」与「订单属于别人」，后者带上订单主人。
+func TestAccrueSkipLogDistinguishesMissingAndForeignOrder(t *testing.T) {
+	e := newEnv(t)
+	var buf bytes.Buffer
+	svc := referral.NewService(referral.Deps{Pool: e.pool, Clock: e.clk, Log: slog.New(slog.NewTextHandler(&buf, nil)), Wallet: e.wallet, Users: e.users, Orders: e.orders})
+	a := e.user("13812345678", true)
+	b := e.user("13900000001", true)
+	e.bind(a, b)
+	accrue := func(l referral.LedgerRowForTest) error {
+		return db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error { return svc.AccrueForTest(e.ctx, tx, e.clk.Now(), l) })
+	}
+	l := e.ledgerOf(e.pay(b, "ord-ghost", 6900))
+	delete(e.orders.m, "ord-ghost")
+	if err := accrue(l); !errors.Is(err, referral.ErrSkip) || !strings.Contains(buf.String(), "order not found") {
+		t.Fatalf("ghost: %v log=%q", err, buf.String())
+	}
+	buf.Reset()
+	l = e.ledgerOf(e.pay(b, "ord-other", 6900))
+	e.orders.m["ord-other"] = fakeOrder{userID: a}
+	if err := accrue(l); !errors.Is(err, referral.ErrSkip) || !strings.Contains(buf.String(), "not the order owner") ||
+		!strings.Contains(buf.String(), fmt.Sprintf("owner=%d", a)) {
+		t.Fatalf("other owner: %v log=%q", err, buf.String())
 	}
 }

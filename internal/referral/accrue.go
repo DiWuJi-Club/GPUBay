@@ -10,6 +10,7 @@ import (
 
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/wallet"
 )
 
 // ledgerRow 是扫描到的一条 wallet_ledger（ref_type='order'）。
@@ -91,6 +92,9 @@ func lockUsersKeyShare(ctx context.Context, tx pgx.Tx, ids ...int64) error {
 // accrue 处理一条 order_pay 流水（规格 §4.2）。调用方提供事务。
 // 加锁：users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE；幂等复查与绑定状态都在账户锁之后读。
 func (s *Service) accrue(ctx context.Context, tx pgx.Tx, now time.Time, l ledgerRow) error {
+	if l.Kind != string(wallet.KindOrderPay) || l.Amount >= 0 {
+		return fmt.Errorf("referral: accrue on ledger %d kind=%s amount=%d", l.ID, l.Kind, l.Amount)
+	}
 	var inviterID int64
 	err := tx.QueryRow(ctx, `SELECT inviter_id FROM referral_bindings WHERE invitee_id = $1`, l.UserID).Scan(&inviterID)
 	if db.IsNoRows(err) {
@@ -124,12 +128,16 @@ func (s *Service) accrue(ctx context.Context, tx pgx.Tx, now time.Time, l ledger
 	}
 	order := l.RefID
 	userID, start, err := s.d.Orders.OrderForReferral(ctx, tx, order)
-	if errors.Is(err, apperr.ErrNotFound) || (err == nil && userID != l.UserID) {
+	if errors.Is(err, apperr.ErrNotFound) {
 		s.d.Log.Error("referral: order not found for order_pay ledger", "ledger", l.ID, "order", order, "user", l.UserID)
 		return errSkip
 	}
 	if err != nil {
 		return err
+	}
+	if userID != l.UserID {
+		s.d.Log.Error("referral: order_pay ledger user is not the order owner", "ledger", l.ID, "order", order, "user", l.UserID, "owner", userID)
+		return errSkip
 	}
 	v, err := s.ConfigAt(ctx, tx, l.CreatedAt)
 	if err != nil {

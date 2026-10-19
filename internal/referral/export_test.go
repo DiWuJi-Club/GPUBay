@@ -25,3 +25,7 @@ func (s *Service) AccrueForTest(ctx context.Context, tx pgx.Tx, now time.Time, l
 func LedgerRowOf(id, userID int64, kind string, amount int64, refID string, at time.Time) ledgerRow {
 	return ledgerRow{ID: id, UserID: userID, Kind: kind, Amount: amount, RefID: refID, CreatedAt: at}
 }
+
+func (s *Service) ApplyRefundForTest(ctx context.Context, tx pgx.Tx, now time.Time, l ledgerRow) error {
+	return s.applyRefund(ctx, tx, now, l)
+}

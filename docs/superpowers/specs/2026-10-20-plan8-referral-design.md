@@ -289,7 +289,7 @@ INSERT referral_events(accrue, source_ledger_id=l.id, amount=cap, detail=raw/roo
 cap < raw → 另记事件 capped(amount = raw − cap)
 ```
 - `OrderLookup` 是 rental 提供的只读接口 `OrderForReferral(ctx, q, orderID) (userID int64, scheduledStartAt *time.Time, err error)`（读 `orders JOIN instances`）；订单不存在（理论上不可能）→ 本行记错误日志、跳过，不写事件（下轮重试）。
-- 并发：同一邀请人的两笔计提同时算 `room_inviter` 会双花上限 → 计提事务先 `SELECT … FROM referral_accounts WHERE user_id = inviter FOR UPDATE`（邀请人必有账户行，因为有码才有绑定）。锁顺序统一为 `referral_accounts(邀请人) → referral_rewards(订单) → wallet_accounts(邀请人)`（§14）。
+- 并发：同一邀请人的两笔计提同时算 `room_inviter` 会双花上限 → 计提事务先 `SELECT … FROM referral_accounts WHERE user_id = inviter FOR UPDATE`（邀请人必有账户行，因为有码才有绑定）。锁顺序统一为 `users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → [幂等复查] → referral_rewards(订单) → wallet_accounts(邀请人)`（§14）：`users` 须先于账户显式加锁（插 `referral_rewards` / `wallet_ledger` 的外键检查会对 `users` 取 `KEY SHARE`，放在账户锁之后就与实名事务的 users → accounts 反向）；「该流水是否已处理」在拿到账户锁之后复查（并发处理同一行的后来者看到已处理即返回，不撞唯一约束），绑定状态 / 返利期也在锁后读。退款处理（§4.3）同一顺序。
 - 30 天上限按「发放净额 + 待发放」占用，是保守口径：待发放最终可能因退款变小，空出的额度下次计提时自然可用。
 
 ### 4.3 退款（处理一条 `refund` 流水 `l`，`ref_type='order'`）
@@ -513,7 +513,7 @@ func (s *Service) Admin*(...)                                                // 
   | 路径 | 顺序 |
   |---|---|
   | Bind（在 identity 事务内） | users(被邀请人, INSERT 持有) → users(码主) FOR KEY SHARE → referral_accounts(码主) FOR SHARE → 插 referral_bindings |
-  | 计提 / 退款处理 | referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回] |
+  | 计提 / 退款处理 | users(邀请人, 被邀请人) FOR KEY SHARE → referral_accounts(邀请人) FOR UPDATE → [幂等复查 `alreadyProcessed`] → referral_rewards(订单) FOR UPDATE → [wallet_accounts(邀请人)，仅扣回] |
   | 发放 | referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → wallet_accounts(邀请人) |
   | 冻结 / 解冻 / 撤销 / 通过 | referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards（撤销时批量 void） |
   | OnKYCVerified（在 identity 事务内） | users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards |
