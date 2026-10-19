@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
@@ -296,68 +297,101 @@ func (l *limitedBuf) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// Exec 在容器里执行一条命令（复用共享 ssh.Client 上的一个 session）。
-// 远端非零退出：exit = 退出码，err = nil。ctx 到期：关闭 session，返回已收到的输出与 ctx.Err()（共享连接保留）。
-// NewSession / Start 的连接层错误：丢弃连接重试一次，再失败返回 *DialError；命令一旦开始执行就不再重试（避免重复执行）。
-// stdout / stderr 各截断到 maxOutput 字节。
+// execCloseGrace 是 ctx 到期关闭 session 后等上游确认的上限；超时说明上游已不回应，丢弃共享连接让 Wait 返回。
+const execCloseGrace = 2 * time.Second
+
+// isConnErr 判断错误是否来自传输层（连接已断 / 写失败），区别于上游正常的拒绝回复。
+func isConnErr(err error) bool {
+	var ne net.Error
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.As(err, &ne)
+}
+
+// Exec 在容器里执行一条命令（复用共享 ssh.Client 上的一个 session）。命令至多执行一次：
+//   - 远端非零退出：exit = 退出码，err = nil；退出码缺失：exit = -1，err 非 DialError。
+//   - NewSession 遇连接层错误（命令尚未发出）：丢弃连接重试一次，再失败返回 *DialError。
+//   - 上游拒绝 session 或 exec：普通错误，共享连接保留（丢弃会断掉该实例的全部入口隧道）。
+//   - Start 遇连接层错误：丢弃连接，返回普通错误，不重试（exec 可能已送达）。
+//   - ctx 到期：尽力发 SIGKILL 并关闭 session，返回已收到的输出与 ctx.Err()；共享连接保留，
+//     除非上游在 execCloseGrace 内不回应关闭（此时丢弃连接，保证 Exec 及时返回）。
+//
+// stdout / stderr 各截断到 maxOutput 字节（<= 0 视为 1 MiB）。
 func (p *Pool) Exec(ctx context.Context, t Target, cmd string, stdin []byte, maxOutput int) (stdout, stderr []byte, exit int, err error) {
 	if maxOutput <= 0 {
 		maxOutput = 1 << 20
 	}
+	var c *ssh.Client
+	var sess *ssh.Session
+	for attempt := 0; ; attempt++ {
+		if c, err = p.client(ctx, t); err != nil {
+			return nil, nil, -1, err
+		}
+		if sess, err = c.NewSession(); err == nil {
+			break
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, nil, -1, ctxErr
+		}
+		var oce *ssh.OpenChannelError
+		if errors.As(err, &oce) { // 上游拒绝 session：连接本身完好
+			return nil, nil, -1, fmt.Errorf("上游拒绝 session: %w", err)
+		}
+		// 其余 NewSession 错误都来自传输层：写失败，或等确认时连接断开
+		// （x/crypto 此时报 "unexpected packet in response to channel open: <nil>"，不是 io.EOF）
+		p.dropClient(t.InstanceID, c)
+		if attempt > 0 {
+			return nil, nil, -1, &DialError{InstanceID: t.InstanceID, Err: err}
+		}
+	}
+	out, errb := &limitedBuf{max: maxOutput}, &limitedBuf{max: maxOutput}
+	sess.Stdin, sess.Stdout, sess.Stderr = bytes.NewReader(stdin), out, errb
 	type runResult struct {
 		started bool
 		err     error
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		var c *ssh.Client
-		if c, err = p.client(ctx, t); err != nil {
-			return nil, nil, -1, err
+	done := make(chan runResult, 1)
+	go func() {
+		if err := sess.Start(cmd); err != nil {
+			done <- runResult{err: err}
+			return
 		}
-		sess, serr := c.NewSession()
-		if serr != nil {
+		done <- runResult{started: true, err: sess.Wait()}
+	}()
+	select {
+	case r := <-done:
+		sess.Close()
+		if !r.started {
+			if isConnErr(r.err) {
+				p.dropClient(t.InstanceID, c)
+			}
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, nil, -1, ctxErr
 			}
-			p.dropClient(t.InstanceID, c)
-			err = serr
-			continue
-		}
-		out, errb := &limitedBuf{max: maxOutput}, &limitedBuf{max: maxOutput}
-		sess.Stdin, sess.Stdout, sess.Stderr = bytes.NewReader(stdin), out, errb
-		done := make(chan runResult, 1)
-		go func() {
-			if err := sess.Start(cmd); err != nil {
-				done <- runResult{err: err}
-				return
+			if isConnErr(r.err) {
+				return nil, nil, -1, fmt.Errorf("发送命令时上游连接中断（命令可能已执行）: %w", r.err)
 			}
-			done <- runResult{started: true, err: sess.Wait()}
-		}()
+			return nil, nil, -1, fmt.Errorf("上游拒绝执行命令: %w", r.err)
+		}
+		var ee *ssh.ExitError
+		var em *ssh.ExitMissingError
+		switch {
+		case errors.As(r.err, &ee):
+			return out.buf.Bytes(), errb.buf.Bytes(), ee.ExitStatus(), nil
+		case errors.As(r.err, &em):
+			return out.buf.Bytes(), errb.buf.Bytes(), -1, fmt.Errorf("远端未返回退出码: %w", r.err)
+		}
+		// r.err 为 nil，或远端已以 0 退出、只是没读完 stdin（Wait 报 stdin 拷贝错误）：都按退出码 0 返回
+		return out.buf.Bytes(), errb.buf.Bytes(), 0, nil
+	case <-ctx.Done():
+		sess.Signal(ssh.SIGKILL) // 尽力而为：容器 sshd 不一定支持 signal
+		sess.Close()             // 只关这个 session；共享连接保留
+		grace := time.NewTimer(execCloseGrace)
+		defer grace.Stop()
 		select {
-		case r := <-done:
-			sess.Close()
-			if !r.started {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return nil, nil, -1, ctxErr
-				}
-				p.dropClient(t.InstanceID, c) // 连接层错误、命令未执行：重建后再试一次
-				err = r.err
-				continue
-			}
-			var ee *ssh.ExitError
-			var em *ssh.ExitMissingError
-			switch {
-			case errors.As(r.err, &ee):
-				return out.buf.Bytes(), errb.buf.Bytes(), ee.ExitStatus(), nil
-			case errors.As(r.err, &em):
-				return out.buf.Bytes(), errb.buf.Bytes(), -1, fmt.Errorf("远端未返回退出码: %w", r.err)
-			}
-			// r.err 为 nil，或远端已以 0 退出、只是没读完 stdin（Wait 报 stdin 拷贝错误）：都按退出码 0 返回
-			return out.buf.Bytes(), errb.buf.Bytes(), 0, nil
-		case <-ctx.Done():
-			sess.Close() // 只关这个 session；共享连接保留
+		case <-done:
+		case <-grace.C:
+			p.dropClient(t.InstanceID, c) // 上游对关闭无回应：丢弃连接，Wait 随之返回
 			<-done
-			return out.buf.Bytes(), errb.buf.Bytes(), -1, ctx.Err()
 		}
+		return out.buf.Bytes(), errb.buf.Bytes(), -1, ctx.Err()
 	}
-	return nil, nil, -1, &DialError{InstanceID: t.InstanceID, Err: err}
 }
