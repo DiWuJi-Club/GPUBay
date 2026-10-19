@@ -701,4 +701,20 @@ func TestRunShDeployLock(t *testing.T) {
 	if !strings.Contains(string(old), "==== deploy #1") || strings.Contains(b.log(), "==== deploy #1") || !strings.Contains(b.log(), "==== deploy #2") {
 		t.Fatalf("log not rotated per deploy:\nlog.1=%s\nlog=%s", old, b.log())
 	}
+	// 建不了锁（同名的不是符号链接）是真错误：退出 1，不是 75（Runner 据 75 只会无限重试）
+	if err := os.WriteFile(lock, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := b.run("deploy"); code != 1 || !strings.Contains(out, "deploy lock: cannot create") {
+		t.Fatalf("deploy with unusable lock path = %d %q", code, out)
+	}
+	os.Remove(lock)
+	// 打破陈旧锁后不留临时名
+	setLock(999999, time.Now().Add(-time.Hour))
+	if out, code := b.run("deploy"); code != 0 {
+		t.Fatalf("deploy over old lock = %d %q", code, out)
+	}
+	if left, _ := filepath.Glob(lock + ".stale.*"); len(left) != 0 {
+		t.Fatalf("stale lock temp names left: %v", left)
+	}
 }

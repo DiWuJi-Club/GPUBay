@@ -52,6 +52,8 @@ type Runner struct {
 	peak atomic.Int32
 	// beforeWriteback 测试钩子：exec 之后、回写事务之前调用（模拟 exec 期间的用户操作）。
 	beforeWriteback func(Deployment)
+	// execHook 测试钩子：非 nil 且返回错误时 exec 不执行命令、直接返回该错误（注入非连接层的 exec 失败）。
+	execHook func(cmd string) error
 }
 
 func NewRunner(s *Service, up *upstream.Pool, cfg RunnerConfig) *Runner {
@@ -346,6 +348,11 @@ type execResult struct {
 
 // exec 在容器里执行；连接层错误返回 *upstream.DialError（调用方走 unreachable 分支）。
 func (r *Runner) exec(ctx context.Context, ut upstream.Target, cmd string, stdin []byte, timeout time.Duration) (execResult, error) {
+	if r.execHook != nil {
+		if err := r.execHook(cmd); err != nil {
+			return execResult{exit: -1}, err
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out, errb, exit, err := r.up.Exec(ctx, ut, cmd, stdin, MaxLogTail+MaxStatusBytes+1024)
@@ -433,14 +440,18 @@ func (r *Runner) unreachable(ctx context.Context, d Deployment, tg target, now t
 		if err := r.s.markFailed(ctx, tx, cur, ErrCodeUnreachable, fmt.Sprintf("连续 %d 次无法连接容器", n), now); err != nil {
 			return err
 		}
-		// 同一实例的几个部署往往同一轮一起失败、各自一个事务：RaiseAlertOnce 的「查重再插入」要按实例串行，否则各插一条
-		msg := rental.AlertAppDeployUnreachable(cur.InstanceID)
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "app_deploy_unreachable:"+cur.InstanceID); err != nil {
-			return err
-		}
-		return r.s.d.Fleet.RaiseAlertOnce(ctx, tx, fleet.Alert{Level: "warning", Kind: "app_deploy_unreachable", MachineID: tg.MachineID,
-			InstanceID: cur.InstanceID, Message: msg})
+		return r.alertUnreachable(ctx, tx, cur.InstanceID, tg.MachineID)
 	})
+}
+
+// alertUnreachable 告警「实例的应用部署无法连接容器」（未处理前同一实例只一条）。
+// 同一实例的几个部署往往同一轮一起失败、各自一个事务：RaiseAlertOnce 的「查重再插入」要按实例串行，否则各插一条。
+func (r *Runner) alertUnreachable(ctx context.Context, tx pgx.Tx, instanceID string, machineID int64) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "app_deploy_unreachable:"+instanceID); err != nil {
+		return err
+	}
+	return r.s.d.Fleet.RaiseAlertOnce(ctx, tx, fleet.Alert{Level: "warning", Kind: "app_deploy_unreachable", MachineID: machineID,
+		InstanceID: instanceID, Message: rental.AlertAppDeployUnreachable(instanceID)})
 }
 
 // stepGone 实例已消失（rental 钩子的兜底）：非终态 → removed(instance_gone)；待清理的目录随实例一起没了 → 清标记。
@@ -454,8 +465,37 @@ func (r *Runner) stepGone(ctx context.Context, d Deployment, now time.Time) erro
 	})
 }
 
-// deployBusy 是 run.sh deploy 拿不到部署锁（上一次 deploy 的 exec 超时后仍在容器里跑）时的退出码。
-const deployBusy = 75
+// deployBusyExit 是 run.sh deploy 拿不到部署锁（上一次 deploy 的 exec 超时后仍在容器里跑）时的退出码。
+const (
+	deployBusyExit = 75
+	// DeployBusyMax：一直 busy 超过 run.sh 陈旧锁时限（120 秒）的两倍 → failed(deploy_busy)（兜底，正常不会发生）。
+	DeployBusyMax     = 2 * 120 * time.Second
+	ErrCodeDeployBusy = "deploy_busy"
+	phaseBusy         = "busy"
+)
+
+func init() { ErrorText[ErrCodeDeployBusy] = "上一次部署未结束" }
+
+// deployBusy：上一次 deploy 还没结束 → 保持 queued，30 秒后再试。phase = busy、started_at 记「从何时开始等」，
+// 等了超过 DeployBusyMax 就 failed(deploy_busy)（并按失败后停进程处理）。
+// attempt：上传已经成功（目录与带 secret 的 env 已在容器里），不能退回 0，否则停机时卸载不会置 cleanup_pending；
+// 但也不让每次 busy 重试累加：退回本轮的 +1，下限 1。
+func (r *Runner) deployBusy(ctx context.Context, d Deployment, ut upstream.Target, dir string, now time.Time) error {
+	if d.Phase == phaseBusy && d.StartedAt != nil && now.Sub(*d.StartedAt) > DeployBusyMax {
+		undo := func(tx pgx.Tx, cur Deployment) error { // 本轮没有启动任何东西：同样退回本轮的 +1
+			_, err := tx.Exec(ctx, `UPDATE app_deployments SET attempt = GREATEST(attempt - 1, 1), row_version = row_version + 1 WHERE id = $1`, cur.ID)
+			return err
+		}
+		return r.failAndStop(ctx, d, ut, dir, ErrCodeDeployBusy, fmt.Sprintf("上一次部署超过 %d 分钟仍未结束", int(DeployBusyMax/time.Minute)), now, undo)
+	}
+	r.log.Info("appdeploy: previous deploy still running in container, retry later", "deployment", d.ID)
+	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+		_, err := tx.Exec(ctx, `UPDATE app_deployments SET attempt = GREATEST(attempt - 1, 1), next_poll_at = $2, updated_at = $3,
+			phase = 'busy', message = '上一次部署仍在进行，稍后重试', started_at = CASE WHEN phase = 'busy' AND started_at IS NOT NULL THEN started_at ELSE $3 END,
+			row_version = row_version + 1 WHERE id = $1`, cur.ID, now.Add(UnreachableRetry), now)
+		return err
+	})
+}
 
 func (r *Runner) stepDeploy(ctx context.Context, d Deployment, ut upstream.Target, tg target, now time.Time) error {
 	root := r.appRoot(d.InstanceID)
@@ -485,13 +525,8 @@ func (r *Runner) stepDeploy(ctx context.Context, d Deployment, ut upstream.Targe
 	if err != nil {
 		return err
 	}
-	if res.exit == deployBusy { // 上一次 deploy 还没结束：保持 queued，30 秒后再试；本轮的 attempt 退回（那一次已经计过）
-		r.log.Info("appdeploy: previous deploy still running in container, retry later", "deployment", d.ID)
-		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
-			_, err := tx.Exec(ctx, `UPDATE app_deployments SET attempt = GREATEST(attempt - 1, 0), next_poll_at = $2, updated_at = $3,
-				row_version = row_version + 1 WHERE id = $1`, cur.ID, now.Add(UnreachableRetry), now)
-			return err
-		})
+	if res.exit == deployBusyExit {
+		return r.deployBusy(ctx, d, ut, dir, now)
 	}
 	if res.exit != 0 {
 		code, msg := ErrCodeScriptFailed, lastLine(res.stderr)
@@ -547,13 +582,37 @@ func (r *Runner) markFailedStopping(ctx context.Context, tx pgx.Tx, cur Deployme
 	if err := r.s.markFailed(ctx, tx, cur, code, msg, now); err != nil {
 		return err
 	}
-	return tx.QueryRow(ctx, `UPDATE app_deployments SET desired = 'stopped', next_poll_at = $2, row_version = row_version + 1
+	return tx.QueryRow(ctx, `UPDATE app_deployments SET desired = 'stopped', unreachable_count = 0, next_poll_at = $2, row_version = row_version + 1
 		WHERE id = $1 RETURNING row_version`, cur.ID, now.Add(r.cfg.PollInterval)).Scan(rv)
 }
 
 // stopFailed 对带「待停止」标记的 failed 部署执行 run.sh stop（幂等），成功后清标记。
 func (r *Runner) stopFailed(ctx context.Context, d Deployment, ut upstream.Target, dir string, now time.Time) error {
 	res, err := r.exec(ctx, ut, runSHCmd(dir, "stop"), nil, ExecStatusTimeout)
+	if isDial(err) {
+		// 连不上容器：与其它步骤一样计 unreachable_count；到阈值放弃（清标记）并告警，不再无限重试
+		r.log.Warn("appdeploy: stop after failure: container unreachable", "deployment", d.ID, "count", d.UnreachableCount+1, "err", err)
+		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+			n := cur.UnreachableCount + 1
+			if n < UnreachableFailAfter {
+				_, err := tx.Exec(ctx, `UPDATE app_deployments SET unreachable_count = $2, next_poll_at = $3, row_version = row_version + 1 WHERE id = $1`,
+					cur.ID, n, now.Add(UnreachableRetry))
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE app_deployments SET unreachable_count = $2, desired = 'running', next_poll_at = $3, updated_at = $4,
+				row_version = row_version + 1 WHERE id = $1`, cur.ID, n, now.Add(24*time.Hour), now); err != nil {
+				return err
+			}
+			if err := addEvent(ctx, tx, cur.ID, cur.State, cur.State, "无法连接容器，未能停止容器内的进程", now); err != nil {
+				return err
+			}
+			var machineID int64
+			if err := tx.QueryRow(ctx, `SELECT machine_id FROM instances WHERE id = $1`, cur.InstanceID).Scan(&machineID); err != nil {
+				return err
+			}
+			return r.alertUnreachable(ctx, tx, cur.InstanceID, machineID)
+		})
+	}
 	if err != nil {
 		r.log.Warn("appdeploy: stop after failure did not run, retry later", "deployment", d.ID, "err", err)
 		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
@@ -565,7 +624,7 @@ func (r *Runner) stopFailed(ctx context.Context, d Deployment, ut upstream.Targe
 		r.logStderr(d, "appdeploy: run.sh stop after failure exited non-zero", res)
 	}
 	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
-		_, err := tx.Exec(ctx, `UPDATE app_deployments SET desired = 'running', next_poll_at = $2, updated_at = $3, row_version = row_version + 1 WHERE id = $1`,
+		_, err := tx.Exec(ctx, `UPDATE app_deployments SET desired = 'running', unreachable_count = 0, next_poll_at = $2, updated_at = $3, row_version = row_version + 1 WHERE id = $1`,
 			cur.ID, now.Add(24*time.Hour), now)
 		return err
 	})

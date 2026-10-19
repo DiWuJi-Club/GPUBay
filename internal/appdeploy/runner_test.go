@@ -1072,16 +1072,39 @@ func TestRunnerFailedStopRetried(t *testing.T) {
 		!got.NextPollAt.Equal(now.Add(appdeploy.UnreachableRetry)) {
 		t.Fatalf("failed with pending stop = %+v", got)
 	}
+	// 补做 stop 一直连不上：与其它步骤一样计 unreachable_count，第 10 次放弃（清标记）并告警
+	for i := 2; i < appdeploy.UnreachableFailAfter; i++ {
+		re.clk.Advance(appdeploy.UnreachableRetry)
+		re.tick()
+		if got := re.dep(d2.ID); got.Desired != appdeploy.DesiredStopped || got.UnreachableCount != i {
+			t.Fatalf("round %d: pending stop = %+v", i, got)
+		}
+	}
+	if n := re.count(`SELECT count(*) FROM alerts WHERE kind = 'app_deploy_unreachable'`); n != 0 {
+		t.Fatalf("alert before threshold: %d", n)
+	}
 	re.clk.Advance(appdeploy.UnreachableRetry)
+	now = re.clk.Now()
 	re.tick()
-	if got := re.dep(d2.ID); got.Desired != appdeploy.DesiredStopped {
-		t.Fatalf("pending stop dropped while unreachable = %+v", got)
+	got = re.dep(d2.ID)
+	if got.Desired != appdeploy.DesiredRunning || got.UnreachableCount != appdeploy.UnreachableFailAfter || !got.NextPollAt.Equal(now.Add(24*time.Hour)) {
+		t.Fatalf("gave up pending stop = %+v", got)
+	}
+	if n := re.count(`SELECT count(*) FROM alerts WHERE kind = 'app_deploy_unreachable' AND instance_id = $1 AND machine_id = $2`, inst2.ID, inst2.MachineID); n != 1 {
+		t.Fatalf("alerts = %d", n)
+	}
+	if detail := re.lastEventDetail(d2.ID); !strings.Contains(detail, "未能停止") {
+		t.Fatalf("event = %q", detail)
+	}
+	re.clk.Advance(time.Hour)
+	if n := re.tick(); n != 0 {
+		t.Fatalf("still retrying after giving up: processed %d", n)
 	}
 }
 
 // TestRunnerDeployBusyKeepsQueued：上一次 deploy 还在容器里跑（run.sh 部署锁被活着的进程持有）→ 不失败、保持 queued，30 秒后再试。
 func TestRunnerDeployBusyKeepsQueued(t *testing.T) {
-	re := newRunnerEnv(t, 1)
+	re := newRunnerEnv(t, 2)
 	a := re.app("vllm", 8000)
 	inst := re.instance()
 	d := re.create(inst, a.ID, nil)
@@ -1098,15 +1121,102 @@ func TestRunnerDeployBusyKeepsQueued(t *testing.T) {
 	if err := os.Symlink(strconv.Itoa(holder.Process.Pid)+" "+strconv.FormatInt(time.Now().Unix(), 10), lock); err != nil {
 		t.Fatal(err)
 	}
-	now := re.clk.Now()
+	t0 := re.clk.Now()
 	re.tick()
-	if got := re.dep(d.ID); got.State != appdeploy.StateQueued || got.Attempt != 0 || got.ErrorCode != "" || !got.NextPollAt.Equal(now.Add(appdeploy.UnreachableRetry)) {
+	// 上传已成功：attempt 保持 1（卸载据此知道容器里有目录）；phase busy、started_at 记开始等待的时间
+	got := re.dep(d.ID)
+	if got.State != appdeploy.StateQueued || got.Attempt != 1 || got.ErrorCode != "" || got.Phase != "busy" || got.StartedAt == nil ||
+		!got.StartedAt.Equal(t0) || !got.NextPollAt.Equal(t0.Add(appdeploy.UnreachableRetry)) {
 		t.Fatalf("busy deploy = %+v", got)
+	}
+	re.clk.Advance(appdeploy.UnreachableRetry)
+	re.tick()
+	if got := re.dep(d.ID); got.State != appdeploy.StateQueued || got.Attempt != 1 || !got.StartedAt.Equal(t0) {
+		t.Fatalf("second busy round = %+v", got)
 	}
 	os.Remove(lock)
 	re.clk.Advance(appdeploy.UnreachableRetry)
 	re.tick()
-	if got := re.dep(d.ID); got.State != appdeploy.StateInstalling || got.Attempt != 1 {
+	if got := re.dep(d.ID); got.State != appdeploy.StateInstalling || got.Attempt != 2 || got.Phase != "prepare" {
 		t.Fatalf("after lock released = %+v", got)
+	}
+	// busy 的 queued 部署（上传过、attempt 1）在实例停机时卸载：要清理目录（带 secret 的 env 已在容器里）
+	inst2 := re.instance()
+	d2 := re.create(inst2, a.ID, nil)
+	dir2 := re.dir(inst2.ID, "vllm")
+	if err := os.MkdirAll(dir2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(strconv.Itoa(holder.Process.Pid)+" "+strconv.FormatInt(time.Now().Unix(), 10), filepath.Join(dir2, ".deploy.lock")); err != nil {
+		t.Fatal(err)
+	}
+	re.tick()
+	if got := re.dep(d2.ID); got.State != appdeploy.StateQueued || got.Attempt != 1 {
+		t.Fatalf("busy on second instance = %+v", got)
+	}
+	re.exec(`UPDATE instances SET state = 'stopped' WHERE id = $1`, inst2.ID)
+	if _, err := re.svc.Remove(re.ctx, re.userID, inst2.ID, d2.ID, "1.2.3.4"); err != nil {
+		t.Fatal(err)
+	}
+	if got := re.dep(d2.ID); got.State != appdeploy.StateRemoved || !got.CleanupPending {
+		t.Fatalf("remove of busy queued deployment = %+v", got)
+	}
+}
+
+// TestRunnerDeployBusyBackstop：一直 busy 超过 2×120 秒 → failed(deploy_busy)。
+func TestRunnerDeployBusyBackstop(t *testing.T) {
+	re := newRunnerEnv(t, 1)
+	a := re.app("vllm", 8000)
+	inst := re.instance()
+	d := re.create(inst, a.ID, nil)
+	dir := re.dir(inst.ID, "vllm")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	holder := exec.Command("sleep", "60")
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { holder.Process.Kill(); holder.Wait() })
+	if err := os.Symlink(strconv.Itoa(holder.Process.Pid)+" "+strconv.FormatInt(time.Now().Unix(), 10), filepath.Join(dir, ".deploy.lock")); err != nil {
+		t.Fatal(err)
+	}
+	t0 := re.clk.Now()
+	for re.clk.Now().Sub(t0) <= appdeploy.DeployBusyMax {
+		re.tick()
+		if got := re.dep(d.ID); got.State != appdeploy.StateQueued {
+			t.Fatalf("at +%v: %+v", re.clk.Now().Sub(t0), got)
+		}
+		re.clk.Advance(appdeploy.UnreachableRetry)
+	}
+	re.tick()
+	got := re.dep(d.ID)
+	if got.State != appdeploy.StateFailed || got.ErrorCode != appdeploy.ErrCodeDeployBusy || got.Attempt != 1 {
+		t.Fatalf("backstop = %+v", got)
+	}
+}
+
+// TestRunnerHealthExecErrorBackoff：running 部署的 status exec 非连接层失败（注入）→ health unknown，按 HealthInterval 退避，state 不变。
+func TestRunnerHealthExecErrorBackoff(t *testing.T) {
+	re := newRunnerEnv(t, 1)
+	a := re.app("vllm", 8000)
+	inst := re.instance()
+	d := re.create(inst, a.ID, nil)
+	re.until(d.ID, appdeploy.StateRunning)
+	appdeploy.SetExecHook(re.r, func(string) error { return errors.New("injected exec failure") })
+	re.clk.Advance(appdeploy.HealthInterval)
+	now := re.clk.Now()
+	if _, locked, err := re.r.Tick(re.ctx); !locked || err == nil || !strings.Contains(err.Error(), "injected") {
+		t.Fatalf("tick = %v %v", locked, err)
+	}
+	got := re.dep(d.ID)
+	if got.State != appdeploy.StateRunning || got.Health != appdeploy.HealthUnknown || !got.NextPollAt.Equal(now.Add(appdeploy.HealthInterval)) || got.UnreachableCount != 0 {
+		t.Fatalf("after exec error = %+v", got)
+	}
+	appdeploy.SetExecHook(re.r, nil)
+	re.clk.Advance(appdeploy.HealthInterval)
+	re.tick()
+	if got := re.dep(d.ID); got.Health != appdeploy.HealthOK {
+		t.Fatalf("recovered = %+v", got)
 	}
 }

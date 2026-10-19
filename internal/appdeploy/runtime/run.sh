@@ -218,23 +218,44 @@ cmd_prepare() {
 
 # deploy 前台部分互斥（stop_procs → prepare → detach）：Runner 的 deploy exec 超时（20 秒）后命令可能还在容器里跑，
 # 下一轮会再 deploy；两个并发的 deploy 会各自 detach 一个 _bg。锁是符号链接（ln -s 原子且自带内容「pid 秒」），
-# 持有者已死或超过 DEPLOY_LOCK_S 秒视为陈旧（被 SIGKILL 的 deploy 留下的）。拿不到锁：stderr「busy: …」，退出 75。
+# 持有者已死或超过 DEPLOY_LOCK_S 秒视为陈旧（被 SIGKILL 的 deploy 留下的）。
+# 锁确实被别人持有：stderr「busy: …」，退出 75；建不了锁（只读、权限、同名普通文件）是真错误：退出 1。
 DEPLOY_LOCK_S=120
 DEPLOY_BUSY=75
 deploy_lock() {
   _lk="$DIR/.deploy.lock"
   _own="$$ $(date +%s)"
   ln -s "$_own" "$_lk" 2>/dev/null && return 0
+  if [ ! -L "$_lk" ]; then
+    printf 'deploy lock: cannot create %s\n' "$_lk" >&2
+    return 1
+  fi
   _cur=$(readlink "$_lk" 2>/dev/null)
   _lp=$(num "${_cur%% *}"); _lt=$(num "${_cur##* }")
   if pid_alive "$_lp" && [ $(( $(date +%s) - _lt )) -lt "$DEPLOY_LOCK_S" ]; then
     printf 'busy: deploy pid %s still running\n' "$_lp" >&2
     return "$DEPLOY_BUSY"
   fi
-  rm -f "$_lk"
+  # 打破陈旧锁要原子：先 rename 到本进程独有的名字，再核对拿到的正是刚才判定为陈旧的那个；
+  # 若别人抢先换上了新锁（被我们误挪走），原样放回（ln -s 不覆盖：此时又有第三者建了锁就算它的）
+  _stale="$_lk.stale.$$"
+  if mv -f "$_lk" "$_stale" 2>/dev/null; then
+    _got=$(readlink "$_stale" 2>/dev/null)
+    if [ "$_got" != "$_cur" ]; then
+      ln -s "$_got" "$_lk" 2>/dev/null
+      rm -f "$_stale"
+      printf 'busy: deploy lock taken over\n' >&2
+      return "$DEPLOY_BUSY"
+    fi
+    rm -f "$_stale"
+  fi
   ln -s "$_own" "$_lk" 2>/dev/null && return 0
-  printf 'busy: deploy lock contended\n' >&2
-  return "$DEPLOY_BUSY"
+  if [ -L "$_lk" ]; then
+    printf 'busy: deploy lock contended\n' >&2
+    return "$DEPLOY_BUSY"
+  fi
+  printf 'deploy lock: cannot create %s\n' "$_lk" >&2
+  return 1
 }
 deploy_unlock() { [ "$(readlink "$DIR/.deploy.lock" 2>/dev/null)" = "$_own" ] && rm -f "$DIR/.deploy.lock"; return 0; }
 

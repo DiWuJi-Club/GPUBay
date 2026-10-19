@@ -265,7 +265,13 @@ ALTER TABLE machines ADD COLUMN cached_images TEXT[] NOT NULL DEFAULT '{}', ADD 
   spec.json       版本 spec（供 app.sh 读取端口等）
   env             变量文件（0600，§3.3）
   status.json     run.sh 写：{"seq":N,"state":"installing|running|stopped|failed","phase":"download","progress":42,"message":"...","pid":<run.sh 进程组>,"service_pid":<服务>,"spec_hash":"...","exit_code":0,"at":"<ISO8601>"}
-  log             run.sh 与 app.sh 的合并输出（append；每次 deploy 开头写分隔行 "==== deploy #N <时间> ===="）
+  log             本次部署 run.sh 与 app.sh 的合并输出（每次 deploy 先把上一次的 log 改名为 log.1，新 log 开头写分隔行
+                  "==== deploy #N <时间> ===="）；平台（status 轮询、「查看日志」）只读 log
+  log.1           上一次部署的日志（只保留一份，留在用户容器里供手工查看）：平台按当前 secret 值脱敏，换过 secret 后
+                  旧日志里的旧值认不出来，所以不再读取它
+  .deploy.lock    deploy 前台部分的互斥锁（符号链接，内容「pid 秒」；持有者已死或超过 120 秒视为陈旧）：
+                  上一次 deploy 的 exec 超时后仍在跑时，新的 deploy 退出 75（busy），Runner 保持 queued 30 秒后重试，
+                  连续 busy 超过 240 秒 → failed(deploy_busy)
   .installed      安装标记：内容 = spec_hash（install 成功后写）
   service.pid     app.sh start 启动的服务进程 PID（start 子命令必须写）
 ```
