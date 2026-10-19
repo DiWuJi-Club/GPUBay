@@ -201,7 +201,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	srv := &api.Server{
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SSHHost: cfg.SSHHost(), SSHPort: cfg.SSHPublicPort, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, TrustedProxyHops: cfg.TrustedProxyHops, PublicBaseURL: cfg.PublicBaseURL,
-		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit,
+		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit, CalendarLimit: authorizeLimit, // 两者零值各取默认（60 / 120）；DisableRateLimits 时同为 noRateLimit
 	}
 	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
 	if err != nil {
