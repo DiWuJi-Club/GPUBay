@@ -4,7 +4,7 @@
 //     整个事务遇 40P01 / 40001 重试一次（withRetry）
 //   ProvisionDue：instance → 自己的 lease → machine(NO KEY UPDATE) → [改派：machines SKIP LOCKED] → agent_commands
 //   机器行锁一律 FOR NO KEY UPDATE：插入引用 machines(id) 的行会取 FOR KEY SHARE，与 FOR UPDATE 互斥、与 NO KEY UPDATE 不互斥。
-//   后台改派：instance → lease → machines(SKIP LOCKED)
+//   后台改派：instance → lease → machines（自动挑选 SKIP LOCKED；指定机器 NO KEY UPDATE 等待）
 //   Renew / AdminExtend / 自动续费：[idem] → instance → 自己的 lease(读 cap) → orders → wallet → 更新 lease（不锁机器）
 //   取消：instance → lease → agent_commands（CancelCommands）→ orders → wallet
 //   HandleCommandResult：instance → agent_commands → lease(refreshLease) → machine(Release)

@@ -1,8 +1,10 @@
 package adminapi
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -94,14 +96,10 @@ func (s *Server) upcoming(r *http.Request, days int) ([]upcomingDay, error) {
 }
 
 func (s *Server) handleUpcomingBookings(w http.ResponseWriter, r *http.Request) {
-	days := 7
-	if v := r.URL.Query().Get("days"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 61 {
-			s.writeError(w, r, apperr.BadRequest("days 需在 1～61 之间"))
-			return
-		}
-		days = n
+	days, err := queryDays(r, 7)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
 	}
 	out, err := s.upcoming(r, days)
 	if err != nil {
@@ -109,6 +107,19 @@ func (s *Server) handleUpcomingBookings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"days": out})
+}
+
+// queryDays 解析 days（缺省 def），须在 1～rental.MaxCalendarDays 之间；/bookings/upcoming 与 /machines/{id}/calendar 共用。
+func queryDays(r *http.Request, def int) (int, error) {
+	v := r.URL.Query().Get("days")
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > rental.MaxCalendarDays {
+		return 0, apperr.BadRequest(fmt.Sprintf("days 需在 1～%d 之间", rental.MaxCalendarDays))
+	}
+	return n, nil
 }
 
 // handleCancelBooking 后台取消预订（全额退款）：ops + 动态码。
@@ -119,6 +130,11 @@ func (s *Server) handleCancelBooking(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		s.writeError(w, r, err)
+		return
+	}
+	// 先校验原因再验动态码：空原因的请求不能打开 stepUp 窗口（窗口内后续敏感操作免动态码）
+	if strings.TrimSpace(req.Reason) == "" {
+		s.writeError(w, r, apperr.BadRequest("请填写取消原因"))
 		return
 	}
 	if err := s.stepUp(r, req.TOTP); err != nil {
@@ -170,12 +186,10 @@ func (s *Server) handleMachineCalendar(w http.ResponseWriter, r *http.Request) {
 		}
 		from = t.UTC()
 	}
-	days := 61
-	if v := q.Get("days"); v != "" {
-		if days, err = strconv.Atoi(v); err != nil {
-			s.writeError(w, r, apperr.BadRequest("days 必须是整数"))
-			return
-		}
+	days, err := queryDays(r, rental.MaxCalendarDays)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
 	}
 	out, err := s.Rental.MachineLeases(r.Context(), id, from, days)
 	if err != nil {

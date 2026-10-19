@@ -59,8 +59,13 @@ func TestBookingAdminAPI(t *testing.T) {
 	if code != 200 || len(out["days"].([]any)) != 7 || out["days"].([]any)[0].(map[string]any)["count"].(float64) != 1 {
 		t.Fatalf("upcoming = %d %v", code, out)
 	}
-	if code, out := fin.do("GET", "/bookings/upcoming?days=0", nil); code != 400 {
-		t.Fatalf("upcoming days=0 = %d %v", code, out)
+	// /bookings/upcoming 与 /machines/{id}/calendar 共用一个 days 解析：非整数、越界都是同一条 400
+	for _, path := range []string{"/bookings/upcoming", "/machines/" + itoa(inst.MachineID) + "/calendar"} {
+		for _, days := range []string{"0", "62", "abc"} {
+			if code, out := ops.do("GET", path+"?days="+days, nil); code != 400 || out["message"] != "days 需在 1～61 之间" {
+				t.Fatalf("%s days=%s = %d %v", path, days, code, out)
+			}
+		}
 	}
 	code, out = fin.do("GET", "/dashboard", nil)
 	if code != 200 || out["bookings_upcoming_7d"].(float64) != 1 || out["instances"].(map[string]any)["reserved"].(float64) != 1 {
@@ -129,6 +134,10 @@ func TestBookingAdminAPI(t *testing.T) {
 	if !strings.HasPrefix(csvText, "\xEF\xBB\xBF订单号,用户ID,类型,实例,租期,数量,金额(元),已退(元),状态,批次,自动续费,下单时间\n") ||
 		!strings.Contains(csvText, ",1d,1,69.00,0.00,paid,"+batchID+",,") || strings.Count(csvText, "\n") != 2 {
 		t.Fatalf("csv = %q", csvText)
+	}
+	// 取消预订：先校验原因再验动态码——空原因带着正确动态码也只得 400，且不打开 stepUp 窗口（随后不带动态码仍要求动态码）
+	if code, out := ops.do("POST", "/instances/"+inst.ID+"/cancel-booking", map[string]any{"reason": "  ", "totp": ops.totp()}); code != 400 || out["message"] != "请填写取消原因" {
+		t.Fatalf("cancel with empty reason = %d %v", code, out)
 	}
 	// 取消预订：需要动态码；全额退款；审计
 	if code, out := ops.do("POST", "/instances/"+inst.ID+"/cancel-booking", map[string]any{"reason": "机房断电"}); code != 403 || codeOf(out) != "totp_required" {

@@ -1,6 +1,7 @@
 package rental_test
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -65,6 +66,59 @@ func TestAdminReassignToMachineAndAuto(t *testing.T) {
 	}
 	if _, err := e.svc.AdminReassign(e.ctx, actor, other.ID, nil, "x"); !errors.Is(err, apperr.ErrInvalidState) {
 		t.Fatalf("cancelled booking = %v", err)
+	}
+}
+
+// 指定机器改派：实例的 group_id 改为目标机器的机组（之后的自动改派只在新机组里挑）；
+// 目标机器行锁 FOR NO KEY UPDATE：别的事务锁着目标机器时等待（不是跳过后报 machine_unavailable），锁释放后成功。
+func TestAdminReassignToTakesTargetGroupAndLocksTarget(t *testing.T) {
+	e := newEnv(t, 3)
+	ga, gh := e.group("A", true), e.group("留池", false)
+	e.setGroup(e.machines[0], ga)
+	e.setGroup(e.machines[1], ga)
+	e.setGroup(e.machines[2], gh)
+	start := dbtest.T0.Add(3 * time.Hour)
+	req := e.batchReq(1, &start)
+	req.GroupID = &ga
+	res, err := e.svc.PlaceBatch(e.ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := res.Instances[0]
+	target := e.machines[2]
+	actor := audit.Actor{AdminID: 9}
+
+	lockTx, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTx.Exec(e.ctx, `SELECT id FROM machines WHERE id = $1 FOR NO KEY UPDATE`, target); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(e.ctx, 300*time.Millisecond)
+	_, err = e.svc.AdminReassign(ctx, actor, inst.ID, &target, "换机柜")
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		_ = lockTx.Rollback(e.ctx)
+		t.Fatalf("reassign to a locked target must wait, got %v", err)
+	}
+	if err := lockTx.Rollback(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.get(inst.ID); got.MachineID != inst.MachineID || got.ReassignCount != 0 {
+		t.Fatalf("timed-out reassign changed the instance: %+v", got)
+	}
+
+	got, err := e.svc.AdminReassign(e.ctx, actor, inst.ID, &target, "换机柜")
+	if err != nil || got.MachineID != target || got.GroupID == nil || *got.GroupID != gh {
+		t.Fatalf("reassign to hidden-group machine = %+v, %v", got, err)
+	}
+	if g := e.get(inst.ID).GroupID; g == nil || *g != gh {
+		t.Fatalf("stored group_id = %v", g)
+	}
+	// 新机组里没有别的机器：自动改派无候选（旧机组 A 的两台不再是候选）
+	if _, err := e.svc.AdminReassign(e.ctx, actor, inst.ID, nil, "自动"); !errors.Is(err, apperr.ErrMachineUnavailable) {
+		t.Fatalf("auto reassign after group change = %v", err)
 	}
 }
 

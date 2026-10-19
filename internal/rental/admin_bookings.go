@@ -106,7 +106,7 @@ func (s *Service) UpcomingBookingsForMachine(ctx context.Context, machineID int6
 }
 
 // AdminReassign 后台提前改派：machineID 为 nil 时同机组自动挑（不要求在线）；指定时目标必须空闲 / 已分配且时段无冲突（任意机组）。
-// 加锁顺序：instance → lease → machines(SKIP LOCKED)；整个事务遇 40P01 / 40001 重试一次。
+// 加锁顺序：instance → lease → machines（自动挑选 SKIP LOCKED；指定机器 NO KEY UPDATE 等待）；整个事务遇 40P01 / 40001 重试一次。
 func (s *Service) AdminReassign(ctx context.Context, actor audit.Actor, id string, machineID *int64, reason string) (Instance, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -152,19 +152,23 @@ func (s *Service) AdminReassign(ctx context.Context, actor audit.Actor, id strin
 
 // reassignTo 改派到指定机器：机器存在、同商品、idle / allocated、与 lease 时段无冲突（排他约束兜底）。
 // 与自动挑选不对称（有意）：不要求 agent_online（提前改派，开通时再看），也允许 visible=false 机组的机器（运维留池）；后台页面的说明文字同此。
+// 目标机器行锁 FOR NO KEY UPDATE（等待而非 SKIP LOCKED：运维点名的机器不该因并发分配被悄悄跳过）；
+// 实例的 group_id 改为目标机器的机组（与 AdminMigrate 一致），之后的自动改派与展示都以新机组为准。
 func (s *Service) reassignTo(ctx context.Context, tx pgx.Tx, inst *Instance, lease *leaseRow, target int64, reason string, now time.Time) error {
 	if target == inst.MachineID {
 		return apperr.ErrMachineUnavailable
 	}
-	var ok bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM machines m WHERE m.id = $1 AND m.product_id = $2 AND m.state IN ('idle', 'allocated')
+	var groupID *int64
+	err := tx.QueryRow(ctx, `SELECT m.group_id FROM machines m WHERE m.id = $1 AND m.product_id = $2 AND m.state IN ('idle', 'allocated')
 			AND NOT EXISTS (SELECT 1 FROM machine_leases l WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active')
-			                AND l.period && tstzrange($3::timestamptz, $4::timestamptz)))`,
-		target, inst.ProductID, lease.Lower, lease.Upper).Scan(&ok); err != nil {
-		return err
-	}
-	if !ok {
+			                AND l.period && tstzrange($3::timestamptz, $4::timestamptz))
+			FOR NO KEY UPDATE OF m`,
+		target, inst.ProductID, lease.Lower, lease.Upper).Scan(&groupID)
+	if db.IsNoRows(err) {
 		return apperr.ErrMachineUnavailable
+	}
+	if err != nil {
+		return err
 	}
 	newLease, err := insertLease(ctx, tx, target, inst.ID, lease.Lower, lease.Upper, "reserved", now)
 	if db.IsExclusionViolation(err) { // 并发事务刚提交的时段：整个事务随错误回滚
@@ -176,13 +180,14 @@ func (s *Service) reassignTo(ctx context.Context, tx pgx.Tx, inst *Instance, lea
 	if _, err := tx.Exec(ctx, `UPDATE machine_leases SET status = 'cancelled', updated_at = $2 WHERE id = $1`, lease.ID, now); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE instances SET machine_id = $2, reassign_count = reassign_count + 1, updated_at = $3 WHERE id = $1`, inst.ID, target, now); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE instances SET machine_id = $2, group_id = $3, reassign_count = reassign_count + 1, updated_at = $4 WHERE id = $1`,
+		inst.ID, target, groupID, now); err != nil {
 		return err
 	}
 	if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, fmt.Sprintf("reassigned %d -> %d: %s", inst.MachineID, target, reason), now); err != nil {
 		return err
 	}
-	inst.MachineID, inst.ReassignCount = target, inst.ReassignCount+1
+	inst.MachineID, inst.GroupID, inst.ReassignCount = target, groupID, inst.ReassignCount+1
 	lease.ID, lease.MachineID = newLease, target
 	return nil
 }

@@ -14,7 +14,7 @@ import (
 	"spark-cloud/internal/platform/tz"
 )
 
-const maxCalendarDays = 61
+const MaxCalendarDays = 61
 
 type AvailabilityQuery struct {
 	ProductID int64
@@ -93,8 +93,8 @@ type CalendarDay struct {
 }
 
 func calendarRange(from time.Time, days int) (time.Time, error) {
-	if days < 1 || days > maxCalendarDays {
-		return time.Time{}, apperr.BadRequest(fmt.Sprintf("days 需在 1～%d 之间", maxCalendarDays))
+	if days < 1 || days > MaxCalendarDays {
+		return time.Time{}, apperr.BadRequest(fmt.Sprintf("days 需在 1～%d 之间", MaxCalendarDays))
 	}
 	return tz.DayStart(from), nil
 }
