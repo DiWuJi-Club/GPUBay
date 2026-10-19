@@ -6,6 +6,7 @@ import { placeOrder, seedUser, toast } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
 import { yuan } from '../helpers/money'
+import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
 import { cstTime, duration } from '../helpers/time'
 
 type AdminInst = {
@@ -823,4 +824,112 @@ test('A-INS-09 操作按钮按角色与状态：财务只有退款、运维只�
     await expectButtons(running, 'running', ['adetail-extend-btn', 'adetail-migrate-btn', 'adetail-refund-btn'])
     await expectButtons(second.id, 'wiping', ['adetail-rewipe-btn'])
   })
+})
+
+test('A-INS-10 实例详情「访问」卡片：密码登录、主机密钥、端口（备注按文本显示）与 SSH 会话；财务无端口处置按钮', async ({ page }) => {
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  await api.post(`/api/v1/instances/${id}/ports`, { data: { port: 8888, visibility: 'public', note: XSS } })
+  const pw = ((await (await api.get(`/api/v1/instances/${id}/password`)).json()) as { password: string }).password
+  expect((await hooks.ssh({ instance_id: id, password: pw, command: 'echo 1' })).output).toBe('1\n')
+  const admin = await createAdmin('finance')
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/instances/${id}`)
+  await expect(page.getByTestId('adetail-password-auth')).toHaveText('已开启')
+  await expect(page.getByTestId('adetail-hostkey')).toHaveText(/^SHA256:/)
+  await expect(page.getByTestId('adetail-port-row')).toHaveCount(1)
+  await expect(page.getByTestId('adetail-port-url')).toHaveText(`http://${id}-8888.spark.test:18080/`)
+  await expect(page.getByTestId('adetail-port-visibility')).toHaveText('公开')
+  await expect(page.getByTestId('adetail-port-row')).toContainText(XSS)
+  await expect(page.getByTestId('adetail-port-row').locator('img')).toHaveCount(0)
+  expect(await xssFired(page)).toBe(false)
+  await expect(page.getByTestId('adetail-port-force')).toHaveCount(0) // 财务无处置按钮
+  await expect(page.getByTestId('adetail-port-delete')).toHaveCount(0)
+  await expect(page.getByTestId('adetail-session-row')).toHaveCount(1)
+  await expect(page.getByTestId('adetail-session-method')).toHaveText('密码')
+  await expect(page.getByTestId('adetail-session-ip')).toHaveText('127.0.0.1')
+  // 关闭密码登录后卡片显示「仅公钥」
+  await api.post('/api/v1/ssh-keys', { data: { public_key: freshPublicKey() } })
+  expect((await api.put(`/api/v1/instances/${id}/access`, { data: { password_auth: false } })).status()).toBe(200)
+  await page.reload()
+  await expect(page.getByTestId('adetail-password-auth')).toHaveText('已关闭（仅公钥）')
+  await expect(page.getByTestId('adetail-session-row')).toHaveCount(1)
+
+  // 同一组件换实例（站内跳转）时，旧实例迟到的会话列表被丢弃，不会显示在新实例下
+  await hooks.machines(1)
+  const other = await placeOrder(api)
+  await hooks.agent()
+  let release!: () => void
+  const held = new Promise<void>((r) => (release = r))
+  await page.route(`**/admin/api/v1/instances/${id}/ssh-sessions?*`, async (route) => {
+    await held
+    await route.continue()
+  })
+  await page.reload()
+  await expect(page.getByTestId('adetail-id')).toHaveText(id)
+  await page.evaluate((path) => {
+    history.pushState(history.state, '', path)
+    dispatchEvent(new PopStateEvent('popstate', { state: history.state }))
+  }, `/admin/instances/${other}`)
+  await expect(page.getByTestId('adetail-id')).toHaveText(other)
+  await expect(page.getByTestId('adetail-sessions-empty')).toBeVisible()
+  const lateA = page.waitForResponse((r) => r.url().includes(`/instances/${id}/ssh-sessions`))
+  release()
+  await lateA
+  await drainTasks(page)
+  await expect(page.getByTestId('adetail-session-row')).toHaveCount(0)
+  await expect(page.getByTestId('adetail-sessions-empty')).toBeVisible()
+  await page.unroute(`**/admin/api/v1/instances/${id}/ssh-sessions?*`)
+})
+
+test('A-INS-11 强制私有：需原因、写审计、用户端显示平台限制', async ({ page }) => {
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  await api.post(`/api/v1/instances/${id}/ports`, { data: { port: 8888, visibility: 'public' } })
+  const admin = await createAdmin('ops')
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/instances/${id}`)
+  await expect(page.getByTestId('adetail-port-visibility')).toHaveText('公开')
+  const posts = recordRequests(page, 'POST', `/instances/${id}/ports/8888/force-private`)
+  await page.getByTestId('adetail-port-force').click()
+  await page.getByTestId('port-action-submit').click()
+  await expect(page.getByTestId('port-action-error')).toHaveText('请填写原因')
+  await page.getByTestId('port-action-reason').fill('   ')
+  await page.getByTestId('port-action-submit').click()
+  await expect(page.getByTestId('port-action-error')).toHaveText('请填写原因')
+  expect(posts).toHaveLength(0)
+  await page.getByTestId('port-action-reason').fill('钓鱼页面')
+  await page.getByTestId('port-action-submit').click()
+  await toast(page, '已限制为私有')
+  expect(posts.map((p) => p.body)).toEqual([{ reason: '钓鱼页面' }])
+  await expect(page.getByTestId('adetail-port-visibility')).toHaveText('私有')
+  await expect(page.getByTestId('adetail-port-forced')).toBeVisible()
+  await expect(page.getByTestId('adetail-port-force')).toHaveCount(0)
+  const ctx = await adminApi(admin)
+  const audit = (await getJSON<{ items: { action: string; target_id: string; diff: { reason: string; port: number } }[] }>(ctx, `/admin/api/v1/audit?action=instance.port_force_private&target_id=${id}`)).items
+  expect(audit.map((a) => [a.target_id, a.diff.port, a.diff.reason])).toEqual([[id, 8888, '钓鱼页面']])
+  const ports = ((await (await api.get(`/api/v1/instances/${id}/ports`)).json()) as { items: { visibility: string; forced_private: boolean }[] }).items
+  expect(ports).toEqual([expect.objectContaining({ visibility: 'private', forced_private: true })])
+})
+
+test('A-INS-12 删除端口：需原因、写审计、用户端消失', async ({ page }) => {
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  await api.post(`/api/v1/instances/${id}/ports`, { data: { port: 8888 } })
+  const admin = await createAdmin('ops')
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/instances/${id}`)
+  await page.getByTestId('adetail-port-delete').click()
+  await page.getByTestId('port-action-submit').click()
+  await expect(page.getByTestId('port-action-error')).toHaveText('请填写原因')
+  await expect(page.getByTestId('adetail-port-row')).toHaveCount(1)
+  await page.getByTestId('port-action-reason').fill('abuse')
+  await page.getByTestId('port-action-submit').click()
+  await toast(page, '已删除端口')
+  await expect(page.getByTestId('adetail-port-row')).toHaveCount(0)
+  const list = (await (await api.get(`/api/v1/instances/${id}/ports`)).json()) as { items: unknown[] }
+  expect(list.items).toHaveLength(0)
+  const ctx = await adminApi(admin)
+  const audit = (await getJSON<{ items: { target_id: string; actor_id: number; diff: { reason: string; port: number } }[] }>(ctx, `/admin/api/v1/audit?action=instance.port_delete&target_id=${id}`)).items
+  expect(audit.map((a) => [a.actor_id, a.diff.port, a.diff.reason])).toEqual([[admin.id, 8888, 'abuse']])
 })

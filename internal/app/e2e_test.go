@@ -175,6 +175,16 @@ func TestBuildRejectsMockPluginsInProd(t *testing.T) {
 	}
 }
 
+// 测试注入的主机密钥生成（所有实例共用一把）绝不能用于生产。
+func TestBuildRejectsHostKeyGenInProd(t *testing.T) {
+	cfg := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key}
+	gen := func() (string, []byte, error) { return "", nil, nil }
+	_, err := app.Build(cfg, nil, discardLog(), app.Options{HostKeyGen: gen})
+	if err == nil || !strings.Contains(err.Error(), "主机密钥") {
+		t.Fatalf("err = %v, want host key gen rejection", err)
+	}
+}
+
 // TestBuildWiresAliyunPlugins 验证 aliyun 驱动按配置的 endpoint 与凭证发出请求。
 func TestBuildWiresAliyunPlugins(t *testing.T) {
 	ctx := context.Background()
@@ -398,7 +408,10 @@ func TestServersUseConfiguredAddressesAndTimeouts(t *testing.T) {
 }
 
 func TestSecureCookieOutsideDev(t *testing.T) {
-	for env, wantSecure := range map[string]bool{"dev": false, "staging": true} {
+	for env, want := range map[string]struct {
+		name   string
+		secure bool
+	}{"dev": {"sc_session", false}, "staging": {"__Host-sc_session", true}} {
 		cfg := config.Config{UpstreamSSHKeyFile: upstreamKeyFile(t), Env: env, Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
 		a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0)})
 		if err != nil {
@@ -417,12 +430,12 @@ func TestSecureCookieOutsideDev(t *testing.T) {
 		resp.Body.Close()
 		secure := false
 		for _, c := range resp.Cookies() {
-			if c.Name == "sc_session" {
+			if c.Name == want.name {
 				secure = c.Secure
 			}
 		}
-		if resp.StatusCode != 200 || secure != wantSecure {
-			t.Fatalf("%s: status %d secure %v, want %v", env, resp.StatusCode, secure, wantSecure)
+		if resp.StatusCode != 200 || secure != want.secure {
+			t.Fatalf("%s: status %d secure %v, want %v (cookie %q)", env, resp.StatusCode, secure, want.secure, want.name)
 		}
 		ts.Close()
 	}

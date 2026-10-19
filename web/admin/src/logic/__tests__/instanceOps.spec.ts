@@ -1,6 +1,6 @@
 import type { InstanceState, Role } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { extendSeconds, isZeroRefund, showExtend, showMigrate, showRefund, showRewipe, validateExtend, validateRefund } from '../instanceOps'
+import { extendSeconds, isZeroRefund, showExtend, showMigrate, showPortActions, showRefund, showRewipe, validateExtend, validateRefund } from '../instanceOps'
 
 const RANGE = '补偿时长需在 1 分钟到 30 天之间'
 
@@ -63,5 +63,13 @@ describe('instance ops', () => {
     expect(visible('super')).toEqual({
       creating: ['extend', 'refund'], running: ['extend', 'migrate', 'refund'], stopped: ['extend', 'refund'], wiping: ['rewipe'], released: [], failed: [],
     })
+  })
+})
+
+describe('showPortActions', () => {
+  it('只有运维与超管能处置端口', () => {
+    expect(showPortActions('ops')).toBe(true)
+    expect(showPortActions('super')).toBe(true)
+    expect(showPortActions('finance')).toBe(false)
   })
 })

@@ -6,15 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wechatpay-apiv3/wechatpay-go/utils"
+	"golang.org/x/crypto/ssh"
 
+	"spark-cloud/internal/access/upstream"
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/adminapi"
 	"spark-cloud/internal/agentgw"
@@ -23,17 +28,20 @@ import (
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/ingress"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/platform/secretbox"
+	"spark-cloud/internal/platform/tlsfile"
 	"spark-cloud/internal/plugins/aliyun"
 	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/pay"
 	"spark-cloud/internal/plugins/pdu"
 	"spark-cloud/internal/plugins/sms"
 	"spark-cloud/internal/rental"
+	"spark-cloud/internal/sshgw"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
 )
@@ -51,6 +59,8 @@ type Options struct {
 	// 两个限流器都按注入的时钟计窗口，假时钟下窗口永不滑过。没有任何配置项或环境变量能打开它，
 	// 并且生产环境设置为 true 时 Build 直接报错。
 	DisableRateLimits bool
+	// HostKeyGen 是测试注入的实例主机密钥生成；nil → pki.GenerateInstanceHostKey。Go 集成测试与 e2e-server 让所有实例共用假上游的主机密钥。
+	HostKeyGen func() (pub string, pem []byte, err error)
 }
 
 const noRateLimit = 1_000_000
@@ -70,11 +80,25 @@ type App struct {
 
 	Gateway *agentgw.Server // Agent 网关（gRPC，mTLS）；由 cmd/platform 在 SPARK_AGENT_ADDR 上监听
 	CA      *pki.CA
+
+	IngressAuth *ingress.Auth   // Web 入口鉴权（票据 / Cookie）
+	Ingress     *ingress.Server // 租户 Web 端口反向代理；Handler 按 Host 把实例域名分给它
+	Routes      *ingress.Table  // 入口路由表（RunAccessLoops 定时刷新）
+	Upstream    *upstream.Pool  // 到容器 sshd 的共享连接池；cmd/platform 在 HTTP 关闭之后 Close
+	TLS         *tlsfile.Loader // 由 platform 终止 TLS 时非 nil
+
+	SSH            *sshgw.Server // SSH 网关；由 cmd/platform 在 SPARK_SSH_ADDR 上监听
+	SSHHostKey     ssh.Signer
+	UpstreamSigner ssh.Signer
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
+	cfg = cfg.FillAccessDefaults() // 测试里的 Config 字面量没有接入层字段
 	if opt.DisableRateLimits && cfg.Env == "prod" {
 		return nil, errors.New("生产环境禁止关闭速率限制")
+	}
+	if opt.HostKeyGen != nil && cfg.Env == "prod" {
+		return nil, errors.New("生产环境禁止注入实例主机密钥生成")
 	}
 	ipHourLimit, loginLimit := 0, 0
 	if opt.DisableRateLimits {
@@ -83,6 +107,10 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	if cfg.Env == "prod" && ((opt.SMS == nil && cfg.SMSDriver == "mock") || (opt.KYC == nil && cfg.KYCDriver == "mock") ||
 		(opt.Pay == nil && cfg.PayDriver != "real") || (opt.PDU == nil && cfg.PDUDriver != "snmp")) {
 		return nil, errors.New("生产环境禁止使用 mock 插件")
+	}
+	if cfg.Env != "dev" && cfg.AdminPublicBaseURL == "" {
+		log.Warn("SPARK_ADMIN_PUBLIC_BASE_URL 未设置：后台写请求若带 Origin 而不带 Sec-Fetch-Site（旧版 Safari、部分内嵌 WebView 等）将一律返回 403；" +
+			"经反向代理或 ssh -L 隧道访问后台时请把它设为浏览器地址栏里的后台地址")
 	}
 	clk := opt.Clock
 	if clk == nil {
@@ -137,8 +165,8 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	f := fleet.NewService(pool, clk)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
-		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f,
-		Notifier: expiryNotifier{ids: ids, sms: smsSender},
+		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
+		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen,
 	})
 	providers := opt.Pay
 	devPay := false
@@ -162,18 +190,45 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Alerts: f,
 		Providers: providers, NotifyBaseURL: cfg.PublicBaseURL,
 	})
-	srv := &api.Server{
-		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
-		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy,
-	}
-	upstreamPub, err := upstreamPublicKey(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
+	ingressAuth, err := ingress.NewAuth(cfg.SecretKey, cfg.PublicBaseURL, cfg.IngressDomain, cfg.Env != "dev", clk)
 	if err != nil {
 		return nil, err
+	}
+	authorizeLimit := 0
+	if opt.DisableRateLimits {
+		authorizeLimit = noRateLimit
+	}
+	srv := &api.Server{
+		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
+		Domain: cfg.Domain, SSHHost: cfg.SSHHost(), SSHPort: cfg.SSHPublicPort, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, TrustedProxyHops: cfg.TrustedProxyHops, PublicBaseURL: cfg.PublicBaseURL,
+		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit,
+	}
+	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
+	if err != nil {
+		return nil, err
+	}
+	upstreamPub, err := pki.LoadUpstreamPublicKey(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取上游 SSH 密钥: %w", err)
+	}
+	upstreamSigner, err := pki.LoadUpstreamSigner(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取上游 SSH 密钥: %w", err)
 	}
 	// 证书有效期按墙上时钟（对端按真实时间校验）；注入的假时钟若领先真实时间，会签出尚未生效的 CA。
 	ca, err := pki.EnsureCA(context.Background(), pool, box, clock.Real{})
 	if err != nil {
 		return nil, fmt.Errorf("初始化内置 CA: %w", err)
+	}
+	sshHostKey, err := pki.EnsureSSHHostKey(context.Background(), pool, box)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 SSH 网关主机密钥: %w", err)
+	}
+	sshSrv, err := sshgw.New(sshgw.Config{HostKey: sshHostKey, Upstream: upstreamSigner, UpstreamPort: cfg.UpstreamSSHPort,
+		MaxSessionsPerInstance: cfg.SSHMaxSessions, DrainTimeout: cfg.SSHDrainTimeout, DisableRateLimits: opt.DisableRateLimits},
+		sshgw.Deps{Store: r, Keys: ids, Clock: clk, Log: log})
+	if err != nil {
+		return nil, err
 	}
 	enrollLimit := 0
 	if opt.DisableRateLimits {
@@ -183,21 +238,47 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		AdvertiseAddr: cfg.AgentAdvertiseAddr(), Hosts: cfg.AgentHosts, AllowCIDRs: cfg.AgentAllowCIDRs, DNSServers: cfg.AgentDNSServers,
 		BandwidthMbps: cfg.AgentBandwidthMbps, DataSizeGiB: cfg.AgentDataSizeGiB, UpstreamPubKey: upstreamPub,
 		DownloadURL: cfg.AgentDownloadURL, BinarySHA256: cfg.AgentBinarySHA256, Tick: opt.AgentTick, EnrollLimit: enrollLimit,
-	}, agentgw.Deps{Pool: pool, Fleet: f, Rental: r, CA: ca, Clock: clk, Log: log})
+		SSHPort: cfg.UpstreamSSHPort,
+	}, agentgw.Deps{Pool: pool, Fleet: f, Rental: r, HostKeys: r, CA: ca, Clock: clk, Log: log})
 	if err != nil {
 		return nil, err
 	}
 	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
 	adminSrv := &adminapi.Server{
 		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Gateway: gw,
-		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit,
+		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit, PublicBaseURL: cfg.AdminPublicBaseURL,
+		PortURL: ingressAuth.PortURL,
 	}
-	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router(),
-		Gateway: gw, CA: ca}, nil
+	var loader *tlsfile.Loader
+	if cfg.TLSEnabled() {
+		loader = &tlsfile.Loader{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Now: clk.Now, Log: log,
+			OnReloadError: func(err error) {
+				log.Error("tls certificate reload failed repeatedly, keeping previous certificate", "err", err)
+				go alertOnce(f, log, "critical", "tls_cert_reload_failed", "TLS 证书文件重新加载失败，详情见日志") // 在 TLS 握手路径上：不等数据库
+			},
+			OnExpiring: func(na time.Time) {
+				log.Warn("tls certificate expiring", "not_after", na)
+				alertOnce(f, log, "warning", "tls_cert_expiring", "TLS 证书将在 14 天内到期")
+			}}
+		if err := loader.Load(); err != nil {
+			return nil, fmt.Errorf("加载 TLS 证书（SPARK_TLS_CERT_FILE=%s, SPARK_TLS_KEY_FILE=%s）: %w", cfg.TLSCertFile, cfg.TLSKeyFile, err)
+		}
+	}
+	upstreamPool := upstream.New(upstream.Config{Signer: upstreamSigner, Port: cfg.UpstreamSSHPort, Log: log}, r)
+	routes := ingress.NewTable(r, log)
+	ingSrv := ingress.NewServer(ingressAuth, routes, ids, upstreamPool, r, clk, log)
+	proxyHops := 0 // 不信任代理：入口不看任何转发头
+	if cfg.TrustProxy {
+		proxyHops = cfg.TrustedProxyHops
+	}
+	handler := ingress.Front(cfg.IngressDomain, proxyHops, ingSrv, srv.Router())
+	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: handler,
+		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
+		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner}, nil
 }
 
-// upstreamPublicKey 读取平台登录容器用的上游公钥；非生产环境未配置时自动在临时目录生成并打印路径。
-func upstreamPublicKey(cfg config.Config, log *slog.Logger) (string, error) {
+// upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。
+func upstreamKeyPath(cfg config.Config, log *slog.Logger) (string, error) {
 	path := cfg.UpstreamSSHKeyFile
 	if path == "" {
 		if cfg.Env == "prod" {
@@ -209,11 +290,7 @@ func upstreamPublicKey(cfg config.Config, log *slog.Logger) (string, error) {
 		}
 		log.Warn("SPARK_UPSTREAM_SSH_KEY_FILE 未设置，已生成临时上游 SSH 密钥（仅开发环境）", "path", path)
 	}
-	pub, err := pki.LoadUpstreamPublicKey(path)
-	if err != nil {
-		return "", fmt.Errorf("读取上游 SSH 密钥: %w", err)
-	}
-	return pub, nil
+	return path, nil
 }
 
 func aliyunClient(cfg config.Config, endpoint string) *aliyun.Client {
@@ -310,6 +387,9 @@ func (a *App) Servers(cfg config.Config) (public, admin *http.Server) {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	if a.TLS != nil {
+		public.TLSConfig = a.TLS.TLSConfig()
+	}
 	admin = &http.Server{
 		Addr:              cfg.AdminAddr,
 		Handler:           a.AdminHandler,
@@ -319,4 +399,88 @@ func (a *App) Servers(cfg config.Config) (public, admin *http.Server) {
 		IdleTimeout:       120 * time.Second,
 	}
 	return public, admin
+}
+
+func alertOnce(f *fleet.Service, log *slog.Logger, level, kind, message string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.RaiseAlertOnce(ctx, f.Pool(), fleet.Alert{Level: level, Kind: kind, Message: message}); err != nil {
+		log.Error("raise alert", "kind", kind, "err", err)
+	}
+}
+
+// RedirectServer 返回把明文 HTTP 301 到 https 的服务器；未配置 SPARK_HTTP_REDIRECT_ADDR（或未启用 TLS）时为 nil。
+// Location 只由配置决定：控制台域名 → 对外地址（SPARK_PUBLIC_BASE_URL）的 host；合法实例域名 → 规范化的实例地址；
+// 其它 Host（IP、未知域名、其它父域）一律 404，绝不按请求里的 Host 拼出跳转目标。
+func (a *App) RedirectServer(cfg config.Config) *http.Server {
+	if cfg.HTTPRedirectAddr == "" || a.TLS == nil {
+		return nil
+	}
+	cfg = cfg.FillAccessDefaults()
+	base := a.IngressAuth.BaseURL // 已校验的对外地址（scheme + host[:port]）
+	consoleHosts := map[string]bool{strings.ToLower(base.Hostname()): true, strings.ToLower(cfg.Domain): true}
+	return &http.Server{
+		Addr: cfg.HTTPRedirectAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var target string
+			if id, port, ok := ingress.ParseHost(r.Host, cfg.IngressDomain); ok {
+				target = strings.TrimSuffix(a.IngressAuth.PortURL(id, port), "/")
+			} else {
+				host := strings.ToLower(r.Host)
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				if !consoleHosts[strings.TrimSuffix(host, ".")] {
+					http.NotFound(w, r)
+					return
+				}
+				target = "https://" + base.Host
+			}
+			http.Redirect(w, r, target+r.URL.RequestURI(), http.StatusMovedPermanently)
+		}),
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second,
+	}
+}
+
+// accessSweepInterval：活动流复核间隔。加上路由表 2 秒刷新，访问权限变化后最迟约 7 秒断开（≤ ingress.MaxRevokeInterval）。
+const accessSweepInterval = 5 * time.Second
+
+// poolKeep：上游连接池应保留的实例。暂停（机器失联）仍算 running，不丢池（裁定 5）；上游真断了由池的 keepalive 自行丢弃。
+func poolKeep(routes []rental.IngressRoute) map[string]bool {
+	keep := map[string]bool{}
+	for _, r := range routes {
+		if r.State == rental.StateRunning {
+			keep[r.InstanceID] = true
+		}
+	}
+	return keep
+}
+
+// RunAccessLoops：路由表每 2 秒刷新、活动流（WebSocket / SSE）按访问权限变化撤销、离开 running 的实例从上游连接池丢弃、
+// TLS 到期每日检查；ctx 结束后等所有子循环退出再返回。连接池不在这里关闭：停机时 HTTP / ingress 关闭之后由 cmd/platform 关。
+func (a *App) RunAccessLoops(ctx context.Context) {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	if a.TLS != nil {
+		wg.Go(func() { a.TLS.RunExpiryCheck(ctx, 24*time.Hour, 14*24*time.Hour) })
+	}
+	wg.Go(func() { a.Routes.Run(ctx, 2*time.Second) })
+	wg.Go(func() { a.Ingress.Run(ctx, accessSweepInterval) })
+	running := map[string]bool{}
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			now := poolKeep(a.Routes.Routes())
+			for id := range running {
+				if !now[id] {
+					a.Upstream.Drop(id)
+				}
+			}
+			running = now
+		}
+	}
 }

@@ -80,9 +80,14 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	keys, err := s.Identity.ListSSHKeys(ctx, id)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"user": u, "balance": balance, "instances": s.instanceViews(insts), "orders": orderViews(orders),
-		"ledger": httpx.List(ledger)["items"], "kyc": httpx.List(kyc)["items"],
+		"ledger": httpx.List(ledger)["items"], "kyc": httpx.List(kyc)["items"], "ssh_keys": httpx.List(keys)["items"],
 	})
 }
 

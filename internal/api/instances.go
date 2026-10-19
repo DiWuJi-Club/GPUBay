@@ -30,6 +30,10 @@ type instanceView struct {
 	PendingSeconds   int64      `json:"pending_seconds"`
 	RetainUntil      *time.Time `json:"retain_until"` // 停机后数据保留截止时间
 	SSHCommand       string     `json:"ssh_command"`
+	PasswordAuth     bool       `json:"password_auth"`
+	SSHHost          string     `json:"ssh_host"`
+	SSHPort          int        `json:"ssh_port"`
+	PortsCount       int        `json:"ports_count"`
 	CreatedAt        time.Time  `json:"created_at"`
 }
 
@@ -40,14 +44,30 @@ func (s *Server) view(i rental.Instance) instanceView {
 		ExpiresAt: i.ExpiresAt, RemainingSeconds: int64(i.Remaining(now) / time.Second),
 		PendingSeconds: i.PendingSeconds, CreatedAt: i.CreatedAt,
 	}
+	v.PasswordAuth, v.SSHHost, v.SSHPort = i.PasswordAuth, s.SSHHost, s.sshPort()
 	if i.State == rental.StateRunning {
-		v.SSHCommand = fmt.Sprintf("ssh %s@ssh.%s", i.ID, s.Domain)
+		v.SSHCommand = sshCommand(i.ID, s.SSHHost, s.sshPort())
 	}
 	if i.State == rental.StateStopped && i.StoppedAt != nil && i.PendingSeconds == 0 {
 		t := i.StoppedAt.Add(rental.RetainAfterStop)
 		v.RetainUntil = &t
 	}
 	return v
+}
+
+func (s *Server) sshPort() int {
+	if s.SSHPort <= 0 {
+		return 22
+	}
+	return s.SSHPort
+}
+
+// sshCommand：公网端口 22 时省略 -p。
+func sshCommand(id, host string, port int) string {
+	if port == 22 {
+		return fmt.Sprintf("ssh %s@%s", id, host)
+	}
+	return fmt.Sprintf("ssh -p %d %s@%s", port, id, host)
 }
 
 // nameCache 在一次请求内去重商品 / 镜像名称查询（列表最多 100 条，通常只有 1 个商品、几个镜像）。
@@ -88,10 +108,22 @@ func (s *Server) viewNamed(ctx context.Context, i rental.Instance, nc *nameCache
 }
 
 func (s *Server) viewOne(ctx context.Context, i rental.Instance) (instanceView, error) {
-	return s.viewNamed(ctx, i, newNameCache())
+	vs, err := s.views(ctx, []rental.Instance{i})
+	if err != nil {
+		return instanceView{}, err
+	}
+	return vs[0], nil
 }
 
 func (s *Server) views(ctx context.Context, insts []rental.Instance) ([]instanceView, error) {
+	ids := make([]string, 0, len(insts))
+	for _, i := range insts {
+		ids = append(ids, i.ID)
+	}
+	counts, err := s.Rental.PortCounts(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
 	nc := newNameCache()
 	out := make([]instanceView, 0, len(insts))
 	for _, i := range insts {
@@ -99,6 +131,7 @@ func (s *Server) views(ctx context.Context, insts []rental.Instance) ([]instance
 		if err != nil {
 			return nil, err
 		}
+		v.PortsCount = counts[i.ID]
 		out = append(out, v)
 	}
 	return out, nil

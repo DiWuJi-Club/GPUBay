@@ -55,11 +55,15 @@ func (s *Service) Place(ctx context.Context, req PlaceRequest) (Order, Instance,
 		if err != nil {
 			return err
 		}
+		hostPub, hostPEM, err := s.d.HostKeyGen()
+		if err != nil {
+			return err
+		}
 		id := randx.ID("ins-", 8)
 		inst, err = scanInstance(tx.QueryRow(ctx, `INSERT INTO instances
-			(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $8) RETURNING `+instanceCols,
-			id, req.UserID, m.ID, req.ProductID, img.ID, seconds(req.Duration), s.d.Box.Seal([]byte(randx.Password(16))), now))
+			(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, ssh_host_pubkey, ssh_host_key_enc, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $10) RETURNING `+instanceCols,
+			id, req.UserID, m.ID, req.ProductID, img.ID, seconds(req.Duration), s.d.Box.Seal([]byte(randx.Password(16))), hostPub, s.d.Box.Seal(hostPEM), now))
 		if err != nil {
 			return err
 		}

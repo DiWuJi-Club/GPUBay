@@ -5,6 +5,7 @@ import { canRelease, canRenew, instanceTimeText, releaseWarning, remainingNow } 
 const base: Instance = {
   id: 'ins-abc12345', state: 'running', product_id: 1, image_id: 1, product_name: 'DGX Spark 整机', image_name: 'PyTorch', suspended: false,
   expires_at: '2026-10-18T06:00:00Z', remaining_seconds: 86399, pending_seconds: 0, retain_until: null, ssh_command: 'ssh ins-abc12345@ssh.spark.test',
+  password_auth: true, ssh_host: 'ssh.spark.test', ssh_port: 22, ports_count: 0,
   created_at: '2026-10-17T06:00:00Z',
 }
 

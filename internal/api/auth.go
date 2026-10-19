@@ -8,7 +8,7 @@ import (
 
 func (s *Server) setSession(w http.ResponseWriter, token string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: token, Path: "/", MaxAge: maxAge,
+		Name: s.cookieName(), Value: token, Path: "/", MaxAge: maxAge,
 		HttpOnly: true, Secure: s.SecureCookie, SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -48,7 +48,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.setSession(w, "", -1)
-	if c, err := r.Cookie(sessionCookie); err == nil {
+	if c, err := r.Cookie(s.cookieName()); err == nil {
 		if err := s.Identity.Logout(r.Context(), c.Value); err != nil {
 			s.writeError(w, r, err)
 			return

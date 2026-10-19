@@ -3,6 +3,9 @@ import { request, type APIRequestContext } from '@playwright/test'
 export const HOOKS_URL = 'http://127.0.0.1:18090'
 export const CONSOLE_URL = 'http://127.0.0.1:18080'
 export const ADMIN_URL = 'http://127.0.0.1:18081'
+/** 控制台的对外地址（SPARK_PUBLIC_BASE_URL）：实例 Web 入口的 authorize / 登录跳转都回到这里。
+ *  spark.test 与 ins-*-<port>.spark.test 由 console project 的 --host-resolver-rules 解析到 127.0.0.1。 */
+export const CONSOLE_SITE_URL = 'http://spark.test:18080'
 
 let ctx: APIRequestContext | undefined
 async function api(): Promise<APIRequestContext> {
@@ -55,5 +58,15 @@ export const hooks = {
   },
   async kyc(reject: boolean): Promise<void> {
     await post('/hooks/kyc', { reject })
+  },
+  /** 用进程内 ssh 客户端经 SSH 网关执行命令：验证页面上显示的密码 / 公钥真的能登录。
+   *  error 非空表示连接或认证失败（exit_status 为 -1）；网关的 Banner 并在 output 开头。 */
+  ssh(opts: { instance_id: string; password?: string; key_pem?: string; command: string }) {
+    return post<{ output: string; exit_status: number; error: string }>('/hooks/ssh', opts)
+  },
+  /** 让假容器 sshd 在容器内 127.0.0.1:<port> 回显 `body|host=<Host>|path=<RequestURI>|cookie=<到达容器的 Cookie 头>`，并立即刷新入口路由表。
+   *  先经 API 加端口、再调本钩子（路由表只收录已登记的端口）。所有实例共用同一个假容器：同一端口后登记的覆盖先登记的。 */
+  async ingressUpstream(port: number, body: string): Promise<void> {
+    await post('/hooks/ingress-upstream', { port, body })
   },
 }

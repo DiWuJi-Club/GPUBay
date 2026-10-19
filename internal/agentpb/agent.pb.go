@@ -616,10 +616,13 @@ type CreateInstance struct {
 	ImageRef       string                 `protobuf:"bytes,1,opt,name=image_ref,json=imageRef,proto3" json:"image_ref,omitempty"`
 	UpstreamPubkey string                 `protobuf:"bytes,2,opt,name=upstream_pubkey,json=upstreamPubkey,proto3" json:"upstream_pubkey,omitempty"` // authorized_keys 一行
 	BandwidthMbps  uint32                 `protobuf:"varint,3,opt,name=bandwidth_mbps,json=bandwidthMbps,proto3" json:"bandwidth_mbps,omitempty"`
-	SshPort        uint32                 `protobuf:"varint,4,opt,name=ssh_port,json=sshPort,proto3" json:"ssh_port,omitempty"` // 本计划固定 2222
+	SshPort        uint32                 `protobuf:"varint,4,opt,name=ssh_port,json=sshPort,proto3" json:"ssh_port,omitempty"` // 容器 22 发布到 <lan_ip>:<ssh_port>
 	DataSizeGib    uint32                 `protobuf:"varint,5,opt,name=data_size_gib,json=dataSizeGib,proto3" json:"data_size_gib,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// 平台生成的容器 sshd 主机私钥（OpenSSH PEM）。敏感：只在 mTLS 流上传输，不落日志，不进 agent_commands.payload；
+	// 为空时 Agent 沿用本地生成（兼容旧平台）。
+	HostKeyPem    string `protobuf:"bytes,6,opt,name=host_key_pem,json=hostKeyPem,proto3" json:"host_key_pem,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CreateInstance) Reset() {
@@ -685,6 +688,13 @@ func (x *CreateInstance) GetDataSizeGib() uint32 {
 		return x.DataSizeGib
 	}
 	return 0
+}
+
+func (x *CreateInstance) GetHostKeyPem() string {
+	if x != nil {
+		return x.HostKeyPem
+	}
+	return ""
 }
 
 type StartInstance struct {
@@ -1191,13 +1201,15 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x04stop\x18\f \x01(\v2\x1c.spark.agent.v1.StopInstanceH\x00R\x04stop\x122\n" +
 	"\x04wipe\x18\r \x01(\v2\x1c.spark.agent.v1.WipeInstanceH\x00R\x04wipe\x12/\n" +
 	"\x04pull\x18\x0e \x01(\v2\x19.spark.agent.v1.PullImageH\x00R\x04pullB\x06\n" +
-	"\x04body\"\xbc\x01\n" +
+	"\x04body\"\xde\x01\n" +
 	"\x0eCreateInstance\x12\x1b\n" +
 	"\timage_ref\x18\x01 \x01(\tR\bimageRef\x12'\n" +
 	"\x0fupstream_pubkey\x18\x02 \x01(\tR\x0eupstreamPubkey\x12%\n" +
 	"\x0ebandwidth_mbps\x18\x03 \x01(\rR\rbandwidthMbps\x12\x19\n" +
 	"\bssh_port\x18\x04 \x01(\rR\asshPort\x12\"\n" +
-	"\rdata_size_gib\x18\x05 \x01(\rR\vdataSizeGib\"\x0f\n" +
+	"\rdata_size_gib\x18\x05 \x01(\rR\vdataSizeGib\x12 \n" +
+	"\fhost_key_pem\x18\x06 \x01(\tR\n" +
+	"hostKeyPem\"\x0f\n" +
 	"\rStartInstance\"\x0e\n" +
 	"\fStopInstance\"\x0e\n" +
 	"\fWipeInstance\"(\n" +

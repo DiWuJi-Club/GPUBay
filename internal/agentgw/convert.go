@@ -45,7 +45,8 @@ func metricsJSON(m *agentpb.Metrics) (json.RawMessage, error) {
 	return json.Marshal(d)
 }
 
-func toProtoCommand(cmd fleet.Command, cfg Config) (*agentpb.Command, error) {
+// toProtoCommand 把指令转成协议消息；hostKeyPEM 只用于 Create（由调用方从 HostKeys 读取，不经过指令 payload）。
+func toProtoCommand(cmd fleet.Command, cfg Config, hostKeyPEM string) (*agentpb.Command, error) {
 	out := &agentpb.Command{Id: cmd.ID, InstanceId: cmd.InstanceID}
 	switch cmd.Type {
 	case fleet.CmdCreateInstance:
@@ -54,7 +55,7 @@ func toProtoCommand(cmd fleet.Command, cfg Config) (*agentpb.Command, error) {
 			return nil, err
 		}
 		out.Body = &agentpb.Command_Create{Create: &agentpb.CreateInstance{ImageRef: p.ImageRef, UpstreamPubkey: cfg.UpstreamPubKey,
-			BandwidthMbps: uint32(cfg.BandwidthMbps), SshPort: 2222, DataSizeGib: uint32(cfg.DataSizeGiB)}}
+			BandwidthMbps: uint32(cfg.BandwidthMbps), SshPort: uint32(cfg.SSHPort), DataSizeGib: uint32(cfg.DataSizeGiB), HostKeyPem: hostKeyPEM}}
 	case fleet.CmdStartInstance:
 		out.Body = &agentpb.Command_Start{Start: &agentpb.StartInstance{}}
 	case fleet.CmdStopInstance:

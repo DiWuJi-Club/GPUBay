@@ -72,6 +72,7 @@ type Command struct {
 	BandwidthMbps  int
 	SSHPort        int
 	DataSizeGiB    int
+	HostKeyPEM     string // 平台生成的主机私钥（敏感，不落日志）；为空则本地生成
 }
 
 type ResultMsg struct {

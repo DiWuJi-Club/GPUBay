@@ -33,6 +33,7 @@ async function logout() {
       <el-descriptions-item label="注册时间"><span data-testid="account-created">{{ fmtTime(session.user?.created_at) }}</span></el-descriptions-item>
     </el-descriptions>
     <div class="actions">
+      <router-link to="/account/ssh-keys" data-testid="account-ssh-keys">SSH 公钥</router-link>
       <router-link to="/help" data-testid="account-help">使用帮助</router-link>
       <el-button data-testid="account-logout" :loading="loggingOut" @click="logout">退出登录</el-button>
     </div>

@@ -27,5 +27,5 @@ export async function runningInstance(phone: string, opts: { duration?: '1d' | '
 }
 
 export async function instanceOf(api: APIRequestContext, id: string) {
-  return (await (await api.get(`/api/v1/instances/${id}`)).json()) as { state: string; remaining_seconds: number; retain_until: string | null; pending_seconds: number; suspended: boolean }
+  return (await (await api.get(`/api/v1/instances/${id}`)).json()) as { state: string; remaining_seconds: number; retain_until: string | null; pending_seconds: number; suspended: boolean; password_auth: boolean }
 }

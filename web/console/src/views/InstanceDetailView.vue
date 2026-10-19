@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import {
-  durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf, useCountdown, useIdempotencyKey,
-  type Duration, type Instance, type Listed, type Order, type Product,
+  durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, isApiError, labelOf, messageOf, portVisibilityLabel,
+  useCountdown, useIdempotencyKey,
+  type Duration, type Instance, type InstancePort, type Listed, type Order, type PortVisibility, type Product,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, ref, watch } from 'vue'
@@ -11,6 +12,7 @@ import AppDialog from '../components/AppDialog.vue'
 import GuideDialog from '../components/GuideDialog.vue'
 import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
+import { MAX_PORTS, validatePort } from '../logic/access'
 import { canRelease, canRenew, releaseWarning } from '../logic/instance'
 import { notifyError } from '../logic/notify'
 import { refreshBalance, session } from '../store/session'
@@ -31,7 +33,9 @@ async function load() {
   try {
     const next = await api.get<Instance>(`/instances/${id.value}`)
     if (mine !== seq) return // 之后又发出过查询（轮询 / 操作后刷新 / 换实例）：丢弃迟到的旧响应
+    const prevState = inst.value?.state
     inst.value = next
+    if (canManagePorts(next.state) && prevState !== next.state) void loadPorts() // 首次加载与状态变化时拉端口，轮询不重复拉
     loadError.value = ''
     failing = false
     if (next.state === 'running' && !next.suspended) countdown.start(next.remaining_seconds)
@@ -72,6 +76,127 @@ async function copy(text: string) {
   } catch {
     ElMessage.error('复制失败，请手动选择复制')
   }
+}
+
+// ---- 密码重置：新密码只在确认框里显示一次（只放这个组件的内存），关闭即清除 ----
+const resetVisible = ref(false)
+const resetting = ref(false)
+const resetPassword = ref('')
+async function confirmReset() {
+  if (resetting.value) return
+  resetting.value = true
+  const of = id.value
+  try {
+    const { password: next } = await api.post<{ password: string }>(`/instances/${of}/password/reset`)
+    if (of !== id.value) return // 已换实例：响应作废（watch(id) 已关掉对话框、清掉页面密码）
+    password.value = '' // 页面上显示过的旧密码已失效
+    // 请求期间对话框可以关闭；关闭后迟到的响应不再写入，避免新密码留在内存里、下次打开时又显示出来
+    if (!resetVisible.value) {
+      ElMessage.success('密码已重置，可点「显示」查看新密码')
+      return
+    }
+    resetPassword.value = next
+    ElMessage.success('密码已重置，请复制保存')
+  } catch (e) {
+    if (of === id.value) resetVisible.value = false
+    notifyError(e)
+  } finally {
+    resetting.value = false
+  }
+}
+watch(resetVisible, (v) => {
+  if (!v) resetPassword.value = ''
+})
+
+// ---- 密码登录开关 ----
+const togglingAuth = ref(false)
+async function setPasswordAuth(enabled: boolean) {
+  if (togglingAuth.value || !inst.value) return
+  togglingAuth.value = true
+  try {
+    inst.value = { ...inst.value, ...(await api.put<Instance>(`/instances/${id.value}/access`, { password_auth: enabled })) }
+    ElMessage.success(enabled ? '已打开密码登录' : '已关闭密码登录，只能用公钥登录')
+  } catch (e) {
+    if (isApiError(e) && e.code === 'password_auth_requires_key') ElMessage.warning('关闭密码登录前请先在「我的 → SSH 公钥」添加公钥')
+    else notifyError(e)
+  } finally {
+    togglingAuth.value = false
+  }
+}
+
+// ---- Web 访问（端口）----
+const ports = ref<InstancePort[]>([])
+const portInput = ref('')
+const portNote = ref('')
+const portError = ref('')
+const addingPort = ref(false)
+const publicTarget = ref<InstancePort | null>(null)
+const togglingPort = ref(false)
+function canManagePorts(s: string) {
+  return s === 'creating' || s === 'running' || s === 'stopped'
+}
+async function loadPorts() {
+  const of = id.value
+  try {
+    const { items } = await api.get<Listed<InstancePort>>(`/instances/${of}/ports`)
+    if (of === id.value) ports.value = items // 换实例后迟到的响应丢弃
+  } catch (e) {
+    notifyError(e)
+  }
+}
+async function addPort() {
+  if (addingPort.value) return
+  const v = validatePort(portInput.value)
+  if ('error' in v) {
+    portError.value = v.error
+    return
+  }
+  portError.value = ''
+  addingPort.value = true
+  try {
+    await api.post(`/instances/${id.value}/ports`, { port: v.port, note: portNote.value.trim() })
+    portInput.value = ''
+    portNote.value = ''
+    await loadPorts()
+  } catch (e) {
+    if (isApiError(e) && e.code.startsWith('port_')) portError.value = e.message
+    else notifyError(e)
+  } finally {
+    addingPort.value = false
+  }
+}
+async function setVisibility(p: InstancePort, visibility: PortVisibility) {
+  if (togglingPort.value) return
+  togglingPort.value = true
+  try {
+    await api.put(`/instances/${id.value}/ports/${p.port}`, { visibility })
+    publicTarget.value = null
+    await loadPorts()
+  } catch (e) {
+    publicTarget.value = null
+    if (isApiError(e) && e.code === 'port_forced_private') {
+      ElMessage.warning(e.message)
+      await loadPorts()
+    } else notifyError(e)
+  } finally {
+    togglingPort.value = false
+  }
+}
+function togglePort(p: InstancePort) {
+  if (p.visibility === 'public') void setVisibility(p, 'private')
+  else publicTarget.value = p // 设为公开需二次确认
+}
+async function deletePort(p: InstancePort) {
+  try {
+    await api.del(`/instances/${id.value}/ports/${p.port}`)
+    await loadPorts()
+  } catch (e) {
+    notifyError(e)
+  }
+}
+function openPort(p: InstancePort) {
+  // 私有端口：实例域名没有票据 Cookie 时会自己跳到控制台的 authorize，再带票据回来
+  window.open(p.url, '_blank', 'noopener')
 }
 
 // ---- 续费 ----
@@ -140,6 +265,12 @@ async function confirmRelease() {
 
 watch(id, () => {
   password.value = ''
+  resetVisible.value = false
+  ports.value = []
+  portInput.value = ''
+  portNote.value = ''
+  portError.value = ''
+  publicTarget.value = null
   inst.value = null
   loadError.value = ''
   failing = false
@@ -189,14 +320,59 @@ watch(id, () => {
             <code class="mono" data-testid="detail-ssh-command">{{ inst.ssh_command }}</code>
             <el-button size="small" data-testid="detail-ssh-copy" @click="copy(inst.ssh_command)">复制</el-button>
           </div>
+          <p class="muted">主机 <span data-testid="detail-ssh-host">{{ inst.ssh_host }}</span>，端口 {{ inst.ssh_port }}；首次连接请在<router-link to="/help">帮助页</router-link>核对主机密钥指纹。</p>
+        </template>
+        <p v-else class="muted" data-testid="detail-ssh-hint">实例运行中才能连接</p>
+        <template v-if="canManagePorts(inst.state)">
           <div class="row">
             <span>密码：</span>
             <code class="mono" data-testid="detail-password">{{ password || '••••••••' }}</code>
             <el-button v-if="!password" size="small" :loading="loadingPassword" data-testid="detail-password-show" @click="showPassword">显示</el-button>
             <el-button v-else size="small" data-testid="detail-password-copy" @click="copy(password)">复制</el-button>
+            <el-button size="small" plain data-testid="detail-password-reset" @click="resetVisible = true">重置密码</el-button>
+          </div>
+          <div class="row">
+            <span>密码登录：</span>
+            <el-switch
+              :model-value="inst.password_auth"
+              :loading="togglingAuth"
+              data-testid="detail-password-auth"
+              @change="(v: string | number | boolean) => setPasswordAuth(v === true)"
+            />
+            <span class="muted">关闭后只能用<router-link to="/account/ssh-keys">SSH 公钥</router-link>登录</span>
           </div>
         </template>
-        <p v-else class="muted" data-testid="detail-ssh-hint">实例运行中才能连接</p>
+      </el-card>
+
+      <el-card v-if="canManagePorts(inst.state)" header="Web 访问" data-testid="detail-ports-card">
+        <p class="muted">把容器里监听的端口（如 JupyterLab 8888）开放为网址；默认只有您登录控制台后能访问，可设为公开。应用需监听 127.0.0.1 或 0.0.0.0。</p>
+        <p v-if="inst.state !== 'running'" class="muted" data-testid="detail-port-hint">实例运行中才可访问，现在可以先添加端口</p>
+        <div v-for="p in ports" :key="p.port" class="port" data-testid="detail-port-row">
+          <div class="row">
+            <b>{{ p.port }}</b>
+            <span v-if="p.note" class="muted">{{ p.note }}</span>
+            <el-tag :type="p.visibility === 'public' ? 'warning' : 'info'" data-testid="detail-port-visibility">{{ labelOf(portVisibilityLabel, p.visibility) }}</el-tag>
+            <el-tag v-if="p.forced_private" type="danger" data-testid="detail-port-forced">已锁定：平台限制为私有</el-tag>
+          </div>
+          <div v-if="p.url" class="row">
+            <a :href="p.url" target="_blank" rel="noopener" class="mono" data-testid="detail-port-url">{{ p.url }}</a>
+          </div>
+          <div class="row">
+            <el-button v-if="p.url && inst.state === 'running'" size="small" type="primary" plain data-testid="detail-port-open" @click="openPort(p)">打开</el-button>
+            <el-button v-if="p.url" size="small" data-testid="detail-port-copy" @click="copy(p.url)">复制网址</el-button>
+            <el-button v-if="!p.forced_private" size="small" :loading="togglingPort" data-testid="detail-port-toggle" @click="togglePort(p)">{{ p.visibility === 'public' ? '设为私有' : '设为公开' }}</el-button>
+            <el-button size="small" type="danger" plain data-testid="detail-port-delete" @click="deletePort(p)">删除</el-button>
+          </div>
+          <p v-if="p.forced_private" class="muted" data-testid="detail-port-forced-text">平台已将此端口限制为私有，只能在登录控制台后访问，不能改为公开；如有疑问请联系客服。</p>
+          <p v-else-if="p.visibility === 'public'" class="warn small" data-testid="detail-port-public-warn">公开端口是不经平台鉴权的互联网服务：任何人都能访问，平台不做鉴权与限流，请确认应用自带密码。</p>
+        </div>
+        <div v-if="ports.length < MAX_PORTS" class="row">
+          <el-input v-model="portInput" placeholder="端口，如 8888" style="width: 140px" inputmode="numeric" data-testid="detail-port-input" @keyup.enter="addPort" />
+          <el-input v-model="portNote" placeholder="备注（可选）" maxlength="32" style="width: 180px" data-testid="detail-port-note" />
+          <el-button type="primary" size="small" :loading="addingPort" data-testid="detail-port-add" @click="addPort">添加端口</el-button>
+        </div>
+        <p v-else class="muted" data-testid="detail-port-limit">每个实例最多开放 {{ MAX_PORTS }} 个端口</p>
+        <p v-if="portError" class="danger" data-testid="detail-port-error">{{ portError }}</p>
       </el-card>
     </template>
 
@@ -231,6 +407,32 @@ watch(id, () => {
         <el-button type="danger" :loading="releasing" :disabled="releasing" data-testid="detail-release-ok" @click="confirmRelease">确定释放</el-button>
       </template>
     </AppDialog>
+    <AppDialog v-model="resetVisible" kind="confirm" title="重置 SSH 密码" data-testid="detail-reset-dialog">
+      <template v-if="resetPassword">
+        <p>新密码只在这里显示一次，请复制保存（之后也可在详情页点「显示」查看）：</p>
+        <div class="row">
+          <code class="mono" data-testid="detail-reset-password">{{ resetPassword }}</code>
+          <el-button size="small" data-testid="detail-reset-copy" @click="copy(resetPassword)">复制</el-button>
+        </div>
+      </template>
+      <p v-else>将生成新的 16 位密码，旧密码立即失效（已连接的会话不受影响）。</p>
+      <template #footer>
+        <el-button v-if="resetPassword" type="primary" data-testid="detail-reset-done" @click="resetVisible = false">我已保存</el-button>
+        <template v-else>
+          <el-button data-testid="detail-reset-cancel" @click="resetVisible = false">取消</el-button>
+          <el-button type="primary" :loading="resetting" data-testid="detail-reset-ok" @click="confirmReset">确定重置</el-button>
+        </template>
+      </template>
+    </AppDialog>
+
+    <AppDialog :model-value="!!publicTarget" kind="confirm" title="设为公开" data-testid="detail-port-public-dialog" @update:model-value="(v: boolean) => { if (!v) publicTarget = null }">
+      <p data-testid="detail-port-public-text">设为公开后，<b>任何人</b>都能通过网址访问端口 {{ publicTarget?.port }}，平台不做鉴权与限流；请确认应用自带鉴权（例如 Jupyter 的 token）。</p>
+      <template #footer>
+        <el-button data-testid="detail-port-public-cancel" @click="publicTarget = null">取消</el-button>
+        <el-button type="warning" :loading="togglingPort" data-testid="detail-port-public-ok" @click="publicTarget && setVisibility(publicTarget, 'public')">确认公开</el-button>
+      </template>
+    </AppDialog>
+
     <GuideDialog :guide="guide" />
   </div>
 </template>
@@ -242,6 +444,9 @@ watch(id, () => {
 .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
 .actions { display: flex; gap: 12px; margin-top: 16px; }
 .muted { color: #909399; }
+.small { font-size: 12px; margin: 4px 0; }
+.port { padding: 8px 0; border-bottom: 1px solid var(--el-border-color-lighter); }
+.port .row { margin: 4px 0; }
 .warn { color: var(--el-color-warning); }
 .danger { color: var(--el-color-danger); }
 </style>

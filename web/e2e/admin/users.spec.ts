@@ -5,6 +5,7 @@ import {
 import { seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
+import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
 import { cstTime } from '../helpers/time'
 
 type User = { id: number; phone: string; kind: string; kyc_status: string; status: string; created_at: string }
@@ -697,4 +698,20 @@ test('A-USR-06 60 秒内相同调账被拦截：只提示一次、保留输入�
     await drainTasks(page)
     expect(posts.filter((p) => !('totp' in (p.body ?? {}))).map((p) => p.body)).toEqual(Array(3).fill({ amount: 1000, remark: '重复提交测试' }))
   })
+})
+
+test('A-USR-07 用户详情显示 SSH 公钥（名称按文本显示）', async ({ page }) => {
+  const u = await seedUser()
+  const api = await userApi(u.phone)
+  expect((await api.post('/api/v1/ssh-keys', { data: { public_key: freshPublicKey('laptop') } })).status()).toBe(201)
+  expect((await api.post('/api/v1/ssh-keys', { data: { public_key: freshPublicKey(), name: XSS } })).status()).toBe(201)
+  const admin = await createAdmin('finance')
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/users/${u.id}`)
+  await page.getByRole('tab', { name: 'SSH 公钥' }).click()
+  await expect(page.getByTestId('udetail-key-row')).toHaveCount(2)
+  await expect(page.getByTestId('udetail-key-name')).toHaveText(['laptop', XSS])
+  await expect(page.getByTestId('udetail-key-fp').first()).toHaveText(/^SHA256:/)
+  await expect(page.locator('[data-testid="udetail-key-row"] img')).toHaveCount(0)
+  expect(await xssFired(page)).toBe(false)
 })

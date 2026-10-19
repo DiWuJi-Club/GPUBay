@@ -52,6 +52,7 @@ type env struct {
 	wallet    *wallet.Service
 	fleet     *fleet.Service
 	notifier  *fakeNotifier
+	keys      *fakeKeys
 	userID    int64
 	productID int64
 	imageID   int64
@@ -70,11 +71,12 @@ func newEnv(t *testing.T, machines int) *env {
 	w := wallet.NewService(pool, clk)
 	f := fleet.NewService(pool, clk)
 	n := &fakeNotifier{}
+	keys := &fakeKeys{}
 	svc := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: w,
-		Catalog: catalog.NewService(pool), Fleet: f, Notifier: n,
+		Catalog: catalog.NewService(pool), Fleet: f, Notifier: n, Keys: keys,
 	})
-	e := &env{t: t, ctx: context.Background(), pool: pool, clock: clk, svc: svc, wallet: w, fleet: f, notifier: n,
+	e := &env{t: t, ctx: context.Background(), pool: pool, clock: clk, svc: svc, wallet: w, fleet: f, notifier: n, keys: keys,
 		productID: dbtest.ProductID(t, pool), imageID: dbtest.ImageID(t, pool)}
 	e.userID = e.newUser("13600000001", startFunds)
 	for i := 0; i < machines; i++ {
@@ -188,3 +190,8 @@ func firstOf(n int, err error) int {
 	}
 	return n
 }
+
+// fakeKeys 模拟 identity.CountSSHKeys：n 为用户当前公钥数。
+type fakeKeys struct{ n int }
+
+func (f *fakeKeys) CountSSHKeys(context.Context, int64) (int, error) { return f.n, nil }

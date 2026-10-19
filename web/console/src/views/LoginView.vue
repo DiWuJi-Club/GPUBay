@@ -3,9 +3,9 @@ import { brand, isApiError, useCountdown, type User } from '@spark/shared'
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
+import { postLoginTarget } from '../logic/access'
 import { isValidPhone, normalizeCode, normalizePhone } from '../logic/login'
 import { notifyError } from '../logic/notify'
-import { safeRedirect } from '../router'
 import { setUser } from '../store/session'
 
 const route = useRoute()
@@ -49,7 +49,12 @@ async function submit() {
   try {
     const u = await api.post<User>('/auth/login', { phone: p, code: c })
     setUser(u)
-    await router.replace(safeRedirect(route.query.redirect) ?? '/market')
+    const next = postLoginTarget(route.query.redirect)
+    if (next.kind === 'assign') {
+      window.location.assign(next.url) // Web 访问授权端点是后端路径，router.replace 到不了
+      return
+    }
+    await router.replace(next.path)
   } catch (e) {
     if (isApiError(e) && e.code === 'invalid_code') codeError.value = e.message
     else notifyError(e) // banned → 「账号已被封禁」

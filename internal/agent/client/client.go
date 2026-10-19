@@ -325,6 +325,7 @@ func toCommand(cmd *agentpb.Command) executor.Command {
 		out.Type = "create_instance"
 		out.ImageRef, out.UpstreamPubKey = b.Create.GetImageRef(), b.Create.GetUpstreamPubkey()
 		out.BandwidthMbps, out.SSHPort, out.DataSizeGiB = int(b.Create.GetBandwidthMbps()), int(b.Create.GetSshPort()), int(b.Create.GetDataSizeGib())
+		out.HostKeyPEM = b.Create.GetHostKeyPem()
 	case *agentpb.Command_Start:
 		out.Type = "start_instance"
 	case *agentpb.Command_Stop:

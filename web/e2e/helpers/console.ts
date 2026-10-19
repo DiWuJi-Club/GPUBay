@@ -17,8 +17,13 @@ export async function seedUser(opts: { verified?: boolean; balance?: number; led
  * 先推进 61 秒，保证本测试里之前（例如 userApi）发过的码不会让这次 rate_limited。
  */
 export async function loginConsole(page: Page, phone: string, expectPath = '/market') {
+  await loginConsoleAt(page, '', phone, expectPath)
+}
+
+/** 在指定 origin 登录（Web 入口用例要在 CONSOLE_SITE_URL 上持有会话：会话 Cookie 是 host-only 的）；origin 为空即 baseURL。 */
+export async function loginConsoleAt(page: Page, origin: string, phone: string, expectPath = '/market') {
   await hooks.advance(61)
-  await page.goto('/login')
+  await page.goto(`${origin}/login`)
   await page.getByTestId('login-phone').fill(phone)
   await page.getByTestId('login-send').click()
   await page.getByTestId('login-code').fill('000000')

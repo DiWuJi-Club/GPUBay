@@ -9,8 +9,33 @@ import { brand } from '@spark/shared'
       <ol>
         <li>实例状态变为「运行中」后，在实例详情页复制 SSH 命令（形如 <code>ssh ins-xxxxxxxx@ssh.您的域名</code>）。</li>
         <li>点击「显示」查看 SSH 密码并复制；密码只在您点击时才会显示，离开页面后需要重新查看。</li>
-        <li>如遇换机，SSH 密码会变化，请在详情页重新查看。</li>
+        <li data-testid="help-migrated-web">如遇换机，SSH 密码会变化，Web 访问地址也会变为新实例 ID，请在详情页重新查看。</li>
       </ol>
+    </el-card>
+    <el-card>
+      <h2 data-testid="help-ssh-keys">用公钥登录、关闭密码登录</h2>
+      <ol>
+        <li>在「我的 → SSH 公钥」粘贴您电脑的公钥（<code>~/.ssh/id_ed25519.pub</code> 的内容，一行），之后 <code>ssh -i ~/.ssh/id_ed25519 ins-xxxxxxxx@…</code> 免密登录。</li>
+        <li>添加公钥后可在实例详情关闭密码登录；在容器里执行 <code>ssh-copy-id</code> 或修改 <code>~/.ssh/authorized_keys</code> 不会生效，公钥只在控制台管理。</li>
+        <li>首次连接会提示主机密钥指纹，请与本页公布的网关指纹核对：<code data-testid="help-hostkey">{{ brand.sshHostKeyFingerprint || '（部署后由运维在此填写）' }}</code>。</li>
+      </ol>
+    </el-card>
+    <el-card>
+      <h2 data-testid="help-forward">端口转发与文件传输</h2>
+      <ul>
+        <li><code>scp</code> / <code>sftp</code> / <code>rsync</code> 都可用（走同一条 SSH 连接）；大文件请放到 <code>/root/data</code>。</li>
+        <li>本地转发 <code>ssh -L 8888:127.0.0.1:8888 ins-xxxxxxxx@…</code> 可在本机浏览器访问容器里的服务；<code>-R</code>、<code>-A</code>（agent 转发）也支持；不支持 X11。</li>
+        <li>VS Code Remote-SSH：Host 填 <code>ssh.您的域名</code>，User 填实例 ID。</li>
+      </ul>
+    </el-card>
+    <el-card>
+      <h2 data-testid="help-web">Web 访问（端口开放）</h2>
+      <ul>
+        <li>在实例详情「Web 访问」添加端口后，会得到形如 <code>https://ins-xxxxxxxx-8888.…/</code> 的网址；默认<b>私有</b>：只有您在本站登录后才能打开。</li>
+        <li>设为<b>公开</b>后任何人都能访问，平台不做鉴权与限流，请确认应用自带密码；平台可在收到滥用举报后将端口限制为私有。</li>
+        <li>应用需监听 <code>127.0.0.1</code> 或 <code>0.0.0.0</code>（只监听容器 eth0 地址不通）。Jupyter 请用 <code>jupyter lab --ip=127.0.0.1 --port=8888 --ServerApp.allow_remote_access=True</code>，否则会提示 Host not allowed。</li>
+        <li>网址下的 <code>/.spark/</code> 路径由平台保留；应用自身的 CSRF 等安全防护由应用负责。</li>
+      </ul>
     </el-card>
     <el-card>
       <h2 data-testid="help-retention">数据保留规则</h2>
@@ -35,4 +60,5 @@ import { brand } from '@spark/shared'
 .help { display: grid; gap: 16px; max-width: 760px; }
 h2 { font-size: 16px; margin: 0 0 8px; }
 .support { color: #909399; font-size: 12px; }
+code { word-break: break-all; }
 </style>

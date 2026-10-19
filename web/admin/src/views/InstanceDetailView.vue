@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import {
   centsToYuanInput, commandStatusLabel, commandTypeLabel, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
-  orderKindLabel, orderStatusLabel, type AdminImage, type AdminInstance, type AdminInstanceDetail, type AdminProduct, type Listed, type RefundQuote,
+  orderKindLabel, orderStatusLabel, type AdminImage, type AdminInstance, type AdminInstanceDetail, type AdminProduct, type AdminSshSession, type InstancePort, type Listed, type Paged, type RefundQuote,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
-import { extendSeconds, isZeroRefund, showExtend, showMigrate, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
+import { extendSeconds, isZeroRefund, showExtend, showMigrate, showPortActions, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
 
@@ -59,6 +59,7 @@ async function loadOptions() {
 onMounted(() => {
   void load()
   void loadOptions()
+  void loadSessions()
 })
 // 同一组件换了实例（换机结果里点新实例）：清掉旧实例的数据与弹窗，按新 ID 重新加载
 onBeforeRouteUpdate((to) => {
@@ -70,7 +71,11 @@ onBeforeRouteUpdate((to) => {
   migrate.result = null
   rewipe.visible = false
   refund.visible = false
+  sessions.value = []
+  sessionsTotal.value = 0
+  portAction.visible = false
   void load(String(to.params.id))
+  void loadSessions(String(to.params.id))
 })
 
 // ---- 免费延长（ops）----
@@ -173,6 +178,46 @@ async function submitRefund() {
   }
 }
 
+// ---- 访问：端口处置与 SSH 会话 ----
+const sessions = ref<AdminSshSession[]>([])
+const sessionsTotal = ref(0)
+let sessionsSeq = 0
+/** 与 load() 相同：只采用最后一次请求、且仍是当前路由实例的结果（换实例后旧实例迟到的会话列表丢弃）。 */
+async function loadSessions(target = id.value) {
+  const mine = ++sessionsSeq
+  const stale = () => mine !== sessionsSeq || target !== String(route.params.id)
+  try {
+    const p = await api.get<Paged<AdminSshSession>>(`/instances/${target}/ssh-sessions`, { page: 1, page_size: 20 })
+    if (stale()) return
+    sessions.value = p.items
+    sessionsTotal.value = p.total
+  } catch (e) {
+    if (stale()) return
+    notifyError(e)
+  }
+}
+const portAction = reactive({ visible: false, kind: 'force' as 'force' | 'delete', port: 0, reason: '', error: '', busy: false })
+function openPortAction(kind: 'force' | 'delete', p: InstancePort) {
+  Object.assign(portAction, { visible: true, kind, port: p.port, reason: '', error: '' })
+}
+async function submitPortAction() {
+  if (portAction.busy) return
+  portAction.error = portAction.reason.trim() ? '' : '请填写原因'
+  if (portAction.error) return
+  portAction.busy = true
+  try {
+    if (portAction.kind === 'force') await api.post(`/instances/${id.value}/ports/${portAction.port}/force-private`, { reason: portAction.reason.trim() })
+    else await api.del(`/instances/${id.value}/ports/${portAction.port}`, { reason: portAction.reason.trim() })
+    ElMessage.success(portAction.kind === 'force' ? '已限制为私有' : '已删除端口')
+    portAction.visible = false
+    await load()
+  } catch (e) {
+    notifyError(e)
+  } finally {
+    portAction.busy = false
+  }
+}
+
 const eventText = (e: { from_state: string; to_state: string; reason: string; at: string }) => `${e.from_state || '—'} → ${e.to_state} · ${e.reason} · ${fmtTime(e.at)}`
 </script>
 
@@ -249,6 +294,56 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
           </tbody>
         </table>
       </el-card>
+
+      <el-card header="访问" data-testid="adetail-access-card">
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="密码登录"><span data-testid="adetail-password-auth">{{ inst.password_auth ? '已开启' : '已关闭（仅公钥）' }}</span></el-descriptions-item>
+          <el-descriptions-item label="容器主机密钥"><span class="mono" data-testid="adetail-hostkey">{{ data.ssh_host_pubkey_fingerprint || '（存量实例，首连后登记）' }}</span></el-descriptions-item>
+        </el-descriptions>
+        <h4>Web 端口</h4>
+        <table class="grid">
+          <thead><tr><th>端口</th><th>备注</th><th>网址</th><th>可见性</th><th v-if="showPortActions(role)">操作</th></tr></thead>
+          <tbody>
+            <tr v-for="p in data.ports" :key="p.port" data-testid="adetail-port-row">
+              <td>{{ p.port }}</td>
+              <td>{{ p.note }}</td>
+              <td class="mono" data-testid="adetail-port-url">{{ p.url }}</td>
+              <td>
+                <span data-testid="adetail-port-visibility">{{ p.visibility === 'public' ? '公开' : '私有' }}</span>
+                <el-tag v-if="p.forced_private" type="danger" size="small" data-testid="adetail-port-forced">平台限制</el-tag>
+              </td>
+              <td v-if="showPortActions(role)">
+                <el-button v-if="!p.forced_private" size="small" data-testid="adetail-port-force" @click="openPortAction('force', p)">强制私有</el-button>
+                <el-button size="small" type="danger" plain data-testid="adetail-port-delete" @click="openPortAction('delete', p)">删除</el-button>
+              </td>
+            </tr>
+            <tr v-if="!data.ports.length"><td :colspan="showPortActions(role) ? 5 : 4" class="muted empty">无端口</td></tr>
+          </tbody>
+        </table>
+        <h4>最近 SSH 会话（共 {{ sessionsTotal }}）</h4>
+        <table class="grid">
+          <thead><tr><th>方式</th><th>来源 IP</th><th>开始</th><th>结束</th><th>上行 / 下行</th></tr></thead>
+          <tbody>
+            <tr v-for="s in sessions" :key="s.id" data-testid="adetail-session-row">
+              <td data-testid="adetail-session-method">{{ s.auth_method === 'password' ? '密码' : '公钥' }}</td>
+              <td class="mono" data-testid="adetail-session-ip">{{ s.client_ip }}</td>
+              <td>{{ fmtTime(s.started_at) }}</td>
+              <td>{{ s.ended_at ? fmtTime(s.ended_at) : '进行中' }}</td>
+              <td>{{ s.bytes_up }} / {{ s.bytes_down }}</td>
+            </tr>
+            <tr v-if="!sessions.length"><td colspan="5" class="muted empty" data-testid="adetail-sessions-empty">无会话</td></tr>
+          </tbody>
+        </table>
+      </el-card>
+
+      <el-dialog v-model="portAction.visible" :title="portAction.kind === 'force' ? `将端口 ${portAction.port} 限制为私有` : `删除端口 ${portAction.port}`" width="460" align-center data-testid="port-action-dialog">
+        <p class="muted">{{ portAction.kind === 'force' ? '用户将无法再把该端口设为公开（可改备注、可删除）。' : '删除后用户需要重新添加。' }}</p>
+        <el-form label-position="top" @submit.prevent="submitPortAction">
+          <el-form-item label="原因（必填，写入审计）"><el-input v-model="portAction.reason" data-testid="port-action-reason" /></el-form-item>
+          <p v-if="portAction.error" class="error" data-testid="port-action-error">{{ portAction.error }}</p>
+          <el-button :type="portAction.kind === 'force' ? 'warning' : 'danger'" native-type="submit" :loading="portAction.busy" data-testid="port-action-submit">确定</el-button>
+        </el-form>
+      </el-dialog>
 
       <el-dialog v-model="extend.visible" title="免费延长" width="460" align-center data-testid="extend-dialog">
         <!-- novalidate：数字框的原生 step 校验会让 1.5 小时这类值根本提交不了，范围由 validateExtend 统一校验 -->

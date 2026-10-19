@@ -2,6 +2,7 @@ package adminapi_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -236,5 +237,74 @@ func TestAdminRouterServesSPAAndJSON404(t *testing.T) {
 	}
 	if resp, _ := get("/admin/api/v1/dashboard"); resp.StatusCode != 401 || resp.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("anonymous dashboard = %d cache=%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+	}
+}
+
+func TestAdminSameSiteGuard(t *testing.T) {
+	e := newEnvWith(t, func(s *adminapi.Server) { s.PublicBaseURL = "https://admin.spark.test" })
+	req, _ := http.NewRequest("POST", e.ts.URL+"/admin/api/v1/auth/login", strings.NewReader(`{"username":"x","password":"y"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 403 {
+		t.Fatalf("same-site admin login = %d", resp.StatusCode)
+	}
+	req2, _ := http.NewRequest("POST", e.ts.URL+"/admin/api/v1/auth/login", strings.NewReader(`{"username":"x","password":"y"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Origin", "https://admin.spark.test")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == 403 {
+		t.Fatal("matching origin rejected")
+	}
+}
+
+// SecureCookie=true（staging / prod）：后台会话 Cookie 为 __Host-sc_admin（Secure、Path=/、无 Domain），且服务端按该名读取。
+func TestAdminHostPrefixedCookieOutsideDev(t *testing.T) {
+	e := newEnvWith(t, func(s *adminapi.Server) { s.SecureCookie = true })
+	if _, err := e.admins.Create(e.ctx, audit.Actor{}, "root", adminPassword, admin.RoleSuper); err != nil {
+		t.Fatal(err)
+	}
+	post := func(path, body string, cookie *http.Cookie) (*http.Response, map[string]any) {
+		req, _ := http.NewRequest("POST", e.ts.URL+"/admin/api/v1"+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if cookie != nil {
+			req.AddCookie(&http.Cookie{Name: cookie.Name, Value: cookie.Value})
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp, out
+	}
+	resp, out := post("/auth/login", fmt.Sprintf(`{"username":"root","password":%q}`, adminPassword), nil)
+	var cookie *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "__Host-sc_admin" {
+			cookie = c
+		}
+	}
+	if resp.StatusCode != 200 || cookie == nil || !cookie.Secure || cookie.Path != "/" || cookie.Domain != "" || !cookie.HttpOnly ||
+		cookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("login = %d cookies %+v", resp.StatusCode, resp.Cookies())
+	}
+	u, _ := url.Parse(out["otpauth_uri"].(string))
+	c := &client{e: e, secret: u.Query().Get("secret")}
+	if resp, out := post("/auth/totp/setup", fmt.Sprintf(`{"code":%q}`, c.totp()), cookie); resp.StatusCode != 200 {
+		t.Fatalf("totp setup with __Host- cookie = %d %v", resp.StatusCode, out)
+	}
+	// 旧名 sc_admin 不再被识别
+	if resp, _ := post("/auth/totp", fmt.Sprintf(`{"code":%q}`, c.totp()), &http.Cookie{Name: "sc_admin", Value: cookie.Value}); resp.StatusCode != 401 {
+		t.Fatalf("legacy cookie name = %d, want 401", resp.StatusCode)
 	}
 }

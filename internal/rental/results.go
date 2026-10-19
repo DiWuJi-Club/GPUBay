@@ -83,7 +83,7 @@ func (s *Service) HandleCommandResult(ctx context.Context, commandID string, ok 
 				return s.d.Fleet.RaiseAlert(ctx, tx, fleet.Alert{Level: "critical", Kind: "wipe_failed",
 					MachineID: inst.MachineID, InstanceID: inst.ID, Message: result})
 			}
-			if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'released', updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'released', ssh_host_key_enc = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 				return err
 			}
 			if err := recordEvent(ctx, tx, inst.ID, StateWiping, StateReleased, "agent: wiped", now); err != nil {
@@ -115,7 +115,7 @@ func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from
 
 // failCreating 开通失败：实例失败、退款、机器隔离为故障、取消剩余指令并告警。
 func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, reason string, now time.Time) error {
-	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'failed', pending_seconds = 0, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'failed', pending_seconds = 0, ssh_host_key_enc = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 		return err
 	}
 	if err := recordEvent(ctx, tx, inst.ID, StateCreating, StateFailed, reason, now); err != nil {

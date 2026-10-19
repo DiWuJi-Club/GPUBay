@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
@@ -18,6 +20,7 @@ import (
 func TestMain(m *testing.M) { dbtest.Main(m) }
 
 type env struct {
+	pool  *pgxpool.Pool
 	svc   *identity.Service
 	sms   *sms.Mock
 	clock *clock.Fake
@@ -29,7 +32,7 @@ func newEnv(t *testing.T, fixedCode string) env {
 	mock := &sms.Mock{}
 	clk := clock.NewFake(dbtest.T0)
 	svc := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: mock, FixedCode: fixedCode})
-	return env{svc: svc, sms: mock, clock: clk}
+	return env{pool: pool, svc: svc, sms: mock, clock: clk}
 }
 
 func lastCode(t *testing.T, m *sms.Mock) string {
@@ -329,5 +332,68 @@ func TestSendCodeIPHourLimitConfigurable(t *testing.T) {
 	}
 	if err := def.SendLoginCode(ctx, "13999999999", "10.0.0.8"); !errors.Is(err, apperr.ErrRateLimited) {
 		t.Fatalf("31st send = %v, want rate_limited", err)
+	}
+}
+
+func TestSessionHashAndUserID(t *testing.T) {
+	e := newEnv(t, "000000")
+	ctx := context.Background()
+	if err := e.svc.SendLoginCode(ctx, "13800001234", "1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	token, u, err := e.svc.Login(ctx, "13800001234", "000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := identity.SessionHash(token)
+	if len(h) != 64 || h == token {
+		t.Fatalf("hash = %q", h)
+	}
+	if id, err := e.svc.SessionUserID(ctx, h); err != nil || id != u.ID {
+		t.Fatalf("session user = %d %v", id, err)
+	}
+	if _, err := e.svc.SessionUserID(ctx, identity.SessionHash("other")); !errors.Is(err, apperr.ErrUnauthorized) {
+		t.Fatalf("unknown = %v", err)
+	}
+	if err := e.svc.Logout(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.SessionUserID(ctx, h); !errors.Is(err, apperr.ErrUnauthorized) {
+		t.Fatalf("after logout = %v", err)
+	}
+}
+
+func TestSessionUserIDBannedAndExpired(t *testing.T) {
+	e := newEnv(t, "000000")
+	ctx := context.Background()
+	login := func(phone string) (string, identity.User) {
+		t.Helper()
+		if err := e.svc.SendLoginCode(ctx, phone, "1.1.1.1"); err != nil {
+			t.Fatal(err)
+		}
+		token, u, err := e.svc.Login(ctx, phone, "000000")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token, u
+	}
+	// 会话仍在而用户已被封禁（Ban 会删会话，这里直接改状态模拟封禁与会话清理之间的窗口）
+	banned, bu := login("13800005555")
+	if _, err := e.pool.Exec(ctx, `UPDATE users SET status = 'banned' WHERE id = $1`, bu.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.SessionUserID(ctx, identity.SessionHash(banned)); !errors.Is(err, apperr.ErrBanned) {
+		t.Fatalf("banned = %v", err)
+	}
+	// 过期：会话有效期 30 天
+	token, u := login("13800005556")
+	h := identity.SessionHash(token)
+	e.clock.Advance(30*24*time.Hour - time.Second)
+	if id, err := e.svc.SessionUserID(ctx, h); err != nil || id != u.ID {
+		t.Fatalf("just before expiry = %d %v", id, err)
+	}
+	e.clock.Advance(time.Second)
+	if _, err := e.svc.SessionUserID(ctx, h); !errors.Is(err, apperr.ErrUnauthorized) {
+		t.Fatalf("expired = %v", err)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/secretbox"
@@ -124,5 +125,20 @@ func TestAdminGenUpstreamKey(t *testing.T) {
 	}
 	if err := runAdmin(context.Background(), nil, []string{"gen-upstream-key"}, &out, nil); err == nil {
 		t.Fatal("missing --path accepted")
+	}
+}
+
+func TestAdminSSHHostKey(t *testing.T) {
+	pool := dbtest.New(t)
+	box, _ := secretbox.New(dbtest.Key)
+	if _, err := pki.EnsureCA(context.Background(), pool, box, clock.NewFake(dbtest.T0)); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := adminSSHHostKey(context.Background(), pool, box, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "公钥：ssh-ed25519 ") || !strings.Contains(out.String(), "指纹：SHA256:") {
+		t.Fatalf("output = %s", out.String())
 	}
 }

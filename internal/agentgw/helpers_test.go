@@ -57,7 +57,10 @@ type env struct {
 
 const tick = 20 * time.Millisecond
 
-func newEnvWith(t *testing.T, tweak func(*agentgw.Config)) *env {
+func newEnvWith(t *testing.T, tweak func(*agentgw.Config)) *env { return newEnvFull(t, tweak, nil) }
+
+// newEnvFull 额外允许改 Deps（替换 HostKeys、注入日志等）。
+func newEnvFull(t *testing.T, tweak func(*agentgw.Config), tweakDeps func(*agentgw.Deps)) *env {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -78,7 +81,11 @@ func newEnvWith(t *testing.T, tweak func(*agentgw.Config)) *env {
 	if tweak != nil {
 		tweak(&cfg)
 	}
-	srv, err := agentgw.New(cfg, agentgw.Deps{Pool: pool, Fleet: f, Rental: r, CA: ca, Clock: clk, Log: log})
+	deps := agentgw.Deps{Pool: pool, Fleet: f, Rental: r, HostKeys: r, CA: ca, Clock: clk, Log: log}
+	if tweakDeps != nil {
+		tweakDeps(&deps)
+	}
+	srv, err := agentgw.New(cfg, deps)
 	if err != nil {
 		t.Fatal(err)
 	}

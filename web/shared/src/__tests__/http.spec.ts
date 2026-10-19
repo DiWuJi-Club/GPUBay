@@ -256,3 +256,23 @@ describe('download (U-14)', () => {
     expect(filenameOf('inline')).toBe('export.csv')
   })
 })
+
+describe('http.del', () => {
+  it('del 发送 DELETE 与 JSON 体', async () => {
+    const f = fakeFetch(json(200, { ok: true }))
+    const http = createHttp({ base: '/api/v1', onUnauthorized: vi.fn(), fetch: f.fn })
+    await http.del('/instances/ins-a/ports/8888')
+    expect(f.calls[0].url).toBe('/api/v1/instances/ins-a/ports/8888')
+    expect(f.calls[0].init.method).toBe('DELETE')
+    expect((f.calls[0].init.headers as Record<string, string>)['Content-Type']).toBe('application/json')
+    expect(f.calls[0].init.body).toBe('{}')
+  })
+
+  it('del 的错误与 post 同样处理（401 触发 onUnauthorized）', async () => {
+    const onUnauthorized = vi.fn()
+    const f = fakeFetch(json(401, { code: 'unauthorized', message: '请先登录', request_id: 'r' }))
+    const http = createHttp({ base: '/api/v1', onUnauthorized, fetch: f.fn })
+    await expect(http.del('/ssh-keys/1')).rejects.toMatchObject({ code: 'unauthorized' })
+    expect(onUnauthorized).toHaveBeenCalledOnce()
+  })
+})

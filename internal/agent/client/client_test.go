@@ -342,7 +342,11 @@ func TestAutoModeHelloReportHeartbeatsAndResults(t *testing.T) {
 	}
 	waitFor(t, "hello+state+heartbeat", func() bool { k := kinds(h.gw.msgs()); return len(k) >= 3 && k[0] == "hello" && k[1] == "state" })
 	waitFor(t, "periodic heartbeat", func() bool { return count(h.gw.msgs(), "heartbeat") >= 2 })
-	cmd := &agentpb.Command{Id: "cmd-1", InstanceId: "ins-aaaaaaaa", Body: &agentpb.Command_Create{Create: &agentpb.CreateInstance{ImageRef: "img:1", UpstreamPubkey: "k", BandwidthMbps: 200, SshPort: 2222, DataSizeGib: 1}}}
+	_, hostKey, err := pki.GenerateInstanceHostKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := &agentpb.Command{Id: "cmd-1", InstanceId: "ins-aaaaaaaa", Body: &agentpb.Command_Create{Create: &agentpb.CreateInstance{ImageRef: "img:1", UpstreamPubkey: "k", BandwidthMbps: 200, SshPort: 2222, DataSizeGib: 1, HostKeyPem: string(hostKey)}}}
 	h.gw.push(cmd)
 	h.gw.push(cmd) // 网关可能重复推送同一指令：执行器去重
 	waitFor(t, "result followed by a state report", func() bool {
@@ -360,6 +364,9 @@ func TestAutoModeHelloReportHeartbeatsAndResults(t *testing.T) {
 	})
 	if !c.Received("cmd-1") || !rt.Containers()["ins-aaaaaaaa"].Running {
 		t.Fatal("command not executed")
+	}
+	if got, _ := os.ReadFile(filepath.Join(h.dir, "ssh", "ins-aaaaaaaa", "hostkeys", "ssh_host_ed25519_key")); string(got) != string(hostKey) {
+		t.Fatal("host_key_pem not carried through to the container ssh dir")
 	}
 	// 结果之后紧跟一份 StateReport，且含 running
 	ms := h.gw.msgs()

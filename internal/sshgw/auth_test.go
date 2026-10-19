@@ -1,0 +1,511 @@
+package sshgw_test
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+
+	"spark-cloud/internal/rental"
+	"spark-cloud/internal/sshgw"
+)
+
+func TestPasswordLoginRelaysExecAndRecordsSession(t *testing.T) {
+	e := newEnv(t)
+	c := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	out, _, err := run(t, c, "echo hello")
+	if err != nil || out != "hello\n" {
+		t.Fatalf("exec = %q %v", out, err)
+	}
+	c.Close()
+	waitFor(t, "session closed", func() bool { _, closed, _ := e.store.snapshot(); return len(closed) == 1 })
+	opened, closed, _ := e.store.snapshot()
+	if len(opened) != 1 || opened[0].InstanceID != instA || opened[0].UserID != 7 || opened[0].AuthMethod != "password" || opened[0].KeyID != nil || opened[0].ClientIP != "127.0.0.1" {
+		t.Fatalf("opened = %+v", opened)
+	}
+	if b := closed[1]; b[1] < int64(len("hello\n")) {
+		t.Fatalf("bytes = %v", b)
+	}
+	if e.srv.Sessions() != 0 {
+		t.Fatalf("sessions = %d", e.srv.Sessions())
+	}
+}
+
+func TestPublicKeyLoginAndPasswordDisabled(t *testing.T) {
+	e := newEnv(t)
+	userKey := newSigner(t)
+	k := e.keys.add(7, userKey.PublicKey())
+	c := e.mustDial(instA, ssh.PublicKeys(userKey))
+	if out, _, err := run(t, c, "echo k"); err != nil || out != "k\n" {
+		t.Fatalf("pubkey exec = %q %v", out, err)
+	}
+	waitFor(t, "key touched", func() bool {
+		e.keys.mu.Lock()
+		defer e.keys.mu.Unlock()
+		return len(e.keys.touched) == 1 && e.keys.touched[0] == k.ID
+	})
+	opened, _, _ := e.store.snapshot()
+	if opened[0].AuthMethod != "publickey" || opened[0].KeyID == nil || *opened[0].KeyID != k.ID {
+		t.Fatalf("opened = %+v", opened[0])
+	}
+	// 未登记的钥匙不行
+	if _, _, err := e.dial(instA, ssh.PublicKeys(newSigner(t))); err == nil {
+		t.Fatal("unknown key accepted")
+	}
+	// 登记在其他用户（8）名下的钥匙也不行：钥匙按实例所属用户查找
+	otherKey := newSigner(t)
+	e.keys.add(8, otherKey.PublicKey())
+	if _, _, err := e.dial(instA, ssh.PublicKeys(otherKey)); err == nil {
+		t.Fatal("another user's key accepted")
+	}
+	// 关闭密码登录后密码被拒、公钥仍通
+	info := runningInfo(e, instA, 7, "pw-correct-16chr")
+	info.Instance.PasswordAuth = false
+	e.store.set(instA, info)
+	if _, _, err := e.dial(instA, ssh.Password("pw-correct-16chr")); err == nil {
+		t.Fatal("password accepted while disabled")
+	}
+	e.mustDial(instA, ssh.PublicKeys(userKey))
+}
+
+func TestBannerForUnknownUsernames(t *testing.T) {
+	e := newEnv(t)
+	for _, user := range []string{"root", "INS-AAAAAAAA", " ins-aaaaaaaa", "ins-aaaaaaaa@ssh", "ins-zzzzzzzz", "ins-aaaaaaa", ""} {
+		_, banner, err := e.dial(user, ssh.Password("pw-correct-16chr"))
+		if err == nil || banner != sshgw.BannerUnknown {
+			t.Fatalf("user %q: banner=%q err=%v", user, banner, err)
+		}
+	}
+	if _, banner, err := e.dial(instA, ssh.Password("wrong")); err == nil || banner != "" {
+		t.Fatalf("wrong password: banner=%q err=%v", banner, err)
+	}
+}
+
+func TestBannerByState(t *testing.T) {
+	e := newEnv(t)
+	retain := time.Date(2026, 3, 4, 5, 6, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		mutate func(*rental.AccessInfo)
+		want   string
+	}{
+		{"suspended", func(i *rental.AccessInfo) { now := e.clk.Now(); i.Instance.SuspendedAt = &now }, sshgw.BannerSuspended},
+		{"creating", func(i *rental.AccessInfo) { i.Instance.State = rental.StateCreating }, sshgw.BannerCreating},
+		{"stopped", func(i *rental.AccessInfo) { i.Instance.State = rental.StateStopped; i.RetainUntil = &retain }, "实例已到期停机，数据保留至 2026-03-04 13:06，续费后可继续使用"},
+		{"wiping", func(i *rental.AccessInfo) { i.Instance.State = rental.StateWiping }, sshgw.BannerReleased},
+		{"released", func(i *rental.AccessInfo) { i.Instance.State = rental.StateReleased }, sshgw.BannerReleased},
+		{"failed", func(i *rental.AccessInfo) { i.Instance.State = rental.StateFailed }, sshgw.BannerReleased},
+	}
+	for _, c := range cases {
+		info := runningInfo(e, instA, 7, "pw-correct-16chr")
+		c.mutate(&info)
+		e.store.set(instA, info)
+		if _, banner, err := e.dial(instA, ssh.Password("pw-correct-16chr")); err == nil || banner != c.want {
+			t.Fatalf("%s: banner=%q err=%v", c.name, banner, err)
+		}
+	}
+	// agent_online=false 但实例仍 running（5 分钟判定窗口内）：允许
+	info := runningInfo(e, instA, 7, "pw-correct-16chr")
+	info.AgentOnline = false
+	e.store.set(instA, info)
+	e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+}
+
+func TestFailureCountingIsPerConnection(t *testing.T) {
+	e := newEnv(t)
+	sshgw.SetLimitsForTest(e.srv, 3, 100, 32)
+	// agent 里 4 把陌生钥匙 + 正确密码：PublicKeyCallback 失败 4 次，但连接最终成功 → 不计失败
+	keys := []ssh.Signer{newSigner(t), newSigner(t), newSigner(t), newSigner(t)}
+	c, _, err := e.dial(instA, ssh.PublicKeys(keys...))
+	if err == nil {
+		c.Close()
+		t.Fatal("unknown keys accepted")
+	}
+	// 服务端在读到 EOF 后才计数，客户端 Dial 返回时未必已计入：一律等待
+	fails := func(n int) {
+		waitFor(t, fmt.Sprintf("fail count %d", n), func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") == n })
+	}
+	fails(1)
+	c2, err := ssh.Dial("tcp", e.addr, &ssh.ClientConfig{User: instA, Auth: []ssh.AuthMethod{ssh.PublicKeys(keys...), ssh.Password("pw-correct-16chr")},
+		HostKeyCallback: ssh.FixedHostKey(e.hostKey.PublicKey()), Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.Close()
+	time.Sleep(100 * time.Millisecond)
+	fails(1) // 成功的连接不计
+	// 密码错 5 次（同一连接内重试）只计 1
+	e.dial(instA, ssh.RetryableAuthMethod(ssh.Password("wrong"), 5))
+	fails(2)
+	e.dial(instA, ssh.Password("wrong"))
+	waitFor(t, "ip blocked", func() bool { return sshgw.BlockedForTest(e.srv, "127.0.0.1") })
+	if _, _, err := e.dial(instA, ssh.Password("pw-correct-16chr")); err == nil {
+		t.Fatal("blocked ip could connect")
+	}
+	e.clk.Advance(10*time.Minute + time.Second)
+	e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+}
+
+func TestInstanceBruteforceAlertOnce(t *testing.T) {
+	e := newEnv(t)
+	sshgw.SetLimitsForTest(e.srv, 100, 2, 32)
+	for i := 0; i < 4; i++ {
+		e.dial(instA, ssh.Password("wrong"))
+	}
+	waitFor(t, "alert raised", func() bool { _, _, alerts := e.store.snapshot(); return len(alerts) >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	_, _, alerts := e.store.snapshot()
+	if len(alerts) != 1 || alerts[0] != "bruteforce:"+instA {
+		t.Fatalf("alerts = %v", alerts)
+	}
+}
+
+func TestIPKeyAndConcurrentConnCap(t *testing.T) {
+	if sshgw.IPKeyForTest("203.0.113.9") != "203.0.113.9" || sshgw.IPKeyForTest("2001:db8:1:2::1") != sshgw.IPKeyForTest("2001:db8:1:2:ffff::2") ||
+		sshgw.IPKeyForTest("2001:db8:1:2::1") == sshgw.IPKeyForTest("2001:db8:1:3::1") || !strings.HasSuffix(sshgw.IPKeyForTest("2001:db8::1"), "/64") {
+		t.Fatal("ipKey: IPv6 must be keyed by /64, IPv4 by address")
+	}
+	e := newEnv(t)
+	sshgw.SetLimitsForTest(e.srv, 100, 100, 2)
+	a := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	b := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	if _, _, err := e.dial(instA, ssh.Password("pw-correct-16chr")); err == nil {
+		t.Fatal("third concurrent connection from same ip accepted")
+	}
+	a.Close()
+	waitFor(t, "slot freed", func() bool { _, _, err := e.dial(instA, ssh.Password("pw-correct-16chr")); return err == nil })
+	b.Close()
+}
+
+func TestSessionCapAndUpstreamUnreachable(t *testing.T) {
+	e := newEnvWith(t, func(c *sshgw.Config) { c.MaxSessionsPerInstance = 1 })
+	first := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	if _, _, err := run(t, first, "echo one"); err != nil {
+		t.Fatal(err)
+	}
+	second := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	_, stderr, err := run(t, second, "echo two")
+	if err == nil || !strings.Contains(stderr, sshgw.MsgTooManySessions) {
+		t.Fatalf("second session: err=%v stderr=%q", err, stderr)
+	}
+	first.Close()
+	waitFor(t, "slot released", func() bool { return e.srv.Sessions() == 0 })
+	// 上游拨不通（端口 1 没人监听）：提示 + 告警（进程内 5 分钟节流，连两次只告警一次）
+	bad := newEnvWith(t, func(c *sshgw.Config) { c.UpstreamPort = 1 })
+	for i := 0; i < 2; i++ {
+		c := bad.mustDial(instA, ssh.Password("pw-correct-16chr"))
+		_, stderr, err = run(t, c, "echo x")
+		if err == nil || !strings.Contains(stderr, sshgw.MsgUpstreamUnreachable) {
+			t.Fatalf("unreachable: err=%v stderr=%q", err, stderr)
+		}
+	}
+	_, _, alerts := bad.store.snapshot()
+	if len(alerts) != 1 || alerts[0] != "unreachable:"+instA {
+		t.Fatalf("alerts = %v", alerts)
+	}
+}
+
+func TestLimiterSweepAndUnknownInstanceNotCounted(t *testing.T) {
+	e := newEnv(t)
+	sshgw.SetLimitsForTest(e.srv, 2, 100, 32)
+	e.dial("ins-zzzzzzzz", ssh.Password("wrong")) // 实例不存在：只按 IP 计
+	waitFor(t, "ip fail 1", func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") == 1 })
+	if _, instF, _ := sshgw.LimiterSizesForTest(e.srv); instF != 0 {
+		t.Fatalf("nonexistent instance grew instF: %d", instF)
+	}
+	e.dial(instA, ssh.Password("wrong")) // 第 2 次：封禁，IP 失败表的键随之删除
+	waitFor(t, "ip blocked", func() bool { return sshgw.BlockedForTest(e.srv, "127.0.0.1") })
+	if fails, instF, blocked := sshgw.LimiterSizesForTest(e.srv); fails != 0 || instF != 1 || blocked != 1 {
+		t.Fatalf("sizes before sweep = %d %d %d, want 0 1 1", fails, instF, blocked)
+	}
+	e.clk.Advance(10*time.Minute + time.Second)
+	sshgw.SweepForTest(e.srv)
+	if fails, instF, blocked := sshgw.LimiterSizesForTest(e.srv); fails != 0 || instF != 0 || blocked != 0 {
+		t.Fatalf("sizes after sweep = %d %d %d, want all 0", fails, instF, blocked)
+	}
+}
+
+func TestOnlyRealAuthAttemptsCount(t *testing.T) {
+	e := newEnv(t)
+	// 裸 TCP 连上就断
+	nc, err := net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc.Close()
+	// 版本串之后发坏包：密钥交换失败
+	nc, err = net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc.SetDeadline(time.Now().Add(5 * time.Second))
+	nc.Write([]byte("SSH-2.0-probe\r\n\xff\xff\xff\xff garbage"))
+	io.Copy(io.Discard, nc)
+	nc.Close()
+	// 只走到 none 认证（拿到 Banner）就放弃
+	if _, banner, err := e.dial(instA, ssh.KeyboardInteractive(func(string, string, []string, []bool) ([]string, error) {
+		return nil, errors.New("no")
+	})); err == nil || banner != "" {
+		t.Fatalf("none-only dial: banner=%q err=%v", banner, err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 0 {
+		t.Fatalf("non-attempts counted: %d", n)
+	}
+	e.dial(instA, ssh.Password("wrong")) // 真实尝试仍计
+	waitFor(t, "real attempt counted", func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") == 1 })
+}
+
+func TestLookupErrorLooksLikeUnknown(t *testing.T) {
+	e := newEnv(t)
+	e.store.setFailFor(errors.New("pq: connection refused to 10.0.0.5:5432"), 100)
+	_, banner, err := e.dial(instA, ssh.Password("pw-correct-16chr"))
+	if err == nil || banner != sshgw.BannerUnknown {
+		t.Fatalf("db error: banner=%q err=%v", banner, err)
+	}
+	if strings.Contains(err.Error(), "pq") || strings.Contains(err.Error(), "10.0.0.5") {
+		t.Fatalf("db error leaked to client: %v", err)
+	}
+	e.store.setFailFor(nil, 0)
+	e.dial(instA, ssh.Password("wrong-guess-xyz"))
+	waitFor(t, "fail counted", func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") >= 1 })
+	if logs := e.logs.String(); strings.Contains(logs, "pw-correct-16chr") || strings.Contains(logs, "wrong-guess-xyz") {
+		t.Fatalf("password in logs:\n%s", logs)
+	}
+}
+
+// 停机 / 暂停 / 开通中的实例在此状态下猜什么都不可能成功：IDE 反复重连不能把用户的 IP 封掉。
+func TestRefusalsForNonLoginableInstancesNotCounted(t *testing.T) {
+	e := newEnv(t)
+	userKey := newSigner(t)
+	e.keys.add(7, userKey.PublicKey())
+	retain := time.Date(2026, 3, 4, 5, 6, 0, 0, time.UTC)
+	stopped := runningInfo(e, instA, 7, "pw-correct-16chr")
+	stopped.Instance.State = rental.StateStopped
+	stopped.RetainUntil = &retain
+	e.store.set(instA, stopped)
+	for i := 0; i < 15; i++ {
+		if _, banner, err := e.dial(instA, ssh.PublicKeys(userKey)); err == nil || !strings.HasPrefix(banner, "实例已到期停机") {
+			t.Fatalf("dial %d to stopped: banner=%q err=%v", i, banner, err)
+		}
+	}
+	suspended := runningInfo(e, instA, 7, "pw-correct-16chr")
+	now := e.clk.Now()
+	suspended.Instance.SuspendedAt = &now
+	e.store.set(instA, suspended)
+	for i := 0; i < 5; i++ {
+		e.dial(instA, ssh.Password("pw-correct-16chr"))
+		e.dial(instA, ssh.PublicKeys(userKey))
+	}
+	creating := runningInfo(e, instA, 7, "pw-correct-16chr")
+	creating.Instance.State = rental.StateCreating
+	e.store.set(instA, creating)
+	for i := 0; i < 5; i++ {
+		e.dial(instA, ssh.Password("wrong"))
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 0 || sshgw.BlockedForTest(e.srv, "127.0.0.1") {
+		t.Fatalf("refusals for non-loginable instance counted: fails=%d blocked=%v", n, sshgw.BlockedForTest(e.srv, "127.0.0.1"))
+	}
+	if _, instF, _ := sshgw.LimiterSizesForTest(e.srv); instF != 0 {
+		t.Fatalf("instance failure table grew: %d", instF)
+	}
+	// 实例恢复 running：照常登录
+	e.store.set(instA, runningInfo(e, instA, 7, "pw-correct-16chr"))
+	e.mustDial(instA, ssh.PublicKeys(userKey))
+}
+
+// 对 running 实例的错误密码、以及形如实例 ID 却不存在的用户名，仍按默认阈值（10 次）封 IP。
+func TestWrongPasswordsAndUnknownInstancesStillBlock(t *testing.T) {
+	e := newEnv(t)
+	for i := 0; i < 9; i++ {
+		e.dial(instA, ssh.Password("wrong"))
+	}
+	waitFor(t, "9 failures", func() bool { return sshgw.FailCountForTest(e.srv, "127.0.0.1") == 9 })
+	if sshgw.BlockedForTest(e.srv, "127.0.0.1") {
+		t.Fatal("blocked before 10")
+	}
+	e.dial(instA, ssh.Password("wrong"))
+	waitFor(t, "ip blocked at 10", func() bool { return sshgw.BlockedForTest(e.srv, "127.0.0.1") })
+
+	u := newEnv(t)
+	for i := 0; i < 10; i++ {
+		u.dial(fmt.Sprintf("ins-zzzzzz%02d", i), ssh.Password("wrong"))
+	}
+	waitFor(t, "unknown ids block ip", func() bool { return sshgw.BlockedForTest(u.srv, "127.0.0.1") })
+}
+
+// 关闭了密码登录：密码尝试不可能成功，不计失败；日志记一行原因与实例，不含密码。
+func TestPasswordAuthDisabledRefusalsNotCounted(t *testing.T) {
+	e := newEnv(t)
+	info := runningInfo(e, instA, 7, "pw-correct-16chr")
+	info.Instance.PasswordAuth = false
+	e.store.set(instA, info)
+	for i := 0; i < 12; i++ {
+		if _, _, err := e.dial(instA, ssh.Password(fmt.Sprintf("guess-%02d-xyz", i))); err == nil {
+			t.Fatal("password accepted while disabled")
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := sshgw.FailCountForTest(e.srv, "127.0.0.1"); n != 0 || sshgw.BlockedForTest(e.srv, "127.0.0.1") {
+		t.Fatalf("disabled-password refusals counted: fails=%d", n)
+	}
+	logs := e.logs.String()
+	if !strings.Contains(logs, "password_auth disabled") || !strings.Contains(logs, "instance="+instA) {
+		t.Fatalf("missing refusal log:\n%s", logs)
+	}
+	if strings.Contains(logs, "guess-") || strings.Contains(logs, "pw-correct-16chr") {
+		t.Fatalf("password in logs:\n%s", logs)
+	}
+}
+
+// M-2：同一连接的多次认证尝试共用一次实例查询（含密码解密）；认证通过后 serve 再复核一次。
+func TestAuthLookupCachedPerConnection(t *testing.T) {
+	e := newEnv(t)
+	var signers []ssh.Signer
+	for i := 0; i < 4; i++ {
+		signers = append(signers, newSigner(t)) // 未登记的钥匙：逐把被拒
+	}
+	good := newSigner(t)
+	e.keys.add(7, good.PublicKey())
+	signers = append(signers, good)
+	e.store.mu.Lock()
+	before := e.store.accessed
+	e.store.mu.Unlock()
+	c := e.mustDial(instA, ssh.PublicKeys(signers...))
+	if out, _, err := run(t, c, "echo hi"); err != nil || !strings.Contains(out, "hi") {
+		t.Fatalf("run: %q %v", out, err)
+	}
+	e.store.mu.Lock()
+	n := e.store.accessed - before
+	e.store.mu.Unlock()
+	if n > 2 {
+		t.Fatalf("Access called %d times for 5 pubkey attempts on one connection, want ≤ 2", n)
+	}
+	// 全部失败的连接：只查一次
+	e.store.mu.Lock()
+	before = e.store.accessed
+	e.store.mu.Unlock()
+	if _, _, err := e.dial(instA, ssh.PublicKeys(signers[:4]...)); err == nil {
+		t.Fatal("unregistered keys authenticated")
+	}
+	e.store.mu.Lock()
+	n = e.store.accessed - before
+	e.store.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("Access called %d times for a failed connection, want 1", n)
+	}
+}
+
+// M-3：全进程握手中连接上限；超出的连接立即关闭，不计暴力破解失败；名额释放后恢复。
+func TestUnauthConnCap(t *testing.T) {
+	e := newEnvWith(t, func(c *sshgw.Config) { c.MaxUnauthConns = 2 })
+	var held []net.Conn
+	for i := 0; i < 2; i++ {
+		nc, err := net.Dial("tcp", e.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, nc)
+	}
+	waitFor(t, "2 in handshake", func() bool { return sshgw.UnauthForTest(e.srv) == 2 })
+	over, err := net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer over.Close()
+	over.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := over.Read(make([]byte, 64)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("over-cap connection not closed: n=%d err=%v", n, err)
+	}
+	if got := sshgw.FailCountForTest(e.srv, "127.0.0.1"); got != 0 {
+		t.Fatalf("over-cap close counted as auth failure: %d", got)
+	}
+	for _, nc := range held {
+		nc.Close()
+	}
+	waitFor(t, "handshake slots released", func() bool { return sshgw.UnauthForTest(e.srv) == 0 })
+	c := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	// 已认证会话不占握手名额
+	if got := sshgw.UnauthForTest(e.srv); got != 0 {
+		t.Fatalf("authenticated session still counted: %d", got)
+	}
+	if out, _, err := run(t, c, "echo ok"); err != nil || out != "ok\n" {
+		t.Fatalf("run after cap: %q %v", out, err)
+	}
+	if !strings.Contains(e.logs.String(), "ssh unauthenticated connection limit reached") {
+		t.Fatal("no warning logged when cap reached")
+	}
+}
+
+// fakeIPListener 把接受的连接的远端 IP 换成 ip（端口保留，pending 键仍唯一）。
+type fakeIPListener struct {
+	net.Listener
+	mu sync.Mutex
+	ip string
+}
+
+func (l *fakeIPListener) set(ip string) { l.mu.Lock(); l.ip = ip; l.mu.Unlock() }
+
+func (l *fakeIPListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	port := c.RemoteAddr().(*net.TCPAddr).Port
+	return &fakeIPConn{Conn: c, addr: &net.TCPAddr{IP: net.ParseIP(l.ip), Port: port}}, nil
+}
+
+type fakeIPConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c *fakeIPConn) RemoteAddr() net.Addr { return c.addr }
+
+// N-1：每个来源 IP（IPv6 按 /64）握手中连接上限；超出立即关闭、不计失败，其它 IP 不受影响。
+func TestUnauthConnCapPerIP(t *testing.T) {
+	fl := &fakeIPListener{}
+	e := newEnvLis(t, nil, func(l net.Listener) net.Listener { fl.Listener = l; return fl })
+	dialFrom := func(ip string, want int64) net.Conn {
+		t.Helper()
+		fl.set(ip)
+		nc, err := net.Dial("tcp", e.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { nc.Close() })
+		if want > 0 {
+			waitFor(t, "connection in handshake", func() bool { return sshgw.UnauthForTest(e.srv) == want })
+		}
+		return nc
+	}
+	// 同一 /64 内不同地址共用名额（默认 8）
+	for i := 1; i <= 8; i++ {
+		dialFrom(fmt.Sprintf("2001:db8::%d", i), int64(i))
+	}
+	over := dialFrom("2001:db8::9", 0)
+	over.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := over.Read(make([]byte, 64)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("9th in-handshake connection from the same /64 not closed: n=%d err=%v", n, err)
+	}
+	if got := sshgw.FailCountForTest(e.srv, "2001:db8::9"); got != 0 {
+		t.Fatalf("per-IP cap counted as auth failure: %d", got)
+	}
+	// 其它 /64：照常握手（收到服务端版本串）
+	other := dialFrom("2001:db8:0:1::1", 9)
+	other.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len("SSH-2.0-"))
+	if _, err := io.ReadFull(other, buf); err != nil || string(buf) != "SSH-2.0-" {
+		t.Fatalf("other IP affected: %q %v", buf, err)
+	}
+}

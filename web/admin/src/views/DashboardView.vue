@@ -63,6 +63,7 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
       <el-card header="实例">
         <ul class="kv">
           <li v-for="s in instanceStates" :key="s"><span>{{ instanceStateLabel[s] }}</span><b :data-testid="`dash-instance-${s}`">{{ data.instances[s] ?? 0 }}</b></li>
+          <li><span>在线 SSH 会话</span><b data-testid="dash-ssh-sessions">{{ data.ssh_sessions_open }}</b></li>
         </ul>
       </el-card>
       <el-card header="充值金额">

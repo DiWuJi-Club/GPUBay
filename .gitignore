@@ -8,3 +8,5 @@ coverage.out
 /web/test-results/
 /web/playwright-report/
 /web/*/dist/
+/deploy/compose/.env
+/deploy/compose/acme.env

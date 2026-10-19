@@ -35,17 +35,21 @@ func Record(ctx context.Context, q db.Querier, at time.Time, e Entry) error {
 	return err
 }
 
-// Actor 标识发起后台操作的管理员与来源 IP；AdminID 为 0 表示命令行等系统操作。
+// Actor 标识操作主体：后台管理员（AdminID）、控制台用户（UserID）或系统（都为 0）。
 type Actor struct {
 	AdminID int64
+	UserID  int64
 	IP      string
 }
 
 // Entry 生成一条以该操作人为主体的审计记录。
 func (a Actor) Entry(action, targetType, targetID string, diff any) Entry {
-	actorType := "admin"
-	if a.AdminID == 0 {
-		actorType = "system"
+	actorType, actorID := "system", int64(0)
+	switch {
+	case a.AdminID != 0:
+		actorType, actorID = "admin", a.AdminID
+	case a.UserID != 0:
+		actorType, actorID = "user", a.UserID
 	}
-	return Entry{ActorType: actorType, ActorID: a.AdminID, Action: action, TargetType: targetType, TargetID: targetID, Diff: diff, IP: a.IP}
+	return Entry{ActorType: actorType, ActorID: actorID, Action: action, TargetType: targetType, TargetID: targetID, Diff: diff, IP: a.IP}
 }

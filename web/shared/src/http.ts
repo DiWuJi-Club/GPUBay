@@ -24,6 +24,8 @@ export interface Http {
   get<T>(path: string, query?: Record<string, unknown>, opt?: HttpOptions): Promise<T>
   post<T>(path: string, body?: unknown, opt?: HttpOptions): Promise<T>
   put<T>(path: string, body?: unknown, opt?: HttpOptions): Promise<T>
+  /** DELETE：同样带 JSON 体（缺省 {}），错误处理与 post 相同 */
+  del<T>(path: string, body?: unknown, opt?: HttpOptions): Promise<T>
   /** multipart，字段名 file；不手动设 Content-Type，由浏览器生成边界 */
   upload<T>(path: string, file: File): Promise<T>
   /** CSV 导出：JSON 响应按错误处理，否则从 Content-Disposition 取文件名 */
@@ -180,6 +182,7 @@ export function createHttp(cfg: HttpConfig): Http {
     get: (path, query, opt) => request(`GET`, path + buildQuery(query), undefined, opt),
     post: (path, body, opt) => request('POST', path, body ?? {}, opt),
     put: (path, body, opt) => request('PUT', path, body ?? {}, opt),
+    del: (path, body, opt) => request('DELETE', path, body ?? {}, opt),
     async upload<T>(path: string, file: File): Promise<T> {
       const fd = new FormData()
       fd.append('file', file, file.name)

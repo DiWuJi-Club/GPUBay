@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -22,6 +23,7 @@ import (
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/ingress"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/secretbox"
@@ -41,12 +43,15 @@ type rentalNoop struct{}
 func (rentalNoop) NotifyExpiry(context.Context, int64, string, time.Duration) error { return nil }
 
 type testEnv struct {
-	t      *testing.T
-	pool   *pgxpool.Pool
-	ts     *httptest.Server
-	wallet *wallet.Service
-	pay    *pay.Mock
-	clk    *clock.Fake
+	t       *testing.T
+	pool    *pgxpool.Pool
+	ts      *httptest.Server
+	wallet  *wallet.Service
+	pay     *pay.Mock
+	clk     *clock.Fake
+	rental  *rental.Service
+	fleet   *fleet.Service
+	ingress *ingress.Auth
 }
 
 func newTestEnv(t *testing.T) *testEnv { return newTestEnvWith(t, nil) }
@@ -61,7 +66,7 @@ func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 	w := wallet.NewService(pool, clk)
 	c := catalog.NewService(pool)
 	f := fleet.NewService(pool, clk)
-	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: w, Catalog: c, Fleet: f, Notifier: rentalNoop{}})
+	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: w, Catalog: c, Fleet: f, Notifier: rentalNoop{}, Keys: ids})
 	disk, err := storage.NewLocalDisk(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -73,15 +78,19 @@ func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 		Providers:     map[string]pay.Provider{pay.ChannelWechat: payMock, pay.ChannelAlipay: payMock},
 		NotifyBaseURL: "https://spark.test",
 	})
+	auth, err := ingress.NewAuth(dbtest.Key, "http://spark.test", "spark.test", false, clk)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test",
-		Billing: bill, DevPay: true}
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test", SSHHost: "ssh.spark.test", PublicBaseURL: "http://spark.test",
+		Billing: bill, DevPay: true, Ingress: auth}
 	if tweak != nil {
 		tweak(srv)
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
-	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk}
+	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, fleet: f, ingress: auth}
 }
 
 type client struct {
@@ -402,4 +411,85 @@ func TestRouterServesConsoleAndJSON404(t *testing.T) {
 	if resp := get("/api/v1/wallet"); resp.StatusCode != 401 || resp.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("anonymous wallet = %d cache=%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
 	}
+}
+
+func TestSessionCookieNameAndSameSiteGuard(t *testing.T) {
+	e := newTestEnvWith(t, func(s *api.Server) { s.SecureCookie = true })
+	raw := &http.Client{}
+	post := func(path, body string, headers map[string]string) *http.Response {
+		req, _ := http.NewRequest("POST", e.ts.URL+"/api/v1"+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := raw.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+	post("/auth/sms-code", `{"phone":"13800009999"}`, nil)
+	resp := post("/auth/login", `{"phone":"13800009999","code":"000000"}`, nil)
+	var cookie *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "__Host-sc_session" {
+			cookie = c
+		}
+	}
+	if cookie == nil || !cookie.Secure || cookie.Path != "/" || cookie.Domain != "" || !cookie.HttpOnly {
+		t.Fatalf("cookie = %+v", resp.Cookies())
+	}
+	me := func() int {
+		req, _ := http.NewRequest("GET", e.ts.URL+"/api/v1/me", nil)
+		req.AddCookie(&http.Cookie{Name: cookie.Name, Value: cookie.Value})
+		r, err := raw.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+	if code := me(); code != 200 {
+		t.Fatalf("me with __Host- cookie = %d", code)
+	}
+	// 同站（兄弟子域）写请求被拒且会话仍有效；same-origin 放行且会话真正注销
+	sessionHeader := cookie.Name + "=" + cookie.Value
+	if r := post("/auth/logout", `{}`, map[string]string{"Sec-Fetch-Site": "same-site", "Cookie": sessionHeader}); r.StatusCode != 403 {
+		t.Fatalf("same-site logout = %d", r.StatusCode)
+	}
+	if code := me(); code != 200 {
+		t.Fatalf("me after rejected logout = %d, want 200", code)
+	}
+	if r := post("/auth/logout", `{}`, map[string]string{"Sec-Fetch-Site": "same-origin", "Cookie": sessionHeader}); r.StatusCode != 200 {
+		t.Fatalf("same-origin logout = %d", r.StatusCode)
+	}
+	if code := me(); code != 401 {
+		t.Fatalf("me after logout = %d, want 401", code)
+	}
+	// 支付回调不受同站限制（这里渠道会因验签失败返回非 403）
+	if r := post("/pay/notify/wechat", `{}`, map[string]string{"Sec-Fetch-Site": "cross-site"}); r.StatusCode == 403 {
+		t.Fatal("payment notify blocked by same-site guard")
+	}
+	if r := post("/pay/notify/alipay", `{}`, map[string]string{"Origin": "https://openapi.alipay.com"}); r.StatusCode == 403 {
+		t.Fatal("payment notify with foreign Origin blocked by same-site guard")
+	}
+	// dev（SecureCookie=false）仍叫 sc_session
+	dev := newTestEnv(t)
+	c := dev.client()
+	c.login("13800009998")
+	for _, ck := range c.http.Jar.Cookies(mustURL(dev.ts.URL)) {
+		if ck.Name == "sc_session" {
+			return
+		}
+	}
+	t.Fatal("dev cookie not named sc_session")
+}
+
+func mustURL(s string) *url.URL {
+	u, err := url.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
 }

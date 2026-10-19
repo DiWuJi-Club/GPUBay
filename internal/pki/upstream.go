@@ -67,3 +67,26 @@ func LoadUpstreamPublicKey(path string) (string, error) {
 	}
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub))), nil
 }
+
+// LoadUpstreamSigner 读取上游私钥供网关 / 入口登录容器 sshd（权限检查同 LoadUpstreamPublicKey）。
+func LoadUpstreamSigner(path string) (ssh.Signer, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if st.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("上游 SSH 私钥 %s 权限过宽（%o），请 chmod 600", path, st.Mode().Perm())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	s, err := ssh.ParsePrivateKey(raw)
+	if err != nil {
+		return nil, fmt.Errorf("解析上游 SSH 私钥: %w", err)
+	}
+	if s.PublicKey().Type() != ssh.KeyAlgoED25519 {
+		return nil, errors.New("上游 SSH 私钥必须是 ed25519")
+	}
+	return s, nil
+}
