@@ -69,6 +69,13 @@ func (s *Service) WipeStale(ctx context.Context) (int, error) {
 // 加锁时用 SKIP LOCKED 并重新校验 pred，已被其他清扫处理或状态已变的行直接跳过；
 // 单行失败只回滚该行，错误汇总返回，其余行继续处理。返回成功处理的行数。
 func (s *Service) sweepEach(ctx context.Context, pred string, arg any, orderBy string, fn func(pgx.Tx, Instance) error) (int, error) {
+	return s.sweepEachAfter(ctx, pred, arg, orderBy, func(tx pgx.Tx, inst Instance) (func(), error) { return nil, fn(tx, inst) }, nil)
+}
+
+// sweepEachAfter 同 sweepEach，但回调可返回一个在该行事务提交后执行的动作（发短信等外部调用不进事务），
+// 单行失败时先回调 onErr（用于在独立事务里告警）。单行事务遇 40P01 / 40001 重试一次（改派路径要求，规格 §14）。
+func (s *Service) sweepEachAfter(ctx context.Context, pred string, arg any, orderBy string,
+	fn func(pgx.Tx, Instance) (func(), error), onErr func(id string, err error)) (int, error) {
 	rows, err := s.d.Pool.Query(ctx, `SELECT id FROM instances WHERE `+pred+` ORDER BY `+orderBy+` LIMIT $2`, arg, sweepBatch)
 	if err != nil {
 		return 0, err
@@ -84,25 +91,36 @@ func (s *Service) sweepEach(ctx context.Context, pred string, arg any, orderBy s
 			errs = append(errs, ctx.Err())
 			break
 		}
-		done := false
-		err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-			inst, err := scanInstance(tx.QueryRow(ctx, `SELECT `+instanceCols+` FROM instances
-				WHERE id = $2 AND `+pred+` FOR UPDATE SKIP LOCKED`, arg, id))
-			if errors.Is(err, apperr.ErrNotFound) {
+		var done bool
+		var after func()
+		err := withRetry(func() error {
+			done, after = false, nil
+			return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+				inst, err := scanInstance(tx.QueryRow(ctx, `SELECT `+instanceCols+` FROM instances
+					WHERE id = $2 AND `+pred+` FOR UPDATE SKIP LOCKED`, arg, id))
+				if errors.Is(err, apperr.ErrNotFound) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				after, err = fn(tx, inst)
+				if err != nil {
+					return err
+				}
+				done = true
 				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if err := fn(tx, inst); err != nil {
-				return err
-			}
-			done = true
-			return nil
+			})
 		})
 		if err != nil {
+			if onErr != nil {
+				onErr(id, err)
+			}
 			errs = append(errs, fmt.Errorf("instance %s: %w", id, err))
 			continue
+		}
+		if after != nil {
+			after()
 		}
 		if done {
 			n++
@@ -130,11 +148,19 @@ func (s *Service) beginWipe(ctx context.Context, tx pgx.Tx, inst Instance, reaso
 	return err
 }
 
-// FailStuckCreating 把开通超时的实例判为失败并全额退款。
+// FailStuckCreating 把开通超时的实例判为失败并全额退款；预订实例改为改派（规格 §5.4）。
+// 超时从预订的开通时刻（provisioned_at）起算，即时订单仍从 created_at 起算。
 func (s *Service) FailStuckCreating(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
-	return s.sweepEach(ctx, `state = 'creating' AND created_at <= $1`, now.Add(-CreateTimeout), "created_at",
-		func(tx pgx.Tx, inst Instance) error { return s.failCreating(ctx, tx, inst, "开通超时", now) })
+	return s.sweepEachAfter(ctx, `state = 'creating' AND COALESCE(provisioned_at, created_at) <= $1`, now.Add(-CreateTimeout), "created_at",
+		func(tx pgx.Tx, inst Instance) (func(), error) {
+			if inst.Booked() {
+				var after func()
+				err := s.reassignAfterCreateFailure(ctx, tx, inst, "开通超时", now, &after)
+				return after, err
+			}
+			return nil, s.failCreating(ctx, tx, inst, "开通超时", now)
+		}, s.alertCancelFailed)
 }
 
 // SuspendMachines 冻结失联机器上运行中实例的剩余时长，暂停期间不计时、不会被判到期。

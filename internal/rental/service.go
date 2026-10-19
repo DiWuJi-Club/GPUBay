@@ -6,7 +6,7 @@
 //   机器行锁一律 FOR NO KEY UPDATE：插入引用 machines(id) 的行会取 FOR KEY SHARE，与 FOR UPDATE 互斥、与 NO KEY UPDATE 不互斥。
 //   后台改派：instance → lease → machines(SKIP LOCKED)
 //   Renew / AdminExtend / 自动续费：[idem] → instance → 自己的 lease(读 cap) → orders → wallet → 更新 lease（不锁机器）
-//   取消：instance → lease → orders → wallet
+//   取消：instance → lease → agent_commands（CancelCommands）→ orders → wallet
 //   HandleCommandResult：instance → agent_commands → lease(refreshLease) → machine(Release)
 //   ExpireDue / WipeStale / Suspend / Resume / RefreshCapped / beginWipe：instance → lease → agent_commands
 //   AdminDeleteGroup：machine_groups(FOR UPDATE) → instances(清 group_id) → machines(只读计数) → 删机组
@@ -136,7 +136,7 @@ func (i Instance) Booked() bool { return i.ScheduledStartAt != nil }
 
 func (i Instance) Suspended() bool { return i.SuspendedAt != nil }
 
-// Remaining 返回剩余可用时长；暂停中返回冻结的剩余时长；非运行状态返回 0。
+// Remaining 返回剩余可用时长；暂停中返回冻结的剩余时长；预订实例在开始时刻之前返回整段预订时长（早开通不计费）；非运行状态返回 0。
 func (i Instance) Remaining(now time.Time) time.Duration {
 	if i.State != StateRunning {
 		return 0
@@ -146,6 +146,9 @@ func (i Instance) Remaining(now time.Time) time.Duration {
 	}
 	if i.ExpiresAt == nil {
 		return 0
+	}
+	if i.ScheduledStartAt != nil && now.Before(*i.ScheduledStartAt) {
+		return i.ExpiresAt.Sub(*i.ScheduledStartAt)
 	}
 	if r := i.ExpiresAt.Sub(now); r > 0 {
 		return r
