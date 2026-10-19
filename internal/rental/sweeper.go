@@ -349,7 +349,9 @@ func (s *Service) SendReminders(ctx context.Context) (int, error) {
 	return len(due), nil
 }
 
-// Sweep 执行一轮完整清扫：离线检测与暂停、到期停机、保留期洗机、开通超时、到期提醒。
+// Sweep 执行一轮完整清扫，按顺序（规格 §9）：离线检测与暂停 → 恢复计时 → 推进停机 / 洗机 / 暂停实例的占用上界（RefreshCappedLeases）→
+// 到点预订开通（ProvisionDue）→ 自动续费（AutoRenewDue，须在到期停机之前）→ 到期停机 → 保留期洗机 → 开通超时 →
+// 指令超时 → 回收 SSH 会话 → 到期提醒。各步互不阻断，错误合并返回。
 func (s *Service) Sweep(ctx context.Context) error {
 	var errs []error
 	offline, err := s.d.Fleet.MarkOfflineStale(ctx, OfflineTimeout)
