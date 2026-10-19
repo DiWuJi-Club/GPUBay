@@ -632,7 +632,7 @@ func TestSweepOrderProvisionsAndAutoRenewsBeforeExpiry(t *testing.T) {
 	e.ack(true)
 	e.autoRenewOn(running.ID, catalog.D1d)
 	booked := e.book(dbtest.T0.Add(25 * time.Hour)) // 开通时刻 T0 + 24h
-	e.clock.Advance(24 * time.Hour)                   // running 恰好到期；自动续费本该在 1 小时前触发，这里让两者同一轮
+	e.clock.Advance(24 * time.Hour)                 // running 恰好到期；自动续费本该在 1 小时前触发，这里让两者同一轮
 	e.heartbeatAll()
 	if err := e.svc.Sweep(e.ctx); err != nil {
 		t.Fatal(err)

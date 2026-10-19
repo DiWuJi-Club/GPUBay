@@ -59,9 +59,26 @@ export async function bookViaApi(
 /** 控制台匿名接口：机组内机器 ID（用于指定机器）。 */
 export async function groupMachineIds(groupId: number): Promise<number[]> {
   const ctx = await request.newContext({ baseURL: CONSOLE_URL })
-  const r = await ctx.get(`/api/v1/groups/${groupId}/machines`)
-  if (!r.ok()) throw new Error(`group machines ${r.status()} ${await r.text()}`)
-  return ((await r.json()).items as { id: number }[]).map((m) => m.id)
+  try {
+    const r = await ctx.get(`/api/v1/groups/${groupId}/machines`)
+    if (!r.ok()) throw new Error(`group machines ${r.status()} ${await r.text()}`)
+    return ((await r.json()).items as { id: number }[]).map((m) => m.id)
+  } finally {
+    await ctx.dispose()
+  }
+}
+
+/**
+ * 用例结束时取消自己留下的未开通预订并释放请求上下文。整轮共享一个假时钟，后面的用例会把时间推过这些预订的开始时刻，
+ * 不取消的话它们会在之后的清扫里开通，留下与本用例无关的运行中实例和清扫噪声。
+ */
+export async function cancelBookingsAndDispose(api: APIRequestContext, ids: string[]) {
+  for (const id of ids) {
+    const r = await api.post(`/api/v1/instances/${id}/cancel`, { data: {} })
+    if (!r.ok()) throw new Error(`cancel ${id} ${r.status()} ${await r.text()}`)
+    expect(((await r.json()) as { state: string }).state).toBe('cancelled')
+  }
+  await api.dispose()
 }
 
 /** 整串精确匹配的正则（机组名都以 G<stamp>- 开头，子串 / 前缀匹配会命中多个选项或行）。 */

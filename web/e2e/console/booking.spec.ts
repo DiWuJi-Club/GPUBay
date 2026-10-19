@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { adminApi, clickTwiceSync, createAdmin, drainIdleMachines } from '../helpers/admin'
-import { bookViaApi, exact, groupMachineIds, pickOption, privateGroup, startAfter } from '../helpers/booking'
+import { bookViaApi, cancelBookingsAndDispose, exact, groupMachineIds, pickOption, privateGroup, startAfter } from '../helpers/booking'
 import { pauseClock } from '../helpers/clock'
 import { dialog, loginConsole, nav, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
@@ -82,7 +82,7 @@ test('C-BKG-03 指定机器与占用条带', async ({ page }, info) => {
   const u = await seedUser({ balance: 1_000_000 })
   const api = await userApi(u.phone)
   const s = await startAfter(30)
-  await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: mid })
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: mid })
   const lower = cstTime(new Date(s.date.getTime() - HOUR).toISOString()) // 开始前 1 小时开通
   const upper = cstTime(new Date(s.date.getTime() + 24 * HOUR + TAIL).toISOString())
   await loginConsole(page, u.phone)
@@ -94,6 +94,7 @@ test('C-BKG-03 指定机器与占用条带', async ({ page }, info) => {
   await expect(page.getByTestId('rent-machine-periods').locator('li')).toHaveText([`${lower} ～ ${upper}（我的）`])
   await setNumber(page, 'rent-count', '2') // 多台不能指定机器
   await expect(page.getByTestId('rent-machine')).toHaveCount(0)
+  await cancelBookingsAndDispose(api, ids)
 })
 
 test('C-BKG-04 预订成功跳转详情并显示已预订', async ({ page }, info) => {
@@ -120,6 +121,7 @@ test('C-BKG-04 预订成功跳转详情并显示已预订', async ({ page }, inf
   await expect(page.getByTestId('detail-start')).toHaveText(cstTime(s.iso))
   await expect(page.getByTestId('detail-cancel-btn')).toBeVisible()
   await expect(page.getByTestId('detail-ssh-hint')).toHaveText('开通后可连接')
+  await cancelBookingsAndDispose(await userApi(u.phone), [new URL(page.url()).pathname.split('/').pop()!])
 })
 
 test('C-BKG-05 一次 3 台即时下单，按批次筛选显示', async ({ page }, info) => {
@@ -150,7 +152,7 @@ test('C-BKG-06 台数不足：按钮禁用并提示', async ({ page }, info) => 
   const u = await seedUser({ balance: 1_000_000 })
   const api = await userApi(u.phone)
   const s = await startAfter(26)
-  await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: g.machineIds[0] }) // 订满该组唯一的机器
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: g.machineIds[0] }) // 订满该组唯一的机器
   await loginConsole(page, u.phone)
   await nav(page, info, 'market')
   await openBooking(page)
@@ -158,6 +160,7 @@ test('C-BKG-06 台数不足：按钮禁用并提示', async ({ page }, info) => 
   await fillStart(page, s.day, s.hour)
   await expect(page.getByTestId('rent-availability')).toHaveText('该时段可预订 0 台，不足 1 台，请减少数量或更换时段')
   await expect(page.getByTestId('rent-next')).toBeDisabled()
+  await cancelBookingsAndDispose(api, ids)
 })
 
 test('C-BKG-07 余额不足改为去充值', async ({ page }, info) => {

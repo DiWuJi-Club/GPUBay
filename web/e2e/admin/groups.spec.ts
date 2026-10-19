@@ -9,9 +9,13 @@ const groupRow = (page: Page, name: string) => page.getByRole('row').filter({ ha
 /** 控制台匿名接口里可见的机组名。 */
 async function consoleGroupNames(): Promise<string[]> {
   const ctx = await request.newContext({ baseURL: CONSOLE_URL })
-  const r = await ctx.get('/api/v1/groups')
-  if (!r.ok()) throw new Error(`GET /api/v1/groups ${r.status()} ${await r.text()}`)
-  return ((await r.json()).items as { name: string }[]).map((g) => g.name)
+  try {
+    const r = await ctx.get('/api/v1/groups')
+    if (!r.ok()) throw new Error(`GET /api/v1/groups ${r.status()} ${await r.text()}`)
+    return ((await r.json()).items as { name: string }[]).map((g) => g.name)
+  } finally {
+    await ctx.dispose()
+  }
 }
 
 type MachineJSON = { machine: { group_id: number | null; display_name: string } }

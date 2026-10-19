@@ -3,7 +3,7 @@ import { drainTasks, fail500, trackToasts } from '../helpers/admin'
 import { pauseClock } from '../helpers/clock'
 import { dialog, loginConsole, placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
-import { advanceToProvision, bookViaApi, privateGroup, startAfter } from '../helpers/booking'
+import { advanceToProvision, bookViaApi, cancelBookingsAndDispose, privateGroup, startAfter } from '../helpers/booking'
 import { instanceOf, runningInstance } from '../helpers/instances'
 import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
 import { cstTime } from '../helpers/time'
@@ -578,7 +578,7 @@ test('C-DET-21 续费表单显示可续至并禁用超限档位；接口提交�
   const u = await seedUser({ balance: 1_000_000 })
   const { api, id, g } = await runningInGroup(u.phone)
   const s = await startAfter(72)
-  await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: g.machineIds[0] })
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: g.machineIds[0] })
   const until = at(s.date, -8 * HOUR) // 下一预订开通前 1 小时、再留 7 小时保留 + 洗机
   await loginConsole(page, u.phone)
   await page.goto(`/instances/${id}`)
@@ -596,6 +596,7 @@ test('C-DET-21 续费表单显示可续至并禁用超限档位；接口提交�
     code: 'renew_blocked',
     message: `该机器自 ${cstTime(s.iso)} 起已有预订，本次最多可续至 ${until}`,
   })
+  await cancelBookingsAndDispose(api, ids)
 })
 
 test('C-DET-22 自动续费开关；余额不足时失败提示', async ({ page }) => {
@@ -605,7 +606,7 @@ test('C-DET-22 自动续费开关；余额不足时失败提示', async ({ page 
   await page.goto(`/instances/${id}`)
   await page.getByTestId('detail-auto-renew').click()
   await toast(page, '已开启自动续费')
-  expect(((await instanceOf(api, id)) as unknown as { auto_renew: boolean }).auto_renew).toBe(true)
+  expect((await instanceOf(api, id)).auto_renew).toBe(true)
   await hooks.advance(23 * 3600)
   await hooks.sweep()
   await page.reload()
@@ -622,7 +623,7 @@ test('C-DET-23 自动续费被预订挡住时降档，动态显示实际档位',
   expect(put.status()).toBe(200)
   // 下一预订开始 = now + 1d + 8d + 8h（整点）→ 可续至 ≈ now + 1d + 8d：1 月放不下、1 周放得下
   const s = await startAfter(24 + 8 * 24 + 8)
-  await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: g.machineIds[0] })
+  const { ids } = await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: g.machineIds[0] })
   const before = (await (await api.get('/api/v1/wallet')).json()).balance as number
   await hooks.advance(23 * 3600)
   await hooks.sweep()
@@ -630,6 +631,7 @@ test('C-DET-23 自动续费被预订挡住时降档，动态显示实际档位',
   await page.goto(`/instances/${id}`)
   await expect(page.getByTestId('detail-event').filter({ hasText: '自动续费成功（1 周）' })).toHaveAttribute('data-kind', 'auto_renew')
   expect(before - ((await (await api.get('/api/v1/wallet')).json()).balance as number)).toBe(41400) // 按 1 周扣款
+  await cancelBookingsAndDispose(api, ids)
 })
 
 test('C-DET-24 时间线：预订下单、开始开通、开通成功（新到旧）', async ({ page }) => {

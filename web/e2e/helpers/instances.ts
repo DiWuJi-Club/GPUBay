@@ -26,6 +26,22 @@ export async function runningInstance(phone: string, opts: { duration?: '1d' | '
   return { api, id }
 }
 
-export async function instanceOf(api: APIRequestContext, id: string) {
-  return (await (await api.get(`/api/v1/instances/${id}`)).json()) as { state: string; remaining_seconds: number; retain_until: string | null; pending_seconds: number; suspended: boolean; password_auth: boolean }
+/** 控制台实例视图里用例会读到的字段。 */
+export type InstanceJSON = {
+  state: string
+  remaining_seconds: number
+  retain_until: string | null
+  pending_seconds: number
+  suspended: boolean
+  password_auth: boolean
+  auto_renew: boolean
+  auto_renew_duration: '1d' | '1w' | '1m'
+  auto_renew_failed_reason: string
+  scheduled_start_at: string | null
+}
+
+export async function instanceOf(api: APIRequestContext, id: string): Promise<InstanceJSON> {
+  const r = await api.get(`/api/v1/instances/${id}`)
+  if (!r.ok()) throw new Error(`GET instance ${id} ${r.status()} ${await r.text()}`)
+  return (await r.json()) as InstanceJSON
 }

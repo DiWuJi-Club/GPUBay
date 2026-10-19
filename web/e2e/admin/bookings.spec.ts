@@ -6,6 +6,7 @@ import { hooks } from '../helpers/hooks'
 import { cstDate, cstTime } from '../helpers/time'
 
 const HOUR = 3600e3
+const DAY = 24 * HOUR
 
 /** 自己的机组（groupMachines 台机器）里，一个用户在 30 小时后预订 count 台（第 k 台钉在第 k 台机器上）。 */
 async function seedBooking(groupMachines = 2, count = 1) {
@@ -154,16 +155,18 @@ test('A-BKG-05 进入维护时提示未开通预订数量', async ({ page }) => 
 })
 
 test('A-BKG-06 仪表盘显示未来 7 天预订开始台数', async ({ page }) => {
+  // 统计窗口按北京时间自然日：离午夜不足 1 小时就先把假时钟推过午夜，整个用例（只推进几分钟）落在同一天，差值恰为本用例的 1 台
+  const toMidnight = DAY - ((await hooks.clock()).getTime() + 8 * HOUR) % DAY
+  if (toMidnight < HOUR) await hooks.advance(Math.ceil(toMidnight / 1000) + 60)
   const admin = await createAdmin('finance')
   const ctx = await adminApi(admin)
   const dayBefore = cstDate(await hooks.clock())
   const before = (await getJSON<{ bookings_upcoming_7d: number }>(ctx, '/admin/api/v1/dashboard')).bookings_upcoming_7d
-  await seedBooking(1)
+  const { api } = await seedBooking(1)
   await loginAdmin(page, admin)
-  const dash = page.getByTestId('dash-bookings-7d')
-  await expect(dash).toHaveText(/^\d+$/)
-  const shown = Number(await dash.textContent())
-  // 统计窗口按北京时间自然日：期间假时钟只推进了几分钟，没跨过午夜时恰好多出本用例的 1 台
-  if (cstDate(await hooks.clock()) === dayBefore) expect(shown).toBe(before + 1)
-  expect((await getJSON<{ bookings_upcoming_7d: number }>(ctx, '/admin/api/v1/dashboard')).bookings_upcoming_7d).toBe(shown)
+  await expect(page.getByTestId('dash-bookings-7d')).toHaveText(String(before + 1))
+  expect(cstDate(await hooks.clock())).toBe(dayBefore)
+  expect((await getJSON<{ bookings_upcoming_7d: number }>(ctx, '/admin/api/v1/dashboard')).bookings_upcoming_7d).toBe(before + 1)
+  await api.dispose()
+  await ctx.dispose()
 })
