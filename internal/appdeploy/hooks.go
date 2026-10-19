@@ -69,15 +69,26 @@ func (s *Service) OnInstanceGone(ctx context.Context, tx pgx.Tx, instanceID, rea
 	return err
 }
 
-// OnInstanceMigrated：旧实例非终态部署 → lost（事件「实例已更换机器」），旧端口行不再指向它们（deployment_id 置 NULL，裁定 P7）；
-// state ≠ failed 且 desired ≠ removed 的复制为新实例的 queued（attempt 0，同版本 / 变量 / 密文 / 端口 / spec_hash）。
-// 新实例的端口行已由 AdminMigrate 复制（deployment_id NULL），新部署 running 时由 Runner 认领。
+// OnInstanceMigrated（规格 §6.4）：旧实例非终态部署 → lost（事件「实例已更换机器」），旧端口行不再指向它们（deployment_id 置 NULL，裁定 P7）。
+// state ≠ failed 且 desired ≠ removed 的复制到新实例（attempt 0，同版本 / 变量 / 密文 / 端口 / spec_hash）：
+//   - desired = running → queued，新实例 running 后部署；
+//   - desired = stopped → stopped / stopped（用户停的不自动启动；「启动」走 Start → queued 的完整部署）。
+//
+// 新实例的端口行已由 AdminMigrate 复制（deployment_id NULL），复制过去的部署 running 时由 Runner 认领；
+// 不复制的部署（failed / 正在卸载）在旧实例上占的端口，在新实例上对应的复制行删除（否则成了无主的孤儿端口，
+// 之后在新实例上重新部署该应用会撞 port_conflict）。
 func (s *Service) OnInstanceMigrated(ctx context.Context, tx pgx.Tx, oldID, newID string, now time.Time) error {
 	deps, err := lockLive(ctx, tx, oldID)
 	if err != nil {
 		return err
 	}
 	for _, d := range deps {
+		copied := d.State != StateFailed && d.Desired != DesiredRemoved
+		if !copied {
+			if err := s.dropCopiedPorts(ctx, tx, d, newID, now); err != nil {
+				return err
+			}
+		}
 		if _, err := tx.Exec(ctx, `UPDATE app_deployments SET state = 'lost', health = 'unknown', finished_at = $2, updated_at = $2, row_version = row_version + 1
 			WHERE id = $1`, d.ID, now); err != nil {
 			return err
@@ -88,19 +99,50 @@ func (s *Service) OnInstanceMigrated(ctx context.Context, tx pgx.Tx, oldID, newI
 		if err := addEvent(ctx, tx, d.ID, d.State, StateLost, "实例已更换机器", now); err != nil {
 			return err
 		}
-		if d.State == StateFailed || d.Desired == DesiredRemoved {
+		if !copied {
 			continue
 		}
 		if err := cancelStaleCleanup(ctx, tx, newID, d.AppID, now); err != nil {
 			return err
 		}
+		state, desired, detail := StateQueued, DesiredRunning, "从 "+oldID+" 迁移，模型需重新下载"
+		if d.Desired == DesiredStopped {
+			state, desired, detail = StateStopped, DesiredStopped, "从 "+oldID+" 迁移（已停止，启动时重新下载模型）"
+		}
 		nd, err := scanDeployment(tx.QueryRow(ctx, `INSERT INTO app_deployments (id, instance_id, user_id, app_id, app_version_id, state, desired, env, secret_env_enc, port, spec_hash, next_poll_at, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, 'queued', 'running', $6, $7, $8, $9, $10, $10, $10) RETURNING `+depCols,
-			randx.ID("dep-", 12), newID, d.UserID, d.AppID, d.AppVersionID, mustJSON(d.Env), d.SecretEnvEnc, d.Port, d.SpecHash, now))
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12) RETURNING `+depCols,
+			randx.ID("dep-", 12), newID, d.UserID, d.AppID, d.AppVersionID, state, desired, mustJSON(d.Env), d.SecretEnvEnc, d.Port, d.SpecHash, now))
 		if err != nil {
 			return err
 		}
-		if err := addEvent(ctx, tx, nd.ID, "", StateQueued, "从 "+oldID+" 迁移，模型需重新下载", now); err != nil {
+		if err := addEvent(ctx, tx, nd.ID, "", state, detail, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// dropCopiedPorts 删除新实例上「复制自旧部署 d 所占端口」的行（d 不迁移时用）；以部署主人审计 instance.port_delete。
+func (s *Service) dropCopiedPorts(ctx context.Context, tx pgx.Tx, d Deployment, newID string, now time.Time) error {
+	rows, err := tx.Query(ctx, `DELETE FROM instance_ports WHERE instance_id = $1 AND deployment_id IS NULL
+		AND port IN (SELECT port FROM instance_ports WHERE deployment_id = $2) RETURNING port`, newID, d.ID)
+	if err != nil {
+		return err
+	}
+	ports, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	if err != nil {
+		return err
+	}
+	if len(ports) == 0 {
+		return nil
+	}
+	name, err := appName(ctx, tx, d.AppID)
+	if err != nil {
+		return err
+	}
+	for _, p := range ports {
+		if err := audit.Record(ctx, tx, now, audit.Actor{UserID: d.UserID}.Entry("instance.port_delete", "instance", newID,
+			map[string]any{"port": p, "deployment": d.ID, "reason": "换机：应用 " + name + " 未迁移"})); err != nil {
 			return err
 		}
 	}

@@ -319,7 +319,7 @@ ALTER TABLE machines ADD COLUMN cached_images TEXT[] NOT NULL DEFAULT '{}', ADD 
 type AppHooks interface {
     OnInstanceRunning(ctx, tx, instanceID)                 // startLease：running 时（含首次开通、续费恢复、换机后新实例）
     OnInstanceGone(ctx, tx, instanceID, reason)            // beginWipe / failCreating / 取消 / AdminMigrate 的旧实例：running/stopped/failed/installing/queued → removed 或 lost
-    OnInstanceMigrated(ctx, tx, oldID, newID)              // AdminMigrate：旧实例部署 → lost；按 §6.4 复制 queued 到新实例
+    OnInstanceMigrated(ctx, tx, oldID, newID)              // AdminMigrate：旧实例部署 → lost；按 §6.4 复制到新实例（queued，用户停止的为 stopped）
 }
 ```
 - `OnInstanceRunning`：把该实例 `desired = running` 且 `state IN ('running', 'stopped')` 的部署**统一置回 `state = 'queued'`**（phase 清空，`next_poll_at = now`，事件「实例已启动，正在恢复应用」）。容器停过，进程必然不在；走 queued 分支会重新上传部署包（覆盖同名文件，`.installed` 与模型缓存保留）并 `deploy`。`state = 'failed'` 的不动（用户决定）。首次开通（预装）本来就是 queued。同时对 `removed AND cleanup_pending` 的部署把 `next_poll_at = now`，Runner 下一轮 `rm -rf` 其目录后清掉标记（§6.2）。
@@ -369,9 +369,10 @@ queued ──(Runner 上传+启动)──▶ installing ──(status: running, 
 | 用户在容器里 `rm -rf /root/data/.spark-apps` | `status` exec 非零 → 当作 `failed(script_failed)`，消息「状态文件缺失」 |
 
 ### 6.4 换机（`AdminMigrate`）
-- 旧实例的非终态部署 → `lost`（事件「实例已更换机器」）。
-- 新实例：对每个旧部署（`state ∉ removed/lost/failed` 且 `desired ≠ removed`）插入一条 `queued`（同 app / version / env / secret / port、`attempt = 0`，事件「从 <旧实例> 迁移，模型需重新下载」）。`instance_ports` 的复制已有，`deployment_id` 置 NULL，新部署成功后以 `(instance_id, port)` 既有行**认领**（`UPDATE instance_ports SET deployment_id = $dep WHERE instance_id = $new AND port = $port AND deployment_id IS NULL`），不重复插入。
-- 复制在 `AdminMigrate` 的事务内通过 `OnInstanceMigrated` 完成；新实例 running 时 `OnInstanceRunning` 不改 queued（它只处理 running / stopped）。
+- 旧实例的非终态部署 → `lost`（事件「实例已更换机器」），旧实例 `instance_ports` 里指向它们的 `deployment_id` 置 NULL（§14 一致性检查）。
+- 新实例：对每个旧部署（`state ∉ removed/lost/failed` 且 `desired ≠ removed`）插入一条（同 app / version / env / secret / port、`attempt = 0`）：`desired = running` → `queued`（事件「从 <旧实例> 迁移，模型需重新下载」）；**`desired = stopped` → `state = stopped`、`desired = stopped`**（事件「从 <旧实例> 迁移（已停止，启动时重新下载模型）」；裁定：用户停掉的应用换机后不自动启动，「启动」走 Start → queued 的完整部署）。
+- 不复制的部署（failed、`desired = removed`）在旧实例上占的端口：新实例上对应的复制行删除（审计 `instance.port_delete`，detail「换机：应用 <name> 未迁移」），不留无主端口，之后在新实例上重新部署该应用不会 `port_conflict`。`instance_ports` 的复制已有，`deployment_id` 置 NULL，新部署成功后以 `(instance_id, port)` 既有行**认领**（`UPDATE instance_ports SET deployment_id = $dep WHERE instance_id = $new AND port = $port AND deployment_id IS NULL`），不重复插入。
+- 复制在 `AdminMigrate` 的事务内通过 `OnInstanceMigrated` 完成；新实例 running 时 `OnInstanceRunning` 不改 queued，也不启动 `desired = stopped` 的复制行（它只处理 `desired = running` 的 installing / running / stopped）。
 
 ## 7. 暴露与链接
 - 部署进入 `running` 时（Runner 回写事务内）对 `spec.ports` 每项：若 `(instance_id, port)` 已存在且 `deployment_id IS NULL` → 认领并把 `note` 改为应用名；已存在且属于别的部署 → 不可能（创建时已查冲突）；不存在 → `INSERT (visibility='private', note=<app.name>, deployment_id)`。端口数超过 5 → 不可能（创建时已算入），兜底 `failed(port_limit)`。

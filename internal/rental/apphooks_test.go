@@ -12,6 +12,7 @@ import (
 
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/rental"
@@ -324,5 +325,54 @@ func TestBookingWithAppCancelAndProvision(t *testing.T) {
 	e.agentCreated(b2.ID)
 	if got := h.snapshot(); got[len(got)-1] != "running:"+b2.ID {
 		t.Fatalf("after booked start: %v", got)
+	}
+}
+
+func TestAppEnvWithoutAppRejected(t *testing.T) {
+	e := newEnv(t, 1)
+	h := &recHooks{}
+	e.svc.SetAppHooks(h)
+	before := e.balance(e.userID)
+	env := map[string]string{"MODEL_ID": "m"}
+	_, err := e.svc.PlaceBatch(e.ctx, rental.BatchRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Count: 1, Duration: catalog.D1d, AppEnv: env})
+	if ae := apperr.As(err); ae == nil || ae.Code != "bad_request" || ae.Status != 400 {
+		t.Fatalf("batch app_env without app_id = %v", err)
+	}
+	_, _, err = e.svc.Place(e.ctx, rental.PlaceRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Duration: catalog.D1d, AppEnv: env})
+	if ae := apperr.As(err); ae == nil || ae.Code != "bad_request" {
+		t.Fatalf("place app_env without app_id = %v", err)
+	}
+	if e.balance(e.userID) != before || e.countInstances() != 0 || len(h.snapshot()) != 0 {
+		t.Fatalf("rejected order left side effects: balance %d→%d instances %d calls %v", before, e.balance(e.userID), e.countInstances(), h.snapshot())
+	}
+	// 空 map 等同于没填
+	if _, _, err := e.svc.Place(e.ctx, rental.PlaceRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Duration: catalog.D1d, AppEnv: map[string]string{}}); err != nil {
+		t.Fatalf("empty app_env = %v", err)
+	}
+}
+
+// 机器失联暂停 / 恢复不是实例生命周期变化（容器没停，进程可能还在）：不调任何钩子。
+func TestSuspendResumeCallNoHooks(t *testing.T) {
+	e := newEnv(t, 1)
+	h := &recHooks{}
+	e.svc.SetAppHooks(h)
+	_, inst := e.place(catalog.D1d)
+	e.agentCreated(inst.ID)
+	n := len(h.snapshot())
+	if got, err := e.svc.SuspendMachines(e.ctx, []int64{inst.MachineID}); err != nil || got != 1 {
+		t.Fatalf("SuspendMachines = %d, %v", got, err)
+	}
+	if got := e.get(inst.ID); !got.Suspended() {
+		t.Fatalf("not suspended: %+v", got)
+	}
+	e.clock.Advance(time.Hour)
+	if got, err := e.svc.ResumeMachine(e.ctx, inst.MachineID, []string{inst.ID}); err != nil || got != 1 {
+		t.Fatalf("ResumeMachine = %d, %v", got, err)
+	}
+	if got := e.get(inst.ID); got.Suspended() || got.State != rental.StateRunning {
+		t.Fatalf("not resumed: %+v", got)
+	}
+	if got := h.snapshot(); len(got) != n {
+		t.Fatalf("suspend / resume called hooks: %v", got[n:])
 	}
 }

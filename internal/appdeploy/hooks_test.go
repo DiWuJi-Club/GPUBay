@@ -211,6 +211,14 @@ func TestOnInstanceMigratedCopies(t *testing.T) {
 	if n := e.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1`, old.ID); n != 3 {
 		t.Fatalf("old instance ports = %d", n)
 	}
+	// 不迁移的 failed webui 在旧实例上占的 8080：新实例上复制来的那行删掉（不留无主孤儿），审计一条；8000 与用户端口保留
+	if n := e.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1 AND port = ANY($2)`, moved.ID, []int{8000, 22000}); n != 2 ||
+		e.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1`, moved.ID) != 2 {
+		t.Fatalf("new instance ports after migrate = %d", e.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1`, moved.ID))
+	}
+	if logs := e.auditLogs("instance.port_delete", moved.ID); len(logs) != 1 {
+		t.Fatalf("port_delete audit on new instance = %+v", logs)
+	}
 
 	news, err := e.svc.ListForInstance(e.ctx, moved.ID)
 	if err != nil || len(news) != 1 {
@@ -241,8 +249,65 @@ func TestOnInstanceMigratedCopies(t *testing.T) {
 	if n := e.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1 AND port = 8000 AND deployment_id = $2`, moved.ID, nd.ID); n != 1 {
 		t.Fatal("copied port row not claimed")
 	}
-	if n := e.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1`, moved.ID); n != 3 {
+	if n := e.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1`, moved.ID); n != 2 {
 		t.Fatalf("new instance ports = %d", n)
+	}
+	// 在新实例上重新部署没迁移的 failed 应用：端口不冲突
+	if _, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.userID, InstanceID: moved.ID, AppID: webui.ID, Env: model4B}); err != nil {
+		t.Fatalf("re-deploy webui on new instance: %v", err)
+	}
+}
+
+// TestOnInstanceMigratedKeepsStopped 裁定：用户停止的部署（desired = stopped）换机后仍是 stopped，不自动启动；「启动」走 Start → queued。
+func TestOnInstanceMigratedKeepsStopped(t *testing.T) {
+	e := newEnv(t, 2)
+	vllm, _ := e.publishedApp("vllm", goodSpec(), goodScript, []int64{e.imageID})
+	webui, _ := e.publishedApp("webui", specPorts(8080), goodScript, []int64{e.imageID})
+	old := e.runningInstance()
+	stopped := e.setDep(e.create(old, vllm.ID, map[string]string{"MODEL_ID": "Qwen/Qwen3-4B", "API_KEY": "sk-secret-12345"}).ID,
+		appdeploy.StateStopped, appdeploy.DesiredStopped)
+	e.addAppPort(stopped, 8000)
+	stopping := e.setDep(e.create(old, webui.ID, model4B).ID, appdeploy.StateRunning, appdeploy.DesiredStopped) // 已请求停止、Runner 还没执行
+	e.addAppPort(stopping, 8080)
+	moved := e.instanceOf(e.userID, rental.StateCreating)
+	e.exec(`INSERT INTO instance_ports (instance_id, port, visibility, forced_private, note, created_at, updated_at)
+		SELECT $2, port, visibility, forced_private, note, $3, $3 FROM instance_ports WHERE instance_id = $1`, old.ID, moved.ID, e.clk.Now())
+
+	e.clk.Advance(time.Minute)
+	now := e.clk.Now()
+	e.hookTx(old.ID, func(tx pgx.Tx) error { return e.svc.OnInstanceMigrated(e.ctx, tx, old.ID, moved.ID, now) })
+
+	news, err := e.svc.ListForInstance(e.ctx, moved.ID)
+	if err != nil || len(news) != 2 {
+		t.Fatalf("new deployments = %+v, %v", news, err)
+	}
+	for _, nd := range news {
+		if nd.State != appdeploy.StateStopped || nd.Desired != appdeploy.DesiredStopped || nd.Attempt != 0 {
+			t.Fatalf("copied stopped deployment = %+v", nd)
+		}
+		if ev := e.lastEvent(nd.ID); ev.FromState != "" || ev.ToState != appdeploy.StateStopped || ev.Detail != "从 "+old.ID+" 迁移（已停止，启动时重新下载模型）" {
+			t.Fatalf("event = %+v", ev)
+		}
+	}
+	if e.secrets(news[0])["API_KEY"] != "sk-secret-12345" && e.secrets(news[1])["API_KEY"] != "sk-secret-12345" {
+		t.Fatal("secret not carried over")
+	}
+	// 端口行随迁移的部署保留（等启动后认领）
+	if n := e.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1 AND deployment_id IS NULL`, moved.ID); n != 2 {
+		t.Fatalf("new instance ports = %d", n)
+	}
+	// 新实例开通（running 钩子）不启动它们
+	e.exec(`UPDATE instances SET state = 'running' WHERE id = $1`, moved.ID)
+	e.hookTx(moved.ID, func(tx pgx.Tx) error { return e.svc.OnInstanceRunning(e.ctx, tx, moved.ID, now) })
+	for _, nd := range news {
+		if d := e.dep(nd.ID); d.State != appdeploy.StateStopped || d.Desired != appdeploy.DesiredStopped {
+			t.Fatalf("stopped copy auto-started: %+v", d)
+		}
+	}
+	// 用户「启动」→ queued / desired running（完整部署）
+	d, err := e.svc.Start(e.ctx, e.userID, moved.ID, news[0].ID, "")
+	if err != nil || d.State != appdeploy.StateQueued || d.Desired != appdeploy.DesiredRunning {
+		t.Fatalf("Start = %+v, %v", d, err)
 	}
 }
 

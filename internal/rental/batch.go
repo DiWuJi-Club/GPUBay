@@ -77,6 +77,9 @@ func validateBatch(req *BatchRequest, now time.Time) (int64, error) {
 	if err := checkIdempotencyKey(req.IdempotencyKey); err != nil {
 		return 0, err
 	}
+	if req.AppID == nil && len(req.AppEnv) > 0 {
+		return 0, apperr.BadRequest("未选择预装应用时不能填写应用变量")
+	}
 	if req.StartAt != nil {
 		start := req.StartAt.UTC()
 		if !tz.IsHour(start) {

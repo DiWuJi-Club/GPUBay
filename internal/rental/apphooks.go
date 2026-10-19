@@ -20,7 +20,7 @@ type AppHooks interface {
 	OnInstanceRunning(ctx context.Context, tx pgx.Tx, instanceID string, now time.Time) error
 	// OnInstanceGone：实例释放 / 洗机 / 开通失败 / 取消；非终态部署 → removed。reason 为中文短句。
 	OnInstanceGone(ctx context.Context, tx pgx.Tx, instanceID, reason string, now time.Time) error
-	// OnInstanceMigrated：换机；旧实例部署 → lost，复制为新实例的 queued。
+	// OnInstanceMigrated：换机；旧实例部署 → lost，复制到新实例（queued；用户停止的仍为 stopped），不迁移的部署的端口不留在新实例上。
 	OnInstanceMigrated(ctx context.Context, tx pgx.Tx, oldID, newID string, now time.Time) error
 	// PrepareInstall：下单预装校验（应用 / 镜像兼容 / 变量），失败整单不下。
 	PrepareInstall(ctx context.Context, q db.Querier, appID, imageID int64, env map[string]string) (InstallPlan, error)
