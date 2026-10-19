@@ -17,7 +17,7 @@
 ## 执行须知（写给每个子代理）
 
 - 任务**按编号顺序串行执行，一个任务一个子代理**。子代理只看得到自己任务的文字，看不到本文其它任务：每个任务的 Interfaces 必须完整（消费什么、产出什么、精确签名），代码步骤给完整代码，不写「同上」「类似 Task N」。
-- 测试机 192.168.1.221（`imac` 用户）。**需要 root 的命令由协调人（controller）执行，绝不写进任何脚本**；密码由负责人运行时提供，放进仅该条命令的环境变量，经 stdin 送给 `sudo -S`。此前「先 `sudo -v` 缓存凭据再执行」的做法在 `ssh -T` 下不可靠（凭据缓存绑定 tty），改用在远端定义一个每次都从变量读密码的 shell 函数 `s`，形如：
+- 测试机 192.168.1.221（`imac` 用户）。**需要 root 的命令由协调人（controller）在运行时执行，绝不写进任何脚本**；密码由负责人在对话中提供，协调人在**运行时**把它放进仅该条命令的环境变量，经 stdin 送给 `sudo -S`。负责人要求密码不进任何持久化存储：**不写进文件、脚本、提交，也不用 Keychain 之类的凭据库**（评审建议的 `security add-generic-password` 方案因此不采用；会话内的运行时环境变量可以接受）。此前「先 `sudo -v` 缓存凭据再执行」的做法在 `ssh -T` 下不可靠（凭据缓存绑定 tty），改用在远端定义一个每次都从变量读密码的 shell 函数 `s`，形如：
   `SUDO_PW='<运行时提供>' sh -c 'printf "%s\n" "$SUDO_PW" | ssh -T imac@192.168.1.221 "read -r P; s() { printf \"%s\n\" \"\$P\" | sudo -S -p \"\" \"\$@\"; }; s systemctl stop spark-agent"'`
   （远端 `read -r P` 从 stdin 读走密码，之后每个 `s <cmd>` 都把它送给 `sudo -S`；`-p ""` 关掉提示符，`-T` 不分配 tty。）**密码绝不写进任何文件、记录、提交或本计划**；记录前核对输出不含密码（`sudo -S` 不回显，`set -x` 不得开启；`git diff --cached | grep -i sudo_pw` 应为空）。
 - 开发 Mac 的 DNS 对 `*.sslip.io` 返回假地址（198.18.x.x）：curl 一律加 `--resolve <host>:<port>:<ip>`；Chrome / Playwright 用 `--host-resolver-rules`。
@@ -32,7 +32,7 @@
 - 预订载体（规格 §1.1 第 1 条）：预订 = 一条 `status='reserved'` 的 `machine_leases` + 一个 `state='reserved'` 的实例行，下单时钉机器；`instances_machine_active_uniq` **不含** `reserved`。
 - 时段（规格 §4.1）：`period = [S − PrepLead, S + D + Tail)`，`PrepLead = 1h`，`Tail = RetainAfterStop (6h) + WipeBuffer (1h) = 7h`；即时订单 `period = [now, now + CreateTimeout + D + Tail)`，进入 running 后收缩为 `expires + Tail`。
 - 参数（裁定 B1）：最早 **2 小时后**开始（校验 `S ≥ now + 2h − 5m`，容差 5 分钟）、最多提前 **60 天**、单次 `duration × quantity ≤ 90 天`（`1d×1~90`、`1w×1~12`、`1m×1~3`）、一单 **≤ 8 台**、每用户未开通预订 **≤ 16 台**（预订分支取咨询锁 `booking:<user_id>` 后计数）；开始时刻取**整点**（Asia/Shanghai，等价于 UTC 整点）。
-- 候选机器（规格 §4.2）：`product_id` 匹配；`group_id IS NULL`（不限）时 `(m.group_id IS NULL OR g.visible)`，指定机组时 `m.group_id = $group`；`machine_id` 指定时只看该机；预订分支 `state IN ('idle','allocated')`（不要求在线）；即时分支 `state = 'idle' AND agent_online`；`maintenance / faulty` 一律排除；`NOT EXISTS` 与 reserved / active 时段相交；ORDER BY「最紧贴前一档期」（`max(upper)` of 同机 ≤ lower 的 reserved/active/ended 时段）DESC NULLS LAST，再 `id`；`LIMIT want FOR UPDATE OF m SKIP LOCKED`。每台 savepoint 插实例 + lease，排他冲突（`23P01`）→ 回滚 savepoint、剔除、补取（最多 3 轮）；不足 → 整单回滚 `no_capacity`（消息「该时段只有 X 台可用，请减少数量或更换时段」，X=0 时「该时段暂无可用机器」）。
+- 候选机器（规格 §4.2）：`product_id` 匹配；`group_id IS NULL`（不限）时 `(m.group_id IS NULL OR g.visible)`，指定机组时 `m.group_id = $group`；`machine_id` 指定时只看该机；预订分支 `state IN ('idle','allocated')`（不要求在线）；即时分支 `state = 'idle' AND agent_online`；`maintenance / faulty` 一律排除；`NOT EXISTS` 与 reserved / active 时段相交；ORDER BY「最紧贴前一档期」（`max(upper)` of 同机 ≤ lower 的 reserved/active/ended 时段）DESC NULLS LAST，再 `id`；`LIMIT want FOR NO KEY UPDATE OF m SKIP LOCKED`（**不能用 `FOR UPDATE`**：插入引用 `machines(id)` 的行——`instances`、`machine_leases`、`agent_commands`、`ssh_sessions`——会对机器行取 `FOR KEY SHARE`，与 `FOR UPDATE` 互斥、与 `NO KEY UPDATE` 不互斥；锁机器行的地方只改非键列 `state / group_id / display_name`，`NO KEY UPDATE` 足够）。每台 savepoint 插实例 + lease，排他冲突（`23P01`）→ 回滚 savepoint、剔除、补取（最多 3 轮）；不足 → 整单回滚 `no_capacity`（消息「该时段只有 X 台可用，请减少数量或更换时段」，X=0 时「该时段暂无可用机器」）。
 - 封顶（规格 §4.3）：`refreshLease` 的 `upper = GREATEST(lower + 1s, LEAST(desired, cap))`，`cap` = 同机其它实例 reserved lease 的最小 `lower`（`lower ≥ 自己的 lower`），cap 为 NULL 不封顶；`occupiedUntil` 任何分支至少 `now + 1s`；`reserved` 与预订的 `creating` 实例的 lease 不由 `refreshLease` 改写；`refreshLease` 不再可能撞排他约束，`ErrNoCapacity` 分支删除。`RefreshCappedLeases` 每轮对 `stopped`、`wiping`、`running AND suspended_at IS NOT NULL` 的实例各 `refreshLease` 一次（每轮 ≤ 200 行）。
 - 开通（规格 §5.2）：`ProvisionDue` 谓词 `state='reserved' AND scheduled_start_at <= $1`（`$1 = now + PrepLead`）；锁顺序 instance → 自己的 lease → machine；先 `Users.CanRent` 失败 → 平台取消全退（事件 `"cancelled: user cannot rent"`）；机器可用 = `state='idle' AND agent_online AND NOT EXISTS 活动实例`；可用 → 机器 `allocated`、实例 `creating`、`provisioned_at = now`、lease `active`、事件 `reserved → creating "scheduled start <S>"`、`Enqueue CreateInstance{image_ref}`；不可用 → 改派。`FailStuckCreating` 谓词 `COALESCE(provisioned_at, created_at) <= now − CreateTimeout`。
 - 计时（规格 §5.3）：预订首次开通（`from == creating AND scheduled_start_at IS NOT NULL AND provisioned_at IS NOT NULL`）：`base = max(S, now)`，`expires = min(base + pending, cap − Tail)`；封顶导致 `expires < base + pending` 时按差额 × 最新可退订单单价退款（remark「迟开通补偿 <id>」），不足 1 分不退；事件 `"agent: created (scheduled S, late by Δ)"`（Δ ≤ 0 省略）。停机续费后的 Start 走现有分支。
@@ -48,7 +48,7 @@
 - 枚举同步（规格 §2 M4）：`rental.instanceStates`、`labels.ts`、`types/instance.ts`、`ListIngressRoutes` 状态列表加 `reserved`（不加 `cancelled`）、`ingress.NotRunningPage` 显式 `reserved` 分支、`sshgw.stateBanner` 显式 `reserved` 分支（不能靠 default）、sshgw `terminalState` 加 `cancelled`、Banner / 页面里的 `<S>` 按 Asia/Shanghai `2006-01-02 15:04`；`reconcile.go` 预期实例查询保持四个活动状态。
 - 换机（规格 §8）：`AdminMigrate` period `[now, now + CreateTimeout + 剩余 + Tail)`；新实例复制 `auto_renew`、`auto_renew_duration`、`group_id`（`batch_id` 不复制，`scheduled_*` / `provisioned_at` NULL）；预订实例不可换机。
 - 退款折算（规格 §8）：`refund.go` 的 `quote` 与 `refundAll` 改用 `seconds(duration) × quantity`。
-- 加锁顺序（规格 §14，写进 `service.go` 头注释）：PlaceBatch `idem 咨询锁 → [booking 咨询锁] → machines(SKIP LOCKED) → 插实例 / lease → orders → wallet`；ProvisionDue `instance → 自己的 lease → machine(FOR UPDATE) → [改派 machines SKIP LOCKED] → agent_commands`；后台改派 `instance → lease → machines(SKIP LOCKED)`；Renew / AdminExtend / 自动续费 `[idem] → instance → 自己的 lease(读 cap) → orders → wallet → 更新 lease`（不锁机器）；取消 `instance → lease → orders → wallet`；HandleCommandResult `instance → agent_commands → lease → machine(Release)`；`PlaceBatch` 与 `reassign` 遇 `40P01` / `40001` 整个事务重试一次。
+- 加锁顺序（规格 §14，写进 `service.go` 头注释）：所有机器行锁一律 `FOR NO KEY UPDATE`（见上一条）；PlaceBatch `idem 咨询锁 → [booking 咨询锁] → machines(NO KEY UPDATE SKIP LOCKED) → 插实例 / lease → orders → wallet`；ProvisionDue `instance → 自己的 lease → machine(NO KEY UPDATE) → [改派 machines SKIP LOCKED] → agent_commands`；后台改派 `instance → lease → machines(SKIP LOCKED)`；Renew / AdminExtend / 自动续费 `[idem] → instance → 自己的 lease(读 cap) → orders → wallet → 更新 lease`（不锁机器）；取消 `instance → lease → orders → wallet`；HandleCommandResult `instance → agent_commands → lease → machine(Release)`；`PlaceBatch` 与 `reassign` 遇 `40P01` / `40001` 整个事务重试一次。
 - 错误码新增（规格 §10）：`booking_too_soon`（400「开始时间至少在 2 小时之后」）、`booking_too_far`（400「最多提前 60 天预订」）、`booking_too_long`（400「单次租期最长 90 天」）、`booking_not_hour`（400「开始时间需为整点」）、`booking_limit`（409「未开通的预订最多 16 台」）、`count_invalid`（400「一次最多租用 8 台」）、`renew_blocked`（409）、`group_not_found`（404「机组不存在」）、`machine_unavailable`（409「该机器在所选时段不可用」）、`cancel_not_allowed`（409「预订已开始开通，不能取消」）、`group_not_empty`（409「机组内还有机器或未结束的实例」）、`duplicate_group_name`（409「机组名称已存在」）、`duplicate_display_name`（409「展示名已被其他机器使用」）。
 - 控制台 API（规格 §10.1）：`GET /groups?product_id=`、`GET /groups/{id}/machines`、`GET /groups/{id}/calendar?from&days`、`GET /machines/{id}/calendar?from&days`、`GET /availability?…`（五个在 `requireUser` 组外、可匿名、按 IP 每分钟 120 次）；`POST /bookings`、`GET /bookings/{batch_id}`、`GET /instances/{id}/cancel-quote`、`POST /instances/{id}/cancel`、`PUT /instances/{id}/auto-renew`、`POST /instances/{id}/renew`（加 `quantity`）、`GET /instances/{id}/events`；`instanceView` 新字段 `scheduled_start_at, scheduled_end_at, cancellable_until, group_id, group_name, machine_label, batch_id, reassign_count, auto_renew, auto_renew_duration, auto_renew_failed_reason, renewable_until, renew_options`；`Order` 视图 `quantity, batch_id, auto`；`productView.idle_count` = 此刻可即时租用台数。
 - 后台 API（规格 §10.2）：机组 CRUD（ops）、`POST/DELETE /groups/{id}/machines`、`PUT /machines/{id}`、`GET /machines/{id}` 加 `group / display_name / leases`、`GET /machines/{id}/calendar`、`GET /bookings`、`GET /bookings/upcoming?days=7`（all）、`POST /instances/{id}/cancel-booking`（ops + TOTP）、`POST /instances/{id}/reassign`（ops）、`GET /dashboard` 加 `bookings_upcoming_7d`、`GET /orders` 筛选 `batch_id` + CSV 列、`POST /machines/{id}/maintenance` 响应 `upcoming_bookings`。
@@ -62,13 +62,14 @@
 1. **两个用户同时抢同一时段的最后几台**（50 个并发批次、每单 1～8 台、随机窗口，只有 10 台机器）：任一时刻同机时段两两不交、没有「订单数 ≠ 批次台数」的批次、没有死锁或 500 → Task 16 `TestConcurrentBatchesConsistent`。
 2. **`NOT EXISTS` 预筛通过但插 lease 时撞上刚提交的重叠时段**（READ COMMITTED 快照滞后）：savepoint 回滚、换下一台，整单仍成功；候选全部撞光时整单回滚且钱不动 → Task 4 `TestPlaceOnMachinesRetriesOnExclusionViolation`。
 3. **开始时间卡在边界**（`now + 2h − 4m59s` 接受、`now + 2h − 5m01s` 拒绝、第 60 天整点接受、60 天 + 1 小时拒绝、`1m × 3` 接受、`1m × 4` 拒绝、非整点拒绝、UTC 偏移后的整点仍是整点）→ Task 5 `TestBatchValidationMatrix`。
-4. **续费被同机下一条预订挡住时不能扣钱**（手动续费、后台延长、停机续费、自动续费四条路径）：返回 `renew_blocked`、余额与 `expires_at` 不变、lease 不变 → Task 9 `TestRenewBlockedByReservationDoesNotCharge` + Task 10 `TestAutoRenewFallsBackThenBlocks`。
+4. **续费被同机下一条预订挡住时不能扣钱**（手动续费、后台延长、停机续费、自动续费四条路径）：返回 `renew_blocked`、余额与 `expires_at` 不变、lease 不变 → Task 9 `TestRenewBlockedByReservationDoesNotCharge`（预订已存在）+ `TestRenewRaceWithNewReservationIsBlocked`（`renewFits` 之后才提交的预订：`verifyLeaseFits` 回滚扣款）+ Task 10 `TestAutoRenewFallsBackThenBlocks`。
 5. **旧客户端继续用 `POST /orders` + 同一个幂等键重试**：第二次得到第一次的订单与实例（不建批次、不报冲突）；用户提交含 `#` 的键被 400 拒绝而不是撞上批次子单 → Task 5 `TestLegacyOrderIdempotencyUnchanged`。
 
 ## 已做出的裁定（规格未写明或与代码核对后确定的细节）
 
-- **`fleet.Allocate` 删除**，替换为 `fleet.MarkAllocated(ctx, q, id)`（只把一台已选中的机器从 idle 置 allocated）；候选选择全部在 `rental.pickMachines`（fleet 不能依赖 rental，反向做不到）。`fleet` 原有 `TestAllocateRequiresIdleAndOnline` / `TestConcurrentAllocationNeverDoubleAssigns` 改为 `TestMarkAllocatedRequiresIdleAndOnline`，并发不重复分配由 Task 17 的批次并发测试覆盖。
+- **`fleet.Allocate` 删除**，替换为 `fleet.MarkAllocated(ctx, q, id)`（只把一台已选中的机器从 idle 置 allocated）；候选选择全部在 `rental.pickMachines`（fleet 不能依赖 rental，反向做不到）。`fleet` 原有 `TestAllocateRequiresIdleAndOnline` / `TestConcurrentAllocationNeverDoubleAssigns` 改为 `TestMarkAllocatedRequiresIdleAndOnline`，并发不重复分配由 Task 16 的 `TestConcurrentBatchesConsistent` 覆盖（现有 `rental` 的 `TestConcurrentPlaceForLastMachines` 仍覆盖单机竞争）。
 - **`fleet.IdleCount` 保留**（机组的「现空闲」用它），市场页的 `idle_count` 改用 `rental.AvailableNow(ctx, productID)`（lease-aware）。
+- **`no_capacity` 消息里的台数 X 是本次实际拿到的台数**（`placeOnMachines` 的 `len(done)`），不另起一次 `countAvailable`：候选补取 3 轮后拿不到的机器要么已被别人占、要么撞了约束，与「此刻可用台数」在实践中一致，少一次查询；规格 §10 的「可用台数」按此理解。
 - **`machines.group_id` 的三态更新**：`fleet.MachineUpdate{GroupID *int64; SetGroup bool; DisplayName *string}`，`SetGroup=true, GroupID=nil` 表示移出机组。
 - **机组删除放在 `rental.AdminDeleteGroup`**：先查无未终态实例引用，再调 `fleet.DeleteGroupIn(ctx, tx, id)`（查无机器并删除），同一事务；审计在 rental 写。
 - **预订实例的 lease 读写**：`rental.lockLease(ctx, tx, instanceID)` 锁定并返回实例当前的 reserved / active lease 行（`leaseRow{ID, MachineID, Lower, Upper, Status}`）。
@@ -76,7 +77,7 @@
 - **自动续费失败的独立事务**：`AutoRenewDue` 的每行先在主事务里尝试，失败时主事务回滚，然后用 `s.d.Pool.Exec` 单独写失败标记（不再锁实例；`UPDATE … WHERE id = $1 AND state = 'running' AND auto_renew`）。
 - **短信模板键**：`sms.TemplateAutoRenewFailed = "auto_renew_failed"`（参数 instance、reason）、`sms.TemplateBookingCancelled = "booking_cancelled"`（参数 instance、reason）；`reason` 传中文短句（「余额不足」/「机器已有后续预订」/「无法安排机器」/「账号不可租用」）。
 - **`rental.Notifier` 扩展**为三个方法；`internal/app` 的 `expiryNotifier` 实现全部；各测试包的 fake 同步加方法。
-- **Renew 签名改为 `Renew(ctx, userID, instanceID, d, quantity, idempotencyKey)`**（`quantity` 0 视为 1），现有调用点同步。
+- **`Renew` 保持 5 参数包装不变，新增 `RenewQuantity(ctx, userID, instanceID, d, quantity, idempotencyKey)`**（`quantity` 0 视为 1）；现有调用点与 Task 9 / 10 的测试都继续用 5 参数的 `Renew`，不要改它的签名。
 - **`POST /orders` 的内部实现**：`Place` 调 `placeBatch(ctx, req, false)`；`PlaceBatch` 调 `placeBatch(ctx, req, true)`；两者差别只有「是否建批次行、子单键是否加 `#n`」。
 - **日历 `from` 缺省**：今天（Asia/Shanghai），`days` 缺省 61、上限 61；机器日历只返回 `[from, from + days)` 内相交的时段。
 - **`GET /availability` 匿名可用**，`start_at` 为 RFC3339；缺省立即分支（`period = [now, now + CreateTimeout + D + Tail)`）。
@@ -148,8 +149,15 @@ func TestBookingColumnsDefaults(t *testing.T) {
 	ord, inst := e.place(catalog.D1d)
 	got := e.get(inst.ID)
 	if got.Booked() || got.ScheduledStartAt != nil || got.GroupID != nil || got.BatchID != nil || got.AutoRenew ||
-		got.AutoRenewDuration != catalog.D1m || got.ReassignCount != 0 || got.ProvisionedAt != nil || got.CancelledAt != nil {
+		!got.AutoRenewDuration.Valid() || got.ReassignCount != 0 || got.ProvisionedAt != nil || got.CancelledAt != nil {
 		t.Fatalf("defaults = %+v", got)
+	}
+	// 列默认值（Task 4 起 Place 会显式写入首单档位，所以默认值用一行不带该列的裸插入来验）
+	var def string
+	if err := e.pool.QueryRow(e.ctx, `INSERT INTO instances (id, user_id, machine_id, product_id, image_id, state, ssh_password_enc, created_at, updated_at)
+		VALUES ('ins-defaults', $1, $2, $3, $4, 'released', $5, $6, $6) RETURNING auto_renew_duration`,
+		e.userID, e.machines[0], e.productID, e.imageID, []byte("x"), e.clock.Now()).Scan(&def); err != nil || def != "1m" {
+		t.Fatalf("auto_renew_duration default = %q, %v", def, err)
 	}
 	if ord.Quantity != 1 || ord.BatchID != nil || ord.Auto {
 		t.Fatalf("order defaults = %+v", ord)
@@ -357,7 +365,8 @@ func MaxQuantity(d catalog.Duration) int {
 ```go
 // 各路径的实际加锁顺序（规格 §14）：
 //   PlaceBatch：idem 咨询锁 → [booking:<uid> 咨询锁] → machines(SKIP LOCKED) → 插实例 / lease → orders → wallet
-//   ProvisionDue：instance → 自己的 lease → machine(FOR UPDATE) → [改派：machines SKIP LOCKED] → agent_commands
+//   ProvisionDue：instance → 自己的 lease → machine(NO KEY UPDATE) → [改派：machines SKIP LOCKED] → agent_commands
+//   机器行锁一律 FOR NO KEY UPDATE：插入引用 machines(id) 的行会取 FOR KEY SHARE，与 FOR UPDATE 互斥、与 NO KEY UPDATE 不互斥。
 //   后台改派：instance → lease → machines(SKIP LOCKED)
 //   Renew / AdminExtend / 自动续费：[idem] → instance → 自己的 lease(读 cap) → orders → wallet → 更新 lease（不锁机器）
 //   取消：instance → lease → orders → wallet
@@ -577,9 +586,11 @@ func TestHourHelpers(t *testing.T) {
 
 ```go
 // reserveRaw 直接写库造一个预订（Task 5 之前没有 PlaceBatch，之后也用于绕过参数校验）：
-// reserved 实例 + reserved lease，period 按规格 §4.1 = [start − PrepLead, start + d + Tail)。
-func (e *env) reserveRaw(machineID int64, start time.Time, d time.Duration) string {
+// reserved 实例 + reserved lease，period 按规格 §4.1 = [start − PrepLead, start + secs + Tail)。
+// 第三参数是秒（int64），调用方写 86400 / 3600 这类字面量；不要用 time.Duration，无类型常量会被当成纳秒。
+func (e *env) reserveRaw(machineID int64, start time.Time, secs int64) string {
 	e.t.Helper()
+	d := time.Duration(secs) * time.Second
 	id := randx.ID("ins-", 8)
 	now := e.clock.Now()
 	if _, err := e.pool.Exec(e.ctx, `INSERT INTO instances (id, user_id, machine_id, product_id, image_id, state, pending_seconds,
@@ -627,7 +638,7 @@ func TestRefreshLeaseCapsAtNextReservation(t *testing.T) {
 	_, inst := e.place(catalog.D1d)
 	e.ack(true) // running，expires = T0 + 24h，lease = [T0, T0 + 31h)
 	// 同机下一条预订：T0 + 40h 开始 → lease 下界 T0 + 39h
-	resv := e.reserveRaw(e.machines[0], dbtest.T0.Add(40*time.Hour), 24*time.Hour)
+	resv := e.reserveRaw(e.machines[0], dbtest.T0.Add(40*time.Hour), 86400)
 
 	// 失联 5 小时后暂停：剩余 19h 冻结；desired = now + 19h + 7h = T0 + 31h（未碰到封顶）
 	e.clock.Advance(5 * time.Hour)
@@ -832,17 +843,18 @@ func (s *Service) refreshLease(ctx context.Context, tx pgx.Tx, id string, now ti
 	if inst.State == StateReleased || inst.State == StateFailed || inst.State == StateCancelled {
 		desired, status = now, "ended"
 	}
+	// cap 按 lease 自己的 machine_id 算（不用 inst.MachineID）：改派过渡期 lease 与实例的机器可能短暂不一致
 	_, err = tx.Exec(ctx, `WITH own AS (
-			SELECT id, lower(period) AS lo FROM machine_leases
+			SELECT id, machine_id, lower(period) AS lo FROM machine_leases
 			WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1 FOR UPDATE
 		), cap AS (
 			SELECT min(lower(l.period)) AS c FROM machine_leases l, own
-			WHERE l.machine_id = $5 AND l.status = 'reserved' AND l.instance_id <> $1 AND lower(l.period) >= own.lo
+			WHERE l.machine_id = own.machine_id AND l.status = 'reserved' AND l.instance_id <> $1 AND lower(l.period) >= own.lo
 		)
 		UPDATE machine_leases m
 		SET period = tstzrange(own.lo, GREATEST(own.lo + interval '1 second', LEAST($2::timestamptz, COALESCE((SELECT c FROM cap), $2::timestamptz)))),
 		    status = $3, updated_at = $4
-		FROM own WHERE m.id = own.id`, id, desired, status, now, inst.MachineID)
+		FROM own WHERE m.id = own.id`, id, desired, status, now)
 	return err
 }
 ```
@@ -1349,7 +1361,7 @@ func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64
 	now := s.clock.Now()
 	var out Machine
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		before, err := scanMachine(tx.QueryRow(ctx, `SELECT `+machineCols+` FROM machines WHERE id = $1 FOR UPDATE`, id))
+		before, err := scanMachine(tx.QueryRow(ctx, `SELECT `+machineCols+` FROM machines WHERE id = $1 FOR NO KEY UPDATE`, id))
 		if err != nil {
 			return err
 		}
@@ -1659,10 +1671,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `internal/rental/place.go`（改用 `placeOnMachines`，仍是单台 / 无批次，Task 5 再重构）、`internal/rental/migrate.go`、`internal/rental/export_test.go`（导出内部函数供测试）、`internal/fleet/machines.go`（删除 `Allocate`）、`internal/fleet/machines_test.go`（删除 `allocate` helper 与两个 Allocate 测试）、`internal/rental/migrate_test.go`（追加复制字段的用例）
 
 **Interfaces:**
-- Consumes: Task 2 的 `insertLease`、`lockLease`、`Tail`、`PrepLead`；Task 3 的 `Fleet.MarkAllocated`、`Machine.GroupID`。
+- Consumes: Task 2 的 `insertLease`、`Tail`、`PrepLead`；Task 3 的 `Fleet.MarkAllocated`、`Machine.GroupID`。
 - Produces:
   - `rental.pickSpec{ProductID int64; GroupID, MachineID *int64; Lower, Upper time.Time; Immediate bool; Exclude []int64}`。
-  - `pickMachines(ctx, q, spec, limit int, lock bool) ([]int64, error)`（规格 §4.2 的 SQL；`lock` 为 true 时 `FOR UPDATE OF m SKIP LOCKED`）；`countAvailable(ctx, q, spec) (int, error)`。
+  - `pickMachines(ctx, q, spec, limit int, lock bool) ([]int64, error)`（规格 §4.2 的 SQL；`lock` 为 true 时 `FOR NO KEY UPDATE OF m SKIP LOCKED`——不能用 `FOR UPDATE`，否则测试里另一连接插 `machine_leases` / `instances`（外键 `KEY SHARE`）会与它互相等待而挂死）；`countAvailable(ctx, q, spec) (int, error)`。
   - `placeOnMachines(ctx, tx, spec, want int, fn func(sp pgx.Tx, machineID int64) error) ([]int64, error)`：每台在 savepoint 内执行 `fn`，排他冲突换下一台，最多补取 3 轮；不足 → 即时分支返回 `apperr.ErrNoCapacity`（消息不变，现有测试与前端引导依赖它），预订分支返回 `no_capacity` + 带台数的消息。
   - `immediatePeriod(now, secs int64) (lower, upper)` = `[now, now + CreateTimeout + secs + Tail)`；`bookingPeriod(start, secs) (lower, upper)` = `[start − PrepLead, start + secs + Tail)`。
   - `(*Service).AvailableNow(ctx, productID) (int, error)`：此刻可即时租 1 天的台数（市场页 `idle_count` 的新语义，Task 13 接入）。
@@ -2031,7 +2043,7 @@ func pickArgs(spec pickSpec) []any {
 func pickMachines(ctx context.Context, q db.Querier, spec pickSpec, limit int, lock bool) ([]int64, error) {
 	sql := pickSQL + ` LIMIT $8`
 	if lock {
-		sql += ` FOR UPDATE OF m SKIP LOCKED`
+		sql += ` FOR NO KEY UPDATE OF m SKIP LOCKED` // 不用 FOR UPDATE：与外键插入的 KEY SHARE 互斥
 	}
 	rows, err := q.Query(ctx, sql, append(pickArgs(spec), limit)...)
 	if err != nil {
@@ -2060,7 +2072,7 @@ func noCapacity(spec pickSpec, got int) error {
 
 // placeOnMachines 挑出 want 台机器，对每台在 savepoint 内执行 fn（插实例 + lease [+ 标记 allocated]）：
 // 排他约束冲突（并发事务刚提交了重叠时段，预筛的快照没看到）→ 回滚 savepoint、剔除这台、补取；最多补取 3 轮。
-// 机器行锁在外层事务里取（SKIP LOCKED），savepoint 回滚不释放它，并发批次不会互相等待。
+// 机器行锁（NO KEY UPDATE）在外层事务里取（SKIP LOCKED），savepoint 回滚不释放它，并发批次不会互相等待。
 // 不足 want 台 → 返回 no_capacity，调用方回滚整个事务（没有部分成功）。
 func placeOnMachines(ctx context.Context, tx pgx.Tx, spec pickSpec, want int, fn func(sp pgx.Tx, machineID int64) error) ([]int64, error) {
 	var done []int64
@@ -2208,7 +2220,7 @@ func (s *Service) AvailableNow(ctx context.Context, productID int64) (int, error
 
 - [ ] **Step 6: 删除 `fleet.Allocate`**
 
-`internal/fleet/machines.go` 删除 `Allocate` 方法；`internal/fleet/machines_test.go` 删除 `allocate` helper、`TestAllocateRequiresIdleAndOnline`、`TestConcurrentAllocationNeverDoubleAssigns`（并发不重复分配由 Task 17 覆盖）。`go vet` 不得报未使用的 import。
+`internal/fleet/machines.go` 删除 `Allocate` 方法；`internal/fleet/machines_test.go` 删除 `allocate` helper、`TestAllocateRequiresIdleAndOnline`、`TestConcurrentAllocationNeverDoubleAssigns`（并发不重复分配由 Task 16 `TestConcurrentBatchesConsistent` 与现有 `rental` 的 `TestConcurrentPlaceForLastMachines` 覆盖）。`go vet` 不得报未使用的 import。
 
 - [ ] **Step 7: 运行测试确认通过**
 
@@ -2235,7 +2247,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: Task 4 的 `pickSpec` / `placeOnMachines` / `immediatePeriod` / `bookingPeriod` / `noCapacity`；Task 2 的 `insertLease`、`tz`。
 - Produces:
   - `rental.BatchRequest{UserID, ProductID, ImageID int64; GroupID, MachineID *int64; Count int; Duration catalog.Duration; Quantity int; StartAt *time.Time; AutoRenew bool; AutoRenewDuration catalog.Duration; IdempotencyKey string}`（`Quantity` 0 视为 1；`AutoRenewDuration` 空视为 `Duration`；`StartAt` nil = 立即）。
-  - `rental.Batch{ID string \`json:"id"\`; UserID int64 \`json:"-"\`; Count int \`json:"count"\`; CreatedAt time.Time \`json:"created_at"\`}`；`rental.BatchResult{Batch *Batch; Orders []Order; Instances []Instance}`（`Orders[i]` 对应 `Instances[i]`）。
+  - `rental.Batch{ID string \`json:"id"\`; UserID int64 \`json:"-"\`; Count int \`json:"count"\`; CreatedAt time.Time \`json:"created_at"\`}`；`rental.BatchResult{Batch *Batch; Orders []Order; Instances []Instance}`（`Orders[i]` 对应 `Instances[i]`，两者都按实例 ID 升序，首单与回放顺序一致）。
   - `(*Service).PlaceBatch(ctx, req BatchRequest) (BatchResult, error)`；`(*Service).GetBatch(ctx, userID int64, id string) (BatchResult, error)`；`(*Service).Place` 不变（内部 = 不建批次的单台即时）。
   - `charge(ctx, tx, userID int64, kind, instanceID string, productID int64, d catalog.Duration, quantity int, auto bool, batchID *string, idemKey string, now) (Order, error)`，`amount = Quote × quantity`。
   - `(*Service).RenewQuantity(ctx, userID int64, instanceID string, d catalog.Duration, quantity int, idempotencyKey string) (Order, error)`；`Renew` = `RenewQuantity(…, 1, …)`。
@@ -2268,15 +2280,11 @@ func (e *env) batchReq(count int, start *time.Time) rental.BatchRequest {
 
 func ptr[T any](v T) *T { return &v }
 
-func codeOf(err error) string {
-	if ae := apperr.As(err); ae != nil {
-		return ae.Code
-	}
-	return ""
-}
+// codeOf 已在 admin_ops_test.go 里定义（同包），这里直接复用，不要重复声明。
 
 func TestBatchValidationMatrix(t *testing.T) {
 	e := newEnv(t, 8) // 接受的用例各自真的下单：机器要够，窗口彼此错开或落在不同机器
+	dbtest.Fund(t, e.pool, e.userID, 5_000_000) // 1m×3（479,700 分）+ 1d×90（621,000 分）+ 其余单日单，startFunds 不够
 	h := func(d time.Duration) *time.Time { x := dbtest.T0.Add(d); return &x } // T0 是整点
 	cases := []struct {
 		name string
@@ -2425,8 +2433,8 @@ func TestBatchIdempotencyReplayAndConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	again, err := e.svc.PlaceBatch(e.ctx, req)
-	if err != nil || again.Batch.ID != first.Batch.ID || len(again.Orders) != 2 || again.Instances[0].ID != first.Instances[0].ID {
-		t.Fatalf("replay = %+v, %v", again, err)
+	if err != nil || again.Batch.ID != first.Batch.ID || len(again.Orders) != 2 || again.Instances[0].ID != first.Instances[0].ID || again.Instances[1].ID != first.Instances[1].ID {
+		t.Fatalf("replay = %+v, %v", again, err) // 两边都按实例 ID 排序，顺序必须一致
 	}
 	if b := e.balance(e.userID); b != startFunds-2*6900 {
 		t.Fatalf("replay charged again: %d", b)
@@ -2684,6 +2692,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -2882,6 +2891,9 @@ func (s *Service) placeBatch(ctx context.Context, req BatchRequest, withBatch bo
 				}
 				out.Orders = append(out.Orders, ord)
 			}
+			// 顺序唯一：按实例 ID 排序（loadBatch 回放也按 id），避免「首单按挑机顺序、回放按 id」不一致
+			sort.Slice(insts, func(i, j int) bool { return insts[i].ID < insts[j].ID })
+			sort.Slice(out.Orders, func(i, j int) bool { return out.Orders[i].InstanceID < out.Orders[j].InstanceID })
 			out.Instances = insts
 			return nil
 		})
@@ -3108,7 +3120,10 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 		if err := recordEvent(ctx, tx, inst.ID, inst.State, inst.State, "renew "+ord.ID, now); err != nil {
 			return err
 		}
-		return s.refreshLease(ctx, tx, inst.ID, now)
+		if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
+			return err
+		}
+		return s.verifyLeaseFits(ctx, tx, inst.ID, now)
 	})
 	if isIdempotencyViolation(err) {
 		prev, found, ferr := findByIdempotencyKey(ctx, s.d.Pool, userID, idempotencyKey)
@@ -3132,7 +3147,7 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 	case inst.State == StateReserved:
 		_, err = tx.Exec(ctx, `UPDATE instances SET pending_seconds = pending_seconds + $2, updated_at = $3 WHERE id = $1`, inst.ID, secs, now)
 		if err == nil { // 预订的占用时段按新时长推后（refreshLease 对 reserved 不动，这里直接改）
-			_, err = tx.Exec(ctx, `UPDATE machine_leases SET period = tstzrange(lower(period), upper(period) + make_interval(secs => $2)), updated_at = $3
+			_, err = tx.Exec(ctx, `UPDATE machine_leases SET period = tstzrange(lower(period), upper(period) + ($2::bigint * interval '1 second')), updated_at = $3
 				WHERE instance_id = $1 AND status = 'reserved'`, inst.ID, secs, now)
 		}
 ```
@@ -3187,32 +3202,12 @@ func TestRefundQuoteUsesQuantity(t *testing.T) {
 		t.Fatalf("quote = %+v", q)
 	}
 }
-
-func TestCreateFailureRefundsQuantityOrder(t *testing.T) {
-	e := newEnv(t, 1)
-	req := e.batchReq(1, nil)
-	req.Quantity = 2
-	res, err := e.svc.PlaceBatch(e.ctx, req)
-	if err != nil || res.Orders[0].Amount != 2*6900 {
-		t.Fatalf("batch = %+v, %v", res, err)
-	}
-	if got := e.get(res.Instances[0].ID); got.PendingSeconds != 2*86400 {
-		t.Fatalf("pending = %d", got.PendingSeconds)
-	}
-	e.ack(false) // 开通失败：全额退
-	if b := e.balance(e.userID); b != startFunds {
-		t.Fatalf("balance = %d, want full refund", b)
-	}
-	if status, refunded := e.orderState(res.Orders[0].ID); status != "refunded" || refunded != 2*6900 {
-		t.Fatalf("order = %s %d", status, refunded)
-	}
-}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `go test ./internal/rental/ -run 'TestRefundQuoteUsesQuantity|TestCreateFailureRefundsQuantityOrder' 2>&1 | tail -6`
-Expected: `TestRefundQuoteUsesQuantity` 失败（`Suggested` 按 1 个单位折算，偏大 3 倍）；第二个通过或失败都可以（`refundAll` 退全额不看秒数，但 `ownSecs` 用于换机退款上限，下一步一并改）。
+Run: `go test ./internal/rental/ -run 'TestRefundQuoteUsesQuantity' 2>&1 | tail -6`
+Expected: 失败（`Suggested` 按 1 个单位折算，偏大 3 倍）。`refundAll` 的 `ownSecs` 只影响换机后的退款上限：不单独加「改前就能通过」的测试，由现有 `refund_test.go` 的换机退款用例在改后继续通过来保证。
 
 - [ ] **Step 3: 改 `refund.go`**
 
@@ -3262,7 +3257,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `internal/rental/cancel.go`、`internal/rental/cancel_test.go`
-- Modify: `internal/rental/service.go`（`Notifier` 接口）、`internal/rental/alerts.go`（三条新告警文案）、`internal/plugins/sms/sms.go`（两个模板常量）、`internal/app/app.go`（`expiryNotifier` 实现新方法）、`internal/rental/helpers_test.go`（`fakeNotifier`）、`internal/api/api_test.go`（`rentalNoop`）、`internal/adminapi/helpers_test.go`（`noopNotifier`）
+- Modify: `internal/rental/service.go`（`Notifier` 接口）、`internal/rental/alerts.go`（三条新告警文案）、`internal/plugins/sms/sms.go`（两个模板常量）、`internal/app/app.go`（`expiryNotifier` 实现新方法）、`internal/rental/helpers_test.go`（`fakeNotifier`）、`internal/api/api_test.go`（`rentalNoop`）、`internal/adminapi/helpers_test.go`（`noopNotifier`）、`internal/agentgw/helpers_test.go`（`noopNotifier`，它也实现 `rental.Notifier`）
 
 **Interfaces:**
 - Consumes: Task 5 的 `BatchRequest` / `PlaceBatch`；Task 1 的 `StateCancelled`、`CancelCoolOff` 等常量；现有 `refundableOrders` / `refundAcross`。
@@ -3303,7 +3298,7 @@ func (rentalNoop) NotifyAutoRenewFailed(context.Context, int64, string, string) 
 func (rentalNoop) NotifyBookingCancelled(context.Context, int64, string, string) error { return nil }
 ```
 
-（adminapi 里接收者写 `noopNotifier`。）
+（adminapi 与 agentgw 的 `helpers_test.go` 里接收者都写 `noopNotifier`；三个文件缺一个都会让 `go vet ./...` 失败。）
 
 `internal/rental/cancel_test.go`：
 
@@ -3682,13 +3677,13 @@ func (s *Service) cancelPlatform(ctx context.Context, tx pgx.Tx, inst Instance, 
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `go vet ./... && go test ./internal/rental/ ./internal/api/ ./internal/adminapi/ ./internal/app/ 2>&1 | tail -8`
+Run: `go vet ./... && go test ./internal/rental/ ./internal/api/ ./internal/adminapi/ ./internal/agentgw/ ./internal/app/ 2>&1 | tail -8`
 Expected: 全部 `ok`。
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add internal/rental/cancel.go internal/rental/cancel_test.go internal/rental/service.go internal/rental/alerts.go internal/rental/helpers_test.go internal/plugins/sms/sms.go internal/app/app.go internal/api/api_test.go internal/adminapi/helpers_test.go
+git add internal/rental/cancel.go internal/rental/cancel_test.go internal/rental/service.go internal/rental/alerts.go internal/rental/helpers_test.go internal/plugins/sms/sms.go internal/app/app.go internal/api/api_test.go internal/adminapi/helpers_test.go internal/agentgw/helpers_test.go
 git commit -m "feat(booking): user/admin/platform cancellation with cool-off and two-tier refund, notifier and sms templates
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -3709,6 +3704,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
   - `provision(ctx, tx, inst, now) (after func(), err error)`；`machineReady(ctx, tx, machineID) (bool, error)`（锁机器行）；`startProvision(ctx, tx, inst, lease, now) error`。
   - `reassign(ctx, tx, inst *Instance, lease *leaseRow, reason string, needOnline bool, now) (moved bool, err error)`：成功时就地更新 `inst.MachineID / ReassignCount` 与 `lease.ID / MachineID`，新 lease 以 `reserved` 插入（开通路径随后由 `startProvision` / Create 失败路径置 `active`），旧 lease `cancelled`，事件 `"reassigned <old> -> <new>: <reason>"`。
   - `reassignAfterCreateFailure(ctx, tx, inst, reason string, now, after *func()) error`（规格 §5.4 末段）。
+  - `(Instance).Remaining(now)`：预订实例在 `now < S` 时返回 `expires_at − S`（早开通期间剩余时长不递减；`api.view` 的 `remaining_seconds` 与退款折算 `remainingSeconds` 都随之正确）。
   - `startLease` 对预订首次开通走 `startBooked`：`expires = min(max(S, now) + pending, cap − Tail)`；差额 `compensateShortfall`（按最新可退订单单价退款，remark「迟开通补偿 <id>」，事件 `"late start compensated: <secs>s refund <amount>"`）；事件 `"agent: created (scheduled <S>)"` 或 `"… late by <Δ>)"`。
   - 类型 `cancelFailure{err}`（`Unwrap`），`ProvisionDue` 对它在独立事务里 `RaiseAlertOnce(critical, booking_cancel_failed)`。
 
@@ -3787,9 +3783,16 @@ func TestProvisionDueStartsOneHourBefore(t *testing.T) {
 	if _, upper, _ := e.lease(inst.ID); !upper.Equal(start.Add(24*time.Hour + rental.Tail)) {
 		t.Fatalf("lease upper = %v", upper)
 	}
+	if r := e.get(inst.ID).Remaining(e.clock.Now()); r != 24*time.Hour {
+		t.Fatalf("remaining before S must not tick: %v", r)
+	}
 	e.clock.Advance(55 * time.Minute) // 到 S
 	if r := e.get(inst.ID).Remaining(e.clock.Now()); r != 24*time.Hour {
 		t.Fatalf("remaining at S = %v", r)
+	}
+	e.clock.Advance(time.Hour)
+	if r := e.get(inst.ID).Remaining(e.clock.Now()); r != 23*time.Hour {
+		t.Fatalf("remaining after S = %v", r)
 	}
 }
 
@@ -4125,7 +4128,31 @@ func (s *Service) FailStuckCreating(ctx context.Context) (int, error) {
 }
 ```
 
-- [ ] **Step 4: `results.go`：Create 失败分支与 `startLease` 预订分支**
+- [ ] **Step 4: `results.go`：Create 失败分支与 `startLease` 预订分支；`Remaining` 的早开通分支**
+
+`internal/rental/service.go` 的 `Remaining` 改为：
+
+```go
+// Remaining 返回剩余可用时长；暂停中返回冻结的剩余时长；预订实例在开始时刻之前返回整段预订时长（早开通不计费）；非运行状态返回 0。
+func (i Instance) Remaining(now time.Time) time.Duration {
+	if i.State != StateRunning {
+		return 0
+	}
+	if i.SuspendedAt != nil && i.PausedRemaining != nil {
+		return time.Duration(*i.PausedRemaining) * time.Second
+	}
+	if i.ExpiresAt == nil {
+		return 0
+	}
+	if i.ScheduledStartAt != nil && now.Before(*i.ScheduledStartAt) {
+		return i.ExpiresAt.Sub(*i.ScheduledStartAt)
+	}
+	if r := i.ExpiresAt.Sub(now); r > 0 {
+		return r
+	}
+	return 0
+}
+```
 
 `HandleCommandResult` 改为在事务外持有一个 `after func()`：
 
@@ -4251,6 +4278,7 @@ func (c cancelFailure) Error() string { return "booking cancel failed: " + c.err
 func (c cancelFailure) Unwrap() error { return c.err }
 
 // ProvisionDue 到点开通（规格 §5.2）：开始前 PrepLead 的预订实例逐个开通或改派；开始后仍无机器超过 BookingGrace 则平台取消。
+// 返回值 n 是「本轮处理过的行」：开通、改派、取消，以及「无候选仍在宽限期内等待」的行都计入；测试按状态断言，不按 n。
 func (s *Service) ProvisionDue(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
 	return s.sweepEachAfter(ctx, `state = 'reserved' AND scheduled_start_at <= $1`, now.Add(PrepLead), "scheduled_start_at",
@@ -4319,11 +4347,11 @@ func (s *Service) smsCancelled(inst Instance, reason string) func() {
 	}
 }
 
-// machineReady 锁机器行并判断能否现在开通：空闲、在线、没有活动实例。
+// machineReady 锁机器行（NO KEY UPDATE：随后要插 agent_commands，FOR UPDATE 会与其外键 KEY SHARE 冲突）并判断能否现在开通：空闲、在线、没有活动实例。
 func (s *Service) machineReady(ctx context.Context, tx pgx.Tx, machineID int64) (bool, error) {
 	var state string
 	var online bool
-	err := tx.QueryRow(ctx, `SELECT state, agent_online FROM machines WHERE id = $1 FOR UPDATE`, machineID).Scan(&state, &online)
+	err := tx.QueryRow(ctx, `SELECT state, agent_online FROM machines WHERE id = $1 FOR NO KEY UPDATE`, machineID).Scan(&state, &online)
 	if db.IsNoRows(err) {
 		return false, nil
 	}
@@ -4488,7 +4516,7 @@ Expected: 全部 `ok`。`TestCreatingTimeoutRefundsAndIgnoresLateAck`（即时�
 - [ ] **Step 8: 提交**
 
 ```bash
-git add internal/rental/provision.go internal/rental/reassign.go internal/rental/provision_test.go internal/rental/sweeper.go internal/rental/results.go
+git add internal/rental/provision.go internal/rental/reassign.go internal/rental/provision_test.go internal/rental/sweeper.go internal/rental/results.go internal/rental/service.go
 git commit -m "feat(booking): ProvisionDue with reassignment and grace cancel, booked start timing with shortfall compensation, create-failure reassignment
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -4507,7 +4535,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
   - `rental.RenewOption{Duration catalog.Duration \`json:"duration"\`; QuantityMax int \`json:"quantity_max"\`}`；`rental.RenewInfo{RenewableUntil *time.Time \`json:"renewable_until"\`; Options []RenewOption \`json:"renew_options"\`}`。
   - `(*Service).RenewInfoFor(ctx, inst Instance) (RenewInfo, error)`（只读；API 视图用）。
   - `renewBase(inst, now) time.Time`（规格 §7.1 表的「新上界 − secs − Tail」）；`renewFits(ctx, q, inst, secs, now) error`（不满足返回 `renew_blocked`，消息「该机器自 <cap + PrepLead> 起已有预订，本次最多可续至 <cap − Tail>」，时间按 `tz.Format`）。
-  - `RenewQuantity`、`AdminExtend`、停机续费（同一条路径）在扣款前先 `renewFits`；`addTime` 的 reserved 分支若仍撞排他约束，映射为 `renew_blocked`（通用消息「该机器已有后续预订，无法续费」）。
+  - `RenewQuantity`、`AdminExtend`、停机续费（同一条路径）在扣款前先 `renewFits`，并在 `refreshLease` 之后 `verifyLeaseFits`（lease 上界被并发提交的预订封顶 → `errRenewBlockedGeneric`，事务回滚不扣款）；`addTime` 的 reserved 分支若仍撞排他约束，映射为 `renew_blocked`（通用消息「该机器已有后续预订，无法续费」）。`renewHook`（测试钩子）与 `SetRenewHookForTest`。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -4563,7 +4591,7 @@ func TestRenewBlockedByReservationDoesNotCharge(t *testing.T) {
 	if !e.get(inst.ID).ExpiresAt.Equal(dbtest.T0.Add(48 * time.Hour)) {
 		t.Fatal("1d renewal must extend")
 	}
-	// 停机期续费：base = now + 20m + pending；到期停机后续 1d 可以（T0 + 48h + 20m + 24h ≤ T0 + 64h 不成立……用 1d 之后 2d 就不行）
+	// 停机期续费：base = now + 20m + pending；停机在 T0 + 48h，续 2d → T0 + 96h20m > 可续至 T0 + 64h → renew_blocked
 	e.clock.Advance(48 * time.Hour)
 	if _, err := e.svc.ExpireDue(e.ctx); err != nil {
 		t.Fatal(err)
@@ -4574,6 +4602,33 @@ func TestRenewBlockedByReservationDoesNotCharge(t *testing.T) {
 	}
 	if e.get(inst.ID).PendingSeconds != 0 {
 		t.Fatal("blocked stopped renewal must not add pending time")
+	}
+}
+
+// 评审 M2：renewFits 通过之后、本事务提交之前，另一连接提交了同机紧随的预订 → 必须 renew_blocked 且不扣款。
+func TestRenewRaceWithNewReservationIsBlocked(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true) // expires = T0 + 24h，lease 上界 T0 + 31h
+	restore := rental.SetRenewHookForTest(func() {
+		e.reserveRaw(e.machines[0], dbtest.T0.Add(32*time.Hour), 86400) // 下界 T0 + 31h：紧贴当前 lease，续 1d 就越界
+	})
+	defer restore()
+	balance := e.balance(e.userID)
+	_, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, "")
+	if ae := apperr.As(err); ae == nil || ae.Code != "renew_blocked" {
+		t.Fatalf("want renew_blocked, got %v", err)
+	}
+	got := e.get(inst.ID)
+	if e.balance(e.userID) != balance || !got.ExpiresAt.Equal(dbtest.T0.Add(24*time.Hour)) {
+		t.Fatalf("race must roll back charge and expiry: balance=%d expires=%v", e.balance(e.userID), got.ExpiresAt)
+	}
+	if _, upper, _ := e.lease(inst.ID); !upper.Equal(dbtest.T0.Add(31 * time.Hour)) {
+		t.Fatalf("lease upper = %v", upper)
+	}
+	restore()
+	if _, err := e.svc.Renew(e.ctx, e.userID, inst.ID, catalog.D1d, ""); apperr.As(err) == nil || apperr.As(err).Code != "renew_blocked" {
+		t.Fatalf("after the reservation exists renewFits itself must block: %v", err)
 	}
 }
 
@@ -4697,14 +4752,54 @@ func (s *Service) renewFits(ctx context.Context, q db.Querier, inst Instance, se
 var errRenewBlockedGeneric = apperr.New("renew_blocked", "该机器已有后续预订，无法续费", 409)
 ```
 
-（`renew.go` import 加 `"fmt"`、`"spark-cloud/internal/platform/db"`、`"spark-cloud/internal/platform/tz"`。）
+（`renew.go` import 加 `"fmt"`、`"spark-cloud/internal/platform/tz"`；`db` 已经导入，不要重复加。）
 
-`RenewQuantity` 在状态检查之后、`charge` 之前插入：
+`RenewQuantity` 在状态检查之后、`charge` 之前插入（`renewHook` 是只给测试用的钩子，用来在 `renewFits` 通过之后、扣款之前制造并发预订）：
 
 ```go
 		if err := s.renewFits(ctx, tx, inst, secs, now); err != nil {
 			return err
 		}
+		if renewHook != nil {
+			renewHook()
+		}
+```
+
+**竞态复核（评审 M2）**：`renewFits` 只读 cap、不锁任何行；若另一事务在它之后、本事务提交之前提交了同机紧随的预订，`refreshLease` 会把 lease 上界封顶而不是报错，结果是扣了款、`expires_at` 却越过了已付的预订。所以三条加时路径（`RenewQuantity`、`AdminExtend`、`autoRenewOne`）在 `refreshLease` **之后**都再做一次复核：lease 上界必须等于按新状态算出的 `occupiedUntil`，否则返回 `errRenewBlockedGeneric`，整个事务（含扣款）回滚。`renew.go` 追加：
+
+```go
+// renewHook 测试钩子：在 renewFits 通过后、扣款前调用（制造「并发预订刚提交」的竞态）；生产为 nil。
+var renewHook func()
+
+// verifyLeaseFits 加时并 refreshLease 之后复核：lease 上界若被同机新提交的预订封顶（小于按新状态算出的 occupiedUntil），
+// 说明 renewFits 读到的 cap 已过期——返回 renew_blocked 让事务回滚，不能既扣款又让到期越过别人已付的预订。
+func (s *Service) verifyLeaseFits(ctx context.Context, tx pgx.Tx, id string, now time.Time) error {
+	inst, err := lockInstance(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if inst.Booked() && inst.State == StateReserved { // reserved 的 lease 由 addTime 直接推后，撞约束时已经报错
+		return nil
+	}
+	var upper time.Time
+	if err := tx.QueryRow(ctx, `SELECT upper(period) FROM machine_leases WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`, id).Scan(&upper); err != nil {
+		return err
+	}
+	if upper.Before(occupiedUntil(inst, now)) {
+		return errRenewBlockedGeneric
+	}
+	return nil
+}
+```
+
+`internal/rental/export_test.go` 追加：
+
+```go
+// SetRenewHookForTest 设置 renewFits 之后的钩子，返回恢复函数。
+func SetRenewHookForTest(f func()) func() {
+	renewHook = f
+	return func() { renewHook = nil }
+}
 ```
 
 `addTime` 的 reserved 分支末尾：`if db.IsExclusionViolation(err) { return errRenewBlockedGeneric }`。
@@ -4717,6 +4812,8 @@ var errRenewBlockedGeneric = apperr.New("renew_blocked", "该机器已有后续�
 		}
 ```
 
+并把它原来的 `if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil { return err }` 之后、审计之前加一行 `if err := s.verifyLeaseFits(ctx, tx, inst.ID, now); err != nil { return err }`。
+
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `go vet ./... && go test ./internal/rental/ 2>&1 | tail -4`
@@ -4725,7 +4822,7 @@ Expected: `ok`。
 - [ ] **Step 5: 提交**
 
 ```bash
-git add internal/rental/renew.go internal/rental/admin_ops.go internal/rental/renew_test.go
+git add internal/rental/renew.go internal/rental/admin_ops.go internal/rental/renew_test.go internal/rental/export_test.go
 git commit -m "feat(booking): renewFits blocks extensions past the next reservation; renewable_until and renew options
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -4908,20 +5005,32 @@ func TestAutoRenewSkipsStoppedAndSuspended(t *testing.T) {
 	e.ack(true)
 	e.autoRenewOn(a.ID, catalog.D1d)
 	e.autoRenewOn(b.ID, catalog.D1d)
-	// a 到期停机（关掉自动续费后再让它到期）；b 失联暂停
+	// 到期前 1h：b 所在机器失联 → b 暂停（running + suspended_at，剩余 1h 冻结）；a 暂时关掉自动续费免得被续
 	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET auto_renew = false WHERE id = $1`, a.ID); err != nil {
 		t.Fatal(err)
 	}
-	e.clock.Advance(24 * time.Hour)
-	_, _ = e.svc.ExpireDue(e.ctx)
-	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET auto_renew = true WHERE id = $1`, a.ID); err != nil {
-		t.Fatal(err)
-	}
+	e.clock.Advance(23 * time.Hour)
 	if _, err := e.svc.SuspendMachines(e.ctx, []int64{b.MachineID}); err != nil {
 		t.Fatal(err)
 	}
+	if got := e.get(b.ID); got.State != rental.StateRunning || got.SuspendedAt == nil {
+		t.Fatalf("b must be suspended: %+v", got)
+	}
 	n, err := e.svc.AutoRenewDue(e.ctx)
-	mustCount(t, n, err, 0, "stopped and suspended skipped")
+	mustCount(t, n, err, 0, "suspended skipped")
+	if got := e.get(b.ID); !got.ExpiresAt.Equal(dbtest.T0.Add(24 * time.Hour)) {
+		t.Fatalf("suspended instance must not be auto-renewed: %+v", got)
+	}
+	// 到期：a 停机（b 暂停中不被判到期）；再打开 a 的自动续费也不会续
+	e.clock.Advance(time.Hour)
+	if n, err := e.svc.ExpireDue(e.ctx); err != nil || n != 1 {
+		t.Fatalf("expire = %d, %v", n, err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET auto_renew = true WHERE id = $1`, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	n, err = e.svc.AutoRenewDue(e.ctx)
+	mustCount(t, n, err, 0, "stopped skipped")
 	if e.get(a.ID).State != rental.StateStopped {
 		t.Fatal("stopped instance must not be auto-renewed")
 	}
@@ -4984,15 +5093,16 @@ func (s *Service) SetAutoRenew(ctx context.Context, userID int64, id string, ena
 	return out, err
 }
 
-// autoRenewPred：到期前 1 小时内、运行中未暂停、开了自动续费；失败后按原因间隔重试（$1 = now + AutoRenewLead）。
-const autoRenewPred = `state = 'running' AND suspended_at IS NULL AND auto_renew AND expires_at <= $1
-	AND (auto_renew_failed_at IS NULL OR auto_renew_failed_at <= $1 - interval '1 hour'
-	     - CASE WHEN auto_renew_failed_reason = 'renew_blocked' THEN interval '10 minutes' ELSE interval '1 minute' END)`
+// autoRenewPred：到期前 AutoRenewLead 内、运行中未暂停、开了自动续费；失败后按原因间隔重试（$1 = now；间隔来自常量）。
+var autoRenewPred = fmt.Sprintf(`state = 'running' AND suspended_at IS NULL AND auto_renew AND expires_at <= $1 + interval '%d seconds'
+	AND (auto_renew_failed_at IS NULL OR auto_renew_failed_at <= $1
+	     - CASE WHEN auto_renew_failed_reason = 'renew_blocked' THEN interval '%d seconds' ELSE interval '%d seconds' END)`,
+	int(AutoRenewLead/time.Second), int(AutoRenewRetryBlocked/time.Second), int(AutoRenewRetry/time.Second))
 
 // AutoRenewDue 自动续费（规格 §7.2）：到期前 AutoRenewLead 扣款并延长；余额不足或被预订挡住时记失败标记，首次失败发短信。
 func (s *Service) AutoRenewDue(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
-	return s.sweepEachAfter(ctx, autoRenewPred, now.Add(AutoRenewLead), "expires_at",
+	return s.sweepEachAfter(ctx, autoRenewPred, now, "expires_at",
 		func(tx pgx.Tx, inst Instance) (func(), error) { return s.autoRenewOne(ctx, tx, inst, now) }, nil)
 }
 
@@ -5025,6 +5135,7 @@ func (s *Service) autoRenewOne(ctx context.Context, tx pgx.Tx, inst Instance, no
 		func() error { return s.addTime(ctx, sp, inst, seconds(d), now) },
 		func() error { return recordEvent(ctx, sp, inst.ID, StateRunning, StateRunning, fmt.Sprintf("auto renew %s (%s)", ord.ID, d), now) },
 		func() error { return s.refreshLease(ctx, sp, inst.ID, now) },
+		func() error { return s.verifyLeaseFits(ctx, sp, inst.ID, now) }, // 评审 M2：并发预订刚提交时不能既扣款又越过它
 		func() error {
 			_, err := sp.Exec(ctx, `UPDATE instances SET auto_renew_failed_at = NULL, auto_renew_failed_reason = '', updated_at = $2 WHERE id = $1`, inst.ID, now)
 			return err
@@ -5144,7 +5255,10 @@ func TestGroupCalendarCountsFreeMachinesPerDay(t *testing.T) {
 	if err != nil || len(days) != 5 {
 		t.Fatalf("calendar = %+v, %v", days, err)
 	}
-	want := []rental.CalendarDay{{"2026-01-01", 2, 2}, {"2026-01-02", 2, 2}, {"2026-01-03", 1, 2}, {"2026-01-04", 1, 2}, {"2026-01-05", 2, 2}}
+	want := []rental.CalendarDay{
+		{Date: "2026-01-01", Free: 2, Total: 2}, {Date: "2026-01-02", Free: 2, Total: 2}, {Date: "2026-01-03", Free: 1, Total: 2},
+		{Date: "2026-01-04", Free: 1, Total: 2}, {Date: "2026-01-05", Free: 2, Total: 2},
+	}
 	for i, d := range days {
 		if d != want[i] {
 			t.Fatalf("day[%d] = %+v, want %+v", i, d, want[i])
@@ -5497,7 +5611,7 @@ func TestUserEventsWhitelistAndMasking(t *testing.T) {
 			}
 		}
 	}
-	want := []string{"renew", "created", "reassigned", "order"} // 新到旧
+	want := []string{"renew", "created", "provision", "reassigned", "order"} // 新到旧：开通链路先记 reassigned 再记 scheduled start
 	if len(kinds) != len(want) {
 		t.Fatalf("kinds = %v, want %v", kinds, want)
 	}
@@ -5506,7 +5620,7 @@ func TestUserEventsWhitelistAndMasking(t *testing.T) {
 			t.Fatalf("kinds = %v, want %v", kinds, want)
 		}
 	}
-	if events[3].Detail != "预订下单，2026-01-01 11:00 开始" || events[2].Detail != "已为您更换机器" {
+	if events[4].Detail != "预订下单，2026-01-01 11:00 开始" || events[3].Detail != "已为您更换机器" || events[2].Detail != "开始开通" {
 		t.Fatalf("details = %+v", events)
 	}
 	if _, err := e.svc.UserEvents(e.ctx, e.userID+1, inst.ID); err == nil {
@@ -5647,8 +5761,9 @@ func TestBookingEndpoints(t *testing.T) {
 	if code != 200 || out["items"].([]any)[0].(map[string]any)["idle_count"].(float64) != 1 {
 		t.Fatalf("idle_count = %d %v", code, out)
 	}
-	// 机器日历：匿名也能看，但不带实例 ID
-	code, out = anon.do("GET", "/machines/"+itoa(m2)+"/calendar?days=5", nil)
+	// 机器日历：匿名也能看，但不带实例 ID（看仍有预订的那台：insts[1] 所在机器）
+	other := int64(insts[1].(map[string]any)["machine_id"].(float64))
+	code, out = anon.do("GET", "/machines/"+itoa(other)+"/calendar?days=5", nil)
 	periods := out["periods"].([]any)
 	if code != 200 || len(periods) != 1 || periods[0].(map[string]any)["instance_id"] != nil {
 		t.Fatalf("machine calendar = %d %v", code, out)
@@ -5854,6 +5969,13 @@ func (l *ipLimiter) allow(key string, now time.Time) bool {
 		return false
 	}
 	l.hits[key] = append(ts, now)
+	// 匿名端点按 IP 建键：顺手清掉一个已空的键，map 不会无界增长（每次调用摊销 O(1)）
+	for k, v := range l.hits {
+		if k != key && (len(v) == 0 || now.Sub(v[len(v)-1]) >= time.Minute) {
+			delete(l.hits, k)
+			break
+		}
+	}
 	return true
 }
 
@@ -6082,6 +6204,14 @@ func (s *Server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	// 规格 §10.1：指定机器时 group_id 必须是该机器所在机组（validateBatch 不管这条，后台改派与 rental 测试依赖它的宽松）
+	if req.MachineID != nil {
+		m, err := s.Fleet.Get(r.Context(), s.Fleet.Pool(), *req.MachineID)
+		if err != nil || m.GroupID == nil || req.GroupID == nil || *m.GroupID != *req.GroupID {
+			s.writeError(w, r, apperr.BadRequest("指定机器时 group_id 必须是该机器所在机组"))
+			return
+		}
+	}
 	res, err := s.Rental.PlaceBatch(r.Context(), rental.BatchRequest{
 		UserID: currentUser(r).ID, ProductID: req.ProductID, ImageID: req.ImageID, GroupID: req.GroupID, MachineID: req.MachineID,
 		Count: req.Count, Duration: catalog.Duration(req.Duration), Quantity: req.Quantity, StartAt: start,
@@ -6308,7 +6438,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: Task 7 `AdminCancelBooking`；Task 8 `reassign` / `lockLease`；Task 11 `MachineCalendar`；Task 5 `Order` 字段；`paging`。
 - Produces:
   - `rental.BookingFilter{State string; UserID, GroupID, MachineID int64; From, To *time.Time}`（`From/To` 作用于 `scheduled_start_at`；`State` 缺省 `reserved`，允许 `reserved / cancelled`）；`(*Service).AdminListBookings(ctx, f, page) ([]Instance, int, error)`（按 `scheduled_start_at, id`）。
-  - `(*Service).UpcomingBookings(ctx, from time.Time, days int) ([]int, error)`（北京时间逐日 reserved 开始台数）；`(*Service).UpcomingBookingsForMachine(ctx, machineID) (int, error)`。
+  - `(*Service).UpcomingBookings(ctx, from time.Time, days int) ([]int, error)`（北京时间逐日 reserved 开始台数）；`(*Service).UpcomingBookingsForMachine(ctx, machineID) (int, error)`；`(*Service).MachineStates(ctx, ids []int64) (map[int64]string, error)`；`GET /bookings` 每行为 `instanceView` 加 `machine_state`。
   - `(*Service).AdminReassign(ctx, actor, id string, machineID *int64, reason string) (Instance, error)`：仅 reserved；`machineID` 为 nil 时同组自动挑选（不要求在线），否则目标机器必须 `idle / allocated` 且时段无冲突（任意机组，含不可见），不满足 → `ErrMachineUnavailable`；审计 `booking.reassign`（diff `from_machine / to_machine / reason`）。
   - `rental.OrderFilter.BatchID string`。
   - 后台路由：`GET /bookings`（all）、`GET /bookings/upcoming?days=`（all）、`POST /instances/{id}/cancel-booking`（ops，body `{reason, totp}`）、`POST /instances/{id}/reassign`（ops，body `{machine_id?, reason}`）、`GET /machines/{id}/calendar?from&days`（ops）。
@@ -6333,6 +6463,17 @@ import (
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/rental"
 )
+
+// smsCount 按模板统计已发送短信条数。
+func (e *env) smsCount(template string) int {
+	n := 0
+	for _, m := range e.sms.Sent() {
+		if m.Template == template {
+			n++
+		}
+	}
+	return n
+}
 
 func (e *env) book(uid int64, start time.Time) rental.Instance {
 	e.t.Helper()
@@ -6398,9 +6539,10 @@ func TestBookingAdminAPI(t *testing.T) {
 	if code, out := fin.do("POST", "/instances/"+inst.ID+"/reassign", map[string]any{"reason": "x"}); code != 403 || codeOf(out) != "forbidden" {
 		t.Fatalf("finance reassign = %d %v", code, out)
 	}
-	// 进入维护时的提示数
-	code, out = ops.do("POST", "/machines/"+itoa(target)+"/maintenance", map[string]any{"on": true})
-	if code != 200 || out["state"] != "maintenance" {
+	// 进入维护时的提示数：对预订当前所在的机器（自动改派后要重读）
+	cur, _ := e.rental.Get(e.ctx, inst.ID)
+	code, out = ops.do("POST", "/machines/"+itoa(cur.MachineID)+"/maintenance", map[string]any{"on": true})
+	if code != 200 || out["state"] != "maintenance" || out["upcoming_bookings"].(float64) != 1 {
 		t.Fatalf("maintenance = %d %v", code, out)
 	}
 	// 订单按批次筛选与 CSV
@@ -6525,6 +6667,28 @@ func (s *Service) UpcomingBookings(ctx context.Context, from time.Time, days int
 	return pgx.CollectRows(rows, pgx.RowTo[int])
 }
 
+// MachineStates 批量读取机器状态（预订列表里标出钉在 faulty / maintenance 机器上的预订，便于宽限期前手动改派）。
+func (s *Service) MachineStates(ctx context.Context, ids []int64) (map[int64]string, error) {
+	out := map[int64]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.d.Pool.Query(ctx, `SELECT id, state FROM machines WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var st string
+		if err := rows.Scan(&id, &st); err != nil {
+			return nil, err
+		}
+		out[id] = st
+	}
+	return out, rows.Err()
+}
+
 // UpcomingBookingsForMachine 机器上未开通预订的台数（进入维护时提示）。
 func (s *Service) UpcomingBookingsForMachine(ctx context.Context, machineID int64) (int, error) {
 	var n int
@@ -6575,6 +6739,7 @@ func (s *Service) AdminReassign(ctx context.Context, actor audit.Actor, id strin
 }
 
 // reassignTo 改派到指定机器：机器存在、同商品、idle / allocated、与 lease 时段无冲突（排他约束兜底）。
+// 与自动挑选不对称（有意）：不要求 agent_online（提前改派，开通时再看），也允许 visible=false 机组的机器（运维留池）；后台页面的说明文字同此。
 func (s *Service) reassignTo(ctx context.Context, tx pgx.Tx, inst *Instance, lease *leaseRow, target int64, reason string, now time.Time) error {
 	if target == inst.MachineID {
 		return apperr.ErrMachineUnavailable
@@ -6681,7 +6846,26 @@ func (s *Server) handleListBookings(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, httpx.Page(s.instanceViews(list), total))
+	ids := make([]int64, 0, len(list))
+	for _, i := range list {
+		ids = append(ids, i.MachineID)
+	}
+	states, err := s.Rental.MachineStates(r.Context(), ids)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	views := make([]bookingView, 0, len(list))
+	for _, i := range list {
+		views = append(views, bookingView{instanceView: s.instanceView(i), MachineState: states[i.MachineID]})
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.Page(views, total))
+}
+
+// bookingView 预订列表行：实例视图加当前机器状态（faulty / maintenance 上的预订需要运维在宽限期前改派）。
+type bookingView struct {
+	instanceView
+	MachineState string `json:"machine_state"`
 }
 
 type upcomingDay struct {
@@ -7154,7 +7338,7 @@ func (s *Service) ListIngressRoutes(ctx context.Context) ([]IngressRoute, error)
 		return fmt.Sprintf(BannerReservedFmt, when)
 ```
 
-（import 加 `"spark-cloud/internal/platform/tz"`。）
+（import 加 `"spark-cloud/internal/platform/tz"`；同一文件的 `stopped` 分支 `info.RetainUntil.In(cst).Format("2006-01-02 15:04")` 改为 `tz.Format(*info.RetainUntil)` 并删掉包级 `cst`，一个文件只留一个时区来源；`adminapi/finance.go` 的 `cst` 同理改用 `tz.CST`。）
 
 `internal/sshgw/lifecycle.go` 的 `terminalState`：`case rental.StateStopped, rental.StateWiping, rental.StateReleased, rental.StateFailed, rental.StateCancelled:`。
 
@@ -7254,11 +7438,22 @@ func TestConcurrentBatchesConsistent(t *testing.T) {
 		wg.Add(1)
 		go func(j job) {
 			defer wg.Done()
-			_, err := e.svc.PlaceBatch(ctx, j.req)
+			res, err := e.svc.PlaceBatch(ctx, j.req)
 			mu.Lock()
 			defer mu.Unlock()
 			if err == nil {
 				okCount++
+				// 排他约束已保证「同机时段不交」；真正能抓问题的是这两条：批次内机器两两不同、返回台数 == 批次 count
+				seen := map[int64]bool{}
+				for _, inst := range res.Instances {
+					if seen[inst.MachineID] {
+						t.Errorf("batch %s has two instances on machine %d", res.Batch.ID, inst.MachineID)
+					}
+					seen[inst.MachineID] = true
+				}
+				if len(res.Instances) != res.Batch.Count || len(res.Orders) != res.Batch.Count || res.Batch.Count != j.req.Count {
+					t.Errorf("batch %s returned %d instances / %d orders for count %d", res.Batch.ID, len(res.Instances), len(res.Orders), res.Batch.Count)
+				}
 				return
 			}
 			ae := apperr.As(err)
@@ -7455,16 +7650,18 @@ func TestBookingLifecycleHTTP(t *testing.T) {
 		t.Fatalf("renewable_until missing: %v", st)
 	}
 	e.clk.Advance(30 * 24 * time.Hour) // now = expires1 − 1h：自动续费到点
-	before := len(e.sms.Sent())
 	e.sweep()
 	st = e.state(id)
-	if st["auto_renew_failed_reason"] != "renew_blocked" || len(e.sms.Sent()) != before+1 || e.sms.Sent()[before].Template != sms.TemplateAutoRenewFailed {
+	if st["auto_renew_failed_reason"] != "renew_blocked" || e.smsCount(sms.TemplateAutoRenewFailed) != 1 { // 同一轮可能还有到期提醒短信，按模板计数
 		t.Fatalf("blocked auto renew = %v sms=%+v", st, e.sms.Sent())
 	}
 	// 到期停机 → 6h 保留 → 洗机 → 释放；下一预订在 S2 − 1h 开通
 	e.clk.Advance(time.Hour)
 	e.sweep()
 	e.agent()
+	if e.smsCount(sms.TemplateAutoRenewFailed) != 1 { // 10 分钟重试间隔内到期：被挡的自动续费只发过一条短信（规格 S15）
+		t.Fatalf("blocked auto renew must notify once, sms=%+v", e.sms.Sent())
+	}
 	if st := e.state(id); st["state"] != "stopped" {
 		t.Fatalf("expired = %v", st)
 	}
@@ -7657,7 +7854,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `web/shared/src/types/booking.ts`、`web/console/src/logic/booking.ts`、`web/console/src/logic/__tests__/booking.spec.ts`、`web/console/src/components/RentDialog.vue`
-- Modify: `web/shared/src/types/instance.ts`、`web/shared/src/types/index.ts`、`web/shared/src/labels.ts`、`web/console/src/views/MarketView.vue`
+- Modify: `web/shared/src/types/instance.ts`、`web/shared/src/types/index.ts`、`web/shared/src/labels.ts`、`web/shared/src/__tests__/labels.spec.ts`（`auditActions` 长度 37 → 47，并 `toContain('booking.cancel')`）、`web/console/src/views/MarketView.vue`
 
 **Interfaces:**
 - Consumes: Task 12 的控制台 API。
@@ -7980,6 +8177,8 @@ const calendar = ref<CalendarDay[]>([])
 const availability = ref<Availability | null>(null)
 const submitting = ref(false)
 
+const NO_GROUP = 0 // el-option 的 value 不能是 null：0 作为「不限机组」哨兵，提交时映射回 null
+const groupSel = computed({ get: () => form.groupId ?? NO_GROUP, set: (v: number) => { form.groupId = v === NO_GROUP ? null : v } })
 const unitPrice = computed(() => props.product.prices.find((p) => p.duration === form.duration)?.amount ?? null)
 const quantityMax = computed(() => MAX_QUANTITY[form.duration])
 const total = computed(() => (unitPrice.value == null ? null : totalPrice(unitPrice.value, form.quantity, form.count)))
@@ -8148,8 +8347,8 @@ async function submit() {
     <template v-if="step === 'form'">
       <el-form label-position="top">
         <el-form-item label="机组">
-          <el-select v-model="form.groupId" data-testid="rent-group" placeholder="不限机组">
-            <el-option :value="null" label="不限机组" />
+          <el-select v-model="groupSel" data-testid="rent-group" placeholder="不限机组">
+            <el-option :value="NO_GROUP" label="不限机组" />
             <el-option v-for="g in groups" :key="g.id" :value="g.id" :label="`${g.name}${g.region ? ' · ' + g.region : ''}（共 ${g.machine_count} · 现空闲 ${g.idle_now}）`" />
           </el-select>
         </el-form-item>
@@ -8234,8 +8433,9 @@ async function submit() {
         <el-button type="primary" :loading="submitting" data-testid="market-confirm-ok" @click="submit">{{ insufficient ? '去充值' : '确认下单' }}</el-button>
       </template>
     </template>
-    <GuideDialog :guide="guide" />
   </AppDialog>
+  <!-- 放在 AppDialog 外（fragment）：el-dialog 带 destroy-on-close，余额不足时先关对话框再弹引导，放在里面会随插槽销毁 -->
+  <GuideDialog :guide="guide" />
 </template>
 
 <style scoped>
@@ -8321,7 +8521,7 @@ Expected: Vitest 全绿（含 `booking.spec.ts`、既有 `instance.spec.ts` 因 
 - [ ] **Step 8: 提交**
 
 ```bash
-git add web/shared/src/types web/shared/src/labels.ts web/console/src/logic/booking.ts web/console/src/logic/__tests__ web/console/src/components/RentDialog.vue web/console/src/views/MarketView.vue
+git add web/shared/src/types web/shared/src/labels.ts web/shared/src/__tests__/labels.spec.ts web/console/src/logic/booking.ts web/console/src/logic/__tests__ web/console/src/components/RentDialog.vue web/console/src/views/MarketView.vue
 git commit -m "feat(console): booking types, RentDialog (group/count/time/quantity/machine/auto-renew/availability/calendar), market page
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -8539,7 +8739,7 @@ async function cancelAll() {
 
 `web/console/src/views/InstanceDetailView.vue` 的改动点（按现有结构插入）：
 
-`<script>` 增加 import：`type CancelQuote, type UserEvent` 来自 `@spark/shared`；`autoRenewFailureText, canCancel, canSetAutoRenew, renewQuantityMax` 来自 `../logic/instance`；`describeDuration` 来自 `../logic/booking`。新增状态与方法：
+`<script>` 增加 import：`onUnmounted` 加进现有的 vue 导入列表（`import { computed, onMounted, onUnmounted, ref, watch } from 'vue'`）；`type CancelQuote, type Duration, type UserEvent` 来自 `@spark/shared`；`autoRenewFailureText, canCancel, canSetAutoRenew, renewQuantityMax` 来自 `../logic/instance`；`describeDuration` 来自 `../logic/booking`。新增状态与方法：
 
 ```ts
 const nowMs = ref(Date.now())
@@ -9070,7 +9270,7 @@ async function saveDisplay(m: Machine) {
 
 ```vue
 <script setup lang="ts">
-import { fmtDuration, fmtTime, fmtYuan, type AdminGroup, type AdminInstance, type Listed, type Paged } from '@spark/shared'
+import { fmtDuration, fmtTime, fmtYuan, labelOf, machineStateLabel, type AdminGroup, type AdminInstance, type Listed, type Paged } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
@@ -9084,8 +9284,9 @@ import { session } from '../store/session'
 const digits = (v: string) => v.replace(/\D/g, '')
 const filter = reactive({ state: 'reserved', user_id: '', group_id: '', machine_id: '', range: { from: '', to: '' } })
 let applied = { ...filter, range: { ...filter.range } }
-const list = usePaged<AdminInstance>((page, size) =>
-  api.get<Paged<AdminInstance>>('/bookings', { state: applied.state, user_id: applied.user_id, group_id: applied.group_id, machine_id: applied.machine_id, from: applied.range.from, to: applied.range.to, page, page_size: size }),
+type BookingRow = AdminInstance & { machine_state: string }
+const list = usePaged<BookingRow>((page, size) =>
+  api.get<Paged<BookingRow>>('/bookings', { state: applied.state, user_id: applied.user_id, group_id: applied.group_id, machine_id: applied.machine_id, from: applied.range.from, to: applied.range.to, page, page_size: size }),
 )
 const groups = ref<AdminGroup[]>([])
 const groupName = computed(() => new Map(groups.value.map((g) => [g.id, g.name])))
@@ -9183,7 +9384,12 @@ async function submitCancel() {
       <el-table-column label="实例" min-width="150"><template #default="{ row }"><span data-testid="booking-row"><span data-testid="booking-id"><IdLink kind="instance" :id="row.id" /></span></span></template></el-table-column>
       <el-table-column label="用户" width="90"><template #default="{ row }"><span data-testid="booking-user"><IdLink kind="user" :id="row.user_id" /></span></template></el-table-column>
       <el-table-column label="机组" width="120"><template #default="{ row }"><span data-testid="booking-group">{{ row.group_id ? (groupName.get(row.group_id) ?? row.group_id) : '不限' }}</span></template></el-table-column>
-      <el-table-column label="机器" width="90"><template #default="{ row }"><span data-testid="booking-machine"><IdLink kind="machine" :id="row.machine_id" :disabled="isFinance" /></span></template></el-table-column>
+      <el-table-column label="机器" width="150">
+        <template #default="{ row }">
+          <span data-testid="booking-machine"><IdLink kind="machine" :id="row.machine_id" :disabled="isFinance" /></span>
+          <el-tag v-if="row.machine_state === 'faulty' || row.machine_state === 'maintenance'" type="warning" size="small" data-testid="booking-machine-state">{{ labelOf(machineStateLabel, row.machine_state) }}</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="开始" width="150"><template #default="{ row }"><span data-testid="booking-start">{{ fmtTime(row.scheduled_start_at) }}</span></template></el-table-column>
       <el-table-column label="时长" width="110"><template #default="{ row }"><span data-testid="booking-duration">{{ fmtDuration(row.pending_seconds) }}</span></template></el-table-column>
       <el-table-column label="批次" min-width="150"><template #default="{ row }"><span class="mono" data-testid="booking-batch">{{ row.batch_id ?? '—' }}</span></template></el-table-column>
@@ -9202,7 +9408,7 @@ async function submitCancel() {
     </div>
 
     <el-dialog v-model="reassign.visible" title="改派" width="460" align-center data-testid="reassign-dialog">
-      <p class="muted">留空机器 ID 由系统在同机组内自动挑选；指定机器须空闲 / 已分配且所需时段无冲突（可以是任意机组）。</p>
+      <p class="muted">留空机器 ID 由系统在同机组内自动挑选（只挑可见机组）；指定机器须空闲 / 已分配且所需时段无冲突，可以是任意机组（含仅后台可见的留池），不要求此刻在线——开通时再判断。</p>
       <el-form label-position="top" @submit.prevent="submitReassign">
         <el-form-item label="目标机器 ID（可空）"><el-input :model-value="reassign.machineId" data-testid="reassign-machine" @update:model-value="(v: string) => (reassign.machineId = digits(v))" /></el-form-item>
         <el-form-item label="原因（必填）"><el-input v-model="reassign.reason" data-testid="reassign-reason" /></el-form-item>
@@ -9231,7 +9437,7 @@ async function submitCancel() {
 - [ ] **Step 6: 机器详情、实例详情、仪表盘、订单**
 
 `web/admin/src/views/MachineDetailView.vue`：
-- `<script>` 加 `import { type AdminGroup, type Listed } from '@spark/shared'`（并入现有 import）；状态 `const groups = ref<AdminGroup[]>([])`、`const edit = reactive({ visible: false, groupId: '' as string, displayName: '', busy: false })`；`onMounted` 时顺带 `api.get<Listed<AdminGroup>>('/groups')` 填 `groups`；方法：
+- `<script>` 加 `import { type AdminGroup, type Listed } from '@spark/shared'`（并入现有 import），vue 导入列表加 `reactive`（`import { computed, onMounted, reactive, ref } from 'vue'`）；状态 `const groups = ref<AdminGroup[]>([])`、`const edit = reactive({ visible: false, groupId: '' as string, displayName: '', busy: false })`；`onMounted` 时顺带 `api.get<Listed<AdminGroup>>('/groups')` 填 `groups`；方法：
 
 ```ts
 function openEdit() {
@@ -9386,6 +9592,11 @@ export async function groupMachineIds(groupId: number): Promise<number[]> {
   return ((await r.json()).items as { id: number }[]).map((m) => m.id)
 }
 
+/** 整串精确匹配的正则（机组名都以 G<stamp>- 开头，子串 / 前缀匹配会命中多个选项或行）。 */
+export function exact(text: string): RegExp {
+  return new RegExp(`^${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)
+}
+
 /** Element Plus 下拉：点开后选择文本匹配的选项。 */
 export async function pickOption(page: Page, testid: string, text: string | RegExp) {
   await page.getByTestId(testid).click()
@@ -9401,7 +9612,7 @@ export async function pickOption(page: Page, testid: string, text: string | RegE
 ```ts
 import { expect, test, type Page } from '@playwright/test'
 import { clickTwiceSync } from '../helpers/admin'
-import { bookViaApi, groupMachineIds, pickOption, startAfter, uniqueGroupName } from '../helpers/booking'
+import { bookViaApi, exact, groupMachineIds, pickOption, startAfter, uniqueGroupName } from '../helpers/booking'
 import { dialog, loginConsole, nav, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { cstDate } from '../helpers/time'
@@ -9421,13 +9632,14 @@ async function fillStart(page: Page, day: string, hour?: number) {
 }
 
 test('C-BKG-01 预订对话框：机组 / 数量 / 租期联动与可用台数', async ({ page }, info) => {
-  const g = await hooks.groups(uniqueGroupName())
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
   await hooks.machines(2, undefined, undefined, g.id)
   const u = await seedUser({ balance: 1_000_000 })
   await loginConsole(page, u.phone)
   await nav(page, info, 'market')
   await openBooking(page)
-  await pickOption(page, 'rent-group', new RegExp(`^G.*（共 2 · 现空闲 2）$`))
+  await pickOption(page, 'rent-group', exact(`${name}（共 2 · 现空闲 2）`))
   await expect(page.getByTestId('rent-availability')).toHaveText(/可预订 2 台/)
   await page.getByTestId('rent-count').locator('input').fill('3')
   await page.getByTestId('rent-count').locator('input').blur()
@@ -9443,14 +9655,15 @@ test('C-BKG-01 预订对话框：机组 / 数量 / 租期联动与可用台数',
 })
 
 test('C-BKG-02 机组日历：点击日期填入开始日期', async ({ page }, info) => {
-  const g = await hooks.groups(uniqueGroupName())
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
   await hooks.machines(1, undefined, undefined, g.id)
   const u = await seedUser()
   const tomorrow = cstDate(new Date((await hooks.clock()).getTime() + 24 * 3600e3))
   await loginConsole(page, u.phone)
   await nav(page, info, 'market')
   await openBooking(page)
-  await pickOption(page, 'rent-group', /^G/)
+  await pickOption(page, 'rent-group', exact(`${name}（共 1 · 现空闲 1）`))
   await page.getByTestId('rent-start-later').click()
   await expect(page.getByTestId('rent-calendar')).toBeVisible()
   await page.getByTestId(`rent-day-${tomorrow}`).click()
@@ -9458,7 +9671,8 @@ test('C-BKG-02 机组日历：点击日期填入开始日期', async ({ page }, 
 })
 
 test('C-BKG-03 指定机器与占用条带', async ({ page }, info) => {
-  const g = await hooks.groups(uniqueGroupName())
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
   await hooks.machines(1, undefined, undefined, g.id)
   const [mid] = await groupMachineIds(g.id)
   const u = await seedUser({ balance: 1_000_000 })
@@ -9468,7 +9682,7 @@ test('C-BKG-03 指定机器与占用条带', async ({ page }, info) => {
   await loginConsole(page, u.phone)
   await nav(page, info, 'market')
   await openBooking(page)
-  await pickOption(page, 'rent-group', /^G/)
+  await pickOption(page, 'rent-group', exact(`${name}（共 1 · 现空闲 1）`))
   await expect(page.getByTestId('rent-machine')).toBeVisible()
   await pickOption(page, 'rent-machine', /机器 #/)
   await expect(page.getByTestId('rent-machine-periods').locator('li')).toHaveCount(1)
@@ -9479,12 +9693,15 @@ test('C-BKG-03 指定机器与占用条带', async ({ page }, info) => {
 })
 
 test('C-BKG-04 预订成功跳转详情并显示已预订', async ({ page }, info) => {
-  await hooks.machines(1)
+  const name = uniqueGroupName() // 库整轮共享：只有按本用例的机组计数才可控
+  const g = await hooks.groups(name)
+  await hooks.machines(1, undefined, undefined, g.id)
   const u = await seedUser({ balance: 1_000_000 })
   const s = await startAfter(26)
   await loginConsole(page, u.phone)
   await nav(page, info, 'market')
   await openBooking(page)
+  await pickOption(page, 'rent-group', exact(`${name}（共 1 · 现空闲 1）`))
   await fillStart(page, s.day, s.hour)
   await expect(page.getByTestId('rent-availability')).toHaveText(/可预订 1 台/)
   await page.getByTestId('rent-next').click()
@@ -9500,11 +9717,15 @@ test('C-BKG-04 预订成功跳转详情并显示已预订', async ({ page }, inf
 })
 
 test('C-BKG-05 一次 3 台即时下单，按批次筛选显示', async ({ page }, info) => {
-  await hooks.machines(3)
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
+  await hooks.machines(3, undefined, undefined, g.id)
   const u = await seedUser({ balance: 1_000_000 })
   await loginConsole(page, u.phone)
   await nav(page, info, 'market')
   await openBooking(page)
+  await page.getByTestId('rent-start-now').click() // 预订档期按钮打开的是「指定时间」模式，这里要即时
+  await pickOption(page, 'rent-group', exact(`${name}（共 3 · 现空闲 3）`))
   await page.getByTestId('rent-count').locator('input').fill('3')
   await page.getByTestId('rent-count').locator('input').blur()
   await expect(page.getByTestId('rent-availability')).toHaveText(/可租 3 台/)
@@ -9519,14 +9740,18 @@ test('C-BKG-05 一次 3 台即时下单，按批次筛选显示', async ({ page 
 })
 
 test('C-BKG-06 台数不足：按钮禁用并提示', async ({ page }, info) => {
-  await hooks.machines(1)
+  const name = uniqueGroupName()
+  const g = await hooks.groups(name)
+  await hooks.machines(1, undefined, undefined, g.id)
+  const [mid] = await groupMachineIds(g.id)
   const u = await seedUser({ balance: 1_000_000 })
   const api = await userApi(u.phone)
   const s = await startAfter(26)
-  await bookViaApi(api, { startAt: s.iso })
+  await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: mid }) // 订满该组唯一的机器
   await loginConsole(page, u.phone)
   await nav(page, info, 'market')
   await openBooking(page)
+  await pickOption(page, 'rent-group', exact(`${name}（共 1 · 现空闲 1）`))
   await fillStart(page, s.day, s.hour)
   await expect(page.getByTestId('rent-availability')).toHaveText(/可预订 0 台，不足 1 台/)
   await expect(page.getByTestId('rent-next')).toBeDisabled()
@@ -9597,7 +9822,7 @@ test('C-BKG-10 未登录与未实名点预订的引导', async ({ page }, info) 
 
 - [ ] **Step 3: 实例详情 / 列表追加**
 
-`web/e2e/console/instance-detail.spec.ts` 追加（import 加 `bookViaApi, groupMachineIds, startAfter, uniqueGroupName` from `../helpers/booking`、`yuan` from `../helpers/money`、`cstTime` from `../helpers/time`）：
+`web/e2e/console/instance-detail.spec.ts` 追加（import 加 `bookViaApi, groupMachineIds, startAfter, uniqueGroupName` from `../helpers/booking`、`cstTime` from `../helpers/time`）：
 
 ```ts
 test('C-DET-17 预订详情：开始 / 结束 / 机器 / 批次，无释放按钮', async ({ page }) => {
@@ -9676,15 +9901,19 @@ test('C-DET-21 续费表单显示可续至并禁用超限档位；接口提交�
   await hooks.machines(1, undefined, undefined, g.id)
   const [mid] = await groupMachineIds(g.id)
   const u = await seedUser({ balance: 1_000_000 })
-  const { api, id } = await runningInstance(u.phone)
+  const api = await userApi(u.phone)
+  const { ids } = await bookViaApi(api, { groupId: g.id, machineId: mid }) // 即时分支、钉在 mid（runningInstance 会落在任意空闲机器）
+  await hooks.agent()
+  const id = ids[0]
   const s = await startAfter(72)
   await bookViaApi(api, { startAt: s.iso, groupId: g.id, machineId: mid })
   await loginConsole(page, u.phone)
   await page.goto(`/instances/${id}`)
   await page.getByTestId('detail-renew-btn').click()
   await expect(page.getByTestId('detail-renew-until')).toContainText('可续至')
-  await expect(page.getByTestId('detail-renew-duration-1w')).toBeDisabled()
-  await expect(page.getByTestId('detail-renew-duration-1d')).toBeEnabled()
+  // testid 在 el-radio-button 的 <label> 上，disabled 落在内部 <input>
+  await expect(page.getByTestId('detail-renew-duration-1w').locator('input')).toBeDisabled()
+  await expect(page.getByTestId('detail-renew-duration-1d').locator('input')).toBeEnabled()
   const r = await api.post(`/api/v1/instances/${id}/renew`, { data: { duration: '1w', quantity: 1 }, headers: { 'Idempotency-Key': crypto.randomUUID() } })
   expect(r.status()).toBe(409)
   expect(((await r.json()) as { code: string; message: string }).message).toMatch(/^该机器自 .* 起已有预订，本次最多可续至 /)
@@ -9709,7 +9938,10 @@ test('C-DET-23 自动续费被预订挡住时降档，动态显示实际档位',
   await hooks.machines(1, undefined, undefined, g.id)
   const [mid] = await groupMachineIds(g.id)
   const u = await seedUser({ balance: 1_000_000 })
-  const { api, id } = await runningInstance(u.phone) // expires = now + 1d
+  const api = await userApi(u.phone)
+  const { ids } = await bookViaApi(api, { groupId: g.id, machineId: mid }) // 即时、钉在 mid；expires = now + 1d
+  await hooks.agent()
+  const id = ids[0]
   await api.put(`/api/v1/instances/${id}/auto-renew`, { data: { enabled: true, duration: '1m' } })
   // 下一预订开始 = now + 1d + 8d + 8h（整点）→ 可续至 now + 1d + 8d：1m 放不下、1w 放得下
   const s = await startAfter(24 + 8 * 24 + 8)
@@ -9828,7 +10060,7 @@ test('A-INS-13 实例详情显示预订字段与只读自动续费', async ({ pa
 ```ts
 import { expect, test } from '@playwright/test'
 import { adminApi, createAdmin, getJSON, loginAdmin } from '../helpers/admin'
-import { pickOption, uniqueGroupName } from '../helpers/booking'
+import { exact, pickOption, uniqueGroupName } from '../helpers/booking'
 import { toast } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 
@@ -9842,7 +10074,7 @@ test('A-GRP-01 新建 / 编辑机组与可见开关', async ({ page }) => {
   await page.getByTestId('group-form-region').fill('一楼')
   await page.getByTestId('group-form-submit').click()
   await toast(page, '机组已创建')
-  const row = page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: name }) })
+  const row = page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: exact(name) }) })
   await expect(row.getByTestId('group-region')).toHaveText('一楼')
   await expect(row.getByTestId('group-visible')).toHaveText('可见')
   await row.getByTestId('group-edit').click()
@@ -9864,7 +10096,7 @@ test('A-GRP-02 删除：有机器时拒绝，移出后可删', async ({ page }) 
   await hooks.machines(1, undefined, undefined, g.id)
   await loginAdmin(page, admin)
   await page.goto('/admin/groups')
-  const row = page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: name }) })
+  const row = page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: exact(name) }) })
   await row.getByTestId('group-delete').click()
   await page.getByTestId('group-delete-ok').click()
   await toast(page, '机组内还有机器或未结束的实例')
@@ -9885,7 +10117,7 @@ test('A-GRP-03 批量加入 / 移出机器', async ({ page }) => {
   const ids = await hooks.machines(2)
   await loginAdmin(page, admin)
   await page.goto('/admin/groups')
-  const row = page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: name }) })
+  const row = page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: exact(name) }) })
   await row.getByTestId('group-machines').click()
   await page.getByTestId('gm-add-input').fill(ids.join(','))
   await page.getByTestId('gm-add').click()
@@ -9904,7 +10136,7 @@ test('A-GRP-04 展示名：保存、重名拒绝', async ({ page }) => {
   await hooks.machines(2, undefined, undefined, g.id)
   await loginAdmin(page, admin)
   await page.goto('/admin/groups')
-  const row = page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: name }) })
+  const row = page.getByRole('row').filter({ has: page.getByTestId('group-name').filter({ hasText: exact(name) }) })
   await row.getByTestId('group-machines').click()
   const label = `${name}-01`
   await page.getByTestId('gm-display-input').first().fill(label)
@@ -10050,7 +10282,7 @@ test('A-BKG-06 仪表盘显示未来 7 天预订开始台数', async ({ page }) 
 
 `web/e2e/coverage.json`：`console` 数组追加 `"C-BKG-01"`～`"C-BKG-10"`、`"C-DET-17"`～`"C-DET-24"`、`"C-INS-05"`～`"C-INS-07"`；`admin` 数组追加 `"A-GRP-01"`～`"A-GRP-05"`、`"A-BKG-01"`～`"A-BKG-06"`、`"A-INS-13"`。
 
-`web/playwright.config.ts` 的 `projects` 上方注释末尾追加一句：`计划 6 的预订用例（C-BKG / C-DET-17～24 / C-INS-05～07 / A-BKG）按服务器时间（hooks.clock）算开始时刻，每个用例最多推进约 10 天（C-DET-23），都只用自己新登记的机器与机组。`
+`web/playwright.config.ts` 的 `projects` 上方注释末尾追加一句：`计划 6 的预订用例（C-BKG / C-DET-17～24 / C-INS-05～07 / A-BKG）按服务器时间（hooks.clock）算开始时刻，每个用例最多推进约 1 天（C-DET-22 / 23 推进 23 小时；没有用例推进到 3 天以上），都只用自己新登记的机器与机组。`
 
 - [ ] **Step 6: 运行**
 
@@ -10166,6 +10398,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ## 可以继续延后
 - 即时分支的 `no_capacity` 保持旧消息与错误值（前端引导依赖），只有预订分支带台数。
 - 控制台实例列表的「批次折叠」实现为批次列 / 标签 + `?batch=` 筛选视图，不做视觉折叠。
+- 后台机器详情的「档期」只有列表，没有规格 §12 的 60 天横向时间轴；机组「管理机器」抽屉用机器 ID 输入与机柜筛选代替勾选表。
+- 候选机器改为 best-fit 排序后，`placeOrder` / `runningInstance` 拿到哪台空闲机器不再严格按 id：现有 e2e 里按 `ids[0]` 操作的用例在 Task 21 的全量 `make e2e` 中复核过。
 - 后台取消预订也发短信（规格表只写了平台无法履约 / 失去资格两种；取消原因不进短信）。
 - 自动续费失败标记写在该行事务里（savepoint 回滚扣款尝试），不是独立连接的事务；效果等价。
 - 机器日历匿名可见会暴露单机占用情况（设计已接受）。
@@ -10208,4 +10442,4 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **类型一致性**：`rental.Instance` 新字段（Task 1）↔ `scanInstance` / `insertInstance`（Task 5）/ `AdminMigrate` INSERT（Task 4）/ 视图（Task 12、13）；`rental.Order{Quantity, BatchID *string, Auto}`（Task 1）↔ `charge(…, quantity int, auto bool, batchID *string, idemKey, now)`（Task 5）↔ `refundable.quantity`（Task 6）↔ `orderView`（Task 13）；`leaseRow{ID, MachineID, Lower, Upper, Status}` / `lockLease` / `insertLease` / `nextReservedLower`（Task 2）↔ `provision` / `reassign` / `reassignTo`（Task 8、13）↔ `renewInfo`（Task 9）；`pickSpec{ProductID, GroupID, MachineID, Lower, Upper, Immediate, Exclude}` / `pickMachines` / `placeOnMachines` / `countAvailable` / `noCapacity` / `immediatePeriod` / `bookingPeriod`（Task 4）↔ `placeBatch`（Task 5）↔ `reassign`（Task 8）↔ `Availability`（Task 11）；`BatchRequest` / `Batch` / `BatchResult` / `PlaceBatch` / `GetBatch` / `RenewQuantity`（Task 5）↔ `api/booking.go`（Task 12）↔ `bookViaApi`（Task 21）；`CancelQuote` / `Cancel` / `AdminCancelBooking` / `cancelPlatform` / `cancelInstance`（Task 7）↔ `provision`（Task 8）↔ API（Task 12、13）；`RenewInfo{RenewableUntil, Options []RenewOption}` / `RenewInfoFor` / `renewFits`（Task 9）↔ `autoRenewDuration`（Task 10）↔ `instanceView.renew_options`（Task 12）↔ `Instance.renew_options`（Task 18）；`SetAutoRenew(ctx, userID, id, enabled, d, ip)` / `AutoRenewDue`（Task 10）↔ `handleAutoRenew`（Task 12）；`sweepEachAfter(ctx, pred, arg, orderBy, fn func(pgx.Tx, Instance) (func(), error), onErr)`（Task 8）↔ `ProvisionDue` / `FailStuckCreating` / `AutoRenewDue`（Task 8、10）；`Notifier{NotifyExpiry, NotifyAutoRenewFailed, NotifyBookingCancelled}`（Task 7）↔ `expiryNotifier`（Task 7）↔ `fakeNotifier` / `rentalNoop` / `noopNotifier`（Task 7）；`fleet.Group` / `GroupInput` / `GroupRow` / `MachineUpdate` / `MarkAllocated` / `Machine.GroupID / DisplayName / Label()`（Task 3）↔ `adminapi/groups.go`（Task 3）↔ `calendar.go`（Task 11）↔ e2e 钩子（Task 16）；`UserEvent` / `UserEvents`（Task 12）↔ `detail-event`（Task 19）；`BookingFilter` / `AdminListBookings` / `UpcomingBookings` / `UpcomingBookingsForMachine` / `AdminReassign` / `MachineLeases` / `OrderFilter.BatchID`（Task 13）↔ 后台页面（Task 20）；`api.Server.CalendarLimit`（Task 12）↔ `app.Build`（Task 12）；`tz.CST / FloorHour / IsHour / DayStart / Format`（Task 2）↔ Task 5、8、9、11、12、13、15；`IngressRoute.ScheduledStartAt`（Task 15）↔ `NotRunningPage`（Task 15）；`sms.TemplateAutoRenewFailed / TemplateBookingCancelled`（Task 7）↔ `config.AliyunConfig.SMSTplAutoRenewFailed / SMSTplBookingCancelled`（Task 14）；前端 `Instance` / `Order` / `booking.ts` 类型（Task 18）↔ `RentDialog` / `logic/booking.ts` / `logic/instance.ts`（Task 18、19）↔ `AdminInstance` / `MachineDetail` / `AdminGroup` / `Dashboard`（Task 20）↔ e2e `data-testid`（Task 21）。
 
-**Review Focus 落点**：1 → Task 16 `TestConcurrentBatchesConsistent`（50 并发 / 10 机、一致性三条 SQL、失败码白名单、60 秒超时）；2 → Task 4 `TestPlaceOnMachinesRetriesOnExclusionViolation`（第一台撞约束换第二台；换窗口后两台都撞 → `no_capacity` 且事务回滚无残留）；3 → Task 5 `TestBatchValidationMatrix`（整 2h 接受 / 1h 拒绝 / 第 60 天接受 / +1h 拒绝 / 非整点 / 1m×3 与 ×4 / 1d×90 与 ×91 / count 9、0 / 指定机器 count 2 / 键含 # / CST 整点 / 5 分钟容差两端）；4 → Task 9 `TestRenewBlockedByReservationDoesNotCharge`（手动 1w、后台延长 7d、停机续 2d 都被挡且不扣款、不改 lease；1d 通过）+ Task 10 `TestAutoRenewFallsBackThenBlocks`（1m→1w→1d 降档、全挡时 `renew_blocked` + 短信 + 10 分钟重试、手动续费同样被挡）；5 → Task 5 `TestLegacyOrderIdempotencyUnchanged`（同键回放同订单 / 实例、不建批次、键原样存储、含 # 被 400）+ `TestBatchIdempotencyReplayAndConflict`（批次键回放、子单键 `#n`、旧接口 / 续费用批次键冲突）。
+**Review Focus 落点**：1 → Task 16 `TestConcurrentBatchesConsistent`（50 并发 / 10 机、一致性三条 SQL、失败码白名单、60 秒超时）；2 → Task 4 `TestPlaceOnMachinesRetriesOnExclusionViolation`（第一台撞约束换第二台；换窗口后两台都撞 → `no_capacity` 且事务回滚无残留）；3 → Task 5 `TestBatchValidationMatrix`（整 2h 接受 / 1h 拒绝 / 第 60 天接受 / +1h 拒绝 / 非整点 / 1m×3 与 ×4 / 1d×90 与 ×91 / count 9、0 / 指定机器 count 2 / 键含 # / CST 整点 / 5 分钟容差两端）；4 → Task 9 `TestRenewBlockedByReservationDoesNotCharge`（手动 1w、后台延长 7d、停机续 2d 都被挡且不扣款、不改 lease；1d 通过）+ `TestRenewRaceWithNewReservationIsBlocked`（并发预订在 `renewFits` 后提交 → `renew_blocked`、扣款回滚）+ Task 10 `TestAutoRenewFallsBackThenBlocks`（1m→1w→1d 降档、全挡时 `renew_blocked` + 短信 + 10 分钟重试、手动续费同样被挡）；5 → Task 5 `TestLegacyOrderIdempotencyUnchanged`（同键回放同订单 / 实例、不建批次、键原样存储、含 # 被 400）+ `TestBatchIdempotencyReplayAndConflict`（批次键回放、子单键 `#n`、旧接口 / 续费用批次键冲突）。
