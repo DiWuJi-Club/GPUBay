@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,10 +187,14 @@ func TestCreateLimitsAndConflicts(t *testing.T) {
 	if err := createErr(inst, apps[3].ID); codeOf(err) != "app_limit" {
 		t.Fatalf("4th app = %v", err)
 	}
-	// removed 的旧部署不占名额：卸载后可再建
-	if r, err := e.svc.Remove(e.ctx, e.userID, inst.ID, d1.ID, ""); err != nil || r.State != appdeploy.StateRemoved {
+	// removing 仍占名额；removed 的旧部署不占名额：卸载完成后可再建
+	if r, err := e.svc.Remove(e.ctx, e.userID, inst.ID, d1.ID, ""); err != nil || r.State != appdeploy.StateRemoving {
 		t.Fatalf("Remove = %+v, %v", r, err)
 	}
+	if err := createErr(inst, apps[0].ID); codeOf(err) != "app_limit" {
+		t.Fatalf("re-create while removing = %v", err)
+	}
+	e.exec(`UPDATE app_deployments SET state = 'removed' WHERE id = $1`, d1.ID) // Runner 执行完 remove
 	if again := e.create(inst, apps[0].ID, nil); again.ID == d1.ID {
 		t.Fatal("re-create returned the removed row")
 	}
@@ -518,11 +524,30 @@ func TestRemoveWhenInstanceStopped(t *testing.T) {
 	if n := e.count(`SELECT count(*) FROM instance_ports WHERE deployment_id = $1`, d2.ID); n != 1 {
 		t.Fatalf("port rows on removing = %d", n)
 	}
-	// 暂停的实例按停机处理
+	// 暂停的实例与 running 相同：removing，等恢复后 Runner 执行 run.sh remove；端口保留
 	e.exec(`UPDATE app_deployments SET state = 'running', desired = 'running' WHERE id = $1`, d2.ID)
 	e.exec(`UPDATE instances SET suspended_at = $2 WHERE id = $1`, run.ID, e.clk.Now())
-	if got, err = e.svc.Remove(e.ctx, e.userID, run.ID, d2.ID, ""); err != nil || got.State != appdeploy.StateRemoved || !got.CleanupPending {
+	if got, err = e.svc.Remove(e.ctx, e.userID, run.ID, d2.ID, ""); err != nil || got.State != appdeploy.StateRemoving || got.CleanupPending {
 		t.Fatalf("remove on suspended instance = %+v, %v", got, err)
+	}
+	if n := e.count(`SELECT count(*) FROM instance_ports WHERE deployment_id = $1`, d2.ID); n != 1 {
+		t.Fatalf("port rows on suspended removing = %d", n)
+	}
+	// running 实例上从未执行过的 queued（attempt 0）也走 removing：Runner 可能正在上传
+	e.exec(`UPDATE app_deployments SET state = 'removed' WHERE id = $1`, d2.ID) // Runner 执行完 remove：置 removed、删端口
+	e.exec(`DELETE FROM instance_ports WHERE deployment_id = $1`, d2.ID)
+	e.exec(`UPDATE instances SET suspended_at = NULL WHERE id = $1`, run.ID)
+	fresh := e.create(run, a.ID, nil)
+	if got, err = e.svc.Remove(e.ctx, e.userID, run.ID, fresh.ID, ""); err != nil || got.State != appdeploy.StateRemoving || got.Desired != appdeploy.DesiredRemoved {
+		t.Fatalf("remove fresh queued on running instance = %+v, %v", got, err)
+	}
+
+	// 停机时卸载留下 cleanup_pending；实例恢复后同一应用再部署 → 取消旧行的清理（新部署用同一目录）
+	e.exec(`UPDATE instances SET state = 'running' WHERE id = $1`, stopped.ID)
+	pending := e.dep(d.ID)
+	e.create(stopped, a.ID, nil)
+	if old := e.dep(d.ID); old.CleanupPending || old.RowVersion != pending.RowVersion+1 {
+		t.Fatalf("old row after re-create = %+v", old)
 	}
 
 	res := e.reservedInstance()
@@ -563,6 +588,18 @@ func TestAdminForceRemoveAndLists(t *testing.T) {
 	if _, err := e.svc.AdminForceRemove(e.ctx, audit.Actor{AdminID: 7}, d1.ID, "x"); codeOf(err) != "app_invalid_state" {
 		t.Fatalf("force remove terminal = %v", err)
 	}
+
+	// 停机实例上强制卸载：直接 removed，端口删除的审计记在后台操作人名下
+	e.exec(`UPDATE app_deployments SET state = 'running', attempt = 1 WHERE id = $1`, d3.ID)
+	e.addAppPort(d3, 8000)
+	e.exec(`UPDATE instances SET state = 'stopped' WHERE id = $1`, i2.ID)
+	if got, err := e.svc.AdminForceRemove(e.ctx, audit.Actor{AdminID: 7}, d3.ID, "清理"); err != nil || got.State != appdeploy.StateRemoved || !got.CleanupPending {
+		t.Fatalf("force remove on stopped = %+v, %v", got, err)
+	}
+	if logs := e.auditLogs("instance.port_delete", i2.ID); len(logs) != 1 || logs[0].ActorType != "admin" || logs[0].ActorID != 7 {
+		t.Fatalf("force port_delete audit = %+v", logs)
+	}
+	e.exec(`UPDATE app_deployments SET state = 'queued', cleanup_pending = false WHERE id = $1`, d3.ID) // 还原，供下面的列表断言
 
 	all, err := e.svc.ListForInstance(e.ctx, i1.ID)
 	if err != nil || len(all) != 2 || all[0].ID != d1.ID || all[1].ID != d2.ID {
@@ -700,17 +737,26 @@ func TestMarkFailedAndRemoved(t *testing.T) {
 	e := newEnv(t, 1)
 	a, _ := e.publishedApp("vllm", goodSpec(), goodScript, []int64{e.imageID})
 	inst := e.runningInstance()
-	d := e.create(inst, a.ID, nil)
+	d := e.create(inst, a.ID, map[string]string{"API_KEY": "sk-secret-12345"})
 	e.exec(`UPDATE app_deployments SET state = 'installing' WHERE id = $1`, d.ID)
 	d = e.dep(d.ID)
 	e.clk.Advance(time.Minute)
 	now := e.clk.Now()
+	if err := e.svc.MarkFailed(e.ctx, e.pool, d, appdeploy.ErrCodeScriptFailed, "auth sk-secret-12345 rejected", now); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.dep(d.ID); got.Message != "auth *** rejected" {
+		t.Fatalf("markFailed message not redacted: %q", got.Message)
+	}
+	if evs, _ := e.svc.Events(e.ctx, d.ID, 1); evs[0].Detail != "脚本执行失败：auth *** rejected" {
+		t.Fatalf("markFailed event not redacted: %q", evs[0].Detail)
+	}
 	if err := e.svc.MarkFailed(e.ctx, e.pool, d, appdeploy.ErrCodeTimeout, strings.Repeat("长", 300), now); err != nil {
 		t.Fatal(err)
 	}
 	got := e.dep(d.ID)
 	if got.State != appdeploy.StateFailed || got.ErrorCode != appdeploy.ErrCodeTimeout || len([]rune(got.Message)) != appdeploy.MaxMessageLen ||
-		got.FinishedAt == nil || !got.FinishedAt.Equal(now) || !got.NextPollAt.Equal(now.Add(24*time.Hour)) || got.RowVersion != d.RowVersion+1 {
+		got.FinishedAt == nil || !got.FinishedAt.Equal(now) || !got.NextPollAt.Equal(now.Add(24*time.Hour)) || got.RowVersion != d.RowVersion+2 {
 		t.Fatalf("markFailed = %+v", got)
 	}
 	evs, _ := e.svc.Events(e.ctx, d.ID, 1)
@@ -773,5 +819,75 @@ func TestRegisterPorts(t *testing.T) {
 	}
 	if code, err := appdeploy.RegisterPorts(e.ctx, e.pool, other, specPorts(9000).Ports, "bb", now); err != nil || code != appdeploy.ErrCodePortLimit {
 		t.Fatalf("limit = %q, %v", code, err)
+	}
+}
+
+func TestRedeploySecretOnlyCarriedIntoSecret(t *testing.T) {
+	e := newEnv(t, 1)
+	a, _ := e.publishedApp("vllm", goodSpec(), goodScript, []int64{e.imageID})
+	inst := e.runningInstance()
+	d := e.create(inst, a.ID, map[string]string{"API_KEY": "sk-secret-12345"})
+	// v2 把 API_KEY 改成普通变量：旧 secret 不得以明文沿用进 env 列
+	s2 := goodSpec()
+	s2.Env[2].Type, s2.Env[2].Pattern = "string", ""
+	e.publish(a.ID, "2.0.0", s2, goodScript, []int64{e.imageID})
+	e.exec(`UPDATE app_deployments SET state = 'failed' WHERE id = $1`, d.ID)
+	for _, envSet := range []bool{false, true} {
+		got, err := e.svc.Redeploy(e.ctx, appdeploy.RedeployRequest{UserID: e.userID, InstanceID: inst.ID, DeploymentID: d.ID, EnvSet: envSet, Env: map[string]string{}})
+		if err != nil {
+			t.Fatalf("redeploy (EnvSet=%v): %v", envSet, err)
+		}
+		if _, has := got.Env["API_KEY"]; has || got.SecretEnvEnc != nil {
+			t.Fatalf("secret carried into plain var (EnvSet=%v): env %v enc %v", envSet, got.Env, got.SecretEnvEnc != nil)
+		}
+		e.exec(`UPDATE app_deployments SET state = 'failed', secret_env_enc = $2 WHERE id = $1`, d.ID, d.SecretEnvEnc)
+	}
+}
+
+func TestConcurrentCreatesRespectLimits(t *testing.T) {
+	e := newEnv(t, 2)
+	var apps []appdeploy.App
+	for i, slug := range []string{"a1", "a2", "a3", "a4"} {
+		a, _ := e.publishedApp(slug, specPorts(8000+i), goodScript, []int64{e.imageID})
+		apps = append(apps, a)
+	}
+	x, _ := e.publishedApp("xx", specPorts(9000), goodScript, []int64{e.imageID})
+	y, _ := e.publishedApp("yy", specPorts(9100, 9000), goodScript, []int64{e.imageID})
+	race := func(inst rental.Instance, appIDs ...int64) []error {
+		errs := make([]error, len(appIDs))
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i, id := range appIDs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, errs[i] = e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: inst.UserID, InstanceID: inst.ID, AppID: id})
+			}()
+		}
+		close(start)
+		wg.Wait()
+		return errs
+	}
+	// D2：已有 2 个，两个并发新建 → 恰好一个成功，另一个 app_limit
+	inst := e.runningInstance()
+	e.create(inst, apps[0].ID, nil)
+	e.create(inst, apps[1].ID, nil)
+	errs := race(inst, apps[2].ID, apps[3].ID)
+	codes := []string{codeOf(errs[0]), codeOf(errs[1])}
+	slices.Sort(codes)
+	if codes[0] != "" || codes[1] != "app_limit" {
+		t.Fatalf("concurrent creates at limit = %v", codes)
+	}
+	if n := e.count(`SELECT count(*) FROM app_deployments WHERE instance_id = $1 AND state NOT IN ('removed', 'lost')`, inst.ID); n != appdeploy.MaxAppsPerInstance {
+		t.Fatalf("live deployments = %d", n)
+	}
+	// 端口：两个并发新建声明同一端口 9000 → 恰好一个成功，另一个 app_port_conflict
+	inst2 := e.runningInstance()
+	errs = race(inst2, x.ID, y.ID)
+	codes = []string{codeOf(errs[0]), codeOf(errs[1])}
+	slices.Sort(codes)
+	if codes[0] != "" || codes[1] != "app_port_conflict" {
+		t.Fatalf("concurrent creates on same port = %v", codes)
 	}
 }

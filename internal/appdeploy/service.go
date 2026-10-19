@@ -1,8 +1,11 @@
 // 部署服务：用户操作（创建 / 重新部署 / 停止 / 启动 / 卸载 / 日志 / 事件）与后台查询 / 强制卸载。
 //
-// 加锁顺序（规格 §14）：rental 钩子在已持 instances 行锁的事务里锁 app_deployments 行（instance → app_deployments → instance_ports）；
-// 用户操作 rental.LockOwned（先实例后部署，同序）；Runner 回写只锁部署行，不锁实例；
-// instance_ports 的插入 / 认领 / 删除都在持部署行锁之后。
+// 加锁顺序（规格 §14，所有路径一律）：instances 行 → app_deployments 行 → instance_ports。
+//   - rental 钩子：在已持 instances 行锁（FOR UPDATE）的事务里锁 app_deployments 行。
+//   - 用户操作：rental.LockOwned（instances FOR UPDATE）→ lockDeployment；后台强制卸载同序（instances FOR UPDATE → 部署）。
+//   - Runner 回写：先取 instances 行 FOR KEY SHARE，再锁部署行。不能只锁部署行：
+//     插入 instance_ports 的外键检查会对 instances 行取 KEY SHARE，与持实例 FOR UPDATE、等部署行锁的用户操作成环（死锁）。
+//   - instance_ports 的插入 / 认领 / 删除都在持部署行锁之后（registerPorts 的前置条件）。
 //
 // 每个写 app_deployments 行的 UPDATE 都 row_version = row_version + 1：Runner 回写按 row_version 判断 exec 期间行是否被改过。
 
@@ -124,6 +127,11 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Deployment, er
 		if err != nil {
 			return err
 		}
+		// 同一应用的旧部署若还等着清理目录（停机时卸载），新部署会用同一个目录：取消清理，免得 Runner 删掉新部署的文件
+		if _, err := tx.Exec(ctx, `UPDATE app_deployments SET cleanup_pending = false, updated_at = $3, row_version = row_version + 1
+			WHERE instance_id = $1 AND app_id = $2 AND state = 'removed' AND cleanup_pending`, inst.ID, app.ID, now); err != nil {
+			return err
+		}
 		if out, err = s.insert(ctx, tx, inst, req.UserID, app, ver, plain, secret, now); err != nil {
 			return err
 		}
@@ -230,11 +238,14 @@ type RedeployRequest struct {
 	IP                       string
 }
 
-// mergeEnv 按重新部署的规则合并变量；沿用的旧值只保留 spec 里仍声明的变量（换版本后已删除的变量不报错）。
+// mergeEnv 按重新部署的规则合并变量。沿用的旧值只进入目标版本仍以同类声明的变量：
+// 旧 secret 只沿用到仍是 secret 的变量（变成普通变量后不得以明文写进 env 列）；旧普通值只沿用到仍是普通类型的变量。
 func mergeEnv(spec Spec, oldPlain, oldSecret map[string]string, req map[string]string, envSet bool) map[string]string {
+	isSecret := map[string]bool{}
 	declared := map[string]bool{}
 	for _, e := range spec.Env {
 		declared[e.Name] = true
+		isSecret[e.Name] = e.Type == "secret"
 	}
 	merged := map[string]string{}
 	if envSet {
@@ -243,13 +254,13 @@ func mergeEnv(spec Spec, oldPlain, oldSecret map[string]string, req map[string]s
 		}
 	} else {
 		for k, v := range oldPlain {
-			if declared[k] {
+			if declared[k] && !isSecret[k] {
 				merged[k] = v
 			}
 		}
 	}
 	for k, v := range oldSecret {
-		if !declared[k] {
+		if !isSecret[k] {
 			continue
 		}
 		if nv, given := merged[k]; given && envSet {
@@ -385,7 +396,7 @@ func (s *Service) Remove(ctx context.Context, userID int64, instanceID, depID, i
 			return d, nil
 		}
 		actor := audit.Actor{UserID: userID, IP: ip}
-		out, err := s.remove(ctx, tx, inst.State, inst.Suspended(), d, "", actor, now)
+		out, err := s.remove(ctx, tx, inst.State, d, "", actor, now)
 		if err != nil {
 			return Deployment{}, err
 		}
@@ -394,20 +405,20 @@ func (s *Service) Remove(ctx context.Context, userID int64, instanceID, depID, i
 }
 
 // remove 是用户卸载与后台强制卸载的共同部分（调用方持实例与部署行锁）：
-//   - 实例不在运行（停机 / 暂停 / 未开通）或部署从未执行过（queued 且 attempt = 0）→ 直接 removed，端口立即删除；
-//     容器里可能有目录（实例停机或暂停中）时 cleanup_pending = true，实例恢复 running 后 Runner 删除目录。
-//   - 否则 → removing / desired removed，由 Runner 执行 run.sh remove 后删端口、置 removed。
+//   - 实例不是 running（停机 / 未开通 / 已消失）→ 直接 removed，端口立即删除；实例停机且部署执行过（容器里可能有目录）时
+//     cleanup_pending = true，实例恢复 running 后 Runner 删除目录。
+//   - 实例 running（含暂停中）→ 一律 removing / desired removed，由 Runner 执行 run.sh remove（目录不存在也算成功）后删端口、置 removed；
+//     暂停中的实例 Runner 等恢复后再执行。queued 且 attempt = 0 也不走捷径：Runner 可能正在上传部署包。
 //
-// detail 非空时作为事件文案（后台：「平台卸载：<原因>」）。
-func (s *Service) remove(ctx context.Context, tx pgx.Tx, instState string, suspended bool, d Deployment, detail string, actor audit.Actor, now time.Time) (Deployment, error) {
+// detail 非空时作为事件文案（后台：「平台卸载：<原因>」）。actor 是端口删除审计的操作人。
+func (s *Service) remove(ctx context.Context, tx pgx.Tx, instState string, d Deployment, detail string, actor audit.Actor, now time.Time) (Deployment, error) {
 	if !d.Live() {
 		return Deployment{}, apperr.ErrAppInvalidState
 	}
-	gone := instState != rental.StateRunning || suspended
-	fresh := d.State == StateQueued && d.Attempt == 0
-	if gone || fresh {
-		// 容器还在（运行中暂停 / 停机保留数据）才需要事后清理目录
-		cleanup := gone && !fresh && (instState == rental.StateRunning || instState == rental.StateStopped)
+	if instState != rental.StateRunning {
+		fresh := d.State == StateQueued && d.Attempt == 0
+		// 只有停机保留数据的实例容器里可能有目录；未开通 / 已消失的实例没有可清理的东西
+		cleanup := !fresh && instState == rental.StateStopped
 		if detail == "" {
 			detail = "已卸载"
 			if cleanup {
@@ -446,10 +457,9 @@ func (s *Service) AdminForceRemove(ctx context.Context, actor audit.Actor, depID
 			}
 			return err
 		}
-		// 先实例后部署（与用户操作同序）；后台不校验归属，也不拒绝已释放的实例
+		// 先实例后部署（与用户操作同序；instance_id 不会变，未加锁读取无妨）；后台不校验归属，也不拒绝已释放的实例
 		var instState string
-		var suspended bool
-		if err := tx.QueryRow(ctx, `SELECT state, suspended_at IS NOT NULL FROM instances WHERE id = $1 FOR UPDATE`, instanceID).Scan(&instState, &suspended); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT state FROM instances WHERE id = $1 FOR UPDATE`, instanceID).Scan(&instState); err != nil {
 			return err
 		}
 		d, err := lockDeployment(ctx, tx, depID)
@@ -458,7 +468,7 @@ func (s *Service) AdminForceRemove(ctx context.Context, actor audit.Actor, depID
 		}
 		if d.State == StateRemoving {
 			out = d
-		} else if out, err = s.remove(ctx, tx, instState, suspended, d, "平台卸载："+reason, audit.Actor{UserID: d.UserID}, now); err != nil {
+		} else if out, err = s.remove(ctx, tx, instState, d, "平台卸载："+reason, actor, now); err != nil { // 端口删除审计记在后台操作人名下
 			return err
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("app.deployment.force_remove", "app_deployment", d.ID,

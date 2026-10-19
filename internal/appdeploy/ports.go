@@ -13,6 +13,10 @@ import (
 // 已有行且无主（换机复制来的 / 用户手动加的）→ 认领并把备注改成应用名；已是本部署的 → 不动；
 // 不存在 → 插入私有端口。属于别的部署 → errCode = port_conflict；登记后总数 > 5 → errCode = port_limit。
 // 先整体检查再写，errCode 非空时不写任何行（调用方据此 markFailed）。
+//
+// 前置条件：调用方必须先持该实例 instances 行的锁（FOR UPDATE 或 FOR KEY SHARE），再持部署行锁，然后调用本函数。
+// 插入 instance_ports 的外键检查会对 instances 行取 KEY SHARE；若只持部署行锁就插入，会与「持实例 FOR UPDATE、
+// 等部署行锁」的用户操作 / rental 钩子互相等待（死锁）。
 func registerPorts(ctx context.Context, q db.Querier, d Deployment, ports []PortSpec, appName string, now time.Time) (errCode string, err error) {
 	rows, err := q.Query(ctx, `SELECT port, deployment_id FROM instance_ports WHERE instance_id = $1`, d.InstanceID)
 	if err != nil {

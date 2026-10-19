@@ -175,8 +175,14 @@ func appName(ctx context.Context, q db.Querier, appID int64) (string, error) {
 }
 
 // markFailed 把部署置为 failed（Runner / 钩子用；调用方持部署行锁）：next_poll_at 推后 24 小时（failed 不在 Runner 候选里，只为索引整洁）。
+// msg 在这里按该部署的全部 secret 值脱敏（先脱敏再截断，避免截断留下 secret 前缀）；解密失败时丢弃 msg（宁缺勿漏）。
 func (s *Service) markFailed(ctx context.Context, q db.Querier, cur Deployment, code, msg string, now time.Time) error {
-	msg = truncRunes(msg, MaxMessageLen)
+	secrets, err := openSecrets(s.d.Box, cur.SecretEnvEnc)
+	if err != nil {
+		s.d.Log.Warn("app deploy markFailed: cannot open secrets, dropping message", "deployment", cur.ID, "err", err)
+		msg = ""
+	}
+	msg = truncRunes(Redact(msg, secrets), MaxMessageLen)
 	if _, err := q.Exec(ctx, `UPDATE app_deployments SET state = 'failed', error_code = $2, message = $3, health = 'unknown', finished_at = $4,
 		next_poll_at = $5, updated_at = $4, row_version = row_version + 1 WHERE id = $1`, cur.ID, code, msg, now, now.Add(24*time.Hour)); err != nil {
 		return err
