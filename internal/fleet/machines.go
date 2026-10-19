@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -38,6 +39,10 @@ type Machine struct {
 	PDUOutlet   *int       `json:"pdu_outlet"`
 	CreatedAt   time.Time  `json:"created_at"`
 
+	// 计划 6：机组与对用户展示名
+	GroupID     *int64 `json:"group_id"`
+	DisplayName string `json:"display_name"`
+
 	// 计划 2：Agent 接入与连接状态。指纹全文不输出，只给前 16 位。
 	CertFingerprint   string          `json:"-"`
 	Enrolled          bool            `json:"enrolled"`
@@ -70,14 +75,15 @@ func NewService(pool *pgxpool.Pool, clk clock.Clock) *Service {
 }
 
 const machineCols = `id, serial, rack, slot, lan_ip, product_id, state, agent_online, last_seen_at, pdu_id, pdu_outlet, created_at,
-	cert_fingerprint, agent_conn_id, agent_version, agent_connected_at, state_reported_at, last_metrics`
+	cert_fingerprint, agent_conn_id, agent_version, agent_connected_at, state_reported_at, last_metrics, group_id, display_name`
 
 func scanMachine(row pgx.Row) (Machine, error) {
 	var m Machine
 	var connID *string
 	var metrics []byte
 	err := row.Scan(&m.ID, &m.Serial, &m.Rack, &m.Slot, &m.LanIP, &m.ProductID, &m.State, &m.AgentOnline, &m.LastSeenAt,
-		&m.PDUID, &m.PDUOutlet, &m.CreatedAt, &m.CertFingerprint, &connID, &m.AgentVersion, &m.AgentConnectedAt, &m.StateReportedAt, &metrics)
+		&m.PDUID, &m.PDUOutlet, &m.CreatedAt, &m.CertFingerprint, &connID, &m.AgentVersion, &m.AgentConnectedAt, &m.StateReportedAt, &metrics,
+		&m.GroupID, &m.DisplayName)
 	if db.IsNoRows(err) {
 		return Machine{}, apperr.ErrNotFound
 	}
@@ -166,6 +172,24 @@ func (s *Service) Allocate(ctx context.Context, tx pgx.Tx, productID int64) (Mac
 			WHERE product_id = $1 AND state = 'idle' AND agent_online
 			ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
 		) RETURNING `+machineCols, productID, s.clock.Now()))
+	if errors.Is(err, apperr.ErrNotFound) {
+		return Machine{}, apperr.ErrNoCapacity
+	}
+	return m, err
+}
+
+// Label 对用户展示的机器名：后台设置的展示名，缺省「机器 #<id>」。序列号与内网 IP 不对用户展示。
+func (m Machine) Label() string {
+	if m.DisplayName != "" {
+		return m.DisplayName
+	}
+	return fmt.Sprintf("机器 #%d", m.ID)
+}
+
+// MarkAllocated 把一台由 rental.pickMachines 选中并锁定的机器从空闲置为已分配；不再空闲或离线 → ErrNoCapacity。
+func (s *Service) MarkAllocated(ctx context.Context, q db.Querier, id int64) (Machine, error) {
+	m, err := scanMachine(q.QueryRow(ctx, `UPDATE machines SET state = 'allocated', updated_at = $2
+		WHERE id = $1 AND state = 'idle' AND agent_online RETURNING `+machineCols, id, s.clock.Now()))
 	if errors.Is(err, apperr.ErrNotFound) {
 		return Machine{}, apperr.ErrNoCapacity
 	}

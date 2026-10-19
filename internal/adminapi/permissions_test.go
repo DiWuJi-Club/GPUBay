@@ -30,6 +30,8 @@ var expectedRoutes = []struct {
 	{"POST", "/machines/{id}/enroll-command", ops}, {"POST", "/machines/{id}/revoke-enrollment", ops},
 	{"GET", "/pdus", ops}, {"POST", "/pdus", ops}, {"PUT", "/pdus/{id}", ops},
 	{"GET", "/alerts", all}, {"POST", "/alerts/{id}/resolve", all},
+	{"GET", "/groups", all}, {"POST", "/groups", ops}, {"PUT", "/groups/{id}", ops}, {"DELETE", "/groups/{id}", ops},
+	{"POST", "/groups/{id}/machines", ops}, {"DELETE", "/groups/{id}/machines", ops}, {"PUT", "/machines/{id}", ops},
 
 	{"GET", "/instances", all}, {"GET", "/instances/{id}", all}, {"GET", "/instances/{id}/refund-quote", all},
 	{"POST", "/instances/{id}/extend", ops}, {"POST", "/instances/{id}/migrate", ops}, {"POST", "/instances/{id}/rewipe", ops},

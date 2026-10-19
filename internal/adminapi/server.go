@@ -111,6 +111,7 @@ func (s *Server) Router() http.Handler {
 			g.Use(s.requireAdmin)
 			s.accountRoutes(g)
 			s.machineRoutes(g)
+			s.groupRoutes(g)
 			s.instanceRoutes(g)
 			s.userRoutes(g)
 			s.financeRoutes(g)
