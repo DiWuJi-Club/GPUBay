@@ -1,6 +1,6 @@
 import type { Instance } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { canRelease, canRenew, instanceTimeText, releaseWarning, remainingNow } from '../instance'
+import { autoRenewFailureText, canCancel, canRelease, canRenew, canSetAutoRenew, instanceTimeText, releaseWarning, remainingNow, renewQuantityMax } from '../instance'
 
 const base: Instance = {
   id: 'ins-abc12345', state: 'running', product_id: 1, image_id: 1, product_name: 'DGX Spark 整机', image_name: 'PyTorch', suspended: false,
@@ -47,5 +47,37 @@ describe('按钮与状态匹配 (C-DET-09 的逻辑)', () => {
   ] as const)('%s renew=%s release=%s', (state, renew, release) => {
     expect(canRenew(state)).toBe(renew)
     expect(canRelease(state)).toBe(release)
+  })
+})
+
+describe('booking states (U-21)', () => {
+  const reserved: Instance = { ...base, state: 'reserved', expires_at: null, remaining_seconds: 0, pending_seconds: 86400, ssh_command: '',
+    scheduled_start_at: '2026-10-20T02:00:00Z', scheduled_end_at: '2026-10-21T02:00:00Z', cancellable_until: '2026-10-20T01:00:00Z',
+    renewable_until: '2026-10-25T00:00:00Z', renew_options: [{ duration: '1d', quantity_max: 3 }, { duration: '1w', quantity_max: 0 }, { duration: '1m', quantity_max: 0 }] }
+  it('预订 / 取消的时间文案', () => {
+    expect(instanceTimeText(reserved, 0)).toBe('2026-10-20 10:00 开始 · 共 1 天')
+    expect(instanceTimeText({ ...base, state: 'cancelled' }, 0)).toBe('已取消')
+  })
+  it('可取消：reserved 且未过截止', () => {
+    expect(canCancel(reserved, Date.parse('2026-10-20T00:59:00Z'))).toBe(true)
+    expect(canCancel(reserved, Date.parse('2026-10-20T01:00:00Z'))).toBe(false)
+    expect(canCancel({ ...reserved, state: 'creating' }, 0)).toBe(false)
+  })
+  it('续费数量上限来自 renew_options', () => {
+    expect(renewQuantityMax(reserved, '1d')).toBe(3)
+    expect(renewQuantityMax(reserved, '1w')).toBe(0)
+    expect(renewQuantityMax({ ...reserved, renew_options: [] }, '1m')).toBe(3)
+  })
+  it('自动续费失败文案', () => {
+    expect(autoRenewFailureText({ ...base, auto_renew_failed_reason: 'insufficient_balance' })).toBe('自动续费失败：余额不足，请充值后系统会自动重试')
+    expect(autoRenewFailureText({ ...reserved, auto_renew_failed_reason: 'renew_blocked' })).toBe('自动续费失败：机器已有后续预订，可续至 2026-10-25 08:00')
+    expect(autoRenewFailureText(base)).toBe('')
+  })
+  it('按钮矩阵含 reserved / cancelled', () => {
+    expect(canRenew('reserved')).toBe(true)
+    expect(canRelease('reserved')).toBe(false)
+    expect(canRenew('cancelled')).toBe(false)
+    expect(canSetAutoRenew('reserved')).toBe(true)
+    expect(canSetAutoRenew('released')).toBe(false)
   })
 })
