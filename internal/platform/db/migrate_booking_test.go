@@ -47,6 +47,9 @@ func TestMigration00019RoundTrip(t *testing.T) {
 		}
 		return v
 	}
+	idx := func() string {
+		return scalar(`SELECT count(*) FROM pg_indexes WHERE indexname IN ('instances_batch_idx', 'instances_group_idx') AND indexdef LIKE '%IS NOT NULL%'`)
+	}
 	cols := func(table, col string) string {
 		return scalar(`SELECT count(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`, table, col)
 	}
@@ -85,6 +88,9 @@ func TestMigration00019RoundTrip(t *testing.T) {
 	if got := scalar(`SELECT quantity || '/' || auto || '/' || (batch_id IS NULL) FROM orders WHERE id = 'ord-old'`); got != "1/false/true" {
 		t.Fatalf("order defaults = %s", got)
 	}
+	if got := idx(); got != "2" {
+		t.Fatalf("instances batch/group partial indexes = %s", got)
+	}
 
 	// 有 reserved 实例时 Down 拒绝，且整条 Down 回滚（版本仍为 19）
 	exec(`UPDATE instances SET state = 'reserved', scheduled_start_at = $1 WHERE id = 'ins-c'`, dbtest.T0.Add(48*time.Hour))
@@ -116,6 +122,9 @@ func TestMigration00019RoundTrip(t *testing.T) {
 	if cols("instances", "auto_renew") != "0" || cols("orders", "quantity") != "0" || cols("machines", "display_name") != "0" ||
 		scalar(`SELECT count(*) FROM information_schema.tables WHERE table_name IN ('machine_groups', 'rental_batches')`) != "0" {
 		t.Fatal("down left 00019 schema behind")
+	}
+	if idx() != "0" {
+		t.Fatal("down left instances batch/group indexes behind")
 	}
 	if _, err := sqlDB.ExecContext(ctx, `UPDATE instances SET state = 'cancelled' WHERE id = 'ins-c'`); err == nil {
 		t.Fatal("old CHECK not restored")

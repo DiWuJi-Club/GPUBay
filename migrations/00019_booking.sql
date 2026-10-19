@@ -50,6 +50,8 @@ ALTER TABLE instances
     ADD COLUMN cancelled_at             TIMESTAMPTZ;
 CREATE INDEX instances_reserved_idx ON instances (scheduled_start_at) WHERE state = 'reserved';
 CREATE INDEX instances_auto_renew_idx ON instances (expires_at) WHERE state = 'running' AND auto_renew;
+CREATE INDEX instances_batch_idx ON instances (batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX instances_group_idx ON instances (group_id) WHERE group_id IS NOT NULL;
 
 -- 先清掉 occupiedUntil 回退为 now 产生的空时段（isempty 的 range 没有 lower，用 created_at 代替），否则 CHECK 建不起来
 UPDATE machine_leases SET period = tstzrange(created_at, created_at + interval '1 second'), status = 'ended' WHERE isempty(period);
@@ -71,6 +73,8 @@ UPDATE instances SET state = 'failed' WHERE state = 'cancelled';
 ALTER TABLE machine_leases DROP CONSTRAINT machine_leases_period_nonempty;
 DROP INDEX machine_leases_reserved_idx;
 DROP INDEX machine_leases_machine_period_idx;
+DROP INDEX instances_group_idx;
+DROP INDEX instances_batch_idx;
 DROP INDEX instances_auto_renew_idx;
 DROP INDEX instances_reserved_idx;
 ALTER TABLE instances
