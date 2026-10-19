@@ -3,11 +3,12 @@
 # 用法：sh run.sh deploy|start|stop|status|remove
 # 约定：本文件与 app.sh / spec.json / env 同目录；状态写 status.json（原子），输出追加到 log；
 #       app.sh 的子命令 install / start / stop，start 必须把服务放后台并把 PID 写进 service.pid。
-# 只用 POSIX sh（Ubuntu 的 /bin/sh 是 dash），不要写 bash 语法。
+# 只用 POSIX sh（Ubuntu 的 /bin/sh 是 dash），不要写 bash 语法；日志行用 printf（dash 的 echo 会解释反斜杠）。
 set -u
 cd "$(dirname "$0")" || exit 1
 DIR=$(pwd)
 SEQ_FILE="$DIR/.seq"
+APP_STOP_LIMIT_S=5 # app.sh stop 的时限：5 + kill_group 10 + 服务 2，整体留在 Runner 的 20 秒 exec 上限内
 
 load_env() {
   # shellcheck disable=SC1091
@@ -19,17 +20,22 @@ load_env() {
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+logln() { printf '%s\n' "$*" >> "$DIR/log"; }
+
 # 非负十进制整数原样输出，其他（空、带符号、非数字、前导 0）一律 0：status.json 的数字字段不能被文件内容弄坏
 num() { case "${1:-}" in ''|*[!0-9]*|0?*) echo 0 ;; *) echo "$1" ;; esac; }
 
-# JSON 字符串转义：反斜杠、双引号；控制字符（含换行、制表、ESC）直接删掉
-json_escape() { printf '%s' "$1" | tr -d '\000-\037\177' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+# JSON 字符串转义：控制字符（含换行、制表、ESC）删掉，截到 1024 字符，再转义反斜杠、双引号
+json_escape() { printf '%s' "$1" | tr -d '\000-\037\177' | cut -c1-1024 | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# 原子写小文件：临时文件 + mv
+put() { printf '%s\n' "$2" > "$1.$$" && mv -f "$1.$$" "$1"; }
 
 # write_status state phase progress message [service_pid] [exit_code]
 write_status() {
   _seq=$(num "$(cat "$SEQ_FILE" 2>/dev/null)")
   _seq=$((_seq + 1))
-  echo "$_seq" > "$SEQ_FILE"
+  put "$SEQ_FILE" "$_seq"
   _spid=$(num "${5:-$(cat "$DIR/service.pid" 2>/dev/null)}")
   _pgid=$(num "${SPARK_PGID:-$(cat "$DIR/.pgid" 2>/dev/null)}")
   _tmp="$DIR/status.json.$$"
@@ -52,7 +58,7 @@ EOS
 cmd_report() { # cmd_report <phase> <progress> <message>：spark_status 的实现，进度同时记进 log
   _p=$(num "$2"); [ "$_p" -gt 100 ] && _p=100
   write_status installing "$1" "$_p" "$3"
-  echo "[spark_status] $1 $_p% $3" >> "$DIR/log"
+  logln "[spark_status] $1 $_p% $3"
 }
 
 free_gib() {
@@ -61,17 +67,23 @@ free_gib() {
   echo $(( $(num "$_kb") / 1024 / 1024 ))
 }
 
+# install 跳过标记的键：spec_hash + env 文件校验和（换 MODEL_ID 等变量也要重跑 install；install 自身幂等，模型缓存保留）
+install_key() { printf '%s %s' "$SPARK_SPEC_HASH" "$(cksum < "$DIR/env" 2>/dev/null | awk '{print $1 "-" $2}')"; }
+
+# 脱离当前 SSH 会话后台运行。输出「<pid> <1|0>」：1 = 已成为新会话 / 进程组的组长（pgid = pid）
 detach() {
-  # 脱离当前 SSH 会话：优先 setsid（util-linux），其次 python3 的 os.setsid，最后普通后台（会随会话结束被 HUP，只在无 setsid 的开发机出现）
+  # 优先 setsid（util-linux），其次 python3 的 os.setsid，最后普通后台（会随会话结束被 HUP，只在无 setsid 的开发机出现）
   if command -v setsid >/dev/null 2>&1; then
     setsid "$@" </dev/null >>"$DIR/log" 2>&1 &
+    echo "$! 1"
   elif command -v python3 >/dev/null 2>&1; then
     python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" </dev/null >>"$DIR/log" 2>&1 &
+    echo "$! 1"
   else
-    echo "warn: no setsid/python3, running without session detach" >> "$DIR/log"
+    logln "warn: no setsid/python3, running without session detach"
     nohup "$@" </dev/null >>"$DIR/log" 2>&1 &
+    echo "$! 0"
   fi
-  echo $!
 }
 
 # 本 shell 的进程组号：Linux 读 /proc（精简镜像可能没有 ps），否则 ps
@@ -108,12 +120,62 @@ kill_group() {
   kill -KILL "-$1" 2>/dev/null || true
 }
 
+# kill_pid <pid> ：TERM，2 秒后 KILL（服务自己 setsid 出了进程组时 kill_group 够不着）
+kill_pid() {
+  pid_alive "${1:-}" || return 0
+  kill -TERM "$1" 2>/dev/null
+  _i=0
+  while [ $_i -lt 20 ]; do
+    pid_alive "$1" || return 0
+    sleep 0.1; _i=$((_i + 1))
+  done
+  kill -KILL "$1" 2>/dev/null || true
+}
+
+# app.sh 里有 stop 分支吗（容忍制表符缩进、`(stop)`、`restart|stop)` 这类写法）
+has_stop() {
+  grep -Eq '^[[:space:]]*\(?([^)#]*\|)?[[:space:]]*stop[[:space:]]*(\|[^)]*)?\)' "$DIR/app.sh" 2>/dev/null
+}
+
+# 限时执行 app.sh stop，输出进日志
+app_stop() {
+  [ -f "$DIR/app.sh" ] && has_stop || return 0
+  if command -v timeout >/dev/null 2>&1; then
+    (cd "$DIR" && timeout -s KILL "$APP_STOP_LIMIT_S" sh "$DIR/app.sh" stop) </dev/null >>"$DIR/log" 2>&1
+  else
+    # 没有 timeout（macOS）：后台跑 + 看门狗。整段放子 shell 并丢弃 stderr，免得 bash 打印 "Terminated" 作业通知
+    (
+      (cd "$DIR" && exec sh "$DIR/app.sh" stop) </dev/null >>"$DIR/log" 2>&1 &
+      _ap=$!
+      (sleep "$APP_STOP_LIMIT_S"; kill -KILL "$_ap") </dev/null >/dev/null 2>&1 &
+      _wd=$!
+      wait "$_ap"
+      kill "$_wd"
+    ) 2>/dev/null
+  fi
+  return 0
+}
+
+# 停掉本应用的全部进程（app.sh stop → 进程组 → 服务进程），清掉 pid 文件，免得之后误杀被复用的 pid
+stop_procs() {
+  _pg=$(num "$(cat "$DIR/.pgid" 2>/dev/null)")
+  _sp=$(num "$(cat "$DIR/service.pid" 2>/dev/null)")
+  [ "${1:-}" = always ] || [ "$_pg" -gt 1 ] || [ "$_sp" -gt 1 ] && app_stop
+  kill_group "$_pg"
+  kill_pid "$_sp"
+  rm -f "$DIR/.pgid" "$DIR/service.pid"
+}
+
 tcp_probe() { # tcp_probe host:port
   _h=${1%:*}; _p=${1##*:}
-  if command -v python3 >/dev/null 2>&1; then
+  if [ "${SPARK_TEST_TCP_PROBE:-}" != curl ] && command -v python3 >/dev/null 2>&1; then
     python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(2); s.connect((sys.argv[1], int(sys.argv[2]))); s.close()' "$_h" "$_p" 2>/dev/null
   else
-    curl -s -o /dev/null --connect-timeout 2 --max-time 3 "telnet://$1" </dev/null; _rc=$?; [ $_rc -eq 0 ] || [ $_rc -eq 28 ]
+    # telnet:// 连上后会一直等数据直到 --max-time（rc 28），连接超时也是 rc 28：用 time_connect 区分是否真的连上了
+    _tc=$(curl -s -o /dev/null -w '%{time_connect}' --connect-timeout 2 --max-time 3 "telnet://$1" </dev/null)
+    _rc=$?
+    [ $_rc -eq 0 ] && return 0
+    [ $_rc -eq 28 ] && awk -v t="${_tc:-0}" 'BEGIN { exit !(t + 0 > 0) }'
   fi
 }
 
@@ -129,12 +191,12 @@ cmd_prepare() {
   _free=$(free_gib)
   if [ "$(num "$_free")" -lt "$(num "$SPARK_MIN_FREE_GIB")" ]; then
     write_status failed prepare 0 "disk: 数据盘剩余 ${_free}GiB，需要 ${SPARK_MIN_FREE_GIB}GiB" 0 2
-    echo "disk: free ${_free}GiB < ${SPARK_MIN_FREE_GIB}GiB" >&2
+    printf 'disk: free %sGiB < %sGiB\n' "$_free" "$SPARK_MIN_FREE_GIB" >&2
     return 2
   fi
   if ! _err=$(sh -n "$DIR/app.sh" 2>&1); then
     write_status failed prepare 0 "app.sh 语法错误: $_err" 0 2
-    echo "syntax: $_err" >&2
+    printf 'syntax: %s\n' "$_err" >&2
     return 2
   fi
   install_spark_status
@@ -143,16 +205,40 @@ cmd_prepare() {
 
 cmd_deploy() {
   load_env
+  # 旧的部署 / 服务先停掉（幂等：没有也不报错）。放在 prepare 之前：prepare 失败时旧服务也已停，状态 failed 与实际一致
+  stop_procs
   cmd_prepare || return $?
-  # 旧的部署 / 服务先停掉（幂等：没有也不报错）
-  kill_group "$(cat "$DIR/.pgid" 2>/dev/null)"
-  rm -f "$DIR/.pgid"
-  _n=$(num "$(cat "$DIR/.attempt" 2>/dev/null)"); _n=$((_n + 1)); echo "$_n" > "$DIR/.attempt"
-  echo "==== deploy #$_n $(now_iso) ====" >> "$DIR/log"
+  _n=$(num "$(cat "$DIR/.attempt" 2>/dev/null)"); _n=$((_n + 1)); put "$DIR/.attempt" "$_n"
+  logln "==== deploy #$_n $(now_iso) ===="
   write_status installing prepare 0 "starting" 0 0
-  _pid=$(detach sh "$DIR/run.sh" _bg deploy)
-  echo "started background deploy pid $_pid"
+  _out=$(detach sh "$DIR/run.sh" _bg deploy)
+  _pid=${_out% *}
+  if [ "${_out#* }" = 1 ]; then
+    # 立刻记下组号：deploy 返回后马上 stop / remove 也能杀到 _bg（它自己写 .pgid 之前）。
+    # 等到 setsid 真正生效（进程组出现）再返回，否则那一瞬间的 kill -<pgid> 会落空
+    put "$DIR/.pgid" "$_pid"
+    _i=0
+    while [ $_i -lt 100 ] && kill -0 "$_pid" 2>/dev/null && ! kill -0 "-$_pid" 2>/dev/null; do
+      sleep 0.02; _i=$((_i + 1))
+    done
+  fi
+  printf 'started background deploy pid %s\n' "$_pid"
   return 0
+}
+
+# _bg 的失败出口：先写 failed 状态，再清掉整个进程组（服务、孙进程、本进程自己），pid 文件一并清除
+fail_exit() { # fail_exit <phase> <progress> <message> <service_pid> <exit_code>
+  write_status failed "$1" "$2" "$3" "$4" "$5"
+  trap '' TERM INT
+  rm -f "$DIR/.pgid" "$DIR/service.pid"
+  if [ "$(num "$SPARK_PGID")" -gt 1 ]; then
+    kill -TERM "-$SPARK_PGID" 2>/dev/null
+    sleep 1
+    kill -KILL "-$SPARK_PGID" 2>/dev/null # 本进程也在组里，到这里为止
+  else
+    kill_pid "$4"
+  fi
+  exit "$5"
 }
 
 cmd_bg_deploy() {
@@ -161,17 +247,18 @@ cmd_bg_deploy() {
   # 否则组里还有调用方（SSH 会话、测试进程），宁可只杀服务进程
   SPARK_PGID=$(num "$(my_pgid)")
   if [ "$SPARK_PGID" != "$$" ]; then
-    echo "warn: not a process group leader (pgid $SPARK_PGID, pid $$); stop will only kill service.pid"
+    printf 'warn: not a process group leader (pgid %s, pid %s); stop will only kill service.pid\n' "$SPARK_PGID" "$$"
     SPARK_PGID=0
   fi
   export SPARK_PGID
-  echo "$SPARK_PGID" > "$DIR/.pgid"
+  put "$DIR/.pgid" "$SPARK_PGID"
   trap 'write_status failed "${PHASE:-prepare}" 0 "interrupted" 0 143; exit 143' TERM INT
   PHASE=prepare
   write_status installing prepare 1 "prepare"
+  _key=$(install_key)
   _installed=$(cat "$DIR/.installed" 2>/dev/null || echo "")
-  if [ "$_installed" = "$SPARK_SPEC_HASH" ] && [ -n "$SPARK_SPEC_HASH" ]; then
-    echo "skip install: spec_hash $SPARK_SPEC_HASH already installed"
+  if [ "$_installed" = "$_key" ] && [ -n "$SPARK_SPEC_HASH" ]; then
+    printf 'skip install: spec_hash %s and env unchanged\n' "$SPARK_SPEC_HASH"
   else
     PHASE=install
     write_status installing install 5 "install"
@@ -181,25 +268,18 @@ cmd_bg_deploy() {
     if [ "$_rc" -ne 0 ]; then
       # phase 取 app.sh 最后一次 spark_status 汇报的阶段（如 download），失败点更具体
       _ph=$(sed -n 's/.*"phase":"\([A-Za-z0-9_.-]*\)".*/\1/p' "$DIR/status.json" 2>/dev/null)
-      write_status failed "${_ph:-install}" 0 "install 失败，退出码 $_rc" 0 "$_rc"
-      exit "$_rc"
+      fail_exit "${_ph:-install}" 0 "install 失败，退出码 $_rc" 0 "$_rc"
     fi
-    echo "$SPARK_SPEC_HASH" > "$DIR/.installed"
+    put "$DIR/.installed" "$_key"
   fi
   PHASE=start
   write_status installing start 80 "start"
   rm -f "$DIR/service.pid"
   (cd "$DIR" && sh "$DIR/app.sh" start)
   _rc=$?
-  if [ "$_rc" -ne 0 ]; then
-    write_status failed start 80 "start 失败，退出码 $_rc" 0 "$_rc"
-    exit "$_rc"
-  fi
+  [ "$_rc" -eq 0 ] || fail_exit start 80 "start 失败，退出码 $_rc" 0 "$_rc"
   _spid=$(num "$(cat "$DIR/service.pid" 2>/dev/null)")
-  if [ "$_spid" -le 0 ]; then
-    write_status failed start 80 "app.sh start 没有写 service.pid" 0 1
-    exit 1
-  fi
+  [ "$_spid" -gt 0 ] || fail_exit start 80 "app.sh start 没有写 service.pid" 0 1
   PHASE=health
   write_status installing health 90 "health check" "$_spid"
   _deadline=$(( $(date +%s) + $(num "$SPARK_TIMEOUT_S") ))
@@ -208,20 +288,10 @@ cmd_bg_deploy() {
       write_status running health 100 "healthy" "$_spid"
       exit 0
     fi
-    if ! pid_alive "$_spid"; then
-      write_status failed health 90 "服务进程已退出" "$_spid" 1
-      exit 1
-    fi
+    pid_alive "$_spid" || fail_exit health 90 "服务进程已退出" "$_spid" 1
     if [ "$(date +%s)" -ge "$_deadline" ]; then
-      echo "health check timeout after ${SPARK_TIMEOUT_S}s"
-      # 先写状态再杀服务：不能 kill 整个进程组（本进程也在组里，trap 会把状态改写成 interrupted）；
-      # 同组里残留的子进程（tail 等）由平台随后下发的 run.sh stop 的 kill_group 收尾
-      write_status failed health 90 "timeout: 健康检查 ${SPARK_TIMEOUT_S} 秒内未通过" "$_spid" 124
-      trap - TERM INT
-      kill -TERM "$_spid" 2>/dev/null || true
-      sleep 1
-      kill -KILL "$_spid" 2>/dev/null || true
-      exit 124
+      printf 'health check timeout after %ss\n' "$SPARK_TIMEOUT_S"
+      fail_exit health 90 "timeout: 健康检查 ${SPARK_TIMEOUT_S} 秒内未通过" "$_spid" 124
     fi
     sleep 5
   done
@@ -229,14 +299,9 @@ cmd_bg_deploy() {
 
 cmd_stop() {
   load_env
-  _pgid=$(cat "$DIR/.pgid" 2>/dev/null)
-  _spid=$(num "$(cat "$DIR/service.pid" 2>/dev/null)")
-  if [ -f "$DIR/app.sh" ] && grep -q '^ *stop)' "$DIR/app.sh" 2>/dev/null; then
-    (cd "$DIR" && sh "$DIR/app.sh" stop) >> "$DIR/log" 2>&1 || true
-  fi
-  kill_group "$_pgid"
-  [ "$_spid" -gt 1 ] && kill -KILL "$_spid" 2>/dev/null
-  write_status stopped "" 0 "stopped" "$_spid" 0
+  _sp0=$(num "$(cat "$DIR/service.pid" 2>/dev/null)")
+  stop_procs always
+  write_status stopped "" 0 "stopped" "$_sp0" 0
   return 0
 }
 
@@ -256,12 +321,12 @@ cmd_status() {
 }
 
 cmd_remove() {
-  cmd_stop >/dev/null 2>&1 || true
   # 只删 <...>/.spark-apps/<slug> 形状的目录：run.sh 被拷到别处误跑时不能 rm -rf 掉别的东西
   if [ "$(basename "$(dirname "$DIR")")" != ".spark-apps" ]; then
-    echo "refuse to remove $DIR: not under .spark-apps" >&2
+    printf 'refuse to remove %s: not under .spark-apps\n' "$DIR" >&2
     return 0
   fi
+  cmd_stop >/dev/null 2>&1 || true
   cd / && rm -rf "$DIR"
   return 0
 }

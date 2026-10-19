@@ -164,7 +164,8 @@ func TestRunShDeployInstallsStartsAndBecomesRunning(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(b.dir, "installed.marker")); err != nil {
 		t.Fatal("install not executed")
 	}
-	if got, _ := os.ReadFile(filepath.Join(b.dir, ".installed")); string(got) != "hash-1\n" {
+	// .installed = "<spec_hash> <env 文件 cksum>"：env 变了（如换 MODEL_ID）也要重跑 install
+	if got, _ := os.ReadFile(filepath.Join(b.dir, ".installed")); !strings.HasPrefix(string(got), "hash-1 ") || len(strings.Fields(string(got))) != 2 {
 		t.Fatalf(".installed = %q", got)
 	}
 	log := b.log()
@@ -203,6 +204,15 @@ func TestRunShRedeploySkipsInstall(t *testing.T) {
 	third := b.waitState("running")
 	if _, err := os.Stat(filepath.Join(b.dir, "installed.marker")); err != nil || third.SpecHash != "hash-2" {
 		t.Fatalf("install not re-run for new hash: %+v", third)
+	}
+	// 只改 env（同 spec_hash，换模型）→ 也要重跑 install，否则新模型不会下载
+	os.Remove(filepath.Join(b.dir, "installed.marker"))
+	b.setEnv("MODEL_ID", "Qwen/Qwen3-8B")
+	b.run("deploy")
+	b.waitState("installing")
+	b.waitState("running")
+	if got, err := os.ReadFile(filepath.Join(b.dir, "installed.marker")); err != nil || !strings.Contains(string(got), "Qwen3-8B") {
+		t.Fatalf("install not re-run after env change: %q %v\n%s", got, err, b.log())
 	}
 }
 
@@ -244,6 +254,11 @@ func TestRunShTimeoutAndStop(t *testing.T) {
 	if st2.State != "stopped" || alive(running.ServicePid) || !strings.Contains(out, "\nalive=0\n") {
 		t.Fatalf("after stop = %+v alive=%v", st2, alive(running.ServicePid))
 	}
+	for _, f := range []string{".pgid", "service.pid"} { // stop 之后不留可能被复用的 pid
+		if _, err := os.Stat(filepath.Join(b2.dir, f)); err == nil {
+			t.Fatalf("%s left after stop", f)
+		}
+	}
 }
 
 func TestRunShDiskCheckAndRemove(t *testing.T) {
@@ -261,10 +276,27 @@ func TestRunShDiskCheckAndRemove(t *testing.T) {
 	if _, err := os.Stat(b.dir); err == nil {
 		t.Fatal("dir still exists after remove")
 	}
-	// 对不存在的目录再 remove：仍 0
-	cmd := exec.Command("/bin/sh", "-c", "sh run.sh remove")
-	cmd.Dir = b.root
-	_ = cmd.Run()
+	// Runner 的形式：从别的工作目录用绝对路径调用 remove
+	b3 := newBox(t, "app_ok.sh", nil)
+	b3.run("deploy")
+	running := b3.waitState("running")
+	cmd := exec.Command("/bin/sh", filepath.Join(b3.dir, "run.sh"), "remove")
+	cmd.Dir = b3.root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("remove by absolute path: %v %s", err, out)
+	}
+	if _, err := os.Stat(b3.dir); err == nil || alive(running.ServicePid) {
+		t.Fatalf("remove left dir or service %d", running.ServicePid)
+	}
+	if _, err := os.Stat(filepath.Join(b3.root, appdeploy.AppDirName)); err != nil {
+		t.Fatalf("remove deleted the parent .spark-apps: %v", err)
+	}
+	// 目录已不在时 run.sh 本身也不在，sh 报错退出（非 0）：Task 9 的 Runner 把「目录不存在」当作已删除
+	cmd = exec.Command("/bin/sh", filepath.Join(b3.dir, "run.sh"), "remove")
+	cmd.Dir = b3.root
+	if err := cmd.Run(); err == nil {
+		t.Fatal("remove of a missing dir unexpectedly succeeded")
+	}
 	// status 对缺失状态文件返回 3
 	dir2 := appdeploy.AppDir(t.TempDir(), "x")
 	os.MkdirAll(dir2, 0o700)
@@ -373,4 +405,215 @@ func TestSparkStatusEscapesInput(t *testing.T) {
 	if st, _ := b.status(); st.Progress != 100 {
 		t.Fatalf("progress not clamped: %+v", st)
 	}
+}
+
+func waitDead(t *testing.T, what string, pid int) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); alive(pid); {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s %d still alive", what, pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func groupGone(pgid int) bool { return pgid > 1 && syscall.Kill(-pgid, 0) != nil }
+
+// deploy 刚返回就 stop：后台 _bg 还没来得及写 .pgid，也必须被杀掉，不能之后自己跑完变成 running。
+func TestRunShStopRightAfterDeploy(t *testing.T) {
+	b := newBox(t, "app_ok.sh", map[string]string{"INSTALL_SLEEP": "1"})
+	if _, code := b.run("deploy"); code != 0 {
+		t.Fatalf("deploy = %d", code)
+	}
+	pg, _ := os.ReadFile(filepath.Join(b.dir, ".pgid"))
+	pgid, _ := strconv.Atoi(strings.TrimSpace(string(pg)))
+	if _, code := b.run("stop"); code != 0 {
+		t.Fatalf("stop = %d", code)
+	}
+	if pgid <= 1 || !groupGone(pgid) {
+		t.Fatalf("deploy group %q still alive after stop", pg)
+	}
+	time.Sleep(2 * time.Second) // INSTALL_SLEEP=1：若 _bg 幸存，此时已装完并起了服务
+	st, out := b.status()
+	if st.State != "stopped" || !strings.Contains(out, "\nalive=0\n") {
+		t.Fatalf("after deploy+stop: %+v\n%s", st, b.log())
+	}
+	if _, err := os.Stat(filepath.Join(b.dir, "installed.marker")); err == nil {
+		t.Fatal("install finished after stop")
+	}
+}
+
+func TestRunShStopDuringInstall(t *testing.T) {
+	b := newBox(t, "app_ok.sh", map[string]string{"INSTALL_SLEEP": "30"})
+	b.run("deploy")
+	var st status
+	for deadline := time.Now().Add(10 * time.Second); st.Phase != "download"; {
+		if time.Now().After(deadline) {
+			t.Fatalf("never reached download: %+v", st)
+		}
+		time.Sleep(50 * time.Millisecond)
+		st, _ = b.status()
+	}
+	start := time.Now()
+	if _, code := b.run("stop"); code != 0 || time.Since(start) > 5*time.Second {
+		t.Fatalf("stop = %d after %v", code, time.Since(start))
+	}
+	if !groupGone(st.Pid) {
+		t.Fatalf("install group %d still alive", st.Pid)
+	}
+	if st2, _ := b.status(); st2.State != "stopped" {
+		t.Fatalf("after stop: %+v", st2)
+	}
+}
+
+// start 之后的失败路径（超时、服务退出、start 失败）都要清掉整个进程组，包括服务派生的孙进程。
+func TestRunShFailureReapsProcessGroup(t *testing.T) {
+	for _, tc := range []struct{ mode, phase, msg string }{
+		{"hang", "health", "timeout"},
+		{"exit", "health", "服务进程已退出"},
+		{"fail", "start", "start 失败"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			b := newBox(t, "app_grandchild.sh", map[string]string{"GC_MODE": tc.mode})
+			b.setEnv("SPARK_HEALTH_ADDR", "127.0.0.1:1")
+			b.setEnv("SPARK_TIMEOUT_S", "2")
+			b.run("deploy")
+			st := b.waitState("failed")
+			if st.Phase != tc.phase || !strings.Contains(st.Message, tc.msg) {
+				t.Fatalf("status = %+v", st)
+			}
+			data, err := os.ReadFile(filepath.Join(b.dir, "grandchild.pid"))
+			gc, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil || gc <= 1 {
+				t.Fatalf("grandchild.pid = %q %v", data, err)
+			}
+			waitDead(t, "grandchild", gc)
+			for deadline := time.Now().Add(5 * time.Second); !groupGone(st.Pid); {
+				if time.Now().After(deadline) {
+					t.Fatalf("group %d still alive", st.Pid)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			for _, f := range []string{".pgid", "service.pid"} {
+				if _, err := os.Stat(filepath.Join(b.dir, f)); err == nil {
+					t.Fatalf("%s left after failure", f)
+				}
+			}
+			if _, out := b.status(); !strings.Contains(out, "\nalive=0\n") {
+				t.Fatalf("status = %q", out)
+			}
+		})
+	}
+}
+
+// 重新部署时 prepare 失败（磁盘不够）：旧服务先停掉，状态 failed 与实际一致。
+func TestRunShRedeployPrepareFailureStopsOld(t *testing.T) {
+	b := newBox(t, "app_ok.sh", nil)
+	b.run("deploy")
+	running := b.waitState("running")
+	b.setEnv("SPARK_MIN_FREE_GIB", "100")
+	b.setEnv("SPARK_TEST_DF_FREE_GIB", "5")
+	if _, code := b.run("deploy"); code != 2 {
+		t.Fatalf("redeploy = %d", code)
+	}
+	st, out := b.status()
+	if st.State != "failed" || alive(running.ServicePid) || !strings.Contains(out, "\nalive=0\n") {
+		t.Fatalf("after failed redeploy: %+v old alive=%v", st, alive(running.ServicePid))
+	}
+}
+
+func TestRunShDeploySyntaxError(t *testing.T) {
+	b := newBox(t, "app_ok.sh", nil)
+	os.WriteFile(filepath.Join(b.dir, "app.sh"), []byte("case \"$1\" in\n  install) if then ;;\nesac\n"), 0o644)
+	out, code := b.run("deploy")
+	st, _ := b.status()
+	if code != 2 || st.State != "failed" || st.Phase != "prepare" || !strings.Contains(st.Message, "语法错误") || !strings.Contains(out, "syntax") {
+		t.Fatalf("syntax: code=%d out=%q status=%+v", code, out, st)
+	}
+}
+
+func TestRunShRemoveRefusesOutsideAppsDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "elsewhere")
+	os.MkdirAll(dir, 0o700)
+	os.WriteFile(filepath.Join(dir, "run.sh"), runtime.RunSH, 0o755)
+	cmd := exec.Command("/bin/sh", "run.sh", "remove")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "refuse") {
+		t.Fatalf("remove outside .spark-apps: %v %q", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "run.sh")); err != nil {
+		t.Fatal("dir outside .spark-apps was removed")
+	}
+}
+
+// app.sh stop 卡住也不能拖垮 run.sh stop（Runner 的 exec 上限 20 秒）；stop 分支写成制表符缩进 + restart|stop) 也要认得。
+func TestRunShStopTimeLimitsAppStop(t *testing.T) {
+	b := newBox(t, "app_slowstop.sh", nil)
+	b.run("deploy")
+	running := b.waitState("running")
+	start := time.Now()
+	if _, code := b.run("stop"); code != 0 {
+		t.Fatalf("stop = %d", code)
+	}
+	if d := time.Since(start); d > 12*time.Second {
+		t.Fatalf("stop took %v", d)
+	}
+	if _, err := os.Stat(filepath.Join(b.dir, "stop.marker")); err != nil {
+		t.Fatal("app.sh stop branch (tab + alternation) not executed")
+	}
+	if alive(running.ServicePid) {
+		t.Fatal("service still alive")
+	}
+}
+
+func TestSparkStatusTruncatesAndLogsLiterally(t *testing.T) {
+	b := newBox(t, "app_ok.sh", nil)
+	b.run("deploy")
+	b.waitState("running")
+	long := strings.Repeat("x", 5000)
+	cmd := exec.Command("/bin/sh", "-c", `. ./env; PATH=$SPARK_APP_DIR:$PATH spark_status download 1 'back\cslash`+long+`'`)
+	cmd.Dir = b.dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("spark_status: %v %s", err, out)
+	}
+	st, _ := b.status()
+	if len(st.Message) > 1024 || !strings.HasPrefix(st.Message, `back\cslashxxx`) {
+		t.Fatalf("message len %d prefix %q", len(st.Message), st.Message[:min(20, len(st.Message))])
+	}
+	if !strings.Contains(b.log(), `[spark_status] download 1% back\cslashxxx`) { // echo 会把 \c 当转义吞掉后文
+		t.Fatalf("log line not literal:\n%s", b.log()[max(0, len(b.log())-300):])
+	}
+}
+
+// 没有 python3 时 TCP 探测走 curl telnet://：连上即健康，连接超时（rc 28 且 time_connect=0）不算健康。
+func TestRunShCurlTCPProbe(t *testing.T) {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { time.Sleep(5 * time.Second); c.Close() }()
+		}
+	}()
+	t.Run("connected", func(t *testing.T) {
+		b := newBox(t, "app_ok.sh", map[string]string{"SPARK_TEST_TCP_PROBE": "curl"})
+		b.setEnv("SPARK_HEALTH_PATH", "")
+		b.setEnv("SPARK_HEALTH_ADDR", ln.Addr().String())
+		b.run("deploy")
+		b.waitState("running")
+	})
+	t.Run("connect-timeout", func(t *testing.T) {
+		b := newBox(t, "app_ok.sh", map[string]string{"SPARK_TEST_TCP_PROBE": "curl"})
+		b.setEnv("SPARK_HEALTH_PATH", "")
+		b.setEnv("SPARK_HEALTH_ADDR", "10.255.255.1:80") // 不可路由：连接超时
+		b.setEnv("SPARK_TIMEOUT_S", "2")
+		b.run("deploy")
+		if st := b.waitState("failed"); !strings.Contains(st.Message, "timeout") {
+			t.Fatalf("status = %+v", st)
+		}
+	})
 }
