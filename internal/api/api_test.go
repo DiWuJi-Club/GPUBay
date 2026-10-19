@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,6 +31,7 @@ import (
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
+	"spark-cloud/internal/web"
 )
 
 func TestMain(m *testing.M) { dbtest.Main(m) }
@@ -43,9 +46,13 @@ type testEnv struct {
 	ts     *httptest.Server
 	wallet *wallet.Service
 	pay    *pay.Mock
+	clk    *clock.Fake
 }
 
-func newTestEnv(t *testing.T) *testEnv {
+func newTestEnv(t *testing.T) *testEnv { return newTestEnvWith(t, nil) }
+
+// newTestEnvWith 在构建路由前允许调整 Server 字段（例如 Static）。
+func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
@@ -69,9 +76,12 @@ func newTestEnv(t *testing.T) *testEnv {
 	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test",
 		Billing: bill, DevPay: true}
+	if tweak != nil {
+		tweak(srv)
+	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
-	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock}
+	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk}
 }
 
 type client struct {
@@ -304,5 +314,92 @@ func TestPlaceOrderHonorsIdempotencyKey(t *testing.T) {
 	if code, out := c.doH("POST", "/instances/"+instID+"/renew", map[string]string{"duration": "1d"}, key); code != 409 ||
 		out["code"] != "idempotency_conflict" {
 		t.Fatalf("renew with order key = %d %v", code, out)
+	}
+}
+
+func TestInstanceViewIncludesProductAndImageNames(t *testing.T) {
+	e := newTestEnv(t)
+	dbtest.CreateMachine(t, e.pool, "SN-NAMES")
+	c, uid := e.verifiedClient("13800000021")
+	if _, err := e.wallet.AdminAdjust(context.Background(), 1, uid, 100000, "测试充值", ""); err != nil {
+		t.Fatal(err)
+	}
+	iid := dbtest.ImageID(t, e.pool)
+	code, out := c.do("POST", "/orders", map[string]any{"product_id": dbtest.ProductID(t, e.pool), "duration": "1d", "image_id": iid})
+	if code != 201 {
+		t.Fatalf("order = %d %v", code, out)
+	}
+	inst := out["instance"].(map[string]any)
+	if inst["product_name"] != "DGX Spark 整机" || inst["image_name"] != "Ubuntu 24.04 + CUDA" {
+		t.Fatalf("names on create = %v", inst)
+	}
+	// 镜像停用后仍能显示名称
+	if _, err := e.pool.Exec(context.Background(), `UPDATE images SET enabled = false WHERE id = $1`, iid); err != nil {
+		t.Fatal(err)
+	}
+	id := inst["id"].(string)
+	if code, out := c.do("GET", "/instances/"+id, nil); code != 200 || out["image_name"] != "Ubuntu 24.04 + CUDA" {
+		t.Fatalf("detail = %d %v", code, out)
+	}
+	if code, out := c.do("GET", "/instances", nil); code != 200 || out["items"].([]any)[0].(map[string]any)["product_name"] != "DGX Spark 整机" {
+		t.Fatalf("list = %d %v", code, out)
+	}
+}
+
+func TestMyKYCRecord(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.client()
+	c.login("13800000022")
+	if code, out := c.do("GET", "/kyc", nil); code != 200 || out["record"] != nil {
+		t.Fatalf("empty kyc = %d %v", code, out)
+	}
+	if code, out := c.do("POST", "/kyc/personal", map[string]string{"name": "欧阳娜娜", "id_number": "11010119900101123X"}); code != 200 {
+		t.Fatalf("kyc = %d %v", code, out)
+	}
+	code, out := c.do("GET", "/kyc", nil)
+	rec, _ := out["record"].(map[string]any)
+	if code != 200 || rec == nil || rec["kind"] != "personal" || rec["result"] != "verified" || rec["real_name"] != "欧***" {
+		t.Fatalf("kyc record = %d %v", code, out)
+	}
+	for _, k := range []string{"id_number_masked", "license_file", "user_id"} {
+		if _, ok := rec[k]; ok {
+			t.Fatalf("%s must not be exposed: %v", k, rec)
+		}
+	}
+	if code, _ := e.client().do("GET", "/kyc", nil); code != 401 {
+		t.Fatalf("anonymous kyc = %d, want 401", code)
+	}
+}
+
+func TestRouterServesConsoleAndJSON404(t *testing.T) {
+	index := fstest.MapFS{"index.html": {Data: []byte("<!doctype html><title>console</title>")}}
+	e := newTestEnvWith(t, func(s *api.Server) { s.Static = web.NewHandler(index, "/") })
+	get := func(path string) *http.Response {
+		resp, err := http.Get(e.ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+	for _, p := range []string{"/", "/market", "/instances/ins-abc12345", "/wallet/recharge/rch-x"} {
+		resp := get(p)
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 || !strings.Contains(string(body), "console") || resp.Header.Get("Cache-Control") != "no-cache" ||
+			resp.Header.Get("Content-Security-Policy") == "" {
+			t.Fatalf("%s: %d %q cache=%q", p, resp.StatusCode, body, resp.Header.Get("Cache-Control"))
+		}
+	}
+	resp := get("/api/v1/nope")
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode != 404 || out["code"] != "not_found" {
+		t.Fatalf("unknown api = %d %v", resp.StatusCode, out)
+	}
+	if resp := get("/api/nope"); resp.StatusCode != 404 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+		t.Fatalf("/api/nope = %d %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	if resp := get("/api/v1/wallet"); resp.StatusCode != 401 || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("anonymous wallet = %d cache=%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
 	}
 }

@@ -11,9 +11,9 @@ import (
 )
 
 func (s *Server) catalogRoutes(g chi.Router) {
-	s.handle(g, http.MethodGet, "/products", superOnly, s.handleAdminProducts)
+	s.handle(g, http.MethodGet, "/products", allRoles, s.handleAdminProducts)
 	s.handle(g, http.MethodPut, "/products/{id}/prices/{duration}", superOnly, s.handleSetPrice)
-	s.handle(g, http.MethodGet, "/images", superOnly, s.handleAdminImages)
+	s.handle(g, http.MethodGet, "/images", allRoles, s.handleAdminImages)
 	s.handle(g, http.MethodPost, "/images", superOnly, s.handleCreateImage)
 	s.handle(g, http.MethodPut, "/images/{id}", superOnly, s.handleUpdateImage)
 	s.handle(g, http.MethodGet, "/audit", allRoles, s.handleAudit)
@@ -133,5 +133,28 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, httpx.Page(list, total))
+	admins, err := s.Admins.List(r.Context())
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	names := make(map[int64]string, len(admins))
+	for _, a := range admins {
+		names[a.ID] = a.Username
+	}
+	views := make([]auditView, 0, len(list))
+	for _, l := range list {
+		v := auditView{Log: l}
+		if l.ActorType == "admin" {
+			v.ActorName = names[l.ActorID]
+		}
+		views = append(views, v)
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.Page(views, total))
+}
+
+// auditView 在审计记录上补操作人用户名（admin 之外的 actor 或已不存在的管理员为空串）。
+type auditView struct {
+	audit.Log
+	ActorName string `json:"actor_name"`
 }

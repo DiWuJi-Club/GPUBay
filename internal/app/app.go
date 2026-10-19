@@ -42,7 +42,13 @@ type Options struct {
 	KYC   kyc.Verifier
 	Pay   map[string]pay.Provider // 测试注入的支付渠道
 	PDU   pdu.Driver              // 测试注入：所有 PDU 都使用该驱动
+	// DisableRateLimits 把验证码按 IP 限流与后台登录限流调到 100 万次。只供 cmd/e2e-server 使用：
+	// 两个限流器都按注入的时钟计窗口，假时钟下窗口永不滑过。没有任何配置项或环境变量能打开它，
+	// 并且生产环境设置为 true 时 Build 直接报错。
+	DisableRateLimits bool
 }
+
+const noRateLimit = 1_000_000
 
 type App struct {
 	Identity *identity.Service
@@ -59,6 +65,13 @@ type App struct {
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
+	if opt.DisableRateLimits && cfg.Env == "prod" {
+		return nil, errors.New("生产环境禁止关闭速率限制")
+	}
+	ipHourLimit, loginLimit := 0, 0
+	if opt.DisableRateLimits {
+		ipHourLimit, loginLimit = noRateLimit, noRateLimit
+	}
 	if cfg.Env == "prod" && ((opt.SMS == nil && cfg.SMSDriver == "mock") || (opt.KYC == nil && cfg.KYCDriver == "mock") ||
 		(opt.Pay == nil && cfg.PayDriver != "real") || (opt.PDU == nil && cfg.PDUDriver != "snmp")) {
 		return nil, errors.New("生产环境禁止使用 mock 插件")
@@ -110,7 +123,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	uploads := storage.NewService(pool, clk, disk)
 
-	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: smsSender, KYC: verifier, Box: box, Uploads: uploads, FixedCode: fixedCode})
+	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: smsSender, KYC: verifier, Box: box, Uploads: uploads, FixedCode: fixedCode, CodeIPHourLimit: ipHourLimit})
 	w := wallet.NewService(pool, clk)
 	c := catalog.NewService(pool).WithClock(clk)
 	f := fleet.NewService(pool, clk)
@@ -143,12 +156,12 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	})
 	srv := &api.Server{
 		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
-		Domain: cfg.Domain, SecureCookie: cfg.Env == "prod", TrustProxy: cfg.TrustProxy,
+		Domain: cfg.Domain, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy,
 	}
 	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
 	adminSrv := &adminapi.Server{
 		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads,
-		Clock: clk, Log: log, SecureCookie: cfg.Env == "prod",
+		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit,
 	}
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: srv.Router()}, nil
 }
@@ -234,4 +247,26 @@ func pduOpener(cfg config.Config, override pdu.Driver) fleet.PDUOpener {
 		}
 		return nil, fmt.Errorf("未知的 PDU 驱动 %q", c.Driver)
 	}
+}
+
+// Servers 按配置创建用户端与后台两个 HTTP 服务器（地址与超时），cmd/platform 与 cmd/e2e-server 共用，
+// 保证端到端测试跑的是与生产相同的监听与路由。
+func (a *App) Servers(cfg config.Config) (public, admin *http.Server) {
+	public = &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           a.Handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	admin = &http.Server{
+		Addr:              cfg.AdminAddr,
+		Handler:           a.AdminHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second, // CSV 导出最多 10 万行
+		IdleTimeout:       120 * time.Second,
+	}
+	return public, admin
 }

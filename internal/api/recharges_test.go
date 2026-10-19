@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"spark-cloud/internal/api"
 	"spark-cloud/internal/platform/clock"
@@ -39,10 +40,17 @@ func TestRechargeFlowWithDevPay(t *testing.T) {
 		t.Fatal("user_id must not be exposed")
 	}
 	id := out["id"].(string)
+	if out["remaining_seconds"].(float64) != 900 {
+		t.Fatalf("remaining_seconds on create = %v, want 900", out["remaining_seconds"])
+	}
+	e.clk.Advance(60 * time.Second)
+	if code, out := c.do("GET", "/recharges/"+id, nil); code != 200 || out["remaining_seconds"].(float64) != 840 {
+		t.Fatalf("remaining after 60s = %d %v, want 840", code, out)
+	}
 	if code, out := c.do("POST", "/dev/recharges/"+id+"/pay", map[string]any{}); code != 200 || out["status"] != "paid" {
 		t.Fatalf("dev pay = %d %v", code, out)
 	}
-	if code, out := c.do("GET", "/recharges/"+id, nil); code != 200 || out["status"] != "paid" || out["qr_code"] != nil {
+	if code, out := c.do("GET", "/recharges/"+id, nil); code != 200 || out["status"] != "paid" || out["qr_code"] != nil || out["remaining_seconds"].(float64) != 0 {
 		t.Fatalf("get = %d %v", code, out)
 	}
 	if code, out := c.do("GET", "/wallet", nil); code != 200 || out["balance"].(float64) != 5000 {

@@ -1,13 +1,13 @@
-export PATH := $(HOME)/.local/go/bin:$(PATH)
+export PATH := $(HOME)/.local/go/bin:$(HOME)/.local/bin:$(PATH)
 
 DEV_DB  := postgres://postgres:postgres@localhost:5433/spark?sslmode=disable
 # 仅本地开发使用的固定密钥，生产环境必须用 openssl rand -base64 32 生成
 DEV_KEY := MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
 
-.PHONY: test devdb run build
+.PHONY: test devdb run build web-install web web-test e2e check
 
 test:
-	go vet ./... && go test ./...
+	go vet ./... && go test ./... && $(MAKE) web-test
 
 devdb:
 	go run ./cmd/devdb
@@ -15,6 +15,23 @@ devdb:
 run:
 	SPARK_DATABASE_URL=$(DEV_DB) SPARK_SECRET_KEY=$(DEV_KEY) go run ./cmd/platform
 
-build:
+# 前端：首次 make web-install；产物输出到 internal/web/dist/{console,admin}，由 Go embed
+web-install:
+	cd web && npm ci
+
+web:
+	cd web && npm run build
+
+web-test:
+	cd web && npm test
+
+# 端到端：先构建前端（e2e-server 与生产一样从 embed 读产物），核对覆盖表，再跑 Playwright（自动拉起 cmd/e2e-server）
+e2e: web
+	cd web && npm run e2e:coverage && npx playwright test
+
+# 发布产物先构建前端再编译后端，保证二进制里是最新页面
+build: web
 	GOOS=linux GOARCH=amd64 go build -o bin/platform-linux-amd64 ./cmd/platform
 	GOOS=linux GOARCH=arm64 go build -o bin/platform-linux-arm64 ./cmd/platform
+
+check: test e2e

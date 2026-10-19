@@ -35,8 +35,9 @@ func TestPricesAndImagesEndpoints(t *testing.T) {
 		t.Fatalf("images = %d %v", code, out)
 	}
 	ops := e.loginAs("ops", admin.RoleOps)
-	if code, out := ops.do("GET", "/products", nil); code != 403 || codeOf(out) != "forbidden" {
-		t.Fatalf("ops products = %d %v", code, out)
+	// 读权限已对全部角色开放（B6）；写价格仍仅 super
+	if code, out := ops.do("PUT", "/products/1/prices/1d", map[string]any{"amount": 100, "enabled": true}); code != 403 || codeOf(out) != "forbidden" {
+		t.Fatalf("ops set price = %d %v", code, out)
 	}
 }
 
@@ -52,5 +53,29 @@ func TestAuditEndpoint(t *testing.T) {
 	}
 	if code, _ := fin.do("GET", "/audit?from=bad", nil); code != 400 {
 		t.Fatalf("bad from = %d", code)
+	}
+	// 操作人名称：root 的操作带用户名；命令行 / 系统写入的记录为空串
+	if code, out := root.do("POST", "/images", map[string]any{"name": "审计镜像", "ref": "registry.spark.internal/base/audit:1", "enabled": true, "sort": 50}); code != 201 {
+		t.Fatalf("create image = %d %v", code, out)
+	}
+	code, out := fin.do("GET", "/audit?action=image.create", nil)
+	items := out["items"].([]any)
+	if code != 200 || len(items) != 1 || items[0].(map[string]any)["actor_name"] != "root" {
+		t.Fatalf("audit actor_name = %d %v", code, out)
+	}
+	code, out = fin.do("GET", "/audit?action=admin.create", nil)
+	if code != 200 || out["items"].([]any)[0].(map[string]any)["actor_name"] != "" {
+		t.Fatalf("system entry actor_name = %d %v, want empty", code, out)
+	}
+	// B6：ops / finance 也能读商品与镜像
+	ops := e.loginAs("ops2", admin.RoleOps)
+	if code, _ := ops.do("GET", "/products", nil); code != 200 {
+		t.Fatalf("ops products = %d", code)
+	}
+	if code, _ := fin.do("GET", "/images", nil); code != 200 {
+		t.Fatalf("finance images = %d", code)
+	}
+	if code, out := fin.do("POST", "/images", map[string]any{"name": "x", "ref": "r", "enabled": true, "sort": 1}); code != 403 || codeOf(out) != "forbidden" {
+		t.Fatalf("finance create image = %d %v, want forbidden", code, out)
 	}
 }

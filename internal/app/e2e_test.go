@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -367,6 +368,99 @@ func TestAdminRefundEndToEnd(t *testing.T) {
 	for _, action := range []string{"machine.register", "machine.maintenance", "instance.refund_release"} {
 		if got := ac.do("GET", "/audit?action="+action, nil); got["total"].(float64) != 1 {
 			t.Fatalf("audit %s = %v", action, got)
+		}
+	}
+}
+
+func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestBuildRejectsDisabledRateLimitsInProd(t *testing.T) {
+	cfg := config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "aliyun", KYCDriver: "aliyun",
+		PayDriver: "real", PDUDriver: "snmp", UploadDir: t.TempDir()}
+	if _, err := app.Build(cfg, nil, discardLog(), app.Options{DisableRateLimits: true}); err == nil || !strings.Contains(err.Error(), "速率限制") {
+		t.Fatalf("err = %v, want 生产环境禁止关闭速率限制", err)
+	}
+}
+
+func TestServersUseConfiguredAddressesAndTimeouts(t *testing.T) {
+	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+	a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.HTTPAddr, cfg.AdminAddr = "127.0.0.1:18080", "127.0.0.1:18081"
+	pub, adm := a.Servers(cfg)
+	if pub.Addr != "127.0.0.1:18080" || adm.Addr != "127.0.0.1:18081" || pub.Handler == nil || adm.Handler == nil ||
+		pub.ReadHeaderTimeout != 10*time.Second || pub.WriteTimeout != 60*time.Second || adm.WriteTimeout != 120*time.Second ||
+		pub.IdleTimeout != 120*time.Second {
+		t.Fatalf("servers = %+v / %+v", pub, adm)
+	}
+}
+
+func TestSecureCookieOutsideDev(t *testing.T) {
+	for env, wantSecure := range map[string]bool{"dev": false, "staging": true} {
+		cfg := config.Config{Env: env, Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+		a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ts := httptest.NewServer(a.Handler)
+		post := func(path, body string) *http.Response {
+			resp, err := http.Post(ts.URL+"/api/v1"+path, "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return resp
+		}
+		post("/auth/sms-code", `{"phone":"13800007777"}`).Body.Close()
+		resp := post("/auth/login", `{"phone":"13800007777","code":"000000"}`)
+		resp.Body.Close()
+		secure := false
+		for _, c := range resp.Cookies() {
+			if c.Name == "sc_session" {
+				secure = c.Secure
+			}
+		}
+		if resp.StatusCode != 200 || secure != wantSecure {
+			t.Fatalf("%s: status %d secure %v, want %v", env, resp.StatusCode, secure, wantSecure)
+		}
+		ts.Close()
+	}
+}
+
+// TestDisableRateLimitsLiftsBothLimits 核对 DisableRateLimits 确实放开了验证码按 IP 每小时上限（默认 30）
+// 与后台登录按 IP 每分钟上限（默认 20）；未设置时同样的请求序列会在第 31 / 21 次被限流。
+func TestDisableRateLimitsLiftsBothLimits(t *testing.T) {
+	const smsTries, loginTries = 31, 21
+	for _, disabled := range []bool{false, true} {
+		cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir()}
+		a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0), DisableRateLimits: disabled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		post := func(h http.Handler, path, body string) int {
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.RemoteAddr = "192.0.2.7:4000"
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		smsLast := 0
+		for i := 0; i < smsTries; i++ { // 不同手机号、同一 IP，避开按手机号的间隔与日上限
+			smsLast = post(a.Handler, "/api/v1/auth/sms-code", fmt.Sprintf(`{"phone":"1380000%04d"}`, i))
+		}
+		loginLast := 0
+		for i := 0; i < loginTries; i++ {
+			loginLast = post(a.AdminHandler, "/admin/api/v1/auth/login", `{"username":"nobody","password":"wrong-password"}`)
+		}
+		wantSMS, wantLogin := http.StatusTooManyRequests, http.StatusTooManyRequests
+		if disabled {
+			wantSMS, wantLogin = http.StatusOK, http.StatusUnauthorized
+		}
+		if smsLast != wantSMS || loginLast != wantLogin {
+			t.Fatalf("disabled=%v: sms #%d = %d (want %d), admin login #%d = %d (want %d)",
+				disabled, smsTries, smsLast, wantSMS, loginTries, loginLast, wantLogin)
 		}
 	}
 }

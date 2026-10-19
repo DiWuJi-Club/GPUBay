@@ -15,22 +15,26 @@ import (
 const notifyPathPrefix = "/api/v1/pay/notify/"
 
 type rechargeView struct {
-	ID        string     `json:"id"`
-	Channel   string     `json:"channel"`
-	Amount    int64      `json:"amount"`
-	Status    string     `json:"status"`
-	QRCode    string     `json:"qr_code,omitempty"` // 仅待支付时返回
-	ExpiresAt time.Time  `json:"expires_at"`
-	PaidAt    *time.Time `json:"paid_at"`
-	ClosedAt  *time.Time `json:"closed_at"`
-	CreatedAt time.Time  `json:"created_at"`
+	ID               string     `json:"id"`
+	Channel          string     `json:"channel"`
+	Amount           int64      `json:"amount"`
+	Status           string     `json:"status"`
+	QRCode           string     `json:"qr_code,omitempty"` // 仅待支付时返回
+	RemainingSeconds int64      `json:"remaining_seconds"`
+	ExpiresAt        time.Time  `json:"expires_at"`
+	PaidAt           *time.Time `json:"paid_at"`
+	ClosedAt         *time.Time `json:"closed_at"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
-func toRechargeView(r billing.Recharge) rechargeView {
+func (s *Server) toRechargeView(r billing.Recharge) rechargeView {
 	v := rechargeView{ID: r.ID, Channel: r.Channel, Amount: r.Amount, Status: r.Status, ExpiresAt: r.ExpiresAt,
 		PaidAt: r.PaidAt, ClosedAt: r.ClosedAt, CreatedAt: r.CreatedAt}
 	if r.Status == billing.StatusPending {
 		v.QRCode = r.QRCode
+		if rem := r.ExpiresAt.Sub(s.Clock.Now()); rem > 0 {
+			v.RemainingSeconds = int64(rem / time.Second) // 向下取整；前端用它驱动倒计时，不拿设备时钟减 expires_at
+		}
 	}
 	return v
 }
@@ -53,7 +57,7 @@ func (s *Server) handleCreateRecharge(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, toRechargeView(rch))
+	writeJSON(w, http.StatusCreated, s.toRechargeView(rch))
 }
 
 func (s *Server) handleRecharge(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +66,7 @@ func (s *Server) handleRecharge(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toRechargeView(rch))
+	writeJSON(w, http.StatusOK, s.toRechargeView(rch))
 }
 
 func (s *Server) handleRecharges(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +82,7 @@ func (s *Server) handleRecharges(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]rechargeView, 0, len(items))
 	for _, it := range items {
-		views = append(views, toRechargeView(it))
+		views = append(views, s.toRechargeView(it))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": views, "total": total})
 }
@@ -111,5 +115,5 @@ func (s *Server) handleDevPay(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toRechargeView(rch))
+	writeJSON(w, http.StatusOK, s.toRechargeView(rch))
 }

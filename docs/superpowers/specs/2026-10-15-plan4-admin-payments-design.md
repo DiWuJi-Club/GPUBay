@@ -87,6 +87,8 @@ platform 进程内：identity / wallet / catalog / fleet / rental（已有）
 | 价格与镜像 | ✅ | ❌ | ❌ |
 | 管理员管理 | ✅ | ❌ | ❌ |
 
+> 计划 5 调整（2026-10-17，见 `2026-10-17-plan5-frontend-design.md` §6 B6）：`GET /products` 与 `GET /images` 的读权限放开为全部角色（ops 登记机器需选商品、所有角色的实例页需显示镜像 / 商品名）；写接口（价格、镜像新增 / 修改）仍仅 super。
+
 **审计**：所有后台修改操作写 `audit_logs`（actor_type=admin、动作、对象、前后差异、IP）。审计日志没有修改和删除接口。
 
 ## 3. 后台功能与接口（`/admin/api/v1`）

@@ -20,6 +20,7 @@ import (
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
+	"spark-cloud/internal/web"
 )
 
 type Server struct {
@@ -33,9 +34,10 @@ type Server struct {
 	DevPay       bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
 	Clock        clock.Clock
 	Log          *slog.Logger
-	Domain       string // 用于生成 SSH 命令，例如 spark.example.com
-	SecureCookie bool   // 生产环境为 true：Cookie 仅经 HTTPS 发送
-	TrustProxy   bool   // 仅当部署在会改写转发头的反向代理之后才设为 true
+	Domain       string       // 用于生成 SSH 命令，例如 spark.example.com
+	SecureCookie bool         // 生产环境为 true：Cookie 仅经 HTTPS 发送
+	TrustProxy   bool         // 仅当部署在会改写转发头的反向代理之后才设为 true
+	Static       http.Handler // 控制台静态文件；nil 时使用 web.Console()
 }
 
 const sessionCookie = "sc_session"
@@ -49,6 +51,17 @@ func (s *Server) Router() http.Handler {
 		r.Use(middleware.RealIP)
 	}
 	r.Use(httpx.Recoverer(s.Log), s.requireJSONForWrites)
+	static := s.Static
+	if static == nil {
+		static = web.Console()
+	}
+	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasPrefix(req.URL.Path, "/api/") {
+			s.writeError(w, req, apperr.ErrNotFound) // 未知 API 路径返回 JSON 404，不回退页面
+			return
+		}
+		static.ServeHTTP(w, req)
+	})
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/sms-code", s.handleSendCode)
 		r.Post("/auth/login", s.handleLogin)
@@ -62,6 +75,7 @@ func (s *Server) Router() http.Handler {
 			r.Use(httpx.NoStore, s.requireUser)
 			r.Get("/me", s.handleMe)
 			r.Post("/uploads", s.handleUpload)
+			r.Get("/kyc", s.handleMyKYC)
 			r.Post("/kyc/personal", s.handleKYCPersonal)
 			r.Post("/kyc/enterprise", s.handleKYCEnterprise)
 			r.Get("/wallet", s.handleWallet)

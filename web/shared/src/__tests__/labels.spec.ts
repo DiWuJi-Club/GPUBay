@@ -1,0 +1,23 @@
+import { describe, expect, it } from 'vitest'
+import { alertKindLabel, auditActions, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel } from '../labels'
+
+describe('labels', () => {
+  it('实例状态中文与颜色', () => {
+    expect(labelOf(instanceStateLabel, 'creating')).toBe('开通中')
+    expect(labelOf(instanceStateLabel, 'stopped')).toBe('已到期停机')
+    expect(labelOf(instanceStateType, 'running')).toBe('success')
+    expect(labelOf(instanceStateType, 'failed')).toBe('danger')
+  })
+  it('指令状态中文', () => {
+    expect(commandStatusLabel).toEqual({ pending: '待执行', sent: '已下发', done: '已完成', failed: '失败' })
+  })
+  it('未知值原样显示', () => {
+    expect(labelOf(ledgerKindLabel, 'mystery')).toBe('mystery')
+    expect(labelOf(alertKindLabel, 'new_kind')).toBe('new_kind')
+  })
+  it('审计动作列表与后端写入值一致', () => {
+    expect(auditActions).toHaveLength(26)
+    expect(auditActions).toContain('instance.refund_release')
+    expect(auditActions).toContain('wallet.manual_recharge')
+  })
+})

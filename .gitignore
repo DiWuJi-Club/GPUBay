@@ -2,3 +2,9 @@
 /.devdata/
 *.test
 coverage.out
+/internal/web/dist/console/
+/internal/web/dist/admin/
+/web/node_modules/
+/web/test-results/
+/web/playwright-report/
+/web/*/dist/

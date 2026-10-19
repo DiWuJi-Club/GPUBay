@@ -1,0 +1,19 @@
+/* 后台只按 ≥ 1200px 设计 */
+html {
+  min-width: 1200px;
+}
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: #f5f7fa;
+  color: #303133;
+}
+a {
+  color: var(--el-color-primary);
+}
+.money-plus {
+  color: var(--el-color-success);
+}
+.money-minus {
+  color: #303133;
+}
