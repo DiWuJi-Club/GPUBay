@@ -2,9 +2,11 @@ package fleet
 
 import (
 	"context"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -52,6 +54,28 @@ func scanGroup(row pgx.Row) (Group, error) {
 	return g, err
 }
 
+// 机组排序值范围、一次分配机器的上限。
+const (
+	maxGroupSort   = 1_000_000
+	maxAssignBatch = 500
+)
+
+// defaultLabelRe 匹配缺省展示名「机器 #<id>」；后台设置的展示名不能冒充它。
+var defaultLabelRe = regexp.MustCompile(`^机器 #\d+$`)
+
+// hasControlChars 报告 s 是否含控制字符或格式字符（Cc / Cf，如零宽字符、方向控制符）；allowNewline 时放过 \n。
+func hasControlChars(s string, allowNewline bool) bool {
+	for _, r := range s {
+		if allowNewline && r == '\n' {
+			continue
+		}
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return true
+		}
+	}
+	return false
+}
+
 func (in GroupInput) normalize() (GroupInput, error) {
 	in.Name = strings.TrimSpace(in.Name)
 	in.Region = strings.TrimSpace(in.Region)
@@ -65,7 +89,35 @@ func (in GroupInput) normalize() (GroupInput, error) {
 	if utf8.RuneCountInString(in.Description) > 200 {
 		return in, apperr.BadRequest("描述最多 200 个字符")
 	}
+	if hasControlChars(in.Name, false) || hasControlChars(in.Region, false) || hasControlChars(in.Description, true) {
+		return in, apperr.BadRequest("名称、位置标签与描述不能包含控制字符")
+	}
+	if in.Sort < -maxGroupSort || in.Sort > maxGroupSort {
+		return in, apperr.BadRequest("排序值需在 -1000000～1000000 之间")
+	}
 	return in, nil
+}
+
+// normalizeMachineIDs 去重并校验机器 ID 列表：非空、均为正数、去重后不超过 maxAssignBatch 台。
+func normalizeMachineIDs(ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, apperr.BadRequest("请选择机器")
+	}
+	seen := make(map[int64]bool, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, apperr.BadRequest("机器 ID 无效")
+		}
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	if len(out) > maxAssignBatch {
+		return nil, apperr.BadRequest("一次最多选择 500 台机器")
+	}
+	return out, nil
 }
 
 // ListGroups 按 sort、id 返回机组（visibleOnly 只返回控制台可见的），附机器数与现空闲台数。
@@ -157,37 +209,73 @@ func (s *Service) DeleteGroupIn(ctx context.Context, q db.Querier, id int64) err
 }
 
 // AssignMachines 把机器加入机组（已在其它机组的直接改组）；任一机器不存在整批失败。
+// 审计记录每台机器原来的机组（previous_group_ids：机器 ID → 原 group_id，null = 原未分组）。
 func (s *Service) AssignMachines(ctx context.Context, actor audit.Actor, groupID int64, ids []int64) error {
-	if len(ids) == 0 {
-		return apperr.BadRequest("请选择机器")
+	ids, err := normalizeMachineIDs(ids)
+	if err != nil {
+		return err
 	}
 	now := s.clock.Now()
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := s.GetGroup(ctx, tx, groupID); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `UPDATE machines SET group_id = $1, updated_at = $3 WHERE id = ANY($2)`, groupID, ids, now)
+		rows, err := tx.Query(ctx, `SELECT id, group_id FROM machines WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE`, ids)
 		if err != nil {
 			return err
 		}
-		if int(tag.RowsAffected()) != len(ids) {
+		previous := map[string]*int64{}
+		for rows.Next() {
+			var id int64
+			var prev *int64
+			if err := rows.Scan(&id, &prev); err != nil {
+				rows.Close()
+				return err
+			}
+			previous[strconv.FormatInt(id, 10)] = prev
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(previous) != len(ids) {
 			return apperr.BadRequest("有机器不存在")
 		}
-		return audit.Record(ctx, tx, now, actor.Entry("group.assign", "group", strconv.FormatInt(groupID, 10), map[string]any{"machine_ids": ids}))
+		// 机组在 GetGroup 之后被并发删除时外键检查失败，按机组不存在处理。
+		if _, err := tx.Exec(ctx, `UPDATE machines SET group_id = $1, updated_at = $3 WHERE id = ANY($2)`, groupID, ids, now); err != nil {
+			if db.IsForeignKeyViolation(err) {
+				return apperr.ErrGroupNotFound
+			}
+			return err
+		}
+		return audit.Record(ctx, tx, now, actor.Entry("group.assign", "group", strconv.FormatInt(groupID, 10),
+			map[string]any{"machine_ids": ids, "previous_group_ids": previous}))
 	})
 }
 
-// UnassignMachines 把机器移出机组（只影响当前确实在该组的机器）。
+// UnassignMachines 把机器移出机组（只影响当前确实在该组的机器；审计只记实际移出的）。
 func (s *Service) UnassignMachines(ctx context.Context, actor audit.Actor, groupID int64, ids []int64) error {
-	if len(ids) == 0 {
-		return apperr.BadRequest("请选择机器")
+	ids, err := normalizeMachineIDs(ids)
+	if err != nil {
+		return err
 	}
 	now := s.clock.Now()
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE machines SET group_id = NULL, updated_at = $3 WHERE id = ANY($2) AND group_id = $1`, groupID, ids, now); err != nil {
+		if _, err := s.GetGroup(ctx, tx, groupID); err != nil {
 			return err
 		}
-		return audit.Record(ctx, tx, now, actor.Entry("group.unassign", "group", strconv.FormatInt(groupID, 10), map[string]any{"machine_ids": ids}))
+		rows, err := tx.Query(ctx, `UPDATE machines SET group_id = NULL, updated_at = $3 WHERE id = ANY($2) AND group_id = $1 RETURNING id`, groupID, ids, now)
+		if err != nil {
+			return err
+		}
+		removed, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			return err
+		}
+		if removed == nil {
+			removed = []int64{}
+		}
+		return audit.Record(ctx, tx, now, actor.Entry("group.unassign", "group", strconv.FormatInt(groupID, 10), map[string]any{"machine_ids": removed}))
 	})
 }
 
@@ -205,6 +293,12 @@ func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64
 		name = strings.TrimSpace(*in.DisplayName)
 		if utf8.RuneCountInString(name) > 32 {
 			return Machine{}, apperr.BadRequest("展示名最多 32 个字符")
+		}
+		if hasControlChars(name, false) {
+			return Machine{}, apperr.BadRequest("展示名不能包含控制字符")
+		}
+		if defaultLabelRe.MatchString(name) {
+			return Machine{}, apperr.BadRequest("展示名不能使用「机器 #编号」格式")
 		}
 	}
 	now := s.clock.Now()
@@ -230,6 +324,9 @@ func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64
 			id, groupID, display, now))
 		if db.IsUniqueViolation(err) && db.ConstraintName(err) == "machines_display_name_uniq" {
 			return apperr.ErrDuplicateDisplayName
+		}
+		if db.IsForeignKeyViolation(err) { // 目标机组在 GetGroup 之后被并发删除
+			return apperr.ErrGroupNotFound
 		}
 		if err != nil {
 			return err

@@ -179,6 +179,10 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 		}
 		in.DisplayName = &str
 	}
+	if !in.SetGroup && in.DisplayName == nil {
+		s.writeError(w, r, apperr.BadRequest("请提供 group_id 或 display_name"))
+		return
+	}
 	m, err := s.Fleet.UpdateMachine(r.Context(), s.actor(r), id, in)
 	if err != nil {
 		s.writeError(w, r, err)

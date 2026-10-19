@@ -36,6 +36,9 @@ func TestGroupAPI(t *testing.T) {
 	if row["machine_count"].(float64) != 2 || row["idle_now"].(float64) != 2 || row["reserved_upcoming"].(float64) != 0 {
 		t.Fatalf("row = %v", row)
 	}
+	if code, out := ops.do("PUT", "/machines/"+itoa(m1), map[string]any{}); code != 400 || codeOf(out) != "bad_request" {
+		t.Fatalf("empty machine update = %d %v", code, out)
+	}
 	if code, out := ops.do("PUT", "/machines/"+itoa(m1), map[string]any{"display_name": "A-01"}); code != 200 || out["display_name"] != "A-01" {
 		t.Fatalf("update machine = %d %v", code, out)
 	}

@@ -76,10 +76,85 @@ func TestGroupCRUDAndAssign(t *testing.T) {
 	if _, err := svc.GetGroup(ctx, pool, g.ID); !errors.Is(err, apperr.ErrGroupNotFound) {
 		t.Fatalf("after delete = %v", err)
 	}
-	var audits int
-	_ = pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action LIKE 'group.%' OR action = 'machine.update'`).Scan(&audits)
-	if audits < 7 { // create×2 + assign + update(display)+update(move)+update(ungroup) + unassign
-		t.Fatalf("audits = %d", audits)
+	// 失败的操作整笔回滚，不留审计
+	for action, want := range map[string]int{"group.create": 2, "group.assign": 1, "machine.update": 3, "group.unassign": 1, "group.delete": 0} {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action = $1`, action).Scan(&n); err != nil || n != want {
+			t.Fatalf("audit %s = %d (%v), want %d", action, n, err, want)
+		}
+	}
+}
+
+func TestGroupValidation(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	isBadRequest := func(err error) bool { return apperr.As(err) != nil && apperr.As(err).Code == "bad_request" }
+	for _, in := range []fleet.GroupInput{
+		{Name: "A\u200b区"},                 // 零宽空格（Cf）
+		{Name: "A\x01区"},                   // 控制字符
+		{Name: "A 区", Region: "一\n楼"},      // 位置标签不许换行
+		{Name: "A 区", Description: "a\tb"}, // 描述只放过 \n
+		{Name: "A 区", Sort: 1_000_001},
+		{Name: "A 区", Sort: -1_000_001},
+	} {
+		if _, err := svc.CreateGroup(ctx, opsActor, in); !isBadRequest(err) {
+			t.Fatalf("create %+v = %v, want bad_request", in, err)
+		}
+	}
+	g, err := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "A 区", Description: "第一行\n第二行", Sort: 1_000_000})
+	if err != nil || g.Description != "第一行\n第二行" || g.Sort != 1_000_000 {
+		t.Fatalf("create = %+v, %v", g, err)
+	}
+	g2, _ := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "B 区"})
+	m1 := dbtest.CreateMachine(t, pool, "SN1")
+	m2 := dbtest.CreateMachine(t, pool, "SN2")
+	m3 := dbtest.CreateMachine(t, pool, "SN3")
+
+	// 分配：ID 必须为正、去重后最多 500 台；审计记去重后的列表与各机原机组
+	if err := svc.AssignMachines(ctx, opsActor, g.ID, []int64{m1, 0}); !isBadRequest(err) {
+		t.Fatalf("zero id = %v", err)
+	}
+	many := make([]int64, 501)
+	for i := range many {
+		many[i] = int64(i + 1)
+	}
+	if err := svc.AssignMachines(ctx, opsActor, g.ID, many); !isBadRequest(err) {
+		t.Fatalf("501 ids = %v", err)
+	}
+	if err := svc.AssignMachines(ctx, opsActor, g2.ID, []int64{m2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AssignMachines(ctx, opsActor, g.ID, []int64{m1, m2, m1, m2}); err != nil {
+		t.Fatalf("duplicate ids = %v", err)
+	}
+	var diff string
+	_ = pool.QueryRow(ctx, `SELECT diff::text FROM audit_logs WHERE action = 'group.assign' AND target_id = $1`, itoa(g.ID)).Scan(&diff)
+	want := fmt.Sprintf(`{"machine_ids": [%d, %d], "previous_group_ids": {"%d": null, "%d": %d}}`, m1, m2, m1, m2, g2.ID)
+	if diff != want {
+		t.Fatalf("assign audit = %s, want %s", diff, want)
+	}
+
+	// 移出：机组不存在 → ErrGroupNotFound；审计只记实际移出的机器
+	if err := svc.UnassignMachines(ctx, opsActor, 424242, []int64{m1}); !errors.Is(err, apperr.ErrGroupNotFound) {
+		t.Fatalf("unassign unknown group = %v", err)
+	}
+	if err := svc.UnassignMachines(ctx, opsActor, g.ID, []int64{m1, m3}); err != nil {
+		t.Fatal(err)
+	}
+	_ = pool.QueryRow(ctx, `SELECT diff::text FROM audit_logs WHERE action = 'group.unassign'`).Scan(&diff)
+	if want := fmt.Sprintf(`{"machine_ids": [%d]}`, m1); diff != want {
+		t.Fatalf("unassign audit = %s, want %s", diff, want)
+	}
+
+	// 展示名：不许控制 / 格式字符，不许冒充缺省「机器 #<id>」
+	for _, name := range []string{"A\u202e01", "A\n01", "机器 #12", "机器 #" + itoa(m3)} {
+		if _, err := svc.UpdateMachine(ctx, opsActor, m3, fleet.MachineUpdate{DisplayName: &name}); !isBadRequest(err) {
+			t.Fatalf("display %q = %v, want bad_request", name, err)
+		}
+	}
+	ok := "机器 #A1"
+	if m, err := svc.UpdateMachine(ctx, opsActor, m3, fleet.MachineUpdate{DisplayName: &ok}); err != nil || m.DisplayName != ok {
+		t.Fatalf("display %q = %+v, %v", ok, m, err)
 	}
 }
 

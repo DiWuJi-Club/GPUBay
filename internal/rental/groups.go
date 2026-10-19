@@ -34,9 +34,18 @@ func (s *Service) ReservedCountsByGroup(ctx context.Context) (map[int64]int, err
 func (s *Service) AdminDeleteGroup(ctx context.Context, actor audit.Actor, id int64) error {
 	now := s.d.Clock.Now()
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
+		// 先锁机组行：与并发的分配 / 改组 / 下单（外键 KEY SHARE）互斥。
+		var name, region string
+		err := tx.QueryRow(ctx, `SELECT name, region FROM machine_groups WHERE id = $1 FOR UPDATE`, id).Scan(&name, &region)
+		if db.IsNoRows(err) {
+			return apperr.ErrGroupNotFound
+		}
+		if err != nil {
+			return err
+		}
 		var busy bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM instances WHERE group_id = $1
-			AND state IN ('reserved', 'creating', 'running', 'stopped', 'wiping'))`, id).Scan(&busy); err != nil {
+			AND state NOT IN ('released', 'failed', 'cancelled'))`, id).Scan(&busy); err != nil {
 			return err
 		}
 		if busy {
@@ -46,8 +55,12 @@ func (s *Service) AdminDeleteGroup(ctx context.Context, actor audit.Actor, id in
 			return err
 		}
 		if err := s.d.Fleet.DeleteGroupIn(ctx, tx, id); err != nil {
+			if db.IsForeignKeyViolation(err) { // 仍有引用（并发写入）
+				return apperr.ErrGroupNotEmpty
+			}
 			return err
 		}
-		return audit.Record(ctx, tx, now, actor.Entry("group.delete", "group", strconv.FormatInt(id, 10), nil))
+		return audit.Record(ctx, tx, now, actor.Entry("group.delete", "group", strconv.FormatInt(id, 10),
+			map[string]any{"name": name, "region": region}))
 	})
 }
