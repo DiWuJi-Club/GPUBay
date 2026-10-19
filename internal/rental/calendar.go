@@ -10,6 +10,7 @@ import (
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/tz"
 )
 
@@ -42,6 +43,16 @@ func (s *Service) VisibleGroup(ctx context.Context, id int64) (fleet.Group, erro
 	return g, nil
 }
 
+// VisibleMachine 控制台可看的机器：不存在、未分组或所在机组不可见都按不存在处理（规格 §10.1）。
+func (s *Service) VisibleMachine(ctx context.Context, id int64) error {
+	var visible bool
+	err := s.d.Pool.QueryRow(ctx, `SELECT g.visible FROM machines m JOIN machine_groups g ON g.id = m.group_id WHERE m.id = $1`, id).Scan(&visible)
+	if db.IsNoRows(err) || (err == nil && !visible) {
+		return apperr.ErrNotFound
+	}
+	return err
+}
+
 // Availability 所选时段可租台数（只读预筛，下单以事务内结果为准）。
 func (s *Service) Availability(ctx context.Context, q AvailabilityQuery) (Availability, error) {
 	if !q.Duration.Valid() {
@@ -50,7 +61,10 @@ func (s *Service) Availability(ctx context.Context, q AvailabilityQuery) (Availa
 	if q.Quantity == 0 {
 		q.Quantity = 1
 	}
-	if q.Quantity < 1 || q.Quantity > MaxQuantity(q.Duration) {
+	if q.Quantity < 0 {
+		return Availability{}, apperr.BadRequest("数量不正确")
+	}
+	if q.Quantity > MaxQuantity(q.Duration) {
 		return Availability{}, apperr.ErrBookingTooLong
 	}
 	if q.GroupID != nil {
@@ -126,8 +140,14 @@ type CalendarPeriod struct {
 	UserID     int64     `json:"user_id,omitempty"`
 }
 
-// MachineCalendar 机器在 [from 当天 00:00, + days) 内的 reserved / active 时段；非 admin 只标 mine，不透出别人的实例与用户。
+// MachineCalendar 机器在 [from 当天 00:00, + days) 内的 reserved / active 时段；非 admin 只标 mine，不透出别人的实例与用户，
+// 且机器须在可见机组（否则 ErrNotFound）。
 func (s *Service) MachineCalendar(ctx context.Context, machineID, userID int64, from time.Time, days int, admin bool) ([]CalendarPeriod, error) {
+	if !admin {
+		if err := s.VisibleMachine(ctx, machineID); err != nil {
+			return nil, err
+		}
+	}
 	start, err := calendarRange(from, days)
 	if err != nil {
 		return nil, err
@@ -157,7 +177,7 @@ func (s *Service) MachineCalendar(ctx context.Context, machineID, userID int64, 
 type MachineBrief struct {
 	ID        int64      `json:"id"`
 	Label     string     `json:"label"`
-	BusyUntil *time.Time `json:"busy_until"` // 现有 / 未来时段的最晚结束；nil = 当前没有占用
+	BusyUntil *time.Time `json:"busy_until"` // 最近一条当前 / 未来 active / reserved 时段的上界；nil = 没有
 }
 
 // GroupMachines 机组内可租机器（idle / allocated）与展示名，供控制台指定机器。
@@ -168,7 +188,8 @@ func (s *Service) GroupMachines(ctx context.Context, groupID int64, visibleOnly 
 		}
 	}
 	rows, err := s.d.Pool.Query(ctx, `SELECT m.id, m.display_name,
-			(SELECT max(upper(l.period)) FROM machine_leases l WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND upper(l.period) > $2)
+			(SELECT upper(l.period) FROM machine_leases l WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND upper(l.period) > $2
+			 ORDER BY lower(l.period) LIMIT 1)
 		FROM machines m WHERE m.group_id = $1 AND m.state IN ('idle', 'allocated') ORDER BY m.display_name, m.id`, groupID, s.d.Clock.Now())
 	if err != nil {
 		return nil, err

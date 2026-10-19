@@ -76,9 +76,21 @@ func TestMachineCalendarMasksOtherUsers(t *testing.T) {
 	if later, _ := e.svc.MachineCalendar(e.ctx, e.machines[0], e.userID, dbtest.T0.Add(10*24*time.Hour), 5, false); len(later) != 0 {
 		t.Fatalf("outside window = %+v", later)
 	}
+	// busy_until = 最近一条（当前或未来）active / reserved 时段的上界，不是最晚的那条
 	ms, err := e.svc.GroupMachines(e.ctx, gid, true)
-	if err != nil || len(ms) != 1 || ms[0].Label != "机器 #"+itoa64(e.machines[0]) || ms[0].BusyUntil == nil || !ms[0].BusyUntil.Equal(dbtest.T0.Add(72*time.Hour+24*time.Hour+rental.Tail)) {
+	if err != nil || len(ms) != 1 || ms[0].Label != "机器 #"+itoa64(e.machines[0]) || ms[0].BusyUntil == nil || !ms[0].BusyUntil.Equal(dbtest.T0.Add(3*time.Hour+24*time.Hour+rental.Tail)) {
 		t.Fatalf("group machines = %+v, %v", ms, err)
+	}
+	// 控制台：机器不在可见机组（隐藏机组 / 未分组 / 不存在）→ not_found；后台照常可看
+	hiddenM, looseM := e.newMachine("SN-HID"), e.newMachine("SN-LOOSE")
+	e.setGroup(hiddenM, e.group("留池", false))
+	for _, id := range []int64{hiddenM, looseM, 999999} {
+		if _, err := e.svc.MachineCalendar(e.ctx, id, e.userID, dbtest.T0, 5, false); !errors.Is(err, apperr.ErrNotFound) {
+			t.Fatalf("console calendar of machine %d = %v", id, err)
+		}
+	}
+	if _, err := e.svc.MachineCalendar(e.ctx, hiddenM, 0, dbtest.T0, 5, true); err != nil {
+		t.Fatalf("admin calendar of hidden machine = %v", err)
 	}
 }
 
@@ -109,6 +121,10 @@ func TestAvailabilityMatchesPlacement(t *testing.T) {
 	imm.Quantity = 91
 	if _, err := e.svc.Availability(e.ctx, imm); !errors.Is(err, apperr.ErrBookingTooLong) {
 		t.Fatalf("quantity 91 = %v", err)
+	}
+	imm.Quantity = -1
+	if _, err := e.svc.Availability(e.ctx, imm); apperr.As(err) == nil || apperr.As(err).Code != "bad_request" {
+		t.Fatalf("quantity -1 = %v", err)
 	}
 }
 

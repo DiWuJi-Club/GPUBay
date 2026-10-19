@@ -9,6 +9,7 @@ import (
 
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/rental"
 )
 
@@ -578,5 +579,37 @@ func TestRunSweeperExtraTaskTimesOut(t *testing.T) {
 	}
 	if !errors.Is(taskErr, context.DeadlineExceeded) {
 		t.Fatalf("hung task ctx err = %v, want deadline exceeded", taskErr)
+	}
+}
+
+// 恢复后按冻结剩余时长推算的到期若越过同机下一条预订，到期封顶于 lease 上界 − Tail（与 refreshLease 的封顶一致）。
+func TestResumeMachineCapsExpiryAtNextBooking(t *testing.T) {
+	e := newEnv(t, 1)
+	_, inst := e.place(catalog.D1d)
+	e.ack(true)                                                     // 到期 T0+24h，lease 上界 T0+31h
+	e.reserveRaw(e.machines[0], dbtest.T0.Add(33*time.Hour), 86400) // 下一条预订的 lease 下界 T0+32h
+
+	e.clock.Advance(time.Hour)
+	e.heartbeatAll()
+	e.clock.Advance(10 * time.Minute)
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !e.get(inst.ID).Suspended() {
+		t.Fatal("not suspended")
+	}
+	e.clock.Advance(5 * time.Hour) // 冻结 22h50m；恢复后按 now + 22h50m = T0+29h 到期，+Tail 越过 T0+32h
+	if _, err := e.fleet.Heartbeat(e.ctx, e.machines[0]); err != nil {
+		t.Fatal(err)
+	}
+	n, err := e.svc.ResumeMachine(e.ctx, e.machines[0], []string{inst.ID})
+	mustCount(t, n, err, 1, "resumed")
+	got := e.get(inst.ID)
+	wantExpiry := dbtest.T0.Add(32*time.Hour - rental.Tail)
+	if got.Suspended() || got.ExpiresAt == nil || !got.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("expires_at = %v, want %v", got.ExpiresAt, wantExpiry)
+	}
+	if _, upper, _ := e.lease(inst.ID); !upper.Equal(dbtest.T0.Add(32 * time.Hour)) {
+		t.Fatalf("lease upper = %v", upper)
 	}
 }

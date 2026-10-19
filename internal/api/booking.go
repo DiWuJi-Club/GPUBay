@@ -178,21 +178,12 @@ func (s *Server) handleMachineCalendar(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	m, err := s.Fleet.Get(r.Context(), s.Fleet.Pool(), id)
-	if err != nil || m.GroupID == nil {
-		s.writeError(w, r, apperr.ErrNotFound)
-		return
-	}
-	if _, err := s.Rental.VisibleGroup(r.Context(), *m.GroupID); err != nil {
-		s.writeError(w, r, apperr.ErrNotFound)
-		return
-	}
 	from, days, err := s.calendarWindow(r)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	out, err := s.Rental.MachineCalendar(r.Context(), id, s.optionalUserID(r), from, days, false)
+	out, err := s.Rental.MachineCalendar(r.Context(), id, s.optionalUserID(r), from, days, false) // 机器不在可见机组 → 404（服务层校验）
 	if err != nil {
 		s.writeError(w, r, err)
 		return
