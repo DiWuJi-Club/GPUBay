@@ -452,7 +452,24 @@ export interface AdminReferralEvent {
 export interface AdminInviterDetail {
   account: AdminReferralAccount
   phone: string
+  /** 最近 100 个；全量个数见 bindings_total */
   bindings: AdminBinding[]
+  bindings_total: number
+  /** 最近 100 条；全量条数见 rewards_total */
   rewards: AdminReferralReward[]
+  rewards_total: number
+  /** 最近 50 条 */
   events: AdminReferralEvent[]
+}
+
+/**
+ * POST /referral/rescan 的结果（200）。拨回水位后重扫已执行：failed 为处理失败的流水行数（之后每轮清扫重试），
+ * incomplete 表示发现或发放本身出错 / 超时（之后的清扫轮继续）。返回错误时什么都没发生。
+ */
+export interface RescanResult {
+  watermark: string
+  processed: number
+  failed: number
+  released: number
+  incomplete: boolean
 }

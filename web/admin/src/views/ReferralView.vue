@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {
-  bindingStatusLabel, centsToYuanInput, digitsOnly, fmtTime, fmtYuan, isApiError, labelOf, messageOf, rewardStatusLabel,
-  type AdminBinding, type AdminInviterDetail, type AdminInviterRow, type AdminRateVersion, type AdminReferralReward, type AdminReferralSummary, type Paged,
+  bindingStatusLabel, centsToYuanInput, digitsOnly, fmtTime, fmtYuan, labelOf, messageOf, rewardStatusLabel,
+  type AdminBinding, type AdminInviterDetail, type AdminInviterRow, type AdminRateVersion, type AdminReferralReward, type AdminReferralSummary, type Paged, type RescanResult,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, reactive, ref, watch, type Directive } from 'vue'
@@ -185,6 +185,29 @@ async function unfreeze() {
   }
 }
 
+/** 抽屉只带最近 100 条返利：超出时跳到「返利明细」按该邀请人筛选的分页列表 */
+function showAllRewards() {
+  if (!drawer.data) return
+  Object.assign(rwFilter, { inviter_id: String(drawer.data.account.user_id), invitee_id: '', status: '', range: { from: '', to: '' } })
+  rwApplied = rwQuery()
+  drawer.visible = false
+  tab.value = 'rewards' // 切换 Tab 时按 rwApplied 加载
+}
+/** 抽屉只带最近 100 个被邀请人：超出时导出该邀请人的全部绑定 */
+const drawerExporting = ref(false)
+async function exportInviterBindings() {
+  if (drawerExporting.value || !drawer.data) return
+  drawerExporting.value = true
+  try {
+    const { blob, filename } = await api.download('/referral/bindings/export', { inviter_id: drawer.data.account.user_id })
+    downloadBlob(filename, blob)
+  } catch (e) {
+    notifyError(e)
+  } finally {
+    drawerExporting.value = false
+  }
+}
+
 // ---- 返利明细 ----
 const rwFilter = reactive({ inviter_id: '', invitee_id: '', status: '', range: { from: '', to: '' } })
 // 空值由 buildQuery 省略；日期按 YYYY-MM-DD 原样发出（后端按北京时间解释，to 含当天；按 paid_at 筛选）
@@ -271,12 +294,11 @@ async function submitRescan() {
   if (days == null) return
   rescan.busy = true
   try {
-    const m = rescanMessage(await api.post<{ failed?: number }>('/referral/rescan', { days }))
+    // 200 即重扫已执行（失败行 / 未完成记在结果里）；返回错误时什么都没发生，按原文提示
+    const m = rescanMessage(await api.post<RescanResult>('/referral/rescan', { days }))
     ElMessage({ type: m.type, message: m.text })
   } catch (e) {
-    // 旧接口在重扫已生效、但仍有行处理失败时返回 5xx：不当作「没执行」提示
-    if (isApiError(e) && e.status >= 500) ElMessage.warning(`重扫可能未全部完成：${messageOf(e)}`)
-    else notifyError(e)
+    notifyError(e)
   } finally {
     rescan.busy = false
   }
@@ -315,7 +337,7 @@ const days = (n: number) => `${n} 天`
           <div class="stat"><span>本月已发放</span><b data-testid="ref-sum-month">{{ fmtYuan(summary.month_settled) }}</b></div>
           <div class="stat"><span>累计净发放（发放 − 扣回）</span><b data-testid="ref-sum-net">{{ fmtYuan(summary.settled_net) }}</b></div>
           <div class="stat"><span>欠账合计</span><b data-testid="ref-sum-debt">{{ fmtYuan(summary.debt) }}</b></div>
-          <div class="stat clickable" @click="tab = 'held'"><span>待审核绑定</span><b data-testid="ref-sum-held">{{ summary.held_count }}</b></div>
+          <div class="stat clickable" role="button" tabindex="0" data-testid="ref-sum-held-link" @click="tab = 'held'" @keydown.enter.prevent="tab = 'held'"><span>待审核绑定</span><b data-testid="ref-sum-held">{{ summary.held_count }}</b></div>
         </div>
       </el-tab-pane>
 
@@ -383,7 +405,7 @@ const days = (n: number) => `${n} 天`
             <thead><tr><th>邀请人</th><th>邀请码</th><th>状态</th><th>被邀请人</th><th>待审核</th><th>待发放</th><th>累计净发放</th><th>欠账</th></tr></thead>
             <tbody>
               <!-- 整行点击打开详情抽屉（行内不放链接，避免误跳转；抽屉里有用户详情链接） -->
-              <tr v-for="r in inviters.items.value" :key="r.user_id" class="clickable" data-testid="inv-row" @click="openDrawer(r.user_id)">
+              <tr v-for="r in inviters.items.value" :key="r.user_id" class="clickable" role="button" tabindex="0" data-testid="inv-row" @click="openDrawer(r.user_id)" @keydown.enter.prevent="openDrawer(r.user_id)">
                 <td><span class="mono" data-testid="inv-user">{{ r.user_id }}</span> <span class="muted mono" data-testid="inv-phone">{{ maskPhone(r.phone) }}</span></td>
                 <td class="mono" data-testid="inv-code">{{ r.code }}</td>
                 <td><el-tag :type="r.status === 'frozen' ? 'danger' : 'success'" size="small" data-testid="inv-status">{{ labelOf(accountStatusLabel, r.status) }}</el-tag></td>
@@ -562,7 +584,11 @@ const days = (n: number) => `${n} 天`
             <span class="muted">冻结后邀请码不能再绑定新用户，返利继续计提但暂停发放；解冻后恢复。</span>
           </div>
 
-          <h4>被邀请人（最近 100 个）</h4>
+          <h4>被邀请人</h4>
+          <p v-if="drawer.data.bindings_total > drawer.data.bindings.length" class="muted" data-testid="inv-d-bindings-more">
+            共 {{ drawer.data.bindings_total }} 个，仅显示最近 {{ drawer.data.bindings.length }} 个。
+            <el-button link type="primary" :loading="drawerExporting" data-testid="inv-d-bindings-export" @click="exportInviterBindings">导出全部绑定 CSV</el-button>
+          </p>
           <table class="grid">
             <thead><tr><th>被邀请人</th><th>状态</th><th>标记</th><th>绑定时间</th><th>返利截止</th><th>累计贡献</th><th>待发放</th></tr></thead>
             <tbody>
@@ -582,7 +608,11 @@ const days = (n: number) => `${n} 天`
             </tbody>
           </table>
 
-          <h4>返利（最近 100 条）</h4>
+          <h4>返利</h4>
+          <p v-if="drawer.data.rewards_total > drawer.data.rewards.length" class="muted" data-testid="inv-d-rewards-more">
+            共 {{ drawer.data.rewards_total }} 条，仅显示最近 {{ drawer.data.rewards.length }} 条。
+            <el-button link type="primary" data-testid="inv-d-rewards-all" @click="showAllRewards">在返利明细中查看全部</el-button>
+          </p>
           <table class="grid">
             <thead><tr><th>订单号</th><th>被邀请人</th><th>消费</th><th>返利</th><th>状态</th><th>发放时间</th><th>已扣回</th></tr></thead>
             <tbody>
@@ -643,7 +673,8 @@ const days = (n: number) => `${n} 天`
 .grid { width: 100%; border-collapse: collapse; font-size: 13px; }
 .grid th, .grid td { padding: 8px; text-align: left; border-bottom: 1px solid var(--el-border-color-lighter); }
 .grid th { color: #909399; font-weight: 500; }
-tbody tr.clickable:hover { background: var(--el-fill-color-light); }
+tbody tr.clickable:hover, tbody tr.clickable:focus-visible { background: var(--el-fill-color-light); }
+.clickable:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: -2px; }
 .empty { text-align: center; }
 .ops { white-space: nowrap; }
 .tag { margin-right: 4px; }

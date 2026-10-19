@@ -1,3 +1,4 @@
+import type { RescanResult } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import { fmtRate, flagLabel, maskPhone, parseRateForm, parseRescanDays, rescanMessage } from '../referral'
 
@@ -59,12 +60,15 @@ describe('parseRescanDays', () => {
 })
 
 describe('rescanMessage', () => {
-  it('没有失败行：已重扫', () => {
-    expect(rescanMessage({})).toEqual({ type: 'success', text: '已重扫' })
-    expect(rescanMessage({ failed: 0 })).toEqual({ type: 'success', text: '已重扫' })
-    expect(rescanMessage(undefined)).toEqual({ type: 'success', text: '已重扫' })
+  const r = (over: Partial<RescanResult> = {}): RescanResult => ({ watermark: '2026-10-17T00:00:00Z', processed: 5, failed: 0, released: 2, incomplete: false, ...over })
+  it('全部成功：已重扫 + 处理 / 发放数量', () => {
+    expect(rescanMessage(r())).toEqual({ type: 'success', text: '已重扫：处理 5 行，发放 2 笔' })
   })
   it('部分行失败：已重扫，N 行仍失败（提醒，不是错误）', () => {
-    expect(rescanMessage({ failed: 4 })).toEqual({ type: 'warning', text: '已重扫，4 行仍失败' })
+    expect(rescanMessage(r({ failed: 4 }))).toEqual({ type: 'warning', text: '已重扫，4 行仍失败（处理 5 行，发放 2 笔）' })
+  })
+  it('未全部完成：提醒，带失败行数', () => {
+    expect(rescanMessage(r({ incomplete: true }))).toEqual({ type: 'warning', text: '已重扫，但本轮未全部完成（处理 5 行，发放 2 笔），之后的清扫会继续' })
+    expect(rescanMessage(r({ incomplete: true, failed: 1 }))).toEqual({ type: 'warning', text: '已重扫，但本轮未全部完成（处理 5 行，发放 2 笔，1 行失败），之后的清扫会继续' })
   })
 })

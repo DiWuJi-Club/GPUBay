@@ -32,11 +32,15 @@ const binding = (over: Partial<AdminBinding> = {}): AdminBinding => ({
 })
 const rate = { id: 2, rate_bp: 1500, max_per_invitee: 50000, max_per_inviter_30d: 500000, hold_days: 7, period_days: 365, effective_from: '2026-10-01T00:00:00Z', note: '', created_by: 1, created_at: '2026-10-01T00:00:00Z' }
 
+const inviterRow = { user_id: 10, code: 'ABC234', status: 'active', frozen_reason: '', debt: 0, created_at: '', phone: '13800001234', kyc_status: 'verified', user_status: 'active', invitees: 120, held_count: 0, pending: 0, settled_net: 0, last_bound_at: null }
+let detail: Record<string, unknown> = {}
 let heldItems: AdminBinding[] = []
 function routeGet(path: string) {
   if (path === '/referral/summary') return Promise.resolve({ pending: 690, month_settled: 0, settled_net: 100, debt: 0, held_count: heldItems.length })
   if (path === '/referral/bindings') return Promise.resolve({ items: heldItems, total: heldItems.length })
   if (path === '/referral/config') return Promise.resolve({ current: rate, versions: [rate] })
+  if (path === '/referral/inviters') return Promise.resolve({ items: [inviterRow], total: 1 })
+  if (path === '/referral/inviters/10') return Promise.resolve(detail)
   return Promise.resolve({ items: [], total: 0 })
 }
 
@@ -65,6 +69,7 @@ async function fill(id: string, v: string) {
 
 beforeEach(() => {
   heldItems = [binding()]
+  detail = { account: inviterRow, phone: '13800001234', bindings: [binding({ status: 'active' })], bindings_total: 1, rewards: [], rewards_total: 0, events: [] }
   mocks.get.mockImplementation(routeGet)
   mocks.post.mockReset()
   Object.values(mocks.msg).forEach((f) => f.mockReset())
@@ -185,10 +190,12 @@ describe('配置与重扫（super）', () => {
     expect($('cfg-effective')!.tagName).toBe('INPUT')
   })
 
+  const rescanOut = (over: Record<string, unknown> = {}) => ({ watermark: '2026-10-17T00:00:00Z', processed: 5, failed: 0, released: 2, incomplete: false, ...over })
   it.each([
-    [{ ok: true }, { type: 'success', message: '已重扫' }],
-    [{ failed: 4 }, { type: 'warning', message: '已重扫，4 行仍失败' }],
-  ])('重扫 %o → %o', async (out, msg) => {
+    [rescanOut(), { type: 'success', message: '已重扫：处理 5 行，发放 2 笔' }],
+    [rescanOut({ failed: 4 }), { type: 'warning', message: '已重扫，4 行仍失败（处理 5 行，发放 2 笔）' }],
+    [rescanOut({ incomplete: true }), { type: 'warning', message: '已重扫，但本轮未全部完成（处理 5 行，发放 2 笔），之后的清扫会继续' }],
+  ])('重扫 200 %o → %o', async (out, msg) => {
     mocks.post.mockResolvedValue(out)
     await render('super', '/referral?tab=config')
     await click('cfg-rescan')
@@ -196,12 +203,13 @@ describe('配置与重扫（super）', () => {
     expect(mocks.msg.call).toHaveBeenCalledWith(msg)
   })
 
-  it('重扫 5xx（旧接口：已生效但有行失败）用提醒，不当成没执行', async () => {
+  it('重扫返回错误（什么都没发生）：按原文报错，不当成已重扫', async () => {
     mocks.post.mockRejectedValue(new ApiError(500, 'internal', '服务器内部错误', 'req-1'))
     await render('super', '/referral?tab=config')
     await click('cfg-rescan')
-    expect(mocks.msg.warning).toHaveBeenCalledWith('重扫可能未全部完成：服务器内部错误（请求号 req-1）')
-    expect(mocks.msg.error).not.toHaveBeenCalled()
+    expect(mocks.msg.error).toHaveBeenCalledWith('服务器内部错误（请求号 req-1）')
+    expect(mocks.msg.call).not.toHaveBeenCalled()
+    expect(mocks.msg.warning).not.toHaveBeenCalled()
   })
 
   it('重扫天数越界不发请求', async () => {
@@ -210,5 +218,48 @@ describe('配置与重扫（super）', () => {
     await click('cfg-rescan')
     expect($('cfg-rescan-error')!.textContent).toBe('天数需为 1～30 的整数')
     expect(mocks.post).not.toHaveBeenCalled()
+  })
+})
+
+describe('邀请人', () => {
+  it('行可用键盘打开抽屉（tabindex + role=button + Enter）', async () => {
+    await render('finance', '/referral?tab=inviters')
+    const row = $('inv-row')!
+    expect(row.getAttribute('tabindex')).toBe('0')
+    expect(row.getAttribute('role')).toBe('button')
+    row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))
+    await flushPromises()
+    expect(mocks.get).toHaveBeenCalledWith('/referral/inviters/10')
+    expect($$('inv-binding-row')).toHaveLength(1)
+    expect($('inv-d-bindings-more')).toBeNull()
+    expect($('inv-d-rewards-more')).toBeNull()
+  })
+
+  it('全量多于抽屉显示的条数：提示总数，返利跳到按邀请人筛选的明细，绑定可导出全部', async () => {
+    detail = { ...detail, bindings_total: 120, rewards: [], rewards_total: 300 }
+    mocks.download.mockResolvedValue({ blob: new Blob(['x']), filename: 'b.csv' })
+    URL.createObjectURL = vi.fn(() => 'blob:x')
+    URL.revokeObjectURL = vi.fn()
+    await render('finance', '/referral?tab=inviters')
+    await click('inv-row')
+    expect($('inv-d-bindings-more')!.textContent).toContain('共 120 个，仅显示最近 1 个')
+    expect($('inv-d-rewards-more')!.textContent).toContain('共 300 条，仅显示最近 0 条')
+    await click('inv-d-bindings-export')
+    expect(mocks.download).toHaveBeenCalledWith('/referral/bindings/export', { inviter_id: 10 })
+    await click('inv-d-rewards-all')
+    expect(mocks.get).toHaveBeenCalledWith('/referral/rewards', expect.objectContaining({ inviter_id: '10', page: 1 }))
+    expect(($('rw-inviter') as HTMLInputElement).value).toBe('10')
+  })
+})
+
+describe('概览', () => {
+  it('待审核数可用键盘切到待审核 Tab', async () => {
+    await render('finance', '/referral')
+    const card = $('ref-sum-held-link')!
+    expect(card.getAttribute('tabindex')).toBe('0')
+    expect(card.getAttribute('role')).toBe('button')
+    card.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))
+    await flushPromises()
+    expect(mocks.get).toHaveBeenCalledWith('/referral/bindings', expect.objectContaining({ status: 'held' }))
   })
 })

@@ -1,4 +1,4 @@
-import { labelOf, yuanToCents, type LabelMap } from '@spark/shared'
+import { labelOf, yuanToCents, type LabelMap, type RescanResult } from '@spark/shared'
 
 /** 邀请返利页只显示脱敏手机号（138****1234）；不是 11 位的一律整体打码，不回显原文。 */
 export function maskPhone(p: string): string {
@@ -89,8 +89,13 @@ export function parseRescanDays(v: string): number | null {
   return n >= RESCAN_MIN_DAYS && n <= RESCAN_MAX_DAYS ? n : null
 }
 
-/** 重扫结果：重扫已生效；仍有处理失败的行（failed > 0）时用提醒而不是错误。 */
-export function rescanMessage(out: { failed?: number } | undefined): { type: 'success' | 'warning'; text: string } {
-  const failed = out?.failed ?? 0
-  return failed > 0 ? { type: 'warning', text: `已重扫，${failed} 行仍失败` } : { type: 'success', text: '已重扫' }
+/**
+ * 重扫结果提示（接口 200 即重扫已执行）。仍有处理失败的行或本轮未全部完成时用提醒（不是错误），
+ * 并带上本次处理与发放的数量；失败行与未完成的部分由之后的清扫轮继续。
+ */
+export function rescanMessage(r: RescanResult): { type: 'success' | 'warning'; text: string } {
+  const counts = `处理 ${r.processed} 行，发放 ${r.released} 笔`
+  if (r.incomplete) return { type: 'warning', text: `已重扫，但本轮未全部完成（${counts}${r.failed > 0 ? `，${r.failed} 行失败` : ''}），之后的清扫会继续` }
+  if (r.failed > 0) return { type: 'warning', text: `已重扫，${r.failed} 行仍失败（${counts}）` }
+  return { type: 'success', text: `已重扫：${counts}` }
 }
