@@ -1,0 +1,3 @@
+{"name": "vLLM 推理服务", "summary": "OpenAI 兼容的大模型推理接口（Qwen3 等）", "category": "llm", "icon": "llm", "sort": 10, "version": "1.0.0",
+ "images": ["LLM Serving"], "changelog": "初始版本",
+ "description": "在实例上启动 vLLM，提供 OpenAI 兼容接口（/v1/chat/completions）。模型从 ModelScope 下载并缓存在 /root/data/models，卸载应用不会删除模型。\n\n- 接口密钥留空时接口不鉴权：端口默认私有、经控制台票据保护；设为公开前请先填写密钥。\n- 16GB 模型在默认限速下约需 15 分钟下载。"}

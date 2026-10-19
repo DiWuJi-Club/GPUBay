@@ -1,0 +1,14 @@
+{
+  "ports": [{"port": 8000, "label": "OpenAI 兼容接口", "path": "/v1", "health_path": "/health"}],
+  "timeout_minutes": 90,
+  "min_data_free_gib": 40,
+  "env": [
+    {"name": "MODEL_ID", "label": "模型", "type": "enum", "required": true,
+     "options": ["Qwen/Qwen3-8B", "Qwen/Qwen3-4B", "Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen3-14B"], "default": "Qwen/Qwen3-8B", "help": "ModelScope 模型 ID"},
+    {"name": "MODEL_SOURCE", "label": "下载源", "type": "enum", "options": ["modelscope", "hf-mirror"], "default": "modelscope"},
+    {"name": "MAX_MODEL_LEN", "label": "最大上下文", "type": "int", "min": 1024, "max": 131072, "default": "32768"},
+    {"name": "GPU_MEMORY_UTILIZATION", "label": "显存占用比例", "type": "string", "pattern": "^0\\.[3-9][0-9]?$", "default": "0.7"},
+    {"name": "API_KEY", "label": "接口密钥", "type": "secret", "required": false, "pattern": "^[A-Za-z0-9_-]{8,128}$", "help": "留空则接口不鉴权（仅建议私有端口）"}
+  ],
+  "links": [{"label": "接口文档", "path": "/docs"}, {"label": "模型列表", "path": "/v1/models"}]
+}
