@@ -2,10 +2,10 @@
 import {
   durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, isApiError, labelOf, messageOf, portVisibilityLabel,
   useCountdown, useIdempotencyKey,
-  type Duration, type Instance, type InstancePort, type Listed, type Order, type PortVisibility, type Product,
+  type CancelQuote, type Duration, type Instance, type InstancePort, type Listed, type Order, type PortVisibility, type Product, type UserEvent,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import AppDialog from '../components/AppDialog.vue'
@@ -13,7 +13,8 @@ import GuideDialog from '../components/GuideDialog.vue'
 import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
 import { MAX_PORTS, validatePort } from '../logic/access'
-import { canRelease, canRenew, releaseWarning } from '../logic/instance'
+import { describeDuration } from '../logic/booking'
+import { autoRenewFailureText, canCancel, canRelease, canRenew, canSetAutoRenew, releaseWarning, renewQuantityMax } from '../logic/instance'
 import { notifyError } from '../logic/notify'
 import { refreshBalance, session } from '../store/session'
 
@@ -36,6 +37,7 @@ async function load() {
     const prevState = inst.value?.state
     inst.value = next
     if (canManagePorts(next.state) && prevState !== next.state) void loadPorts() // 首次加载与状态变化时拉端口，轮询不重复拉
+    if (prevState !== undefined && prevState !== next.state) void loadEvents() // 状态变化时刷新时间线（首次由 onMounted 拉）
     loadError.value = ''
     failing = false
     if (next.state === 'running' && !next.suspended) countdown.start(next.remaining_seconds)
@@ -50,11 +52,20 @@ async function load() {
     failing = true
   }
 }
-onMounted(load)
-// 开通中 / 洗机中每 10 秒刷新一次（页面不可见时暂停，卸载自动停止）。
+onMounted(() => {
+  // 商品价格依赖实例的 product_id：实例加载后再拉；失败不提示（续费对话框打开时会再拉一次并提示）
+  void load().then(() => loadProduct().catch(() => (productError.value = true)))
+  void loadEvents()
+})
+const nowMs = ref(Date.now())
+const ticker = setInterval(() => (nowMs.value = Date.now()), 1000)
+onUnmounted(() => clearInterval(ticker))
+// 已预订 / 开通中 / 洗机中每 10 秒刷新一次（预订到开通时刻自动变为开通中）（页面不可见时暂停，卸载自动停止）。
 // 运行中且服务器已报剩余 0 秒：到期停机由后端每分钟的清扫执行，归零那次刷新多半还是「运行中」，同样每 10 秒再查，状态变了就停
 const awaitingExpiry = () => inst.value?.state === 'running' && !inst.value.suspended && inst.value.remaining_seconds === 0
-usePolling(load, 10_000, { enabled: () => inst.value?.state === 'creating' || inst.value?.state === 'wiping' || awaitingExpiry() })
+usePolling(load, 10_000, {
+  enabled: () => inst.value?.state === 'reserved' || inst.value?.state === 'creating' || inst.value?.state === 'wiping' || awaitingExpiry(),
+})
 
 // ---- SSH 密码：只在点击时请求，只放内存，离开页面即丢弃 ----
 const password = ref('')
@@ -133,7 +144,7 @@ const addingPort = ref(false)
 const publicTarget = ref<InstancePort | null>(null)
 const togglingPort = ref(false)
 function canManagePorts(s: string) {
-  return s === 'creating' || s === 'running' || s === 'stopped'
+  return s === 'reserved' || s === 'creating' || s === 'running' || s === 'stopped'
 }
 async function loadPorts() {
   const of = id.value
@@ -202,19 +213,41 @@ function openPort(p: InstancePort) {
 // ---- 续费 ----
 const renewVisible = ref(false)
 const renewDuration = ref<Duration>('1d')
+const renewQuantity = ref(1)
 const product = ref<Product | null>(null)
 const renewing = ref(false)
-const renewKey = useIdempotencyKey(() => [id.value, renewDuration.value])
-const renewPrice = computed(() => product.value?.prices.find((p) => p.duration === renewDuration.value)?.amount ?? null)
+const renewKey = useIdempotencyKey(() => [id.value, renewDuration.value, renewQuantity.value])
+const renewUnit = computed(() => product.value?.prices.find((p) => p.duration === renewDuration.value)?.amount ?? null)
+const renewPrice = computed(() => (renewUnit.value == null ? null : renewUnit.value * renewQuantity.value))
+const renewMax = computed(() => (inst.value ? renewQuantityMax(inst.value, renewDuration.value) : 1))
+// 档位切换或实例刷新导致上限变化时，把数量夹回 [1, 上限]
+watch([renewDuration, renewMax], () => {
+  renewQuantity.value = Math.min(Math.max(renewQuantity.value || 1, 1), Math.max(renewMax.value, 1))
+})
 const balance = computed(() => session.balance ?? 0)
 const renewAfter = computed(() => (renewPrice.value == null ? null : balance.value - renewPrice.value))
 const renewInsufficient = computed(() => renewPrice.value != null && balance.value < renewPrice.value)
 
+/** 商品价格：续费对话框与自动续费档位下拉共用。 */
+const productError = ref(false) // 商品价格加载失败：自动续费档位只显示当前值，不能改
+async function loadProduct() {
+  if (!inst.value) return
+  const pid = inst.value.product_id
+  const { items } = await api.get<Listed<Product>>('/products')
+  product.value = items.find((p) => p.id === pid) ?? null
+  productError.value = false
+}
+/** 自动续费档位选项：价格没加载到时只列当前值，下拉仍能显示它。 */
+const autoRenewDurations = computed<Duration[]>(() =>
+  product.value ? product.value.prices.map((p) => p.duration) : inst.value ? [inst.value.auto_renew_duration] : [],
+)
 async function openRenew() {
   try {
-    const [{ items }] = await Promise.all([api.get<Listed<Product>>('/products'), refreshBalance()])
-    product.value = items.find((p) => p.id === inst.value?.product_id) ?? null
-    renewDuration.value = product.value?.prices[0]?.duration ?? '1d'
+    await Promise.all([loadProduct(), refreshBalance()])
+    const prices = product.value?.prices ?? []
+    const i = inst.value
+    renewDuration.value = (i ? prices.find((p) => renewQuantityMax(i, p.duration) > 0) : undefined)?.duration ?? prices[0]?.duration ?? '1d'
+    renewQuantity.value = 1
     renewVisible.value = true
   } catch (e) {
     notifyError(e)
@@ -230,14 +263,21 @@ async function confirmRenew() {
   renewing.value = true
   const wasStopped = inst.value.state === 'stopped'
   try {
-    await api.post<{ order: Order }>(`/instances/${id.value}/renew`, { duration: renewDuration.value }, { idempotencyKey: renewKey.current() })
+    await api.post<{ order: Order }>(
+      `/instances/${id.value}/renew`,
+      { duration: renewDuration.value, quantity: renewQuantity.value },
+      { idempotencyKey: renewKey.current() },
+    )
     renewKey.rotate()
     renewVisible.value = false
     ElMessage.success(wasStopped ? '续费成功，正在重新启动' : '续费成功')
-    await Promise.all([load(), refreshBalance()])
+    await Promise.all([load(), refreshBalance(), loadEvents()])
   } catch (e) {
     renewVisible.value = false
-    guide.handle(e)
+    if (isApiError(e) && e.code === 'renew_blocked') {
+      ElMessage.warning(e.message) // 后端文案原样显示（含可续至时间）
+      await load()
+    } else guide.handle(e)
   } finally {
     renewing.value = false
   }
@@ -263,8 +303,80 @@ async function confirmRelease() {
   }
 }
 
+// ---- 取消预订 ----
+const cancelVisible = ref(false)
+const cancelQuote = ref<CancelQuote | null>(null)
+const cancelling = ref(false)
+async function openCancel() {
+  try {
+    cancelQuote.value = await api.get<CancelQuote>(`/instances/${id.value}/cancel-quote`)
+    cancelQuoteChanged.value = false
+    cancelVisible.value = true
+  } catch (e) {
+    notifyError(e)
+  }
+}
+const cancelQuoteChanged = ref(false)
+async function confirmCancel() {
+  if (cancelling.value) return // 双击保护
+  cancelling.value = true
+  try {
+    // 确认时重新报价：跨过冷静期 / 24 小时档位后金额会变，变了就更新显示并请用户再确认一次
+    const shown = cancelQuote.value
+    const latest = await api.get<CancelQuote>(`/instances/${id.value}/cancel-quote`)
+    if (!shown || latest.refund !== shown.refund || latest.percent !== shown.percent) {
+      cancelQuote.value = latest
+      cancelQuoteChanged.value = true
+      return
+    }
+    const next = await api.post<Instance>(`/instances/${id.value}/cancel`, {})
+    seq++ // 作废进行中的轮询，避免旧的 reserved 响应覆盖取消结果
+    inst.value = next
+    cancelVisible.value = false
+    ElMessage.success('已取消预订，退款已退回余额')
+    await Promise.all([refreshBalance(), loadEvents()])
+  } catch (e) {
+    cancelVisible.value = false
+    notifyError(e) // cancel_not_allowed 等后端原文
+    await load()
+  } finally {
+    cancelling.value = false
+  }
+}
+
+// ---- 自动续费 ----
+const togglingAutoRenew = ref(false)
+async function setAutoRenew(enabled: boolean, duration?: Duration) {
+  if (togglingAutoRenew.value || !inst.value) return
+  togglingAutoRenew.value = true
+  try {
+    const next = await api.put<Instance>(`/instances/${id.value}/auto-renew`, { enabled, duration: duration ?? inst.value.auto_renew_duration })
+    seq++ // 作废进行中的轮询，避免旧响应把开关拨回去
+    inst.value = next
+    ElMessage.success(enabled ? '已开启自动续费' : '已关闭自动续费')
+  } catch (e) {
+    notifyError(e)
+  } finally {
+    togglingAutoRenew.value = false
+  }
+}
+
+// ---- 时间线 ----
+const events = ref<UserEvent[]>([])
+async function loadEvents() {
+  const of = id.value
+  try {
+    const { items } = await api.get<Listed<UserEvent>>(`/instances/${of}/events`)
+    if (of === id.value) events.value = items // 换实例后迟到的响应丢弃
+  } catch (e) {
+    notifyError(e)
+  }
+}
+
 watch(id, () => {
   password.value = ''
+  events.value = []
+  cancelVisible.value = false
   resetVisible.value = false
   ports.value = []
   portInput.value = ''
@@ -276,6 +388,7 @@ watch(id, () => {
   failing = false
   countdown.stop()
   void load()
+  void loadEvents()
 })
 </script>
 
@@ -291,11 +404,24 @@ watch(id, () => {
           </div>
         </template>
         <el-alert v-if="inst.state === 'failed'" type="error" title="开通失败，费用已原路退回余额" show-icon :closable="false" data-testid="detail-failed-hint" />
+        <el-alert v-if="inst.auto_renew_failed_reason" type="error" :title="autoRenewFailureText(inst)" show-icon :closable="false" data-testid="detail-auto-renew-failed">
+          <router-link v-if="inst.auto_renew_failed_reason === 'insufficient_balance'" to="/wallet/recharge">去充值</router-link>
+        </el-alert>
+        <el-alert v-if="inst.state === 'cancelled'" type="info" title="预订已取消，退款已退回余额" show-icon :closable="false" data-testid="detail-cancelled-hint" />
         <el-alert v-if="inst.suspended" type="warning" title="计时已暂停（机器维护中）" show-icon :closable="false" data-testid="detail-suspended" />
         <!-- el-descriptions 会把条目展平重排：v-if 条目增减时 Vue 按位置复用 span，静态 data-testid 不会被更新，所以条件条目的 span 必须带 key -->
         <el-descriptions :column="1" border>
           <el-descriptions-item label="商品"><span data-testid="detail-product">{{ inst.product_name }}</span></el-descriptions-item>
           <el-descriptions-item label="镜像"><span data-testid="detail-image">{{ inst.image_name }}</span></el-descriptions-item>
+          <el-descriptions-item v-if="inst.group_name" label="机组"><span key="group" data-testid="detail-group">{{ inst.group_name }}</span></el-descriptions-item>
+          <el-descriptions-item label="机器">
+            <span key="machine" data-testid="detail-machine">{{ inst.machine_label || '—' }}<template v-if="inst.reassign_count > 0">（<span data-testid="detail-reassigned">已更换机器 {{ inst.reassign_count }} 次</span>）</template></span>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="inst.scheduled_start_at" label="预订开始"><span key="start" data-testid="detail-start">{{ fmtTime(inst.scheduled_start_at) }}</span></el-descriptions-item>
+          <el-descriptions-item v-if="inst.scheduled_end_at" label="预订结束"><span key="end" data-testid="detail-end">{{ fmtTime(inst.scheduled_end_at) }}</span></el-descriptions-item>
+          <el-descriptions-item v-if="inst.batch_id" label="批次">
+            <router-link key="batch" :to="{ path: '/instances', query: { batch: inst.batch_id } }" class="mono" data-testid="detail-batch">{{ inst.batch_id }}</router-link>
+          </el-descriptions-item>
           <el-descriptions-item label="创建时间"><span data-testid="detail-created">{{ fmtTime(inst.created_at) }}</span></el-descriptions-item>
           <el-descriptions-item label="到期时间"><span data-testid="detail-expires">{{ inst.expires_at ? fmtTime(inst.expires_at) : '—' }}</span></el-descriptions-item>
           <el-descriptions-item label="剩余时长">
@@ -309,7 +435,8 @@ watch(id, () => {
           </el-descriptions-item>
         </el-descriptions>
         <div class="actions">
-          <el-button v-if="canRenew(inst.state)" type="primary" data-testid="detail-renew-btn" @click="openRenew">续费</el-button>
+          <el-button v-if="canRenew(inst.state)" type="primary" data-testid="detail-renew-btn" @click="openRenew">{{ inst.state === 'reserved' ? '续费（加时）' : '续费' }}</el-button>
+          <el-button v-if="canCancel(inst, nowMs)" type="danger" plain data-testid="detail-cancel-btn" @click="openCancel">取消预订</el-button>
           <el-button v-if="canRelease(inst.state)" type="danger" plain data-testid="detail-release-btn" @click="releaseVisible = true">释放</el-button>
         </div>
       </el-card>
@@ -322,7 +449,7 @@ watch(id, () => {
           </div>
           <p class="muted">主机 <span data-testid="detail-ssh-host">{{ inst.ssh_host }}</span>，端口 {{ inst.ssh_port }}；首次连接请在<router-link to="/help">帮助页</router-link>核对主机密钥指纹。</p>
         </template>
-        <p v-else class="muted" data-testid="detail-ssh-hint">实例运行中才能连接</p>
+        <p v-else class="muted" data-testid="detail-ssh-hint">{{ inst.state === 'reserved' ? '开通后可连接' : '实例运行中才能连接' }}</p>
         <template v-if="canManagePorts(inst.state)">
           <div class="row">
             <span>密码：</span>
@@ -374,16 +501,63 @@ watch(id, () => {
         <p v-else class="muted" data-testid="detail-port-limit">每个实例最多开放 {{ MAX_PORTS }} 个端口</p>
         <p v-if="portError" class="danger" data-testid="detail-port-error">{{ portError }}</p>
       </el-card>
+
+      <el-card v-if="canSetAutoRenew(inst.state)" header="自动续费" data-testid="detail-auto-renew-card">
+        <div class="row">
+          <el-switch :model-value="inst.auto_renew" :loading="togglingAutoRenew" data-testid="detail-auto-renew" @change="(v: string | number | boolean) => setAutoRenew(v === true)" />
+          <el-select
+            :model-value="inst.auto_renew_duration"
+            :disabled="!inst.auto_renew || togglingAutoRenew || !product"
+            data-testid="detail-auto-renew-duration"
+            style="width: 110px"
+            @change="(d: Duration) => setAutoRenew(true, d)"
+          >
+            <el-option v-for="d in autoRenewDurations" :key="d" :value="d" :label="labelOf(durationLabel, d)" />
+          </el-select>
+        </div>
+        <p v-if="productError" class="warn small" data-testid="detail-auto-renew-product-error">档位价格加载失败，暂时只能开关自动续费，刷新页面后可修改档位。</p>
+        <p class="muted small">到期前 1 小时自动扣款续 1 个单位；余额不足会重试到到期，被后续预订挡住时按能放下的档位办理；停机后不自动续。</p>
+      </el-card>
+
+      <el-card header="动态" data-testid="detail-timeline">
+        <el-timeline v-if="events.length">
+          <el-timeline-item v-for="(ev, i) in events" :key="i" :timestamp="fmtTime(ev.at)" placement="top">
+            <span data-testid="detail-event" :data-kind="ev.reason_kind">{{ ev.detail }}</span>
+          </el-timeline-item>
+        </el-timeline>
+        <p v-else class="muted">暂无记录</p>
+      </el-card>
     </template>
 
     <AppDialog v-model="renewVisible" kind="form" title="续费" data-testid="detail-renew-dialog">
       <el-form label-position="top">
+        <p v-if="inst?.renewable_until" class="muted" data-testid="detail-renew-until">可续至 {{ fmtTime(inst.renewable_until) }}（机器之后已有预订）</p>
         <el-form-item label="租期">
           <el-radio-group v-model="renewDuration">
-            <el-radio-button v-for="p in product?.prices ?? []" :key="p.duration" :value="p.duration" :data-testid="`detail-renew-duration-${p.duration}`">
+            <el-radio-button
+              v-for="p in product?.prices ?? []"
+              :key="p.duration"
+              :value="p.duration"
+              :disabled="!!inst && renewQuantityMax(inst, p.duration) === 0"
+              :data-testid="`detail-renew-duration-${p.duration}`"
+            >
               {{ labelOf(durationLabel, p.duration) }} {{ fmtYuan(p.amount) }}
+              <span v-if="inst && renewQuantityMax(inst, p.duration) === 0" class="small">超出可续时间</span>
             </el-radio-button>
           </el-radio-group>
+        </el-form-item>
+        <el-form-item label="数量">
+          <div class="row">
+            <el-input-number
+              v-model="renewQuantity"
+              :min="1"
+              :max="Math.max(renewMax, 1)"
+              :value-on-clear="1"
+              :disabled="renewMax === 0"
+              data-testid="detail-renew-quantity"
+            />
+            <span class="muted">{{ describeDuration(renewDuration, renewQuantity) }}</span>
+          </div>
         </el-form-item>
         <el-descriptions :column="1" border>
           <el-descriptions-item label="价格"><span data-testid="detail-renew-price">{{ renewPrice == null ? '—' : fmtYuan(renewPrice) }}</span></el-descriptions-item>
@@ -395,7 +569,7 @@ watch(id, () => {
       </el-form>
       <template #footer>
         <el-button data-testid="detail-renew-cancel" @click="renewVisible = false">取消</el-button>
-        <el-button type="primary" :loading="renewing" data-testid="detail-renew-ok" @click="confirmRenew">{{ renewInsufficient ? '去充值' : '确认续费' }}</el-button>
+        <el-button type="primary" :loading="renewing" :disabled="renewMax === 0 || !renewQuantity" data-testid="detail-renew-ok" @click="confirmRenew">{{ renewInsufficient ? '去充值' : '确认续费' }}</el-button>
       </template>
     </AppDialog>
 
@@ -405,6 +579,14 @@ watch(id, () => {
       <template #footer>
         <el-button data-testid="detail-release-cancel" @click="releaseVisible = false">取消</el-button>
         <el-button type="danger" :loading="releasing" :disabled="releasing" data-testid="detail-release-ok" @click="confirmRelease">确定释放</el-button>
+      </template>
+    </AppDialog>
+    <AppDialog v-model="cancelVisible" kind="confirm" title="取消预订" data-testid="detail-cancel-dialog">
+      <p v-if="cancelQuoteChanged" class="warn" data-testid="detail-cancel-changed">退款金额已按最新规则更新，请确认后再次点击。</p>
+      <p v-if="cancelQuote" data-testid="detail-cancel-text">将退款 {{ fmtYuan(cancelQuote.refund) }}（{{ cancelQuote.percent }}%），可取消至 {{ fmtTime(cancelQuote.deadline) }}。开通后将不能取消。</p>
+      <template #footer>
+        <el-button :disabled="cancelling" data-testid="detail-cancel-cancel" @click="cancelVisible = false">再想想</el-button>
+        <el-button type="danger" :loading="cancelling" data-testid="detail-cancel-ok" @click="confirmCancel">确定取消</el-button>
       </template>
     </AppDialog>
     <AppDialog v-model="resetVisible" kind="confirm" title="重置 SSH 密码" data-testid="detail-reset-dialog">

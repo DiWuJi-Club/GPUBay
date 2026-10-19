@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { digitsOnly, type Paged } from '@spark/shared'
 import { onMounted, reactive, ref } from 'vue'
-import { onBeforeRouteUpdate, useRoute } from 'vue-router'
+import { onBeforeRouteUpdate, useRoute, type LocationQuery } from 'vue-router'
 import { api } from '../api'
 import { usePaged } from '../composables/usePaged'
 import { downloadBlob } from '../logic/csv'
@@ -18,10 +18,25 @@ const props = defineProps<{
 }>()
 
 const route = useRoute()
-const emptyFilter = (userId: unknown = '') => ({ user_id: digitsOnly(String(userId ?? '')), kind: '', status: '', range: { from: '', to: '' } })
-const filter = reactive(emptyFilter(route.query.user_id))
+// 批次筛选只有订单页有（?batch_id= 预填，来自预订 / 实例页的批次链接）
+const isOrders = props.endpoint === 'orders'
+const emptyFilter = (q: LocationQuery = {}) => ({
+  user_id: digitsOnly(String(q.user_id ?? '')),
+  batch_id: isOrders ? String(q.batch_id ?? '') : '',
+  kind: '',
+  status: '',
+  range: { from: '', to: '' },
+})
+const filter = reactive(emptyFilter(route.query))
 // 空值由 buildQuery 省略；日期按 YYYY-MM-DD 原样发出（后端按北京时间解释，to 含当天）
-const query = () => ({ user_id: filter.user_id, [props.kindParam]: filter.kind, status: filter.status, from: filter.range.from, to: filter.range.to })
+const query = () => ({
+  user_id: filter.user_id,
+  [props.kindParam]: filter.kind,
+  status: filter.status,
+  from: filter.range.from,
+  to: filter.range.to,
+  ...(isOrders ? { batch_id: filter.batch_id.trim() } : {}),
+})
 // 已生效的筛选：只在查询 / 重置 / 打开页面（含 ?user_id= 预填）时取表单快照。
 // 翻页与导出都用它：表单改了但没点「查询」时，第 2 页和导出的 CSV 仍与屏幕上的表格一致。
 let applied = query()
@@ -35,10 +50,11 @@ function resetFilter() {
   Object.assign(filter, emptyFilter())
   search()
 }
-// 同一路由只换查询串（/orders?user_id=X → /orders 或 ?user_id=Y，含浏览器前进后退）：组件复用，按新地址重新预填并加载
+// 同一路由只换查询串（/orders?user_id=X → /orders 或 ?user_id=Y / ?batch_id=，含浏览器前进后退）：组件复用，按新地址重新预填并加载
+const same = (a: LocationQuery, b: LocationQuery, k: string) => String(a[k] ?? '') === String(b[k] ?? '')
 onBeforeRouteUpdate((to) => {
-  if (String(to.query.user_id ?? '') === String(route.query.user_id ?? '')) return
-  Object.assign(filter, emptyFilter(to.query.user_id))
+  if (same(to.query, route.query, 'user_id') && same(to.query, route.query, 'batch_id')) return
+  Object.assign(filter, emptyFilter(to.query))
   search()
 })
 
@@ -73,6 +89,7 @@ async function exportCSV() {
           <el-option v-for="o in statusOptions" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
       </el-form-item>
+      <el-form-item v-if="endpoint === 'orders'" label="批次"><el-input v-model="filter.batch_id" clearable data-testid="fin-filter-batch" style="width: 170px" /></el-form-item>
       <el-form-item label="日期"><DateRange v-model="filter.range" prefix="fin" /></el-form-item>
       <el-button type="primary" native-type="submit" data-testid="fin-search">查询</el-button>
       <el-button data-testid="fin-reset" @click="resetFilter">重置</el-button>

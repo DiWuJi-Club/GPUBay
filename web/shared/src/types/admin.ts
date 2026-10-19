@@ -1,4 +1,5 @@
 import type { InstancePort, SshKey } from './access'
+import type { CalendarPeriod } from './booking'
 import type { Duration } from './catalog'
 import type { InstanceState, OrderKind, OrderStatus } from './instance'
 import type { KycResult } from './kyc'
@@ -54,6 +55,8 @@ export interface Machine {
   agent_connected_at: string | null
   state_reported_at: string | null
   last_metrics: MachineMetrics | null
+  group_id: number | null
+  display_name: string
 }
 
 export interface MachineMetrics {
@@ -88,12 +91,51 @@ export interface AdminInstance {
   stopped_at: string | null
   password_auth: boolean
   created_at: string
+  scheduled_start_at: string | null
+  scheduled_end_at: string | null
+  group_id: number | null
+  batch_id: string | null
+  reassign_count: number
+  auto_renew: boolean
+  auto_renew_duration: Duration
+  auto_renew_failed_reason: string
+  provisioned_at: string | null
+  cancelled_at: string | null
 }
 
 export interface MachineDetail {
   machine: Machine
   current_instance: AdminInstance | null
   history: AdminInstance[]
+  group: AdminGroupBrief | null
+  leases: CalendarPeriod[]
+  upcoming_bookings: number
+}
+
+export interface AdminGroup {
+  id: number
+  name: string
+  region: string
+  description: string
+  sort: number
+  visible: boolean
+  created_at: string
+  updated_at: string
+  machine_count: number
+  idle_now: number
+  reserved_upcoming: number
+}
+export type AdminGroupBrief = Pick<AdminGroup, 'id' | 'name' | 'region' | 'visible'>
+export interface GroupInput {
+  name: string
+  region: string
+  description: string
+  sort: number
+  visible: boolean
+}
+export interface UpcomingDay {
+  date: string
+  count: number
 }
 
 export interface ImportError {
@@ -164,6 +206,9 @@ export interface AdminOrder {
   refunded_amount: number
   status: OrderStatus
   created_at: string
+  quantity: number
+  batch_id: string | null
+  auto: boolean
 }
 
 export interface AdminInstanceDetail {
@@ -286,4 +331,5 @@ export interface Dashboard {
   order_month: number
   utilization: { date: string; rate: number }[]
   ssh_sessions_open: number
+  bookings_upcoming_7d: number
 }
