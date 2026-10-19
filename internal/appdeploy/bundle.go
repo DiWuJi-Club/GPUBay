@@ -54,6 +54,9 @@ func Bundle(in BundleInput, runSH []byte) ([]byte, error) {
 		return nil, err
 	}
 	user := append(sortedKV(in.Env), sortedKV(in.Secret)...)
+	if err := checkUserEnvNames(user); err != nil {
+		return nil, err
+	}
 	env := RenderEnv(ReservedEnv(in), user)
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -78,7 +81,8 @@ func Bundle(in BundleInput, runSH []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// UploadCommand 上传部署包的固定命令；dir 只由 AppRoot 与 slug 拼出，命令行里没有任何用户输入。
+// UploadCommand 上传部署包的固定命令；dir 只由 AppRoot 与 slug 拼出，命令行里没有任何用户输入；仍按单引号转义，AppRoot 配置异常也不会被 sh 解释。
 func UploadCommand(dir string) string {
-	return "mkdir -p " + dir + " && chmod 700 " + dir + " && tar -x -C " + dir + " -f - && chmod 600 " + dir + "/env"
+	q := ShellQuote(dir)
+	return "mkdir -p " + q + " && chmod 700 " + q + " && tar -x -C " + q + " -f - && chmod 600 " + ShellQuote(dir+"/env")
 }

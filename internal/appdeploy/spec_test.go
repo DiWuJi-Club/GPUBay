@@ -35,6 +35,7 @@ func TestValidateSpecMatrix(t *testing.T) {
 	}
 	// enum 选项按字符计：128 个汉字合法
 	cjk := goodSpec()
+	cjk.Env[0].MaxLen = 1024 // 128 个汉字 = 384 字节，须放得下（选项也要过 max_len）
 	cjk.Env[0].Options = append(cjk.Env[0].Options, strings.Repeat("模", 128))
 	if err := appdeploy.ValidateSpec(&cjk); err != nil {
 		t.Fatalf("128-char option rejected: %v", err)
@@ -79,6 +80,17 @@ func TestValidateSpecMatrix(t *testing.T) {
 		"5 links":                     {func(s *appdeploy.Spec) { s.Links = make([]appdeploy.LinkSpec, 5) }, "links"},
 		"link path":                   {func(s *appdeploy.Spec) { s.Links[0].Path = "docs" }, "links[0].path"},
 		"enum option long":            {func(s *appdeploy.Spec) { s.Env[0].Options = append(s.Env[0].Options, strings.Repeat("模", 129)) }, "env[0].options"},
+		"env name LD_ prefix":         {func(s *appdeploy.Spec) { s.Env[0].Name = "LD_AUDIT" }, "env[0].name"},
+		"env name UID":                {func(s *appdeploy.Spec) { s.Env[0].Name = "UID" }, "env[0].name"},
+		"env name EUID":               {func(s *appdeploy.Spec) { s.Env[0].Name = "EUID" }, "env[0].name"},
+		"env name PPID":               {func(s *appdeploy.Spec) { s.Env[0].Name = "PPID" }, "env[0].name"},
+		"env name SHELLOPTS":          {func(s *appdeploy.Spec) { s.Env[0].Name = "SHELLOPTS" }, "env[0].name"},
+		"secret default":              {func(s *appdeploy.Spec) { s.Env[2].Default = "abcdefgh12" }, "env[2].default"},
+		"enum option newline":         {func(s *appdeploy.Spec) { s.Env[0].Options = append(s.Env[0].Options, "a\nb") }, "env[0].options"},
+		"enum option CR":              {func(s *appdeploy.Spec) { s.Env[0].Options = append(s.Env[0].Options, "a\rb") }, "env[0].options"},
+		"enum option NUL":             {func(s *appdeploy.Spec) { s.Env[0].Options = append(s.Env[0].Options, "a\x00b") }, "env[0].options"},
+		"enum option utf8":            {func(s *appdeploy.Spec) { s.Env[0].Options = append(s.Env[0].Options, "\xff") }, "env[0].options"},
+		"enum option > max_len":       {func(s *appdeploy.Spec) { s.Env[0].MaxLen = 10 }, "env[0].options"},
 		"secret pattern allows short": {func(s *appdeploy.Spec) { s.Env[2].Pattern = "^.{1,4}$" }, "env[2].pattern"},
 	}
 	for name, c := range cases {

@@ -87,6 +87,14 @@ func TestRenderEnvEscapes(t *testing.T) {
 	if got != want {
 		t.Fatalf("render =\n%s\nwant\n%s", got, want)
 	}
+	// 纵深防御：名字不合规（格式错、保留名、SPARK_ 前缀、LD_ 前缀）的行不写进 env
+	got2 := string(appdeploy.RenderEnv(
+		[]appdeploy.EnvKV{{Name: "SPARK_APP", Value: "vllm"}, {Name: "bad;name", Value: "x"}},
+		[]appdeploy.EnvKV{{Name: "PATH", Value: "/evil"}, {Name: "X=1; touch /tmp/p; Y", Value: "x"}, {Name: "SPARK_PORT", Value: "1"},
+			{Name: "LD_AUDIT", Value: "x"}, {Name: "UID", Value: "0"}, {Name: "lower", Value: "x"}, {Name: "OK", Value: "v"}}))
+	if want2 := "export SPARK_APP='vllm'\nexport OK='v'\n"; got2 != want2 {
+		t.Fatalf("invalid names rendered:\n%s", got2)
+	}
 	// 真用 /bin/sh 加载：值原样回来，没有执行任何命令
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "env"), []byte(got), 0o600); err != nil {

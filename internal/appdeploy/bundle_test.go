@@ -65,6 +65,20 @@ func TestBundleContents(t *testing.T) {
 	if !bytes.Equal(b, b2) {
 		t.Fatal("bundle not deterministic")
 	}
+	for _, bad := range []struct{ env, secret map[string]string }{
+		{env: map[string]string{"PATH": "/evil"}},
+		{env: map[string]string{"SPARK_APP": "x"}},
+		{env: map[string]string{"LD_AUDIT": "x"}},
+		{env: map[string]string{"X; touch /tmp/p": "x"}},
+		{secret: map[string]string{"bad-name": "abcdefgh"}},
+		{secret: map[string]string{"IFS": "abcdefgh"}},
+	} {
+		badIn := in
+		badIn.Env, badIn.Secret = bad.env, bad.secret
+		if _, err := appdeploy.Bundle(badIn, []byte("#!/bin/sh\n")); err == nil {
+			t.Errorf("bundle accepted bad env name: %v %v", bad.env, bad.secret)
+		}
+	}
 	noPorts := in
 	noPorts.Spec.Ports = nil
 	if _, err := appdeploy.Bundle(noPorts, []byte("#!/bin/sh\n")); err == nil {
@@ -81,7 +95,7 @@ func TestBundleContents(t *testing.T) {
 
 func TestUploadCommand(t *testing.T) {
 	got := appdeploy.UploadCommand(appdeploy.AppDir("/root/data", "vllm"))
-	want := "mkdir -p /root/data/.spark-apps/vllm && chmod 700 /root/data/.spark-apps/vllm && tar -x -C /root/data/.spark-apps/vllm -f - && chmod 600 /root/data/.spark-apps/vllm/env"
+	want := "mkdir -p '/root/data/.spark-apps/vllm' && chmod 700 '/root/data/.spark-apps/vllm' && tar -x -C '/root/data/.spark-apps/vllm' -f - && chmod 600 '/root/data/.spark-apps/vllm/env'"
 	if got != want {
 		t.Fatalf("UploadCommand =\n%s\nwant\n%s", got, want)
 	}

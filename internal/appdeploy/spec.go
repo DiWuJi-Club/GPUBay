@@ -17,15 +17,21 @@ var (
 	slugRe    = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
 	versionRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.-]{0,31}$`)
 	envNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
-	// reservedNames 会影响 run.sh 自身或 sh 的行为，不允许作为用户变量。
-	reservedNames = map[string]bool{"PATH": true, "LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "HOME": true, "SHELL": true, "IFS": true, "ENV": true, "BASH_ENV": true}
-	envTypes      = map[string]bool{"string": true, "int": true, "bool": true, "enum": true, "secret": true}
+	// reservedNames 会影响 run.sh 自身或 sh 的行为（含 bash 只读变量），不允许作为用户变量；LD_ 前缀另行整体禁止。
+	reservedNames = map[string]bool{"PATH": true, "LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "HOME": true, "SHELL": true, "IFS": true, "ENV": true, "BASH_ENV": true,
+		"UID": true, "EUID": true, "PPID": true, "SHELLOPTS": true}
+	envTypes = map[string]bool{"string": true, "int": true, "bool": true, "enum": true, "secret": true}
 )
 
 func ValidSlug(s string) bool    { return slugRe.MatchString(s) }
 func ValidVersion(s string) bool { return versionRe.MatchString(s) }
 
 func invalid(path, reason string) error { return apperr.AppVersionInvalid(path, reason) }
+
+// validUserEnvName 用户变量名规则（§3.2）：格式合法、不以 SPARK_ / LD_ 开头、不是保留名。
+func validUserEnvName(name string) bool {
+	return envNameRe.MatchString(name) && !strings.HasPrefix(name, "SPARK_") && !strings.HasPrefix(name, "LD_") && !reservedNames[name]
+}
 
 func runeLen(s string) int { return utf8.RuneCountInString(s) }
 
@@ -109,7 +115,7 @@ func ValidateSpec(s *Spec) error {
 func validateEnvSpec(e *EnvSpec, path string) error {
 	e.Name = strings.TrimSpace(e.Name)
 	e.Label = strings.TrimSpace(e.Label)
-	if !envNameRe.MatchString(e.Name) || strings.HasPrefix(e.Name, "SPARK_") || reservedNames[e.Name] {
+	if !validUserEnvName(e.Name) {
 		return invalid(path+".name", "变量名须为大写字母开头的 [A-Z0-9_]，不得以 SPARK_ 开头，不得是 PATH / HOME / LD_* 等保留名")
 	}
 	if e.Label == "" {
@@ -139,6 +145,9 @@ func validateEnvSpec(e *EnvSpec, path string) error {
 			if o == "" || runeLen(o) > 128 {
 				return invalid(path+".options", "每个选项 1～128 个字符")
 			}
+			if reason := checkBasic(*e, o); reason != "" {
+				return invalid(path+".options", "选项 "+strconv.Quote(o)+" "+reason)
+			}
 		}
 	case "int":
 		if e.Min != nil && e.Max != nil && *e.Min > *e.Max {
@@ -162,6 +171,9 @@ func validateEnvSpec(e *EnvSpec, path string) error {
 			}
 		}
 	}
+	if e.Type == "secret" && e.Default != "" {
+		return invalid(path+".default", "secret 不能设默认值（默认值会以明文出现在版本 spec 里并被所有部署共用）")
+	}
 	if e.Default != "" {
 		if reason := checkValue(*e, e.Default); reason != "" {
 			return invalid(path+".default", "默认值不符合自身规则："+reason)
@@ -170,8 +182,8 @@ func validateEnvSpec(e *EnvSpec, path string) error {
 	return nil
 }
 
-// checkValue 按类型校验单个值；返回空串表示合法，否则返回原因。
-func checkValue(e EnvSpec, v string) string {
+// checkBasic 与类型无关的值校验（UTF-8、无换行 / NUL、≤ max_len）；返回空串表示合法。
+func checkBasic(e EnvSpec, v string) string {
 	if !utf8.ValidString(v) {
 		return "不是合法的 UTF-8"
 	}
@@ -180,6 +192,14 @@ func checkValue(e EnvSpec, v string) string {
 	}
 	if len(v) > e.MaxLen {
 		return fmt.Sprintf("最多 %d 字节", e.MaxLen)
+	}
+	return ""
+}
+
+// checkValue 按类型校验单个值；返回空串表示合法，否则返回原因。
+func checkValue(e EnvSpec, v string) string {
+	if reason := checkBasic(e, v); reason != "" {
+		return reason
 	}
 	switch e.Type {
 	case "int":
