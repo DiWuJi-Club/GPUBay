@@ -26,12 +26,17 @@ export const isZeroRefund = (yuan: string) => yuanToCents(yuan) === 0
 
 const opsRole = (r: Role) => r === 'ops' || r === 'super'
 const finRole = (r: Role) => r === 'finance' || r === 'super'
-/** 后端 addTime / RefundRelease 允许的状态 */
-const extendable = (s: InstanceState) => s === 'creating' || s === 'running' || s === 'stopped'
+/** 后端 addTime 允许的状态（后台免费延长允许 reserved） */
+const extendable = (s: InstanceState) => s === 'reserved' || s === 'creating' || s === 'running' || s === 'stopped'
+/** 后端 RefundRelease 允许的状态 */
+const refundable = (s: InstanceState) => s === 'creating' || s === 'running' || s === 'stopped'
 
 export const showExtend = (r: Role, s: InstanceState) => opsRole(r) && extendable(s)
 export const showMigrate = (r: Role, s: InstanceState) => opsRole(r) && s === 'running'
 export const showRewipe = (r: Role, s: InstanceState) => opsRole(r) && s === 'wiping'
-export const showRefund = (r: Role, s: InstanceState) => finRole(r) && extendable(s)
+export const showRefund = (r: Role, s: InstanceState) => finRole(r) && refundable(s)
+/** 预订（reserved）改派 / 取消：运维与超管。 */
+export const showReassign = (r: Role, s: InstanceState) => opsRole(r) && s === 'reserved'
+export const showCancelBooking = (r: Role, s: InstanceState) => opsRole(r) && s === 'reserved'
 /** 端口处置（强制私有 / 删除）：运维与超管。 */
 export const showPortActions = (role: Role): boolean => role === 'ops' || role === 'super'
