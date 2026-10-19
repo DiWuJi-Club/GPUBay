@@ -78,7 +78,10 @@ func TestEnsureCodeIdempotentUnderConcurrency(t *testing.T) {
 func TestLookupCode(t *testing.T) {
 	e := newEnv(t)
 	inviter := e.user("13812345678", true)
-	a, _ := e.svc.EnsureCode(e.ctx, inviter)
+	a, err := e.svc.EnsureCode(e.ctx, inviter)
+	if err != nil {
+		t.Fatal(err)
+	}
 	valid, masked, err := e.svc.LookupCode(e.ctx, strings.ToLower(" "+a.Code+" "))
 	if err != nil || !valid || masked != "138****5678" {
 		t.Fatalf("lookup = %v %q %v", valid, masked, err)
@@ -89,13 +92,53 @@ func TestLookupCode(t *testing.T) {
 	if valid, _, err := e.svc.LookupCode(e.ctx, "bad code!"); err != nil || valid {
 		t.Fatalf("garbage = %v %v", valid, err)
 	}
-	e.pool.Exec(e.ctx, `UPDATE referral_accounts SET status = 'frozen' WHERE user_id = $1`, inviter)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE referral_accounts SET status = 'frozen' WHERE user_id = $1`, inviter); err != nil {
+		t.Fatal(err)
+	}
 	if valid, _, _ := e.svc.LookupCode(e.ctx, a.Code); valid {
 		t.Fatal("frozen account must be invalid")
 	}
-	e.pool.Exec(e.ctx, `UPDATE referral_accounts SET status = 'active' WHERE user_id = $1`, inviter)
-	e.pool.Exec(e.ctx, `UPDATE users SET status = 'banned' WHERE id = $1`, inviter)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE referral_accounts SET status = 'active' WHERE user_id = $1`, inviter); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE users SET status = 'banned' WHERE id = $1`, inviter); err != nil {
+		t.Fatal(err)
+	}
 	if valid, _, _ := e.svc.LookupCode(e.ctx, a.Code); valid {
 		t.Fatal("banned owner must be invalid")
+	}
+}
+
+func TestEnsureCodeRetriesOnCollision(t *testing.T) {
+	e := newEnv(t)
+	first, err := e.svc.EnsureCode(e.ctx, e.user("13800000001", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 前两次都给出已被占用的码，第三次给新码 → 重试后成功
+	calls := 0
+	restore := referral.SetCodeGen(func() string {
+		calls++
+		if calls <= 2 {
+			return first.Code
+		}
+		return "ABCDEFGH"
+	})
+	defer restore()
+	uid := e.user("13800000002", false)
+	a, err := e.svc.EnsureCode(e.ctx, uid)
+	if err != nil || a.Code != "ABCDEFGH" || a.UserID != uid || calls != 3 {
+		t.Fatalf("retry = %+v %v calls=%d", a, err, calls)
+	}
+	// 每次都撞码：用尽 CodeRetries 后报内部错误，不建行
+	calls = 0
+	referral.SetCodeGen(func() string { calls++; return first.Code })
+	uid3 := e.user("13800000003", false)
+	if _, err := e.svc.EnsureCode(e.ctx, uid3); err == nil || calls != referral.CodeRetries {
+		t.Fatalf("exhausted = %v calls=%d", err, calls)
+	}
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM referral_accounts WHERE user_id = $1`, uid3).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("rows = %d %v", n, err)
 	}
 }

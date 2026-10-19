@@ -3,11 +3,15 @@ package referral
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"strings"
 
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 )
+
+// newCode 是 EnsureCode 使用的码生成器；测试经 export_test.go 替换以制造撞码。
+var newCode = GenerateCode
 
 // GenerateCode 生成 8 位 Crockford Base32 随机码（crypto/rand）。
 func GenerateCode() string {
@@ -61,7 +65,7 @@ func (s *Service) EnsureCode(ctx context.Context, userID int64) (Account, error)
 	for i := 0; i < CodeRetries; i++ {
 		// ON CONFLICT (user_id) DO NOTHING 处理并发的首次调用；撞到 code 唯一索引仍会报错 → 换码重试
 		_, err := s.d.Pool.Exec(ctx, `INSERT INTO referral_accounts (user_id, code, created_at, updated_at) VALUES ($1, $2, $3, $3)
-			ON CONFLICT (user_id) DO NOTHING`, userID, GenerateCode(), now)
+			ON CONFLICT (user_id) DO NOTHING`, userID, newCode(), now)
 		if err != nil {
 			if db.IsUniqueViolation(err) {
 				continue
@@ -73,7 +77,7 @@ func (s *Service) EnsureCode(ctx context.Context, userID int64) (Account, error)
 		}
 		return scanAccount(s.d.Pool.QueryRow(ctx, `SELECT `+accountCols+` FROM referral_accounts WHERE user_id = $1`, userID))
 	}
-	return a, apperr.New("invite_code_collision", "邀请码生成失败，请重试", 500)
+	return a, fmt.Errorf("referral: invite code collided %d times for user %d", CodeRetries, userID)
 }
 
 // LookupCode 匿名查码：码存在、账户未冻结、码主未封禁才有效；无效不区分原因。

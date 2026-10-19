@@ -85,6 +85,10 @@ func (s *Service) AddRateVersion(ctx context.Context, actor audit.Actor, in Rate
 		if from.Before(now.Add(-EffectiveTolerance)) {
 			return RateVersion{}, configInvalid("生效时间不能早于当前时间")
 		}
+		// 容差只是输入宽限：落库时钳到 now，任何版本都不会早于提交时刻生效（R14）
+		if from.Before(now) {
+			from = now
+		}
 	}
 	var v RateVersion
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {

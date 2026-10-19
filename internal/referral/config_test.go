@@ -21,7 +21,7 @@ func TestConfigAtPicksLatestEffectiveVersion(t *testing.T) {
 	if err != nil || v1.RateBP != 1500 || *v1.CreatedBy != 7 || !v1.EffectiveFrom.Equal(at) {
 		t.Fatalf("add = %+v %v", v1, err)
 	}
-	// 边界：effective_from == t 取新版本；之前 1 纳秒仍是旧版本
+	// 边界：effective_from == t 取新版本；之前 1 微秒仍是旧版本
 	if v, _ := e.svc.ConfigAt(e.ctx, e.pool, at); v.ID != v1.ID {
 		t.Fatalf("at boundary = %+v", v)
 	}
@@ -63,8 +63,14 @@ func TestAddRateVersionValidation(t *testing.T) {
 	}
 	// effective_from 省略 = now；5 分钟内的「过去」容差（表单提交延迟）也接受
 	slightlyPast := dbtest.T0.Add(-4 * time.Minute)
-	if _, err := e.svc.AddRateVersion(e.ctx, audit.Actor{AdminID: 1}, referral.RateInput{RateBP: 1000, MaxPerInvitee: 1, MaxPerInviter30d: 1, HoldDays: 7, PeriodDays: 365, EffectiveFrom: &slightlyPast}); err != nil {
+	sp, err := e.svc.AddRateVersion(e.ctx, audit.Actor{AdminID: 1}, referral.RateInput{RateBP: 1000, MaxPerInvitee: 1, MaxPerInviter30d: 1, HoldDays: 7, PeriodDays: 365, EffectiveFrom: &slightlyPast})
+	if err != nil {
 		t.Fatalf("tolerance: %v", err)
+	}
+	// 容差只放宽输入：落库的 effective_from 钳到提交时刻，绝不追溯（R14）
+	var stored time.Time
+	if err := e.pool.QueryRow(e.ctx, `SELECT effective_from FROM referral_rate_versions WHERE id = $1`, sp.ID).Scan(&stored); err != nil || stored.Before(dbtest.T0) || !sp.EffectiveFrom.Equal(dbtest.T0) {
+		t.Fatalf("slightly past must clamp to now: stored %v returned %v err %v", stored, sp.EffectiveFrom, err)
 	}
 	v, err := e.svc.AddRateVersion(e.ctx, audit.Actor{AdminID: 1}, referral.RateInput{RateBP: 0, MaxPerInvitee: 0, MaxPerInviter30d: 0, HoldDays: 0, PeriodDays: 1})
 	if err != nil || !v.EffectiveFrom.Equal(dbtest.T0) {

@@ -10,6 +10,8 @@
 //	发放：referral_accounts(邀请人) FOR UPDATE → referral_rewards(订单) FOR UPDATE SKIP LOCKED → wallet_accounts(邀请人)
 //	冻结 / 解冻 / 撤销 / 通过：referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
 //	OnKYCVerified（identity 事务内）：users(本人, 已持有) → referral_accounts(邀请人) FOR UPDATE → referral_bindings → referral_rewards
+//	  （可能锁两行 referral_accounts：先本人的邀请人，再本人自己的账户。安全，因为邀请关系是无环的森林
+//	  ——绑定只在被邀请人注册时建立，邀请人必先存在——所有路径都按「祖先 → 后代」加锁，不会反向等待。）
 //	rental / billing 的扣款 / 退款事务只锁 wallet_accounts，从不锁 referral 表 → 等待链不成环。
 package referral
 

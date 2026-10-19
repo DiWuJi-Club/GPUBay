@@ -135,7 +135,7 @@ func (e *env) bind(inviter, invitee int64) int64 {
 	var id int64
 	if err := e.pool.QueryRow(e.ctx, `INSERT INTO referral_bindings (inviter_id, invitee_id, code, status, rate_version_id, bound_at, rebate_until, created_at, updated_at)
 		SELECT $1, $2, a.code, 'active', v.id, $3, $3 + make_interval(days => v.period_days), $3, $3
-		FROM referral_accounts a, LATERAL (SELECT id, period_days FROM referral_rate_versions WHERE effective_from <= $3 ORDER BY effective_from DESC LIMIT 1) v
+		FROM referral_accounts a, LATERAL (SELECT id, period_days FROM referral_rate_versions WHERE effective_from <= $3 ORDER BY effective_from DESC, id DESC LIMIT 1) v
 		WHERE a.user_id = $1 RETURNING id`, inviter, invitee, now).Scan(&id); err != nil {
 		e.t.Fatalf("bind: %v", err)
 	}
