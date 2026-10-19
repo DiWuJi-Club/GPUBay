@@ -448,7 +448,7 @@ func TestGroupsHookAndMachinesInGroup(t *testing.T) {
 	ctx := context.Background()
 	gid := int64(e.must("POST", "/hooks/groups", map[string]any{"name": "A"})["id"].(float64))
 	hidden := int64(e.must("POST", "/hooks/groups", map[string]any{"name": "留池", "visible": false})["id"].(float64))
-	groups, err := e.a.Fleet.ListGroups(ctx, false)
+	groups, err := e.a.Fleet.ListGroups(ctx, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

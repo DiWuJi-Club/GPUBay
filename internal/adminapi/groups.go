@@ -43,7 +43,7 @@ type groupView struct {
 }
 
 func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.Fleet.ListGroups(r.Context(), false)
+	rows, err := s.Fleet.ListGroups(r.Context(), false, nil)
 	if err != nil {
 		s.writeError(w, r, err)
 		return

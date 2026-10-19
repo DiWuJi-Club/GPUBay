@@ -417,11 +417,11 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/groups?product_id=` | `{items:[{id,name,region,description,machine_count,idle_now}]}`，只含 `visible` 机组；匿名可访问（市场页未登录也能看） |
-| GET | `/groups/{id}/machines` | `{items:[{id,label,busy_until}]}`，`label` = `display_name` 或 `机器 #id`；`busy_until` = 最近一条 active / reserved 时段的 upper（无则 null） |
-| GET | `/groups/{id}/calendar?from=&days=` | `{days:[{date,free,total}]}` |
+| GET | `/groups?product_id=` | `{items:[{id,name,region,description,machine_count,idle_now}], now}`，只含 `visible` 机组；匿名可访问（市场页未登录也能看）；带 `product_id` 时两个计数只算该商品的机器（机组可跨商品，§3.1；终审 M1），不带则不过滤 |
+| GET | `/groups/{id}/machines?product_id=` | `{items:[{id,label,busy_until}]}`，`label` = `display_name` 或 `机器 #id`；`busy_until` = 最近一条 active / reserved 时段的 upper（无则 null）；`product_id` 同上 |
+| GET | `/groups/{id}/calendar?product_id=&from=&days=` | `{days:[{date,free,total}]}`；`product_id` 同上 |
 | GET | `/machines/{id}/calendar?from=&days=` | `{periods:[{lower,upper,mine}]}`；机器不在可见机组 → 404；匿名可访问（`mine` 恒为 false） |
-| GET | `/availability?product_id=&group_id?=&machine_id?=&start_at?=&duration=&quantity=` | `{available:n, period:{lower,upper}}`；`start_at` 缺省 = 立即 |
+| GET | `/availability?product_id=&group_id?=&machine_id?=&start_at?=&duration=&quantity=` | `{available:n, period:{lower,upper}}`；`start_at` 缺省 = 立即；带 `machine_id` 时与 `POST /bookings` 指定机器同一校验（机器在可见机组且 `group_id` 与之一致，否则 `not_found`；终审 M2） |
 | POST | `/bookings` | body `{product_id, image_id, group_id?, machine_id?, count, duration, quantity, start_at?, auto_renew?, auto_renew_duration?}` + `Idempotency-Key` → 201 `{batch:{id,count,created_at}, orders:[Order], instances:[Instance]}`；`start_at` 缺省 = 立即（即时分支）；`machine_id` 要求 `count=1` 且 `group_id` 为该机器所在机组 |
 | POST | `/orders` | 保留，语义 = `count 1 / quantity 1 / 立即`，响应不变（内部走 `PlaceBatch`） |
 | GET | `/bookings/{batch_id}` | `{batch, orders, instances}`（只看自己的） |

@@ -100,7 +100,8 @@ func calendarRange(from time.Time, days int) (time.Time, error) {
 }
 
 // GroupCalendar 机组日历：每一天（北京时间自然日）组内与任何 reserved / active 时段都不相交的机器数；total 只算 idle / allocated 机器。
-func (s *Service) GroupCalendar(ctx context.Context, groupID int64, from time.Time, days int, visibleOnly bool) ([]CalendarDay, error) {
+// productID 非 nil 时只算该商品的机器（与下单候选集同口径，终审 M1）。
+func (s *Service) GroupCalendar(ctx context.Context, groupID int64, productID *int64, from time.Time, days int, visibleOnly bool) ([]CalendarDay, error) {
 	if visibleOnly {
 		if _, err := s.VisibleGroup(ctx, groupID); err != nil {
 			return nil, err
@@ -114,12 +115,12 @@ func (s *Service) GroupCalendar(ctx context.Context, groupID int64, from time.Ti
 	}
 	rows, err := s.d.Pool.Query(ctx, `
 		WITH d AS (SELECT generate_series($2::timestamptz, $2::timestamptz + ($3::int - 1) * interval '24 hours', interval '24 hours') AS day),
-		     m AS (SELECT id FROM machines WHERE group_id = $1 AND state IN ('idle', 'allocated'))
+		     m AS (SELECT id FROM machines WHERE group_id = $1 AND ($4::bigint IS NULL OR product_id = $4) AND state IN ('idle', 'allocated'))
 		SELECT d.day,
 		       count(m.id) FILTER (WHERE NOT EXISTS (SELECT 1 FROM machine_leases l WHERE l.machine_id = m.id
 		                                           AND l.status IN ('reserved', 'active') AND l.period && tstzrange(d.day, d.day + interval '24 hours'))),
 		       count(m.id)
-		FROM d LEFT JOIN m ON true GROUP BY d.day ORDER BY d.day`, groupID, start, days)
+		FROM d LEFT JOIN m ON true GROUP BY d.day ORDER BY d.day`, groupID, start, days, productID)
 	if err != nil {
 		return nil, err
 	}
@@ -180,8 +181,8 @@ type MachineBrief struct {
 	BusyUntil *time.Time `json:"busy_until"` // 最近一条当前 / 未来 active / reserved 时段的上界；nil = 没有
 }
 
-// GroupMachines 机组内可租机器（idle / allocated）与展示名，供控制台指定机器。
-func (s *Service) GroupMachines(ctx context.Context, groupID int64, visibleOnly bool) ([]MachineBrief, error) {
+// GroupMachines 机组内可租机器（idle / allocated）与展示名，供控制台指定机器；productID 非 nil 时只列该商品的机器（终审 M1）。
+func (s *Service) GroupMachines(ctx context.Context, groupID int64, productID *int64, visibleOnly bool) ([]MachineBrief, error) {
 	if visibleOnly {
 		if _, err := s.VisibleGroup(ctx, groupID); err != nil {
 			return nil, err
@@ -190,7 +191,8 @@ func (s *Service) GroupMachines(ctx context.Context, groupID int64, visibleOnly 
 	rows, err := s.d.Pool.Query(ctx, `SELECT m.id, m.display_name,
 			(SELECT upper(l.period) FROM machine_leases l WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND upper(l.period) > $2
 			 ORDER BY lower(l.period) LIMIT 1)
-		FROM machines m WHERE m.group_id = $1 AND m.state IN ('idle', 'allocated') ORDER BY m.display_name, m.id`, groupID, s.d.Clock.Now())
+		FROM machines m WHERE m.group_id = $1 AND ($3::bigint IS NULL OR m.product_id = $3) AND m.state IN ('idle', 'allocated')
+		ORDER BY m.display_name, m.id`, groupID, s.d.Clock.Now(), productID)
 	if err != nil {
 		return nil, err
 	}

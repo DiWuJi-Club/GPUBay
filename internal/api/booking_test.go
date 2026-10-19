@@ -247,3 +247,101 @@ func TestCalendarEndpointsRateLimitedPerIP(t *testing.T) {
 		t.Fatalf("third call = %d %v", code, out)
 	}
 }
+
+// 终审 M1：机组列表 / 机组机器 / 机组日历按 product_id 只算该商品的机器（机组可跨商品，规格 §3.1）；不带 product_id 时不过滤。
+func TestGroupEndpointsFilterByProduct(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	p1 := dbtest.ProductID(t, e.pool)
+	var p2 int64
+	if err := e.pool.QueryRow(ctx, `INSERT INTO products (code, name, created_at, updated_at) VALUES ('spark-2', '另一商品', now(), now()) RETURNING id`).Scan(&p2); err != nil {
+		t.Fatal(err)
+	}
+	m1 := dbtest.CreateMachine(t, e.pool, "SN-P1")
+	m2 := dbtest.CreateMachine(t, e.pool, "SN-P2")
+	if _, err := e.pool.Exec(ctx, `UPDATE machines SET product_id = $1 WHERE id = $2`, p2, m2); err != nil {
+		t.Fatal(err)
+	}
+	g, err := e.fleet.CreateGroup(ctx, audit.Actor{AdminID: 1}, fleet.GroupInput{Name: "混合区", Visible: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.fleet.AssignMachines(ctx, audit.Actor{AdminID: 1}, g.ID, []int64{m1, m2}); err != nil {
+		t.Fatal(err)
+	}
+	anon := e.client()
+	for _, tc := range []struct {
+		q    string
+		want float64
+	}{{"?product_id=" + itoa(p1), 1}, {"?product_id=" + itoa(p2), 1}, {"", 2}} {
+		code, out := anon.do("GET", "/groups"+tc.q, nil)
+		row := out["items"].([]any)[0].(map[string]any)
+		if code != 200 || row["machine_count"].(float64) != tc.want || row["idle_now"].(float64) != tc.want {
+			t.Fatalf("groups%s = %d %v", tc.q, code, out)
+		}
+		code, out = anon.do("GET", "/groups/"+itoa(g.ID)+"/machines"+tc.q, nil)
+		if items := out["items"].([]any); code != 200 || float64(len(items)) != tc.want {
+			t.Fatalf("machines%s = %d %v", tc.q, code, out)
+		}
+		sep := "?"
+		if tc.q != "" {
+			sep = "&"
+		}
+		code, out = anon.do("GET", "/groups/"+itoa(g.ID)+"/calendar"+tc.q+sep+"days=2", nil)
+		day := out["days"].([]any)[0].(map[string]any)
+		if code != 200 || day["total"].(float64) != tc.want || day["free"].(float64) != tc.want {
+			t.Fatalf("calendar%s = %d %v", tc.q, code, out)
+		}
+	}
+	if items := func() []any { _, out := anon.do("GET", "/groups/"+itoa(g.ID)+"/machines?product_id="+itoa(p1), nil); return out["items"].([]any) }(); items[0].(map[string]any)["id"].(float64) != float64(m1) {
+		t.Fatalf("machines of p1 = %v", items)
+	}
+	for _, p := range []string{"/groups?product_id=x", "/groups/" + itoa(g.ID) + "/machines?product_id=0", "/groups/" + itoa(g.ID) + "/calendar?product_id=-1"} {
+		if code, out := anon.do("GET", p, nil); code != 400 || out["code"] != "bad_request" {
+			t.Fatalf("%s = %d %v", p, code, out)
+		}
+	}
+}
+
+// 终审 M2：匿名可用性查询带 machine_id 时与指定机器下单同一校验（机器在可见机组、group_id 与之一致），
+// 未分组 / 隐藏机组 / 机组不对 / 不存在一律 404，探测不出未上架机器的空闲情况。
+func TestAvailabilityMachineVisibility(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	vm := dbtest.CreateMachine(t, e.pool, "SN-VIS")
+	hm := dbtest.CreateMachine(t, e.pool, "SN-HID")
+	loose := dbtest.CreateMachine(t, e.pool, "SN-LOOSE")
+	vis, _ := e.fleet.CreateGroup(ctx, audit.Actor{AdminID: 1}, fleet.GroupInput{Name: "公开", Visible: true})
+	other, _ := e.fleet.CreateGroup(ctx, audit.Actor{AdminID: 1}, fleet.GroupInput{Name: "另一公开", Visible: true})
+	hid, _ := e.fleet.CreateGroup(ctx, audit.Actor{AdminID: 1}, fleet.GroupInput{Name: "隐藏", Visible: false})
+	if err := e.fleet.AssignMachines(ctx, audit.Actor{AdminID: 1}, vis.ID, []int64{vm}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.fleet.AssignMachines(ctx, audit.Actor{AdminID: 1}, hid.ID, []int64{hm}); err != nil {
+		t.Fatal(err)
+	}
+	anon := e.client()
+	base := "/availability?product_id=" + itoa(dbtest.ProductID(t, e.pool)) + "&duration=1d&start_at=" + dbtest.T0.Add(3*time.Hour).Format(time.RFC3339)
+	q := func(machine int64, group int64) string {
+		p := base + "&machine_id=" + itoa(machine)
+		if group != 0 {
+			p += "&group_id=" + itoa(group)
+		}
+		return p
+	}
+	for name, p := range map[string]string{
+		"ungrouped machine, no group":      q(loose, 0),
+		"ungrouped machine, visible group": q(loose, vis.ID),
+		"hidden machine, visible group":    q(hm, vis.ID),
+		"visible machine, no group":        q(vm, 0),
+		"visible machine, other group":     q(vm, other.ID),
+		"missing machine":                  q(999999, vis.ID),
+	} {
+		if code, out := anon.do("GET", p, nil); code != 404 || out["code"] != "not_found" {
+			t.Fatalf("%s = %d %v", name, code, out)
+		}
+	}
+	if code, out := anon.do("GET", q(vm, vis.ID), nil); code != 200 || out["available"].(float64) != 1 {
+		t.Fatalf("visible machine in its group = %d %v", code, out)
+	}
+}

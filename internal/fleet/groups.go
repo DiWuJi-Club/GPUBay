@@ -121,11 +121,12 @@ func normalizeMachineIDs(ids []int64) ([]int64, error) {
 }
 
 // ListGroups 按 sort、id 返回机组（visibleOnly 只返回控制台可见的），附机器数与现空闲台数。
-func (s *Service) ListGroups(ctx context.Context, visibleOnly bool) ([]GroupRow, error) {
+// productID 非 nil 时两个计数只算该商品的机器（机组可跨商品，规格 §3.1；终审 M1）。
+func (s *Service) ListGroups(ctx context.Context, visibleOnly bool, productID *int64) ([]GroupRow, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+groupCols+`,
-			(SELECT count(*) FROM machines m WHERE m.group_id = g.id),
-			(SELECT count(*) FROM machines m WHERE m.group_id = g.id AND m.state = 'idle' AND m.agent_online)
-		FROM machine_groups g WHERE NOT $1 OR visible ORDER BY sort, id`, visibleOnly)
+			(SELECT count(*) FROM machines m WHERE m.group_id = g.id AND ($2::bigint IS NULL OR m.product_id = $2)),
+			(SELECT count(*) FROM machines m WHERE m.group_id = g.id AND ($2::bigint IS NULL OR m.product_id = $2) AND m.state = 'idle' AND m.agent_online)
+		FROM machine_groups g WHERE NOT $1 OR visible ORDER BY sort, id`, visibleOnly, productID)
 	if err != nil {
 		return nil, err
 	}
