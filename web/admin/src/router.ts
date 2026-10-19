@@ -36,6 +36,8 @@ export const routes: RouteRecordRaw[] = [
   { path: '/apps/:id', component: () => import('./views/AppDetailView.vue'), meta: { title: '应用详情', roles: ALL_ROLES } },
   // vid 为 new 时是新建（可带 ?copy_from=<版本 id> 预填）
   { path: '/apps/:id/versions/:vid', component: () => import('./views/AppVersionView.vue'), meta: { title: '应用版本', roles: ALL_ROLES } },
+  // ?state=&app_id=&user_id=&instance_id= 预填筛选，?dep= 打开详情抽屉；写操作（强制卸载）按角色显示
+  { path: '/deployments', component: () => import('./views/DeploymentsView.vue'), meta: { title: '应用部署', roles: ALL_ROLES } },
   { path: '/catalog', component: () => import('./views/CatalogView.vue'), meta: { title: '价格与镜像', roles: SUPER_ONLY } },
   { path: '/admins', component: () => import('./views/AdminsView.vue'), meta: { title: '管理员', roles: SUPER_ONLY } },
   { path: '/audit', component: () => import('./views/AuditView.vue'), meta: { title: '审计日志', roles: ALL_ROLES } },

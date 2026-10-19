@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {
-  centsToYuanInput, commandStatusLabel, commandTypeLabel, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
-  orderKindLabel, orderStatusLabel, type AdminImage, type AdminInstance, type AdminInstanceDetail, type AdminProduct, type AdminSshSession, type InstancePort, type Listed, type Paged, type RefundQuote,
+  centsToYuanInput, commandStatusLabel, commandTypeLabel, deploymentErrorLabel, deploymentStateLabel, deploymentStateType, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
+  orderKindLabel, orderStatusLabel, type AdminDeployment, type AdminImage, type AdminInstance, type AdminInstanceDetail, type AdminProduct, type AdminSshSession, type InstancePort, type Listed, type Paged, type RefundQuote,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -9,8 +9,10 @@ import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import BatchLink from '../components/BatchLink.vue'
 import BookingOpsDialogs from '../components/BookingOpsDialogs.vue'
+import ForceRemoveDialog from '../components/ForceRemoveDialog.vue'
 import IdLink from '../components/IdLink.vue'
 import { useBookingOps } from '../composables/useBookingOps'
+import { progressText, showForceRemove } from '../logic/deployments'
 import { extendSeconds, isZeroRefund, showCancelBooking, showExtend, showMigrate, showPortActions, showReassign, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
 import { notifyError } from '../logic/notify'
 import { FIN_ROLES } from '../menu'
@@ -79,6 +81,7 @@ onBeforeRouteUpdate((to) => {
   sessions.value = []
   sessionsTotal.value = 0
   portAction.visible = false
+  removingApp.value = null
   booking.closeAll()
   void load(String(to.params.id))
   void loadSessions(String(to.params.id))
@@ -233,6 +236,14 @@ async function submitPortAction() {
   }
 }
 
+// ---- 应用（只读 + 强制卸载，ops）----
+const apps = computed(() => data.value?.apps ?? [])
+const removingApp = ref<AdminDeployment | null>(null)
+async function onAppRemoved() {
+  removingApp.value = null
+  await load()
+}
+
 const eventText = (e: { from_state: string; to_state: string; reason: string; at: string }) => `${e.from_state || '—'} → ${e.to_state} · ${e.reason} · ${fmtTime(e.at)}`
 </script>
 
@@ -317,6 +328,33 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
           </tbody>
         </table>
       </el-card>
+
+      <el-card data-testid="admin-instance-apps">
+        <template #header>
+          <div class="head"><span>应用</span><router-link :to="{ path: '/deployments', query: { instance_id: inst.id } }" data-testid="admin-instance-apps-all">在部署列表中查看</router-link></div>
+        </template>
+        <table class="grid">
+          <thead><tr><th>应用 / 版本</th><th>状态</th><th>进度 / 错误</th><th>端口</th><th>更新时间</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="a in apps" :key="a.id" data-testid="admin-instance-app" :data-dep="a.id" :data-state="a.state">
+              <td data-testid="admin-instance-app-name">{{ a.app_name }} · {{ a.version }}<el-tag v-if="a.update_available" size="small" type="warning" class="tag-gap">有新版本</el-tag></td>
+              <td><el-tag size="small" :type="labelOf(deploymentStateType, a.state) as 'primary'" data-testid="admin-instance-app-state">{{ labelOf(deploymentStateLabel, a.state) }}</el-tag></td>
+              <td>
+                <span v-if="a.error_code" class="error" data-testid="admin-instance-app-error" :data-code="a.error_code">{{ labelOf(deploymentErrorLabel, a.error_code) }}{{ a.message ? `：${a.message}` : '' }}</span>
+                <span v-else data-testid="admin-instance-app-progress">{{ progressText(a) || '—' }}</span>
+              </td>
+              <td>{{ a.port }}</td>
+              <td>{{ fmtTime(a.updated_at) }}</td>
+              <td>
+                <router-link :to="{ path: '/deployments', query: { instance_id: inst.id, dep: a.id } }" data-testid="admin-instance-app-detail">详情</router-link>
+                <el-button v-if="showForceRemove(role, a.state)" size="small" type="danger" plain class="tag-gap" data-testid="admin-instance-app-force-remove" @click="removingApp = a">强制卸载</el-button>
+              </td>
+            </tr>
+            <tr v-if="!apps.length"><td colspan="6" class="muted empty" data-testid="admin-instance-apps-empty">无应用部署</td></tr>
+          </tbody>
+        </table>
+      </el-card>
+      <ForceRemoveDialog :target="removingApp" @close="removingApp = null" @done="onAppRemoved" />
 
       <el-card header="访问" data-testid="adetail-access-card">
         <el-descriptions :column="2" border>
@@ -434,4 +472,5 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
 .grid th, .grid td { padding: 8px; text-align: left; border-bottom: 1px solid var(--el-border-color-lighter); }
 .grid th { color: #909399; font-weight: 500; }
 .empty { text-align: center; }
+.tag-gap { margin-left: 8px; }
 </style>

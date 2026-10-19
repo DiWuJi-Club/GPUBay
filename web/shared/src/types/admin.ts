@@ -1,5 +1,5 @@
 import type { InstancePort, SshKey } from './access'
-import type { AppCategory, AppSpec, AppStatus, Deployment } from './apps'
+import type { AppCategory, AppSpec, AppStatus, Deployment, DeploymentEvent } from './apps'
 import type { CalendarPeriod } from './booking'
 import type { Duration } from './catalog'
 import type { InstanceState, OrderKind, OrderStatus } from './instance'
@@ -222,6 +222,8 @@ export interface AdminInstanceDetail {
   commands: CommandRow[]
   ports: InstancePort[]
   ssh_host_pubkey_fingerprint: string
+  /** 该实例的全部部署（含已卸载 / 已失效的历史，按创建时间） */
+  apps?: AdminDeployment[]
 }
 
 export interface RefundQuote {
@@ -391,4 +393,10 @@ export interface AdminAppVersion {
 export interface AdminDeployment extends Deployment {
   log_tail: string
   user_id: number
+}
+
+/** GET /deployments/{dep}：事件按时间倒序（最近 100 条）；log_tail 只在 deployment 里。 */
+export interface AdminDeploymentDetail {
+  deployment: AdminDeployment
+  events: DeploymentEvent[]
 }
