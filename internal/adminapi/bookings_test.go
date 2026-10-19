@@ -177,3 +177,37 @@ func TestAdminExtendReservedBooking(t *testing.T) {
 		t.Fatalf("extend reserved = %d %v", code, out)
 	}
 }
+
+// 机器详情：同一台机器上 running 的实例 + 更晚创建的未来预订 → current_instance 仍是 running；
+// reserved 既不顶替当前实例，也不进历史（档期 leases 里单独展示）。
+func TestMachineDetailReservedDoesNotDisplaceRunning(t *testing.T) {
+	e := newEnv(t)
+	mid := e.machine("SN1")
+	uid := e.renter("13600000001")
+	run := e.place(uid)
+	e.ack()
+	start := dbtest.T0.Add(48 * time.Hour)
+	res, err := e.rental.PlaceBatch(e.ctx, rental.BatchRequest{UserID: uid, ProductID: dbtest.ProductID(t, e.pool), ImageID: dbtest.ImageID(t, e.pool),
+		MachineID: &mid, Count: 1, Duration: catalog.D1d, Quantity: 1, StartAt: &start})
+	if err != nil {
+		t.Fatal(err)
+	}
+	booked := res.Instances[0]
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET created_at = created_at + interval '1 hour' WHERE id = $1`, booked.ID); err != nil {
+		t.Fatal(err)
+	}
+	ops := e.loginAs("ops", admin.RoleOps)
+	code, out := ops.do("GET", "/machines/"+itoa(mid), nil)
+	cur, _ := out["current_instance"].(map[string]any)
+	if code != 200 || cur == nil || cur["id"] != run.ID || cur["state"] != "running" {
+		t.Fatalf("current_instance = %d %v", code, out["current_instance"])
+	}
+	for _, h := range out["history"].([]any) {
+		if h.(map[string]any)["id"] == booked.ID {
+			t.Fatalf("reserved booking must not be in history: %v", out["history"])
+		}
+	}
+	if len(out["leases"].([]any)) != 2 || out["upcoming_bookings"].(float64) != 1 {
+		t.Fatalf("leases / upcoming = %v %v", out["leases"], out["upcoming_bookings"])
+	}
+}

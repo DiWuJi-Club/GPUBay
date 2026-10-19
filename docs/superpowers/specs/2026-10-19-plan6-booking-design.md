@@ -444,7 +444,7 @@ expires = min(expires, cap)                         -- 下单（§4.2）与开�
 | POST | `/groups/{id}/machines` | ops | `{machine_ids:[…]}` 批量加入（已在其他机组的机器直接改组）；审计 `group.assign`（含列表） |
 | DELETE | `/groups/{id}/machines` | ops | `{machine_ids}` 移出（置 NULL）；审计 `group.unassign` |
 | PUT | `/machines/{id}` | ops | `{group_id?, display_name?}` 只认这两个字段；审计 `machine.update`（before / after） |
-| GET | `/machines/{id}` | ops | 响应新增 `group`、`display_name`、`leases:[{id,instance_id,status,lower,upper}]`（未来 60 天 + 当前） |
+| GET | `/machines/{id}` | ops | 响应新增 `group`、`display_name`、`leases:[{id,instance_id,status,lower,upper}]`（未来 60 天 + 当前）；`current_instance` 只取活动态（creating / running / stopped / wiping），`reserved` 既不进 `current_instance` 也不进 `history`（只在 `leases` 里出现；终审 I1） |
 | GET | `/machines/{id}/calendar?from&days` | ops | 同控制台但带 `instance_id` / `user_id` |
 | GET | `/bookings?state=&user_id=&group_id=&machine_id=&from=&to=&page=` | all | 预订列表（`state ∈ reserved / cancelled`，默认 reserved）：实例 ID、用户、机组、机器、开始、结束、批次、改派次数、下单时间 |
 | GET | `/bookings/upcoming?days=7` | all | 仪表盘用：未来 N 天每天开始的预订台数 |
