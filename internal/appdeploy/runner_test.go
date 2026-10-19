@@ -432,11 +432,24 @@ func TestRunnerUnreachableTenTimes(t *testing.T) {
 			t.Fatalf("after 10 = %+v", got)
 		}
 	}
-	for i := 0; i < 2; i++ {
-		re.clk.Advance(appdeploy.UnreachableRetry)
-		re.tick()
+	// 同一实例两个部署同一轮失败：告警按 kind + 文案去重（并按实例串行查重），只有一条
+	alerts := func() int {
+		return re.count(`SELECT count(*) FROM alerts WHERE kind = 'app_deploy_unreachable'`)
 	}
-	// 同一实例两个部署都失败：告警按 kind + 文案去重，只有一条
+	if n := alerts(); n != 1 {
+		t.Fatalf("alerts after first failure = %d", n)
+	}
+	// 用户重新部署其中一个，再连续 10 次不可达：告警未处理前不重复
+	if _, err := re.svc.Redeploy(re.ctx, appdeploy.RedeployRequest{UserID: re.userID, InstanceID: inst.ID, DeploymentID: d1.ID}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= appdeploy.UnreachableFailAfter; i++ {
+		re.tick()
+		re.clk.Advance(appdeploy.UnreachableRetry)
+	}
+	if got := re.dep(d1.ID); got.State != appdeploy.StateFailed || got.ErrorCode != appdeploy.ErrCodeUnreachable {
+		t.Fatalf("redeployed then unreachable = %+v", got)
+	}
 	if n := re.count(`SELECT count(*) FROM alerts WHERE kind = 'app_deploy_unreachable' AND instance_id = $1 AND machine_id = $2 AND message = $3`,
 		inst.ID, inst.MachineID, rental.AlertAppDeployUnreachable(inst.ID)); n != 1 {
 		t.Fatalf("alerts = %d", n)
@@ -684,9 +697,23 @@ func TestRunnerClaimsMigratedPort(t *testing.T) {
 	re.exec(`UPDATE app_deployments SET state = 'stopped' WHERE id = $1`, other.ID)
 	re.exec(`INSERT INTO instance_ports (instance_id, port, visibility, note, deployment_id, created_at, updated_at) VALUES ($1, 8000, 'private', 'comfy', $2, $3, $3)`,
 		inst2.ID, other.ID, re.clk.Now())
-	got := re.until(d2.ID, appdeploy.StateFailed)
-	if got.ErrorCode != appdeploy.ErrCodePortConflict {
+	re.tick() // queued → installing
+	dir2 := re.dir(inst2.ID, "vllm")
+	re.waitContainer(dir2, func(st appdeploy.Status) bool { return st.State == appdeploy.StateRunning })
+	pid := re.servicePid(dir2)
+	re.clk.Advance(appdeploy.PollInterval)
+	re.tick()
+	got := re.dep(d2.ID)
+	// failed(port_conflict) 已提交，随后 run.sh stop 停掉已经起来的服务；停成功后「待停止」标记清除（desired 回到 running）
+	if got.State != appdeploy.StateFailed || got.ErrorCode != appdeploy.ErrCodePortConflict || got.Desired != appdeploy.DesiredRunning {
 		t.Fatalf("conflict = %+v", got)
+	}
+	waitGone(t, pid)
+	if st, alive := hostStatus(t, dir2); alive || st.State != appdeploy.StateStopped {
+		t.Fatalf("container after conflict = %+v alive=%v", st, alive)
+	}
+	if n := re.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1 AND deployment_id = $2`, inst2.ID, d2.ID); n != 0 {
+		t.Fatalf("conflicting deployment registered %d ports", n)
 	}
 }
 
@@ -722,9 +749,40 @@ func TestRunnerRedactsSecrets(t *testing.T) {
 	if strings.Contains(got.Message, "abcdefgh12") || !strings.Contains(got.Message, "***") {
 		t.Fatalf("message not redacted: %q", got.Message)
 	}
+	dir := re.dir(inst.ID, "vllm")
 	// 容器里确实是明文（证明脱敏发生在平台侧）
-	if b, _ := os.ReadFile(filepath.Join(re.dir(inst.ID, "vllm"), "log")); !strings.Contains(string(b), "key=abcdefgh12") {
+	if b, _ := os.ReadFile(filepath.Join(dir, "log")); !strings.Contains(string(b), "key=abcdefgh12") {
 		t.Fatalf("container log = %s", b)
+	}
+	// phase 同样脱敏
+	st := `{"seq":999,"state":"installing","phase":"p-abcdefgh12","progress":60,"message":"m","pid":0,"service_pid":0,"spec_hash":"","exit_code":0,"at":""}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(st), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	re.clk.Advance(appdeploy.PollInterval)
+	re.tick()
+	if got := re.dep(d.ID); got.Phase != "p-***" {
+		t.Fatalf("phase not redacted: %+v", got)
+	}
+}
+
+// TestRunnerRotatedSecretNotInLogTail：重新部署换了 secret 后，旧值不再出现在 log_tail（deploy 换新日志，旧的留在 log.1）。
+func TestRunnerRotatedSecretNotInLogTail(t *testing.T) {
+	re := newRunnerEnv(t, 1)
+	a := re.app("vllm", 8000)
+	inst := re.instance()
+	d := re.create(inst, a.ID, map[string]string{"API_KEY": "old-secret-1"})
+	re.until(d.ID, appdeploy.StateRunning)
+	if _, err := re.svc.Redeploy(re.ctx, appdeploy.RedeployRequest{UserID: re.userID, InstanceID: inst.ID, DeploymentID: d.ID,
+		Env: map[string]string{"API_KEY": "new-secret-2"}, EnvSet: true}); err != nil {
+		t.Fatal(err)
+	}
+	got := re.until(d.ID, appdeploy.StateRunning)
+	if strings.Contains(got.LogTail, "old-secret-1") || strings.Contains(got.LogTail, "new-secret-2") || !strings.Contains(got.LogTail, "key=***") {
+		t.Fatalf("log_tail = %q", got.LogTail)
+	}
+	if b, _ := os.ReadFile(filepath.Join(re.dir(inst.ID, "vllm"), "log.1")); !strings.Contains(string(b), "key=old-secret-1") {
+		t.Fatalf("previous log not kept in log.1: %s", b)
 	}
 }
 
@@ -747,29 +805,41 @@ func TestRunnerAdvisoryLock(t *testing.T) {
 	if _, locked, err := re.r.Tick(re.ctx); err != nil || !locked {
 		t.Fatalf("tick after unlock = %v %v", locked, err)
 	}
-	// 两个 Runner 并发各跑 20 轮：都不报错；结束后锁已释放（会话锁没有泄漏在连接池里）
+	// 互斥：Runner A 在一轮中途（回写之前）停住时，Runner B 的 Tick 拿不到锁、什么也不做；A 结束后 B 拿得到
+	a := re.app("vllm", 8000)
+	d := re.create(re.instance(), a.ID, nil)
+	inside, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	appdeploy.SetBeforeWriteback(re.r, func(appdeploy.Deployment) {
+		once.Do(func() { close(inside); <-release })
+	})
 	r2 := appdeploy.NewRunner(re.svc, re.up, re.cfg)
-	var wg sync.WaitGroup
-	var lockedN atomic.Int32
-	for _, r := range []*appdeploy.Runner{re.r, r2} {
-		wg.Add(1)
-		go func(r *appdeploy.Runner) {
-			defer wg.Done()
-			for i := 0; i < 20; i++ {
-				_, locked, err := r.Tick(re.ctx)
-				if err != nil {
-					t.Errorf("tick: %v", err)
-				}
-				if locked {
-					lockedN.Add(1)
-				}
-			}
-		}(r)
+	type result struct {
+		n      int
+		locked bool
+		err    error
 	}
-	wg.Wait()
-	if lockedN.Load() == 0 {
-		t.Fatal("no tick ever took the lock")
+	resA := make(chan result, 1)
+	go func() {
+		n, locked, err := re.r.Tick(re.ctx)
+		resA <- result{n, locked, err}
+	}()
+	<-inside
+	re.clk.Advance(time.Hour) // 哪怕 B 看得到到点的部署
+	if n, locked, err := r2.Tick(re.ctx); err != nil || locked || n != 0 {
+		t.Fatalf("B while A holds the lock = %d %v %v", n, locked, err)
 	}
+	close(release)
+	if r := <-resA; r.err != nil || !r.locked || r.n != 1 {
+		t.Fatalf("A = %+v", r)
+	}
+	if got := re.dep(d.ID); got.State != appdeploy.StateInstalling {
+		t.Fatalf("A's step = %+v", got)
+	}
+	if _, locked, err := r2.Tick(re.ctx); err != nil || !locked {
+		t.Fatalf("B after A = %v %v", locked, err)
+	}
+	// 锁没有泄漏在连接池里
 	var ok bool
 	if err := conn.QueryRow(re.ctx, `SELECT pg_try_advisory_lock(hashtext('appdeploy'))`).Scan(&ok); err != nil || !ok {
 		t.Fatalf("lock leaked: %v %v", ok, err)
@@ -856,6 +926,26 @@ func TestRunnerStatusMissingFails(t *testing.T) {
 	}
 }
 
+// waitLockWaiter 等到库里有会话在等行锁（pg_stat_activity.wait_event_type = 'Lock'）。
+func waitLockWaiter(t *testing.T, re *runnerEnv) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		if err := re.pool.QueryRow(re.ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&n); err != nil {
+			t.Errorf("pg_stat_activity: %v", err)
+			return
+		}
+		if n > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Error("no session ever waited for a lock")
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestRunnerWritebackLockOrder：回写登记端口时，另一个事务按「实例 FOR UPDATE → 部署行」的顺序加锁（用户操作 / rental 钩子）。
 // 回写若只锁部署行，插入 instance_ports 的外键检查要对实例行取 KEY SHARE，两边成环，PostgreSQL 报死锁。
 func TestRunnerWritebackLockOrder(t *testing.T) {
@@ -882,7 +972,7 @@ func TestRunnerWritebackLockOrder(t *testing.T) {
 			}
 			go func() {
 				defer close(done)
-				time.Sleep(300 * time.Millisecond) // 回写事务此时已在等锁
+				waitLockWaiter(t, re) // 回写事务已在等锁（修复前：持部署行、等实例行；修复后：等实例行）
 				if _, err := tx.Exec(re.ctx, `SELECT 1 FROM app_deployments WHERE id = $1 FOR UPDATE`, d.ID); err != nil {
 					otherErr = err
 					tx.Rollback(re.ctx) //nolint:errcheck
@@ -900,5 +990,123 @@ func TestRunnerWritebackLockOrder(t *testing.T) {
 	}
 	if got := re.dep(d.ID); got.State != appdeploy.StateRunning {
 		t.Fatalf("running = %+v", got)
+	}
+}
+
+// TestRunnerTimeoutWithBadStatus：status.json 被写坏（解析失败）时安装超时照样生效，并停掉容器里的进程。
+func TestRunnerTimeoutWithBadStatus(t *testing.T) {
+	re := newRunnerEnv(t, 1)
+	spec := runnerSpec(8000)
+	spec.TimeoutMinutes = 1
+	a, _ := re.publishedApp("vllm", spec, runnerScript, []int64{re.imageID})
+	inst := re.instance()
+	d := re.create(inst, a.ID, map[string]string{"INSTALL_SLEEP": "30"})
+	dir := re.dir(inst.ID, "vllm")
+	re.downloading(d.ID, dir)
+	st, _ := hostStatus(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte("garbage{\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	re.clk.Advance(61 * time.Second)
+	re.tick()
+	if got := re.dep(d.ID); got.State != appdeploy.StateFailed || got.ErrorCode != appdeploy.ErrCodeTimeout || got.Desired != appdeploy.DesiredRunning {
+		t.Fatalf("timeout with bad status = %+v", got)
+	}
+	waitGone(t, -st.Pid)
+	if _, alive := hostStatus(t, dir); alive {
+		t.Fatal("service alive after timeout")
+	}
+}
+
+// TestRunnerHealthParseFailureUnknown：running 时 status.json 读不懂 → health unknown，state 不变，按健康周期再看。
+func TestRunnerHealthParseFailureUnknown(t *testing.T) {
+	re := newRunnerEnv(t, 1)
+	a := re.app("vllm", 8000)
+	inst := re.instance()
+	d := re.create(inst, a.ID, nil)
+	re.until(d.ID, appdeploy.StateRunning)
+	if err := os.WriteFile(filepath.Join(re.dir(inst.ID, "vllm"), "status.json"), []byte("garbage{\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	re.clk.Advance(appdeploy.HealthInterval)
+	now := re.clk.Now()
+	re.tick()
+	if got := re.dep(d.ID); got.State != appdeploy.StateRunning || got.Health != appdeploy.HealthUnknown || !got.NextPollAt.Equal(now.Add(appdeploy.HealthInterval)) {
+		t.Fatalf("parse failure = %+v", got)
+	}
+}
+
+// TestRunnerFailedStopRetried：失败后 stop 没执行成功时，failed 行带「待停止」标记（desired = stopped），Runner 之后补做 stop。
+func TestRunnerFailedStopRetried(t *testing.T) {
+	re := newRunnerEnv(t, 2)
+	a := re.app("vllm", 8000)
+	// 1) 带标记的 failed 行：下一轮执行 run.sh stop，停掉服务后清标记
+	inst := re.instance()
+	d := re.create(inst, a.ID, nil)
+	re.until(d.ID, appdeploy.StateRunning)
+	pid := re.servicePid(re.dir(inst.ID, "vllm"))
+	re.exec(`UPDATE app_deployments SET state = 'failed', desired = 'stopped', error_code = 'timeout', next_poll_at = $2 WHERE id = $1`, d.ID, re.clk.Now())
+	now := re.clk.Now()
+	re.tick()
+	waitGone(t, pid)
+	if got := re.dep(d.ID); got.State != appdeploy.StateFailed || got.Desired != appdeploy.DesiredRunning || !got.NextPollAt.Equal(now.Add(24*time.Hour)) {
+		t.Fatalf("after retried stop = %+v", got)
+	}
+	// 2) 端口冲突标 failed 后容器连不上，stop 做不了：标记保留，30 秒后重试
+	b := re.app("comfy", 8100)
+	inst2 := re.instance()
+	d2 := re.create(inst2, a.ID, nil)
+	other := re.create(inst2, b.ID, nil)
+	re.exec(`UPDATE app_deployments SET state = 'stopped' WHERE id = $1`, other.ID)
+	re.exec(`INSERT INTO instance_ports (instance_id, port, visibility, note, deployment_id, created_at, updated_at) VALUES ($1, 8000, 'private', 'comfy', $2, $3, $3)`,
+		inst2.ID, other.ID, re.clk.Now())
+	re.tick()
+	re.waitContainer(re.dir(inst2.ID, "vllm"), func(st appdeploy.Status) bool { return st.State == appdeploy.StateRunning })
+	var once sync.Once
+	appdeploy.SetBeforeWriteback(re.r, func(appdeploy.Deployment) { once.Do(re.srv.Close) })
+	re.clk.Advance(appdeploy.PollInterval)
+	now = re.clk.Now()
+	re.tick()
+	got := re.dep(d2.ID)
+	if got.State != appdeploy.StateFailed || got.ErrorCode != appdeploy.ErrCodePortConflict || got.Desired != appdeploy.DesiredStopped ||
+		!got.NextPollAt.Equal(now.Add(appdeploy.UnreachableRetry)) {
+		t.Fatalf("failed with pending stop = %+v", got)
+	}
+	re.clk.Advance(appdeploy.UnreachableRetry)
+	re.tick()
+	if got := re.dep(d2.ID); got.Desired != appdeploy.DesiredStopped {
+		t.Fatalf("pending stop dropped while unreachable = %+v", got)
+	}
+}
+
+// TestRunnerDeployBusyKeepsQueued：上一次 deploy 还在容器里跑（run.sh 部署锁被活着的进程持有）→ 不失败、保持 queued，30 秒后再试。
+func TestRunnerDeployBusyKeepsQueued(t *testing.T) {
+	re := newRunnerEnv(t, 1)
+	a := re.app("vllm", 8000)
+	inst := re.instance()
+	d := re.create(inst, a.ID, nil)
+	dir := re.dir(inst.ID, "vllm")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	holder := exec.Command("sleep", "60")
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { holder.Process.Kill(); holder.Wait() })
+	lock := filepath.Join(dir, ".deploy.lock")
+	if err := os.Symlink(strconv.Itoa(holder.Process.Pid)+" "+strconv.FormatInt(time.Now().Unix(), 10), lock); err != nil {
+		t.Fatal(err)
+	}
+	now := re.clk.Now()
+	re.tick()
+	if got := re.dep(d.ID); got.State != appdeploy.StateQueued || got.Attempt != 0 || got.ErrorCode != "" || !got.NextPollAt.Equal(now.Add(appdeploy.UnreachableRetry)) {
+		t.Fatalf("busy deploy = %+v", got)
+	}
+	os.Remove(lock)
+	re.clk.Advance(appdeploy.UnreachableRetry)
+	re.tick()
+	if got := re.dep(d.ID); got.State != appdeploy.StateInstalling || got.Attempt != 1 {
+		t.Fatalf("after lock released = %+v", got)
 	}
 }

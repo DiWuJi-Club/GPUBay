@@ -652,3 +652,53 @@ func TestRunShKillGroupRefusesOwnGroup(t *testing.T) {
 		t.Fatalf("status = %+v", st)
 	}
 }
+
+// TestRunShDeployLock：上一次 deploy 的前台部分还在跑（Runner 的 exec 超时后命令仍在容器里）时，新的 deploy 不并发执行：
+// 退出 75 + stderr「busy:」；持有者已死或锁超过 120 秒视为陈旧，照常部署。每次 deploy 换新日志，旧的留在 log.1。
+func TestRunShDeployLock(t *testing.T) {
+	b := newBox(t, "app_ok.sh", nil)
+	holder := exec.Command("sleep", "60")
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { holder.Process.Kill(); holder.Wait() })
+	lock := filepath.Join(b.dir, ".deploy.lock")
+	setLock := func(pid int, at time.Time) {
+		os.Remove(lock)
+		if err := os.Symlink(fmt.Sprintf("%d %d", pid, at.Unix()), lock); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setLock(holder.Process.Pid, time.Now())
+	out, code := b.run("deploy")
+	if code != 75 || !strings.Contains(out, "busy:") {
+		t.Fatalf("deploy while locked = %d %q", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(b.dir, "status.json")); err == nil {
+		t.Fatal("locked deploy wrote status")
+	}
+	if _, err := os.Lstat(lock); err != nil {
+		t.Fatalf("busy deploy removed someone else's lock: %v", err)
+	}
+	// 陈旧：持有者还活着但锁已超过 120 秒
+	setLock(holder.Process.Pid, time.Now().Add(-200*time.Second))
+	if out, code := b.run("deploy"); code != 0 {
+		t.Fatalf("deploy over stale lock = %d %q", code, out)
+	}
+	b.waitState("running")
+	if _, err := os.Lstat(lock); err == nil {
+		t.Fatal("lock not released after deploy")
+	}
+	// 陈旧：持有者已死
+	holder.Process.Kill()
+	holder.Wait()
+	setLock(holder.Process.Pid, time.Now())
+	if out, code := b.run("deploy"); code != 0 {
+		t.Fatalf("deploy over dead holder = %d %q", code, out)
+	}
+	b.waitState("running")
+	old, _ := os.ReadFile(filepath.Join(b.dir, "log.1"))
+	if !strings.Contains(string(old), "==== deploy #1") || strings.Contains(b.log(), "==== deploy #1") || !strings.Contains(b.log(), "==== deploy #2") {
+		t.Fatalf("log not rotated per deploy:\nlog.1=%s\nlog=%s", old, b.log())
+	}
+}

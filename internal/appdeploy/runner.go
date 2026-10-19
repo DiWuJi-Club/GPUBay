@@ -93,7 +93,10 @@ func (r *Runner) Run(ctx context.Context) {
 }
 
 // candidateCond 是 Runner 处理的部署（stopped / failed 不轮询：用户「启动 / 重新部署」或 rental 钩子把它们置回 queued）。
-const candidateCond = `(state IN ('queued', 'installing', 'running', 'removing') OR (state = 'removed' AND cleanup_pending))`
+// 例外：failed 且 desired = stopped 是「容器里可能还有进程、待停止」的标记（见 failAndStop）。
+// 注：这一项不在 app_deployments_poll_idx 的谓词里，候选查询因此可能不走该部分索引；部署表规模（实例数 × 3 + 历史）下可接受。
+const candidateCond = `(state IN ('queued', 'installing', 'running', 'removing') OR (state = 'removed' AND cleanup_pending)
+	OR (state = 'failed' AND desired = 'stopped'))`
 
 // Tick 执行一轮：拿会话级咨询锁（拿不到 locked = false）→ 选候选 → 并发处理（≤ MaxConcurrent，同一实例 ≤ 3 个）→ 释放锁。
 func (r *Runner) Tick(ctx context.Context) (int, bool, error) {
@@ -208,15 +211,16 @@ func instanceGone(state string) bool {
 type action int
 
 const (
-	actNone    action = iota
-	actWait           // 实例非 running / 暂停中：不 exec（在事务 1 里推后 next_poll_at）
-	actGone           // 实例已消失：removed(instance_gone)
-	actCleanup        // removed 且 cleanup_pending：清理停机时卸载留下的目录
-	actRemove         // removing / desired removed：run.sh remove
-	actDeploy         // queued：上传部署包 + run.sh deploy
-	actStop           // installing / running 且 desired stopped：run.sh stop
-	actPoll           // installing：读 status
-	actHealth         // running：读 status + HTTP 健康检查
+	actNone       action = iota
+	actWait              // 实例非 running / 暂停中：不 exec（在事务 1 里推后 next_poll_at）
+	actGone              // 实例已消失：removed(instance_gone)
+	actCleanup           // removed 且 cleanup_pending：清理停机时卸载留下的目录
+	actRemove            // removing / desired removed：run.sh remove
+	actDeploy            // queued：上传部署包 + run.sh deploy
+	actStop              // installing / running 且 desired stopped：run.sh stop
+	actPoll              // installing：读 status
+	actHealth            // running：读 status + HTTP 健康检查
+	actStopFailed        // failed 且 desired = stopped：补做失败后的 run.sh stop
 )
 
 func decide(d Deployment, tg target) action {
@@ -228,6 +232,11 @@ func decide(d Deployment, tg target) action {
 	case d.State == StateRemoved:
 		if d.CleanupPending {
 			return actCleanup
+		}
+		return actNone
+	case d.State == StateFailed:
+		if d.Desired == DesiredStopped {
+			return actStopFailed
 		}
 		return actNone
 	case d.State == StateRemoving || d.Desired == DesiredRemoved:
@@ -297,6 +306,8 @@ func (r *Runner) step(ctx context.Context, id string, now time.Time) (bool, erro
 		return true, r.stepPoll(ctx, d, ut, tg, now)
 	case actHealth:
 		return true, r.stepHealth(ctx, d, ut, tg, now)
+	case actStopFailed:
+		return true, r.stepStopFailed(ctx, d, ut, now)
 	}
 	return false, nil
 }
@@ -443,19 +454,20 @@ func (r *Runner) stepGone(ctx context.Context, d Deployment, now time.Time) erro
 	})
 }
 
+// deployBusy 是 run.sh deploy 拿不到部署锁（上一次 deploy 的 exec 超时后仍在容器里跑）时的退出码。
+const deployBusy = 75
+
 func (r *Runner) stepDeploy(ctx context.Context, d Deployment, ut upstream.Target, tg target, now time.Time) error {
 	root := r.appRoot(d.InstanceID)
 	bundle, app, err := r.s.bundleFor(ctx, d, root, r.cfg.HealthAddr)
+	dir := AppDir(root, app.Slug)
 	var be *bundleError
-	if errors.As(err, &be) {
-		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
-			return r.s.markFailed(ctx, tx, cur, ErrCodeUploadFailed, "部署包生成失败："+be.Error(), now)
-		})
+	if errors.As(err, &be) { // 重新部署时旧服务可能还在跑：一并停掉
+		return r.failAndStop(ctx, d, ut, dir, ErrCodeUploadFailed, "部署包生成失败："+be.Error(), now, nil)
 	}
 	if err != nil {
 		return err
 	}
-	dir := AppDir(root, app.Slug)
 	res, err := r.exec(ctx, ut, UploadCommand(dir), bundle, ExecUploadTimeout)
 	if isDial(err) {
 		return r.unreachable(ctx, d, tg, now, err, true)
@@ -464,10 +476,7 @@ func (r *Runner) stepDeploy(ctx context.Context, d Deployment, ut upstream.Targe
 		return err
 	}
 	if res.exit != 0 {
-		msg := lastLine(res.stderr)
-		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
-			return r.s.markFailed(ctx, tx, cur, ErrCodeUploadFailed, "上传失败："+msg, now)
-		})
+		return r.failAndStop(ctx, d, ut, dir, ErrCodeUploadFailed, "上传失败："+lastLine(res.stderr), now, nil)
 	}
 	res, err = r.exec(ctx, ut, runSHCmd(dir, "deploy"), nil, ExecStatusTimeout)
 	if isDial(err) {
@@ -476,12 +485,20 @@ func (r *Runner) stepDeploy(ctx context.Context, d Deployment, ut upstream.Targe
 	if err != nil {
 		return err
 	}
+	if res.exit == deployBusy { // 上一次 deploy 还没结束：保持 queued，30 秒后再试；本轮的 attempt 退回（那一次已经计过）
+		r.log.Info("appdeploy: previous deploy still running in container, retry later", "deployment", d.ID)
+		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+			_, err := tx.Exec(ctx, `UPDATE app_deployments SET attempt = GREATEST(attempt - 1, 0), next_poll_at = $2, updated_at = $3,
+				row_version = row_version + 1 WHERE id = $1`, cur.ID, now.Add(UnreachableRetry), now)
+			return err
+		})
+	}
 	if res.exit != 0 {
 		code, msg := ErrCodeScriptFailed, lastLine(res.stderr)
 		if strings.HasPrefix(msg, "disk:") {
 			code = ErrCodeDisk
 		}
-		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error { return r.s.markFailed(ctx, tx, cur, code, msg, now) })
+		return r.failAndStop(ctx, d, ut, dir, code, msg, now, nil)
 	}
 	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
 		if _, err := tx.Exec(ctx, `UPDATE app_deployments SET state = 'installing', phase = 'prepare', progress = 0, message = '', health = 'unknown', error_code = '',
@@ -492,6 +509,82 @@ func (r *Runner) stepDeploy(ctx context.Context, d Deployment, ut upstream.Targe
 		return addEvent(ctx, tx, cur.ID, cur.State, StateInstalling, fmt.Sprintf("开始部署（第 %d 次）", cur.Attempt), now)
 	})
 }
+
+// ---- 失败后停进程 ----
+//
+// 标 failed 时容器里可能还有进程（超时的 _bg、端口冲突时已起来的服务、重新部署失败时的旧服务、status.json 被删但服务还在）：
+// failAndStop 在同一事务里标 failed 并置 desired = stopped（failed 行上的「待停止」标记，Runner 候选之一），提交后立即
+// best-effort run.sh stop；成功（或目录 / run.sh 已不在，无可停）→ desired 改回 running、next_poll_at 推后 24 小时；
+// exec 失败 → 标记保留，30 秒后 Runner 重试（actStopFailed）。用户「重新部署」把 desired 置回 running、「卸载」置为 removed，
+// 都会接管这一行（deploy / remove 本身也会先停进程）。
+
+// failAndStop 见上。before 非 nil 时在标 failed 之前于同一事务内执行（写 log_tail 等）。
+func (r *Runner) failAndStop(ctx context.Context, d Deployment, ut upstream.Target, dir, code, msg string, now time.Time,
+	before func(tx pgx.Tx, cur Deployment) error) error {
+	var rv int
+	committed := false
+	err := r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+		if before != nil {
+			if err := before(tx, cur); err != nil {
+				return err
+			}
+		}
+		if err := r.markFailedStopping(ctx, tx, cur, code, msg, now, &rv); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	})
+	if err != nil || !committed {
+		return err
+	}
+	d.RowVersion = rv
+	return r.stopFailed(ctx, d, ut, dir, now)
+}
+
+// markFailedStopping = markFailed + 「待停止」标记（desired = stopped）；rv 收到提交后的 row_version。
+func (r *Runner) markFailedStopping(ctx context.Context, tx pgx.Tx, cur Deployment, code, msg string, now time.Time, rv *int) error {
+	if err := r.s.markFailed(ctx, tx, cur, code, msg, now); err != nil {
+		return err
+	}
+	return tx.QueryRow(ctx, `UPDATE app_deployments SET desired = 'stopped', next_poll_at = $2, row_version = row_version + 1
+		WHERE id = $1 RETURNING row_version`, cur.ID, now.Add(r.cfg.PollInterval)).Scan(rv)
+}
+
+// stopFailed 对带「待停止」标记的 failed 部署执行 run.sh stop（幂等），成功后清标记。
+func (r *Runner) stopFailed(ctx context.Context, d Deployment, ut upstream.Target, dir string, now time.Time) error {
+	res, err := r.exec(ctx, ut, runSHCmd(dir, "stop"), nil, ExecStatusTimeout)
+	if err != nil {
+		r.log.Warn("appdeploy: stop after failure did not run, retry later", "deployment", d.ID, "err", err)
+		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+			_, err := tx.Exec(ctx, `UPDATE app_deployments SET next_poll_at = $2, row_version = row_version + 1 WHERE id = $1`, cur.ID, now.Add(UnreachableRetry))
+			return err
+		})
+	}
+	if res.exit != 0 { // 目录 / run.sh 已不在：没有可停的进程
+		r.logStderr(d, "appdeploy: run.sh stop after failure exited non-zero", res)
+	}
+	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+		_, err := tx.Exec(ctx, `UPDATE app_deployments SET desired = 'running', next_poll_at = $2, updated_at = $3, row_version = row_version + 1 WHERE id = $1`,
+			cur.ID, now.Add(24*time.Hour), now)
+		return err
+	})
+}
+
+func (r *Runner) stepStopFailed(ctx context.Context, d Deployment, ut upstream.Target, now time.Time) error {
+	app, err := r.s.d.Catalog.GetApp(ctx, d.AppID)
+	if err != nil {
+		return err
+	}
+	return r.stopFailed(ctx, d, ut, AppDir(r.appRoot(d.InstanceID), app.Slug), now)
+}
+
+// logStderr 记一条带 stderr 的警告：只记脱敏后的最后一行与总长度（stderr 可能含变量值）。
+func (r *Runner) logStderr(d Deployment, msg string, res execResult) {
+	r.log.Warn(msg, "deployment", d.ID, "exit", res.exit, "stderr_last", r.redactor(d)(lastLine(res.stderr)), "stderr_len", len(res.stderr))
+}
+
+// ---- 轮询 ----
 
 // statusMissing 是 status 命令非零退出（status.json 缺失 / 目录被删）时的消息（规格 §6.3）。
 const statusMissing = "状态文件缺失"
@@ -515,47 +608,54 @@ func (r *Runner) stepPoll(ctx context.Context, d Deployment, ut upstream.Target,
 		return err
 	}
 	dir := AppDir(r.appRoot(d.InstanceID), app.Slug)
+	minutes := ver.Spec.TimeoutMinutes
+	if minutes <= 0 {
+		minutes = DefaultTimeoutMinutes
+	}
+	timedOut := d.StartedAt != nil && now.Sub(*d.StartedAt) > time.Duration(minutes)*time.Minute
+	timeoutMsg := fmt.Sprintf("超过 %d 分钟未完成", minutes)
 	res, err := r.exec(ctx, ut, statusCmd(dir), nil, ExecStatusTimeout)
 	if isDial(err) {
 		return r.unreachable(ctx, d, tg, now, err, false)
 	}
 	if err != nil {
+		if timedOut { // 状态读不出来（命令超时等）也不能让超时失效
+			return r.failAndStop(ctx, d, ut, dir, ErrCodeTimeout, timeoutMsg, now, nil)
+		}
 		return err
 	}
 	if res.exit != 0 {
-		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
-			return r.s.markFailed(ctx, tx, cur, ErrCodeScriptFailed, statusMissing, now)
-		})
+		return r.failAndStop(ctx, d, ut, dir, ErrCodeScriptFailed, statusMissing, now, nil)
 	}
 	st, _, rawTail, perr := ParseStatusOutput(res.stdout)
+	fresh := perr == nil && st.Seq >= d.StatusSeq
+	red := r.redactor(d)
+	logTail := red(tidyLog(rawTail))
+	msg, phase := truncRunes(red(cleanText(st.Message)), MaxMessageLen), truncRunes(red(cleanText(st.Phase)), 64)
+	// 超时先于「解析失败 / seq 回退就不改状态」判断：status.json 被写坏或回退时超时照样生效。
+	// 只有新鲜且已离开 installing 的状态（running / failed / stopped）按状态处理。
+	if timedOut && (!fresh || st.State == StateInstalling) {
+		var before func(tx pgx.Tx, cur Deployment) error
+		if fresh {
+			before = func(tx pgx.Tx, cur Deployment) error {
+				_, err := tx.Exec(ctx, `UPDATE app_deployments SET log_tail = $2, status_seq = $3, phase = $4, row_version = row_version + 1 WHERE id = $1`,
+					cur.ID, logTail, st.Seq, phase)
+				return err
+			}
+		}
+		return r.failAndStop(ctx, d, ut, dir, ErrCodeTimeout, timeoutMsg, now, before)
+	}
 	if perr != nil {
 		r.log.Warn("appdeploy: bad status output", "deployment", d.ID, "err", perr)
 		return nil
 	}
-	if st.Seq < d.StatusSeq {
+	if !fresh {
 		r.log.Info("appdeploy: status seq went back, ignored", "deployment", d.ID, "seq", st.Seq, "have", d.StatusSeq)
 		return nil
 	}
-	red := r.redactor(d)
-	logTail, msg, phase := red(tidyLog(rawTail)), truncRunes(red(cleanText(st.Message)), MaxMessageLen), truncRunes(cleanText(st.Phase), 64)
-	minutes := ver.Spec.TimeoutMinutes
-	if minutes <= 0 {
-		minutes = DefaultTimeoutMinutes
-	}
-	if st.State == StateInstalling && d.StartedAt != nil && now.Sub(*d.StartedAt) > time.Duration(minutes)*time.Minute {
-		// 超时：先停掉容器里的 _bg / 服务（失败也照样标 failed：之后的 deploy / remove 会再停一次）
-		if res, err := r.exec(ctx, ut, runSHCmd(dir, "stop"), nil, ExecStatusTimeout); err != nil || res.exit != 0 {
-			r.log.Warn("appdeploy: stop after timeout failed", "deployment", d.ID, "exit", res.exit, "err", err)
-		}
-		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
-			if _, err := tx.Exec(ctx, `UPDATE app_deployments SET log_tail = $2, status_seq = $3, phase = $4, row_version = row_version + 1 WHERE id = $1`,
-				cur.ID, logTail, st.Seq, phase); err != nil {
-				return err
-			}
-			return r.s.markFailed(ctx, tx, cur, ErrCodeTimeout, fmt.Sprintf("超过 %d 分钟未完成", minutes), now)
-		})
-	}
-	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+	var rv int
+	stopAfter := false
+	err = r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
 		switch st.State {
 		case StateInstalling:
 			_, err := tx.Exec(ctx, `UPDATE app_deployments SET phase = $2, progress = $3, message = $4, log_tail = $5, status_seq = $6, unreachable_count = 0,
@@ -567,8 +667,13 @@ func (r *Runner) stepPoll(ctx context.Context, d Deployment, ut upstream.Target,
 			if err != nil {
 				return err
 			}
-			if code != "" {
-				return r.s.markFailed(ctx, tx, cur, code, ErrorText[code], now)
+			if code != "" { // 端口登记不了：服务已在容器里跑起来，标 failed 后停掉
+				if _, err := tx.Exec(ctx, `UPDATE app_deployments SET log_tail = $2, status_seq = $3, row_version = row_version + 1 WHERE id = $1`,
+					cur.ID, logTail, st.Seq); err != nil {
+					return err
+				}
+				stopAfter = true
+				return r.markFailedStopping(ctx, tx, cur, code, ErrorText[code], now, &rv)
 			}
 			if _, err := tx.Exec(ctx, `UPDATE app_deployments SET state = 'running', phase = $2, progress = 100, message = $3, health = 'ok', error_code = '',
 				log_tail = $4, status_seq = $5, unreachable_count = 0, crash_count = 0, finished_at = $6, next_poll_at = $7, updated_at = $6,
@@ -592,6 +697,11 @@ func (r *Runner) stepPoll(ctx context.Context, d Deployment, ut upstream.Target,
 		r.log.Warn("appdeploy: unknown container state", "deployment", cur.ID, "state", st.State)
 		return nil
 	})
+	if err != nil || !stopAfter {
+		return err
+	}
+	d.RowVersion = rv
+	return r.stopFailed(ctx, d, ut, dir, now)
 }
 
 func (r *Runner) stepHealth(ctx context.Context, d Deployment, ut upstream.Target, tg target, now time.Time) error {
@@ -599,22 +709,32 @@ func (r *Runner) stepHealth(ctx context.Context, d Deployment, ut upstream.Targe
 	if err != nil {
 		return err
 	}
-	res, err := r.exec(ctx, ut, statusCmd(AppDir(r.appRoot(d.InstanceID), app.Slug)), nil, ExecStatusTimeout)
+	dir := AppDir(r.appRoot(d.InstanceID), app.Slug)
+	res, err := r.exec(ctx, ut, statusCmd(dir), nil, ExecStatusTimeout)
 	if isDial(err) {
 		return r.unreachable(ctx, d, tg, now, err, false)
 	}
-	if err != nil {
+	if err != nil { // 非连接层错误（命令超时、上游拒绝执行）：按健康检查周期退避，健康未知
+		if werr := r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+			_, err := tx.Exec(ctx, `UPDATE app_deployments SET health = 'unknown', next_poll_at = $2, row_version = row_version + 1 WHERE id = $1`,
+				cur.ID, now.Add(HealthInterval))
+			return err
+		}); werr != nil {
+			return werr
+		}
 		return err
 	}
 	if res.exit != 0 {
-		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
-			return r.s.markFailed(ctx, tx, cur, ErrCodeScriptFailed, statusMissing, now)
-		})
+		return r.failAndStop(ctx, d, ut, dir, ErrCodeScriptFailed, statusMissing, now, nil)
 	}
 	st, alive, rawTail, perr := ParseStatusOutput(res.stdout)
 	if perr != nil {
 		r.log.Warn("appdeploy: bad status output", "deployment", d.ID, "err", perr)
-		return nil
+		return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
+			_, err := tx.Exec(ctx, `UPDATE app_deployments SET health = 'unknown', next_poll_at = $2, updated_at = $3, row_version = row_version + 1 WHERE id = $1`,
+				cur.ID, now.Add(HealthInterval), now)
+			return err
+		})
 	}
 	logTail := r.redactor(d)(tidyLog(rawTail))
 	seq := max(st.Seq, d.StatusSeq)
@@ -677,7 +797,7 @@ func (r *Runner) stepStop(ctx context.Context, d Deployment, ut upstream.Target,
 		return err
 	}
 	if res.exit != 0 { // 目录 / run.sh 已不在：没有可停的进程
-		r.log.Warn("appdeploy: run.sh stop failed, treating as stopped", "deployment", d.ID, "exit", res.exit, "stderr", lastLine(res.stderr))
+		r.logStderr(d, "appdeploy: run.sh stop failed, treating as stopped", res)
 	}
 	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
 		if _, err := tx.Exec(ctx, `UPDATE app_deployments SET state = 'stopped', health = 'unknown', phase = '', message = '', unreachable_count = 0, crash_count = 0,
@@ -702,7 +822,7 @@ func (r *Runner) stepRemove(ctx context.Context, d Deployment, ut upstream.Targe
 	}
 	detail := "已卸载"
 	if res.exit != 0 {
-		r.log.Warn("appdeploy: remove exited non-zero, marking removed", "deployment", d.ID, "exit", res.exit, "stderr", lastLine(res.stderr))
+		r.logStderr(d, "appdeploy: remove exited non-zero, marking removed", res)
 		detail = fmt.Sprintf("已卸载（容器内清理返回 %d）", res.exit)
 	}
 	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
@@ -734,7 +854,7 @@ func (r *Runner) stepCleanup(ctx context.Context, d Deployment, ut upstream.Targ
 			})
 		}
 		if res.exit != 0 {
-			r.log.Warn("appdeploy: cleanup exited non-zero", "deployment", d.ID, "exit", res.exit, "stderr", lastLine(res.stderr))
+			r.logStderr(d, "appdeploy: cleanup exited non-zero", res)
 		}
 	}
 	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {

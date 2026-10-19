@@ -216,8 +216,32 @@ cmd_prepare() {
   return 0
 }
 
+# deploy 前台部分互斥（stop_procs → prepare → detach）：Runner 的 deploy exec 超时（20 秒）后命令可能还在容器里跑，
+# 下一轮会再 deploy；两个并发的 deploy 会各自 detach 一个 _bg。锁是符号链接（ln -s 原子且自带内容「pid 秒」），
+# 持有者已死或超过 DEPLOY_LOCK_S 秒视为陈旧（被 SIGKILL 的 deploy 留下的）。拿不到锁：stderr「busy: …」，退出 75。
+DEPLOY_LOCK_S=120
+DEPLOY_BUSY=75
+deploy_lock() {
+  _lk="$DIR/.deploy.lock"
+  _own="$$ $(date +%s)"
+  ln -s "$_own" "$_lk" 2>/dev/null && return 0
+  _cur=$(readlink "$_lk" 2>/dev/null)
+  _lp=$(num "${_cur%% *}"); _lt=$(num "${_cur##* }")
+  if pid_alive "$_lp" && [ $(( $(date +%s) - _lt )) -lt "$DEPLOY_LOCK_S" ]; then
+    printf 'busy: deploy pid %s still running\n' "$_lp" >&2
+    return "$DEPLOY_BUSY"
+  fi
+  rm -f "$_lk"
+  ln -s "$_own" "$_lk" 2>/dev/null && return 0
+  printf 'busy: deploy lock contended\n' >&2
+  return "$DEPLOY_BUSY"
+}
+deploy_unlock() { [ "$(readlink "$DIR/.deploy.lock" 2>/dev/null)" = "$_own" ] && rm -f "$DIR/.deploy.lock"; return 0; }
+
 cmd_deploy() {
   load_env
+  # 每次 deploy 换新日志（旧的留一份 log.1）：平台按当前 secret 值脱敏日志尾部，换过 secret 后旧日志里的旧值认不出来
+  [ -f "$DIR/log" ] && mv -f "$DIR/log" "$DIR/log.1"
   # 旧的部署 / 服务先停掉（幂等：没有也不报错）。放在 prepare 之前：prepare 失败时旧服务也已停，状态 failed 与实际一致
   stop_procs tracked "$DEPLOY_APP_S" "$DEPLOY_GROUP_DS" "$DEPLOY_PID_DS"
   cmd_prepare || return $?
@@ -349,7 +373,7 @@ cmd_remove() {
 }
 
 case "${1:-}" in
-  deploy|start) cmd_deploy ;;
+  deploy|start) deploy_lock || exit $?; cmd_deploy; _rc=$?; deploy_unlock; exit $_rc ;;
   _bg) shift; [ "${1:-}" = "deploy" ] && cmd_bg_deploy ;;
   _status) load_env; cmd_report "${2:-}" "${3:-}" "${4:-}" ;;
   stop) cmd_stop ;;
