@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/ssh"
 
 	"spark-cloud/internal/access/sshtest"
@@ -36,11 +37,12 @@ import (
 func TestMain(m *testing.M) { dbtest.Main(m) }
 
 type env struct {
-	t   *testing.T
-	a   *app.App
-	clk *clock.Fake
-	ts  *httptest.Server
-	up  *sshtest.Server
+	t    *testing.T
+	a    *app.App
+	clk  *clock.Fake
+	ts   *httptest.Server
+	up   *sshtest.Server
+	pool *pgxpool.Pool
 }
 
 func newEnv(t *testing.T) *env { t.Helper(); return newEnvWith(t, false) }
@@ -92,7 +94,7 @@ func newEnvWith(t *testing.T, apps bool) *env {
 	}
 	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(),
 		AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200, AgentDNSServers: []string{"223.5.5.5"}, UpstreamSSHKeyFile: keyFile,
-		UpstreamSSHPort: up.Port()}
+		UpstreamSSHPort: up.Port(), LLMGateway: true} // 与 cmd/e2e-server 相同：挂 /v1
 	a, err := app.Build(cfg, pool, log, opt)
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +124,7 @@ func newEnvWith(t *testing.T, apps bool) *env {
 		a.Upstream.Close()
 		up.Close()
 	})
-	return &env{t: t, a: a, clk: clk, ts: ts, up: up}
+	return &env{t: t, a: a, clk: clk, ts: ts, up: up, pool: pool}
 }
 
 func (e *env) call(method, path string, body any) (int, map[string]any) {

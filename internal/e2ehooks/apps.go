@@ -18,7 +18,7 @@ import (
 	"spark-cloud/internal/platform/apperr"
 )
 
-// fakeAppScript 是四个 fake 应用版本共用的 app.sh：install 汇报一次下载进度后等 1 秒；start 起一个挂住的 sleep 当服务进程
+// fakeAppScript 是全部 fake 应用版本共用的 app.sh：install 汇报一次下载进度后等 1 秒；start 起一个挂住的 sleep 当服务进程
 // （不真的监听端口：run.sh 与 Runner 的健康检查经 AppHealthAddr / sshtest 的 direct-tcpip 目标打到测试起的 httptest）。
 const fakeAppScript = `#!/bin/sh
 # e2e / 集成测试用的 fake 应用（不下载、不起真服务）
@@ -109,6 +109,26 @@ func fakeApps() []fakeApp {
 				},
 			},
 			images: []string{"", ImageLLMServing, ImageComfyUI}},
+		// 平台内部应用（Token 商城节点，计划 9）：与 deploy/apps/vllm-node 的端口 / 变量 / 超时相同；internal → 用户市场不可见，
+		// 只有系统账号能部署。后台建模型（llm_models）要求它已发布、模型镜像在兼容列表内。
+		{in: appdeploy.AppInput{Slug: "vllm-node", Name: "vLLM 节点（平台内部）", Summary: "Token 商城推理节点，平台自动部署", Category: "llm", Icon: "llm",
+			Sort: 999, Internal: true},
+			spec: appdeploy.Spec{
+				Ports:          []appdeploy.PortSpec{{Port: 8000, Label: "OpenAI 兼容接口", Path: "/docs", HealthPath: "/health"}},
+				TimeoutMinutes: 120,
+				Env: []appdeploy.EnvSpec{
+					{Name: "MODEL_ID", Label: "模型", Type: "string", Required: true, Pattern: `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`},
+					source,
+					{Name: "SERVED_MODEL_NAME", Label: "对外模型名", Type: "string", Required: true, Pattern: `^[a-z0-9][a-z0-9.-]{1,63}$`},
+					{Name: "MAX_MODEL_LEN", Label: "最大上下文", Type: "int", Min: i64(1024), Max: i64(1048576), Default: "32768"},
+					{Name: "API_KEY", Label: "节点密钥", Type: "secret", Required: true, Pattern: `^[A-Za-z0-9_-]{32,128}$`},
+					{Name: "GPU_MEMORY_UTILIZATION", Label: "显存占用比例", Type: "string", Pattern: `^0\.[3-9][0-9]?$`, Default: "0.85"},
+					{Name: "MAX_NUM_SEQS", Label: "最大并发序列", Type: "int", Min: i64(1), Max: i64(512), Default: "64"},
+					{Name: "TASK", Label: "任务类型", Type: "enum", Options: []string{"generate", "embed"}, Default: "generate"},
+				},
+				Links: []appdeploy.LinkSpec{{Label: "接口文档", Path: "/docs"}, {Label: "模型列表", Path: "/v1/models"}},
+			},
+			images: []string{"", ImageLLMServing}},
 	}
 }
 
@@ -148,7 +168,7 @@ func seedImages(ctx context.Context, a *app.App) (map[string]int64, error) {
 	return ids, nil
 }
 
-// SeedApps 创建并发布（系统操作人，钩子直接调服务，不经 TOTP）四个应用的 fake 版本，并让假容器 sshd 把每个应用端口的
+// SeedApps 创建并发布（系统操作人，钩子直接调服务，不经 TOTP）四个用户应用与平台内部应用 vllm-node 的 fake 版本，并让假容器 sshd 把每个应用端口的
 // direct-tcpip 转到 healthAddr（Runner 的 HTTP 健康检查与 ingress 都打到它）。幂等：已存在同 slug 的应用直接返回其最新已发布版本。
 // 集成测试（internal/app）与 /hooks/apps/seed 共用。
 func SeedApps(ctx context.Context, a *app.App, up *sshtest.Server, healthAddr string) ([]SeededApp, error) {
@@ -156,7 +176,7 @@ func SeedApps(ctx context.Context, a *app.App, up *sshtest.Server, healthAddr st
 	if err != nil {
 		return nil, err
 	}
-	out := make([]SeededApp, 0, 4)
+	out := make([]SeededApp, 0, len(fakeApps()))
 	for _, fa := range fakeApps() {
 		port := fa.spec.Ports[0].Port
 		if up != nil && healthAddr != "" {

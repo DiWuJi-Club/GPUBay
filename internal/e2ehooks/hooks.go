@@ -56,9 +56,10 @@ type Server struct {
 	HealthAddr string
 
 	sweepMu       sync.Mutex // 进程内串行化 /hooks/sweep（再加清扫咨询锁防跨进程交叠）；见 sweep
+	llmMu         sync.Mutex // 进程内串行化 /hooks/llm/tick（Playwright 超时重发时不让两轮 Controller 交叠）
 	mu            sync.Mutex
 	agents        map[int64]*fakeagent.Agent
-	upstreamStops map[int]func() // ingress-upstream 起的回显服务，按端口
+	upstreamStops map[int]func() // ingress-upstream 起的回显服务 / llm/upstream 起的 FakeVLLM，按端口
 }
 
 // Close 停掉全部 fake Agent。
@@ -93,6 +94,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/ingress-upstream", s.handle(s.ingressUpstream))
 	mux.HandleFunc("POST /hooks/apps/seed", s.handle(s.appsSeed))
 	mux.HandleFunc("POST /hooks/apps/tick", s.handle(s.appsTick))
+	mux.HandleFunc("POST /hooks/llm/upstream", s.handle(s.llmUpstream))
+	mux.HandleFunc("POST /hooks/llm/node", s.handle(s.llmNode))
+	mux.HandleFunc("POST /hooks/llm/tick", s.handle(s.llmTick))
 	return loopbackOnly(mux)
 }
 

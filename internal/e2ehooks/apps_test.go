@@ -12,7 +12,7 @@ import (
 	"spark-cloud/internal/rental"
 )
 
-// /hooks/apps/seed 幂等地建四个 fake 应用（另建 LLM Serving / ComfyUI 镜像，默认镜像不改名）；/hooks/apps/tick 每轮推进假时钟 5 秒
+// /hooks/apps/seed 幂等地建四个 fake 用户应用与平台内部应用 vllm-node（另建 LLM Serving / ComfyUI 镜像，默认镜像不改名）；/hooks/apps/tick 每轮推进假时钟 5 秒
 // 并驱动 Runner 把预装的应用部署到 running；/hooks/agent 的 images 写进机器的已缓存镜像。
 func TestAppsSeedTickAndAgentImages(t *testing.T) {
 	e := newEnvWith(t, true)
@@ -35,8 +35,8 @@ func TestAppsSeedTickAndAgentImages(t *testing.T) {
 		return out
 	}
 	first := seed()
-	wantPorts := map[string]float64{"vllm": 8000, "open-webui": 3000, "comfyui": 8188, "jupyterlab": 8888}
-	if len(first) != 4 {
+	wantPorts := map[string]float64{"vllm": 8000, "open-webui": 3000, "comfyui": 8188, "jupyterlab": 8888, "vllm-node": 8000}
+	if len(first) != 5 {
 		t.Fatalf("seed = %v", first)
 	}
 	for slug, port := range wantPorts {
