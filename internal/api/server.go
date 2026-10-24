@@ -14,6 +14,7 @@ import (
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
@@ -51,10 +52,16 @@ type Server struct {
 	// 计划 7：应用部署；nil 时不注册 /apps* 与 /instances/{id}/apps*，实例视图的 apps_summary 恒为空数组
 	Apps      *appdeploy.Service
 	AppsLimit int // 应用部署类写操作每用户每小时上限；零值 appdeploy.UserOpsPerHour（60）
+	// 计划 11：ComfyUI 工作流市场。Workflows nil 时不注册 /workflows*；Installer / Runs nil（或 Apps nil）时不注册
+	// /instances/{id}/apps/{dep}/workflows* 的安装 / 快速出图接口。安装写接口与应用部署写操作共用 AppsLimit。
+	Workflows *comfywf.Catalog
+	Installer *comfywf.Installer
+	Runs      *comfywf.Runs
 
 	authorizeLim *userLimiter
 	calendarLim  *ipLimiter
 	appsLim      *userLimiter
+	wfUploadLim  *userLimiter
 }
 
 const sessionCookie = "sc_session"
@@ -85,6 +92,7 @@ func (s *Server) Router() http.Handler {
 		alimit = appdeploy.UserOpsPerHour
 	}
 	s.appsLim = &userLimiter{limit: alimit, window: time.Hour}
+	s.wfUploadLim = &userLimiter{limit: comfywf.RunsPerHour, window: time.Hour}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -120,6 +128,11 @@ func (s *Server) Router() http.Handler {
 			if s.Apps != nil {
 				r.Get("/apps", s.handleAppCatalog)
 				r.Get("/apps/{slug}", s.handleAppCatalogItem)
+			}
+			if s.Workflows != nil {
+				r.Get("/workflows", s.handleWorkflowCatalog)
+				r.Get("/workflows/{slug}", s.handleWorkflowDetail)
+				r.Get("/workflows/{slug}/cover", s.handleWorkflowCover) // 处理器自己改 Cache-Control 为公共长缓存
 			}
 		})
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
@@ -170,6 +183,18 @@ func (s *Server) Router() http.Handler {
 				r.Get("/instances/{id}/apps/{dep}/log", s.handleAppLog)
 				r.Get("/instances/{id}/apps/{dep}/events", s.handleAppEvents)
 			}
+			if s.Apps != nil && s.Installer != nil {
+				r.Get("/instances/{id}/apps/{dep}/workflows", s.handleDeploymentWorkflows)
+				r.Post("/instances/{id}/apps/{dep}/workflows", s.handleAddWorkflow)
+				r.Put("/instances/{id}/apps/{dep}/workflows/{wid}", s.handleUpdateWorkflow)
+				r.Delete("/instances/{id}/apps/{dep}/workflows/{wid}", s.handleRemoveWorkflow)
+			}
+			if s.Apps != nil && s.Runs != nil {
+				r.Post("/instances/{id}/apps/{dep}/workflows/{wid}/uploads", s.handleWorkflowUpload)
+				r.Post("/instances/{id}/apps/{dep}/workflows/{wid}/runs", s.handleStartRun)
+				r.Get("/instances/{id}/apps/{dep}/workflows/{wid}/runs/{run}", s.handleGetRun)
+				r.Get("/instances/{id}/apps/{dep}/workflows/{wid}/runs/{run}/files/{index}", s.handleRunFile)
+			}
 			r.Get("/recharges", s.handleRecharges)
 			r.Post("/recharges", s.handleCreateRecharge)
 			r.Get("/recharges/{id}", s.handleRecharge)
@@ -194,7 +219,7 @@ func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 			return
 		}
 		want, msg := "application/json", "请求格式必须为 JSON"
-		if r.URL.Path == uploadPath {
+		if r.URL.Path == uploadPath || (r.Method == http.MethodPost && isWorkflowUploadPath(r.URL.Path)) {
 			want, msg = "multipart/form-data", "请使用 multipart/form-data 上传文件"
 		}
 		if !strings.HasPrefix(r.Header.Get("Content-Type"), want) {
