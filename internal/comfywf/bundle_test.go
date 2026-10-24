@@ -172,6 +172,26 @@ func TestBundleFilesNodes(t *testing.T) {
 	}
 }
 
+// 两个工作流对同一目标 <dir>/<name> 给了不同的 sha256（都非空）→ workflow_version_invalid；一边为空 / 相同 → 通过。
+func TestBundleFilesModelSHA256(t *testing.T) {
+	a, b := bundleSDXL(), bundleUpscale()
+	a.Manifest.Models[0].SHA256 = strings.Repeat("a", 64)
+	if _, err := BundleFiles([]BundleWorkflow{a, b}); err != nil {
+		t.Fatalf("one side empty: %v", err)
+	}
+	b.Manifest.Models[0].SHA256 = strings.Repeat("a", 64)
+	if _, err := BundleFiles([]BundleWorkflow{a, b}); err != nil {
+		t.Fatalf("same sha: %v", err)
+	}
+	b.Manifest.Models[0].SHA256 = strings.Repeat("b", 64)
+	_, err := BundleFiles([]BundleWorkflow{a, b})
+	wantInvalid(t, err, "")
+	if !strings.Contains(err.Error(), "模型 checkpoints/sd_xl_base_1.0.safetensors 在两个工作流里 sha256 不同") ||
+		!strings.Contains(err.Error(), "sdxl-txt2img") || !strings.Contains(err.Error(), "sdxl-upscale") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestBundleFilesInvalid(t *testing.T) {
 	bad := []func(w *BundleWorkflow){
 		// 纵深防御：app.sh 按空格分隔的行读清单，字段必须仍满足清单正则。
