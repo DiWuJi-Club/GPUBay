@@ -1,0 +1,16 @@
+{
+  "name": "Qwen-Image 文生图",
+  "summary": "通义千问 Qwen-Image（fp8），中英文文字渲染出色，适合海报、招牌、排版类图片。",
+  "description": "ComfyUI 官方「Qwen-Image Text to Image」工作流（fp8，去掉了模板里默认旁路的 Lightning LoRA）。\n\n- 模型：qwen_image_fp8_e4m3fn.safetensors（diffusion_models，约 20.43 GB）、qwen_2.5_vl_7b_fp8_scaled.safetensors（text_encoders，约 9.38 GB）、qwen_image_vae.safetensors（vae，约 0.25 GB），合计约 30.06 GB，许可 Apache-2.0\n- 建议：20 步、CFG 2.5（Qwen 团队建议 40 步）；默认 1328×1328，宽高取 16 的倍数\n- 提示词可直接写中文，引号里的文字会渲染到画面上\n- 快速出图可调：提示词、反向提示词、宽、高、步数、CFG、种子",
+  "category": "txt2img",
+  "tags": [
+    "Qwen-Image",
+    "文生图",
+    "中文",
+    "文字渲染"
+  ],
+  "sort": 40,
+  "version": "1.0.0",
+  "changelog": "首个版本：基于 ComfyUI v0.3.60 官方模板（comfyui-workflow-templates 0.1.86），支持快速出图。",
+  "comfyui_min": "0.3.60"
+}

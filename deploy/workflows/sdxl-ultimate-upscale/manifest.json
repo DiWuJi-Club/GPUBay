@@ -1,0 +1,97 @@
+{
+  "models": [
+    {
+      "name": "sd_xl_base_1.0.safetensors",
+      "dir": "checkpoints",
+      "size_gb": 6.94,
+      "modelscope": {
+        "repo": "AI-ModelScope/stable-diffusion-xl-base-1.0",
+        "file": "sd_xl_base_1.0.safetensors"
+      },
+      "hf": {
+        "repo": "stabilityai/stable-diffusion-xl-base-1.0",
+        "file": "sd_xl_base_1.0.safetensors"
+      },
+      "sha256": "31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b"
+    },
+    {
+      "name": "RealESRGAN_x4plus.safetensors",
+      "dir": "upscale_models",
+      "size_gb": 0.07,
+      "modelscope": {
+        "repo": "Comfy-Org/Real-ESRGAN_repackaged",
+        "file": "RealESRGAN_x4plus.safetensors"
+      },
+      "hf": {
+        "repo": "Comfy-Org/Real-ESRGAN",
+        "file": "RealESRGAN_x4plus.safetensors"
+      },
+      "sha256": "37f9a931c215f040aa6d50f711f2cb115f713c46df1d0d6469a8bd7bfe9a60bb"
+    }
+  ],
+  "nodes": [
+    {
+      "name": "ComfyUI_UltimateSDUpscale",
+      "git": "https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git",
+      "commit": "a5547db9e1d07d3318bb21e9e9c474f4c1e9c8df",
+      "node_types": [
+        "UltimateSDUpscale",
+        "UltimateSDUpscaleNoUpscale",
+        "UltimateSDUpscaleCustomSample",
+        "UltimateSDUpscaleGuider"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "key": "image",
+      "label": "输入图片",
+      "type": "image",
+      "node": "10",
+      "input": "image"
+    },
+    {
+      "key": "prompt",
+      "label": "提示词",
+      "type": "textarea",
+      "node": "6",
+      "input": "text",
+      "default": "high quality, highly detailed, sharp focus, 8k",
+      "max_len": 2000
+    },
+    {
+      "key": "denoise",
+      "label": "重绘强度（denoise）",
+      "type": "float",
+      "node": "17",
+      "input": "denoise",
+      "default": 0.3,
+      "min": 0.05,
+      "max": 1,
+      "step": 0.05
+    },
+    {
+      "key": "upscale_by",
+      "label": "放大倍数",
+      "type": "float",
+      "node": "17",
+      "input": "upscale_by",
+      "default": 2,
+      "min": 1,
+      "max": 4,
+      "step": 0.05
+    },
+    {
+      "key": "seed",
+      "label": "种子",
+      "type": "seed",
+      "node": "17",
+      "input": "seed"
+    }
+  ],
+  "outputs": [
+    {
+      "node": "9"
+    }
+  ]
+}
