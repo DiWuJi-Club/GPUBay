@@ -9,6 +9,7 @@ const mobile = useMobile()
 const route = useRoute()
 const tabs = [
   { key: 'market', path: '/market', label: '算力市场' },
+  { key: 'workflows', path: '/workflows', label: '工作流市场' },
   { key: 'instances', path: '/instances', label: '我的实例' },
   { key: 'wallet', path: '/wallet', label: '钱包' },
   { key: 'account', path: '/account', label: '我的' },
