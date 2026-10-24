@@ -373,12 +373,15 @@ func TestAdminDisableKey(t *testing.T) {
 	if diff["reason"] != "滥用" || diff["key_hint"] != k.KeyHint {
 		t.Fatalf("diff = %v", diff)
 	}
-	// 已停用：幂等，不再记审计；已撤销：invalid_state
+	// 已停用：状态不变，但照记审计（留下管理员的原因）；已撤销：invalid_state
 	if err := e.svc.AdminDisableKey(e.ctx, e.admin(), k.ID, "again"); err != nil {
 		t.Fatal(err)
 	}
-	if e.auditCount("llm.key.admin_disable", strconv.FormatInt(k.ID, 10)) != 1 {
-		t.Fatal("idempotent disable must not audit")
+	if e.auditCount("llm.key.admin_disable", strconv.FormatInt(k.ID, 10)) != 2 {
+		t.Fatal("repeated admin disable must still audit")
+	}
+	if diff := e.lastAuditDiff("llm.key.admin_disable", strconv.FormatInt(k.ID, 10)); diff["reason"] != "again" || diff["from"] != llm.KeyDisabled {
+		t.Fatalf("second diff = %v", diff)
 	}
 	if err := e.svc.RevokeKey(e.ctx, u, k.ID, ""); err != nil {
 		t.Fatal(err)

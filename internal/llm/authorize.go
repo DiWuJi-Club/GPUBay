@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"spark-cloud/internal/platform/db"
@@ -41,28 +43,46 @@ type keyCacheEntry struct {
 	expires time.Time
 }
 
+// keyCache 是 Authorize 的进程内缓存：key_hash → *keyCacheEntry。
+//
+// gen 是失效代数：InvalidateKey / InvalidateUser 先 gen+1 再删条目。Authorize 未命中时先读 gen、再查库、写入条目后复核 gen：
+// 变了就删掉自己刚写的条目（CompareAndDelete）。于是「查库在提交前、写缓存在失效后」的旧数据不会留在缓存里——
+// 调用方在事务提交后再失效，本进程内的撤销 / 停用 / 封禁立即生效（期间已在途的那一次查询仍可能用旧数据放行一次）。
+type keyCache struct {
+	m         sync.Map
+	gen       atomic.Uint64
+	afterLoad func() // 仅测试：查库之后、写缓存之前调用
+}
+
 // Authorize 按 Key 哈希鉴权（规格 §6.1 步骤 2～3）：Key（active、未过期）→ 用户（未封禁、已实名）→ 账户（未停用、无欠费）。
 // 查询结果缓存 KeyCacheTTL，状态 / 过期 / 门槛每次按 now 重新判断。失败返回 *AuthError；数据库错误原样返回。
 func (s *Service) Authorize(ctx context.Context, keyHash string, now time.Time) (AuthContext, error) {
 	if keyHash == "" {
 		return AuthContext{}, errInvalidKey()
 	}
-	var ac AuthContext
-	if v, ok := s.keyCache.Load(keyHash); ok && now.Before(v.(keyCacheEntry).expires) {
-		ac = v.(keyCacheEntry).ac
-	} else {
-		found, err := s.loadAuth(ctx, keyHash)
-		if err != nil {
-			return AuthContext{}, err
-		}
-		if found == nil {
-			s.keyCache.Delete(keyHash)
-			return AuthContext{}, errInvalidKey()
-		}
-		ac = *found
-		s.keyCache.Store(keyHash, keyCacheEntry{ac: ac, expires: now.Add(KeyCacheTTL)})
+	c := &s.keyCache
+	if v, ok := c.m.Load(keyHash); ok && now.Before(v.(*keyCacheEntry).expires) {
+		ac := v.(*keyCacheEntry).ac
+		return ac, checkAuth(ac, now)
 	}
-	return ac, checkAuth(ac, now)
+	gen := c.gen.Load()
+	found, err := s.loadAuth(ctx, keyHash)
+	if err != nil {
+		return AuthContext{}, err
+	}
+	if c.afterLoad != nil {
+		c.afterLoad()
+	}
+	if found == nil {
+		c.m.Delete(keyHash)
+		return AuthContext{}, errInvalidKey()
+	}
+	e := &keyCacheEntry{ac: *found, expires: now.Add(KeyCacheTTL)}
+	c.m.Store(keyHash, e)
+	if c.gen.Load() != gen {
+		c.m.CompareAndDelete(keyHash, e)
+	}
+	return e.ac, checkAuth(e.ac, now)
 }
 
 func checkAuth(ac AuthContext, now time.Time) error {
@@ -122,5 +142,19 @@ func (s *Service) loadAuth(ctx context.Context, keyHash string) (*AuthContext, e
 	return &ac, nil
 }
 
-// InvalidateKey 本进程内立即失效该哈希的缓存（控制台修改 / 撤销、后台停用时调用）；其它进程最多 KeyCacheTTL 后生效。
-func (s *Service) InvalidateKey(hash string) { s.keyCache.Delete(hash) }
+// InvalidateKey 本进程内立即失效该哈希的缓存（控制台修改 / 撤销、后台停用时在事务提交后调用）；其它进程最多 KeyCacheTTL 后生效。
+func (s *Service) InvalidateKey(hash string) {
+	s.keyCache.gen.Add(1)
+	s.keyCache.m.Delete(hash)
+}
+
+// InvalidateUser 本进程内立即失效该用户全部 Key 的缓存（账户限额 / 停用、欠费变化、封禁 / 解封、实名变化后在事务提交后调用）。
+func (s *Service) InvalidateUser(userID int64) {
+	s.keyCache.gen.Add(1)
+	s.keyCache.m.Range(func(k, v any) bool {
+		if v.(*keyCacheEntry).ac.UserID == userID {
+			s.keyCache.m.CompareAndDelete(k, v)
+		}
+		return true
+	})
+}

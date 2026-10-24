@@ -339,7 +339,7 @@ func (s *Service) AdminListKeys(ctx context.Context, userID int64) ([]Key, error
 	return collectKeys(s.d.Pool.Query(ctx, `SELECT `+keyCols+` FROM llm_api_keys WHERE user_id = $1 ORDER BY created_at DESC, id DESC`, userID))
 }
 
-// AdminDisableKey 后台停用一把 Key（active → disabled；已停用幂等；已撤销 invalid_state）。reason 必填，写进审计 llm.key.admin_disable。
+// AdminDisableKey 后台停用一把 Key（active → disabled；已停用不改状态但照记审计；已撤销 invalid_state）。reason 必填，写进审计 llm.key.admin_disable。
 func (s *Service) AdminDisableKey(ctx context.Context, actor audit.Actor, id int64, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" || utf8.RuneCountInString(reason) > maxAdminReason {
@@ -352,18 +352,18 @@ func (s *Service) AdminDisableKey(ctx context.Context, actor audit.Actor, id int
 			return err
 		}
 		hash = cur.KeyHash
-		switch cur.Status {
-		case KeyRevoked:
+		if cur.Status == KeyRevoked {
 			return apperr.ErrInvalidState
-		case KeyDisabled:
-			return nil
 		}
 		now := s.d.Clock.Now()
-		if _, err := tx.Exec(ctx, `UPDATE llm_api_keys SET status = $2, updated_at = $3 WHERE id = $1`, id, KeyDisabled, now); err != nil {
-			return err
+		if cur.Status != KeyDisabled {
+			if _, err := tx.Exec(ctx, `UPDATE llm_api_keys SET status = $2, updated_at = $3 WHERE id = $1`, id, KeyDisabled, now); err != nil {
+				return err
+			}
 		}
+		// 已停用（用户自己停的或后台再次停用）也记审计：管理员的原因要留档
 		return audit.Record(ctx, tx, now, actor.Entry("llm.key.admin_disable", "llm_api_key", keyTarget(id),
-			map[string]any{"user_id": cur.UserID, "name": cur.Name, "key_hint": cur.KeyHint, "reason": reason}))
+			map[string]any{"user_id": cur.UserID, "name": cur.Name, "key_hint": cur.KeyHint, "reason": reason, "from": cur.Status}))
 	})
 	if err != nil {
 		return err

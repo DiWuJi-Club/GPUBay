@@ -7,6 +7,7 @@
 //
 //	| 路径                          | 顺序                                                                                              |
 //	|-------------------------------|---------------------------------------------------------------------------------------------------|
+//	| 控制台建 Key CreateKey         | llm_accounts(user) FOR UPDATE（无则先插）→ 插 llm_api_keys（计数 ≤ 20 在账户行锁下）            |
 //	| 网关记账 RecordUsage           | llm_accounts(user) FOR UPDATE → 插 llm_usage → llm_api_keys(key)                                   |
 //	| 结算 Settle                    | llm_accounts(user) FOR UPDATE → llm_usage（UPDATE 标记）→ llm_settlements → llm_usage_daily → wallet_accounts(user) |
 //	| 建节点                         | machines(FOR NO KEY UPDATE SKIP LOCKED) → 插 instances / machine_leases（rental.PlaceSystem）→ 插 llm_nodes |
@@ -22,7 +23,6 @@ package llm
 import (
 	"context"
 	"log/slog"
-	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -97,8 +97,8 @@ type Deps struct {
 
 type Service struct {
 	d Deps
-	// keyCache：key_hash → keyCacheEntry（Authorize 的 KeyCacheTTL 缓存，见 authorize.go）。
-	keyCache sync.Map
+	// keyCache：Authorize 的 KeyCacheTTL 缓存与失效代数（见 authorize.go）。
+	keyCache keyCache
 	limiter  *Limiter
 	router   *Router
 }

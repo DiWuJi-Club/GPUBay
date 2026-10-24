@@ -177,3 +177,50 @@ func TestAuthorizeCacheTTL(t *testing.T) {
 		t.Fatal("revoked in-process")
 	}
 }
+
+// 查库在撤销提交前、写缓存在 InvalidateKey 之后：失效代数让这条旧数据不留在缓存里，下一次立即 401。
+func TestAuthorizeInvalidateRace(t *testing.T) {
+	e := newEnv(t)
+	u := e.verifiedUser()
+	plain, k := e.createKey(u)
+	fired := false
+	llm.SetAuthorizeAfterLoadHook(e.svc, func() {
+		if fired {
+			return
+		}
+		fired = true
+		if err := e.svc.RevokeKey(e.ctx, u, k.ID, ""); err != nil {
+			t.Error(err)
+		}
+	})
+	// 在途的这一次读到的是撤销前的数据，放行
+	if code, _ := e.authCode(e.svc, plain); code != 0 || !fired {
+		t.Fatalf("in-flight lookup: %d fired=%v", code, fired)
+	}
+	if code, c := e.authCode(e.svc, plain); code != 401 || c != "invalid_api_key" {
+		t.Fatalf("stale entry survived invalidate: %d %s", code, c)
+	}
+}
+
+func TestInvalidateUser(t *testing.T) {
+	e := newEnv(t)
+	u, other := e.verifiedUser(), e.verifiedUser()
+	p1, _ := e.createKey(u)
+	p2, _ := e.createKey(u)
+	p3, _ := e.createKey(other)
+	for _, p := range []string{p1, p2, p3} {
+		if code, _ := e.authCode(e.svc, p); code != 0 {
+			t.Fatal("precondition")
+		}
+	}
+	e.exec(`UPDATE llm_accounts SET debt = 50 WHERE user_id IN ($1, $2)`, u, other)
+	e.svc.InvalidateUser(u)
+	for _, p := range []string{p1, p2} {
+		if code, c := e.authCode(e.svc, p); code != 402 || c != "insufficient_quota" {
+			t.Fatalf("after InvalidateUser: %d %s", code, c)
+		}
+	}
+	if code, _ := e.authCode(e.svc, p3); code != 0 {
+		t.Fatal("other user's entry must stay cached")
+	}
+}
