@@ -93,6 +93,11 @@ func TestPrepareInstallWorkflows(t *testing.T) {
 	if _, err := svc.PrepareInstall(e.ctx, e.pool, plain.ID, e.imageID, model4B, ids); !errors.Is(err, apperr.ErrWorkflowAppUnsupported) || gotIDs != nil {
 		t.Fatalf("unsupported version = %v (resolve called with %v)", err, gotIDs)
 	}
+	// 不是 comfyui 的应用，即使版本声明支持工作流 → workflow_app_unsupported（不调 ResolveWorkflows）
+	fake, _ := e.publishedApp("fake-comfy", workflowSpec(8288), goodScript, []int64{e.imageID})
+	if _, err := svc.PrepareInstall(e.ctx, e.pool, fake.ID, e.imageID, model4B, ids); !errors.Is(err, apperr.ErrWorkflowAppUnsupported) || gotIDs != nil {
+		t.Fatalf("non-comfyui app = %v (resolve called with %v)", err, gotIDs)
+	}
 	// 没接 ResolveWorkflows → workflow_app_unsupported
 	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, comfy.ID, e.imageID, model4B, ids); !errors.Is(err, apperr.ErrWorkflowAppUnsupported) {
 		t.Fatalf("no resolver = %v", err)
@@ -267,6 +272,32 @@ func TestRedeployInTxMatchesRedeploy(t *testing.T) {
 	}
 	if _, err := appdeploy.LockDeployment(e.ctx, e.pool, "dep-nope"); !errors.Is(err, apperr.ErrNotFound) {
 		t.Fatalf("LockDeployment missing = %v", err)
+	}
+}
+
+// 显式指定部署自己的当前版本：即使已下线也原样重新部署（计划 11 改工作流集合不换版本）；其它已下线版本仍 app_not_found。
+func TestRedeployCurrentRetiredVersion(t *testing.T) {
+	e := newEnv(t, 1)
+	app, v1 := e.publishedApp("comfyui", workflowSpec(8188), goodScript, []int64{e.imageID})
+	inst := e.runningInstance()
+	d := e.setDep(e.create(inst, app.ID, model4B).ID, appdeploy.StateFailed, appdeploy.DesiredRunning)
+	v2 := e.publish(app.ID, "1.1.0", workflowSpec(8188), goodScript+"# v2\n", []int64{e.imageID})
+	e.exec(`UPDATE app_versions SET status = 'retired' WHERE id = $1`, v1.ID)
+	redeploy := func(vid *int64) (appdeploy.Deployment, error) {
+		return e.svc.Redeploy(e.ctx, appdeploy.RedeployRequest{UserID: e.userID, InstanceID: inst.ID, DeploymentID: d.ID, VersionID: vid})
+	}
+	got, err := redeploy(&v1.ID)
+	if err != nil || got.State != appdeploy.StateQueued || got.AppVersionID != v1.ID || got.SpecHash != v1.SpecHash {
+		t.Fatalf("redeploy current retired = %+v, %v", got, err)
+	}
+	// 换到 v2 后，再指定已下线的 v1（不是当前版本）→ app_not_found
+	e.setDep(d.ID, appdeploy.StateFailed, appdeploy.DesiredRunning)
+	if got, err = redeploy(&v2.ID); err != nil || got.AppVersionID != v2.ID {
+		t.Fatalf("redeploy v2 = %+v, %v", got, err)
+	}
+	e.setDep(d.ID, appdeploy.StateFailed, appdeploy.DesiredRunning)
+	if _, err := redeploy(&v1.ID); !errors.Is(err, apperr.ErrAppNotFound) {
+		t.Fatalf("redeploy other retired = %v", err)
 	}
 }
 

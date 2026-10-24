@@ -178,7 +178,7 @@ func dedupeRefs(refs []WorkflowRef) []WorkflowRef {
 }
 
 // PrepareInstall 下单预装校验：published 应用的最新 published 版本、镜像兼容、变量；workflowIDs 非空时（计划 11）
-// 版本须支持工作流且接了 Deps.ResolveWorkflows（否则 workflow_app_unsupported），由它解析出集合。错误都是 4xx 的 apperr
+// 应用须是 comfyui、版本须支持工作流且接了 Deps.ResolveWorkflows（否则 workflow_app_unsupported），由它解析出集合。错误都是 4xx 的 apperr
 // （app_not_found / app_unavailable / app_image_mismatch / app_env_* / workflow_*），rental 在扣款前整单失败。
 func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, imageID int64, env map[string]string, workflowIDs []int64) (rental.InstallPlan, error) {
 	app, ver, err := s.resolveVersion(ctx, q, appID, nil)
@@ -194,7 +194,7 @@ func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, image
 	}
 	plan := &installPlan{app: app, ver: ver, plain: plain, secret: secret}
 	if len(workflowIDs) > 0 {
-		if !ver.Spec.SupportsWorkflows || s.d.ResolveWorkflows == nil {
+		if app.Slug != comfyUISlug || !ver.Spec.SupportsWorkflows || s.d.ResolveWorkflows == nil {
 			return nil, apperr.ErrWorkflowAppUnsupported
 		}
 		refs, err := s.d.ResolveWorkflows(ctx, q, workflowIDs)
