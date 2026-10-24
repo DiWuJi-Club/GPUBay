@@ -35,7 +35,8 @@ export interface ButlerMessage {
   seq: number
   role: ButlerRole
   content: ButlerBlock[]
-  created_at: string
+  /** 规格 §10.1 未列出，后端可能不返回 */
+  created_at?: string
 }
 
 /** 待确认的写操作（SSE confirm 事件与 GET 详情的 pending_tool_call 同款）。 */
