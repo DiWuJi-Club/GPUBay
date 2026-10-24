@@ -567,6 +567,21 @@ func TestQuickRunFlow(t *testing.T) {
 		!strings.HasPrefix(resp.Header.Get("Content-Disposition"), "inline") {
 		t.Fatalf("file = %d %v %d bytes", resp.StatusCode, resp.Header, len(body))
 	}
+	// 单段 Range 透传 206（视频拖动进度条）；平台自己的 Content-Type / nosniff / CSP 不变
+	resp, body = c.raw("GET", base+"/runs/"+runID+"/files/1", nil, map[string]string{"Range": "bytes=1-3"})
+	if resp.StatusCode != 206 || !bytes.Equal(body, comfytest.OnePixelPNG[1:4]) ||
+		resp.Header.Get("Content-Range") != fmt.Sprintf("bytes 1-3/%d", len(comfytest.OnePixelPNG)) || resp.Header.Get("Accept-Ranges") != "bytes" ||
+		resp.Header.Get("Content-Length") != "3" || resp.Header.Get("Content-Type") != "image/png" || resp.Header.Get("X-Content-Type-Options") != "nosniff" ||
+		resp.Header.Get("Content-Security-Policy") != "default-src 'none'; sandbox" {
+		t.Fatalf("range file = %d %v %q", resp.StatusCode, resp.Header, body)
+	}
+	// 多段 / 不合法 → 完整 200
+	for _, rng := range []string{"bytes=0-1,3-4", "bytes=-3", "bytes=x"} {
+		resp, body = c.raw("GET", base+"/runs/"+runID+"/files/1", nil, map[string]string{"Range": rng})
+		if resp.StatusCode != 200 || !bytes.Equal(body, comfytest.OnePixelPNG) || resp.Header.Get("Content-Range") != "" {
+			t.Fatalf("range %q = %d %v %d bytes", rng, resp.StatusCode, resp.Header, len(body))
+		}
+	}
 	for _, p := range []string{"/files/2", "/files/-1", "/files/x"} {
 		if code, out := c.do("GET", base+"/runs/"+runID+p, nil); code != 404 {
 			t.Fatalf("file %s = %d %v", p, code, out)

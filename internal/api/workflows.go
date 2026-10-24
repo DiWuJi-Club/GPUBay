@@ -485,14 +485,19 @@ func (s *Server) handleRunFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.extendDeadlines(w, 0, wfFileWriteDeadline)
-	f, err := s.Runs.OpenFile(r.Context(), req, index)
+	// 只转发单个 Range 头（comfywf 再校验成单段 bytes=a-b / bytes=a-）；多个 Range 头 → 完整文件
+	var rng string
+	if vs := r.Header.Values("Range"); len(vs) == 1 {
+		rng = vs[0]
+	}
+	f, err := s.Runs.OpenFile(r.Context(), req, index, rng)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
 	}
 	defer f.Body.Close()
 	f.SetHeaders(w.Header()) // 覆盖组中间件的 no-store
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(f.Status)  // 200，或按 Range 的 206（Content-Range 已校验）
 	if _, err := io.Copy(w, f.Body); err != nil {
 		// 响应头已发出，只能中断连接（客户端看到截断的响应）。客户端中途断开很常见（关掉预览），只记 Debug
 		lvl := slog.LevelDebug

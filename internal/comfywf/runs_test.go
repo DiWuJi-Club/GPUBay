@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -576,7 +577,7 @@ func TestRunsOpenFile(t *testing.T) {
 	e.fake.SetHistory(run.PromptID, comfytest.DoneState(comfytest.PNG("图 1.png"),
 		comfytest.File{Filename: "clip.mp4", Subfolder: "video", Type: "output"}))
 	e.fake.SetView(comfytest.ViewConfig{ContentType: "text/html", Body: []byte("<script>alert(1)</script>")})
-	f, err := e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	f, err := e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -598,7 +599,7 @@ func TestRunsOpenFile(t *testing.T) {
 	}
 
 	e.fake.SetView(comfytest.ViewConfig{})
-	f, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 1)
+	f, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -608,23 +609,23 @@ func TestRunsOpenFile(t *testing.T) {
 	}
 
 	for _, idx := range []int{2, -1} {
-		_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), idx)
+		_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), idx, "")
 		wantErr(t, err, "not_found", 404)
 	}
 	// 容器里文件已不在
 	e.fake.SetView(comfytest.ViewConfig{Status: 404, Body: []byte("not found")})
-	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	wantErr(t, err, "not_found", 404)
 	e.fake.SetView(comfytest.ViewConfig{Status: 500, Body: []byte("x")})
-	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	wantErr(t, err, "upstream_unreachable", 502)
 
 	// 大小：Content-Length 超限 → 413；没有长度 → 读到上限后报错；恰好上限 → 正常
 	e.fake.SetView(comfytest.ViewConfig{Size: MaxViewBytes + 1})
-	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	wantErr(t, err, "file_too_large", 413)
 	e.fake.SetView(comfytest.ViewConfig{Size: MaxViewBytes + 1, NoLength: true})
-	f, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	f, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,7 +635,7 @@ func TestRunsOpenFile(t *testing.T) {
 		t.Fatalf("chunked over limit: len %d n %d err %v", f.Length, n, err)
 	}
 	e.fake.SetView(comfytest.ViewConfig{Size: MaxViewBytes, NoLength: true})
-	f, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	f, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,19 +647,19 @@ func TestRunsOpenFile(t *testing.T) {
 
 	// 未完成的运行没有文件；别人的运行 404；实例停了 → app_invalid_state
 	q := e.mustStart()
-	_, err = e.runs.OpenFile(e.ctx, e.getReq(q.ID), 0)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(q.ID), 0, "")
 	wantErr(t, err, "not_found", 404)
 	other := e.getReq(run.ID)
 	other.UserID++
-	_, err = e.runs.OpenFile(e.ctx, other, 0)
+	_, err = e.runs.OpenFile(e.ctx, other, 0, "")
 	wantErr(t, err, "not_found", 404)
 	e.exec(`UPDATE instances SET state = 'stopped' WHERE id = $1`, e.ins)
-	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	wantErr(t, err, "app_invalid_state", 409)
 	e.exec(`UPDATE instances SET state = 'running' WHERE id = $1`, e.ins)
 	// 终态运行读不到 history：如实报连不上 / 坏响应（不是 404）
 	e.setDialErr(&upstream.DialError{InstanceID: e.ins, Err: errors.New("down")})
-	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	wantErr(t, err, "upstream_unreachable", 503)
 	e.setDialErr(nil)
 	e.setOverride(func(w http.ResponseWriter, r *http.Request) bool {
@@ -668,13 +669,125 @@ func TestRunsOpenFile(t *testing.T) {
 		io.WriteString(w, `<html>`)
 		return true
 	})
-	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	wantErr(t, err, "upstream_unreachable", 502)
 	e.setOverride(nil)
 	// history 丢了（ComfyUI 重启）：文件拿不到 → 404
 	e.fake.Forget(run.PromptID)
-	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "")
 	wantErr(t, err, "not_found", 404)
+}
+
+// 视频拖动进度条：单段 Range（bytes=a-b / bytes=a-）原样转给 /view，206 校验 Content-Range 后透传；其余 Range 不转发（完整 200）。
+func TestRunsOpenFileRange(t *testing.T) {
+	e := newRunEnv(t)
+	run := e.mustStart()
+	e.fake.SetHistory(run.PromptID, comfytest.DoneState(comfytest.File{Filename: "clip.mp4", Subfolder: "video", Type: "output"}))
+	body := "0123456789abcdefghijklmnopqrstuvwxyz" // 36 字节
+	e.fake.SetView(comfytest.ViewConfig{ContentType: "text/html", Body: []byte(body)})
+	var gotRange []string
+	var rmu sync.Mutex
+	e.setOverride(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/view" {
+			rmu.Lock()
+			gotRange = append(gotRange, r.Header.Get("Range"))
+			rmu.Unlock()
+		}
+		return false
+	})
+	lastRange := func() string {
+		rmu.Lock()
+		defer rmu.Unlock()
+		return gotRange[len(gotRange)-1]
+	}
+	open := func(rng string) (*File, string) {
+		t.Helper()
+		f, err := e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, rng)
+		if err != nil {
+			t.Fatalf("OpenFile(%q): %v", rng, err)
+		}
+		b, err := io.ReadAll(f.Body)
+		f.Body.Close()
+		if err != nil {
+			t.Fatalf("read %q: %v", rng, err)
+		}
+		return f, string(b)
+	}
+
+	f, b := open("bytes=2-5")
+	h := http.Header{}
+	f.SetHeaders(h)
+	if lastRange() != "bytes=2-5" || f.Status != http.StatusPartialContent || b != "2345" || f.Length != 4 ||
+		h.Get("Content-Range") != "bytes 2-5/36" || h.Get("Accept-Ranges") != "bytes" || h.Get("Content-Length") != "4" ||
+		h.Get("Content-Type") != "video/mp4" || h.Get("X-Content-Type-Options") != "nosniff" || h.Get("Content-Security-Policy") != "default-src 'none'; sandbox" {
+		t.Fatalf("range 2-5: %+v %q %v", f, b, h)
+	}
+	if f, b = open("bytes=30-"); lastRange() != "bytes=30-" || f.Status != 206 || b != "uvwxyz" || f.ContentRange != "bytes 30-35/36" {
+		t.Fatalf("range 30-: %+v %q", f, b)
+	}
+	// 末尾超出文件长度：ComfyUI 截到文件尾
+	if f, b = open("bytes=34-99"); f.Status != 206 || b != "yz" || f.ContentRange != "bytes 34-35/36" {
+		t.Fatalf("range 34-99: %+v %q", f, b)
+	}
+	// 不转发：多段、后缀、反序、非 bytes、带空格 / 杂字符、超长数字
+	for _, rng := range []string{"bytes=1-3,5-6", "bytes=-5", "bytes=5-1", "items=1-2", "bytes= 1-2", "bytes=1-2x", "bytes=1234567890123456789-"} {
+		f, b = open(rng)
+		h = http.Header{}
+		f.SetHeaders(h)
+		if lastRange() != "" || f.Status != http.StatusOK || b != body || h.Get("Content-Range") != "" || h.Get("Content-Length") != "36" {
+			t.Fatalf("%q: forwarded %q, %+v %q", rng, lastRange(), f, b)
+		}
+	}
+	// 起点在文件尾之后：ComfyUI 416 → 不带 Range 重取完整文件
+	if f, b = open("bytes=36-"); f.Status != http.StatusOK || b != body || lastRange() != "" {
+		t.Fatalf("unsatisfiable: %+v %q", f, b)
+	}
+	// ComfyUI 不支持 Range（回 200）：照常完整返回
+	e.setOverride(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/view" {
+			return false
+		}
+		io.WriteString(w, body)
+		return true
+	})
+	if f, b = open("bytes=2-5"); f.Status != http.StatusOK || b != body || f.ContentRange != "" {
+		t.Fatalf("upstream ignores range: %+v %q", f, b)
+	}
+	// 敌意 / 错误的 206：Content-Range 与请求不符、缺失、长度不符 → 502
+	for _, bad := range []struct{ cr, body string }{
+		{"bytes 3-5/36", "345"},      // 起点不符
+		{"bytes 2-9/36", "23456789"}, // 超出请求的终点
+		{"", "2345"},                 // 缺 Content-Range
+		{"bytes 2-5/*", "2345"},      // 总长未知
+		{"bytes 2-5/5", "2345"},      // 终点 ≥ 总长
+		{"bytes 2-5/36", "23"},       // Content-Length 不符
+		{"bytes 2-5/36, 1", "2345"},
+	} {
+		e.setOverride(func(w http.ResponseWriter, r *http.Request) bool {
+			if r.URL.Path != "/view" {
+				return false
+			}
+			if bad.cr != "" {
+				w.Header().Set("Content-Range", bad.cr)
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(bad.body)))
+			w.WriteHeader(http.StatusPartialContent)
+			io.WriteString(w, bad.body)
+			return true
+		})
+		_, err := e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "bytes=2-5")
+		wantErr(t, err, "upstream_unreachable", 502)
+	}
+	// 文件总长超过上限：哪怕只取一小段也 413（与完整取一致）
+	e.setOverride(nil)
+	e.fake.SetView(comfytest.ViewConfig{Size: MaxViewBytes + 1})
+	_, err := e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0, "bytes=0-99")
+	wantErr(t, err, "file_too_large", 413)
+	e.fake.SetView(comfytest.ViewConfig{Size: MaxViewBytes})
+	if f, b = open(fmt.Sprintf("bytes=%d-", MaxViewBytes-3)); f.Status != 206 || b != "xxx" ||
+		f.ContentRange != fmt.Sprintf("bytes %d-%d/%d", MaxViewBytes-3, MaxViewBytes-1, MaxViewBytes) {
+		t.Fatalf("tail of max file: %+v %q", f, b)
+	}
 }
 
 func TestRunsLost(t *testing.T) {
