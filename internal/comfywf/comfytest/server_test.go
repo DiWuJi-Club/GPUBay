@@ -75,14 +75,27 @@ func TestServer(t *testing.T) {
 		t.Fatalf("done = %+v", d)
 	}
 
-	resp, err = http.Get(ts.URL + "/view?filename=a.png&type=output")
+	if resp, err := http.Get(ts.URL + "/view?filename=other.png&type=output"); err != nil || resp.StatusCode != 404 {
+		t.Fatalf("unknown file: %v %v", resp, err)
+	}
+	resp, err = http.Get(ts.URL + "/view?filename=ComfyUI_00001_.png&type=output")
 	if err != nil {
 		t.Fatal(err)
 	}
 	b, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.Header.Get("Content-Type") != "image/png" || string(b) != string(OnePixelPNG) || s.Views()[0].Get("filename") != "a.png" {
+	if resp.Header.Get("Content-Type") != "image/png" || string(b) != string(OnePixelPNG) || s.Views()[1].Get("filename") != "ComfyUI_00001_.png" ||
+		resp.Header.Get("Content-Disposition") != `filename="ComfyUI_00001_.png"` {
 		t.Fatalf("view: %v %d", resp.Header, len(b))
+	}
+
+	// 队列项与 history 回显提交的 prompt 与 client_id
+	var full map[string]struct {
+		Prompt []json.RawMessage `json:"prompt"`
+	}
+	getJSON(t, ts.URL+"/history/"+pr.PromptID, &full)
+	if p := full[pr.PromptID].Prompt; len(p) != 5 || !strings.Contains(string(p[2]), "SaveImage") || string(p[3]) != `{"client_id":"run-abc"}` {
+		t.Fatalf("history prompt = %s", p)
 	}
 
 	s.RejectPrompts("bad ckpt")
@@ -93,6 +106,27 @@ func TestServer(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("reject status = %d", resp.StatusCode)
+	}
+
+	s.RejectMissingNode("FakeNodeType")
+	resp, err = http.Post(ts.URL+"/prompt", "application/json", strings.NewReader(`{"prompt":{"1":{}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mb, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 400 || !strings.Contains(string(mb), "missing_node_type") || !strings.Contains(string(mb), `"node_errors":{}`) {
+		t.Fatalf("missing node: %d %s", resp.StatusCode, mb)
+	}
+	s.RejectMissingNode("")
+	resp, err = http.Post(ts.URL+"/prompt", "application/json", strings.NewReader(`{"client_id":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mb, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 400 || !strings.Contains(string(mb), "no_prompt") {
+		t.Fatalf("no prompt: %d %s", resp.StatusCode, mb)
 	}
 
 	s.Reset()

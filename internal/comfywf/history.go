@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path"
 	"strings"
+	"unicode"
 )
 
 // HistoryResult 是 GET /history/{prompt_id} 解析结果。State：""（history 里还没有该 id，调用方再查 /queue）、
@@ -191,7 +192,7 @@ func errorMessage(msgs []json.RawMessage) string {
 				ExceptionMessage string `json:"exception_message"`
 			}
 			if json.Unmarshal(pair[1], &d) == nil {
-				if s := strings.TrimSpace(d.ExceptionMessage); s != "" {
+				if s := strings.TrimSpace(stripControl(d.ExceptionMessage)); s != "" {
 					return truncateRunes(s, maxRunMessage)
 				}
 			}
@@ -203,6 +204,19 @@ func errorMessage(msgs []json.RawMessage) string {
 		return "任务已被中断"
 	}
 	return "ComfyUI 执行失败"
+}
+
+// stripControl 清理容器给的、要进错误消息的文本：控制字符 → 空格，双向控制字符（unicode.Bidi_Control）删除，非法 UTF-8 删除。
+func stripControl(s string) string {
+	return strings.Map(func(c rune) rune {
+		switch {
+		case unicode.Is(unicode.Bidi_Control, c):
+			return -1
+		case c < 0x20 || c == 0x7f || (c >= 0x80 && c < 0xa0):
+			return ' '
+		}
+		return c
+	}, strings.ToValidUTF8(s, ""))
 }
 
 func truncateRunes(s string, n int) string {
