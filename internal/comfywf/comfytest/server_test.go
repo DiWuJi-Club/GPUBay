@@ -134,3 +134,27 @@ func TestServer(t *testing.T) {
 		t.Fatal("reset")
 	}
 }
+
+func TestIndexAndRequestCap(t *testing.T) {
+	s, ts := Start()
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") || !strings.Contains(string(b), "Fake ComfyUI") {
+		t.Fatalf("GET / = %d %s %q", resp.StatusCode, resp.Header.Get("Content-Type"), b)
+	}
+	for i := 0; i < maxRequests+50; i++ {
+		r, err := http.Get(ts.URL + "/system_stats")
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+	}
+	if got := s.Requests(); len(got) != maxRequests || got[len(got)-1] != "GET /system_stats" {
+		t.Fatalf("requests = %d", len(got))
+	}
+}

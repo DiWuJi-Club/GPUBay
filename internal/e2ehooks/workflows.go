@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"strings"
+	"sync"
 
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/audit"
@@ -19,14 +20,16 @@ import (
 // 两个 fake 工作流（/hooks/workflows/seed，集成测试共用）：A 无自定义节点、有封面；B 带一个自定义节点 FakeNode。
 // 两者都有 api_prompt 与快速出图参数 prompt / steps / seed，输出节点 "9"（SaveImage）。
 const (
-	WorkflowA      = "e2e-wf-a"
-	WorkflowB      = "e2e-wf-b"
-	FakeNodeName   = "FakeNode"
-	FakeNodeType   = "FakeNodeType"
-	FakeNodeGit    = "https://github.com/spark-e2e/FakeNode.git"
-	FakeModelA     = "e2e-a.safetensors"
-	FakeModelB     = "e2e-b.safetensors"
-	FailDiskModel  = "e2e-fail-disk.safetensors" // fake comfyui 的 app.sh 遇到名字含 fail-disk 的模型 → "disk: …" 并退出 2
+	WorkflowA     = "e2e-wf-a"
+	WorkflowB     = "e2e-wf-b"
+	FakeNodeName  = "FakeNode"
+	FakeNodeType  = "FakeNodeType"
+	FakeNodeGit   = "https://github.com/spark-e2e/FakeNode.git"
+	FakeModelA    = "e2e-a.safetensors"
+	FakeModelB    = "e2e-b.safetensors"
+	FailDiskModel = "e2e-fail-disk.safetensors" // 名字含 fail-disk：容器里有 DiskFullMarker 时 fake install 汇报 "disk: …" 并退出 2
+	// DiskFullMarker 是假容器 $SPARK_DATA_DIR（<实例根>/root/data）下的标记文件：存在时 fail-disk 模型安装失败，删掉后重新部署成功。
+	DiskFullMarker = ".e2e-disk-full"
 	fakeModelDir   = "checkpoints"
 	fakeOutputNode = "9"
 )
@@ -41,6 +44,7 @@ type FakeWorkflow struct {
 	SizeGB                        float64
 	Node                          bool
 	Cover                         bool
+	Image                         bool // 再加一个 image 类型的快速出图参数 image（LoadImage 节点 "10"，必填）
 	Sort                          int
 }
 
@@ -93,6 +97,9 @@ func fakeAPIPrompt(fw FakeWorkflow) json.RawMessage {
 		p["10"] = map[string]any{"class_type": FakeNodeType, "inputs": map[string]any{"images": []any{"8", 0}}}
 		images = []any{"10", 0}
 	}
+	if fw.Image {
+		p["11"] = map[string]any{"class_type": "LoadImage", "inputs": map[string]any{"image": "example.png"}}
+	}
 	p[fakeOutputNode] = map[string]any{"class_type": "SaveImage", "inputs": map[string]any{"filename_prefix": "ComfyUI", "images": images}}
 	b, _ := json.Marshal(p)
 	return b
@@ -116,6 +123,9 @@ func fakeManifest(fw FakeWorkflow) comfywf.Manifest {
 		},
 		Outputs: []comfywf.OutputSpec{{Node: fakeOutputNode}},
 	}
+	if fw.Image {
+		m.Inputs = append(m.Inputs, comfywf.InputSpec{Key: "image", Label: "参考图", Type: comfywf.InputImage, Node: "11", Input: "image"})
+	}
 	if fw.Node {
 		m.Nodes = []comfywf.NodeSpec{{Name: FakeNodeName, Git: FakeNodeGit, Commit: FakeNodeCommit, NodeTypes: []string{FakeNodeType}}}
 	}
@@ -131,36 +141,94 @@ func latestSeeded(ctx context.Context, a *app.App, w comfywf.Workflow) (SeededWo
 	return SeededWorkflow{ID: w.ID, Slug: w.Slug, VersionID: v.ID, Version: v.Version}, nil
 }
 
+// seedMu 串行化 fake 工作流的创建 / 发版（并发的 seed 钩子不会撞 slug 唯一键或版本号）。
+var seedMu sync.Mutex
+
+func isWorkflowNotFound(err error) bool {
+	return errors.Is(err, apperr.ErrWorkflowNotFound) || errors.Is(err, apperr.ErrNotFound)
+}
+
 // CreateFakeWorkflow 建并上架一个 fake 工作流、建并发布版本 1.0.0（系统操作人，直接调服务，不经 TOTP），可选封面。
-// 幂等：同 slug 已存在 → 返回其最新已发布版本。
+// 幂等：同 slug 已存在 → 返回其最新已发布版本；自愈：已存在但没有已发布版本（例如上次在发布前失败）→ 发布最新的草稿，
+// 没有草稿则按 fw 新建一个版本并发布；缺封面则补上；未上架则上架。
 func CreateFakeWorkflow(ctx context.Context, a *app.App, fw FakeWorkflow) (SeededWorkflow, error) {
-	if w, err := a.Workflows.WorkflowBySlug(ctx, fw.Slug); err == nil {
-		return latestSeeded(ctx, a, w)
-	} else if !errors.Is(err, apperr.ErrWorkflowNotFound) && !errors.Is(err, apperr.ErrNotFound) {
+	seedMu.Lock()
+	defer seedMu.Unlock()
+	actor := audit.Actor{}
+	w, err := a.Workflows.WorkflowBySlug(ctx, fw.Slug)
+	switch {
+	case isWorkflowNotFound(err):
+		if w, err = a.Workflows.CreateWorkflow(ctx, actor, comfywf.WorkflowInput{Slug: fw.Slug, Name: fw.Name, Summary: fw.Summary,
+			Description: "e2e 用的 fake 工作流：模型与节点不会真的下载。", Category: fw.Category, Tags: []string{"e2e"}, Sort: fw.Sort,
+			Status: comfywf.StatusPublished}); err != nil {
+			return SeededWorkflow{}, fmt.Errorf("create workflow %s: %w", fw.Slug, err)
+		}
+	case err != nil:
 		return SeededWorkflow{}, err
 	}
-	actor := audit.Actor{}
-	w, err := a.Workflows.CreateWorkflow(ctx, actor, comfywf.WorkflowInput{Slug: fw.Slug, Name: fw.Name, Summary: fw.Summary,
-		Description: "e2e 用的 fake 工作流：模型与节点不会真的下载。", Category: fw.Category, Tags: []string{"e2e"}, Sort: fw.Sort,
-		Status: comfywf.StatusPublished})
-	if err != nil {
-		return SeededWorkflow{}, fmt.Errorf("create workflow %s: %w", fw.Slug, err)
+	if w.Status != comfywf.StatusPublished {
+		if w, err = a.Workflows.UpdateWorkflow(ctx, actor, w.ID, comfywf.WorkflowInput{Name: w.Name, Summary: w.Summary, Description: w.Description,
+			Category: w.Category, Tags: w.Tags, Sort: w.Sort, Status: comfywf.StatusPublished}); err != nil {
+			return SeededWorkflow{}, fmt.Errorf("list workflow %s: %w", fw.Slug, err)
+		}
 	}
-	if fw.Cover {
+	if fw.Cover && !w.HasCover {
 		if _, err := a.Workflows.SetCover(ctx, actor, w.ID, bytes.NewReader(comfytest.OnePixelPNG)); err != nil {
 			return SeededWorkflow{}, fmt.Errorf("cover %s: %w", fw.Slug, err)
 		}
 	}
-	changelog := "首个版本"
-	v, err := a.Workflows.CreateVersion(ctx, actor, w.ID, comfywf.VersionInput{Version: "1.0.0", Graph: fakeGraph(fw), APIPrompt: fakeAPIPrompt(fw),
-		Manifest: fakeManifest(fw), Changelog: &changelog})
-	if err != nil {
-		return SeededWorkflow{}, fmt.Errorf("create version %s: %w", fw.Slug, err)
+	if _, err := a.Workflows.LatestPublished(ctx, a.Fleet.Pool(), w.ID); err == nil {
+		return latestSeeded(ctx, a, w)
+	} else if !errors.Is(err, apperr.ErrWorkflowUnavailable) {
+		return SeededWorkflow{}, err
 	}
-	if v, err = a.Workflows.PublishVersion(ctx, actor, w.ID, v.ID); err != nil {
+	vs, err := a.Workflows.ListVersions(ctx, w.ID) // 按创建倒序
+	if err != nil {
+		return SeededWorkflow{}, err
+	}
+	var draft *comfywf.Version
+	for i := range vs {
+		if vs[i].Status == comfywf.StatusDraft {
+			draft = &vs[i]
+			break
+		}
+	}
+	if draft == nil {
+		changelog := "首个版本"
+		version := "1.0.0"
+		if len(vs) > 0 {
+			version, changelog = nextPatch(vs), "e2e 补发版本"
+		}
+		v, err := a.Workflows.CreateVersion(ctx, actor, w.ID, comfywf.VersionInput{Version: version, Graph: fakeGraph(fw), APIPrompt: fakeAPIPrompt(fw),
+			Manifest: fakeManifest(fw), Changelog: &changelog})
+		if err != nil {
+			return SeededWorkflow{}, fmt.Errorf("create version %s: %w", fw.Slug, err)
+		}
+		draft = &v
+	}
+	v, err := a.Workflows.PublishVersion(ctx, actor, w.ID, draft.ID)
+	if err != nil {
 		return SeededWorkflow{}, fmt.Errorf("publish %s: %w", fw.Slug, err)
 	}
 	return SeededWorkflow{ID: w.ID, Slug: w.Slug, VersionID: v.ID, Version: v.Version}, nil
+}
+
+// nextPatch：已有版本里形如 X.Y.Z 的最大者把 Z + 1（都不是这种形状 → 1.0.<版本数>）。
+func nextPatch(vs []comfywf.Version) string {
+	best, found := [3]int{}, false
+	for _, v := range vs {
+		var x [3]int
+		if n, err := fmt.Sscanf(v.Version, "%d.%d.%d", &x[0], &x[1], &x[2]); err != nil || n != 3 || fmt.Sprintf("%d.%d.%d", x[0], x[1], x[2]) != v.Version {
+			continue
+		}
+		if !found || x[0] > best[0] || (x[0] == best[0] && (x[1] > best[1] || (x[1] == best[1] && x[2] > best[2]))) {
+			best, found = x, true
+		}
+	}
+	if !found {
+		return fmt.Sprintf("1.0.%d", len(vs))
+	}
+	return fmt.Sprintf("%d.%d.%d", best[0], best[1], best[2]+1)
 }
 
 // SeedWorkflows 幂等地建 A、B（按此顺序返回）。
@@ -177,8 +245,10 @@ func SeedWorkflows(ctx context.Context, a *app.App) ([]SeededWorkflow, error) {
 }
 
 // PublishFakeVersion 以工作流最新已发布版本的内容（graph / api_prompt / manifest 不变）建并发布新版本 version
-// （空 = 1.0.<已有版本数>）；changelog 空 = "e2e 新版本 <version>"。
+// （空 = 已有 X.Y.Z 版本中最大者的 Z + 1）；changelog 空 = "e2e 新版本 <version>"。
 func PublishFakeVersion(ctx context.Context, a *app.App, slug, version, changelog string) (SeededWorkflow, error) {
+	seedMu.Lock()
+	defer seedMu.Unlock()
 	w, err := a.Workflows.WorkflowBySlug(ctx, slug)
 	if err != nil {
 		return SeededWorkflow{}, err
@@ -192,7 +262,7 @@ func PublishFakeVersion(ctx context.Context, a *app.App, slug, version, changelo
 		if err != nil {
 			return SeededWorkflow{}, err
 		}
-		version = fmt.Sprintf("1.0.%d", len(vs))
+		version = nextPatch(vs)
 	}
 	if changelog == "" {
 		changelog = "e2e 新版本 " + version

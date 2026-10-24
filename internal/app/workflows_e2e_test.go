@@ -1,13 +1,17 @@
 package app_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -35,8 +39,7 @@ type wfEnv struct {
 
 func newWfEnv(t *testing.T, machines int) *wfEnv {
 	t.Helper()
-	e := &wfEnv{appsEnv: newAppsEnv(t, machines)}
-	t.Cleanup(func() { assertWorkflowsConsistent(t, e.pool) })
+	e := &wfEnv{appsEnv: newAppsEnv(t, machines)} // 其清理里已有 assertWorkflowsConsistent
 	e.comfy = comfytest.New()
 	ts := httptest.NewServer(e.comfy)
 	t.Cleanup(ts.Close)
@@ -168,6 +171,11 @@ func TestWorkflowsFullLifecycle(t *testing.T) {
 	if strings.Contains(d.LogTail, "downloading") { // MODEL_ID 默认 none：不下预置模型
 		t.Fatalf("MODEL_ID none still downloaded: %s", d.LogTail)
 	}
+	// SPARK_APP_GIT_MIRROR 注入支持工作流的版本的 env（其它应用没有，见 TestAppsFullLifecycle）
+	if env, err := os.ReadFile(filepath.Join(e.appDir(id, "comfyui"), "env")); err != nil ||
+		!strings.Contains(string(env), "export SPARK_GIT_MIRROR='"+testGitMirror+"'\n") {
+		t.Fatalf("comfyui env lacks SPARK_GIT_MIRROR (%v):\n%s", err, env)
+	}
 	if slugs, _ := e.bundleManifest(id); !slices.Equal(slugs, []string{a.Slug}) {
 		t.Fatalf("bundle manifest = %v", slugs)
 	}
@@ -220,7 +228,10 @@ func TestWorkflowsFullLifecycle(t *testing.T) {
 	if w := e.set(dep)[a.Slug]; w.VersionID != nv.VersionID || w.State != "pending" {
 		t.Fatalf("A after update = %+v", w)
 	}
-	e.untilState(dep, appdeploy.StateRunning)
+	d = e.untilState(dep, appdeploy.StateRunning)
+	if !strings.Contains(d.LogTail, "skip model checkpoints/"+e2ehooks.FakeModelA) {
+		t.Fatalf("update re-downloaded A's model:\n%s", d.LogTail)
+	}
 	if w := e.wantSet(dep, map[string]string{a.Slug: "installed", b.Slug: "installed"})[a.Slug]; w.Version != "1.0.1" || w.UpdateAvailable {
 		t.Fatalf("A after reinstall = %+v", w)
 	}
@@ -294,8 +305,9 @@ func TestWorkflowsFullLifecycle(t *testing.T) {
 	}
 }
 
-// 失败链路：清单里有名字含 fail-disk 的模型 → fake install 汇报 "disk: …" 退出 2 → 部署 failed(disk)、该工作流 failed（已装的仍 installed）
-// → 移除它 → 重新部署成功 → running，集合里没有 pending / failed。
+// 失败链路：清单里有名字含 fail-disk 的模型且容器里有 DiskFullMarker → fake install 汇报 "disk: …" 退出 2 → 部署 failed(disk)、
+// 该工作流 failed（已装的仍 installed）→ 删掉标记、用户「重新部署」→ running，失败的工作流经 OnTransition 由 failed 变 installed →
+// 再移除它 → 重新部署 → running，集合里只剩 A（模型保留）。
 func TestWorkflowsInstallFailure(t *testing.T) {
 	e := newWfEnv(t, 1)
 	a := e.wfs[e2ehooks.WorkflowA]
@@ -307,6 +319,10 @@ func TestWorkflowsInstallFailure(t *testing.T) {
 	id, dep := e.orderComfy(e2ehooks.WorkflowA)
 	e.agent()
 	e.untilState(dep, appdeploy.StateRunning)
+	marker := filepath.Join(e.appRootFor(id), e2ehooks.DiskFullMarker)
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	e.c.do("POST", "/instances/"+id+"/apps/"+dep+"/workflows", map[string]any{"workflow_id": bad.ID})
 	d := e.untilState(dep, appdeploy.StateFailed)
 	if d.ErrorCode != appdeploy.ErrCodeDisk || !strings.HasPrefix(d.Message, "disk:") {
@@ -316,17 +332,36 @@ func TestWorkflowsInstallFailure(t *testing.T) {
 	if v := e.view(id, dep); v["error_code"] != "disk" {
 		t.Fatalf("view = %v", v)
 	}
-	e.c.do("DELETE", e.wfPath(id, dep, bad.ID), nil)
+	if exists(e.modelFile(id, e2ehooks.FailDiskModel)) {
+		t.Fatal("fail-disk model created while the disk is full")
+	}
+
+	// 腾出空间 → 重新部署（不改集合）→ running，failed → installed
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	e.c.do("POST", "/instances/"+id+"/apps/"+dep+"/redeploy", map[string]any{})
 	if d := e.dep(dep); d.State != appdeploy.StateQueued {
-		t.Fatalf("after removing the failing workflow = %s", d.State)
+		t.Fatalf("after redeploy = %s", d.State)
 	}
 	d = e.untilState(dep, appdeploy.StateRunning)
 	if d.ErrorCode != "" {
 		t.Fatalf("recovered with error %q", d.ErrorCode)
 	}
+	e.wantSet(dep, map[string]string{a.Slug: "installed", bad.Slug: "installed"})
+	if !exists(e.modelFile(id, e2ehooks.FailDiskModel)) || !exists(e.wfFile(id, bad.Slug)) {
+		t.Fatalf("bad workflow not installed after redeploy\nlog:\n%s", d.LogTail)
+	}
+
+	// 移除它 → 文件删掉、模型保留
+	e.c.do("DELETE", e.wfPath(id, dep, bad.ID), nil)
+	if d := e.dep(dep); d.State != appdeploy.StateQueued {
+		t.Fatalf("after removing the workflow = %s", d.State)
+	}
+	e.untilState(dep, appdeploy.StateRunning)
 	e.wantSet(dep, map[string]string{a.Slug: "installed"})
-	if !exists(e.wfFile(id, a.Slug)) || exists(e.modelFile(id, e2ehooks.FailDiskModel)) {
-		t.Fatal("container files after recovery")
+	if !exists(e.wfFile(id, a.Slug)) || exists(e.wfFile(id, bad.Slug)) || !exists(e.modelFile(id, e2ehooks.FailDiskModel)) {
+		t.Fatal("container files after removal")
 	}
 }
 
@@ -335,7 +370,13 @@ func TestWorkflowsInstallFailure(t *testing.T) {
 func TestWorkflowsQuickRun(t *testing.T) {
 	e := newWfEnv(t, 1)
 	a := e.wfs[e2ehooks.WorkflowA]
-	id, dep := e.orderComfy(e2ehooks.WorkflowA)
+	img, err := e2ehooks.CreateFakeWorkflow(e.ctx, e.a, e2ehooks.FakeWorkflow{Slug: "e2e-wf-img", Name: "E2E 图生图", Category: comfywf.CategoryImg2Img,
+		Model: e2ehooks.FakeModelA, SizeGB: 2.5, Image: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.wfs[img.Slug] = img
+	id, dep := e.orderComfy(e2ehooks.WorkflowA, img.Slug)
 	e.agent()
 	e.untilState(dep, appdeploy.StateRunning)
 	runs := e.wfPath(id, dep, a.ID) + "/runs"
@@ -413,6 +454,47 @@ func TestWorkflowsQuickRun(t *testing.T) {
 	if len(e.comfy.Prompts()) != before {
 		t.Fatal("invalid inputs reached ComfyUI")
 	}
+	// 上传参考图：multipart file → 平台重命名后经代理 POST /upload/image（subfolder spark-quickrun）→ 作为 image 输入提交
+	upload := func(wid int64) (int, map[string]any) {
+		t.Helper()
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		fw, _ := mw.CreateFormFile("file", "my photo.png")
+		fw.Write(comfytest.OnePixelPNG)
+		mw.Close()
+		req, _ := http.NewRequest("POST", e.c.base+e.wfPath(id, dep, wid)+"/uploads", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		resp, err := e.c.http.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+	code, up := upload(img.ID)
+	name, _ := up["name"].(string)
+	if code != 201 || !regexp.MustCompile(`^spark-quickrun/[a-z0-9]{12}\.png$`).MatchString(name) {
+		t.Fatalf("upload = %d %v", code, up)
+	}
+	if ups := e.comfy.Uploads(); len(ups) != 1 || ups[0].Subfolder != "spark-quickrun" || "spark-quickrun/"+ups[0].Filename != name ||
+		ups[0].Size != len(comfytest.OnePixelPNG) {
+		t.Fatalf("comfy uploads = %+v (name %s)", ups, name)
+	}
+	if code, out := upload(a.ID); code != 400 { // A 没有 image 输入
+		t.Fatalf("upload to A = %d %v", code, out)
+	}
+	if code, out := e.call("POST", e.wfPath(id, dep, img.ID)+"/runs", map[string]any{"inputs": map[string]any{}}); code != 400 || out["code"] != "workflow_input_invalid" {
+		t.Fatalf("run without required image = %d %v", code, out)
+	}
+	e.comfy.RejectPrompts("")
+	ri := e.c.do("POST", e.wfPath(id, dep, img.ID)+"/runs", map[string]any{"inputs": map[string]any{"image": name}})
+	last := e.comfy.Prompts()[len(e.comfy.Prompts())-1]
+	if err := json.Unmarshal(last.Prompt, &p); err != nil || last.ClientID != ri["id"] || p["11"].Inputs["image"] != name {
+		t.Fatalf("image prompt = %+v %v", p["11"], err)
+	}
+
 	// 部署不在 running → app_invalid_state
 	e.c.do("POST", "/instances/"+id+"/apps/"+dep+"/stop", map[string]any{})
 	e.untilState(dep, appdeploy.StateStopped)
@@ -422,7 +504,8 @@ func TestWorkflowsQuickRun(t *testing.T) {
 }
 
 // assertWorkflowsConsistent 是规格 §14 的工作流一致性检查（按实际状态机收紧 / 放宽后的版本）：running 的部署上没有 pending / failed 行
-// （Runner 回写 running 时 pending、failed 都变 installed）；installed 行都有 installed_at；每个部署 ≤ 8 行；集合只挂在 comfyui 部署上。
+// （Runner 回写 running 时 pending、failed 都变 installed）；installed 行都有 installed_at；每个部署 ≤ 8 行；集合只挂在 comfyui 部署上；
+// 不引用草稿版本；版本属于该工作流。newAppsEnv 的清理里对所有应用集成测试都执行。
 func assertWorkflowsConsistent(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
@@ -433,6 +516,8 @@ func assertWorkflowsConsistent(t *testing.T, pool *pgxpool.Pool) {
 		{"deployments with more than 8 workflows", `SELECT deployment_id || ' ' || count(*) FROM deployment_workflows GROUP BY deployment_id HAVING count(*) > 8`},
 		{"workflows on non-comfyui deployments", `SELECT dw.deployment_id || ' ' || a.slug FROM deployment_workflows dw
 			JOIN app_deployments d ON d.id = dw.deployment_id JOIN apps a ON a.id = d.app_id WHERE a.slug <> 'comfyui'`},
+		{"rows referencing a draft version", `SELECT dw.deployment_id || ' wf ' || dw.workflow_id || ' v ' || v.version
+			FROM deployment_workflows dw JOIN comfy_workflow_versions v ON v.id = dw.workflow_version_id WHERE v.status = 'draft'`},
 		{"workflow version not belonging to its workflow", `SELECT dw.deployment_id || ' wf ' || dw.workflow_id FROM deployment_workflows dw
 			JOIN comfy_workflow_versions v ON v.id = dw.workflow_version_id WHERE v.workflow_id <> dw.workflow_id`},
 	}

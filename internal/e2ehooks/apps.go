@@ -37,7 +37,8 @@ esac
 // fakeComfyScript 是 fake comfyui（1.1.0 语义：supports_workflows）的 app.sh：install 按部署包里的 workflows/manifest.json
 // （平台生成的紧凑 JSON，按 '{' 拆行后逐行取字段，不依赖 python3）在 $SPARK_DATA_DIR/comfyui 下模拟安装——
 // 每个 wf 复制为 user/default/workflows/spark-<slug>.json（目录里不在清单中的 spark-*.json 删掉，其它文件不动）、
-// 每个模型 touch models/<dir>/<name>（名字含 fail-disk → spark_status 汇报 "disk: …" 并退出 2）、
+// 每个模型 touch models/<dir>/<name>（名字含 fail-disk 且存在标记文件 $SPARK_DATA_DIR/.e2e-disk-full → spark_status 汇报 "disk: …"
+// 并退出 2；删掉标记后重新部署即成功）、
 // 每个节点 mkdir custom_nodes/<name> 并写 .spark-commit；已存在的模型 / commit 相同的节点跳过（日志 "skip model" / "skip node"）。
 // start 同 fakeAppScript。
 const fakeComfyScript = `#!/bin/sh
@@ -70,9 +71,11 @@ case "$1" in
             dir=$(printf '%s\n' "$line" | field dir)
             case "$name" in
               *fail-disk*)
-                spark_status download 10 "disk: 数据盘空间不足，无法下载模型 $name"
-                echo "disk: no space for $name" >&2
-                exit 2
+                if [ -e "$SPARK_DATA_DIR/.e2e-disk-full" ]; then
+                  spark_status download 10 "disk: 数据盘空间不足，无法下载模型 $name"
+                  echo "disk: no space for $name" >&2
+                  exit 2
+                fi
                 ;;
             esac
             if [ -e "$C/models/$dir/$name" ]; then

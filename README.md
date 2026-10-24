@@ -165,7 +165,13 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 ### ComfyUI 工作流市场（计划 11）
 
 - **发布顺序**：只发 platform（迁移 `00024_comfy_workflows.sql`，四张新表），不改 Agent。发布后依次：
-  1. 导入 comfyui 应用 **1.1.0**（`supports_workflows`、`MODEL_ID` 默认 `none`、模型 / 自定义节点 / 用户目录放到数据盘 `/root/data/comfyui`）：与计划 7 相同的 `platform admin app import /apps`（`deploy/apps` 里 comfyui 已是 1.1.0，其它应用同版本号重复导入会报错、可忽略），再在后台「应用」发布 comfyui 1.1.0（super + TOTP）。1.0.0 的部署照常运行，用户第一次给它装工作流时自动换到 1.1.0。
+  1. 导入 comfyui 应用 **1.1.0**（`supports_workflows`、`MODEL_ID` 默认 `none`、模型 / 自定义节点 / 用户目录放到数据盘 `/root/data/comfyui`）。**只导入 comfyui 一个目录**：`app import` 按目录名顺序导入、遇到第一个失败的目录（例如已导入过的 vllm 1.0.0，同版本号重复导入报错）就停止，整个 `deploy/apps` 再导一遍会报错退出。用一次性容器只读挂载 `deploy/apps/comfyui`（在 `deploy/compose/` 下执行）：
+
+     ```bash
+     docker compose run --rm --no-deps -v "$(cd ../apps/comfyui && pwd):/apps-p11/comfyui:ro" platform admin app import /apps-p11
+     ```
+
+     预期输出一行 `comfyui 1.1.0 version-added`（全新环境首次导入则是 `comfyui 1.1.0 created`）。然后在后台「应用」发布 comfyui 1.1.0（super + TOTP）。1.0.0 的部署照常运行，用户第一次给它装工作流时自动换到 1.1.0。
   2. 导入工作流为草稿：`platform admin workflow import <目录>`，目录形如 `deploy/workflows`（每个 `<slug>/` 下 `workflow.json`、`graph.json`、`manifest.json`，可选 `api.json`、`cover.png|jpg|webp`；格式见 `deploy/workflows/README.md`）。同计划 7，命令读的是 platform 容器内的目录：
 
      ```bash
@@ -173,7 +179,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
      docker compose exec platform /platform admin workflow import /workflows
      ```
 
-     每个工作流输出 `<slug> <版本> created|version-added`，失败的输出 `<slug> error: 原因`（其它照常导入，最后非零退出）。**封面写进 `SPARK_UPLOAD_DIR`**：在 platform 容器内执行（`exec`）天然是同一目录；用一次性容器（`run --rm`）或在宿主机上直接跑 `platform admin` 时，必须让它的 `SPARK_UPLOAD_DIR` 指向与服务**同一个**目录（同一个卷），否则数据库里有封面记录而服务读不到文件。
+     每个工作流输出一行：`<slug> <版本> created`（新工作流）或 `<slug> <版本> version-added`（已有工作流加版本）；符号链接目录输出 `<slug> skipped: 原因`；校验失败的输出 `<slug> error: 原因`（与 `app import` 不同，其它目录照常导入，最后以非零退出）。**封面写进 `SPARK_UPLOAD_DIR`**：在 platform 容器内执行（`exec`）或用 compose 的一次性容器（`run --rm`，挂的是同一个 `uploads` 卷）都是同一目录；在宿主机上直接跑 `platform admin` 时，必须让它的 `SPARK_UPLOAD_DIR` 指向与服务**同一个**目录，否则数据库里有封面记录而服务读不到文件。
   3. 后台「工作流」逐个检查版本（模型 / 节点 / 快速出图参数）并发布（super + TOTP，发布后不可变），再把工作流状态改为「上架」，控制台 `/workflows` 才能看到。
 - **国内网络**：模型从 ModelScope（或 `SPARK_APP_HF_ENDPOINT` 的 hf-mirror）下载；自定义节点从 GitHub 经 `SPARK_APP_GIT_MIRROR` 前缀 clone，镜像失效时改这个变量（或设 `off` 直连）后用户重新部署即可。若指向内网镜像站，网段要加进 `SPARK_AGENT_ALLOW_CIDRS`。
 - **安全**：自定义节点是第三方代码，在用户容器里以 root 安装运行；只有 super 能发布工作流版本，Git 主机限 github.com / gitee.com / gitcode.com 且钉死 commit，导入前须评审节点仓库。

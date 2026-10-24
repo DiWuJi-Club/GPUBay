@@ -2,6 +2,7 @@
 // e2e-server 复用。Server 本身是 http.Handler：单测用 Start（httptest），e2e 把它挂到假容器的 8188 上。线程安全。
 //
 // 端点与真实 ComfyUI（v0.3.60）的响应形状一致：
+//   - GET  /                    200 小 HTML 页（标题 Fake ComfyUI）
 //   - GET  /system_stats        200 {}
 //   - POST /prompt              记录提交；默认 200 {"prompt_id", "number", "node_errors": {}}；RejectPrompts / RejectMissingNode
 //     后 400；缺 prompt → 400 no_prompt（node_errors 是数组，同真实 ComfyUI）
@@ -253,7 +254,13 @@ func (s *Server) Views() []url.Values {
 	return out
 }
 
-// Requests 已收到的请求（"METHOD /path"，不含查询串）。
+// maxRequests Requests 保留的最近请求数。
+const maxRequests = 200
+
+// fakeIndexHTML 是 GET / 的页面（真实 ComfyUI 是前端 SPA）。
+const fakeIndexHTML = `<!doctype html><html><head><meta charset="utf-8"><title>Fake ComfyUI</title></head><body><h1>Fake ComfyUI</h1></body></html>`
+
+// Requests 已收到的请求（"METHOD /path"，不含查询串；只保留最近 maxRequests 条）。
 func (s *Server) Requests() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -272,8 +279,14 @@ func (s *Server) Reset() {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.requests = append(s.requests, r.Method+" "+r.URL.Path)
+	if len(s.requests) > maxRequests { // e2e-server 长时间运行（健康检查每轮打 /system_stats）：只留最近的
+		s.requests = slices.Clone(s.requests[len(s.requests)-maxRequests:])
+	}
 	s.mu.Unlock()
 	switch p := r.URL.Path; {
+	case p == "/" && r.Method == http.MethodGet: // 「打开 ComfyUI」经 ingress 打开的页面
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, fakeIndexHTML)
 	case p == "/system_stats" && r.Method == http.MethodGet:
 		jsonOut(w, http.StatusOK)
 		io.WriteString(w, `{"system":{"comfyui_version":"0.3.60-fake"},"devices":[]}`)

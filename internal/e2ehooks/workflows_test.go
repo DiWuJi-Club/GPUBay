@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/audit"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/e2ehooks"
@@ -37,6 +38,11 @@ func TestWorkflowHooks(t *testing.T) {
 		t.Fatalf("fake comfyui version = %s spec %+v", comfyVer.Version, comfyVer.Spec)
 	}
 
+	// 自愈：A 已存在（草稿、无版本、无封面，例如上次 seed 中途失败）→ seed 补版本、发布、上架、补封面
+	if _, err := e.a.Workflows.CreateWorkflow(ctx, audit.Actor{}, comfywf.WorkflowInput{Slug: e2ehooks.WorkflowA, Name: "half-seeded",
+		Category: comfywf.CategoryTxt2Img}); err != nil {
+		t.Fatal(err)
+	}
 	seed := func() []any {
 		t.Helper()
 		return e.must("POST", "/hooks/workflows/seed", map[string]any{})["workflows"].([]any)
@@ -75,6 +81,13 @@ func TestWorkflowHooks(t *testing.T) {
 	}
 	if _, av3, _, _ := wf(seed(), 0); av3 != int64(nv["version_id"].(float64)) {
 		t.Fatalf("seed after new version returns version %d, want %v", av3, nv["version_id"])
+	}
+	// 默认版本号 = 最大 patch + 1
+	if nv := e.must("POST", "/hooks/workflows/version", map[string]any{"version": "1.0.5"}); nv["version"] != "1.0.5" {
+		t.Fatalf("explicit version = %v", nv)
+	}
+	if nv := e.must("POST", "/hooks/workflows/version", map[string]any{"slug": e2ehooks.WorkflowA}); nv["version"] != "1.0.6" {
+		t.Fatalf("default version after 1.0.5 = %v", nv)
 	}
 	if code, _ := e.call("POST", "/hooks/workflows/version", map[string]any{"slug": "no-such"}); code != 400 {
 		t.Fatalf("version of unknown slug = %d, want 400", code)
