@@ -10,10 +10,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/storage"
 )
 
@@ -108,9 +110,14 @@ func (s *Service) SubmitPersonalKYC(ctx context.Context, userID int64, name, idN
 		if result == "error" {
 			return nil
 		}
-		_, err = tx.Exec(wctx, `UPDATE users SET kyc_status = $2, kind = 'personal', updated_at = $3
-			WHERE id = $1 AND kyc_status <> 'verified'`, userID, result, done)
-		return err
+		if _, err := tx.Exec(wctx, `UPDATE users SET kyc_status = $2, kind = 'personal', updated_at = $3
+			WHERE id = $1 AND kyc_status <> 'verified'`, userID, result, done); err != nil {
+			return err
+		}
+		if result == "verified" {
+			return s.afterVerified(wctx, tx, done, userID, recordID, "kyc", idNumber)
+		}
+		return nil
 	})
 	if err != nil {
 		return User{}, err
@@ -132,6 +139,57 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string([]rune(s)[:n])
+}
+
+// afterVerified 实名通过后：写指纹（有密钥时）并通知 referral 做同身份判定（有钩子时）。与调用方同事务。
+// 钩子在保存点里执行：死锁 / 序列化冲突（40P01 / 40001）在新保存点里重试一次；仍失败则回滚保存点、记日志，
+// 并在外层事务写审计 referral.kyc_check_failed（目标为该用户）留下持久痕迹，由后台人工核查——不让实名失败
+// （个人实名已调用付费接口，结果必须落库）。指纹本身照常写入，之后的判定（含邀请人后实名）仍能命中。
+func (s *Service) afterVerified(ctx context.Context, tx pgx.Tx, at time.Time, userID, recordID int64, kind, number string) error {
+	if len(s.d.FingerprintKey) == 0 {
+		return nil
+	}
+	fp := referral.Fingerprint(s.d.FingerprintKey, kind, number)
+	if _, err := tx.Exec(ctx, `UPDATE kyc_records SET fingerprint = $2 WHERE id = $1`, recordID, fp); err != nil {
+		return err
+	}
+	if s.d.Referral == nil {
+		return nil
+	}
+	var herr error
+	for attempt := 0; attempt < 2; attempt++ {
+		var err error
+		if herr, err = s.referralCheck(ctx, tx, userID, fp); err != nil {
+			return err
+		}
+		if herr == nil || !isTxConflict(herr) {
+			break
+		}
+	}
+	if herr == nil {
+		return nil
+	}
+	s.d.Log.Error("referral: 实名同身份判定失败，已跳过（需人工核查该用户的邀请绑定）", "user_id", userID, "kyc_record_id", recordID, "err", herr)
+	return audit.Record(ctx, tx, at, audit.Actor{}.Entry("referral.kyc_check_failed", "user", strconv.FormatInt(userID, 10),
+		map[string]any{"kyc_record_id": recordID}))
+}
+
+// referralCheck 在一个保存点里调用钩子：钩子出错回滚保存点并以 hookErr 返回；err 是保存点本身的错误（外层事务不可用）。
+func (s *Service) referralCheck(ctx context.Context, tx pgx.Tx, userID int64, fp string) (hookErr, err error) {
+	sp, err := tx.Begin(ctx) // SAVEPOINT
+	if err != nil {
+		return nil, err
+	}
+	if hookErr = s.d.Referral.OnKYCVerified(ctx, sp, userID, fp); hookErr != nil {
+		return hookErr, sp.Rollback(ctx)
+	}
+	return nil, sp.Commit(ctx) // RELEASE SAVEPOINT
+}
+
+// isTxConflict：死锁（40P01）或序列化失败（40001），重试可能成功。
+func isTxConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40P01" || pgErr.Code == "40001")
 }
 
 // SubmitEnterpriseKYC 提交企业认证，等待管理员审核。licenseFile 必须是本人通过上传接口得到的营业执照文件 key。
@@ -182,9 +240,9 @@ func (s *Service) ReviewEnterpriseKYC(ctx context.Context, actor audit.Actor, re
 	now := s.d.Clock.Now()
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 		var userID int64
-		var kind, result string
-		err := tx.QueryRow(ctx, `SELECT user_id, kind, result FROM kyc_records WHERE id = $1 FOR UPDATE`, recordID).
-			Scan(&userID, &kind, &result)
+		var kind, result, licenseNo string
+		err := tx.QueryRow(ctx, `SELECT user_id, kind, result, license_no FROM kyc_records WHERE id = $1 FOR UPDATE`, recordID).
+			Scan(&userID, &kind, &result, &licenseNo)
 		if db.IsNoRows(err) {
 			return apperr.ErrNotFound
 		}
@@ -207,6 +265,11 @@ func (s *Service) ReviewEnterpriseKYC(ctx context.Context, actor audit.Actor, re
 				kind = CASE WHEN $2 = 'verified' THEN 'enterprise' ELSE kind END, updated_at = $3
 			WHERE id = $1 AND ($2 = 'verified' OR kyc_status <> 'verified')`, userID, newResult, now); err != nil {
 			return err
+		}
+		if approve {
+			if err := s.afterVerified(ctx, tx, now, userID, recordID, "lic", licenseNo); err != nil {
+				return err
+			}
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("kyc.review", "kyc_record", strconv.FormatInt(recordID, 10),
 			map[string]any{"approve": approve, "reason": reason, "user_id": userID}))

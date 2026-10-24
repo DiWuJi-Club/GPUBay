@@ -1,6 +1,9 @@
 import { expect, test } from '@playwright/test'
+import { adminApi, adminPost, createAdmin } from '../helpers/admin'
 import { loginConsole, nav, placeOrder, seedUser, settle, toast, toastLocator, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
+import { yuan } from '../helpers/money'
+import { inviteeOf, inviterWithCode, restoreRate } from '../helpers/referral'
 import { cstTime } from '../helpers/time'
 
 test('C-WAL-01 余额与流水：类型中文、正负着色、变动后余额、滚动加载第二页；加载失败可重试；加载中刷新丢弃旧结果', async ({ page }, info) => {
@@ -227,3 +230,31 @@ test('C-ERR-02 网络错误提示', async ({ page }, info) => {
   await expect(page.getByTestId('wallet-error')).toContainText('网络异常，请稍后重试')
 })
 
+
+test('C-WAL-05 流水显示邀请返利 / 返利扣回标签与颜色', async ({ page }, info) => {
+  await hooks.referralConfig({ hold_days: 0 }) // 同 C-REF-08：退款要在实例运行时做，发放延迟临时改为 0 天
+  try {
+    const inv = await inviterWithCode({ balance: 0 })
+    const b = await inviteeOf(inv.code, { balance: 100_000 })
+    const bApi = await userApi(b.phone)
+    await hooks.machines(1)
+    const instance = await placeOrder(bApi)
+    await hooks.sweep()
+    await hooks.agent()
+    const fin = await createAdmin('finance')
+    await adminPost(await adminApi(fin), fin, `/admin/api/v1/instances/${instance}/refund-release`, { amount: 6000, reason: 'e2e' })
+    await hooks.sweep()
+    await loginConsole(page, inv.phone)
+    await nav(page, info, 'wallet')
+    await expect(page.getByTestId('ledger-kind')).toHaveCount(2) // 邀请人余额 0 起步：只有返利与扣回两条
+    await expect(page.getByTestId('ledger-kind').nth(0)).toHaveText('返利扣回')
+    await expect(page.getByTestId('ledger-kind').nth(0)).toHaveClass(/kind-clawback/)
+    await expect(page.getByTestId('ledger-amount').nth(0)).toHaveText(`-${yuan(600)}`)
+    await expect(page.getByTestId('ledger-kind').nth(1)).toHaveText('邀请返利')
+    await expect(page.getByTestId('ledger-kind').nth(1)).toHaveClass(/kind-rebate/)
+    await expect(page.getByTestId('ledger-amount').nth(1)).toHaveText(`+${yuan(690)}`)
+    await expect(page.getByTestId('wallet-balance')).toHaveText(yuan(90))
+  } finally {
+    await restoreRate()
+  }
+})

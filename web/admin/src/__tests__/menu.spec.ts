@@ -4,9 +4,9 @@ import { routes } from '../router'
 
 describe('menuFor (U-12)', () => {
   it.each([
-    ['super', 18, []],
-    ['ops', 13, ['orders', 'ledger', 'recharges', 'catalog', 'admins']],
-    ['finance', 12, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
+    ['super', 19, []],
+    ['ops', 13, ['orders', 'ledger', 'recharges', 'referral', 'catalog', 'admins']],
+    ['finance', 13, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
   ] as const)('%s 有 %d 项', (role, count, missing) => {
     const items = menuFor(role)
     expect(items).toHaveLength(count)

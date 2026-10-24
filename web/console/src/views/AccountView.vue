@@ -8,11 +8,18 @@ import { clearSession, session, setUser } from '../store/session'
 
 const router = useRouter()
 const loggingOut = ref(false)
+/** 本月返利到账（分）：/me 的 referral_month_settled，0 时后端省略 */
+const month = computed(() => session.user?.referral_month_settled ?? 0)
 
-// 会话里的 /me 是应用启动时取的；进入本页刷新一次，让「本月 Token 消费」是最新的。
+// 会话里的 /me 是应用启动时取的；进入「我的」页刷新一次，让本月返利、本月 Token 消费、实名状态是最新的。
 // 不加 quiet：会话过期时与其它需登录页面一样提示并跳登录页；其它失败沿用会话里的值
-onMounted(() => {
-  api.get<User>('/me').then((u) => session.status === 'authed' && setUser(u), () => {})
+onMounted(async () => {
+  try {
+    const u = await api.get<User>('/me')
+    if (session.status === 'authed') setUser(u)
+  } catch {
+    /* 用缓存 */
+  }
 })
 /** 本月 Token 消费（分）；后端为 0 时省略字段 → 不显示 */
 const llmMonth = computed(() => (session.user?.llm_month_cost ? fmtYuan(session.user.llm_month_cost) : ''))
@@ -45,6 +52,9 @@ async function logout() {
       <span v-if="llmMonth" class="muted" data-testid="account-tokens-month">本月 {{ llmMonth }}</span>
     </router-link>
     <div class="actions">
+      <router-link to="/invite" data-testid="account-invite">
+        邀请返利<span v-if="month > 0" class="muted month" data-testid="account-invite-month">本月返利 {{ fmtYuan(month) }}</span>
+      </router-link>
       <router-link to="/account/ssh-keys" data-testid="account-ssh-keys">SSH 公钥</router-link>
       <router-link to="/help" data-testid="account-help">使用帮助</router-link>
       <el-button data-testid="account-logout" :loading="loggingOut" @click="logout">退出登录</el-button>
@@ -53,7 +63,8 @@ async function logout() {
 </template>
 
 <style scoped>
-.actions { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; }
+.actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
 .entry { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; padding: 10px 12px; border: 1px solid #ebeef5; border-radius: 4px; text-decoration: none; }
 .muted { color: #909399; font-size: 12px; }
+.month { margin-left: 6px; }
 </style>

@@ -41,6 +41,7 @@ import (
 	"spark-cloud/internal/plugins/pay"
 	"spark-cloud/internal/plugins/pdu"
 	"spark-cloud/internal/plugins/sms"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/sshgw"
 	"spark-cloud/internal/storage"
@@ -80,6 +81,7 @@ type App struct {
 	Fleet    *fleet.Service
 	Rental   *rental.Service
 	Billing  *billing.Service
+	Referral *referral.Service
 	Uploads  *storage.Service
 	Handler  http.Handler
 
@@ -179,7 +181,13 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	uploads := storage.NewService(pool, clk, disk)
 
-	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: smsSender, KYC: verifier, Box: box, Uploads: uploads, FixedCode: fixedCode, CodeIPHourLimit: ipHourLimit})
+	// 与 `platform referral backfill-fingerprints`（cmd/platform/referral.go 的 referralKeys）相同的输入：config.Load 解出的原始密钥字节
+	fpKey, err := referral.DeriveFingerprintKey(cfg.SecretKey)
+	if err != nil {
+		return nil, err
+	}
+	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: smsSender, KYC: verifier, Box: box, Uploads: uploads, FixedCode: fixedCode, CodeIPHourLimit: ipHourLimit,
+		FingerprintKey: fpKey, Log: log})
 	w := wallet.NewService(pool, clk)
 	c := catalog.NewService(pool).WithClock(clk)
 	f := fleet.NewService(pool, clk)
@@ -188,6 +196,8 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
 		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen,
 	})
+	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r, Alerts: f})
+	ids.SetReferral(ref)
 	appCat := appdeploy.NewCatalog(pool, clk, f, c, log)
 	providers := opt.Pay
 	devPay := false
@@ -220,9 +230,9 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		authorizeLimit = noRateLimit
 	}
 	srv := &api.Server{
-		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, DevPay: devPay, Clock: clk, Log: log,
+		Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Billing: bill, Referral: ref, DevPay: devPay, Clock: clk, Log: log,
 		Domain: cfg.Domain, SSHHost: cfg.SSHHost(), SSHPort: cfg.SSHPublicPort, SecureCookie: cfg.Env != "dev", TrustProxy: cfg.TrustProxy, TrustedProxyHops: cfg.TrustedProxyHops, PublicBaseURL: cfg.PublicBaseURL,
-		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit, CalendarLimit: authorizeLimit, // 两者零值各取默认（60 / 120）；DisableRateLimits 时同为 noRateLimit
+		Ingress: ingressAuth, AuthorizeLimit: authorizeLimit, CalendarLimit: authorizeLimit, ReferralLimit: authorizeLimit, // 零值各取默认（60 / 120 / 60）；DisableRateLimits 时同为 noRateLimit
 	}
 	keyPath, err := upstreamKeyPath(cfg, log) // 先于 EnsureCA：配置错误不应留下任何数据库写入
 	if err != nil {
@@ -266,7 +276,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	admins := admin.NewService(admin.Deps{Pool: pool, Clock: clk, Box: box})
 	adminSrv := &adminapi.Server{
-		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Gateway: gw,
+		Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Gateway: gw,
 		Clock: clk, Log: log, SecureCookie: cfg.Env != "dev", LoginLimit: loginLimit, PublicBaseURL: cfg.AdminPublicBaseURL,
 		PortURL: ingressAuth.PortURL,
 	}
@@ -302,7 +312,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		proxyHops = cfg.TrustedProxyHops
 	}
 	handler := ingress.Front(cfg.IngressDomain, proxyHops, ingSrv, srv.Router())
-	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Uploads: uploads, Handler: handler,
+	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
 		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner}, nil
 }

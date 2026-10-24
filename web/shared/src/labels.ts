@@ -15,9 +15,15 @@ export const instanceStateType: LabelMap = {
 }
 export const orderKindLabel: LabelMap = { new: '新购', renew: '续费' }
 export const orderStatusLabel: LabelMap = { paid: '已支付', refunded: '已退款', partially_refunded: '部分退款' }
-export const ledgerKindLabel: LabelMap = { recharge: '充值', order_pay: '扣款', refund: '退款', admin_adjust: '调账', llm_pay: 'Token 消费' }
-/** el-tag 的 type：入账（充值 / 退款）绿、扣款类（扣款 / Token 消费）橙、调账灰；未登记的种类用 info。 */
-export const ledgerKindType: LabelMap = { recharge: 'success', refund: 'success', order_pay: 'warning', llm_pay: 'warning', admin_adjust: 'info' }
+export const ledgerKindLabel: LabelMap = {
+  recharge: '充值', order_pay: '扣款', refund: '退款', admin_adjust: '调账', referral_rebate: '邀请返利', referral_clawback: '返利扣回', llm_pay: 'Token 消费',
+}
+/** el-tag 的 type：入账（充值 / 退款 / 邀请返利）绿、扣款类（扣款 / 返利扣回 / Token 消费）橙、调账灰；未登记的种类用 info。 */
+export const ledgerKindType: LabelMap = {
+  recharge: 'success', refund: 'success', referral_rebate: 'success', order_pay: 'warning', referral_clawback: 'warning', llm_pay: 'warning', admin_adjust: 'info',
+}
+export const bindingStatusLabel: LabelMap = { active: '有效', held: '审核中', revoked: '已失效' }
+export const rewardStatusLabel: LabelMap = { pending: '待发放', settled: '已发放', void: '已作废' }
 export const rechargeStatusLabel: LabelMap = { pending: '待支付', paid: '已支付', closed: '已关闭' }
 export const rechargeChannelLabel: LabelMap = { wechat: '微信支付', alipay: '支付宝', manual: '手动' }
 export const machineStateLabel: LabelMap = { idle: '空闲', allocated: '已分配', maintenance: '维护中', faulty: '故障' }
@@ -30,6 +36,7 @@ export const alertKindLabel: LabelMap = {
   invalid_report: '上报数据异常',
   ssh_bruteforce: 'SSH 暴力破解', upstream_unreachable: '实例 SSH 上游不可达', tls_cert_reload_failed: 'TLS 证书加载失败', tls_cert_expiring: 'TLS 证书即将到期',
   booking_at_risk: '预订机器不可用', booking_unfulfilled: '预订无法履约', booking_cancel_failed: '预订取消失败',
+  referral_scan_stuck: '邀请返利扫描卡住',
   app_deploy_unreachable: '应用部署无法连接容器',
   llm_pool_short: 'Token 服务池机器不足', llm_node_unhealthy: '模型节点健康检查失败', llm_node_failed: '模型节点多次重建失败', llm_usage_record_failed: 'Token 用量记账失败',
 }
@@ -62,6 +69,7 @@ export const auditActions: readonly string[] = [
   'image.create', 'image.update',
   'group.create', 'group.update', 'group.delete', 'group.assign', 'group.unassign', 'machine.update',
   'booking.cancel', 'booking.admin_cancel', 'booking.reassign', 'instance.auto_renew',
+  'referral.bind', 'referral.auto_revoke', 'referral.auto_hold', 'referral.kyc_check_failed', 'referral.config', 'referral.freeze', 'referral.unfreeze', 'referral.approve', 'referral.revoke', 'referral.rescan',
   'app.create', 'app.update', 'app.delete', 'app.version.create', 'app.version.update', 'app.version.publish', 'app.version.prepull',
   'app.deployment.force_remove',
   'instance.app_deploy', 'instance.app_redeploy', 'instance.app_stop', 'instance.app_start', 'instance.app_remove',

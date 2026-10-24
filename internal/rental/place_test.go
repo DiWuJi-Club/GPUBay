@@ -171,3 +171,24 @@ func TestInstancesAreIsolatedPerUser(t *testing.T) {
 		t.Fatalf("ListForUser = %+v", list)
 	}
 }
+
+func TestOrderForReferral(t *testing.T) {
+	e := newEnv(t, 2) // 立即单占一台；预订需要另一台
+	ord, _ := e.place(catalog.D1d)
+	uid, start, err := e.svc.OrderForReferral(e.ctx, e.pool, ord.ID)
+	if err != nil || uid != e.userID || start != nil {
+		t.Fatalf("immediate = %d %v %v", uid, start, err)
+	}
+	booked := e.book(dbtest.T0.Add(25 * time.Hour))
+	var boID string
+	if err := e.pool.QueryRow(e.ctx, `SELECT id FROM orders WHERE instance_id = $1`, booked.ID).Scan(&boID); err != nil {
+		t.Fatal(err)
+	}
+	uid, start, err = e.svc.OrderForReferral(e.ctx, e.pool, boID)
+	if err != nil || uid != e.userID || start == nil || !start.Equal(dbtest.T0.Add(25*time.Hour)) {
+		t.Fatalf("booked = %d %v %v", uid, start, err)
+	}
+	if _, _, err := e.svc.OrderForReferral(e.ctx, e.pool, "ord-nope"); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("missing = %v", err)
+	}
+}

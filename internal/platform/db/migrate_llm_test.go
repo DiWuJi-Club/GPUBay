@@ -138,6 +138,10 @@ func TestMigration00022RoundTrip(t *testing.T) {
 		VALUES (1, -10, 890, 'llm_pay', 'llm_settlement', '2', now())`); err == nil {
 		t.Fatal("llm_pay accepted after down")
 	}
+	// Down 恢复的是计划 8（00021）的六种：两种返利流水仍可插
+	exec(`INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, created_at)
+		VALUES (1, 5, 895, 'referral_rebate', 'referral', 'ord-y', now()), (1, -5, 890, 'referral_clawback', 'referral', 'ord-y', now())`)
+	exec(`DELETE FROM wallet_ledger WHERE kind IN ('referral_rebate', 'referral_clawback')`)
 	if n := count(`SELECT count(*) FROM wallet_ledger WHERE kind = 'order_pay' AND ref_id = 'ord-1' AND amount = -100`); n != 1 {
 		t.Fatalf("old ledger after down = %d", n)
 	}
