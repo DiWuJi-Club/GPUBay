@@ -41,7 +41,9 @@ func (s *Service) PlaceSystem(ctx context.Context, req SystemPlaceRequest) (Inst
 		return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 			now := s.d.Clock.Now()
 			var productID int64
+			// 机组必须就是 Token 服务池（purpose='llm'）：调用方传错机组也不能把普通机组的机器拿去建节点
 			err := tx.QueryRow(ctx, `SELECT product_id FROM machines WHERE id = $1 AND group_id = $2 AND state = 'idle' AND agent_online
+				AND EXISTS (SELECT 1 FROM machine_groups g WHERE g.id = $2 AND g.purpose = 'llm')
 				FOR NO KEY UPDATE`, req.MachineID, req.GroupID).Scan(&productID)
 			if db.IsNoRows(err) {
 				return apperr.ErrMachineUnavailable
@@ -100,6 +102,13 @@ func (s *Service) PlaceSystem(ctx context.Context, req SystemPlaceRequest) (Inst
 		})
 	})
 	return out, err
+}
+
+// ListLiveSystemInstances 全部未结束（creating / running / stopped / wiping）的系统实例，按 id 排序；
+// 供 llm Controller 对账（找出没有对应节点的孤儿系统实例）。走 instances_system_live_idx 部分索引。
+func (s *Service) ListLiveSystemInstances(ctx context.Context) ([]Instance, error) {
+	return collectInstances(s.d.Pool.Query(ctx, `SELECT `+instanceCols+` FROM instances
+		WHERE system AND state IN ('creating', 'running', 'stopped', 'wiping') ORDER BY id`))
 }
 
 // ReleaseSystem 释放系统实例（creating / running / stopped 均可，规格 §4.2）：与 Release 走同一链路（beginWipe：

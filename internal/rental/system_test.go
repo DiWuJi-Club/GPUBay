@@ -81,6 +81,11 @@ func TestPlaceSystemRequiresPoolIdleOnline(t *testing.T) {
 	// 机组不符
 	_, err = e.svc.PlaceSystem(e.ctx, rental.SystemPlaceRequest{MachineID: m[5], GroupID: pool + 1000, ImageID: e.imageID})
 	wantCode(t, err, "machine_unavailable", "group mismatch")
+	// 机器所在机组与参数一致、但不是池（普通可见机组）
+	normal := e.group("普通机组", true)
+	e.setGroup(m[0], normal)
+	_, err = e.svc.PlaceSystem(e.ctx, rental.SystemPlaceRequest{MachineID: m[0], GroupID: normal, ImageID: e.imageID})
+	wantCode(t, err, "machine_unavailable", "normal group")
 	// 不存在的机器
 	_, err = e.svc.PlaceSystem(e.ctx, rental.SystemPlaceRequest{MachineID: 999999, GroupID: pool, ImageID: e.imageID})
 	wantCode(t, err, "machine_unavailable", "no such machine")
@@ -221,6 +226,44 @@ func TestSystemInstanceNeverExpiresOrBills(t *testing.T) {
 	}
 	if n := e.count(`SELECT count(*) FROM wallet_ledger WHERE user_id = $1`, e.systemID); n != 0 {
 		t.Fatalf("ledger after resume = %d", n)
+	}
+
+	// 真实失联路径：心跳停过 OfflineTimeout，清扫器判离线并暂停；恢复在线 + 报告 running 后清扫器恢复
+	e.heartbeatAll()
+	e.clock.Advance(rental.OfflineTimeout + time.Minute)
+	for i := 0; i < 3; i++ {
+		if err := e.svc.Sweep(e.ctx); err != nil {
+			t.Fatalf("offline sweep %d: %v", i, err)
+		}
+		e.clock.Advance(time.Minute)
+	}
+	got = e.get(inst.ID)
+	if got.SuspendedAt == nil || got.PausedRemaining != nil || got.ExpiresAt != nil || got.State != rental.StateRunning {
+		t.Fatalf("offline = %+v", got)
+	}
+	if lower, upper, status := e.lease(inst.ID); !lower.Equal(lower0) || !upper.Equal(upper0) || status != "active" {
+		t.Fatalf("lease while offline = [%v, %v) %s", lower, upper, status)
+	}
+	e.heartbeatAll()
+	e.reportRunning(m, inst.ID)
+	if err := e.svc.Sweep(e.ctx); err != nil {
+		t.Fatalf("online sweep: %v", err)
+	}
+	got = e.get(inst.ID)
+	if got.SuspendedAt != nil || got.PausedRemaining != nil || got.ExpiresAt != nil || got.State != rental.StateRunning {
+		t.Fatalf("back online = %+v", got)
+	}
+	if lower, upper, status := e.lease(inst.ID); !lower.Equal(lower0) || !upper.Equal(upper0) || status != "active" {
+		t.Fatalf("lease after online = [%v, %v) %s", lower, upper, status)
+	}
+	if n := e.count(`SELECT count(*) FROM orders`); n != 0 {
+		t.Fatalf("orders after offline = %d", n)
+	}
+	if n := e.count(`SELECT count(*) FROM wallet_ledger WHERE user_id = $1`, e.systemID); n != 0 {
+		t.Fatalf("ledger after offline = %d", n)
+	}
+	if calls := e.notifier.Calls(); len(calls) != 0 {
+		t.Fatalf("sms after offline = %v", calls)
 	}
 
 	// ReleaseSystem 后机器回到 idle
@@ -413,5 +456,45 @@ func TestUpstreamTarget(t *testing.T) {
 	}
 	if _, err := e.svc.UpstreamTarget(e.ctx, "ins-nothere1"); !errors.Is(err, apperr.ErrNotFound) {
 		t.Fatalf("missing: %v", err)
+	}
+}
+
+func TestListLiveSystemInstances(t *testing.T) {
+	e := newEnv(t, 3)
+	pool := e.toPool(e.machines[0], e.machines[1])
+	a := e.placeSystem(e.machines[0], pool)
+	b := e.placeSystem(e.machines[1], pool)
+	e.ackFor(b.ID, fleet.CmdCreateInstance, true)
+	_, user := e.place(catalog.D1d) // 落在池外的第三台
+	ids := func() []string {
+		t.Helper()
+		list, err := e.svc.ListLiveSystemInstances(e.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, i := range list {
+			if !i.System {
+				t.Fatalf("non-system instance listed: %+v", i)
+			}
+			out = append(out, i.ID)
+		}
+		return out
+	}
+	want := []string{a.ID, b.ID}
+	slices.Sort(want)
+	if got := ids(); !slices.Equal(got, want) {
+		t.Fatalf("live = %v, want %v (user %s excluded)", got, want, user.ID)
+	}
+	// 洗机中仍算未结束；洗完（released）不再列出
+	if err := e.svc.ReleaseSystem(e.ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := ids(); !slices.Equal(got, want) {
+		t.Fatalf("live while wiping = %v", got)
+	}
+	e.ackFor(a.ID, fleet.CmdWipeInstance, true)
+	if got := ids(); !slices.Equal(got, []string{b.ID}) {
+		t.Fatalf("live after wipe = %v", got)
 	}
 }
