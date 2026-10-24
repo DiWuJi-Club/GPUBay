@@ -20,7 +20,8 @@ import (
 
 // Token 商城（计划 9）的 e2e 钩子：
 //   - POST /hooks/llm/upstream：在假容器 sshd 的某个端口（默认 8000 = llm.NodePort）挂一个 llmtest.FakeVLLM；
-//   - POST /hooks/llm/node：在池内机器上直接造一个 ready 节点（PlaceSystem + fake Agent 完成 Create + 插节点行，不建部署）；
+//   - POST /hooks/llm/node：在池内机器上直接造一个 ready 节点（PlaceSystem + fake Agent 完成 Create + 插节点行，不建部署；
+//     不支持后台重建）；
 //   - POST /hooks/llm/tick：跑一轮 Controller.Tick + Prober.Tick（探测经 Upstream.Dial 真走 sshtest），再刷新路由表。
 // 所有 e2e 实例共用同一个假容器：同一端口上的 FakeVLLM 服务全部节点。
 
@@ -83,6 +84,8 @@ func SeedLLMNode(ctx context.Context, a *app.App, modelID, machineID int64,
 // served 缺省 = 当前全部 online 模型的 slug（/v1/models 的返回与 POST 的 model 校验都按它）；prompt_tokens / completion_tokens
 // 缺省 100 / 50；chunks 缺省 ["你好","，","世界"]；fail_first_n：前 N 个 POST 回 503；delay_ms：非流式响应前 / 每个流式块前的等待；
 // require_key 缺省 ""（接受任意 Bearer：节点密钥是钩子 / Controller 随机生成的，FakeVLLM 不校验它）。
+// 调用顺序：在 /hooks/apps/seed 之后（seed 会把 8000 端口重新指向 fake 应用服务，覆盖本钩子）、模型上线之后
+// （served 缺省按调用时刻的 online 模型取；也可显式传 served）。
 // 非 /v1/* 的路径（如 Runner 的 /health 之外的应用页面）在配置了 HealthAddr 时转给 fake 应用服务，
 // 让 /hooks/apps/seed 登记在同一端口（8000 = vllm）的 ingress / 健康检查用例不受影响；/health 一律 200。
 func (s *Server) llmUpstream(ctx context.Context, body json.RawMessage) (any, error) {
@@ -198,8 +201,9 @@ func (s *Server) llmNode(ctx context.Context, body json.RawMessage) (any, error)
 //
 //	{"provisioned":0,"drained":0,"failed":0,"removed":0,"orphans":0,"error":""}
 //
-// 注意：/hooks/llm/node 造的节点没有部署，每轮探测都对它计一次失败——连续 3 轮（probe 为 true）后转 unhealthy，再下一轮
-// Controller 把它置 failed 并释放实例。只想推进排空 / 移除时传 {"probe": false}。
+// /hooks/llm/node 造的节点没有部署：探测跳过部署检查、直接打 FakeVLLM（GET /v1/models 须含模型 slug），健康跟随假节点；
+// 探测连续失败 3 次转 unhealthy 后，下一轮 Controller 无法 Redeploy、会把它置 failed 并释放实例；后台「重建」对它不可用
+// （llm_node_invalid_state）。只想推进排空 / 移除、不想探测时传 {"probe": false}。
 func (s *Server) llmTick(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := decode[struct {
 		Probe *bool `json:"probe"`

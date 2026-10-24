@@ -137,36 +137,52 @@ func (p *Prober) observe(ctx context.Context, n Node, slug string) observation {
 		}
 		return observation{vFail, "机器失联，实例已暂停"}
 	}
-	if n.DeploymentID == nil {
-		if prov {
-			return observation{vSkip, ""}
-		}
-		return observation{vFail, "节点没有部署"}
+	// 没有部署：provisioning 等 Controller 建部署；ready / unhealthy 只可能是 e2e 钩子直接造的节点（SeedReadyNode）——
+	// 跳过部署检查，直接做 HTTP 探测（生产里 ready 节点一定有部署，此分支不会走到）
+	if n.DeploymentID == nil && prov {
+		return observation{vSkip, ""}
 	}
+	if n.DeploymentID != nil {
+		if obs, done := p.observeDeployment(ctx, n, prov); done {
+			return obs
+		}
+	}
+	return p.probeNode(ctx, n, slug)
+}
+
+// observeDeployment 部署状态检查；done 为真时 obs 即结论，否则继续 HTTP 探测。
+func (p *Prober) observeDeployment(ctx context.Context, n Node, prov bool) (obs observation, done bool) {
+	s := p.s
 	dep, err := s.d.Apps.Get(ctx, *n.DeploymentID)
 	if err != nil {
 		s.d.Log.Warn("llm prober: read deployment", "node", n.ID, "err", err)
-		return observation{vSkip, ""}
+		return observation{vSkip, ""}, true
 	}
 	switch {
 	case dep.State == appdeploy.StateFailed || dep.State == appdeploy.StateRemoved || dep.State == appdeploy.StateLost:
 		if prov {
-			return observation{vSkip, ""} // Controller 第 2 步负责 provisioning → failed
+			return observation{vSkip, ""}, true // Controller 第 2 步负责 provisioning → failed
 		}
-		return observation{vFailNow, deploymentError(dep)}
+		return observation{vFailNow, deploymentError(dep)}, true
 	case dep.State != appdeploy.StateRunning:
 		if prov {
-			return observation{vSkip, ""}
+			return observation{vSkip, ""}, true
 		}
-		return observation{vFail, "部署未运行（" + dep.State + "）"}
+		return observation{vFail, "部署未运行（" + dep.State + "）"}, true
 	case dep.Health == appdeploy.HealthUnhealthy:
 		if prov {
-			return observation{vSkip, ""}
+			return observation{vSkip, ""}, true
 		}
-		return observation{vFail, "部署健康检查未通过"}
+		return observation{vFail, "部署健康检查未通过"}, true
 	case prov && dep.Health != appdeploy.HealthOK:
-		return observation{vSkip, ""}
+		return observation{vSkip, ""}, true
 	}
+	return observation{}, false
+}
+
+// probeNode 经上游拨号做一次 HTTP 探测（GET /v1/models，节点密钥）。
+func (p *Prober) probeNode(ctx context.Context, n Node, slug string) observation {
+	s := p.s
 	target, err := s.d.Rental.UpstreamTarget(ctx, *n.InstanceID)
 	if err != nil {
 		return observation{vFail, "读取拨号目标失败"}
