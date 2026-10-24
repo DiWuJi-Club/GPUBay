@@ -1,7 +1,7 @@
 import {
-  centsToYuanInput, fmtYuan, yuanToCents,
+  centsToYuanInput, digitsOnly, fmtDate, fmtYuan, toHalfWidthDigits, yuanToCents,
   deploymentPhaseLabel, deploymentStateLabel, fmtTime, labelOf,
-  type AdminAppVersion, type AdminGroup, type AdminGroupBrief, type AdminImage, type AppEnvSpec, type LLMModelAdmin, type LLMModelInput, type LLMModelKind, type LLMModelSource,
+  type AdminAppVersion, type AdminGroup, type AdminGroupBrief, type AdminImage, type AppEnvSpec, type LLMAccountAdmin, type LLMAccountUpdate, type LLMDailyAdminRow, type LLMModelAdmin, type LLMModelInput, type LLMModelKind, type LLMModelSource,
   type LLMNode, type LLMNodeState, type LLMPoolMachine, type Role,
 } from '@spark/shared'
 import { ALL_ROLES, FIN_ROLES, OPS_ROLES } from '../menu'
@@ -320,4 +320,202 @@ export type PoolCandidateSource = 'none' | number
 export const POOL_CANDIDATE_PAGE = 50
 export function poolCandidateQuery(source: PoolCandidateSource, rack: string, page: number): Record<string, string | number | undefined> {
   return { group_id: source, rack: rack.trim() || undefined, page, page_size: POOL_CANDIDATE_PAGE }
+}
+
+// ---- 费用与数字 ----
+
+/**
+ * 费用（微分，1 分 = 10^6 微分）→ 元：0「¥0.00」；不足 1 分「< ¥0.01」；其余最多 6 位小数（四舍五入到 10^-6 元），
+ * 去掉末尾的 0 但至少两位：1_250_000 →「¥0.0125」。全程整数运算。
+ * 与控制台分支 shared/format.ts 的 formatMicroFen 规则相同；为避免两个分支同改 shared/format.ts，后台先放在这里。
+ */
+export function fmtCostMicro(micro: number): string {
+  const sign = micro < 0 ? '-' : ''
+  const abs = Math.abs(Math.trunc(micro))
+  if (abs === 0) return '¥0.00'
+  if (abs < 1_000_000) return '< ¥0.01'
+  const units = String(Math.round(abs / 100)).padStart(7, '0') // 10^-6 元
+  const frac = units.slice(-6).replace(/0+$/, '').padEnd(2, '0')
+  const yuan = units.slice(0, -6).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `${sign}¥${yuan}.${frac}`
+}
+
+/** 整数千分位：1234567 →「1,234,567」。 */
+export const fmtCount = (n: number): string => Math.trunc(n).toLocaleString('en-US')
+
+// ---- 账户：限额 / 停用（规格 §5.3、§10.2）----
+
+export type LimitKey = 'rpm' | 'tpm' | 'concurrency'
+export const LIMIT_KEYS: readonly LimitKey[] = ['rpm', 'tpm', 'concurrency']
+export const LIMIT_LABEL: Record<LimitKey, string> = { rpm: 'RPM（每分钟请求）', tpm: 'TPM（每分钟 token）', concurrency: '并发' }
+export const LIMIT_SHORT: Record<LimitKey, string> = { rpm: 'RPM', tpm: 'TPM', concurrency: '并发' }
+/** 平台默认限额（按用户），与后端 llm 默认值一致；表格优先显示后端返回的生效值 limits。 */
+export const LIMIT_DEFAULTS: Record<LimitKey, number> = { rpm: 60, tpm: 200_000, concurrency: 8 }
+/** 与后端 PUT /llm/accounts 的校验一致。 */
+export const LIMIT_BOUNDS: Record<LimitKey, readonly [number, number]> = { rpm: [1, 100_000], tpm: [1, 100_000_000], concurrency: [1, 512] }
+const LIMIT_FIELD = { rpm: 'rpm_limit', tpm: 'tpm_limit', concurrency: 'concurrency_limit' } as const
+type LimitField = (typeof LIMIT_FIELD)[LimitKey]
+
+/** 限额表单：输入框字符串；空串 = 恢复默认。 */
+export type LimitForm = Record<LimitKey, string>
+export type LimitPatch = Partial<Record<LimitField, number | null>>
+type LimitSource = Pick<LLMAccountAdmin, LimitField>
+
+export function limitFormOf(a: LimitSource): LimitForm {
+  const v = (n: number | null) => (n == null ? '' : String(n))
+  return { rpm: v(a.rpm_limit), tpm: v(a.tpm_limit), concurrency: v(a.concurrency_limit) }
+}
+
+/**
+ * 限额表单 → PUT 请求体：空 = null（恢复默认），否则须为范围内的整数；只放与当前值不同的字段（未改的省略 = 不改）。
+ * patch 为空对象表示没有改动。
+ */
+export function buildLimitPatch(a: LimitSource, f: LimitForm): { ok: true; patch: LimitPatch } | { ok: false; errors: Partial<Record<LimitKey, string>> } {
+  const errors: Partial<Record<LimitKey, string>> = {}
+  const patch: LimitPatch = {}
+  for (const k of LIMIT_KEYS) {
+    const t = toHalfWidthDigits(f[k]).trim() // 全角数字按半角；小数点、负号、字母等一律不合法
+    let next: number | null = null
+    if (t !== '') {
+      const [lo, hi] = LIMIT_BOUNDS[k]
+      const n = /^\d+$/.test(t) ? Number(t) : NaN
+      if (!Number.isSafeInteger(n) || n < lo || n > hi) {
+        errors[k] = `需为 ${lo}～${fmtCount(hi)} 的整数，留空恢复默认`
+        continue
+      }
+      next = n
+    }
+    if (next !== a[LIMIT_FIELD[k]]) patch[LIMIT_FIELD[k]] = next
+  }
+  return Object.keys(errors).length ? { ok: false, errors } : { ok: true, patch }
+}
+
+/** 表格里的一项限额：覆盖值原样；null 显示生效值并标「默认」。 */
+export function limitText(a: Pick<LLMAccountAdmin, LimitField | 'limits'>, k: LimitKey): string {
+  const own = a[LIMIT_FIELD[k]]
+  if (own != null) return fmtCount(own)
+  return `${fmtCount(a.limits?.[k] ?? LIMIT_DEFAULTS[k])}（默认）`
+}
+
+/** 停用账户 / 停用 Key 的原因：去首尾空白后 1～200 字符（与后端一致）。 */
+export const REASON_MAX = 200
+export function validateReason(reason: string, what = '原因'): string | null {
+  const r = reason.trim()
+  if (!r) return `请填写${what}`
+  if ([...r].length > REASON_MAX) return `${what}最多 ${REASON_MAX} 个字符`
+  return null
+}
+export const blockBody = (reason: string): LLMAccountUpdate => ({ blocked: true, blocked_reason: reason.trim() })
+export const unblockBody = (): LLMAccountUpdate => ({ blocked: false })
+
+export interface AccountFilter {
+  /** 用户 ID 或手机号片段（只留数字） */
+  q: string
+  blocked: '' | 'true' | 'false'
+  debt: boolean
+}
+export const emptyAccountFilter = (): AccountFilter => ({ q: '', blocked: '', debt: false })
+/** ?user_id=（用户详情的链接）预填搜索框。 */
+export function accountFilterFromQuery(q: Record<string, unknown>): AccountFilter {
+  const v = q.user_id
+  return { ...emptyAccountFilter(), q: digitsOnly(String((Array.isArray(v) ? v[0] : v) ?? '')) }
+}
+/** GET /llm/accounts 的查询串：空值省略（buildQuery 会去掉 '' / undefined）。 */
+export function accountsQuery(f: AccountFilter, page: number, pageSize: number): Record<string, string | number | undefined> {
+  return { q: f.q || undefined, blocked: f.blocked || undefined, debt: f.debt ? 'true' : undefined, page, page_size: pageSize }
+}
+
+// ---- 用量 / 汇总 / 结算（规格 §10.2）----
+
+/** 明细查询窗口上限（天，含首尾）；与后端 UsageWindow 一致。 */
+export const USAGE_MAX_DAYS = 90
+const DAY_MS = 86_400_000
+
+/** 默认最近 7 天（北京时间，含今天）。 */
+export function defaultUsageRange(now: Date = new Date()): { from: string; to: string } {
+  return { from: fmtDate(new Date(now.getTime() - 6 * DAY_MS)), to: fmtDate(now) }
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+/** 日期范围：两端都要填、from ≤ to、含首尾不超过 90 天；null = 通过。 */
+export function validateUsageRange(r: { from: string; to: string }): string | null {
+  if (!DATE_RE.test(r.from) || !DATE_RE.test(r.to)) return '请选择起止日期'
+  const days = (Date.parse(`${r.to}T00:00:00Z`) - Date.parse(`${r.from}T00:00:00Z`)) / DAY_MS + 1
+  if (!Number.isFinite(days) || days < 1) return '开始日期不能晚于结束日期'
+  if (days > USAGE_MAX_DAYS) return `查询范围最多 ${USAGE_MAX_DAYS} 天`
+  return null
+}
+
+export interface UsageFilter {
+  user_id: string
+  model_id: number | ''
+  key_id: string
+  status: string
+  range: { from: string; to: string }
+}
+export function emptyUsageFilter(q: Record<string, unknown> = {}, now?: Date): UsageFilter {
+  const v = q.user_id
+  return { user_id: digitsOnly(String((Array.isArray(v) ? v[0] : v) ?? '')), model_id: '', key_id: '', status: '', range: defaultUsageRange(now) }
+}
+/** 明细 / 导出的查询串。 */
+export function usageQuery(f: UsageFilter): Record<string, string | number | undefined> {
+  return {
+    user_id: f.user_id || undefined, model_id: f.model_id === '' ? undefined : f.model_id, key_id: f.key_id || undefined, status: f.status || undefined,
+    from: f.range.from || undefined, to: f.range.to || undefined,
+  }
+}
+/** 结算记录只按用户与日期筛选。 */
+export function settlementsQuery(f: UsageFilter): Record<string, string | undefined> {
+  return { user_id: f.user_id || undefined, from: f.range.from || undefined, to: f.range.to || undefined }
+}
+
+export type DailyGroup = 'day' | 'model' | 'user'
+export const dailyGroupLabel: Record<DailyGroup, string> = { day: '按天', model: '按模型', user: '按用户' }
+/** 汇总的查询串：按天也用 group_by=model 取数再按天合计。 */
+export function dailyQuery(f: UsageFilter, g: DailyGroup): Record<string, string> {
+  return { from: f.range.from, to: f.range.to, group_by: g === 'user' ? 'user' : 'model' }
+}
+
+export interface DailySummaryRow {
+  key: string
+  day?: string
+  model?: string
+  user_id?: number
+  phone?: string
+  requests: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost_micro: number
+}
+
+/**
+ * 把 /llm/usage/daily 的「天 × 模型 / 天 × 用户」行合计成一维：按天（日期倒序）、按模型 / 按用户（费用倒序）。
+ * 末尾不含合计行，合计见 sumDaily。
+ */
+export function summarizeDaily(rows: LLMDailyAdminRow[], g: DailyGroup): DailySummaryRow[] {
+  const m = new Map<string, DailySummaryRow>()
+  for (const r of rows) {
+    const key = g === 'day' ? r.day : g === 'model' ? (r.model ?? '') : String(r.user_id ?? '')
+    let x = m.get(key)
+    if (!x) {
+      x = { key, requests: 0, prompt_tokens: 0, completion_tokens: 0, cost_micro: 0 }
+      if (g === 'day') x.day = r.day
+      else if (g === 'model') x.model = r.model ?? ''
+      else Object.assign(x, { user_id: r.user_id, phone: r.phone ?? '' })
+      m.set(key, x)
+    }
+    x.requests += r.requests
+    x.prompt_tokens += r.prompt_tokens
+    x.completion_tokens += r.completion_tokens
+    x.cost_micro += r.cost_micro
+  }
+  const out = [...m.values()]
+  if (g === 'day') return out.sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : 0))
+  return out.sort((a, b) => b.cost_micro - a.cost_micro || (a.key < b.key ? -1 : 1))
+}
+export function sumDaily(rows: Pick<DailySummaryRow, 'requests' | 'prompt_tokens' | 'completion_tokens' | 'cost_micro'>[]) {
+  return rows.reduce(
+    (s, r) => ({ requests: s.requests + r.requests, prompt_tokens: s.prompt_tokens + r.prompt_tokens, completion_tokens: s.completion_tokens + r.completion_tokens, cost_micro: s.cost_micro + r.cost_micro }),
+    { requests: 0, prompt_tokens: 0, completion_tokens: 0, cost_micro: 0 },
+  )
 }

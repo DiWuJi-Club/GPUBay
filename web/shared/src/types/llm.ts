@@ -190,19 +190,98 @@ export interface LLMPoolMachine {
 }
 export interface LLMPool { group_id: number; machines: LLMPoolMachine[]; free: number; total: number }
 
-/** GET /llm/accounts 的条目。 */
+export interface LLMLimits { rpm: number; tpm: number; concurrency: number }
+
+/**
+ * GET /llm/accounts 的条目：llm_accounts 一行 + 手机号、Key 数、本月消费（分）、未结算（分，向上取整）、生效限额。
+ * *_limit 为 null = 用默认值（limits 是合并默认值后的生效值）。
+ */
 export interface LLMAccountAdmin {
   user_id: number
-  phone: string
-  keys: number
-  month_cost: number
-  unsettled: number
+  unsettled_micro: number
+  carry_micro: number
   debt: number
   rpm_limit: number | null
   tpm_limit: number | null
   concurrency_limit: number | null
   blocked: boolean
   blocked_reason: string
+  created_at: string
+  updated_at: string
+  phone: string
+  key_count: number
+  month_cost: number
+  unsettled: number
+  limits: LLMLimits
+}
+
+/** PUT /llm/accounts/{user_id}：省略 = 不改，null = 恢复默认；停用要原因，解除停用清空原因。 */
+export interface LLMAccountUpdate {
+  rpm_limit?: number | null
+  tpm_limit?: number | null
+  concurrency_limit?: number | null
+  blocked?: boolean
+  blocked_reason?: string
+}
+
+/** 后台 GET /llm/keys?user_id= 的条目（只有 key_hint）。month_cost_micro 只对 month_ym 那个月有效。 */
+export interface LLMKeyAdmin {
+  id: number
+  user_id: number
+  name: string
+  key_hint: string
+  status: LLMKeyStatus
+  model_slugs: string[]
+  monthly_cap: number | null
+  month_ym: string
+  month_cost_micro: number
+  expires_at: string | null
+  last_used_at: string | null
+  created_at: string
+  revoked_at: string | null
+}
+
+/** 后台 GET /llm/usage 的条目。 */
+export interface LLMUsageAdminRow {
+  request_id: string
+  created_at: string
+  user_id: number
+  user_phone: string
+  model: string
+  key_name: string
+  key_hint: string
+  endpoint: LLMEndpoint
+  stream: boolean
+  prompt_tokens: number
+  completion_tokens: number
+  estimated: boolean
+  input_price: number
+  output_price: number
+  cost_micro: number
+  status: LLMUsageStatus
+  http_status: number
+  latency_ms: number
+  ttft_ms: number | null
+  node_id: string | null
+  client_ip: string
+}
+
+/** 后台 GET /llm/usage/daily?group_by=model|user 的条目（day 为北京时间 YYYY-MM-DD；按用户时带 user_id / phone，按模型时带 model）。 */
+export interface LLMDailyAdminRow {
+  day: string
+  user_id?: number
+  phone?: string
+  model?: string
+  requests: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost_micro: number
+}
+
+/** 后台 GET /llm/settlements 的条目。 */
+export interface LLMSettlementAdmin extends LLMSettlement {
+  user_id: number
+  cost_micro: number
 }
 
 /** GET /llm/summary（仪表盘卡片）。 */

@@ -3,8 +3,10 @@ import { fmtYuan, labelOf, llmModelStatusLabel, llmModelStatusType, messageOf, t
 import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
+import AccountsTab from '../components/llm/AccountsTab.vue'
 import ModelsTab from '../components/llm/ModelsTab.vue'
 import NodesTab from '../components/llm/NodesTab.vue'
+import UsageTab from '../components/llm/UsageTab.vue'
 import { tabFromQuery, visibleTabs, wantedReplicas as wanted, type LlmTabKey } from '../logic/llm'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
@@ -109,8 +111,9 @@ const fmtNum = (n: number) => n.toLocaleString('en-US')
         <!-- active：只在 Tab 可见时自动刷新（el-tabs 切走后面板仍挂载） -->
         <NodesTab v-else-if="t.key === 'nodes'" :active="tab === 'nodes'" />
 
-        <!-- 账户 / 用量（Task 22）在这里接入 -->
-        <el-empty v-else :description="`${t.label}即将上线`" :image-size="60" :data-testid="`llm-${t.key}-placeholder`" />
+        <AccountsTab v-else-if="t.key === 'accounts'" />
+
+        <UsageTab v-else-if="t.key === 'usage'" />
       </el-tab-pane>
     </el-tabs>
   </el-card>

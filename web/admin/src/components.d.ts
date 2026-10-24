@@ -11,6 +11,7 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AccountsTab: typeof import('./components/llm/AccountsTab.vue')['default']
     AddPoolMachineDialog: typeof import('./components/llm/AddPoolMachineDialog.vue')['default']
     AppFormDialog: typeof import('./components/AppFormDialog.vue')['default']
     BatchLink: typeof import('./components/BatchLink.vue')['default']
@@ -57,6 +58,7 @@ declare module 'vue' {
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     TotpDialog: typeof import('./components/TotpDialog.vue')['default']
+    UsageTab: typeof import('./components/llm/UsageTab.vue')['default']
   }
   export interface GlobalDirectives {
     vLoading: typeof import('element-plus/es')['ElLoadingDirective']

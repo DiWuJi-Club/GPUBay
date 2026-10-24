@@ -51,7 +51,7 @@ function onCreated(a: AdminApp) {
     </el-alert>
     <el-table :data="items" v-loading="loading" row-key="id" class="clickable" data-testid="apps-table" @row-click="open">
       <el-table-column label="名称" min-width="160">
-        <template #default="{ row }"><span data-testid="apps-row" :data-id="row.id"><span data-testid="apps-row-name">{{ row.name }}</span></span></template>
+        <template #default="{ row }"><span data-testid="apps-row" :data-id="row.id"><span data-testid="apps-row-name">{{ row.name }}</span></span><el-tag v-if="row.internal" size="small" type="info" class="internal" data-testid="apps-row-internal">内部</el-tag></template>
       </el-table-column>
       <el-table-column label="slug" min-width="140"><template #default="{ row }"><span class="mono" data-testid="apps-row-slug">{{ row.slug }}</span></template></el-table-column>
       <el-table-column label="分类" width="110"><template #default="{ row }">{{ labelOf(appCategoryLabel, row.category) }}</template></el-table-column>
@@ -73,4 +73,5 @@ function onCreated(a: AdminApp) {
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; font-size: 13px; }
 .clickable :deep(tbody tr) { cursor: pointer; }
+.internal { margin-left: 6px; }
 </style>
