@@ -1,8 +1,8 @@
 import type { AdminAppVersion, AdminImage, AppEnvSpec, LLMModelAdmin } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  compatibleImages, emptyModelForm, fenToYuanInput, fmtPrice, latestPublished, modelToForm, nodeEnvSpec, nodeParamsChanged, staleNodesWarning,
-  tabFromQuery, validateEnvValue, validateModelForm, visibleTabs, yuanInputToFen, type ModelForm,
+  compatibleImages, emptyModelForm, extraEnvKeys, fenToYuanInput, fmtPrice, imageNote, latestPublished, modelToForm, nodeEnvSpec, nodeParamsChanged, staleNodesWarning,
+  tabFromQuery, validateEnvValue, validateModelForm, visibleTabs, wantedReplicas, yuanInputToFen, type ModelForm,
 } from '../llm'
 
 const model = (over: Partial<LLMModelAdmin> = {}): LLMModelAdmin => ({
@@ -79,8 +79,26 @@ describe('validateEnvValue', () => {
 describe('validateModelForm（镜像规格 §3.1）', () => {
   const spec = nodeEnvSpec(vllmEnv)
 
-  it('合法表单 → 请求体：价格换算成分，node_env 去掉空值与 spec 外的变量', () => {
-    const out = validateModelForm(goodForm({ node_env: { MAX_NUM_SEQS: '128', GPU_MEMORY_UTILIZATION: '', API_KEY: 'x', OTHER: '1' } }), { creating: true, envSpec: spec })
+  it('spec 外的变量：未确认 → 不能保存并列出变量名；确认后从请求里去掉', () => {
+    const f = goodForm({ node_env: { MAX_NUM_SEQS: '128', OTHER: '1', API_KEY: 'x', EMPTY: '' } })
+    expect(extraEnvKeys(f, spec)).toEqual(['API_KEY', 'OTHER'])
+    const blocked = validateModelForm(f, { creating: true, envSpec: spec })
+    expect(blocked.ok).toBe(false)
+    if (!blocked.ok) expect(blocked.errors.node_env_extra).toContain('API_KEY、OTHER')
+    const out = validateModelForm({ ...f, drop_extra_env: true }, { creating: true, envSpec: spec })
+    expect(out.ok && out.input.node_env).toEqual({ MAX_NUM_SEQS: '128' })
+  })
+
+  it('镜像不在所选版本兼容列表（或已停用）→ 拦下；不传列表时不在前端校验', () => {
+    const blocked = validateModelForm(goodForm({ image_id: 6 }), { creating: true, envSpec: spec, allowedImageIds: [5] })
+    expect(blocked.ok).toBe(false)
+    if (!blocked.ok) expect(blocked.errors.image_id).toContain('不兼容所选 vllm-node 版本')
+    expect(validateModelForm(goodForm({ image_id: 5 }), { creating: true, envSpec: spec, allowedImageIds: [5] }).ok).toBe(true)
+    expect(validateModelForm(goodForm({ image_id: 6 }), { creating: true, envSpec: spec }).ok).toBe(true)
+  })
+
+  it('合法表单 → 请求体：价格换算成分，node_env 去掉空值', () => {
+    const out = validateModelForm(goodForm({ node_env: { MAX_NUM_SEQS: '128', GPU_MEMORY_UTILIZATION: '' } }), { creating: true, envSpec: spec })
     expect(out.ok).toBe(true)
     if (!out.ok) return
     expect(out.input).toMatchObject({ slug: 'qwen3-32b', input_price: 150, output_price: 600, node_env: { MAX_NUM_SEQS: '128' }, app_version_id: null })
@@ -127,6 +145,13 @@ describe('modelToForm', () => {
     expect(f.output_price).toBe('6.00')
     expect(f.node_env).toEqual({ GPU_MEMORY_UTILIZATION: '', MAX_NUM_SEQS: '64', QUANTIZATION: '' })
     expect(f.features).toEqual(['tools'])
+    expect(f.drop_extra_env).toBe(false)
+  })
+  it('已存的、不在所选版本 spec 里的变量保留在表单里（不静默丢弃）', () => {
+    const f = modelToForm(model({ node_env: { MAX_NUM_SEQS: '64', OLD_FLAG: 'on' } }), nodeEnvSpec(vllmEnv))
+    expect(f.node_env.OLD_FLAG).toBe('on')
+    expect(extraEnvKeys(f, nodeEnvSpec(vllmEnv))).toEqual(['OLD_FLAG'])
+    expect(validateModelForm(f, { creating: false, envSpec: nodeEnvSpec(vllmEnv) }).ok).toBe(false)
   })
   it('往返：未改动的表单校验后与原模型参数一致', () => {
     const m = model()
@@ -184,6 +209,21 @@ describe('vllm-node 版本与镜像', () => {
     expect(compatibleImages(ver(1, 'published', '', [5, 6]), images).map((i) => i.id)).toEqual([5])
     expect(compatibleImages(ver(1, 'published', '', [5, 6]), images, 6).map((i) => i.id)).toEqual([5, 6])
     expect(compatibleImages(undefined, images).map((i) => i.id)).toEqual([5, 7]) // 没有版本信息：列出全部启用镜像，由服务器校验
+    expect(compatibleImages(ver(1, 'published', '', [5]), images, 7).map((i) => i.id)).toEqual([5, 7]) // 当前所选不兼容也保留
+  })
+  it('imageNote：不兼容所选版本 / 已停用 / 可选', () => {
+    const img = (id: number, enabled: boolean): AdminImage => ({ id, name: `img${id}`, ref: '', description: '', enabled, sort: id, created_at: '', updated_at: '' })
+    const v = ver(1, 'published', '', [5, 6])
+    expect(imageNote(v, img(7, true))).toBe('不兼容所选版本')
+    expect(imageNote(v, img(6, false))).toBe('已停用')
+    expect(imageNote(v, img(5, true))).toBe('')
+    expect(imageNote(undefined, img(7, true))).toBe('')
+  })
+})
+
+describe('wantedReplicas', () => {
+  it.each([['online', 3, 3], ['draft', 3, 0], ['offline', 3, 0]] as const)('%s replicas=%d → %d', (status, replicas, want) => {
+    expect(wantedReplicas({ status, replicas })).toBe(want)
   })
 })
 

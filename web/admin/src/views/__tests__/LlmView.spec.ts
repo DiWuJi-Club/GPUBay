@@ -116,13 +116,26 @@ describe('LlmView Tab 与总览', () => {
     await mountAt('/llm?tab=models')
     expect(rowsById('llm-model-row')).toHaveLength(1)
     expect(byId('llm-model-row-input-price').text()).toBe('¥1.50')
-    expect(byId('llm-model-row-replicas').text()).toBe('1 / 1')
+    expect(byId('llm-model-row-replicas').text()).toBe('0 / 1') // 草稿：实际期望 0（与总览一致）
+    expect(byId('llm-model-row-replicas-set').text()).toContain('上线后 1')
     expect(byId('llm-model-create').exists()).toBe(false)
     expect(rowById('llm-model-online').exists()).toBe(false)
     expect(rowById('llm-model-edit').exists()).toBe(false)
     await rowById('llm-model-view').trigger('click')
     await flushPromises()
     expect(byId('llm-model-save').exists()).toBe(false)
+  })
+})
+
+describe.each(['ops', 'finance'] as const)('%s 看模型 Tab', (role) => {
+  it('没有新建 / 编辑 / 上下线 / 删除按钮', async () => {
+    login(role)
+    models = [model(), model({ id: 4, slug: 'free', nodes: { ready: 0, total: 0 } }), model({ id: 5, slug: 'on', status: 'online' })]
+    await mountAt('/llm?tab=models')
+    expect(rowsById('llm-model-row')).toHaveLength(3)
+    expect(byId('llm-model-create').exists()).toBe(false)
+    for (const id of ['llm-model-edit', 'llm-model-online', 'llm-model-offline', 'llm-model-delete']) expect(rowsById(id), id).toHaveLength(0)
+    expect(rowsById('llm-model-view')).toHaveLength(3)
   })
 })
 
@@ -197,6 +210,39 @@ describe('模型抽屉（super）', () => {
     await flushPromises()
     expect(put.mock.calls[0][1]).toMatchObject({ input_price: 200 })
     expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('已存的 spec 外变量：只读列出「将被移除」，确认后才保存并去掉', async () => {
+    login('super')
+    models = [model({ node_env: { MAX_NUM_SEQS: '64', OLD_FLAG: 'on' } })]
+    await mountAt('/llm?tab=models')
+    await rowById('llm-model-edit').trigger('click')
+    await flushPromises()
+    expect(byId('llm-model-extra-env').text()).toContain('OLD_FLAG（不在所选版本中，将被移除）')
+    expect((byId('llm-model-extra-env-OLD_FLAG').element as HTMLInputElement).value).toBe('on')
+    await byId('llm-model-save').trigger('click')
+    await flushPromises()
+    expect(put).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(byId('llm-model-extra-env').text()).toContain('请勾选确认'))
+    await byId('llm-model-drop-extra').find('input').setValue(true)
+    await byId('llm-model-save').trigger('click')
+    await flushPromises()
+    expect(put).toHaveBeenCalledTimes(1)
+    expect(put.mock.calls[0][1].node_env).toEqual({ MAX_NUM_SEQS: '64' })
+  })
+
+  it('当前镜像不兼容所选版本：下拉标注并拦下保存', async () => {
+    login('super')
+    models = [model({ image_id: 6 })]
+    await mountAt('/llm?tab=models')
+    await rowById('llm-model-edit').trigger('click')
+    await flushPromises()
+    expect(byId('llm-model-image').exists()).toBe(true)
+    expect(document.body.textContent).toContain('Other（不兼容所选版本）')
+    await byId('llm-model-save').trigger('click')
+    await flushPromises()
+    expect(put).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(wrapper!.text()).toContain('该镜像不兼容所选 vllm-node 版本'))
   })
 
   it('vllm-node 未导入：提示且不能保存', async () => {

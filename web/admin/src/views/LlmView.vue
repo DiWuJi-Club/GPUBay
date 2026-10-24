@@ -4,7 +4,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import ModelsTab from '../components/llm/ModelsTab.vue'
-import { tabFromQuery, visibleTabs, type LlmTabKey } from '../logic/llm'
+import { tabFromQuery, visibleTabs, wantedReplicas as wanted, type LlmTabKey } from '../logic/llm'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
 
@@ -51,8 +51,6 @@ watch(
   { immediate: true },
 )
 const fmtNum = (n: number) => n.toLocaleString('en-US')
-/** 期望副本：只有上线的模型才按 replicas 建节点（下线 / 草稿期望为 0） */
-const wanted = (m: LLMModelAdmin) => (m.status === 'online' ? m.replicas : 0)
 </script>
 
 <template>

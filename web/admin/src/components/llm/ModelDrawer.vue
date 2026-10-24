@@ -7,7 +7,7 @@ import { ElMessage } from 'element-plus'
 import { computed, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
 import {
-  compatibleImages, emptyModelForm, LLM_FEATURES, llmFeatureLabel, llmSourceLabel, latestPublished, modelToForm, nodeEnvSpec, staleNodesWarning,
+  compatibleImages, emptyModelForm, extraEnvKeys, imageNote, LLM_FEATURES, llmFeatureLabel, llmSourceLabel, latestPublished, modelToForm, nodeEnvSpec, staleNodesWarning,
   validateModelForm, type ModelForm,
 } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'
@@ -34,6 +34,11 @@ const latest = computed(() => latestPublished(catalog.versions))
 const version = computed(() => (form.value.app_version_id != null ? catalog.versions.find((v) => v.id === form.value.app_version_id) : latest.value))
 const envSpec = computed<AppEnvSpec[]>(() => nodeEnvSpec(version.value?.spec.env))
 const images = computed(() => compatibleImages(version.value, catalog.images, form.value.image_id))
+/** 前端校验用：所选版本兼容且启用的镜像（不含「当前已选但不兼容」的那一项） */
+const allowedImageIds = computed(() => (version.value ? compatibleImages(version.value, catalog.images).map((i) => i.id) : undefined))
+const validateOpts = (creating: boolean) => ({ creating, envSpec: envSpec.value, allowedImageIds: allowedImageIds.value })
+/** 已存的、不在所选版本 spec 里的变量：只读展示，确认后随保存移除 */
+const extraKeys = computed(() => extraEnvKeys(form.value, envSpec.value))
 const imageName = (id: number) => catalog.images.find((i) => i.id === id)?.name ?? `#${id}`
 /** 不能保存的原因（目录没加载好 / vllm-node 没有可用版本） */
 const blocker = computed(() => {
@@ -48,7 +53,7 @@ const title = computed(() => (props.readonly ? '模型详情' : props.model ? `�
 /** 实时提示：已有节点且改了只影响新节点的参数 */
 const stale = computed(() => {
   if (!props.model || props.readonly || blocker.value) return null
-  const out = validateModelForm(form.value, { creating: false, envSpec: envSpec.value })
+  const out = validateModelForm(form.value, validateOpts(false))
   return out.ok ? staleNodesWarning(props.model, out.input) : null
 })
 
@@ -87,11 +92,11 @@ watch(
   { immediate: true },
 )
 
-/** 换了 vllm-node 版本：变量表跟着换，同名变量保留已填的值。 */
+/** 换了 vllm-node 版本：变量表跟着换，同名变量保留已填的值；新版本没有的变量留在表单里，作为「将被移除」列出（不静默丢弃）。 */
 watch(envSpec, (spec) => {
   const cur = form.value.node_env
   const src = props.model?.node_env ?? {}
-  form.value.node_env = Object.fromEntries(spec.map((e) => [e.name, cur[e.name] ?? src[e.name] ?? '']))
+  form.value.node_env = { ...cur, ...Object.fromEntries(spec.map((e) => [e.name, cur[e.name] ?? src[e.name] ?? ''])) }
 })
 
 const envPlaceholder = (e: AppEnvSpec) => (e.default ? `默认 ${e.default}` : '可留空')
@@ -102,7 +107,7 @@ function setEnv(name: string, v: string | number | null | undefined) {
 
 async function save() {
   if (busy.value || props.readonly || blocker.value) return
-  const out = validateModelForm(form.value, { creating: !props.model, envSpec: envSpec.value })
+  const out = validateModelForm(form.value, validateOpts(!props.model))
   if (!out.ok) {
     errors.value = out.errors
     return
@@ -180,7 +185,7 @@ async function save() {
         </el-form-item>
         <el-form-item label="节点镜像" :error="errors.image_id" required>
           <el-select v-model="form.image_id" placeholder="请选择" data-testid="llm-model-image">
-            <el-option v-for="i in images" :key="i.id" :value="i.id" :label="i.enabled ? i.name : `${i.name}（已停用）`" />
+            <el-option v-for="i in images" :key="i.id" :value="i.id" :label="imageNote(version, i) ? `${i.name}（${imageNote(version, i)}）` : i.name" />
           </el-select>
           <div v-if="form.image_id != null && !images.some((i) => i.id === form.image_id)" class="help">当前镜像 {{ imageName(form.image_id) }} 不在可选列表</div>
         </el-form-item>
@@ -223,6 +228,14 @@ async function save() {
         </el-form-item>
       </div>
       <p v-if="!blocker && envSpec.length === 0" class="help">该版本没有可覆盖的节点变量</p>
+      <div v-if="extraKeys.length" class="extra" data-testid="llm-model-extra-env">
+        <el-form-item v-for="k in extraKeys" :key="k" :label="`${k}（不在所选版本中，将被移除）`">
+          <el-input :model-value="form.node_env[k]" disabled :data-testid="`llm-model-extra-env-${k}`" />
+        </el-form-item>
+        <el-form-item :error="errors.node_env_extra">
+          <el-checkbox v-model="form.drop_extra_env" data-testid="llm-model-drop-extra">确认移除以上变量（之后新建的节点不再带这些参数）</el-checkbox>
+        </el-form-item>
+      </div>
 
       <h4>副本与并发</h4>
       <div class="two">
@@ -251,5 +264,6 @@ h4:first-child { margin-top: 0; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
 .help { color: #909399; font-size: 12px; line-height: 1.5; width: 100%; }
 .mb { margin-bottom: 12px; }
+.extra { border: 1px dashed var(--el-color-warning); border-radius: 4px; padding: 8px 12px 0; margin-bottom: 12px; }
 .el-select, .el-input-number { width: 100%; }
 </style>

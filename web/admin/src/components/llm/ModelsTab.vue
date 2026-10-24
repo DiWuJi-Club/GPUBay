@@ -3,7 +3,7 @@ import { labelOf, llmModelKindLabel, llmModelStatusLabel, llmModelStatusType, me
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../../api'
-import { fmtPrice } from '../../logic/llm'
+import { fmtPrice, wantedReplicas } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'
 import { hasRole } from '../../store/session'
 import ModelDrawer from './ModelDrawer.vue'
@@ -107,9 +107,11 @@ defineExpose({ load })
       <el-table-column label="输入价格" width="100"><template #default="{ row }"><span data-testid="llm-model-row-input-price">{{ fmtPrice(row.input_price) }}</span></template></el-table-column>
       <el-table-column label="输出价格" width="100"><template #default="{ row }"><span data-testid="llm-model-row-output-price">{{ fmtPrice(row.output_price) }}</span></template></el-table-column>
       <el-table-column label="上下文" width="90"><template #default="{ row }">{{ row.context_len.toLocaleString('en-US') }}</template></el-table-column>
-      <el-table-column label="副本 期望 / 就绪" width="130">
+      <el-table-column label="副本 期望 / 就绪" width="170">
         <template #default="{ row }">
-          <span data-testid="llm-model-row-replicas">{{ row.replicas }} / {{ row.nodes.ready }}</span>
+          <!-- 期望 = 实际期望（只有上线才按 replicas 建节点），与总览一致；未上线时另标设置值 -->
+          <span data-testid="llm-model-row-replicas">{{ wantedReplicas(row as LLMModelAdmin) }} / {{ row.nodes.ready }}</span>
+          <span v-if="row.status !== 'online' && row.replicas > 0" class="hint" data-testid="llm-model-row-replicas-set">（上线后 {{ row.replicas }}）</span>
           <span v-if="row.nodes.total > row.nodes.ready" class="hint">（共 {{ row.nodes.total }} 个节点）</span>
         </template>
       </el-table-column>

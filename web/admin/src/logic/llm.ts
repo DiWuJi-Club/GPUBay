@@ -79,8 +79,12 @@ export interface ModelForm {
   /** 元 / 百万 token */
   input_price: string
   output_price: string
-  /** spec 里每个可覆盖变量一项；空串 = 用 spec 默认值（不提交） */
+  /**
+   * spec 里每个可覆盖变量一项（空串 = 用 spec 默认值，不提交），另含已存的、不在所选版本 spec 里的变量（extraEnvKeys）：
+   * 后者只读展示「将被移除」，drop_extra_env 确认后才从请求里去掉，否则不能保存。
+   */
   node_env: Record<string, string>
+  drop_extra_env: boolean
   replicas: number | undefined
   max_concurrency: number | undefined
   features: string[]
@@ -91,7 +95,7 @@ export function emptyModelForm(envSpec: AppEnvSpec[] = []): ModelForm {
   return {
     slug: '', name: '', description: '', kind: 'chat', source: 'modelscope', source_id: '', image_id: undefined, app_version_id: null,
     context_len: 32768, max_output_tokens: 8192, default_max_tokens: 4096, input_price: '', output_price: '',
-    node_env: Object.fromEntries(envSpec.map((e) => [e.name, ''])), replicas: 0, max_concurrency: 32, features: [], sort: 0,
+    node_env: Object.fromEntries(envSpec.map((e) => [e.name, ''])), drop_extra_env: false, replicas: 0, max_concurrency: 32, features: [], sort: 0,
   }
 }
 
@@ -100,7 +104,8 @@ export function modelToForm(m: LLMModelAdmin, envSpec: AppEnvSpec[]): ModelForm 
     slug: m.slug, name: m.name, description: m.description, kind: m.kind, source: m.source, source_id: m.source_id, image_id: m.image_id,
     app_version_id: m.app_version_id, context_len: m.context_len, max_output_tokens: m.max_output_tokens, default_max_tokens: m.default_max_tokens,
     input_price: fenToYuanInput(m.input_price), output_price: fenToYuanInput(m.output_price),
-    node_env: Object.fromEntries(envSpec.map((e) => [e.name, m.node_env?.[e.name] ?? ''])),
+    node_env: { ...Object.fromEntries(envSpec.map((e) => [e.name, ''])), ...(m.node_env ?? {}) },
+    drop_extra_env: false,
     replicas: m.replicas, max_concurrency: m.max_concurrency, features: [...m.features], sort: m.sort,
   }
 }
@@ -147,6 +152,12 @@ export function validateEnvValue(e: AppEnvSpec, v: string): string | null {
   return null
 }
 
+/** 表单里有值、但不在所选版本 spec（非保留变量）里的变量名：版本换了或 spec 删了变量。 */
+export function extraEnvKeys(f: Pick<ModelForm, 'node_env'>, envSpec: AppEnvSpec[]): string[] {
+  const names = new Set(envSpec.map((e) => e.name))
+  return Object.entries(f.node_env).filter(([k, v]) => v !== '' && !names.has(k)).map(([k]) => k).sort()
+}
+
 const isInt = (v: number | undefined | null): v is number => typeof v === 'number' && Number.isInteger(v)
 const inRange = (v: number | undefined | null, [lo, hi]: readonly [number, number]) => isInt(v) && v >= lo && v <= hi
 const charLen = (s: string) => [...s].length
@@ -155,9 +166,12 @@ export type ModelFormResult = { ok: true; input: LLMModelInput } | { ok: false; 
 
 /**
  * 表单 → 请求体，并按规格 §3.1 预校验（服务器仍会再校验）。errors 的键是字段名，node_env 为 `node_env.<变量>`。
- * node_env 只提交 spec 里声明的非保留变量、去掉空值（空 = 用 spec 默认值）。编辑时不校验 slug（不可改，PUT 不带它）。
+ * node_env 只提交 spec 里声明的非保留变量、去掉空值（空 = 用 spec 默认值）；spec 外的已存变量须 drop_extra_env 确认才去掉。编辑时不校验 slug（不可改，PUT 不带它）。
  */
-export function validateModelForm(f: ModelForm, opt: { creating: boolean; envSpec: AppEnvSpec[] }): ModelFormResult {
+export function validateModelForm(
+  f: ModelForm,
+  opt: { creating: boolean; envSpec: AppEnvSpec[]; /** 所选 vllm-node 版本兼容且启用的镜像；不传则不在前端校验 */ allowedImageIds?: number[] },
+): ModelFormResult {
   const errors: Record<string, string> = {}
   const name = f.name.trim()
   const sourceId = f.source_id.trim()
@@ -169,6 +183,7 @@ export function validateModelForm(f: ModelForm, opt: { creating: boolean; envSpe
   if (f.source !== 'modelscope' && f.source !== 'hf-mirror') errors.source = '请选择下载源'
   if (!SOURCE_ID_RE.test(sourceId)) errors.source_id = '格式为「组织/模型」，如 Qwen/Qwen3-32B'
   if (!isInt(f.image_id)) errors.image_id = '请选择镜像'
+  else if (opt.allowedImageIds && !opt.allowedImageIds.includes(f.image_id)) errors.image_id = '该镜像不兼容所选 vllm-node 版本或已停用，请重新选择'
   if (!inRange(f.context_len, LIMITS.context_len)) errors.context_len = '上下文长度需在 1024～1048576 之间'
   if (!inRange(f.max_output_tokens, LIMITS.max_output_tokens)) errors.max_output_tokens = '最大输出需在 1～262144 之间'
   if (!isInt(f.default_max_tokens) || f.default_max_tokens < 1) errors.default_max_tokens = '默认输出需为正整数'
@@ -189,6 +204,8 @@ export function validateModelForm(f: ModelForm, opt: { creating: boolean; envSpe
     if (err) errors[`node_env.${e.name}`] = err
     else if (v !== '') nodeEnv[e.name] = v
   }
+  const extra = extraEnvKeys(f, opt.envSpec)
+  if (extra.length && !f.drop_extra_env) errors.node_env_extra = `${extra.join('、')} 不在所选 vllm-node 版本的变量里，保存时将被移除：请勾选确认`
   if (Object.keys(errors).length) return { ok: false, errors }
   return {
     ok: true,
@@ -235,7 +252,20 @@ export function latestPublished(vs: AdminAppVersion[]): AdminAppVersion | undefi
     .sort((a, b) => Date.parse(b.published_at ?? '') - Date.parse(a.published_at ?? '') || b.id - a.id)[0]
 }
 
-/** 镜像下拉：所选 vllm-node 版本兼容且启用的镜像；当前已选的即使停用也保留（便于看出问题）。没有版本信息时列出全部启用镜像。 */
+/**
+ * 镜像下拉：所选 vllm-node 版本兼容且启用的镜像；当前已选的即使停用 / 不兼容也保留（imageNote 标出，validateModelForm 拦下）。
+ * 没有版本信息时列出全部启用镜像。
+ */
 export function compatibleImages(v: AdminAppVersion | undefined, images: AdminImage[], current?: number): AdminImage[] {
   return images.filter((i) => i.id === current || (i.enabled && (!v || v.image_ids.includes(i.id))))
 }
+
+/** 镜像下拉里的标注：不兼容所选版本 / 已停用；可选时为空串。 */
+export function imageNote(v: AdminAppVersion | undefined, img: AdminImage): string {
+  if (v && !v.image_ids.includes(img.id)) return '不兼容所选版本'
+  if (!img.enabled) return '已停用'
+  return ''
+}
+
+/** 实际期望副本：只有上线的模型按 replicas 建节点（草稿 / 下线为 0）。总览与模型表共用。 */
+export const wantedReplicas = (m: Pick<LLMModelAdmin, 'status' | 'replicas'>): number => (m.status === 'online' ? m.replicas : 0)
