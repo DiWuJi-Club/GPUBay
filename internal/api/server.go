@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
@@ -46,9 +48,13 @@ type Server struct {
 	Ingress          *ingress.Auth // Web 入口鉴权；nil 时不注册 authorize 端点
 	AuthorizeLimit   int           // authorize 每用户每分钟上限；零值 60
 	CalendarLimit    int           // 匿名机组 / 日历 / 可用性端点按 IP 每分钟上限；零值 120
+	// 计划 7：应用部署；nil 时不注册 /apps* 与 /instances/{id}/apps*，实例视图的 apps_summary 恒为空数组
+	Apps      *appdeploy.Service
+	AppsLimit int // 应用部署类写操作每用户每小时上限；零值 appdeploy.UserOpsPerHour（60）
 
-	authorizeLim *authorizeLimiter
+	authorizeLim *userLimiter
 	calendarLim  *ipLimiter
+	appsLim      *userLimiter
 }
 
 const sessionCookie = "sc_session"
@@ -68,12 +74,17 @@ func (s *Server) Router() http.Handler {
 	if limit <= 0 {
 		limit = defaultAuthorizeLimit
 	}
-	s.authorizeLim = &authorizeLimiter{limit: limit}
+	s.authorizeLim = &userLimiter{limit: limit, window: time.Minute}
 	climit := s.CalendarLimit
 	if climit <= 0 {
 		climit = defaultCalendarLimit
 	}
 	s.calendarLim = &ipLimiter{limit: climit}
+	alimit := s.AppsLimit
+	if alimit <= 0 {
+		alimit = appdeploy.UserOpsPerHour
+	}
+	s.appsLim = &userLimiter{limit: alimit, window: time.Hour}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -106,6 +117,10 @@ func (s *Server) Router() http.Handler {
 			r.Get("/groups/{id}/calendar", s.handleGroupCalendar)
 			r.Get("/machines/{id}/calendar", s.handleMachineCalendar)
 			r.Get("/availability", s.handleAvailability)
+			if s.Apps != nil {
+				r.Get("/apps", s.handleAppCatalog)
+				r.Get("/apps/{slug}", s.handleAppCatalogItem)
+			}
 		})
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
 		if s.Ingress != nil {
@@ -144,6 +159,17 @@ func (s *Server) Router() http.Handler {
 			r.Put("/instances/{id}/ports/{port}", s.handleUpdatePort)
 			r.Delete("/instances/{id}/ports/{port}", s.handleDeletePort)
 			r.Get("/instances/{id}/ssh-sessions", s.handleSSHSessions)
+			if s.Apps != nil {
+				r.Get("/instances/{id}/apps", s.handleInstanceApps)
+				r.Post("/instances/{id}/apps", s.handleCreateApp)
+				r.Get("/instances/{id}/apps/{dep}", s.handleInstanceApp)
+				r.Post("/instances/{id}/apps/{dep}/redeploy", s.handleRedeployApp)
+				r.Post("/instances/{id}/apps/{dep}/stop", s.handleStopApp)
+				r.Post("/instances/{id}/apps/{dep}/start", s.handleStartApp)
+				r.Delete("/instances/{id}/apps/{dep}", s.handleRemoveApp)
+				r.Get("/instances/{id}/apps/{dep}/log", s.handleAppLog)
+				r.Get("/instances/{id}/apps/{dep}/events", s.handleAppEvents)
+			}
 			r.Get("/recharges", s.handleRecharges)
 			r.Post("/recharges", s.handleCreateRecharge)
 			r.Get("/recharges/{id}", s.handleRecharge)

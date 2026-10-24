@@ -49,6 +49,8 @@ type Server struct {
 	AgentAddr string          // 真实网关监听地址；fake Agent 连到这里
 	SSHAddr   string          // SSH 网关监听地址；/hooks/ssh 经它登录实例
 	Upstream  *sshtest.Server // 假「容器 sshd」（所有 e2e 机器的 lan_ip 都是 127.0.0.1）；/hooks/ingress-upstream 在它上面登记端口
+	// HealthAddr 是 fake 应用的健康检查 / Web 服务地址（host:port）：/hooks/apps/seed 把每个应用端口的 direct-tcpip 转到它
+	HealthAddr string
 
 	mu            sync.Mutex
 	agents        map[int64]*fakeagent.Agent
@@ -84,6 +86,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/kyc", s.handle(s.kyc))
 	mux.HandleFunc("POST /hooks/ssh", s.handle(s.ssh))
 	mux.HandleFunc("POST /hooks/ingress-upstream", s.handle(s.ingressUpstream))
+	mux.HandleFunc("POST /hooks/apps/seed", s.handle(s.appsSeed))
+	mux.HandleFunc("POST /hooks/apps/tick", s.handle(s.appsTick))
 	return loopbackOnly(mux)
 }
 
@@ -285,11 +289,13 @@ func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 }
 
 // agent 让步进式 fake Agent 执行当前队列：先等网关把 pending 指令投递到 Agent，再执行并上报，最后等网关处理完本次报告。
+// images 非空时先设置该（些）Agent 的已缓存镜像，本次及之后的 StateReport 都带上（覆盖率 / 机器详情用）。
 func (s *Server) agent(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := decode[struct {
-		MachineID *int64 `json:"machine_id"`
-		Fail      bool   `json:"fail"`
-		Result    string `json:"result"`
+		MachineID *int64    `json:"machine_id"`
+		Fail      bool      `json:"fail"`
+		Result    string    `json:"result"`
+		Images    *[]string `json:"images"`
 	}](body)
 	if err != nil {
 		return nil, err
@@ -313,6 +319,9 @@ func (s *Server) agent(ctx context.Context, body json.RawMessage) (any, error) {
 		ag, err := s.agentFor(ctx, mid)
 		if err != nil {
 			return nil, err
+		}
+		if req.Images != nil {
+			ag.SetImages(*req.Images)
 		}
 		if err := s.waitUntil(ctx, fmt.Sprintf("delivery to machine %d", mid), func() bool {
 			cmds, err := s.App.Fleet.PendingCommands(ctx, mid)

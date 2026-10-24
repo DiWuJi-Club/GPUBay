@@ -910,8 +910,10 @@ func (x *CommandResult) GetMessage() string {
 }
 
 type StateReport struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Instances     []*InstanceState       `protobuf:"bytes,1,rep,name=instances,proto3" json:"instances,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Instances []*InstanceState       `protobuf:"bytes,1,rep,name=instances,proto3" json:"instances,omitempty"`
+	// 已缓存镜像的 repository:tag 列表（docker image ls，≤ 200 项）；计划 7 新增，旧 Agent 不发该字段，平台不覆盖已有记录。
+	Images        []string `protobuf:"bytes,2,rep,name=images,proto3" json:"images,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -949,6 +951,13 @@ func (*StateReport) Descriptor() ([]byte, []int) {
 func (x *StateReport) GetInstances() []*InstanceState {
 	if x != nil {
 		return x.Instances
+	}
+	return nil
+}
+
+func (x *StateReport) GetImages() []string {
+	if x != nil {
+		return x.Images
 	}
 	return nil
 }
@@ -1219,9 +1228,10 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x0e\n" +
 	"\x02ok\x18\x02 \x01(\bR\x02ok\x12\x18\n" +
-	"\amessage\x18\x03 \x01(\tR\amessage\"J\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\"b\n" +
 	"\vStateReport\x12;\n" +
-	"\tinstances\x18\x01 \x03(\v2\x1d.spark.agent.v1.InstanceStateR\tinstances\"F\n" +
+	"\tinstances\x18\x01 \x03(\v2\x1d.spark.agent.v1.InstanceStateR\tinstances\x12\x16\n" +
+	"\x06images\x18\x02 \x03(\tR\x06images\"F\n" +
 	"\rInstanceState\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x14\n" +

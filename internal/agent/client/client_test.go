@@ -7,12 +7,14 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -630,5 +632,28 @@ func TestBackoff(t *testing.T) {
 	}
 	if d := b.Next(1000); d < 48*time.Second || d > 72*time.Second { // 大 attempt 不溢出
 		t.Fatalf("huge attempt = %v", d)
+	}
+}
+
+// StateReport 带上运行时报告的已缓存镜像；拿不到列表（nil）时不带该字段，同旧 Agent。
+func TestStateReportCarriesImages(t *testing.T) {
+	h := newHarness(t)
+	c, ex, rt := h.agent(true)
+	rt.SetImages([]string{"spark/llm-serving:25.09"})
+	ctx := h.start(c, ex, false)
+	if err := c.WaitConnected(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "hello+state", func() bool { return len(h.gw.msgs()) >= 2 })
+	if st := h.gw.msgs()[1].GetState(); st == nil || !slices.Equal(st.GetImages(), []string{"spark/llm-serving:25.09"}) {
+		t.Fatalf("first state = %v", h.gw.msgs()[1])
+	}
+	rt.FailNext("images", errors.New("docker down"))
+	if err := c.SendStateReport(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "second state", func() bool { return len(h.gw.msgs()) >= 3 })
+	if st := h.gw.msgs()[2].GetState(); st == nil || st.GetImages() != nil {
+		t.Fatalf("state after images error = %v", h.gw.msgs()[2])
 	}
 }

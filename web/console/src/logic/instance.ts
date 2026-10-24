@@ -26,6 +26,15 @@ export function releaseWarning(i: Instance): string | null {
   return null
 }
 
+/**
+ * 列表每 10 秒刷新的条件：已预订 / 开通中 / 洗机中（预订到开通时刻会自动变为开通中），
+ * 或运行中的实例有排队 / 部署中 / 卸载中的应用（非运行实例上的排队部署要等开通 / 续费，不必轮询）。
+ */
+export function needsRefresh(i: Instance): boolean {
+  if (i.state === 'creating' || i.state === 'wiping' || i.state === 'reserved') return true
+  return i.state === 'running' && (i.apps_summary ?? []).some((a) => a.state === 'queued' || a.state === 'installing' || a.state === 'removing')
+}
+
 export const canRenew = (s: InstanceState) => s === 'reserved' || s === 'creating' || s === 'running' || s === 'stopped'
 export const canRelease = (s: InstanceState) => s === 'running' || s === 'stopped'
 export const canSetAutoRenew = (s: InstanceState) => s === 'reserved' || s === 'creating' || s === 'running' || s === 'stopped'

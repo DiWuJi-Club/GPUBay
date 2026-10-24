@@ -87,3 +87,41 @@ func TestImagesAdmin(t *testing.T) {
 		t.Fatalf("update missing = %v", err)
 	}
 }
+
+func TestImageRefLockedWhileAppVersionUsesIt(t *testing.T) {
+	pool := dbtest.New(t)
+	svc := catalog.NewService(pool)
+	ctx := context.Background()
+	img, err := svc.CreateImage(ctx, superActor, catalog.ImageInput{Name: "LLM Serving", Ref: "spark/llm-serving:1", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var appID, verID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO apps (slug, name, category, created_at, updated_at) VALUES ('vllm', 'vLLM', 'llm', now(), now()) RETURNING id`).Scan(&appID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO app_versions (app_id, version, status, image_ids, spec, script, spec_hash, created_at, updated_at)
+		VALUES ($1, '1', 'published', ARRAY[$2::bigint], '{}', 'true', 'h', now(), now()) RETURNING id`, appID, img.ID).Scan(&verID); err != nil {
+		t.Fatal(err)
+	}
+	moved := catalog.ImageInput{Name: "LLM Serving", Ref: "spark/llm-serving:2", Enabled: true}
+	for _, status := range []string{"published", "draft"} {
+		if _, err := pool.Exec(ctx, `UPDATE app_versions SET status = $2 WHERE id = $1`, verID, status); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.UpdateImage(ctx, superActor, img.ID, moved); !errors.Is(err, catalog.ErrImageRefInUse) || apperr.As(err).Code != "invalid_state" {
+			t.Fatalf("%s version: ref change = %v", status, err)
+		}
+	}
+	// 其它字段（含停用）仍可改
+	got, err := svc.UpdateImage(ctx, superActor, img.ID, catalog.ImageInput{Name: "LLM Serving 25.09", Ref: img.Ref, Enabled: false, Sort: 5})
+	if err != nil || got.Enabled || got.Name != "LLM Serving 25.09" || got.Ref != img.Ref {
+		t.Fatalf("disable while referenced = %+v, %v", got, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE app_versions SET status = 'retired' WHERE id = $1`, verID); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := svc.UpdateImage(ctx, superActor, img.ID, moved); err != nil || got.Ref != moved.Ref {
+		t.Fatalf("ref change after retire = %+v, %v", got, err)
+	}
+}
