@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { formatPricePerM, labelOf, llmModelKindLabel, type LLMModelPublic } from '@spark/shared'
+import { formatPricePerM, labelOf, llmFeatureLabel, llmModelKindLabel, type LLMModelPublic } from '@spark/shared'
 import { copyText } from '../../logic/clipboard'
 import { contextLabel } from '../../logic/tokens'
 
@@ -28,7 +28,7 @@ defineProps<{ models: LLMModelPublic[] }>()
           <li><span class="label">上下文</span><span data-testid="tokens-model-context">{{ contextLabel(m.context_len) }}</span></li>
         </ul>
         <div v-if="m.features.length" class="features">
-          <el-tag v-for="f in m.features" :key="f" size="small" effect="plain" data-testid="tokens-model-feature">{{ f }}</el-tag>
+          <el-tag v-for="f in m.features" :key="f" size="small" effect="plain" data-testid="tokens-model-feature">{{ labelOf(llmFeatureLabel, f) }}</el-tag>
         </div>
         <div class="prices">
           <div>输入 <b data-testid="tokens-model-input-price">{{ formatPricePerM(m.input_price) }}</b> / 百万 token</div>
@@ -42,7 +42,8 @@ defineProps<{ models: LLMModelPublic[] }>()
 
 <style scoped>
 .intro { color: #606266; margin: 0 0 12px; font-size: 14px; }
-.cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+.cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr)); }
+.card { min-width: 0; }
 .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .name { font-weight: 600; }
 .slug { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }

@@ -42,7 +42,7 @@ export function formatMicroFen(micro: number): string {
   const sign = micro < 0 ? '-' : ''
   const abs = Math.abs(Math.trunc(micro))
   if (abs === 0) return '¥0.00'
-  if (abs < 1_000_000) return `${sign}< ¥0.01`
+  if (abs < 1_000_000) return '< ¥0.01' // 不足 1 分不带符号（「-< ¥0.01」没有意义）
   const units = String(Math.round(abs / 100)).padStart(7, '0') // 10^-6 元
   const frac = units.slice(-6).replace(/0+$/, '').padEnd(2, '0')
   return `${sign}¥${thousands(units.slice(0, -6))}.${frac}`

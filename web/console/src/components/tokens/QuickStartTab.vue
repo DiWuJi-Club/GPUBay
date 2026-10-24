@@ -85,7 +85,9 @@ const errors = computed(() =>
 </template>
 
 <style scoped>
-.quickstart { display: grid; gap: 20px; max-width: 960px; }
+/* minmax(0, 1fr)：列宽不被 <pre> 的内容撑开，代码块在自身内部横向滚动 */
+.quickstart { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; max-width: 960px; }
+section { min-width: 0; }
 h3 { margin: 0 0 8px; font-size: 15px; }
 .muted { color: #606266; font-size: 13px; margin: 0 0 8px; }
 .line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }

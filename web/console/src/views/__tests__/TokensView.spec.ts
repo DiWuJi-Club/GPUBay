@@ -66,6 +66,7 @@ describe('TokensView（未登录）', () => {
     expect(qwen.querySelector('[data-testid="tokens-model-input-price"]')!.textContent).toBe('¥0.50')
     expect(qwen.querySelector('[data-testid="tokens-model-output-price"]')!.textContent).toBe('¥2.00')
     expect(qwen.querySelector('[data-testid="tokens-model-available"]')!.textContent).toBe('可用')
+    expect(qwen.querySelector('[data-testid="tokens-model-feature"]')!.textContent).toBe('工具调用')
     const bge = byId('tokens-model-card-bge-m3')!
     expect(bge.querySelector('[data-testid="tokens-model-available"]')!.textContent).toBe('暂无节点')
     expect(bge.querySelector('[data-testid="tokens-model-output-price"]')).toBeNull()

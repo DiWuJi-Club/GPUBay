@@ -109,4 +109,6 @@ export const llmUsageStatusLabel: LabelMap = {
   ok: '成功', client_abort: '客户端中断', upstream_error: '上游错误', upstream_timeout: '上游超时', no_node: '无可用节点',
 }
 export const llmKeyStatusLabel: LabelMap = { active: '启用', disabled: '已停用', revoked: '已撤销' }
+/** 模型 features 标签；未登记的原样显示（labelOf 回落）。 */
+export const llmFeatureLabel: LabelMap = { tools: '工具调用', reasoning: '深度思考', vision: '视觉', 'long-context': '长上下文' }
 export const llmEndpointLabel: LabelMap = { chat: '对话', completions: '补全', embeddings: '向量' }

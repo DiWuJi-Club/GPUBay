@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  alertKindLabel, auditActions, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel, llmKeyStatusLabel, llmModelStatusLabel,
+  alertKindLabel, auditActions, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel, llmFeatureLabel, llmKeyStatusLabel, llmModelStatusLabel,
   llmNodeStateLabel, llmNodeStateType, llmUsageStatusLabel,
 } from '../labels'
 import type { LLMNodeState, LLMUsageStatus } from '../types'
@@ -51,5 +51,15 @@ describe('labels', () => {
       'llm.model.create', 'llm.model.update', 'llm.model.status', 'llm.model.delete', 'llm.node.drain', 'llm.node.rebuild', 'llm.node.remove',
       'llm.account.update', 'llm.key.create', 'llm.key.update', 'llm.key.revoke', 'llm.key.admin_disable',
     ]) expect(auditActions).toContain(a)
+  })
+})
+
+describe('llmFeatureLabel', () => {
+  it('已知 feature 中文，未知原样', () => {
+    expect(labelOf(llmFeatureLabel, 'tools')).toBe('工具调用')
+    expect(labelOf(llmFeatureLabel, 'reasoning')).toBe('深度思考')
+    expect(labelOf(llmFeatureLabel, 'vision')).toBe('视觉')
+    expect(labelOf(llmFeatureLabel, 'long-context')).toBe('长上下文')
+    expect(labelOf(llmFeatureLabel, 'json-mode')).toBe('json-mode')
   })
 })

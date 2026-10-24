@@ -1,7 +1,7 @@
 import { mount } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
 import type { LLMModelPublic } from '@spark/shared'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ConsoleLayout from '../../layouts/ConsoleLayout.vue'
 import {
@@ -85,7 +85,7 @@ describe('快速开始示例', () => {
 
   it('错误码表覆盖网关的全部错误码，且每个都有状态码', () => {
     for (const code of [
-      'invalid_api_key', 'account_banned', 'kyc_required', 'account_blocked', 'insufficient_quota', 'model_not_allowed', 'model_not_found',
+      'invalid_api_key', 'account_banned', 'kyc_required', 'account_blocked', 'insufficient_quota', 'model_not_allowed', 'model_not_found', 'not_found',
       'invalid_request_error', 'request_too_large', 'rate_limit_exceeded', 'monthly_cap_exceeded', 'model_unavailable', 'server_overloaded', 'upstream_error',
     ]) {
       expect(llmErrorHelp[code], code).toBeTruthy()
@@ -105,6 +105,8 @@ describe('keyHintMask', () => {
 })
 
 describe('ConsoleLayout 导航', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
   function mountLayout(mobile: boolean) {
     vi.stubGlobal('matchMedia', (q: string) => ({ matches: mobile, media: q, addEventListener: () => {}, removeEventListener: () => {} }))
     const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:p(.*)*', component: { template: '<div />' }, meta: { title: 't' } }] })
@@ -118,13 +120,11 @@ describe('ConsoleLayout 导航', () => {
     const tokens = w.get('[data-testid="menu-tokens"]')
     expect(tokens.text()).toContain('Token 商城')
     expect(tokens.attributes('href')).toBe('/tokens')
-    vi.unstubAllGlobals()
   })
 
   it('手机底部导航 5 项，含 Token 商城', () => {
     const w = mountLayout(true)
     expect(w.findAll('[data-testid^="tabbar-"]')).toHaveLength(5)
     expect(w.get('[data-testid="tabbar-tokens"]').text()).toContain('Token 商城')
-    vi.unstubAllGlobals()
   })
 })
