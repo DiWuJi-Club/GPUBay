@@ -82,3 +82,10 @@
 - **O-9** 发布动态码的 5 分钟免码窗口：帮助文案里说明（运营批量发布时「有时要码、有时不要」）。
 - **O-8 / O-14**：下载时间预期与 hf-mirror 未测，见「上线前核对」。
 - **O-12 / O-13**：共享机器的让机记录，以及 `spark-*.json` 每次 install 都被重写，见验收记录与上面的裁定遗留。
+
+### 实施方补充（lead）
+- **单副本假设**：快速出图的进程内限流 / 锁（`Runs` 的按用户串行锁与上传并发、API 层的上传与运行尝试限流器）只在单个 platform 副本内生效；多副本时退化为每副本的软上限（README 已注明）。上多副本前改为数据库锁或 Redis。
+- **W-1**：ComfyUI 每次启动日志里 `Failed to initialize database`（默认库路径在程序目录）。下一个 comfyui 版本在 `start` 里加 `--database-url sqlite:///$CDATA/user/comfyui.db`，先在真机确认 v0.3.60 支持该参数。
+- **视频 Range**：输出文件代理已支持单段 Range（Safari / iOS `<video>` 需要），真机只在 Chrome 验证过播放；上线前用 Safari 打开一次 Wan2.2 结果。
+- **已装 1.0.0 部署的模型复用**：1.1.0 安装时会复用 1.0.0 预置模型的旧位置（`models/unet`、`models/clip`、`/opt/ComfyUI/models/<dir>` 软链），只在单测中覆盖，真机未覆盖从 1.0.0 升级的部署。
+- 验收用的 `spark_p11` 库（Mac :5433）可以删除。
