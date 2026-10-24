@@ -180,7 +180,12 @@ func (s *Service) SuspendMachines(ctx context.Context, machineIDs []int64) (int,
 			return err
 		}
 		for _, inst := range list {
-			remaining := int64(inst.Remaining(now) / time.Second)
+			// 系统实例不计时（expires_at NULL）：只记 suspended_at，paused_remaining 保持 NULL（规格 §4.2）
+			var remaining *int64
+			if !inst.System {
+				r := int64(inst.Remaining(now) / time.Second)
+				remaining = &r
+			}
 			if _, err := tx.Exec(ctx, `UPDATE instances SET suspended_at = $2, paused_remaining = $3, updated_at = $2 WHERE id = $1`,
 				inst.ID, now, remaining); err != nil {
 				return err
@@ -258,6 +263,19 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs
 					MachineID: machineID, InstanceID: inst.ID, Message: AlertContainerDown(m.Serial, inst.ID)}); err != nil {
 					return err
 				}
+				continue
+			}
+			if inst.System { // 系统实例只清 suspended_at：没有到期、提醒与封顶补偿
+				if _, err := tx.Exec(ctx, `UPDATE instances SET suspended_at = NULL, paused_remaining = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
+					return err
+				}
+				if err := recordEvent(ctx, tx, inst.ID, StateRunning, StateRunning, "machine online: system instance resumed", now); err != nil {
+					return err
+				}
+				if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
+					return err
+				}
+				n++
 				continue
 			}
 			var remaining time.Duration
