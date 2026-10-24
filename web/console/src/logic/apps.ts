@@ -104,16 +104,19 @@ export function generateSecret(e: AppEnvSpec, c: Pick<Crypto, 'getRandomValues'>
 /** 「模型」变量：spec.env 里第一个 enum。 */
 const modelEnv = (app: AppCatalogItem) => app.version.env.find((e) => e.type === 'enum')
 
-/** 预装应用下拉的选项：`名称 · 默认模型`（没有 enum 变量时只有名称）。 */
+/** 模型变量取值 `none`（comfyui 1.1.0：不下预置模型，D15）不展示，按「没有模型」处理（验收 O-n）。 */
+const shownModel = (m: string | undefined) => (m && m !== 'none' ? m : '')
+
+/** 预装应用下拉的选项：`名称 · 默认模型`（没有 enum 变量或模型为 none 时只有名称）。 */
 export function appOptionLabel(app: AppCatalogItem): string {
-  const m = modelEnv(app)?.default
+  const m = shownModel(modelEnv(app)?.default)
   return m ? `${app.name} · ${m}` : app.name
 }
 
 /** 确认页「预装应用」：`名称（所选模型）`。 */
 export function appConfirmText(app: AppCatalogItem, values: Record<string, string>): string {
   const e = modelEnv(app)
-  const m = e ? values[e.name] || e.default : ''
+  const m = shownModel(e ? values[e.name] || e.default : '')
   return m ? `${app.name}（${m}）` : app.name
 }
 
