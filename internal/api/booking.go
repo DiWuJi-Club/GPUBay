@@ -309,6 +309,10 @@ func (s *Server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	if err := checkAppWorkflowIDs(req.AppWorkflowIDs); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	start, err := parseStartAt(req.StartAt)
 	if err != nil {
 		s.writeError(w, r, err)

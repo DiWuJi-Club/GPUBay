@@ -625,6 +625,22 @@ func TestResolveWorkflows(t *testing.T) {
 	}
 	_, err = e.hooks.ResolveWorkflows(e.ctx, e.pool, many)
 	wantCode(t, err, "workflow_limit")
+	// 超长列表（请求体里塞几十万个 ID）：去重时一超过上限就返回，不做 O(n²) 的去重
+	huge := make([]int64, 200000)
+	for i := range huge {
+		huge[i] = int64(i + 1)
+	}
+	start := time.Now()
+	_, err = e.hooks.ResolveWorkflows(e.ctx, e.pool, huge)
+	wantCode(t, err, "workflow_limit")
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("huge id list took %v", d)
+	}
+	// 重复很多但去重后不超上限：照常解析
+	dup := slices.Repeat([]int64{w1.ID}, 1000)
+	if refs, err := e.hooks.ResolveWorkflows(e.ctx, e.pool, dup); err != nil || len(refs) != 1 {
+		t.Fatalf("dup = %+v, %v", refs, err)
+	}
 	draft := e.workflow("draft-wf", StatusDraft)
 	_, err = e.hooks.ResolveWorkflows(e.ctx, e.pool, []int64{w1.ID, draft.ID})
 	wantCode(t, err, "workflow_not_found")

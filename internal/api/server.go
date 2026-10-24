@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -58,10 +59,13 @@ type Server struct {
 	Installer *comfywf.Installer
 	Runs      *comfywf.Runs
 
-	authorizeLim *userLimiter
-	calendarLim  *ipLimiter
-	appsLim      *userLimiter
-	wfUploadLim  *userLimiter
+	authorizeLim  *userLimiter
+	calendarLim   *ipLimiter
+	appsLim       *userLimiter
+	wfUploadLim   *userLimiter
+	runAttemptLim *userLimiter
+	coverLim      *ipLimiter
+	deadlineOnce  sync.Once
 }
 
 const sessionCookie = "sc_session"
@@ -93,6 +97,8 @@ func (s *Server) Router() http.Handler {
 	}
 	s.appsLim = &userLimiter{limit: alimit, window: time.Hour}
 	s.wfUploadLim = &userLimiter{limit: comfywf.RunsPerHour, window: time.Hour}
+	s.runAttemptLim = &userLimiter{limit: runAttemptsPerHour, window: time.Hour}
+	s.coverLim = &ipLimiter{limit: coverIPLimit}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -132,9 +138,12 @@ func (s *Server) Router() http.Handler {
 			if s.Workflows != nil {
 				r.Get("/workflows", s.handleWorkflowCatalog)
 				r.Get("/workflows/{slug}", s.handleWorkflowDetail)
-				r.Get("/workflows/{slug}/cover", s.handleWorkflowCover) // 处理器自己改 Cache-Control 为公共长缓存
 			}
 		})
+		if s.Workflows != nil {
+			// 封面：公共长缓存（处理器设 Cache-Control），自己的按 IP 限流，不占列表 / 详情的额度
+			r.With(s.coverRateLimit).Get("/workflows/{slug}/cover", s.handleWorkflowCover)
+		}
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
 		if s.Ingress != nil {
 			r.With(httpx.NoStore).Get("/ingress/authorize", s.handleIngressAuthorize) // 组外：未登录要 302 到登录页而不是 JSON 401
@@ -186,6 +195,9 @@ func (s *Server) Router() http.Handler {
 			if s.Apps != nil && s.Installer != nil {
 				r.Get("/instances/{id}/apps/{dep}/workflows", s.handleDeploymentWorkflows)
 				r.Post("/instances/{id}/apps/{dep}/workflows", s.handleAddWorkflow)
+				if s.Workflows != nil {
+					r.Get("/instances/{id}/apps/{dep}/workflows/{wid}", s.handleDeploymentWorkflow)
+				}
 				r.Put("/instances/{id}/apps/{dep}/workflows/{wid}", s.handleUpdateWorkflow)
 				r.Delete("/instances/{id}/apps/{dep}/workflows/{wid}", s.handleRemoveWorkflow)
 			}
