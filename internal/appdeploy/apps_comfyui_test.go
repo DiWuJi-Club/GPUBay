@@ -334,6 +334,7 @@ func TestComfyApp(t *testing.T) {
 		{"InstallDanglingLink", comfyInstallDanglingLink},
 		{"InstallSourceRetry", comfyInstallSourceRetry},
 		{"InstallProgressMonotonic", comfyInstallProgressMonotonic},
+		{"InstallReusesLegacyModels", comfyInstallReusesLegacyModels},
 	} {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, bin) })
 	}
@@ -709,22 +710,25 @@ func comfyInstallNoManifest(t *testing.T, bin string) {
 // 清单里的字段在 sh 里按空白切分、拼进路径：解析器再校验一遍，不合规的整份拒绝（平台已校验，这里是兜底）。
 func comfyInstallRejectsBadManifest(t *testing.T, bin string) {
 	for name, body := range map[string]string{
-		"model path":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"../x","dir":"checkpoints","size_gb":1,"sha256":"","hf":{"repo":"a/b","file":"x"}}],"nodes":[]}]}`,
-		"model dir":   `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"bin","size_gb":1,"sha256":"","hf":{"repo":"a/b","file":"x"}}],"nodes":[]}]}`,
-		"no source":   `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"vae","size_gb":1,"sha256":""}],"nodes":[]}]}`,
-		"repo space":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"vae","size_gb":1,"sha256":"","hf":{"repo":"a/b c","file":"x"}}],"nodes":[]}]}`,
-		"git host":    `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://evil.example/a/b","commit":"` + usduCommit + `"}]}]}`,
-		"commit":      `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/b","commit":"main"}]}]}`,
-		"slug":        `{"workflows":[{"slug":"../a","version":"1","file":"../a.json","models":[],"nodes":[]}]}`,
-		"file":        `{"workflows":[{"slug":"a-b","version":"1","file":"other.json","models":[],"nodes":[]}]}`,
-		"not json":    `{"workflows":[`,
-		"top array":   `[]`,
-		"models obj":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":{"a":1},"nodes":[]}]}`,
-		"model item":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[1],"nodes":[]}]}`,
-		"source str":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"vae","size_gb":1,"sha256":"","hf":"a/b"}],"nodes":[]}]}`,
-		"node item":   `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":["x"]}]}`,
-		"wf item":     `{"workflows":["a-b"]}`,
-		"node commit": `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/b","commit":"` + usduCommit + `"}]},{"slug":"c-d","version":"1","file":"c-d.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/b","commit":"` + strings.Repeat("b", 40) + `"}]}]}`,
+		"model path": `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"../x","dir":"checkpoints","size_gb":1,"sha256":"","hf":{"repo":"a/b","file":"x"}}],"nodes":[]}]}`,
+		"model dir":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"bin","size_gb":1,"sha256":"","hf":{"repo":"a/b","file":"x"}}],"nodes":[]}]}`,
+		"no source":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"vae","size_gb":1,"sha256":""}],"nodes":[]}]}`,
+		"repo space": `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"vae","size_gb":1,"sha256":"","hf":{"repo":"a/b c","file":"x"}}],"nodes":[]}]}`,
+		"git host":   `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://evil.example/a/b","commit":"` + usduCommit + `"}]}]}`,
+		"commit":     `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/b","commit":"main"}]}]}`,
+		// 同平台 checkGitURL：路径段不能以 . 开头
+		"git dot owner": `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://github.com/.a/b","commit":"` + usduCommit + `"}]}]}`,
+		"git dot repo":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/..","commit":"` + usduCommit + `"}]}]}`,
+		"slug":          `{"workflows":[{"slug":"../a","version":"1","file":"../a.json","models":[],"nodes":[]}]}`,
+		"file":          `{"workflows":[{"slug":"a-b","version":"1","file":"other.json","models":[],"nodes":[]}]}`,
+		"not json":      `{"workflows":[`,
+		"top array":     `[]`,
+		"models obj":    `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":{"a":1},"nodes":[]}]}`,
+		"model item":    `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[1],"nodes":[]}]}`,
+		"source str":    `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"vae","size_gb":1,"sha256":"","hf":"a/b"}],"nodes":[]}]}`,
+		"node item":     `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":["x"]}]}`,
+		"wf item":       `{"workflows":["a-b"]}`,
+		"node commit":   `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/b","commit":"` + usduCommit + `"}]},{"slug":"c-d","version":"1","file":"c-d.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/b","commit":"` + strings.Repeat("b", 40) + `"}]}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			b := newComfyBox(t, bin)
@@ -739,6 +743,77 @@ func comfyInstallRejectsBadManifest(t *testing.T, bin string) {
 				t.Errorf("calls:\n%s", raw)
 			}
 		})
+	}
+}
+
+// 目标位置没有、但同名文件已在旧位置（数据盘的旧名目录 unet / clip，或 1.0.0 的 link_models 软链到的 /opt/ComfyUI/models/<子目录>）：
+// 软链到它（解析到最终文件）而不重新下载；清单带 sha256 时先校验，不符就照常下载。
+func comfyInstallReusesLegacyModels(t *testing.T, bin string) {
+	b := newComfyBox(t, bin)
+	cache := func(repo, file string) string {
+		p := filepath.Join(b.root, "models", "modelscope", repo, file)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte("fake:"+repo+"/"+file+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	link := func(target, at string) {
+		os.MkdirAll(filepath.Dir(at), 0o755)
+		if err := os.Symlink(target, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	real := func(p string) string {
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	// 1.1.0 预置 FLUX（数据盘 models/unet）、1.0.0 预置 FLUX 的 clip（/opt/ComfyUI/models/clip）、1.0.0 预置 SDXL（/opt/ComfyUI/models/checkpoints）
+	flux := cache("AI-ModelScope/FLUX.1-schnell", "flux1-schnell.safetensors")
+	link(flux, b.cdata("models", "unet", "flux1-schnell.safetensors"))
+	t5 := cache("AI-ModelScope/flux_text_encoders", "t5xxl_fp16.safetensors")
+	link(t5, filepath.Join(b.comfy, "models", "clip", "t5xxl_fp16.safetensors"))
+	sdxl := cache("AI-ModelScope/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0.safetensors")
+	link(sdxl, filepath.Join(b.comfy, "models", "checkpoints", "sd_xl_base_1.0.safetensors"))
+	// sha256 不符的旧文件：不复用
+	vaeOld := filepath.Join(b.comfy, "models", "vae", "ae.safetensors")
+	os.MkdirAll(filepath.Dir(vaeOld), 0o755)
+	os.WriteFile(vaeOld, []byte("something else\n"), 0o644)
+	vaeSum := sha256.Sum256([]byte("fake:Comfy-Org/flux-vae/ae.safetensors\n"))
+	t5Sum := sha256.Sum256([]byte("fake:AI-ModelScope/flux_text_encoders/t5xxl_fp16.safetensors\n"))
+
+	ms := func(name, dir, repo, file, sha string) comfywf.ModelSpec {
+		return comfywf.ModelSpec{Name: name, Dir: dir, SizeGB: 1, SHA256: sha, ModelScope: &comfywf.RepoFile{Repo: repo, File: file}}
+	}
+	b.bundle(comfywf.BundleWorkflow{Slug: "flux-txt2img", Version: "1.0.0", Graph: json.RawMessage(`{"nodes":[]}`),
+		Manifest: comfywf.Manifest{Models: []comfywf.ModelSpec{
+			ms("flux1-schnell.safetensors", "diffusion_models", "Comfy-Org/flux1-schnell", "flux1-schnell.safetensors", ""),
+			ms("t5xxl_fp16.safetensors", "text_encoders", "Comfy-Org/t5", "t5xxl_fp16.safetensors", hex.EncodeToString(t5Sum[:])),
+			ms("sd_xl_base_1.0.safetensors", "checkpoints", "Comfy-Org/sdxl", "sd_xl_base_1.0.safetensors", ""),
+			ms("ae.safetensors", "vae", "Comfy-Org/flux-vae", "ae.safetensors", hex.EncodeToString(vaeSum[:])),
+		}}})
+	out, code := b.run("install")
+	if code != 0 {
+		t.Fatalf("install = %d:\n%s", code, out)
+	}
+	for dst, want := range map[string]string{
+		b.cdata("models", "diffusion_models", "flux1-schnell.safetensors"): real(flux),
+		b.cdata("models", "text_encoders", "t5xxl_fp16.safetensors"):       real(t5),
+		b.cdata("models", "checkpoints", "sd_xl_base_1.0.safetensors"):     real(sdxl),
+		b.cdata("models", "vae", "ae.safetensors"):                         filepath.Join(b.root, "models", "modelscope", "Comfy-Org/flux-vae", "ae.safetensors"),
+	} {
+		if got := readLink(t, dst); got != want {
+			t.Errorf("%s -> %s, want %s", dst, got, want)
+		}
+	}
+	if calls := b.callLines(); b.countCalls("modelscope download") != 1 || b.countCalls("modelscope download Comfy-Org/flux-vae ae.safetensors ") != 1 {
+		t.Errorf("calls:\n%s", strings.Join(calls, "\n"))
+	}
+	if !strings.Contains(out, "已在") {
+		t.Errorf("no reuse log:\n%s", out)
 	}
 }
 

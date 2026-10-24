@@ -164,7 +164,9 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 REPO = re.compile(SEG + "/" + SEG + r"\Z")
 FILE = re.compile(SEG + "(/" + SEG + r")*\Z")
-GIT = re.compile(r"https://(github\.com|gitee\.com|gitcode\.com)/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+# 同平台 checkGitURL：路径两段，每段不以 . 开头
+GSEG = r"[A-Za-z0-9_-][A-Za-z0-9_.-]*"
+GIT = re.compile(r"https://(github\.com|gitee\.com|gitcode\.com)/" + GSEG + "/" + GSEG + r"\Z")
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 DIRS = sys.argv[2].split()
@@ -288,7 +290,24 @@ wf_fetch() {
   return "$_rc"
 }
 
-# 模型：目标 comfyui/models/<dir>/<name> 已存在（有效软链或普通文件；失效的软链不算）→ 跳过；否则按 MODEL_SOURCE 选源（没有该源就用
+# legacy_model <dir> <name>：同名文件已在旧位置时输出它解析后的真实路径——数据盘上 ComfyUI 旧名目录（unet ⇔ diffusion_models、
+# clip ⇔ text_encoders，1.1.0 预置模型软链在 unet / clip 下），或 1.0.0 的 link_models 软链到的镜像内 $COMFY/models/<子目录>。没有 → 返回 1
+legacy_model() {
+  case "$1" in
+    diffusion_models|unet) set -- "$2" "$CDATA/models/unet" "$CDATA/models/diffusion_models" "$COMFY/models/unet" "$COMFY/models/diffusion_models" ;;
+    text_encoders|clip) set -- "$2" "$CDATA/models/clip" "$CDATA/models/text_encoders" "$COMFY/models/clip" "$COMFY/models/text_encoders" ;;
+    *) set -- "$2" "$COMFY/models/$1" ;;
+  esac
+  _lg=$1
+  shift
+  for _lgd in "$@"; do
+    if [ -f "$_lgd/$_lg" ]; then readlink -f "$_lgd/$_lg"; return 0; fi
+  done
+  return 1
+}
+
+# 模型：目标 comfyui/models/<dir>/<name> 已存在（有效软链或普通文件；失效的软链不算）→ 跳过；同名文件在旧位置（legacy_model；
+# 清单带 sha256 时须校验一致）→ 软链过去；否则按 MODEL_SOURCE 选源（没有该源就用
 # 另一个；所选来源下载失败而另一个来源存在时换它再试），预检磁盘，下载到 $SPARK_MODELS_DIR/<modelscope|hf>/<仓库>，可选 sha256 校验，
 # 软链到目标。进度 WF_LO～70。
 wf_models() {
@@ -301,6 +320,15 @@ wf_models() {
     if [ -e "$_dst" ]; then
       log "模型 $_name 已存在，跳过"
       continue
+    fi
+    if _old=$(legacy_model "$_dir" "$_name"); then
+      if [ "$_sha" = - ] || [ "$(sha256sum "$_old" | awk '{print $1}')" = "$_sha" ]; then
+        mkdir -p "$CDATA/models/$_dir"
+        ln -sfn "$_old" "$_dst"
+        log "模型 $_name 已在 ${_old}，软链复用"
+        continue
+      fi
+      log "模型 $_name 在 $_old 的文件 sha256 与清单不符，重新下载"
     fi
     case "${MODEL_SOURCE:-modelscope}" in
       hf-mirror) if [ "$_hfr" != - ]; then _src=hf; else _src=modelscope; fi ;;
