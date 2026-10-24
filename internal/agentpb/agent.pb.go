@@ -322,10 +322,12 @@ func (*PlatformMessage_Command) isPlatformMessage_Msg() {}
 func (*PlatformMessage_Config) isPlatformMessage_Msg() {}
 
 type Hello struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AgentVersion  string                 `protobuf:"bytes,1,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
-	Hostname      string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
-	Ips           []string               `protobuf:"bytes,3,rep,name=ips,proto3" json:"ips,omitempty"` // 本机全部 IPv4 地址
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	AgentVersion string                 `protobuf:"bytes,1,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
+	Hostname     string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	Ips          []string               `protobuf:"bytes,3,rep,name=ips,proto3" json:"ips,omitempty"` // 本机全部 IPv4 地址
+	// 能力位图（internal/agent/features）：bit0 = 支持 CreateInstance.share_slots。计划 10 新增，旧 Agent 为 0。
+	Features      uint32 `protobuf:"varint,4,opt,name=features,proto3" json:"features,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -379,6 +381,13 @@ func (x *Hello) GetIps() []string {
 		return x.Ips
 	}
 	return nil
+}
+
+func (x *Hello) GetFeatures() uint32 {
+	if x != nil {
+		return x.Features
+	}
+	return 0
 }
 
 type AgentConfig struct {
@@ -620,7 +629,9 @@ type CreateInstance struct {
 	DataSizeGib    uint32                 `protobuf:"varint,5,opt,name=data_size_gib,json=dataSizeGib,proto3" json:"data_size_gib,omitempty"`
 	// 平台生成的容器 sshd 主机私钥（OpenSSH PEM）。敏感：只在 mTLS 流上传输，不落日志，不进 agent_commands.payload；
 	// 为空时 Agent 沿用本地生成（兼容旧平台）。
-	HostKeyPem    string `protobuf:"bytes,6,opt,name=host_key_pem,json=hostKeyPem,proto3" json:"host_key_pem,omitempty"`
+	HostKeyPem string `protobuf:"bytes,6,opt,name=host_key_pem,json=hostKeyPem,proto3" json:"host_key_pem,omitempty"`
+	// 份数：0 / 1 = 整机；2 / 4 = 按份等分内存、CPU、数据盘（Agent 侧计算）。计划 10 新增，旧 Agent 忽略。
+	ShareSlots    uint32 `protobuf:"varint,7,opt,name=share_slots,json=shareSlots,proto3" json:"share_slots,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -695,6 +706,13 @@ func (x *CreateInstance) GetHostKeyPem() string {
 		return x.HostKeyPem
 	}
 	return ""
+}
+
+func (x *CreateInstance) GetShareSlots() uint32 {
+	if x != nil {
+		return x.ShareSlots
+	}
+	return 0
 }
 
 type StartInstance struct {
@@ -1015,8 +1033,10 @@ func (x *InstanceState) GetPhase() string {
 }
 
 type Heartbeat struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Metrics       *Metrics               `protobuf:"bytes,1,opt,name=metrics,proto3" json:"metrics,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Metrics *Metrics               `protobuf:"bytes,1,opt,name=metrics,proto3" json:"metrics,omitempty"`
+	// 每个实例的 cgroup 用量（计划 10 新增；旧 Agent 不发）。
+	Instances     []*InstanceMetrics `protobuf:"bytes,2,rep,name=instances,proto3" json:"instances,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1058,6 +1078,89 @@ func (x *Heartbeat) GetMetrics() *Metrics {
 	return nil
 }
 
+func (x *Heartbeat) GetInstances() []*InstanceMetrics {
+	if x != nil {
+		return x.Instances
+	}
+	return nil
+}
+
+type InstanceMetrics struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	InstanceId    string                 `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	MemCurrent    uint64                 `protobuf:"varint,2,opt,name=mem_current,json=memCurrent,proto3" json:"mem_current,omitempty"`         // 容器 cgroup memory.current（字节）
+	MemMax        uint64                 `protobuf:"varint,3,opt,name=mem_max,json=memMax,proto3" json:"mem_max,omitempty"`                     // 容器 cgroup memory.max（字节；不限为 0）
+	CpuPercent    float64                `protobuf:"fixed64,4,opt,name=cpu_percent,json=cpuPercent,proto3" json:"cpu_percent,omitempty"`        // 两次采样间 CPU 使用率（100 = 一个核满载）
+	DataDiskUsed  uint64                 `protobuf:"varint,5,opt,name=data_disk_used,json=dataDiskUsed,proto3" json:"data_disk_used,omitempty"` // 实例数据盘已用字节
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstanceMetrics) Reset() {
+	*x = InstanceMetrics{}
+	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstanceMetrics) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstanceMetrics) ProtoMessage() {}
+
+func (x *InstanceMetrics) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstanceMetrics.ProtoReflect.Descriptor instead.
+func (*InstanceMetrics) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *InstanceMetrics) GetInstanceId() string {
+	if x != nil {
+		return x.InstanceId
+	}
+	return ""
+}
+
+func (x *InstanceMetrics) GetMemCurrent() uint64 {
+	if x != nil {
+		return x.MemCurrent
+	}
+	return 0
+}
+
+func (x *InstanceMetrics) GetMemMax() uint64 {
+	if x != nil {
+		return x.MemMax
+	}
+	return 0
+}
+
+func (x *InstanceMetrics) GetCpuPercent() float64 {
+	if x != nil {
+		return x.CpuPercent
+	}
+	return 0
+}
+
+func (x *InstanceMetrics) GetDataDiskUsed() uint64 {
+	if x != nil {
+		return x.DataDiskUsed
+	}
+	return 0
+}
+
 type Metrics struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	GpuUtil       float64                `protobuf:"fixed64,1,opt,name=gpu_util,json=gpuUtil,proto3" json:"gpu_util,omitempty"`
@@ -1075,7 +1178,7 @@ type Metrics struct {
 
 func (x *Metrics) Reset() {
 	*x = Metrics{}
-	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_agent_v1_agent_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1087,7 +1190,7 @@ func (x *Metrics) String() string {
 func (*Metrics) ProtoMessage() {}
 
 func (x *Metrics) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_agent_v1_agent_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1100,7 +1203,7 @@ func (x *Metrics) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Metrics.ProtoReflect.Descriptor instead.
 func (*Metrics) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Metrics) GetGpuUtil() float64 {
@@ -1186,11 +1289,12 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x0fPlatformMessage\x123\n" +
 	"\acommand\x18\x01 \x01(\v2\x17.spark.agent.v1.CommandH\x00R\acommand\x125\n" +
 	"\x06config\x18\x02 \x01(\v2\x1b.spark.agent.v1.AgentConfigH\x00R\x06configB\x05\n" +
-	"\x03msg\"Z\n" +
+	"\x03msg\"v\n" +
 	"\x05Hello\x12#\n" +
 	"\ragent_version\x18\x01 \x01(\tR\fagentVersion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12\x10\n" +
-	"\x03ips\x18\x03 \x03(\tR\x03ips\"\xe3\x01\n" +
+	"\x03ips\x18\x03 \x03(\tR\x03ips\x12\x1a\n" +
+	"\bfeatures\x18\x04 \x01(\rR\bfeatures\"\xe3\x01\n" +
 	"\vAgentConfig\x12\x15\n" +
 	"\x06lan_ip\x18\x01 \x01(\tR\x05lanIp\x120\n" +
 	"\x14heartbeat_interval_s\x18\x02 \x01(\rR\x12heartbeatIntervalS\x12\x1f\n" +
@@ -1210,7 +1314,7 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x04stop\x18\f \x01(\v2\x1c.spark.agent.v1.StopInstanceH\x00R\x04stop\x122\n" +
 	"\x04wipe\x18\r \x01(\v2\x1c.spark.agent.v1.WipeInstanceH\x00R\x04wipe\x12/\n" +
 	"\x04pull\x18\x0e \x01(\v2\x19.spark.agent.v1.PullImageH\x00R\x04pullB\x06\n" +
-	"\x04body\"\xde\x01\n" +
+	"\x04body\"\xff\x01\n" +
 	"\x0eCreateInstance\x12\x1b\n" +
 	"\timage_ref\x18\x01 \x01(\tR\bimageRef\x12'\n" +
 	"\x0fupstream_pubkey\x18\x02 \x01(\tR\x0eupstreamPubkey\x12%\n" +
@@ -1218,7 +1322,9 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\bssh_port\x18\x04 \x01(\rR\asshPort\x12\"\n" +
 	"\rdata_size_gib\x18\x05 \x01(\rR\vdataSizeGib\x12 \n" +
 	"\fhost_key_pem\x18\x06 \x01(\tR\n" +
-	"hostKeyPem\"\x0f\n" +
+	"hostKeyPem\x12\x1f\n" +
+	"\vshare_slots\x18\a \x01(\rR\n" +
+	"shareSlots\"\x0f\n" +
 	"\rStartInstance\"\x0e\n" +
 	"\fStopInstance\"\x0e\n" +
 	"\fWipeInstance\"(\n" +
@@ -1235,9 +1341,19 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\rInstanceState\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x14\n" +
-	"\x05phase\x18\x02 \x01(\tR\x05phase\">\n" +
+	"\x05phase\x18\x02 \x01(\tR\x05phase\"}\n" +
 	"\tHeartbeat\x121\n" +
-	"\ametrics\x18\x01 \x01(\v2\x17.spark.agent.v1.MetricsR\ametrics\"\xa4\x02\n" +
+	"\ametrics\x18\x01 \x01(\v2\x17.spark.agent.v1.MetricsR\ametrics\x12=\n" +
+	"\tinstances\x18\x02 \x03(\v2\x1f.spark.agent.v1.InstanceMetricsR\tinstances\"\xb3\x01\n" +
+	"\x0fInstanceMetrics\x12\x1f\n" +
+	"\vinstance_id\x18\x01 \x01(\tR\n" +
+	"instanceId\x12\x1f\n" +
+	"\vmem_current\x18\x02 \x01(\x04R\n" +
+	"memCurrent\x12\x17\n" +
+	"\amem_max\x18\x03 \x01(\x04R\x06memMax\x12\x1f\n" +
+	"\vcpu_percent\x18\x04 \x01(\x01R\n" +
+	"cpuPercent\x12$\n" +
+	"\x0edata_disk_used\x18\x05 \x01(\x04R\fdataDiskUsed\"\xa4\x02\n" +
 	"\aMetrics\x12\x19\n" +
 	"\bgpu_util\x18\x01 \x01(\x01R\agpuUtil\x12\x1c\n" +
 	"\n" +
@@ -1265,7 +1381,7 @@ func file_agent_v1_agent_proto_rawDescGZIP() []byte {
 	return file_agent_v1_agent_proto_rawDescData
 }
 
-var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_agent_v1_agent_proto_goTypes = []any{
 	(*EnrollRequest)(nil),   // 0: spark.agent.v1.EnrollRequest
 	(*EnrollResponse)(nil),  // 1: spark.agent.v1.EnrollResponse
@@ -1283,7 +1399,8 @@ var file_agent_v1_agent_proto_goTypes = []any{
 	(*StateReport)(nil),     // 13: spark.agent.v1.StateReport
 	(*InstanceState)(nil),   // 14: spark.agent.v1.InstanceState
 	(*Heartbeat)(nil),       // 15: spark.agent.v1.Heartbeat
-	(*Metrics)(nil),         // 16: spark.agent.v1.Metrics
+	(*InstanceMetrics)(nil), // 16: spark.agent.v1.InstanceMetrics
+	(*Metrics)(nil),         // 17: spark.agent.v1.Metrics
 }
 var file_agent_v1_agent_proto_depIdxs = []int32{
 	4,  // 0: spark.agent.v1.AgentMessage.hello:type_name -> spark.agent.v1.Hello
@@ -1298,16 +1415,17 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	10, // 9: spark.agent.v1.Command.wipe:type_name -> spark.agent.v1.WipeInstance
 	11, // 10: spark.agent.v1.Command.pull:type_name -> spark.agent.v1.PullImage
 	14, // 11: spark.agent.v1.StateReport.instances:type_name -> spark.agent.v1.InstanceState
-	16, // 12: spark.agent.v1.Heartbeat.metrics:type_name -> spark.agent.v1.Metrics
-	0,  // 13: spark.agent.v1.AgentGateway.Enroll:input_type -> spark.agent.v1.EnrollRequest
-	2,  // 14: spark.agent.v1.AgentGateway.Connect:input_type -> spark.agent.v1.AgentMessage
-	1,  // 15: spark.agent.v1.AgentGateway.Enroll:output_type -> spark.agent.v1.EnrollResponse
-	3,  // 16: spark.agent.v1.AgentGateway.Connect:output_type -> spark.agent.v1.PlatformMessage
-	15, // [15:17] is the sub-list for method output_type
-	13, // [13:15] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	17, // 12: spark.agent.v1.Heartbeat.metrics:type_name -> spark.agent.v1.Metrics
+	16, // 13: spark.agent.v1.Heartbeat.instances:type_name -> spark.agent.v1.InstanceMetrics
+	0,  // 14: spark.agent.v1.AgentGateway.Enroll:input_type -> spark.agent.v1.EnrollRequest
+	2,  // 15: spark.agent.v1.AgentGateway.Connect:input_type -> spark.agent.v1.AgentMessage
+	1,  // 16: spark.agent.v1.AgentGateway.Enroll:output_type -> spark.agent.v1.EnrollResponse
+	3,  // 17: spark.agent.v1.AgentGateway.Connect:output_type -> spark.agent.v1.PlatformMessage
+	16, // [16:18] is the sub-list for method output_type
+	14, // [14:16] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_agent_proto_init() }
@@ -1338,7 +1456,7 @@ func file_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   17,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

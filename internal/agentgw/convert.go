@@ -56,8 +56,14 @@ func toProtoCommand(cmd fleet.Command, cfg Config, hostKeyPEM string) (*agentpb.
 		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
 			return nil, err
 		}
+		// 端口优先取指令（平台按槽位算好）；为 0 的存量 pending 指令沿用全局配置。
+		port := cfg.SSHPort
+		if p.SSHPort > 0 {
+			port = p.SSHPort
+		}
 		out.Body = &agentpb.Command_Create{Create: &agentpb.CreateInstance{ImageRef: p.ImageRef, UpstreamPubkey: cfg.UpstreamPubKey,
-			BandwidthMbps: uint32(cfg.BandwidthMbps), SshPort: uint32(cfg.SSHPort), DataSizeGib: uint32(cfg.DataSizeGiB), HostKeyPem: hostKeyPEM}}
+			BandwidthMbps: uint32(cfg.BandwidthMbps), SshPort: uint32(port), DataSizeGib: uint32(cfg.DataSizeGiB), HostKeyPem: hostKeyPEM,
+			ShareSlots: uint32(max(0, p.ShareSlots))}}
 	case fleet.CmdStartInstance:
 		out.Body = &agentpb.Command_Start{Start: &agentpb.StartInstance{}}
 	case fleet.CmdStopInstance:

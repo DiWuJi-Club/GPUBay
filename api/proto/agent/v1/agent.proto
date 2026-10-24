@@ -40,6 +40,8 @@ message Hello {
   string agent_version = 1;
   string hostname = 2;
   repeated string ips = 3;    // 本机全部 IPv4 地址
+  // 能力位图（internal/agent/features）：bit0 = 支持 CreateInstance.share_slots。计划 10 新增，旧 Agent 为 0。
+  uint32 features = 4;
 }
 
 message AgentConfig {
@@ -72,6 +74,8 @@ message CreateInstance {
   // 平台生成的容器 sshd 主机私钥（OpenSSH PEM）。敏感：只在 mTLS 流上传输，不落日志，不进 agent_commands.payload；
   // 为空时 Agent 沿用本地生成（兼容旧平台）。
   string host_key_pem = 6;
+  // 份数：0 / 1 = 整机；2 / 4 = 按份等分内存、CPU、数据盘（Agent 侧计算）。计划 10 新增，旧 Agent 忽略。
+  uint32 share_slots = 7;
 }
 message StartInstance {}
 message StopInstance {}
@@ -95,7 +99,19 @@ message InstanceState {
   string phase = 2;   // running / stopped / missing_data / unknown
 }
 
-message Heartbeat { Metrics metrics = 1; }
+message Heartbeat {
+  Metrics metrics = 1;
+  // 每个实例的 cgroup 用量（计划 10 新增；旧 Agent 不发）。
+  repeated InstanceMetrics instances = 2;
+}
+
+message InstanceMetrics {
+  string instance_id = 1;
+  uint64 mem_current = 2;     // 容器 cgroup memory.current（字节）
+  uint64 mem_max = 3;         // 容器 cgroup memory.max（字节；不限为 0）
+  double cpu_percent = 4;     // 两次采样间 CPU 使用率（100 = 一个核满载）
+  uint64 data_disk_used = 5;  // 实例数据盘已用字节
+}
 
 message Metrics {
   double gpu_util = 1;

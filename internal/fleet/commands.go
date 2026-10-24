@@ -30,6 +30,10 @@ type PullImagePayload struct {
 
 type CreateInstancePayload struct {
 	ImageRef string `json:"image_ref"`
+	// SSHPort 为容器 sshd 发布端口（基准端口 + 槽位）；0 = 存量指令，网关退回 Config.SSHPort。
+	SSHPort int `json:"ssh_port,omitempty"`
+	// ShareSlots 为商品份数；0 / 1 = 整机。
+	ShareSlots int `json:"share_slots,omitempty"`
 }
 
 type Command struct {
