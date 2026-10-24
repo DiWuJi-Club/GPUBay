@@ -62,6 +62,10 @@ type Config struct {
 	AppHFEndpoint  string // 注入应用容器的 HF_ENDPOINT（HuggingFace 镜像站）
 	AppPipIndexURL string // 注入应用容器的 PIP_INDEX_URL
 	AppRunner      bool   // 是否在本副本启动应用部署 Runner（多副本都开时由咨询锁保证只有一个在工作）
+
+	// 计划 9：Token 商城。经 Load 默认都是 on；Config 字面量（测试、e2e-server）零值为 off，需要时显式设置。
+	LLMGateway    bool // SPARK_LLM_GATEWAY：是否在用户 API 上挂 /v1（OpenAI 兼容网关）；限额按进程各算
+	LLMController bool // SPARK_LLM_CONTROLLER：是否在本副本启动节点 Controller（多副本都开时由咨询锁保证只有一个在工作）
 }
 
 // AliyunConfig 阿里云短信与号码百科（三要素核验）共用一组 AccessKey。
@@ -194,6 +198,9 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if err := c.loadApps(or); err != nil {
+		return Config{}, err
+	}
+	if err := c.loadLLM(or); err != nil {
 		return Config{}, err
 	}
 	if err := c.checkPlugins(); err != nil {
@@ -501,6 +508,24 @@ func (c *Config) loadApps(or func(key, def string) string) error {
 		c.AppRunner = false
 	default:
 		return fmt.Errorf("SPARK_APP_RUNNER 只能是 on 或 off，当前为 %q", v)
+	}
+	return nil
+}
+
+// loadLLM 读取 Token 商城（计划 9）的两个开关：on / off，默认 on，其它值报错（与 SPARK_APP_RUNNER 同模式）。
+func (c *Config) loadLLM(or func(key, def string) string) error {
+	for _, v := range []struct {
+		name string
+		dst  *bool
+	}{{"SPARK_LLM_GATEWAY", &c.LLMGateway}, {"SPARK_LLM_CONTROLLER", &c.LLMController}} {
+		switch s := or(v.name, "on"); s {
+		case "on":
+			*v.dst = true
+		case "off":
+			*v.dst = false
+		default:
+			return fmt.Errorf("%s 只能是 on 或 off，当前为 %q", v.name, s)
+		}
 	}
 	return nil
 }

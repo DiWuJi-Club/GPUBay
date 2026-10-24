@@ -105,7 +105,7 @@ func run(log *slog.Logger) error {
 	sweeperDone := make(chan struct{})
 	go func() {
 		defer close(sweeperDone)
-		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep, a.Referral.Settle)
+		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep, a.Referral.Settle, a.LLM.Settle)
 	}()
 	runnerDone := make(chan struct{})
 	if cfg.AppRunner { // 多副本都开也安全：每轮先拿会话级咨询锁，同一时刻只有一个副本在推进部署
@@ -116,6 +116,19 @@ func run(log *slog.Logger) error {
 	} else {
 		close(runnerDone)
 		log.Warn("SPARK_APP_RUNNER=off：应用部署不会推进")
+	}
+	controllerDone := make(chan struct{})
+	if cfg.LLMController { // 多副本都开也安全：每轮先拿会话级咨询锁，同一时刻只有一个副本在建 / 探测 / 排空节点
+		go func() {
+			defer close(controllerDone)
+			a.LLMController.Run(ctx)
+		}()
+	} else {
+		close(controllerDone)
+		log.Warn("SPARK_LLM_CONTROLLER=off：Token 商城节点不会创建、探测或排空")
+	}
+	if !cfg.LLMGateway {
+		log.Warn("SPARK_LLM_GATEWAY=off：本副本不提供 /v1（OpenAI 兼容网关）")
 	}
 
 	srv, adminSrv := a.Servers(cfg)
@@ -200,7 +213,8 @@ func run(log *slog.Logger) error {
 	}
 	<-ingressDone
 	<-sweeperDone
-	<-runnerDone // Runner 的 exec 走上游连接池：先等它退出再关池
+	<-runnerDone     // Runner 的 exec 走上游连接池：先等它退出再关池
+	<-controllerDone // Controller 的探测同样走上游连接池
 	<-accessDone
 	// SSH 网关已随 ctx 停止 accept 并在 drain；Serve 总是返回 nil，等它 drain 完（会话记录已落库）再关闭连接池与数据库连接池（defer）
 	<-sshErr
