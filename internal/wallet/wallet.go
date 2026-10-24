@@ -3,6 +3,7 @@ package wallet
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,9 @@ const (
 	KindAdminAdjust Kind = "admin_adjust"
 	KindOrderPay    Kind = "order_pay"
 	KindRefund      Kind = "refund"
+	// 计划 8：邀请返利发放 / 扣回（ref_type='referral'，ref_id=<订单号> / <订单号>-c<n>）
+	KindReferralRebate   Kind = "referral_rebate"
+	KindReferralClawback Kind = "referral_clawback"
 )
 
 const MaxAdjust = 100_000_000 // 单次调账上限（分）
@@ -81,22 +85,59 @@ func (s *Service) Apply(ctx context.Context, tx pgx.Tx, e Entry) (int64, error) 
 	if after < 0 {
 		return 0, apperr.ErrInsufficientBalance
 	}
+	if err := writeEntry(ctx, tx, e, e.Amount, after, now); err != nil {
+		return 0, err
+	}
+	return after, nil
+}
+
+// ApplyUpTo 在调用方事务内尽力扣款：扣款额取 min(|e.Amount|, 余额)。
+// 用于邀请返利的退款扣回（计划 8）：钱包余额不能为负，扣不够的部分由调用方记为欠账。
+// e.Amount 必须为负；余额为 0（或没有账户行）时不写流水，返回 applied = 0；重复 (kind, ref_type, ref_id) 返回 ErrDuplicate。
+func (s *Service) ApplyUpTo(ctx context.Context, tx pgx.Tx, e Entry) (applied, after int64, err error) {
+	if e.Amount >= 0 || e.Amount == math.MinInt64 { // MinInt64 取反会溢出
+		return 0, 0, apperr.BadRequest("尽力扣款金额必须为负数")
+	}
+	if e.RefType == "" || e.RefID == "" {
+		return 0, 0, apperr.BadRequest("缺少关联单据")
+	}
+	now := s.clock.Now()
+	var bal int64
+	err = tx.QueryRow(ctx, `SELECT balance FROM wallet_accounts WHERE user_id = $1 FOR UPDATE`, e.UserID).Scan(&bal)
+	if db.IsNoRows(err) {
+		return 0, 0, nil // 从未有过余额：没什么可扣
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	applied = min(-e.Amount, bal)
+	if applied == 0 {
+		return 0, bal, nil
+	}
+	after = bal - applied
+	if err := writeEntry(ctx, tx, e, -applied, after, now); err != nil {
+		return 0, 0, err
+	}
+	return applied, after, nil
+}
+
+// writeEntry 写一条流水（amount 为实际记账金额）并把余额置为 after；调用方须已对账户行加锁。
+// 同一 (kind, ref_type, ref_id) 重复记账返回 ErrDuplicate。
+func writeEntry(ctx context.Context, tx pgx.Tx, e Entry, amount, after int64, now time.Time) error {
 	var operator *int64
 	if e.OperatorID != 0 {
 		operator = &e.OperatorID
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, operator_id, remark, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		e.UserID, e.Amount, after, string(e.Kind), e.RefType, e.RefID, operator, e.Remark, now); err != nil {
+		e.UserID, amount, after, string(e.Kind), e.RefType, e.RefID, operator, e.Remark, now); err != nil {
 		if db.IsUniqueViolation(err) {
-			return 0, apperr.ErrDuplicate
+			return apperr.ErrDuplicate
 		}
-		return 0, err
+		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE wallet_accounts SET balance = $2, updated_at = $3 WHERE user_id = $1`, e.UserID, after, now); err != nil {
-		return 0, err
-	}
-	return after, nil
+	_, err := tx.Exec(ctx, `UPDATE wallet_accounts SET balance = $2, updated_at = $3 WHERE user_id = $1`, e.UserID, after, now)
+	return err
 }
 
 func (s *Service) Balance(ctx context.Context, userID int64) (int64, error) {

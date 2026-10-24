@@ -51,14 +51,17 @@ func (l *ipLimiter) allow(key string, now time.Time) bool {
 	return true
 }
 
-func (s *Server) calendarRateLimit(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.calendarLim.allow(clientIP(r), s.Clock.Now()) {
-			s.writeError(w, r, apperr.ErrRateLimited)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// ipRateLimit 匿名端点按客户端 IP 限流（机组 / 日历 / 可用性、邀请码查询各用一个 ipLimiter）。
+func (s *Server) ipRateLimit(l *ipLimiter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !l.allow(clientIP(r), s.Clock.Now()) {
+				s.writeError(w, r, apperr.ErrRateLimited)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // optionalUserID 匿名端点里尽力识别当前用户（机器日历的 mine 标记）；没有或无效会话返回 0。

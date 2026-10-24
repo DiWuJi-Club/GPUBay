@@ -1,4 +1,5 @@
 import { ApiError } from './errors'
+import { uuid } from './uuid'
 
 export interface HttpOptions {
   idempotencyKey?: string
@@ -18,6 +19,8 @@ export interface HttpConfig {
   onTotpSetupRequired?: () => void
   /** 测试注入 */
   fetch?: typeof fetch
+  /** 设备标识（X-Device-Id）；测试注入，缺省 defaultDeviceId（localStorage） */
+  deviceId?: () => string
 }
 
 export interface Http {
@@ -63,6 +66,27 @@ export function filenameOf(disposition: string | null, fallback = 'export.csv'):
   return plain ? plain[1].trim() : fallback
 }
 
+export const DEVICE_KEY = 'sc_device'
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+/** localStorage 不可用时本页会话内固定的设备标识（刷新后换新，可接受） */
+let sessionDeviceId: string | null = null
+
+/**
+ * 设备标识（随机 v4 UUID）：存 localStorage.sc_device，首次生成后一直复用；后端用于同设备自刷判定，非 UUID 一律丢弃。
+ * 隐私模式等读写失败时退回本页会话内固定的 UUID。
+ */
+export function defaultDeviceId(): string {
+  try {
+    const v = localStorage.getItem(DEVICE_KEY)
+    if (v && UUID_V4.test(v)) return v
+    const id = uuid()
+    localStorage.setItem(DEVICE_KEY, id)
+    return id
+  } catch {
+    return (sessionDeviceId ??= uuid())
+  }
+}
+
 const networkError = (status = 0) => new ApiError(status, 'network', '网络异常，请稍后重试', '')
 const cancelledError = () => new ApiError(0, 'cancelled', '已取消', '')
 
@@ -86,6 +110,7 @@ async function errorOf(resp: Response): Promise<ApiError> {
 
 export function createHttp(cfg: HttpConfig): Http {
   const doFetch: typeof fetch = cfg.fetch ?? ((input, init) => fetch(input, init))
+  const deviceId = cfg.deviceId ?? defaultDeviceId
   // 正在进行的二次验证（含首个请求的重发）；并发收到 totp_required 的其他请求等它完成后直接重发
   let stepUp: Promise<unknown> | null = null
 
@@ -94,7 +119,7 @@ export function createHttp(cfg: HttpConfig): Http {
   const canStepUp = (method: string) => !!cfg.promptTotp && (stepUp !== null || (method !== 'GET' && method !== 'HEAD'))
 
   async function raw<T>(method: string, path: string, body: unknown, opt: HttpOptions): Promise<T> {
-    const headers: Record<string, string> = { Accept: 'application/json' }
+    const headers: Record<string, string> = { Accept: 'application/json', 'X-Device-Id': deviceId() }
     if (body !== undefined) headers['Content-Type'] = 'application/json'
     if (opt.idempotencyKey) headers['Idempotency-Key'] = opt.idempotencyKey
     let resp: Response
@@ -198,7 +223,7 @@ export function createHttp(cfg: HttpConfig): Http {
       fd.append('file', file, file.name)
       let resp: Response
       try {
-        resp = await doFetch(cfg.base + path, { method: 'POST', body: fd, credentials: 'same-origin', signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS) })
+        resp = await doFetch(cfg.base + path, { method: 'POST', body: fd, headers: { 'X-Device-Id': deviceId() }, credentials: 'same-origin', signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS) })
       } catch {
         throw networkError()
       }
@@ -210,7 +235,7 @@ export function createHttp(cfg: HttpConfig): Http {
     async download(path, query) {
       let resp: Response
       try {
-        resp = await doFetch(cfg.base + path + buildQuery(query), { credentials: 'same-origin', signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS) })
+        resp = await doFetch(cfg.base + path + buildQuery(query), { headers: { 'X-Device-Id': deviceId() }, credentials: 'same-origin', signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS) })
       } catch {
         throw networkError()
       }

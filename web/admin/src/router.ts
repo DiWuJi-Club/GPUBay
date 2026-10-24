@@ -32,6 +32,7 @@ export const routes: RouteRecordRaw[] = [
   { path: '/orders', component: () => import('./views/OrdersView.vue'), meta: { title: '订单', roles: FIN_ROLES } },
   { path: '/ledger', component: () => import('./views/LedgerView.vue'), meta: { title: '流水', roles: FIN_ROLES } },
   { path: '/recharges', component: () => import('./views/RechargesView.vue'), meta: { title: '充值单', roles: FIN_ROLES } },
+  { path: '/referral', component: () => import('./views/ReferralView.vue'), meta: { title: '邀请返利', roles: FIN_ROLES } },
   { path: '/apps', component: () => import('./views/AppsView.vue'), meta: { title: '应用', roles: ALL_ROLES } },
   { path: '/apps/:id', component: () => import('./views/AppDetailView.vue'), meta: { title: '应用详情', roles: ALL_ROLES } },
   // vid 为 new 时是新建（可带 ?copy_from=<版本 id> 预填）

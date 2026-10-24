@@ -11,10 +11,11 @@
     "C-KEY-01", "C-KEY-02", "C-KEY-03", "C-KEY-04", "C-KEY-05",
     "C-ING-01", "C-ING-02", "C-ING-03", "C-ING-04", "C-ING-05", "C-ING-06", "C-ING-07",
     "C-APP-01", "C-APP-02", "C-APP-03", "C-APP-04", "C-APP-05", "C-APP-06", "C-APP-07", "C-APP-08", "C-APP-09", "C-APP-10",
-    "C-WAL-01", "C-WAL-02", "C-WAL-03", "C-WAL-04",
+    "C-WAL-01", "C-WAL-02", "C-WAL-03", "C-WAL-04", "C-WAL-05",
     "C-RCH-01", "C-RCH-02", "C-RCH-03", "C-RCH-04", "C-RCH-05", "C-RCH-06", "C-RCH-07",
     "C-KYC-01", "C-KYC-02", "C-KYC-03", "C-KYC-04", "C-KYC-05", "C-KYC-06",
-    "C-ACC-01", "C-ACC-02",
+    "C-ACC-01", "C-ACC-02", "C-ACC-03",
+    "C-REF-01", "C-REF-02", "C-REF-03", "C-REF-04", "C-REF-05", "C-REF-06", "C-REF-07", "C-REF-08",
     "C-ERR-01", "C-ERR-02"
   ],
   "admin": [
@@ -30,7 +31,8 @@
     "A-BKG-01", "A-BKG-02", "A-BKG-03", "A-BKG-04", "A-BKG-05", "A-BKG-06",
     "A-USR-01", "A-USR-02", "A-USR-03", "A-USR-04", "A-USR-05", "A-USR-06", "A-USR-07",
     "A-KYC-01", "A-KYC-02",
-    "A-FIN-01", "A-FIN-02", "A-FIN-03", "A-FIN-04",
+    "A-FIN-01", "A-FIN-02", "A-FIN-03", "A-FIN-04", "A-FIN-05",
+    "A-REF-01", "A-REF-02", "A-REF-03", "A-REF-04", "A-REF-05", "A-REF-06", "A-REF-07",
     "A-CAT-01", "A-CAT-02", "A-CAT-03",
     "A-ADM-01", "A-ADM-02", "A-ADM-03",
     "A-SET-01",

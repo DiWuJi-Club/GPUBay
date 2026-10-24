@@ -30,8 +30,11 @@ import (
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/randx"
+	"spark-cloud/internal/referral"
+	"spark-cloud/internal/rental"
 )
 
 // SeedPassword 是钩子创建的管理员的固定密码。
@@ -52,6 +55,7 @@ type Server struct {
 	// HealthAddr 是 fake 应用的健康检查 / Web 服务地址（host:port）：/hooks/apps/seed 把每个应用端口的 direct-tcpip 转到它
 	HealthAddr string
 
+	sweepMu       sync.Mutex // 进程内串行化 /hooks/sweep（再加清扫咨询锁防跨进程交叠）；见 sweep
 	mu            sync.Mutex
 	agents        map[int64]*fakeagent.Agent
 	upstreamStops map[int]func() // ingress-upstream 起的回显服务，按端口
@@ -83,6 +87,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/groups", s.handle(s.groups))
 	mux.HandleFunc("POST /hooks/users", s.handle(s.users))
 	mux.HandleFunc("POST /hooks/admins", s.handle(s.admins))
+	mux.HandleFunc("POST /hooks/referral/config", s.handle(s.referralConfig))
 	mux.HandleFunc("POST /hooks/kyc", s.handle(s.kyc))
 	mux.HandleFunc("POST /hooks/ssh", s.handle(s.ssh))
 	mux.HandleFunc("POST /hooks/ingress-upstream", s.handle(s.ingressUpstream))
@@ -264,9 +269,13 @@ func (s *Server) heartbeatAll(ctx context.Context) error {
 	return nil
 }
 
-// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep。
+// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep + Referral.Settle。
 // Rental.Sweep 先做离线检测与暂停、再做到期停机，而到期停机只处理未暂停的实例：推进 24 小时后不心跳直接清扫，
 // 机器会被判失联、实例被暂停而永远不会停机。
+//
+// 与生产清扫器一样互斥：两轮 Rental.Sweep 交叠会在 fleet.MarkOfflineStale 的多行 UPDATE 上互相死锁（Playwright 超时后
+// 重发的请求就会和仍在跑的上一轮交叠）。先拿进程内互斥锁（并发请求不会各占一个连接干等、耗尽连接池），
+// 再在专用连接上持有 rental.SweeperLockKey 会话级咨询锁（与 RunSweeper 同一把，跨进程同样互斥）。
 func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := decode[struct {
 		Heartbeat *bool `json:"heartbeat"`
@@ -274,6 +283,17 @@ func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.sweepMu.Lock()
+	defer s.sweepMu.Unlock()
+	conn, err := s.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, rental.SweeperLockKey); err != nil {
+		return nil, fmt.Errorf("sweeper lock: %w", err)
+	}
+	defer conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, rental.SweeperLockKey) //nolint:errcheck
 	if req.Heartbeat == nil || *req.Heartbeat {
 		if err := s.heartbeatAll(ctx); err != nil {
 			return nil, err
@@ -284,6 +304,9 @@ func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 	}
 	if err := s.App.Billing.Sweep(ctx); err != nil {
 		return nil, fmt.Errorf("billing sweep: %w", err)
+	}
+	if err := s.App.Referral.Settle(ctx); err != nil {
+		return nil, fmt.Errorf("referral settle: %w", err)
 	}
 	return map[string]bool{"ok": true}, nil
 }
@@ -439,12 +462,19 @@ func (s *Server) groups(ctx context.Context, body json.RawMessage) (any, error) 
 
 // users 创建用户：用户行直接插入（与 dbtest.CreateUser 相同），余额与分页流水通过 Wallet.AdminAdjust 写入。
 // AdminAdjust 拒绝 60 秒内完全相同的调账，而假时钟下这 60 秒永远不会过去，所以每条流水的备注都不同。
+//
+// 带 invite_code / device_id / ip 任一时改走真实注册路径：SendLoginCode + LoginWith（mock 验证码 000000），新用户按码绑定、
+// 设备被记录，响应带 invite（LoginWith 的 BindResult；未带码时为 null）。手机号已存在时这只是一次再登录（记设备、带码得到
+// existing_user），不重置实名、不再入账（裁定 Q9）。实名只改 kyc_status，不写实名指纹：同身份用例走真实 /kyc/personal。
 func (s *Server) users(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := decode[struct {
 		Phone      string `json:"phone"`
 		Verified   bool   `json:"verified"`
 		Balance    int64  `json:"balance"`
 		LedgerRows int    `json:"ledger_rows"`
+		InviteCode string `json:"invite_code"`
+		DeviceID   string `json:"device_id"`
+		IP         string `json:"ip"`
 	}](body)
 	if err != nil {
 		return nil, err
@@ -459,10 +489,31 @@ func (s *Server) users(ctx context.Context, body json.RawMessage) (any, error) {
 	if req.Verified {
 		kyc = "verified"
 	}
-	now := s.Clock.Now()
 	var id int64
-	if err := s.Pool.QueryRow(ctx, `INSERT INTO users (phone, kind, kyc_status, created_at, updated_at)
-		VALUES ($1, 'personal', $2, $3, $3) RETURNING id`, req.Phone, kyc, now).Scan(&id); err != nil {
+	var invite *referral.BindResult
+	if req.InviteCode != "" || req.DeviceID != "" || req.IP != "" {
+		ip := req.IP
+		if ip == "" {
+			ip = "127.0.0.1"
+		}
+		s.Clock.Advance(61 * time.Second) // 同一手机号 60 秒只能发一次验证码
+		if err := s.App.Identity.SendLoginCode(ctx, req.Phone, ip); err != nil {
+			return nil, err
+		}
+		_, res, err := s.App.Identity.LoginWith(ctx, identity.LoginRequest{Phone: req.Phone, Code: "000000", InviteCode: req.InviteCode,
+			IP: ip, DeviceID: req.DeviceID, UserAgent: "e2e"})
+		if err != nil {
+			return nil, err
+		}
+		id, invite = res.ID, res.Invite
+		if !res.IsNew {
+			return map[string]any{"id": id, "phone": req.Phone, "invite": invite}, nil
+		}
+		if _, err := s.Pool.Exec(ctx, `UPDATE users SET kind = 'personal', kyc_status = $2 WHERE id = $1`, id, kyc); err != nil {
+			return nil, err
+		}
+	} else if err := s.Pool.QueryRow(ctx, `INSERT INTO users (phone, kind, kyc_status, created_at, updated_at)
+		VALUES ($1, 'personal', $2, $3, $3) RETURNING id`, req.Phone, kyc, s.Clock.Now()).Scan(&id); err != nil {
 		return nil, err
 	}
 	for i := 1; i <= req.LedgerRows; i++ {
@@ -475,7 +526,51 @@ func (s *Server) users(ctx context.Context, body json.RawMessage) (any, error) {
 			return nil, err
 		}
 	}
-	return map[string]any{"id": id, "phone": req.Phone}, nil
+	return map[string]any{"id": id, "phone": req.Phone, "invite": invite}, nil
+}
+
+// referralConfig 插入一版费率（effective_from = now，操作人为系统），未给的字段沿用当前版本。
+// 费率是全局的：改了的用例要在结束时（finally）改回去。
+func (s *Server) referralConfig(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := decode[struct {
+		RateBP           *int   `json:"rate_bp"`
+		MaxPerInvitee    *int64 `json:"max_per_invitee"`
+		MaxPerInviter30d *int64 `json:"max_per_inviter_30d"`
+		HoldDays         *int   `json:"hold_days"`
+		PeriodDays       *int   `json:"period_days"`
+	}](body)
+	if err != nil {
+		return nil, err
+	}
+	cur, err := s.App.Referral.CurrentConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	in := referral.RateInput{RateBP: cur.RateBP, MaxPerInvitee: cur.MaxPerInvitee, MaxPerInviter30d: cur.MaxPerInviter30d,
+		HoldDays: cur.HoldDays, PeriodDays: cur.PeriodDays, Note: "e2e"}
+	if req.RateBP != nil {
+		in.RateBP = *req.RateBP
+	}
+	if req.MaxPerInvitee != nil {
+		in.MaxPerInvitee = *req.MaxPerInvitee
+	}
+	if req.MaxPerInviter30d != nil {
+		in.MaxPerInviter30d = *req.MaxPerInviter30d
+	}
+	if req.HoldDays != nil {
+		in.HoldDays = *req.HoldDays
+	}
+	if req.PeriodDays != nil {
+		in.PeriodDays = *req.PeriodDays
+	}
+	if err := in.Validate(s.Clock.Now()); err != nil {
+		return nil, badRequest(err.Error())
+	}
+	v, err := s.App.Referral.AddRateVersion(ctx, audit.Actor{}, in)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": v.ID}, nil
 }
 
 // admins 创建管理员；bind_totp 为真时走命令行同款路径 EnrollTOTP → 按假时钟算码 → ConfirmEnrollment。
