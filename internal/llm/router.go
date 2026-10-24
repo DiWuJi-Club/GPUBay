@@ -50,14 +50,14 @@ func NewRouter(s *Service) *Router {
 		inflight: map[string]int{}, lastNode: map[stickyKey]string{}}
 }
 
-// Refresh 从库里重建节点表：ready 节点 JOIN 模型（online、max_concurrency）JOIN 系统实例 / 机器（lan_ip、主机公钥）。
+// Refresh 从库里重建节点表：ready 节点 JOIN 模型（online、max_concurrency）JOIN 系统实例（running、未挂起）/ 机器（lan_ip、主机公钥）。
 func (r *Router) Refresh(ctx context.Context) error {
 	rows, err := r.s.d.Pool.Query(ctx, `SELECT n.id, n.model_id, md.max_concurrency, i.id, m.lan_ip, i.ssh_host_pubkey
 		FROM llm_nodes n
 		JOIN llm_models md ON md.id = n.model_id
 		JOIN instances i ON i.id = n.instance_id
 		JOIN machines m ON m.id = i.machine_id
-		WHERE n.state = $1 AND md.status = $2
+		WHERE n.state = $1 AND md.status = $2 AND i.state = 'running' AND i.suspended_at IS NULL
 		ORDER BY n.model_id, n.id`, NodeReady, ModelOnline)
 	if err != nil {
 		return err
@@ -122,10 +122,27 @@ func (r *Router) Run(ctx context.Context, every time.Duration) {
 // Pick 为 (模型, Key) 选节点：lastNode[(keyID, modelID)] 在表内、未排除且在途 < 0.8 × max → 它；
 // 否则未排除节点中在途最少且 < max 的（并列取 ID 小的）。
 // 没有未排除的 ready 节点 → ErrNoNode；有但全满 → ErrAllBusy。exclude 用于首字节前的失败转移。
-// Pick 不占在途：调用方随后 Acquire(node.ID)。
+// Pick 不占在途：调用方随后 Acquire(node.ID)；网关应优先用 PickAcquire（选与占在同一把锁内，突发时不超 max）。
 func (r *Router) Pick(modelID, keyID int64, exclude map[string]bool) (RouteNode, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.pickLocked(modelID, keyID, exclude)
+}
+
+// PickAcquire 同 Pick，但在同一把锁内给选中节点在途 +1，返回 release（−1，幂等）。
+func (r *Router) PickAcquire(modelID, keyID int64, exclude map[string]bool) (RouteNode, func(), error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, err := r.pickLocked(modelID, keyID, exclude)
+	if err != nil {
+		return RouteNode{}, nil, err
+	}
+	r.inflight[n.ID]++
+	return n, r.releaser(n.ID), nil
+}
+
+// pickLocked 是 Pick 的策略本体；调用方持 r.mu。
+func (r *Router) pickLocked(modelID, keyID int64, exclude map[string]bool) (RouteNode, error) {
 	if id, ok := r.lastNode[stickyKey{keyID, modelID}]; ok && !exclude[id] {
 		if n, ok := r.nodes[id]; ok && r.inflight[id]*5 < n.MaxConcurrency*4 {
 			return n, nil
@@ -161,6 +178,11 @@ func (r *Router) Acquire(nodeID string) (release func()) {
 	r.mu.Lock()
 	r.inflight[nodeID]++
 	r.mu.Unlock()
+	return r.releaser(nodeID)
+}
+
+// releaser 返回节点在途 −1 的幂等函数；归零且节点已不在表内时回收计数。
+func (r *Router) releaser(nodeID string) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {

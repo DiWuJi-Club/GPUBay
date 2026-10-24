@@ -154,6 +154,74 @@ func TestRouterLeastInflightAndExclude(t *testing.T) {
 	}
 }
 
+// PickAcquire：选与占在同一把锁内——突发并发下任何节点的在途都不超过 max_concurrency；失败不占在途。
+func TestRouterPickAcquireNeverExceedsMax(t *testing.T) {
+	a, b := rtNodeID(1), rtNodeID(2)
+	r := rtNewRouter(rtNode(a, 1, 3), rtNode(b, 1, 2))
+	var mu sync.Mutex
+	cur := map[string]int{}
+	peak := map[string]int{}
+	busy := 0
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for g := 0; g < 32; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 200; i++ {
+				n, rel, err := r.PickAcquire(1, int64(g%4), nil)
+				if err != nil {
+					if !errors.Is(err, ErrAllBusy) {
+						t.Errorf("PickAcquire: %v", err)
+						return
+					}
+					mu.Lock()
+					busy++
+					mu.Unlock()
+					continue
+				}
+				r.Remember(int64(g%4), n.ID)
+				if in := r.Inflight(n.ID); in > n.MaxConcurrency {
+					t.Errorf("inflight(%s) = %d > max %d", n.ID, in, n.MaxConcurrency)
+				}
+				mu.Lock()
+				cur[n.ID]++
+				peak[n.ID] = max(peak[n.ID], cur[n.ID])
+				mu.Unlock()
+				mu.Lock()
+				cur[n.ID]--
+				mu.Unlock()
+				rel()
+				rel() // 幂等
+			}
+		}(g)
+	}
+	close(start)
+	wg.Wait()
+	if peak[a] > 3 || peak[b] > 2 {
+		t.Fatalf("max exceeded: peak = %v", peak)
+	}
+	if busy == 0 {
+		t.Log("no ErrAllBusy observed (scheduling); cap still verified by peak")
+	}
+	if r.Inflight(a) != 0 || r.Inflight(b) != 0 {
+		t.Fatalf("inflight leaked: a=%d b=%d", r.Inflight(a), r.Inflight(b))
+	}
+	// 全满时返回 ErrAllBusy、不占在途
+	h := append(rtHold(r, a, 3), rtHold(r, b, 2)...)
+	if _, rel, err := r.PickAcquire(1, 0, nil); !errors.Is(err, ErrAllBusy) || rel != nil {
+		t.Fatalf("full: err=%v rel=%v", err, rel != nil)
+	}
+	if r.Inflight(a) != 3 || r.Inflight(b) != 2 {
+		t.Fatalf("failed PickAcquire changed inflight: a=%d b=%d", r.Inflight(a), r.Inflight(b))
+	}
+	if _, _, err := r.PickAcquire(2, 0, nil); !errors.Is(err, ErrNoNode) {
+		t.Fatalf("no node: %v", err)
+	}
+	rtReleaseAll(h)
+}
+
 // 没有 ready 节点 → ErrNoNode；有节点但全满 → ErrAllBusy；释放一个即恢复。
 func TestRouterNoNodeVsAllBusy(t *testing.T) {
 	r := rtNewRouter()
@@ -234,6 +302,11 @@ func TestRouterRefreshDropsNonReady(t *testing.T) {
 	unhealthy := node(3, online, NodeUnhealthy, "10.0.1.3", "")
 	_ = node(4, online, NodeProvisioning, "10.0.1.4", "")
 	offReady := node(5, offline, NodeReady, "10.0.1.5", "")
+	// ready 但系统实例不在 running / 被挂起（机器失联）：不进路由表
+	stoppedIns := node(6, online, NodeReady, "10.0.1.6", "")
+	exec(`UPDATE instances SET state = 'stopped' WHERE id = (SELECT instance_id FROM llm_nodes WHERE id = $1)`, stoppedIns)
+	suspended := node(7, online, NodeReady, "10.0.1.7", "")
+	exec(`UPDATE instances SET suspended_at = $2 WHERE id = (SELECT instance_id FROM llm_nodes WHERE id = $1)`, suspended, t0)
 
 	r := NewRouter(NewService(Deps{Pool: pool}))
 	if err := r.Refresh(ctx); err != nil {
@@ -244,8 +317,10 @@ func TestRouterRefreshDropsNonReady(t *testing.T) {
 	_, hasOff := r.byModel[offline]
 	_, hasUnhealthy := r.nodes[unhealthy]
 	_, hasOffNode := r.nodes[offReady]
+	_, hasStopped := r.nodes[stoppedIns]
+	_, hasSuspended := r.nodes[suspended]
 	r.mu.Unlock()
-	if len(got) != 2 || got[0].ID != ready1 || got[1].ID != ready2 || hasOff || hasUnhealthy || hasOffNode {
+	if len(got) != 2 || got[0].ID != ready1 || got[1].ID != ready2 || hasOff || hasUnhealthy || hasOffNode || hasStopped || hasSuspended {
 		t.Fatalf("table = %+v (offline model present %v)", got, hasOff)
 	}
 	if got[0].MaxConcurrency != 16 || got[0].ModelID != online || got[0].Target.LanIP != "10.0.1.1" ||

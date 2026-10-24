@@ -121,7 +121,7 @@ func ceilSeconds(d time.Duration) time.Duration {
 	return (d + time.Second - 1) / time.Second * time.Second
 }
 
-// Acquire 按「并发 → RPM → TPM（含 estTokens）」三检。通过：在途 +1、记一次 RPM，返回 release（在途 −1，幂等）。
+// Acquire 按「并发 → RPM → TPM（含 estTokens，封顶为 TPM 上限）」三检。通过：在途 +1、记一次 RPM，返回 release（在途 −1，幂等）。
 // 拒绝：*LimitError（被拒的请求不记 RPM）。estTokens 只参与本次 TPM 判断，不入窗口；实际 token 在结束时 AddTokens。
 func (l *Limiter) Acquire(userID int64, lim Limits, estTokens int, now time.Time) (release func(), err error) {
 	lim = lim.withDefaults()
@@ -142,9 +142,10 @@ func (l *Limiter) Acquire(userID int64, lim Limits, estTokens int, now time.Time
 			RetryAfter: ceilSeconds(oldest.Add(LimitWindow).Sub(now)),
 			Message:    "每分钟请求数超过上限，请稍后再试"}
 	}
-	est := int64(max(estTokens, 0))
+	// 单次估算按上限封顶：超大请求在窗口清空时放行，而不是永远被拒
+	est := min(int64(max(estTokens, 0)), int64(lim.TPM))
 	if u.tokenSum+est > int64(lim.TPM) {
-		// 等最早的若干条滑出直到放得下；全滑出仍放不下（单次估算超限）→ 一个整窗口
+		// 等最早的若干条滑出直到放得下（est ≤ 上限，全滑出必然放得下）
 		wait := LimitWindow
 		sum := u.tokenSum
 		for _, h := range u.tokens {

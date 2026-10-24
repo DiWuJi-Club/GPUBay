@@ -105,11 +105,16 @@ func TestLimiterTPMIncludesEstimate(t *testing.T) {
 		t.Fatalf("after slide: %v", err)
 	}
 	rel()
-	// 单次估算超过上限：窗口内已计的全滑出后仍不够 → RetryAfter 封顶为整个窗口
-	_, err = l.Acquire(1, lim, 1001, t0.Add(70*time.Second))
-	if le := rtLimitErr(t, err); le.RetryAfter != 60*time.Second {
-		t.Fatalf("retry after = %v", le.RetryAfter)
+	// 单次估算超过上限：按上限封顶 → 窗口里还有 300@t0+20s 时拒绝，等它滑出（t0+80s）；窗口清空后放行
+	_, err = l.Acquire(1, lim, 5000, t0.Add(70*time.Second))
+	if le := rtLimitErr(t, err); le.RetryAfter != 10*time.Second {
+		t.Fatalf("oversized estimate retry after = %v", le.RetryAfter)
 	}
+	rel, err = l.Acquire(1, lim, 5000, t0.Add(80*time.Second))
+	if err != nil {
+		t.Fatalf("oversized estimate with empty window must be admitted: %v", err)
+	}
+	rel()
 	// 其它用户互不影响
 	if rel, err := l.Acquire(2, lim, 1000, t0.Add(30*time.Second)); err != nil {
 		t.Fatalf("other user: %v", err)
