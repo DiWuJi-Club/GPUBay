@@ -1,7 +1,11 @@
 import { expect, request, test, type Page } from '@playwright/test'
 import { adminApi, createAdmin, drainIdleMachines } from '../helpers/admin'
+import { appRow, captureWindowOpen, cleanupApps, expectRowState, listDeployments, ownInstance, seedApps, tickUntil } from '../helpers/apps'
 import { dialog, loginConsole, nav, placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { CONSOLE_URL, hooks } from '../helpers/hooks'
+
+// C-MKT-12 下单预装应用：afterEach 卸载它的部署（其余用例没有部署，清理是空操作）
+test.afterEach(cleanupApps)
 
 const card = (page: Page) => page.getByTestId('market-card').first()
 const guideBox = (page: Page) => dialog(page).filter({ has: page.getByTestId('guide-dialog') })
@@ -228,4 +232,121 @@ test('C-MKT-08 选择 1 周与第二个镜像，确认框与详情一致', async
   await expect(page).toHaveURL(/\/instances\/ins-/)
   await expect(page.getByTestId('detail-image')).toHaveText('PyTorch')
   await expect(page.getByTestId('detail-pending')).toHaveText('7 天')
+})
+
+/** 登录后到市场页，点商品卡片里的「一键部署」应用卡片（打开租用对话框、预选该应用）。 */
+async function openAppCard(page: Page, info: Parameters<typeof nav>[1], slug: string) {
+  await seedApps()
+  await hooks.machines(1)
+  const u = await seedUser()
+  await loginConsole(page, u.phone)
+  await nav(page, info, 'market')
+  await card(page).getByTestId(`market-app-${slug}`).click()
+  await expect(page.getByTestId('rent-dialog')).toBeVisible()
+  return u
+}
+
+test('C-MKT-09 「一键部署」应用卡片打开租用对话框并预选该应用', async ({ page }, info) => {
+  await seedApps()
+  await hooks.machines(1)
+  const u = await seedUser()
+  await loginConsole(page, u.phone)
+  await nav(page, info, 'market')
+  await expect(card(page).getByTestId('market-apps')).toBeVisible()
+  for (const slug of ['vllm', 'open-webui', 'comfyui', 'jupyterlab']) await expect(card(page).getByTestId(`market-app-${slug}`)).toBeVisible()
+  await card(page).getByTestId('market-app-vllm').click()
+  await expect(page.getByTestId('rent-dialog')).toBeVisible() // 预选应用时停在表单步：要看镜像锁定、填变量
+  await expect(page.getByTestId('rent-app')).toContainText('vLLM 推理服务 · Qwen/Qwen3-8B')
+  await expect(page.getByTestId('app-env-form')).toBeVisible()
+  await expect(page.getByTestId('app-env-MODEL_ID')).toContainText('Qwen/Qwen3-8B')
+  await expect(page.getByTestId('app-env-MAX_MODEL_LEN').locator('input')).toHaveValue('32768')
+})
+
+test('C-MKT-10 选应用后镜像锁定为兼容镜像；密钥一键生成 32 位；变量校验在本地拦截', async ({ page }, info) => {
+  const orders: string[] = []
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && new URL(r.url()).pathname === '/api/v1/orders') orders.push(r.url())
+  })
+  await openAppCard(page, info, 'vllm')
+  const catalog = ((await (await page.request.get('/api/v1/apps')).json()) as { items: { slug: string; images: { name: string }[] }[] }).items
+  const compatible = catalog.find((a) => a.slug === 'vllm')!.images.map((i) => i.name)
+  expect(compatible).toHaveLength(2) // 默认镜像 + LLM Serving
+  await expect(page.getByTestId('rent-image-locked')).toHaveText('该应用需要此镜像')
+  await expect(page.getByTestId('rent-image')).toContainText(compatible[0])
+  await page.getByTestId('rent-image').click()
+  await expect(page.getByRole('option')).toHaveText(compatible) // 下拉只剩兼容镜像，按应用声明的顺序
+  await page.getByRole('option', { name: compatible[0], exact: true }).click()
+
+  await page.getByTestId('app-env-API_KEY-gen').click()
+  await expect(page.getByTestId('app-env-API_KEY')).toHaveValue(/^[A-Za-z0-9]{32}$/)
+
+  // 格式不对（GPU 显存比例的正则）：停在表单，错误显示在字段下
+  await page.getByTestId('app-env-GPU_MEMORY_UTILIZATION').fill('1.5')
+  await page.getByTestId('rent-next').click()
+  await expect(page.getByTestId('app-env-GPU_MEMORY_UTILIZATION-error')).toHaveText('格式不正确')
+  await expect(page.getByTestId('market-confirm-dialog')).toHaveCount(0)
+
+  // 必填且没有默认值（JupyterLab 的访问令牌）：留空不能下一步
+  await page.getByTestId('rent-app').click()
+  await page.getByRole('option', { name: 'JupyterLab', exact: true }).click()
+  await expect(page.getByTestId('app-env-API_KEY')).toHaveCount(0)
+  await page.getByTestId('rent-next').click()
+  await expect(page.getByTestId('app-env-JUPYTER_TOKEN-error')).toHaveText('请填写 访问令牌')
+  await expect(page.getByTestId('market-confirm-dialog')).toHaveCount(0)
+
+  // 改回「不预装」：镜像不再锁定，变量表单消失
+  await page.getByTestId('rent-app').click()
+  await page.getByRole('option', { name: '不预装', exact: true }).click()
+  await expect(page.getByTestId('rent-image-locked')).toHaveCount(0)
+  await expect(page.getByTestId('app-env-form')).toHaveCount(0)
+  expect(orders).toHaveLength(0)
+})
+
+test('C-MKT-11 确认页显示预装应用与所选模型', async ({ page }, info) => {
+  await openAppCard(page, info, 'vllm')
+  await page.getByTestId('app-env-MODEL_ID').click()
+  await page.getByRole('option', { name: 'Qwen/Qwen3-4B', exact: true }).click()
+  await page.getByTestId('rent-next').click()
+  await expect(page.getByTestId('market-confirm-dialog')).toBeVisible()
+  await expect(page.getByTestId('market-confirm-app')).toHaveText('vLLM 推理服务（Qwen/Qwen3-4B）')
+  await page.getByTestId('market-confirm-back').click()
+  await page.getByTestId('app-env-MODEL_ID').click()
+  await page.getByRole('option', { name: 'Qwen/Qwen3-8B', exact: true }).click()
+  await page.getByTestId('rent-next').click()
+  await expect(page.getByTestId('market-confirm-app')).toHaveText('vLLM 推理服务（Qwen/Qwen3-8B）')
+})
+
+test('C-MKT-12 下单预装 vLLM：开通前排队，开通后部署中显示进度，完成后可打开', async ({ page }, info) => {
+  const apps = await seedApps()
+  const opened = await captureWindowOpen(page)
+  await openAppCard(page, info, 'vllm')
+  await page.getByTestId('app-env-API_KEY-gen').click()
+  await page.getByTestId('rent-next').click()
+  await expect(page.getByTestId('market-confirm-app')).toHaveText('vLLM 推理服务（Qwen/Qwen3-8B）')
+  const req = page.waitForRequest((r) => r.method() === 'POST' && new URL(r.url()).pathname === '/api/v1/orders')
+  await page.getByTestId('market-confirm-ok').click()
+  const body = (await req).postDataJSON() as { app_id: number; app_env: Record<string, string> }
+  expect(body.app_id).toBe(apps.vllm.id)
+  expect(body.app_env.API_KEY).toMatch(/^[A-Za-z0-9]{32}$/)
+  await toast(page, '下单成功，正在开通')
+  await expect(page).toHaveURL(/\/instances\/ins-[a-z0-9]+$/)
+  const id = page.url().split('/').pop()!
+  ownInstance(page.request, id) // page.request 与浏览器共享会话 Cookie
+  const deps = await listDeployments(page.request, id)
+  expect(deps).toHaveLength(1)
+  const dep = deps[0].id
+  await expectRowState(page, dep, 'queued')
+  await expect(appRow(page, dep).getByTestId('detail-app-instance-hint')).toHaveText('将在开通后自动部署')
+
+  await hooks.agent() // 开通
+  await expect(page.getByTestId('detail-state')).toHaveText('运行中')
+  await tickUntil(page.request, id, dep, 'installing')
+  await expectRowState(page, dep, 'installing')
+  await expect(appRow(page, dep).getByTestId('detail-app-progress')).toBeVisible()
+  const done = await tickUntil(page.request, id, dep, 'running')
+  await expectRowState(page, dep, 'running')
+  await expect(appRow(page, dep).getByTestId('detail-app-progress')).toHaveCount(0)
+  await appRow(page, dep).getByTestId('detail-app-open').click()
+  await expect.poll(opened).toEqual([done.url])
+  expect(done.url).toContain(`${id}-8000.spark.test`)
 })

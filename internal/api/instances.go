@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/rental"
@@ -51,6 +52,8 @@ type instanceView struct {
 	RenewableUntil        *time.Time           `json:"renewable_until"`
 	RenewOptions          []rental.RenewOption `json:"renew_options"`
 	CreatedAt             time.Time            `json:"created_at"`
+	// 计划 7：非终态部署摘要（列表页一行显示）；无部署为空数组
+	AppsSummary []appdeploy.Summary `json:"apps_summary"`
 }
 
 func (s *Server) view(i rental.Instance) instanceView {
@@ -190,6 +193,12 @@ func (s *Server) views(ctx context.Context, insts []rental.Instance) ([]instance
 	if err != nil {
 		return nil, err
 	}
+	var summaries map[string][]appdeploy.Summary
+	if s.Apps != nil {
+		if summaries, err = s.Apps.Summaries(ctx, ids); err != nil {
+			return nil, err
+		}
+	}
 	nc := newNameCache()
 	out := make([]instanceView, 0, len(insts))
 	for _, i := range insts {
@@ -198,6 +207,10 @@ func (s *Server) views(ctx context.Context, insts []rental.Instance) ([]instance
 			return nil, err
 		}
 		v.PortsCount = counts[i.ID]
+		v.AppsSummary = summaries[i.ID]
+		if v.AppsSummary == nil {
+			v.AppsSummary = []appdeploy.Summary{}
+		}
 		out = append(out, v)
 	}
 	return out, nil
@@ -205,9 +218,11 @@ func (s *Server) views(ctx context.Context, insts []rental.Instance) ([]instance
 
 func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ProductID int64  `json:"product_id"`
-		Duration  string `json:"duration"`
-		ImageID   int64  `json:"image_id"`
+		ProductID int64             `json:"product_id"`
+		Duration  string            `json:"duration"`
+		ImageID   int64             `json:"image_id"`
+		AppID     *int64            `json:"app_id"`  // 计划 7：开通后自动部署的应用（可选）
+		AppEnv    map[string]string `json:"app_env"` // 该应用的变量值；校验失败整单不下、不扣款
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		s.writeError(w, r, err)
@@ -215,7 +230,7 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	ord, inst, err := s.Rental.Place(r.Context(), rental.PlaceRequest{
 		UserID: currentUser(r).ID, ProductID: req.ProductID, ImageID: req.ImageID, Duration: catalog.Duration(req.Duration),
-		IdempotencyKey: r.Header.Get(idempotencyHeader),
+		IdempotencyKey: r.Header.Get(idempotencyHeader), AppID: req.AppID, AppEnv: req.AppEnv,
 	})
 	if err != nil {
 		s.writeError(w, r, err)

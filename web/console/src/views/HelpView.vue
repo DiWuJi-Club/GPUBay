@@ -38,6 +38,21 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
+      <h2 data-testid="help-apps">一键部署</h2>
+      <ul>
+        <li>在算力市场的「一键部署」或实例详情的「应用」卡片里选择应用（vLLM、Open WebUI、ComfyUI、JupyterLab），平台会在您的实例里把它装好并启动。应用以进程形式运行在实例里，不另收费。</li>
+        <li>首次部署需要下载模型，速度受实例出网限速影响（16GB 约 15 分钟）；进度在「应用」卡片里显示，可随时「查看日志」。</li>
+        <li>模型缓存在 <code>/root/data/models</code>，卸载应用不会删除，重新部署同一模型无需再下载；不需要时可 SSH 进去用 <code>rm -rf /root/data/models/…</code> 清理以腾出数据盘空间。</li>
+        <li>应用端口会自动开放为<b>私有</b>网址：点「打开」即可访问，只有您登录控制台后能打开；如需设为公开，请先确认应用自带密码。</li>
+        <li>Open WebUI：<b>第一个访问者会成为管理员</b>，部署完成后请先自己打开一次并注册。</li>
+        <li>vLLM：<code>API_KEY</code> 留空时接口不鉴权（私有网址仍受控制台登录保护）；设为公开前请先设置接口密钥，调用时带上 <code>Authorization: Bearer &lt;密钥&gt;</code>。</li>
+        <li>JupyterLab：访问令牌必填，可点「生成」得到 32 位随机值；令牌只在填写时显示一次，请复制保存。</li>
+        <li>实例到期停机后应用随之停止，续费恢复运行后会自动重新启动；停机期间不能重新部署、停止或启动。</li>
+        <li>如遇换机，应用会在新实例上自动重新部署，但模型需要重新下载。</li>
+        <li>想自己改配置可以 SSH 进去查看 <code>/root/data/.spark-apps/&lt;应用&gt;/</code>（<code>app.sh</code>、<code>env</code>、<code>log</code>），但「重新部署」会覆盖 <code>app.sh</code> 与 <code>env</code>。</li>
+      </ul>
+    </el-card>
+    <el-card>
       <h2 data-testid="help-booking">档期预订</h2>
       <ul>
         <li>可提前 2 小时～60 天预订，开始时间为北京时间整点；开始前 1 小时系统自动开通，开通后即可登录，开始时刻起计费。</li>

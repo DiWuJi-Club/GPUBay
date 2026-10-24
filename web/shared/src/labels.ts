@@ -28,6 +28,7 @@ export const alertKindLabel: LabelMap = {
   invalid_report: '上报数据异常',
   ssh_bruteforce: 'SSH 暴力破解', upstream_unreachable: '实例 SSH 上游不可达', tls_cert_reload_failed: 'TLS 证书加载失败', tls_cert_expiring: 'TLS 证书即将到期',
   booking_at_risk: '预订机器不可用', booking_unfulfilled: '预订无法履约', booking_cancel_failed: '预订取消失败',
+  app_deploy_unreachable: '应用部署无法连接容器',
 }
 export const roleLabel: LabelMap = { super: '超级管理员', ops: '运维', finance: '财务' }
 export const adminStatusLabel: LabelMap = { active: '正常', disabled: '已停用' }
@@ -58,4 +59,32 @@ export const auditActions: readonly string[] = [
   'image.create', 'image.update',
   'group.create', 'group.update', 'group.delete', 'group.assign', 'group.unassign', 'machine.update',
   'booking.cancel', 'booking.admin_cancel', 'booking.reassign', 'instance.auto_renew',
+  'app.create', 'app.update', 'app.delete', 'app.version.create', 'app.version.update', 'app.version.publish', 'app.version.prepull',
+  'app.deployment.force_remove',
+  'instance.app_deploy', 'instance.app_redeploy', 'instance.app_stop', 'instance.app_start', 'instance.app_remove',
 ]
+
+export const deploymentStateLabel: LabelMap = {
+  queued: '等待部署', installing: '部署中', running: '运行中', stopped: '已停止', failed: '失败', removing: '卸载中', removed: '已卸载', lost: '已失效',
+}
+export const deploymentStateType: LabelMap = {
+  queued: 'info', installing: 'primary', running: 'success', stopped: 'info', failed: 'danger', removing: 'warning', removed: 'info', lost: 'info',
+}
+// busy：queued 期间上一次部署仍在容器里进行（run.sh 部署锁），Runner 30 秒后自动重试
+export const deploymentPhaseLabel: LabelMap = { prepare: '准备', download: '下载模型', install: '安装', start: '启动', health: '健康检查', busy: '等待上一次部署结束' }
+export const deploymentErrorLabel: LabelMap = {
+  script_failed: '脚本执行失败', timeout: '部署超时', health_failed: '健康检查未通过', upload_failed: '部署包上传失败', unreachable: '无法连接容器',
+  port_conflict: '端口冲突', port_limit: '端口数量超限', instance_gone: '实例已不存在', crashed: '服务进程已退出', disk: '数据盘空间不足',
+  deploy_busy: '上一次部署长时间未结束',
+}
+/**
+ * 部署失败原因：错误码中文 + 「：message」；message 与错误码中文相同（如 crashed「服务进程已退出」）时只显示一次。
+ * 没有错误码时用 fallback。
+ */
+export function deploymentErrorText(code: string, message: string, fallback = ''): string {
+  const label = code ? labelOf(deploymentErrorLabel, code) : fallback
+  if (!message || message === label) return label
+  return label ? `${label}：${message}` : message
+}
+export const appCategoryLabel: LabelMap = { llm: '大模型', image: '图像生成', notebook: 'Notebook', tool: '工具' }
+export const appStatusLabel: LabelMap = { draft: '草稿', published: '已发布', retired: '已退役' }

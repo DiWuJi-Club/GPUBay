@@ -179,6 +179,10 @@ func (s *Service) CreateImage(ctx context.Context, actor audit.Actor, in ImageIn
 	return img, err
 }
 
+// ErrImageRefInUse：草稿或已发布的应用版本引用了该镜像时不能改镜像地址（部署按版本固定镜像，规格 D10）；停用仍允许。
+var ErrImageRefInUse = apperr.New(apperr.ErrInvalidState.Code, "该镜像已被应用版本引用，不能修改镜像地址；请新建镜像，或先下线引用它的版本", apperr.ErrInvalidState.Status)
+
+// UpdateImage 修改镜像；被未下线的应用版本引用时不能改 ref（见 ErrImageRefInUse）。
 func (s *Service) UpdateImage(ctx context.Context, actor audit.Actor, id int64, in ImageInput) (AdminImage, error) {
 	in, err := normalizeImage(in)
 	if err != nil {
@@ -186,6 +190,23 @@ func (s *Service) UpdateImage(ctx context.Context, actor audit.Actor, id int64, 
 	}
 	var img AdminImage
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		// 行锁与应用发布时的 FOR SHARE 互斥：检查「被引用」与改 ref 之间不会有新版本发布
+		var curRef string
+		if err := tx.QueryRow(ctx, `SELECT ref FROM images WHERE id = $1 FOR UPDATE`, id).Scan(&curRef); err != nil {
+			if db.IsNoRows(err) {
+				return apperr.ErrNotFound
+			}
+			return err
+		}
+		if in.Ref != curRef {
+			var used bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM app_versions WHERE $1 = ANY(image_ids) AND status <> 'retired')`, id).Scan(&used); err != nil {
+				return err
+			}
+			if used {
+				return ErrImageRefInUse
+			}
+		}
 		now := s.clock.Now()
 		var err error
 		if img, err = scanAdminImage(tx.QueryRow(ctx, `UPDATE images SET name = $2, ref = $3, description = $4, enabled = $5, sort = $6, updated_at = $7

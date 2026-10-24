@@ -14,13 +14,16 @@ type PlaceRequest struct {
 	Duration  catalog.Duration
 	// IdempotencyKey 非空时，同一用户重复提交同一键只会生成一笔订单，重试返回首次创建的订单与实例。
 	IdempotencyKey string
+	// 计划 7：开通时预装应用（见 BatchRequest.AppID / AppEnv）
+	AppID  *int64
+	AppEnv map[string]string
 }
 
 // Place 新购一台整机（旧接口 POST /orders）：等价于一台、一个单位、立即开通、不建批次的 PlaceBatch；
 // 幂等键原样写在订单上，回放行为与计划 1 完全相同。
 func (s *Service) Place(ctx context.Context, req PlaceRequest) (Order, Instance, error) {
 	res, err := s.placeBatch(ctx, BatchRequest{UserID: req.UserID, ProductID: req.ProductID, ImageID: req.ImageID, Count: 1,
-		Duration: req.Duration, Quantity: 1, IdempotencyKey: req.IdempotencyKey}, false)
+		Duration: req.Duration, Quantity: 1, IdempotencyKey: req.IdempotencyKey, AppID: req.AppID, AppEnv: req.AppEnv}, false)
 	if err != nil {
 		return Order{}, Instance{}, err
 	}

@@ -3,6 +3,7 @@ package docker_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -188,5 +189,38 @@ func TestConnectNetworkCommand(t *testing.T) {
 	}
 	if r.Lines() != "docker network connect spark0 ins-a" {
 		t.Fatalf("calls:\n%s", r.Lines())
+	}
+}
+
+func TestImagesParsesAndFilters(t *testing.T) {
+	rt, r := newRT()
+	ctx := context.Background()
+	r.Stub("docker image ls", "spark/llm-serving:25.09\n<none>:<none>\nnvcr.io/nvidia/vllm:25.09-py3\nspark/llm-serving:25.09\n", nil)
+	got, err := rt.Images(ctx)
+	if err != nil || strings.Join(got, ",") != "nvcr.io/nvidia/vllm:25.09-py3,spark/llm-serving:25.09" {
+		t.Fatalf("images = %v %v", got, err)
+	}
+	if r.Lines() != "docker image ls --format {{.Repository}}:{{.Tag}} --filter dangling=false" {
+		t.Fatalf("calls:\n%s", r.Lines())
+	}
+	var many strings.Builder
+	for i := range 250 {
+		fmt.Fprintf(&many, "img%03d:1\n", i)
+	}
+	r.Stub("docker image ls", many.String(), nil)
+	if got, _ := rt.Images(ctx); len(got) != 200 {
+		t.Fatalf("cap = %d", len(got))
+	}
+	r.Stub("docker image ls", "a:"+strings.Repeat("x", 298)+"\n", nil)
+	if got, _ := rt.Images(ctx); len(got) != 1 || len(got[0]) != 256 {
+		t.Fatalf("long = %v", got)
+	}
+	r.Stub("docker image ls", "", nil)
+	if got, err := rt.Images(ctx); err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("no images = %#v %v", got, err)
+	}
+	r.Stub("docker image ls", "", &cmdrun.CmdError{ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"})
+	if _, err := rt.Images(ctx); err == nil {
+		t.Fatal("docker error must surface")
 	}
 }

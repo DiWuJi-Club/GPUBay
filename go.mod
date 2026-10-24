@@ -17,6 +17,7 @@ require (
 	golang.org/x/term v0.47.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
+	mvdan.cc/sh/v3 v3.14.1
 )
 
 require (
