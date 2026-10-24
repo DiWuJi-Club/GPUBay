@@ -50,7 +50,8 @@ var (
 	errCreateLLMGroup   = apperr.BadRequest("不能创建 Token 服务池机组")
 	errPoolVisible      = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能对用户可见", apperr.ErrInvalidState.Status)
 	errPurposeImmutable = apperr.New(apperr.ErrInvalidState.Code, "机组用途不能修改", apperr.ErrInvalidState.Status)
-	errPoolNotDeletable = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能删除", apperr.ErrInvalidState.Status)
+	// ErrPoolNotDeletable Token 服务池不能删除（rental.AdminDeleteGroup 锁住机组行后先判断，早于 group_not_empty）。
+	ErrPoolNotDeletable = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能删除", apperr.ErrInvalidState.Status)
 )
 
 // GroupRow 列表行：机组加机器数与现空闲台数。
@@ -242,7 +243,7 @@ func (s *Service) DeleteGroupIn(ctx context.Context, q db.Querier, id int64) err
 		return err
 	}
 	if purpose == GroupPurposeLLM {
-		return errPoolNotDeletable
+		return ErrPoolNotDeletable
 	}
 	if machines > 0 {
 		return apperr.ErrGroupNotEmpty
