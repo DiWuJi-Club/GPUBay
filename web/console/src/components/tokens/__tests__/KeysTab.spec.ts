@@ -77,6 +77,7 @@ beforeEach(() => {
   get.mockImplementation(async (path: string) => {
     if (path === '/llm/models') return { items: [model('qwen3-4b'), model('bge-m3', { kind: 'embedding' })], base_url: 'https://x/v1' }
     if (path === '/llm/keys') return { items: keys }
+    if (path === '/llm/account') return { debt: 0, unsettled: 0, today_cost: 0, month_cost: 0, month_tokens: 0, limits: { rpm: 60, tpm: 200000, concurrency: 8 }, blocked: false, blocked_reason: '', kyc_verified: true, base_url: '' }
     throw new Error(`unexpected ${path}`)
   })
   session.status = 'authed'

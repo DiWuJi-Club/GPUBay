@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  durationLabel, fmtTime, fmtYuan, labelOf, ledgerKindLabel, messageOf, orderKindLabel, orderStatusLabel, rechargeChannelLabel, rechargeStatusLabel, useMobile,
+  durationLabel, fmtTime, fmtYuan, labelOf, ledgerKindLabel, ledgerKindType, messageOf, orderKindLabel, orderStatusLabel, rechargeChannelLabel, rechargeStatusLabel, useMobile,
   type LedgerRow, type Listed, type Order, type Paged, type Recharge,
 } from '@spark/shared'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
@@ -42,6 +42,18 @@ function goRecharge() {
 
 // ---- 流水：游标分页 + 滚动到底自动加载 ----
 const PAGE = 20
+// ?ledger=<id>（Token 商城结算记录的「流水」链接）：从这条开始加载（before_id = id + 1），它排在第一行并高亮
+const focusId = computed(() => {
+  const v = route.query.ledger
+  return typeof v === 'string' && /^[1-9]\d{0,15}$/.test(v) ? Number(v) : null
+})
+const focusMissing = computed(() => focusId.value != null && !ledgerLoading.value && !ledgerError.value && ledger.value[0]?.id !== focusId.value)
+const kindTag = (kind: string) => (ledgerKindType[kind] ?? 'info') as 'success' | 'warning' | 'info'
+function clearFocus() {
+  const query = { ...route.query }
+  delete query.ledger
+  void router.replace({ query })
+}
 const ledger = ref<LedgerRow[]>([])
 const ledgerHasMore = ref(true)
 const ledgerLoading = ref(false)
@@ -62,7 +74,7 @@ async function loadLedger(reset = false) {
   const gen = ledgerGen
   ledgerLoading.value = true
   try {
-    const before = ledger.value.length ? ledger.value[ledger.value.length - 1].id : undefined
+    const before = ledger.value.length ? ledger.value[ledger.value.length - 1].id : focusId.value != null ? focusId.value + 1 : undefined
     const { items } = await api.get<Listed<LedgerRow>>('/wallet/ledger', { before_id: before, limit: PAGE })
     if (gen !== ledgerGen) return
     ledger.value.push(...items)
@@ -123,6 +135,12 @@ async function loadRecharges() {
 }
 watch(rechargePage, loadRecharges)
 
+// 定位参数变化（从结算记录再点一条、或「查看全部流水」）时重新加载流水
+watch(focusId, () => {
+  if (tab.value === 'ledger') void loadLedger(true)
+  else loaded.delete('ledger')
+})
+
 const loaded = new Set<Tab>()
 watch(
   tab,
@@ -169,18 +187,27 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
     <el-card>
       <el-tabs v-model="tab">
         <el-tab-pane label="流水" name="ledger">
+          <div v-if="focusId != null" class="focus-bar" data-testid="ledger-focus">
+            <span v-if="focusMissing" class="muted" data-testid="ledger-focus-missing">未找到流水 #{{ focusId }}，以下为更早的流水</span>
+            <span v-else class="muted">已定位到流水 #{{ focusId }}，以下为该条及更早的流水</span>
+            <el-button link type="primary" data-testid="ledger-focus-clear" @click="clearFocus">查看全部流水</el-button>
+          </div>
           <template v-if="mobile">
-            <div v-for="r in ledger" :key="r.id" class="row-card" data-testid="ledger-row">
+            <div v-for="r in ledger" :key="r.id" class="row-card" :class="{ focused: r.id === focusId }" data-testid="ledger-row">
               <div class="row-head">
-                <span data-testid="ledger-kind">{{ labelOf(ledgerKindLabel, r.kind) }}</span>
+                <el-tag :type="kindTag(r.kind)" size="small" disable-transitions><span data-testid="ledger-kind">{{ labelOf(ledgerKindLabel, r.kind) }}</span></el-tag>
                 <b :class="r.amount >= 0 ? 'money-plus' : 'money-minus'" data-testid="ledger-amount">{{ signed(r.amount) }}</b>
               </div>
               <div class="muted">余额 <span data-testid="ledger-after">{{ fmtYuan(r.balance_after) }}</span> · <span data-testid="ledger-time">{{ fmtTime(r.created_at) }}</span></div>
               <div v-if="r.remark" class="muted" data-testid="ledger-remark">{{ r.remark }}</div>
             </div>
           </template>
-          <el-table v-else :data="ledger" row-key="id">
-            <el-table-column label="类型" width="100"><template #default="{ row }"><span data-testid="ledger-kind">{{ labelOf(ledgerKindLabel, row.kind) }}</span></template></el-table-column>
+          <el-table v-else :data="ledger" row-key="id" :row-class-name="({ row }) => (row.id === focusId ? 'focused' : '')">
+            <el-table-column label="类型" width="110">
+              <template #default="{ row }">
+                <el-tag :type="kindTag(row.kind)" size="small" disable-transitions><span data-testid="ledger-kind">{{ labelOf(ledgerKindLabel, row.kind) }}</span></el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="金额" width="140"><template #default="{ row }"><b :class="row.amount >= 0 ? 'money-plus' : 'money-minus'" data-testid="ledger-amount">{{ signed(row.amount) }}</b></template></el-table-column>
             <el-table-column label="变动后余额" width="140"><template #default="{ row }"><span data-testid="ledger-after">{{ fmtYuan(row.balance_after) }}</span></template></el-table-column>
             <el-table-column label="备注" min-width="160"><template #default="{ row }"><span data-testid="ledger-remark">{{ row.remark }}</span></template></el-table-column>
@@ -239,4 +266,7 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .sentinel { height: 24px; text-align: center; color: #909399; font-size: 12px; }
 .end { text-align: center; padding: 12px; }
+.focus-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.row-card.focused { background: var(--el-color-primary-light-9); }
+:deep(.el-table .focused) { --el-table-tr-bg-color: var(--el-color-primary-light-9); }
 </style>

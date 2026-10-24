@@ -16,6 +16,8 @@ export const instanceStateType: LabelMap = {
 export const orderKindLabel: LabelMap = { new: '新购', renew: '续费' }
 export const orderStatusLabel: LabelMap = { paid: '已支付', refunded: '已退款', partially_refunded: '部分退款' }
 export const ledgerKindLabel: LabelMap = { recharge: '充值', order_pay: '扣款', refund: '退款', admin_adjust: '调账', llm_pay: 'Token 消费' }
+/** el-tag 的 type：入账（充值 / 退款）绿、扣款类（扣款 / Token 消费）橙、调账灰；未登记的种类用 info。 */
+export const ledgerKindType: LabelMap = { recharge: 'success', refund: 'success', order_pay: 'warning', llm_pay: 'warning', admin_adjust: 'info' }
 export const rechargeStatusLabel: LabelMap = { pending: '待支付', paid: '已支付', closed: '已关闭' }
 export const rechargeChannelLabel: LabelMap = { wechat: '微信支付', alipay: '支付宝', manual: '手动' }
 export const machineStateLabel: LabelMap = { idle: '空闲', allocated: '已分配', maintenance: '维护中', faulty: '故障' }

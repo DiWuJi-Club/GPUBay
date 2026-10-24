@@ -56,10 +56,12 @@ declare module 'vue' {
     GuideDialog: typeof import('./components/GuideDialog.vue')['default']
     KeysTab: typeof import('./components/tokens/KeysTab.vue')['default']
     LoginPrompt: typeof import('./components/tokens/LoginPrompt.vue')['default']
+    LogsTab: typeof import('./components/tokens/LogsTab.vue')['default']
     ModelsTab: typeof import('./components/tokens/ModelsTab.vue')['default']
     QuickStartTab: typeof import('./components/tokens/QuickStartTab.vue')['default']
     RentDialog: typeof import('./components/RentDialog.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    UsageTab: typeof import('./components/tokens/UsageTab.vue')['default']
   }
 }

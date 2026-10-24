@@ -9,4 +9,6 @@ export interface User {
   kyc_status: KycStatus
   status: UserStatus
   created_at: string
+  /** 计划 9：本月 Token 消费（分，已结算 + 未结算）；只在 GET /me 返回，0 时省略 */
+  llm_month_cost?: number
 }

@@ -1,5 +1,11 @@
 <script setup lang="ts">
-import { brand } from '@spark/shared'
+import { brand, formatTokens } from '@spark/shared'
+import { DEFAULT_LLM_LIMITS, llmErrorHelp, llmErrorStatus } from '../logic/tokens'
+
+// Token 商城的常见错误码：与快速开始同一份说明（llmErrorHelp），按 HTTP 状态码排序
+const llmErrors = Object.keys(llmErrorHelp)
+  .map((code) => ({ code, status: llmErrorStatus[code], help: llmErrorHelp[code] }))
+  .sort((a, b) => a.status - b.status)
 </script>
 
 <template>
@@ -84,6 +90,26 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
+      <h2 data-testid="help-tokens">Token 商城</h2>
+      <ul>
+        <li data-testid="help-tokens-billing">计费：按实际 token 数计费，价格以「元 / 百万 token」标示，输入（提示词）与输出（生成内容）分别计价，向量模型只计输入；请求失败（上游错误、无可用节点）不收费。</li>
+        <li data-testid="help-tokens-settle">结算：费用先累计，累计到 ¥1 或最早一笔满 10 分钟时从钱包余额扣款一次，每次一条「Token 消费」流水；在「Token 商城 → 用量」可查看结算记录并跳转到对应流水。</li>
+        <li data-testid="help-tokens-limits">
+          限额（按账户，所有 Key 共享）：默认每分钟 {{ DEFAULT_LLM_LIMITS.rpm }} 次请求、每分钟 {{ formatTokens(DEFAULT_LLM_LIMITS.tpm) }} token、同时 {{ DEFAULT_LLM_LIMITS.concurrency }} 个并发请求，超出返回 429；需要更高限额请联系客服。每个 Key 还可以设置月消费上限。
+        </li>
+        <li data-testid="help-tokens-key">Key 安全：明文 Key 只在创建时显示一次，平台只保存哈希、无法找回；请勿写进前端代码或公开仓库，一旦泄露请立即在「API Keys」撤销并重新创建。</li>
+        <li data-testid="help-tokens-debt">欠费：每次调用前按余额预检，但并发请求可能让实际费用超过余额，差额记为欠费；有欠费时所有调用返回 402，充值后下一次结算自动补扣，补齐后恢复调用。</li>
+      </ul>
+      <h3>常见错误码</h3>
+      <el-table :data="llmErrors" size="small" data-testid="help-tokens-errors">
+        <el-table-column label="HTTP" prop="status" width="64" />
+        <el-table-column label="code" min-width="150">
+          <template #default="{ row }"><code>{{ row.code }}</code></template>
+        </el-table-column>
+        <el-table-column label="说明" prop="help" min-width="220" />
+      </el-table>
+    </el-card>
+    <el-card>
       <h2 data-testid="help-billing">计费规则</h2>
       <ul>
         <li>预付包时长：1 天 / 1 周 / 1 月（按 30 天计），从开通成功开始计时。</li>
@@ -98,6 +124,7 @@ import { brand } from '@spark/shared'
 <style scoped>
 .help { display: grid; gap: 16px; max-width: 760px; }
 h2 { font-size: 16px; margin: 0 0 8px; }
+h3 { font-size: 14px; margin: 12px 0 8px; }
 .support { color: #909399; font-size: 12px; }
 code { word-break: break-all; }
 </style>

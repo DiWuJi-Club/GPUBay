@@ -42,6 +42,7 @@ beforeEach(() => {
   get.mockImplementation(async (path: string) => {
     if (path === '/llm/models') return { items: models, base_url: BASE }
     if (path === '/products' || path === '/images' || path === '/apps') return { items: [] }
+    if (path === '/llm/account') return { debt: 0, unsettled: 0, today_cost: 0, month_cost: 0, month_tokens: 0, limits: { rpm: 60, tpm: 200000, concurrency: 8 }, blocked: false, blocked_reason: '', kyc_verified: true, base_url: '' }
     throw new Error(`unexpected ${path}`)
   })
   session.status = 'anon'

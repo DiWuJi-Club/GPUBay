@@ -1,4 +1,7 @@
-import { centsToYuanInput, fmtDate, fmtYuan, formatTokens, labelOf, llmKeyStatusLabel, yuanToCents, type LLMKey, type LLMKeyInput, type LLMModelPublic } from '@spark/shared'
+import {
+  centsToYuanInput, fmtDate, fmtYuan, formatTokens, labelOf, llmKeyStatusLabel, llmUsageStatusLabel, yuanToCents,
+  type LLMKey, type LLMKeyInput, type LLMModelPublic, type LLMSettlement, type LLMUsageStatus,
+} from '@spark/shared'
 
 // 计划 9：Token 商城（/tokens）的纯逻辑。价格单位「分 / 百万 token」，费用 cost_micro「微分」（1 分 = 10^6 微分）。
 
@@ -186,4 +189,71 @@ export function keyStatusTag(k: LLMKey, now: Date): { label: string; type: 'succ
   if (k.status === 'disabled') return { label: labelOf(llmKeyStatusLabel, 'disabled'), type: 'warning' }
   if (k.expires_at && new Date(k.expires_at).getTime() <= now.getTime()) return { label: '已过期', type: 'danger' }
   return { label: labelOf(llmKeyStatusLabel, k.status), type: 'success' }
+}
+
+// ---- 用量 / 请求日志 / 结算（Task 19）----
+
+/** token 数（千分位整数）；估算值（客户端中断按块数估算等）前缀「≈」。 */
+export function tokenCount(n: number, estimated = false): string {
+  const v = String(Math.max(0, Math.trunc(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return estimated ? `≈${v}` : v
+}
+
+/** 延迟 / 首字节时间：< 1 秒「850 ms」，其余「1.23 s」；null（非流式没有 TTFT）→「—」。 */
+export function latencyLabel(ms: number | null | undefined): string {
+  if (ms == null) return '—'
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))} ms`
+  return `${(Math.round(ms / 10) / 100).toFixed(2)} s` // 先按 10 ms 取整，避免 2.345.toFixed(2) 的浮点误差
+}
+
+/** 请求状态标签：成功绿、客户端中断橙、其余（上游错误 / 超时 / 无可用节点）红。 */
+export function usageStatusTag(status: LLMUsageStatus | string): { label: string; type: 'success' | 'warning' | 'danger' } {
+  const label = labelOf(llmUsageStatusLabel, status)
+  if (status === 'ok') return { label, type: 'success' }
+  if (status === 'client_abort') return { label, type: 'warning' }
+  return { label, type: 'danger' }
+}
+
+/** 请求日志查询窗口（与后端一致：默认最近 7 天，最长 90 天，含首尾两天，北京时间日期）。 */
+export const USAGE_DEFAULT_DAYS = 7
+export const USAGE_MAX_DAYS = 90
+
+const ymdUTC = (ymd: string) => {
+  const [y, m, d] = ymd.split('-').map(Number)
+  return Date.UTC(y, m - 1, d)
+}
+/** YYYY-MM-DD 加减天数（纯日历运算，不受本地时区影响）。 */
+export function addDays(ymd: string, n: number): string {
+  return new Date(ymdUTC(ymd) + n * 86_400_000).toISOString().slice(0, 10)
+}
+/** 含首尾两天的天数：同一天 = 1。 */
+export function daySpan(from: string, to: string): number {
+  return Math.round((ymdUTC(to) - ymdUTC(from)) / 86_400_000) + 1
+}
+/** 默认范围：北京时间今天及之前 6 天。 */
+export function defaultUsageRange(now: Date): { from: string; to: string } {
+  const to = beijingToday(now)
+  return { from: addDays(to, -(USAGE_DEFAULT_DAYS - 1)), to }
+}
+/** 校验日期范围；合法返回 null，否则返回提示文案（不发请求）。 */
+export function validateUsageRange(from: string, to: string): string | null {
+  if (!ymdRe.test(from) || !ymdRe.test(to)) return '请选择开始和结束日期'
+  if (from > to) return '开始日期不能晚于结束日期'
+  if (daySpan(from, to) > USAGE_MAX_DAYS) return `查询范围最长 ${USAGE_MAX_DAYS} 天`
+  return null
+}
+
+/** 结算金额明细：用量折出的金额、并入的历史欠费、扣不到转为欠费的部分。 */
+export function settlementDetail(s: LLMSettlement): string[] {
+  const out: string[] = []
+  if (s.usage_amount > 0 || s.debt_amount === 0) out.push(`用量 ${fmtYuan(s.usage_amount)}`)
+  if (s.debt_amount > 0) out.push(`补扣欠费 ${fmtYuan(s.debt_amount)}`)
+  const short = s.usage_amount + s.debt_amount - s.charged
+  if (short > 0) out.push(`余额不足，${fmtYuan(short)} 计入欠费`)
+  return out
+}
+
+/** 结算对应的钱包流水链接（charged = 0 时没有流水）。 */
+export function settlementLedgerLink(s: LLMSettlement): { path: string; query: { ledger: string } } | null {
+  return s.wallet_ledger_id == null ? null : { path: '/wallet', query: { ledger: String(s.wallet_ledger_id) } }
 }
