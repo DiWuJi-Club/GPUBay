@@ -36,8 +36,7 @@ func (s *Server) workflowRoutes(g chi.Router) {
 	s.handle(g, http.MethodPost, "/workflows/{id}/versions/{vid}/publish", superOnly, s.handlePublishWorkflowVersion)
 }
 
-// coverUploadRe 是封面上传接口的路径：它收 multipart/form-data，requireJSONForWrites 放行，由处理器自己要求 multipart
-// （角色校验在处理器之前，无权角色照样得到 403）。
+// coverUploadRe 是封面上传接口的路径：requireJSONForWrites 对它要求 multipart/form-data 且带 Origin 或 Sec-Fetch-Site。
 var coverUploadRe = regexp.MustCompile(`^` + prefix + `/workflows/[^/]+/cover$`)
 
 func isCoverUpload(r *http.Request) bool {
@@ -135,8 +134,8 @@ func (s *Server) handleWorkflow(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, viewOfWorkflow(wf))
 }
 
-// handleUpdateWorkflow 整体更新展示信息、排序与状态；slug 不可改（为空或等于原值，否则 bad_request）；
-// status 省略（空）= 保持当前状态（不会因为漏传把已上架的工作流打回草稿）。
+// handleUpdateWorkflow 整体更新（字段语义见 comfywf.WorkflowInput）：name / summary / description / category / tags / sort
+// 按请求写入（省略即清空 / 零值）；slug 为空或等于原值，否则 bad_request；status 省略（空）= 保持当前状态（Catalog 在行锁内取）。
 func (s *Server) handleUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -147,14 +146,6 @@ func (s *Server) handleUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		s.writeError(w, r, err)
 		return
-	}
-	if req.Status == "" {
-		cur, err := s.Workflows.GetWorkflow(r.Context(), id)
-		if err != nil {
-			s.writeError(w, r, err)
-			return
-		}
-		req.Status = cur.Status
 	}
 	wf, err := s.Workflows.UpdateWorkflow(r.Context(), s.actor(r), id, req.input())
 	if err != nil {
@@ -189,10 +180,6 @@ func (s *Server) handleUploadWorkflowCover(w http.ResponseWriter, r *http.Reques
 	id, err := pathID(r, "id")
 	if err != nil {
 		s.writeError(w, r, err)
-		return
-	}
-	if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
-		s.writeError(w, r, apperr.BadRequest("请使用 multipart/form-data 上传，文件字段名为 file"))
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, comfywf.MaxCoverBytes+coverMultipartOverhead)
@@ -247,6 +234,7 @@ func (s *Server) handleWorkflowCover(w http.ResponseWriter, r *http.Request) {
 	h.Set("Content-Length", strconv.FormatInt(up.Size, 10))
 	h.Set("Content-Disposition", "inline")
 	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "private, max-age=86400") // 覆盖 API 的 no-store：cover_url 带 ?v=，换封面后地址改变
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, rc); err != nil {
 		s.Log.Warn("serve workflow cover aborted", "workflow", id, "err", err)
@@ -458,8 +446,9 @@ func (s *Server) handleUpdateWorkflowVersion(w http.ResponseWriter, r *http.Requ
 	httpx.WriteJSON(w, http.StatusOK, v)
 }
 
-// handlePublishWorkflowVersion 发布草稿（super + 动态码，D6）：先确认版本存在且是草稿，明显无法发布的请求不消耗动态码；
-// 发布成功后才打开二次验证窗口（withStepUp）。校验失败 → workflow_version_invalid（不打开窗口）。
+// handlePublishWorkflowVersion 发布草稿（super + 动态码，D6）：先预检（版本存在、是草稿、库里内容通过完整校验，
+// Catalog.CheckPublishable），明显无法发布的请求不消耗动态码；发布成功后才打开二次验证窗口（withStepUp）。
+// PublishVersion 在行锁内重新校验，预检之后的并发变化照样拦住（此时不打开窗口）。
 func (s *Server) handlePublishWorkflowVersion(w http.ResponseWriter, r *http.Request) {
 	id, cur, err := s.workflowAndVersion(r)
 	if err != nil {
@@ -473,8 +462,8 @@ func (s *Server) handlePublishWorkflowVersion(w http.ResponseWriter, r *http.Req
 		s.writeError(w, r, err)
 		return
 	}
-	if cur.Status != comfywf.StatusDraft {
-		s.writeError(w, r, apperr.ErrInvalidState)
+	if err := s.Workflows.CheckPublishable(r.Context(), id, cur.ID); err != nil {
+		s.writeError(w, r, err)
 		return
 	}
 	var out comfywf.Version
