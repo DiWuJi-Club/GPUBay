@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,27 +19,77 @@ import (
 	"spark-cloud/internal/api"
 	"spark-cloud/internal/llm"
 	"spark-cloud/internal/llmgw"
+	"spark-cloud/internal/llmgw/llmtest"
 	"spark-cloud/internal/platform/dbtest"
+	"spark-cloud/internal/platform/secretbox"
 	"spark-cloud/internal/platform/tz"
 )
 
 // llmEnv 在 testEnv 上组装 Token 商城：Server.LLM + Server.LLMGateway（网关挂 /v1）。
+// 网关的上游 Transport 按节点 ID 拨到 nodeAddrs 里登记的 FakeVLLM 地址（见 readyNode）。
 type llmEnv struct {
 	*testEnv
-	svc     *llm.Service
-	imageID int64
+	svc       *llm.Service
+	srv       *api.Server
+	box       *secretbox.Box
+	imageID   int64
+	nodeAddrs *sync.Map // nodeID → 假节点监听地址
 }
 
-func newLLMTestEnv(t *testing.T) *llmEnv {
+func newLLMTestEnv(t *testing.T, mods ...func(*api.Server)) *llmEnv {
 	t.Helper()
-	var svc *llm.Service
+	var (
+		svc   *llm.Service
+		srv   *api.Server
+		addrs sync.Map
+	)
+	box, err := secretbox.New(dbtest.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
 	e := buildTestEnvPool(t, false, func(s *api.Server, pool *pgxpool.Pool) {
 		quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-		svc = llm.NewService(llm.Deps{Pool: pool, Clock: s.Clock, Log: quiet, Wallet: s.Wallet, Users: s.Identity})
+		svc = llm.NewService(llm.Deps{Pool: pool, Clock: s.Clock, Log: quiet, Box: box, Wallet: s.Wallet, Users: s.Identity})
+		cfg := llmgw.Config{Transport: func(node llm.RouteNode) http.RoundTripper {
+			return &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				addr, _ := addrs.Load(node.ID)
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp", fmt.Sprint(addr))
+			}}
+		}}
 		s.LLM = svc
-		s.LLMGateway = llmgw.New(svc, llmgw.Config{}, s.Clock, quiet).Router()
+		s.LLMGateway = llmgw.New(svc, cfg, s.Clock, quiet).Router()
+		for _, m := range mods {
+			m(s)
+		}
+		srv = s
 	})
-	return &llmEnv{testEnv: e, svc: svc, imageID: dbtest.ImageID(t, e.pool)}
+	return &llmEnv{testEnv: e, svc: svc, srv: srv, box: box, imageID: dbtest.ImageID(t, e.pool), nodeAddrs: &addrs}
+}
+
+// readyNode 给模型建一个可路由的 ready 节点：机器 + 运行中的系统实例 + llm_nodes 行（节点密钥 = fake.RequireKey），
+// 背后是跑 fake 的 httptest.Server；刷新路由表。
+func (e *llmEnv) readyNode(id string, modelID int64, fake *llmtest.FakeVLLM) {
+	e.t.Helper()
+	ctx := context.Background()
+	key := "nodekey-" + id + strings.Repeat("x", 32)
+	fake.RequireKey = key
+	up := httptest.NewServer(fake)
+	e.t.Cleanup(up.Close)
+	mach := dbtest.CreateMachine(e.t, e.pool, "SN-"+id)
+	var sysUser int64
+	if err := e.pool.QueryRow(ctx, `SELECT id FROM users WHERE system AND phone = $1`, llm.SystemUserPhone).Scan(&sysUser); err != nil {
+		e.t.Fatal(err)
+	}
+	ins := "ins-" + id
+	e.exec(`INSERT INTO instances (id, user_id, machine_id, product_id, image_id, state, ssh_password_enc, system, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, 'running', 'x', true, $6, $6)`, ins, sysUser, mach, dbtest.ProductID(e.t, e.pool), e.imageID, e.clk.Now())
+	e.exec(`INSERT INTO llm_nodes (id, model_id, machine_id, instance_id, state, api_key_enc, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'ready', $5, $6, $6)`, id, modelID, mach, ins, e.box.Seal([]byte(key)), e.clk.Now())
+	e.nodeAddrs.Store(id, up.Listener.Addr().String())
+	if err := e.svc.Router().Refresh(ctx); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 // model 直接插一个模型（价格 100 / 400 分每百万 token），返回 ID。
@@ -519,5 +572,66 @@ func TestV1MountedAndExempt(t *testing.T) {
 	// /v1x 之类不属于网关
 	if code, _, out := v1Do(t, e, "POST", "/v1x/chat", "text/plain", "x", nil); code != 400 || out["code"] != "bad_request" {
 		t.Fatalf("/v1x = %d %v", code, out)
+	}
+}
+
+func TestLLMModelsRateLimited(t *testing.T) {
+	e := newLLMTestEnv(t, func(s *api.Server) { s.CalendarLimit = 3 })
+	e.model("m-a", "online", 0)
+	c := e.client()
+	for i := 0; i < 3; i++ {
+		if code, out := c.do("GET", "/llm/models", nil); code != 200 {
+			t.Fatalf("#%d = %d %v", i, code, out)
+		}
+	}
+	if code, out := c.do("GET", "/llm/models", nil); code != 429 || out["code"] != "rate_limited" {
+		t.Fatalf("4th = %d %v", code, out)
+	}
+	e.clk.Advance(time.Minute)
+	if code, out := c.do("GET", "/llm/models", nil); code != 200 {
+		t.Fatalf("after window = %d %v", code, out)
+	}
+}
+
+// TestV1StreamOutlivesServerTimeouts 流式响应经 api.Server 的全部中间件，跑在 WriteTimeout / ReadTimeout = 1 秒的 http.Server 上，
+// 持续 2.5 秒仍完整送达 [DONE]：网关用 ResponseController 延长了本连接的期限，中间件没有包装 ResponseWriter 挡住它。
+func TestV1StreamOutlivesServerTimeouts(t *testing.T) {
+	e := newLLMTestEnv(t)
+	mid := e.model("m-a", "online", 0)
+	fake := &llmtest.FakeVLLM{Chunks: []string{"一", "二", "三", "四", "五"}, Delay: 500 * time.Millisecond, PromptTokens: 7, CompletionTokens: 5}
+	e.readyNode("node-stream00001", mid, fake)
+	c, _ := e.fundedClient("13800000141")
+	_, kout := c.do("POST", "/llm/keys", map[string]any{"name": "k"})
+	plain := kout["key"].(string)
+
+	ts := httptest.NewUnstartedServer(e.srv.Router())
+	ts.Config.WriteTimeout = time.Second
+	ts.Config.ReadTimeout = time.Second
+	ts.Start()
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"m-a","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+plain)
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream after %v: %v (got %q)", time.Since(start), err, b)
+	}
+	if el := time.Since(start); el < 2*time.Second {
+		t.Fatalf("stream finished too fast (%v) to exercise the timeouts", el)
+	}
+	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("status = %d %v body %s", resp.StatusCode, resp.Header, b)
+	}
+	body := string(b)
+	if !strings.Contains(body, "data: [DONE]") || !strings.Contains(body, "五") || !strings.Contains(body, `"usage"`) {
+		t.Fatalf("stream body = %s", body)
 	}
 }
