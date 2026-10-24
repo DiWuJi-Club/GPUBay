@@ -21,6 +21,7 @@ import (
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/llm"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/httpx"
@@ -64,6 +65,7 @@ type Server struct {
 	Gateway       *agentgw.Server    // 机器接入命令与撤销（计划 2）
 	Apps          *appdeploy.Service // 应用部署（计划 7）：部署列表 / 详情 / 强制卸载、实例详情与仪表盘
 	AppCatalog    *appdeploy.Catalog // 应用目录（计划 7）：应用、版本、发布、预拉取、覆盖率
+	LLM           *llm.Service       // Token 商城（计划 9）；nil 时不注册 /llm/*，仪表盘 / 用户详情不带 llm 字段，机组变更不做节点检查
 	Clock         clock.Clock
 	Log           *slog.Logger
 	SecureCookie  bool                                     // 生产环境为 true：Cookie 仅经 HTTPS 发送
@@ -87,7 +89,9 @@ var (
 	allRoles     = []admin.Role{admin.RoleSuper, admin.RoleOps, admin.RoleFinance}
 	opsRoles     = []admin.Role{admin.RoleSuper, admin.RoleOps}
 	financeRoles = []admin.Role{admin.RoleSuper, admin.RoleFinance}
-	superOnly    = []admin.Role{admin.RoleSuper}
+	// opsFinanceRoles 只读的运营 + 财务视图（计划 9：Token 商城账户与 Key 列表）
+	opsFinanceRoles = []admin.Role{admin.RoleSuper, admin.RoleOps, admin.RoleFinance}
+	superOnly       = []admin.Role{admin.RoleSuper}
 )
 
 func (s *Server) Router() http.Handler {
@@ -121,6 +125,9 @@ func (s *Server) Router() http.Handler {
 			s.financeRoutes(g)
 			s.catalogRoutes(g)
 			s.appRoutes(g)
+			if s.LLM != nil {
+				s.llmRoutes(g)
+			}
 		})
 	})
 	static := s.Static

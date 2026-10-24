@@ -20,6 +20,8 @@ type UserFilter struct {
 	Q         string // 完整手机号、手机尾号或用户 ID
 	KYCStatus string
 	Status    string
+	// IncludeSystem 为 false（默认）时不列出平台系统账号（users.system，如 Token 商城的 system:llm，计划 9 规格 §2）
+	IncludeSystem bool
 }
 
 var (
@@ -38,6 +40,9 @@ func isDigits(s string) bool {
 
 func (s *Service) AdminListUsers(ctx context.Context, f UserFilter, p paging.Page) ([]User, int, error) {
 	var w db.Where
+	if !f.IncludeSystem {
+		w.Add("NOT system")
+	}
 	switch q := strings.TrimSpace(f.Q); {
 	case q == "":
 	case isDigits(q) && len(q) == 11: // 完整手机号
@@ -145,7 +150,23 @@ func (s *Service) GetKYCRecord(ctx context.Context, id int64) (KYCRecord, error)
 	return s.scanKYC(s.d.Pool.QueryRow(ctx, `SELECT `+kycCols+` FROM kyc_records WHERE id = $1`, id))
 }
 
-// Ban 封禁用户并删除其全部会话；运行中的实例不受影响。
+// CheckNotSystem 后台对用户的资金 / 状态操作前调用：系统账号（users.system）→ apperr.ErrInvalidState；用户不存在 → apperr.ErrNotFound。
+func (s *Service) CheckNotSystem(ctx context.Context, userID int64) error {
+	var system bool
+	err := s.d.Pool.QueryRow(ctx, `SELECT system FROM users WHERE id = $1`, userID).Scan(&system)
+	if db.IsNoRows(err) {
+		return apperr.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if system {
+		return apperr.ErrInvalidState
+	}
+	return nil
+}
+
+// Ban 封禁用户并删除其全部会话；运行中的实例不受影响。系统账号 → apperr.ErrInvalidState。
 func (s *Service) Ban(ctx context.Context, actor audit.Actor, userID int64, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -162,14 +183,15 @@ func (s *Service) setStatus(ctx context.Context, actor audit.Actor, userID int64
 	now := s.d.Clock.Now()
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 		var status string
-		err := tx.QueryRow(ctx, `SELECT status FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&status)
+		var system bool
+		err := tx.QueryRow(ctx, `SELECT status, system FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&status, &system)
 		if db.IsNoRows(err) {
 			return apperr.ErrNotFound
 		}
 		if err != nil {
 			return err
 		}
-		if status != from {
+		if system || status != from { // 系统账号不能封禁 / 解封（计划 9 规格 §2）
 			return apperr.ErrInvalidState
 		}
 		if _, err := tx.Exec(ctx, `UPDATE users SET status = $2, updated_at = $3 WHERE id = $1`, userID, to, now); err != nil {

@@ -26,6 +26,7 @@ import (
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/llm"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
@@ -69,6 +70,9 @@ type env struct {
 	gw       *agentgw.Server
 	apps     *appdeploy.Service
 	appCat   *appdeploy.Catalog
+	llm      *llm.Service
+	// systemUserID 迁移 00022 的系统账号 system:llm
+	systemUserID int64
 }
 
 func newEnv(t *testing.T) *env { return newEnvWith(t, nil) }
@@ -94,8 +98,12 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	f := fleet.NewService(pool, clk)
 	pduMock := &pdu.Mock{}
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, AllowMock: true, Open: func(fleet.PDUConn) (pdu.Driver, error) { return pduMock, nil }})
+	var systemUserID int64 // 迁移 00022 的系统账号 system:llm（计划 9）
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM users WHERE system AND phone = $1`, llm.SystemUserPhone).Scan(&systemUserID); err != nil {
+		t.Fatal(err)
+	}
 	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f,
-		Notifier: noopNotifier{}})
+		Notifier: noopNotifier{}, SystemUserID: systemUserID})
 	payMock := pay.NewMock("s")
 	b := billing.NewService(billing.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Alerts: f,
 		Providers: map[string]pay.Provider{pay.ChannelWechat: payMock}, NotifyBaseURL: "https://spark.test"})
@@ -113,8 +121,10 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	appCat := appdeploy.NewCatalog(pool, clk, f, c, log)
 	apps := appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
 		PortURL: portURL})
+	llmSvc := llm.NewService(llm.Deps{Pool: pool, Clock: clk, Log: log, Box: box, Wallet: w, Users: ids, Rental: r, Apps: apps,
+		AppCat: appCat, Images: c, Fleet: f, SystemUserID: systemUserID})
 	srv := &adminapi.Server{Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: b,
-		Uploads: uploads, Gateway: gw, Clock: clk, Log: log, Apps: apps, AppCatalog: appCat, PortURL: portURL}
+		Uploads: uploads, Gateway: gw, Clock: clk, Log: log, Apps: apps, AppCatalog: appCat, PortURL: portURL, LLM: llmSvc}
 	if tweak != nil {
 		tweak(srv)
 	}
@@ -122,7 +132,7 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	t.Cleanup(ts.Close)
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, srv: srv, ts: ts, admins: admins, identity: ids,
 		wallet: w, catalog: c, fleet: f, rental: r, billing: b, uploads: uploads, pdu: pduMock, pay: payMock, gw: gw,
-		apps: apps, appCat: appCat}
+		apps: apps, appCat: appCat, llm: llmSvc, systemUserID: systemUserID}
 }
 
 type client struct {

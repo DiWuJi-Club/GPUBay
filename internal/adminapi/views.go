@@ -36,6 +36,8 @@ type instanceView struct {
 	AutoRenewFailedReason string     `json:"auto_renew_failed_reason"`
 	ProvisionedAt         *time.Time `json:"provisioned_at"`
 	CancelledAt           *time.Time `json:"cancelled_at"`
+	// 计划 9：Token 商城的系统实例（平台节点）：不计费、不到期
+	System bool `json:"system"`
 }
 
 func (s *Server) instanceView(i rental.Instance) instanceView {
@@ -45,7 +47,7 @@ func (s *Server) instanceView(i rental.Instance) instanceView {
 		PasswordAuth: i.PasswordAuth}
 	v.ScheduledStartAt, v.GroupID, v.BatchID, v.ReassignCount = i.ScheduledStartAt, i.GroupID, i.BatchID, i.ReassignCount
 	v.AutoRenew, v.AutoRenewDuration, v.AutoRenewFailedReason = i.AutoRenew, string(i.AutoRenewDuration), i.AutoRenewFailedReason
-	v.ProvisionedAt, v.CancelledAt = i.ProvisionedAt, i.CancelledAt
+	v.ProvisionedAt, v.CancelledAt, v.System = i.ProvisionedAt, i.CancelledAt, i.System
 	if i.ScheduledStartAt != nil {
 		switch i.State {
 		case rental.StateReserved, rental.StateCreating, rental.StateCancelled:

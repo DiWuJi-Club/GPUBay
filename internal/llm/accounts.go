@@ -228,9 +228,11 @@ func equalIntPtr(a, b *int) bool {
 	return *a == *b
 }
 
-// AccountFilter 后台账户列表筛选：Q 为数字（用户 ID 精确或手机号子串）；Blocked 非 nil 按停用状态；Debt 只看欠费 > 0。
+// AccountFilter 后台账户列表筛选：Q 为数字（用户 ID 精确或手机号子串）；UserID > 0 只看该用户（精确，用户详情的链接）；
+// Blocked 非 nil 按停用状态；Debt 只看欠费 > 0。
 type AccountFilter struct {
 	Q       string
+	UserID  int64
 	Blocked *bool
 	Debt    bool
 }
@@ -254,6 +256,9 @@ func (s *Service) AdminListAccounts(ctx context.Context, f AccountFilter, p pagi
 			return nil, 0, apperr.BadRequest("q 只能是手机号（片段）或用户 ID")
 		}
 		w.Add("(a.user_id::text = ? OR u.phone LIKE ?)", q, "%"+q+"%")
+	}
+	if f.UserID > 0 {
+		w.Add("a.user_id = ?", f.UserID)
 	}
 	if f.Blocked != nil {
 		w.Add("a.blocked = ?", *f.Blocked)

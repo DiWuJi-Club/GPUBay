@@ -90,10 +90,20 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"machines": machines, "instances": instances,
 		"recharge_today": rechargeToday, "recharge_month": rechargeMonth, "order_today": orderToday, "order_month": orderMonth,
 		"utilization": util, "ssh_sessions_open": sshOpen, "bookings_upcoming_7d": upcoming7,
 		"apps_installing": appsInstalling, "apps_running": appsRunning, "apps_failed_24h": appsFailed24h,
-	})
+	}
+	if s.LLM != nil { // 计划 9：Token 商城卡片（= /llm/summary 的子集）
+		sum, err := s.LLM.AdminSummary(ctx)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		out["llm"] = map[string]any{"nodes_ready": sum.Nodes.Ready, "nodes_total": sum.Nodes.Total,
+			"today_requests": sum.Today.Requests, "today_settled_amount": sum.Today.SettledAmount}
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 }
