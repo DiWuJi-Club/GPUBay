@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/jackc/pgx/v5"
 
@@ -90,18 +92,24 @@ func (c *Catalog) ImportDir(ctx context.Context, actor audit.Actor, dir string) 
 	return out, nil
 }
 
-// readImportFile 读工作流目录下的普通文件：不存在且 optional → (nil, nil)；符号链接 → errSymlink；超过 limit 字节在读之前就拒绝。
+// readImportFile 读工作流目录下的普通文件：不存在且 optional → (nil, nil)；符号链接 → errSymlink；超过 limit 字节 → 错误。
+// 以 O_NOFOLLOW 打开后对同一个文件描述符 Fstat 并限量读取（检查与读取之间文件被换成链接 / 变大也不会多读）。
 func readImportFile(dir, name string, limit int64, optional bool) ([]byte, error) {
 	path := filepath.Join(dir, name)
-	fi, err := os.Lstat(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if optional && errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
+	}
+	if errors.Is(err, syscall.ELOOP) {
+		return nil, errSymlink{name}
 	}
 	if err != nil {
 		return nil, err
 	}
-	if fi.Mode()&fs.ModeSymlink != 0 {
-		return nil, errSymlink{name}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s 不是普通文件", name)
@@ -109,7 +117,14 @@ func readImportFile(dir, name string, limit int64, optional bool) ([]byte, error
 	if fi.Size() > limit {
 		return nil, fmt.Errorf("%s 超过 %d 字节", name, limit)
 	}
-	return os.ReadFile(path)
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%s 超过 %d 字节", name, limit)
+	}
+	return b, nil
 }
 
 // decodeStrict 解析 JSON，未知字段或尾随内容报错；数字保留原文（json.Number）。
@@ -181,8 +196,8 @@ func (c *Catalog) importWorkflow(ctx context.Context, actor audit.Actor, dir, sl
 	}
 	res.Version = strings.TrimSpace(meta.Version)
 	// 先校验版本（与工作流信息），避免版本非法时留下一个没有版本的新工作流
-	in := VersionInput{Version: meta.Version, Graph: graph, APIPrompt: api, Manifest: m, Changelog: meta.Changelog}
-	vres, err := validateVersionInput(&in)
+	in := VersionInput{Version: meta.Version, Graph: graph, APIPrompt: api, Manifest: m, Changelog: &meta.Changelog}
+	vres, err := validateVersionInput(&in, "")
 	if err != nil {
 		return res, err
 	}
@@ -194,7 +209,7 @@ func (c *Catalog) importWorkflow(ctx context.Context, actor audit.Actor, dir, sl
 		})
 		return res, err
 	}
-	if !errors.Is(err, apperr.ErrNotFound) {
+	if !errors.Is(err, apperr.ErrWorkflowNotFound) {
 		return res, err
 	}
 	wf, err := normalizeWorkflow(WorkflowInput{Slug: slug, Name: meta.Name, Summary: meta.Summary, Description: meta.Description,

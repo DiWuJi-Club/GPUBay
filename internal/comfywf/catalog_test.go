@@ -42,6 +42,13 @@ func TestWorkflowCRUD(t *testing.T) {
 		"tag 17":           {Slug: "ok-slug", Name: "x", Category: "txt2img", Tags: []string{long(17)}},
 		"bad status":       {Slug: "ok-slug", Name: "x", Category: "txt2img", Status: "hidden"},
 		"sort range":       {Slug: "ok-slug", Name: "x", Category: "txt2img", Sort: 10001},
+		"name control":     {Slug: "ok-slug", Name: "a\x07b", Category: "txt2img"},
+		"name newline":     {Slug: "ok-slug", Name: "a\nb", Category: "txt2img"},
+		"name NUL":         {Slug: "ok-slug", Name: "a\x00b", Category: "txt2img"},
+		"name bad utf8":    {Slug: "ok-slug", Name: "a\xffb", Category: "txt2img"},
+		"summary tab":      {Slug: "ok-slug", Name: "x", Summary: "a\tb", Category: "txt2img"},
+		"tag control":      {Slug: "ok-slug", Name: "x", Category: "txt2img", Tags: []string{"a\x07b"}},
+		"desc control":     {Slug: "ok-slug", Name: "x", Description: "a\x1bb", Category: "txt2img"},
 	} {
 		if _, err := e.cat.CreateWorkflow(e.ctx, e.actor(), in); errCode(err) != "bad_request" {
 			t.Errorf("%s: err = %v, want bad_request", name, err)
@@ -52,13 +59,18 @@ func TestWorkflowCRUD(t *testing.T) {
 		Description: long(8000), Category: "other", Tags: append(nineTags[:7:7], long(16)), Status: StatusRetired}); err != nil {
 		t.Fatalf("boundary values: %v", err)
 	}
+	// 说明允许换行与制表符（\r\n 规范为 \n）
+	md, err := e.cat.CreateWorkflow(e.ctx, e.actor(), WorkflowInput{Slug: "multi-line", Name: "x", Description: "第一行\r\n\t- 第二行", Category: "other"})
+	if err != nil || md.Description != "第一行\n\t- 第二行" {
+		t.Fatalf("multi-line description = %q, %v", md.Description, err)
+	}
 	if _, err := e.cat.CreateWorkflow(e.ctx, e.actor(), WorkflowInput{Slug: "sdxl-txt2img", Name: "dup", Category: "other"}); errCode(err) != "duplicate" {
 		t.Fatalf("duplicate slug: %v", err)
 	}
 
 	// 更新：slug 不可改（被忽略），其余字段可改，审计 before / after
 	e.clk.Advance(time.Minute)
-	u, err := e.cat.UpdateWorkflow(e.ctx, e.actor(), w.ID, WorkflowInput{Slug: "renamed", Name: "新名字", Category: "img2img", Tags: nil, Status: StatusPublished})
+	u, err := e.cat.UpdateWorkflow(e.ctx, e.actor(), w.ID, WorkflowInput{Slug: "sdxl-txt2img", Name: "新名字", Category: "img2img", Tags: nil, Status: StatusPublished})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +78,11 @@ func TestWorkflowCRUD(t *testing.T) {
 		!u.UpdatedAt.Equal(e.clk.Now()) {
 		t.Fatalf("updated = %+v", u)
 	}
-	if _, err := e.cat.UpdateWorkflow(e.ctx, e.actor(), 9999, WorkflowInput{Name: "x", Category: "other"}); errCode(err) != "not_found" {
+	if _, err := e.cat.UpdateWorkflow(e.ctx, e.actor(), w.ID, WorkflowInput{Slug: "renamed", Name: "x", Category: "other"}); errCode(err) != "bad_request" ||
+		!strings.Contains(err.Error(), "slug 不可修改") {
+		t.Fatalf("rename slug: %v", err)
+	}
+	if _, err := e.cat.UpdateWorkflow(e.ctx, e.actor(), 9999, WorkflowInput{Name: "x", Category: "other"}); errCode(err) != "workflow_not_found" {
 		t.Fatalf("update missing: %v", err)
 	}
 	if _, err := e.cat.UpdateWorkflow(e.ctx, e.actor(), w.ID, WorkflowInput{Name: "x", Category: "nope"}); errCode(err) != "bad_request" {
@@ -79,10 +95,10 @@ func TestWorkflowCRUD(t *testing.T) {
 	if err != nil || got.ID != w.ID {
 		t.Fatalf("by slug = %+v, %v", got, err)
 	}
-	if _, err := e.cat.GetWorkflow(e.ctx, 9999); errCode(err) != "not_found" {
+	if _, err := e.cat.GetWorkflow(e.ctx, 9999); errCode(err) != "workflow_not_found" {
 		t.Fatalf("get missing: %v", err)
 	}
-	if _, err := e.cat.WorkflowBySlug(e.ctx, "nope"); errCode(err) != "not_found" {
+	if _, err := e.cat.WorkflowBySlug(e.ctx, "nope"); errCode(err) != "workflow_not_found" {
 		t.Fatalf("by slug missing: %v", err)
 	}
 
@@ -95,7 +111,7 @@ func TestWorkflowCRUD(t *testing.T) {
 	if err := e.cat.DeleteWorkflow(e.ctx, e.actor(), empty.ID); err != nil {
 		t.Fatal(err)
 	}
-	wantCode(t, e.cat.DeleteWorkflow(e.ctx, e.actor(), empty.ID), "not_found")
+	wantCode(t, e.cat.DeleteWorkflow(e.ctx, e.actor(), empty.ID), "workflow_not_found")
 	if n := e.count(`SELECT count(*) FROM audit_logs WHERE action = 'workflow.delete' AND diff->>'slug' = 'draft-empty'`); n != 1 {
 		t.Fatalf("workflow.delete audits = %d", n)
 	}
@@ -126,8 +142,19 @@ func TestVersionDraftValidation(t *testing.T) {
 	for name, mut := range map[string]func(*VersionInput){
 		"bad version":    func(in *VersionInput) { in.Version = "-1" },
 		"empty graph":    func(in *VersionInput) { in.Graph = nil },
-		"changelog 1001": func(in *VersionInput) { in.Changelog = strings.Repeat("字", 1001) },
+		"changelog 1001": func(in *VersionInput) { in.Changelog = ptr(strings.Repeat("字", 1001)) },
 		"bad api":        func(in *VersionInput) { in.APIPrompt = json.RawMessage(`[1]`) },
+		"changelog ctrl": func(in *VersionInput) { in.Changelog = ptr("a\x00b") },
+		"graph NUL": func(in *VersionInput) {
+			in.Graph = json.RawMessage(strings.Replace(string(in.Graph), `"last_node_id"`, `"x\u0000":1,"last_node_id"`, 1))
+		},
+		"graph bad utf8": func(in *VersionInput) {
+			in.Graph = json.RawMessage(strings.Replace(string(in.Graph), `"last_node_id"`, "\"x\xff\":1,\"last_node_id\"", 1))
+		},
+		"api NUL": func(in *VersionInput) {
+			in.APIPrompt = json.RawMessage(strings.Replace(string(in.APIPrompt), `"KSampler"}`, `"KSampler\u0000"}`, 1))
+		},
+		"manifest NUL": func(in *VersionInput) { in.Manifest.Inputs[0].Default = "a\x00" },
 	} {
 		in := goodVersion(t, "1.0.0")
 		mut(&in)
@@ -138,7 +165,19 @@ func TestVersionDraftValidation(t *testing.T) {
 	if n := e.count(`SELECT count(*) FROM comfy_workflow_versions`); n != 0 {
 		t.Fatalf("invalid drafts saved: %d", n)
 	}
-	if _, err := e.cat.CreateVersion(e.ctx, e.actor(), 9999, goodVersion(t, "1.0.0")); errCode(err) != "not_found" {
+	// NUL / 非法 UTF-8 的报错指向字段（不是 PostgreSQL 的原始错误）
+	nul := goodVersion(t, "1.0.0")
+	nul.Graph = json.RawMessage(strings.Replace(string(nul.Graph), `"last_node_id"`, `"x\u0000":1,"last_node_id"`, 1))
+	_, err = e.cat.CreateVersion(e.ctx, e.actor(), w.ID, nul)
+	wantInvalid(t, err, "graph")
+	// 转义的反斜杠后跟 u0000 不是 NUL，照常保存
+	esc := goodVersion(t, "0.0.9")
+	esc.Graph = json.RawMessage(strings.Replace(string(esc.Graph), `"last_node_id"`, `"note":"C:\\u0000","last_node_id"`, 1))
+	if _, err := e.cat.CreateVersion(e.ctx, e.actor(), w.ID, esc); err != nil {
+		t.Fatalf("escaped backslash: %v", err)
+	}
+	e.exec(`DELETE FROM comfy_workflow_versions`)
+	if _, err := e.cat.CreateVersion(e.ctx, e.actor(), 9999, goodVersion(t, "1.0.0")); errCode(err) != "workflow_not_found" {
 		t.Fatalf("missing workflow: %v", err)
 	}
 
@@ -261,7 +300,7 @@ func TestPublishFreezeRetire(t *testing.T) {
 	}
 	same := goodVersion(t, "1.0.0")
 	same.Manifest.Models[0].Dir = "CHECKPOINTS" // 规范化后相同
-	same.Changelog = "新说明"
+	same.Changelog = ptr("新说明")
 	v, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, d.ID, same)
 	if err != nil {
 		t.Fatal(err)
@@ -269,22 +308,22 @@ func TestPublishFreezeRetire(t *testing.T) {
 	if v.Changelog != "新说明" || v.Status != StatusPublished || v.ManifestHash != p.ManifestHash {
 		t.Fatalf("changelog edit = %+v", v)
 	}
-	res, err := e.cat.ValidateVersionUpdate(e.ctx, w.ID, d.ID, VersionInput{Changelog: "x"})
+	res, err := e.cat.ValidateVersionUpdate(e.ctx, w.ID, d.ID, VersionInput{Changelog: ptr("x")})
 	if err != nil || res.ManifestHash != p.ManifestHash || res.DownloadGB != 6.94 {
 		t.Fatalf("validate published = %+v, %v", res, err)
 	}
-	if _, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, d.ID, VersionInput{Changelog: strings.Repeat("字", 1001)}); errCode(err) != "workflow_version_invalid" {
+	if _, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, d.ID, VersionInput{Changelog: ptr(strings.Repeat("字", 1001))}); errCode(err) != "workflow_version_invalid" {
 		t.Fatalf("long changelog: %v", err)
 	}
-	r, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, d.ID, VersionInput{Changelog: "下线", Status: StatusRetired})
-	if err != nil || r.Status != StatusRetired || r.Changelog != "下线" {
+	r, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, d.ID, VersionInput{Status: StatusRetired})
+	if err != nil || r.Status != StatusRetired || r.Changelog != "新说明" {
 		t.Fatalf("retire = %+v, %v", r, err)
 	}
 	if n := e.count(`SELECT count(*) FROM audit_logs WHERE action = 'workflow.version.update' AND diff->'after'->>'status' = 'retired'`); n != 1 {
 		t.Fatalf("retire audits = %d", n)
 	}
 	// 已下线：不能再改
-	if _, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, d.ID, VersionInput{Changelog: "x"}); errCode(err) != "workflow_version_frozen" {
+	if _, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, d.ID, VersionInput{Changelog: ptr("x")}); errCode(err) != "workflow_version_frozen" {
 		t.Fatalf("edit retired: %v", err)
 	}
 	if _, err := e.cat.ValidateVersionUpdate(e.ctx, w.ID, d.ID, VersionInput{}); errCode(err) != "workflow_version_frozen" {
@@ -294,6 +333,8 @@ func TestPublishFreezeRetire(t *testing.T) {
 		t.Fatalf("latest after retire: %v", err)
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
@@ -361,7 +402,7 @@ func TestCopyFromAndValidate(t *testing.T) {
 	in.Manifest.Models = nil
 	_, err = e.cat.ValidateVersion(e.ctx, w.ID, in)
 	wantInvalid(t, err, "")
-	if _, err := e.cat.ValidateVersion(e.ctx, 9999, goodVersion(t, "1")); errCode(err) != "not_found" {
+	if _, err := e.cat.ValidateVersion(e.ctx, 9999, goodVersion(t, "1")); errCode(err) != "workflow_not_found" {
 		t.Fatalf("validate missing workflow: %v", err)
 	}
 	b, _ := json.Marshal(res)
@@ -582,7 +623,7 @@ func TestCover(t *testing.T) {
 	if ae := apperr.As(err); ae == nil || ae.Code != "file_too_large" || ae.Status != 413 || !strings.Contains(ae.Message, "2MB") {
 		t.Fatalf("big cover: %v", err)
 	}
-	if _, err := e.cat.SetCover(e.ctx, e.actor(), 9999, bytes.NewReader(pngBytes)); errCode(err) != "not_found" {
+	if _, err := e.cat.SetCover(e.ctx, e.actor(), 9999, bytes.NewReader(pngBytes)); errCode(err) != "workflow_not_found" {
 		t.Fatalf("missing workflow: %v", err)
 	}
 	if n := e.count(`SELECT count(*) FROM uploads`); n != 0 {

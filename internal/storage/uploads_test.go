@@ -258,7 +258,7 @@ func TestDeleteUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.Delete(ctx, up.Key); err != nil {
+	if err := svc.Delete(ctx, up.Key, storage.PurposeWorkflowCover); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := svc.Open(ctx, up.Key); code(err) != "not_found" {
@@ -269,10 +269,24 @@ func TestDeleteUpload(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("rows after delete = %d", n)
 	}
-	if err := svc.Delete(ctx, up.Key); err != nil { // 幂等
+	if err := svc.Delete(ctx, up.Key, storage.PurposeWorkflowCover); err != nil { // 幂等
 		t.Fatalf("second delete = %v", err)
 	}
-	if err := svc.Delete(ctx, "../x.png"); code(err) != "bad_request" {
+	if err := svc.Delete(ctx, "../x.png", storage.PurposeWorkflowCover); code(err) != "bad_request" {
 		t.Fatalf("bad key delete = %v", err)
 	}
+	// 用途不符：什么都不删（不会经封面路径误删营业执照）
+	uid := dbtest.CreateUser(t, pool, "13900000001", true)
+	lic, err := svc.Save(ctx, uid, storage.PurposeLicense, bytes.NewReader(pngHeader))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(ctx, lic.Key, storage.PurposeWorkflowCover); err != nil {
+		t.Fatal(err)
+	}
+	_, rc, err := svc.Open(ctx, lic.Key)
+	if err != nil {
+		t.Fatalf("license deleted via cover purpose: %v", err)
+	}
+	rc.Close()
 }

@@ -1,6 +1,7 @@
 package comfywf
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -211,5 +212,54 @@ func TestImportInvalidLeavesNothing(t *testing.T) {
 	}
 	if n := e.count(`SELECT count(*) FROM uploads`) + e.count(`SELECT count(*) FROM comfy_workflows`); n != 0 {
 		t.Fatalf("rows left = %d", n)
+	}
+}
+
+// 冻结比较按值：导入时清单写 7.0、graph 里有 1e-7（JSONB 存成 0.0000001），发布后用 7 / 原始文件再 PUT 只改说明 → 通过。
+func TestPublishedEditValueBased(t *testing.T) {
+	e := newCatEnv(t)
+	root := t.TempDir()
+	dir := copyDir(t, "sdxl-demo", root, "num-demo")
+	manifest := strings.Replace(mustRead(t, filepath.Join(dir, "manifest.json")), `{"key": "seed"`,
+		`{"key": "cfg", "label": "CFG", "type": "float", "node": "3", "input": "cfg", "default": 7.0, "min": 1.0, "max": 30},
+    {"key": "seed"`, 1)
+	graph := strings.Replace(mustRead(t, filepath.Join(dir, "graph.json")), `"last_node_id"`, `"spark_eps": 1e-7, "last_node_id"`, 1)
+	for name, body := range map[string]string{"manifest.json": manifest, "graph.json": graph} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.cat.ImportDir(e.ctx, e.actor(), root); err != nil {
+		t.Fatal(err)
+	}
+	w, err := e.cat.WorkflowBySlug(e.ctx, "num-demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs, _ := e.cat.ListVersions(e.ctx, w.ID)
+	p, err := e.cat.PublishVersion(e.ctx, e.actor(), w.ID, vs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(p.Graph), "0.0000001") {
+		t.Fatalf("expected JSONB to rewrite 1e-7: %s", p.Graph)
+	}
+	var m Manifest
+	if err := decodeStrict([]byte(strings.ReplaceAll(strings.ReplaceAll(manifest, "7.0", "7"), "1.0,", "1,")), &m); err != nil {
+		t.Fatal(err)
+	}
+	m.ComfyUIMin = "0.3.60" // 导入时来自 workflow.json
+	v, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, p.ID, VersionInput{Version: "1.0.0", Graph: json.RawMessage(graph),
+		APIPrompt: json.RawMessage(mustRead(t, filepath.Join(dir, "api.json"))), Manifest: m, Changelog: ptr("只改说明")})
+	if err != nil {
+		t.Fatalf("same content with different number spelling: %v", err)
+	}
+	if v.Changelog != "只改说明" || v.ManifestHash != p.ManifestHash {
+		t.Fatalf("edit = %+v", v)
+	}
+	// 数值真的变了 → frozen
+	m.Inputs[len(m.Inputs)-2].Default = json.Number("7.5")
+	if _, err := e.cat.UpdateVersion(e.ctx, e.actor(), w.ID, p.ID, VersionInput{Manifest: m}); errCode(err) != "workflow_version_frozen" {
+		t.Fatalf("changed default: %v", err)
 	}
 }

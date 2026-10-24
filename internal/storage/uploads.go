@@ -25,7 +25,7 @@ const (
 	// PurposeWorkflowCover 工作流封面（计划 11 D13）：后台上传，所有者 userID = 0（uploads.user_id 为 NULL），
 	// 只接受 PNG / JPG / WebP，≤ MaxCoverSize，不计入每用户每日上传次数。
 	PurposeWorkflowCover = "workflow_cover"
-	// MaxCoverSize 与 comfywf.MaxCoverBytes 一致（storage 不能 import comfywf，测试核对两者相等）。
+	// MaxCoverSize 封面上限；comfywf.MaxCoverBytes 直接引用它。
 	MaxCoverSize = 2 << 20 // 2MB
 
 	maxUploadsPerDay = 20 // 每个用户每 24 小时最多上传次数，防止占满磁盘
@@ -176,14 +176,18 @@ func (s *Service) Open(ctx context.Context, key string) (Upload, io.ReadCloser, 
 	return up, rc, nil
 }
 
-// Delete 删除文件登记与文件内容（工作流换封面时删旧文件用）；登记不存在视为成功。
-// 先删登记再删文件：文件删除失败只会留下无人引用的孤儿文件，不会留下指向不存在文件的登记。
-func (s *Service) Delete(ctx context.Context, key string) error {
+// Delete 删除指定用途的文件登记与文件内容（工作流换封面时删旧文件用）；登记不存在或用途不符 → 什么都不删并视为成功
+// （不会误删另一种用途的文件，例如营业执照）。先删登记再删文件：文件删除失败只会留下无人引用的孤儿文件。
+func (s *Service) Delete(ctx context.Context, key, purpose string) error {
 	if !ValidKey(key) {
 		return errBadKey
 	}
-	if _, err := s.pool.Exec(ctx, `DELETE FROM uploads WHERE key = $1`, key); err != nil {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM uploads WHERE key = $1 AND purpose = $2`, key, purpose)
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
 	}
 	return s.store.Delete(ctx, key)
 }
