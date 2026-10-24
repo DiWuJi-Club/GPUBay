@@ -10,17 +10,18 @@ import { api } from '../../api'
 import { usePaged } from '../../composables/usePaged'
 import { firstOf } from '../../logic/deployments'
 import {
-  accountFilterFromQuery, accountsQuery, blockBody, buildLimitPatch, fmtCostMicro, LIMIT_BOUNDS, LIMIT_KEYS, LIMIT_LABEL, LIMIT_SHORT, limitFormOf, limitText,
+  accountFilterFromQuery, accountsQuery, blockBody, buildLimitPatch, emptyAccountFilter, fmtCount, keyMonthCostText, LIMIT_BOUNDS, LIMIT_DEFAULTS, LIMIT_KEYS, LIMIT_LABEL, LIMIT_SHORT, limitFormOf, limitText,
   unblockBody, validateReason, type LimitForm, type LimitKey,
 } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'
 import { FIN_ROLES, OPS_ROLES } from '../../menu'
 import { hasRole } from '../../store/session'
 
-// 账户 Tab（规格 §11，ops / finance 查看）：搜索 + 欠费 / 停用筛选；ops 编辑限额（空 = 恢复默认）、停用 / 解除停用（原因必填）、
-// 展开行查看该用户的 Key（GET /llm/keys 只对 ops 开放）并停用。?user_id= 预填搜索并自动展开该用户。
+// 账户 Tab（规格 §11，ops / finance 查看）：搜索 + 欠费 / 停用筛选；ops 编辑限额（空 = 恢复默认）、停用 / 解除停用（原因必填）。
+// 展开行查看该用户的 Key（GET /llm/keys：ops / finance / super），停用 Key 只有 ops。?user_id= 按精确用户 ID 筛选并自动展开该用户。
 const canOps = computed(() => hasRole(OPS_ROLES))
 const canFinance = computed(() => hasRole(FIN_ROLES))
+const canSeeKeys = computed(() => canOps.value || canFinance.value)
 
 const route = useRoute()
 const filter = reactive(accountFilterFromQuery(route.query))
@@ -34,7 +35,13 @@ function search() {
   list.reset()
 }
 function resetFilter() {
-  Object.assign(filter, { q: '', blocked: '', debt: false })
+  Object.assign(filter, emptyAccountFilter())
+  focusUser.value = ''
+  search()
+}
+/** 关闭精确用户标签：回到全部用户（其它筛选保留） */
+function clearUser() {
+  filter.user_id = ''
   focusUser.value = ''
   search()
 }
@@ -51,7 +58,7 @@ watch(
   },
 )
 
-// ---- 展开行：Key 列表（ops）----
+// ---- 展开行：Key 列表（ops / finance 查看，ops 停用）----
 const keys = reactive<Record<number, { loading: boolean; error: string; items: LLMKeyAdmin[] }>>({})
 const expanded = ref<string[]>([]) // el-table 的 expand-row-keys 是字符串
 async function loadKeys(userId: number) {
@@ -73,9 +80,9 @@ function onExpand(row: LLMAccountAdmin, rows: LLMAccountAdmin[] | boolean) {
   expanded.value = rows.map((r) => String(r.user_id))
   if (rows.includes(row) && !keys[row.user_id]) void loadKeys(row.user_id)
 }
-// ?user_id= 精确命中的那一行自动展开（搜索按 ID 或手机号片段，可能还有别的行）
+// ?user_id= 命中的那一行自动展开
 watch(list.items, (items) => {
-  if (!canOps.value || !focusUser.value) return
+  if (!canSeeKeys.value || !focusUser.value) return
   const hit = items.find((a) => String(a.user_id) === focusUser.value)
   if (hit && !expanded.value.includes(String(hit.user_id))) {
     expanded.value = [...expanded.value, String(hit.user_id)]
@@ -196,6 +203,9 @@ async function submitKeyOff() {
         </el-select>
       </el-form-item>
       <el-form-item><el-checkbox v-model="filter.debt" data-testid="llm-acc-debt">只看欠费</el-checkbox></el-form-item>
+      <el-form-item v-if="filter.user_id">
+        <el-tag closable data-testid="llm-acc-user-tag" @close="clearUser">用户 ID {{ filter.user_id }}</el-tag>
+      </el-form-item>
       <el-button type="primary" native-type="submit" data-testid="llm-acc-search">查询</el-button>
       <el-button data-testid="llm-acc-reset" @click="resetFilter">重置</el-button>
     </el-form>
@@ -204,7 +214,7 @@ async function submitKeyOff() {
       <el-button size="small" :loading="list.loading.value" data-testid="llm-acc-retry" @click="list.load()">重试</el-button>
     </el-alert>
     <el-table :data="list.items.value" v-loading="list.loading.value" row-key="user_id" :expand-row-keys="expanded" @expand-change="onExpand">
-      <el-table-column v-if="canOps" type="expand">
+      <el-table-column v-if="canSeeKeys" type="expand">
         <template #default="{ row }">
           <div class="keys" data-testid="llm-acc-keys" :data-user="row.user_id">
             <p class="muted">用户可自行重新启用被停用的 Key；要强制停用请停用该账户的 Token 服务。</p>
@@ -217,10 +227,10 @@ async function submitKeyOff() {
               <el-table-column label="状态" width="90"><template #default="{ row: k }"><el-tag size="small" :type="k.status === 'active' ? 'success' : 'info'" data-testid="llm-key-status">{{ labelOf(llmKeyStatusLabel, k.status) }}</el-tag></template></el-table-column>
               <el-table-column label="可用模型" min-width="140"><template #default="{ row: k }">{{ modelsText(k as LLMKeyAdmin) }}</template></el-table-column>
               <el-table-column label="月额度" width="110"><template #default="{ row: k }">{{ k.monthly_cap == null ? '不限' : fmtYuan(k.monthly_cap) }}</template></el-table-column>
-              <el-table-column label="本月消费" width="110"><template #default="{ row: k }"><span data-testid="llm-key-cost">{{ fmtCostMicro(k.month_cost_micro) }}</span></template></el-table-column>
+              <el-table-column label="本月消费" width="110"><template #default="{ row: k }"><span data-testid="llm-key-cost">{{ keyMonthCostText(k as LLMKeyAdmin) }}</span></template></el-table-column>
               <el-table-column label="最近使用" width="150"><template #default="{ row: k }">{{ fmtTime(k.last_used_at) || '—' }}</template></el-table-column>
               <el-table-column label="到期" width="150"><template #default="{ row: k }">{{ fmtTime(k.expires_at) || '永久' }}</template></el-table-column>
-              <el-table-column label="操作" width="90">
+              <el-table-column v-if="canOps" label="操作" width="90">
                 <template #default="{ row: k }">
                   <el-button v-if="k.status === 'active'" link type="danger" size="small" data-testid="llm-key-disable" @click="openKeyOff(k as LLMKeyAdmin)">停用</el-button>
                   <span v-else class="muted">—</span>
@@ -278,7 +288,7 @@ async function submitKeyOff() {
             v-model="limits.form[k]"
             inputmode="numeric"
             clearable
-            :placeholder="`默认（当前生效 ${limits.target?.limits?.[k] ?? ''}）`"
+            :placeholder="`留空 = 默认 ${fmtCount(LIMIT_DEFAULTS[k])}`"
             :data-testid="`llm-limit-${k}`"
           />
           <div v-if="limits.errors[k]" class="err" :data-testid="`llm-limit-${k}-error`">{{ limits.errors[k] }}</div>

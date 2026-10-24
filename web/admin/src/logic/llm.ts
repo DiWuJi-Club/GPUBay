@@ -1,7 +1,7 @@
 import {
   centsToYuanInput, digitsOnly, fmtDate, fmtYuan, toHalfWidthDigits, yuanToCents,
   deploymentPhaseLabel, deploymentStateLabel, fmtTime, labelOf,
-  type AdminAppVersion, type AdminGroup, type AdminGroupBrief, type AdminImage, type AppEnvSpec, type LLMAccountAdmin, type LLMAccountUpdate, type LLMDailyAdminRow, type LLMModelAdmin, type LLMModelInput, type LLMModelKind, type LLMModelSource,
+  type AdminAppVersion, type AdminGroup, type AdminGroupBrief, type AdminImage, type AppEnvSpec, type LLMAccountAdmin, type LLMAccountUpdate, type LLMDailyAdminRow, type LLMKeyAdmin, type LLMModelAdmin, type LLMModelInput, type LLMModelKind, type LLMModelSource,
   type LLMNode, type LLMNodeState, type LLMPoolMachine, type Role,
 } from '@spark/shared'
 import { ALL_ROLES, FIN_ROLES, OPS_ROLES } from '../menu'
@@ -411,18 +411,32 @@ export const unblockBody = (): LLMAccountUpdate => ({ blocked: false })
 export interface AccountFilter {
   /** 用户 ID 或手机号片段（只留数字） */
   q: string
+  /** 精确用户 ID：只来自地址 ?user_id=（用户详情的链接），界面上显示为可关闭的标签 */
+  user_id: string
   blocked: '' | 'true' | 'false'
   debt: boolean
 }
-export const emptyAccountFilter = (): AccountFilter => ({ q: '', blocked: '', debt: false })
-/** ?user_id=（用户详情的链接）预填搜索框。 */
+export const emptyAccountFilter = (): AccountFilter => ({ q: '', user_id: '', blocked: '', debt: false })
+/** ?user_id=（用户详情的链接）→ 精确用户筛选。 */
 export function accountFilterFromQuery(q: Record<string, unknown>): AccountFilter {
   const v = q.user_id
-  return { ...emptyAccountFilter(), q: digitsOnly(String((Array.isArray(v) ? v[0] : v) ?? '')) }
+  return { ...emptyAccountFilter(), user_id: digitsOnly(String((Array.isArray(v) ? v[0] : v) ?? '')) }
 }
 /** GET /llm/accounts 的查询串：空值省略（buildQuery 会去掉 '' / undefined）。 */
 export function accountsQuery(f: AccountFilter, page: number, pageSize: number): Record<string, string | number | undefined> {
-  return { q: f.q || undefined, blocked: f.blocked || undefined, debt: f.debt ? 'true' : undefined, page, page_size: pageSize }
+  return { q: f.q || undefined, user_id: f.user_id || undefined, blocked: f.blocked || undefined, debt: f.debt ? 'true' : undefined, page, page_size: pageSize }
+}
+
+/** 北京时间的当前月份 YYYY-MM。 */
+export const currentYM = (now: Date = new Date()): string => fmtDate(now).slice(0, 7)
+
+/**
+ * Key 的本月消费：优先用后端按当前月算好的 month_cost（分）；没有时用 month_cost_micro，
+ * 但它只对 month_ym 那个月有效——跨月后 Key 还没被调用过时 month_ym 停在上个月，此时本月消费是 0。
+ */
+export function keyMonthCostText(k: Pick<LLMKeyAdmin, 'month_ym' | 'month_cost_micro' | 'month_cost'>, now: Date = new Date()): string {
+  if (typeof k.month_cost === 'number') return fmtYuan(k.month_cost)
+  return k.month_ym === currentYM(now) ? fmtCostMicro(k.month_cost_micro) : fmtCostMicro(0)
 }
 
 // ---- 用量 / 汇总 / 结算（规格 §10.2）----

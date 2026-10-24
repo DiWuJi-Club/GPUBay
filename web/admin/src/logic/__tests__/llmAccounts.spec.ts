@@ -1,8 +1,8 @@
 import type { LLMDailyAdminRow } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  accountFilterFromQuery, accountsQuery, blockBody, buildLimitPatch, dailyQuery, defaultUsageRange, emptyAccountFilter, emptyUsageFilter, fmtCostMicro,
-  limitFormOf, limitText, settlementsQuery, sumDaily, summarizeDaily, unblockBody, usageQuery, validateReason, validateUsageRange,
+  accountFilterFromQuery, accountsQuery, blockBody, buildLimitPatch, currentYM, dailyQuery, defaultUsageRange, emptyAccountFilter, emptyUsageFilter, fmtCostMicro,
+  keyMonthCostText, limitFormOf, limitText, settlementsQuery, sumDaily, summarizeDaily, unblockBody, usageQuery, validateReason, validateUsageRange,
 } from '../llm'
 
 const acc = (over: Partial<{ rpm_limit: number | null; tpm_limit: number | null; concurrency_limit: number | null }> = {}) => ({
@@ -63,14 +63,15 @@ describe('停用 / 原因', () => {
 
 describe('筛选与查询串', () => {
   it('账户：空值省略，欠费 / 停用按 true / false', () => {
-    expect(accountsQuery(emptyAccountFilter(), 1, 20)).toEqual({ q: undefined, blocked: undefined, debt: undefined, page: 1, page_size: 20 })
-    expect(accountsQuery({ q: '138', blocked: 'false', debt: true }, 2, 50)).toEqual({ q: '138', blocked: 'false', debt: 'true', page: 2, page_size: 50 })
+    expect(accountsQuery(emptyAccountFilter(), 1, 20)).toEqual({ q: undefined, user_id: undefined, blocked: undefined, debt: undefined, page: 1, page_size: 20 })
+    expect(accountsQuery({ q: '138', user_id: '', blocked: 'false', debt: true }, 2, 50)).toEqual({ q: '138', user_id: undefined, blocked: 'false', debt: 'true', page: 2, page_size: 50 })
   })
 
-  it('账户：?user_id= 预填搜索（只留数字）', () => {
-    expect(accountFilterFromQuery({ user_id: '42' }).q).toBe('42')
-    expect(accountFilterFromQuery({ user_id: ['4a2'] }).q).toBe('42')
-    expect(accountFilterFromQuery({}).q).toBe('')
+  it('账户：?user_id= → 精确 user_id 筛选（只留数字），不放进 q', () => {
+    expect(accountFilterFromQuery({ user_id: '42' })).toEqual({ q: '', user_id: '42', blocked: '', debt: false })
+    expect(accountFilterFromQuery({ user_id: ['4a2'] }).user_id).toBe('42')
+    expect(accountFilterFromQuery({}).user_id).toBe('')
+    expect(accountsQuery(accountFilterFromQuery({ user_id: '42' }), 1, 20)).toMatchObject({ q: undefined, user_id: '42' })
   })
 
   it('用量：默认最近 7 天（北京时间）；空值省略', () => {
@@ -107,6 +108,14 @@ describe('汇总与费用', () => {
   it('按用户合计', () => {
     const u = summarizeDaily([{ day: 'd1', user_id: 5, phone: '138', requests: 1, prompt_tokens: 1, completion_tokens: 1, cost_micro: 1 }, { day: 'd2', user_id: 5, phone: '138', requests: 1, prompt_tokens: 1, completion_tokens: 1, cost_micro: 2 }], 'user')
     expect(u).toEqual([{ key: '5', user_id: 5, phone: '138', requests: 2, prompt_tokens: 2, completion_tokens: 2, cost_micro: 3 }])
+  })
+  it('Key 本月消费：优先 month_cost（分）；否则 month_ym 不是北京时间当前月时为 0', () => {
+    const now = new Date('2026-10-31T16:30:00Z') // 北京 11-01 00:30
+    expect(currentYM(now)).toBe('2026-11')
+    expect(keyMonthCostText({ month_ym: '2026-10', month_cost_micro: 5_000_000 }, now)).toBe('¥0.00')
+    expect(keyMonthCostText({ month_ym: '2026-11', month_cost_micro: 5_000_000 }, now)).toBe('¥0.05')
+    expect(keyMonthCostText({ month_ym: '2026-10', month_cost_micro: 5_000_000, month_cost: 0 }, now)).toBe('¥0.00')
+    expect(keyMonthCostText({ month_ym: '2026-11', month_cost_micro: 5_000_000, month_cost: 1234 }, now)).toBe('¥12.34')
   })
   it('微分 → 元', () => {
     expect(fmtCostMicro(0)).toBe('¥0.00')

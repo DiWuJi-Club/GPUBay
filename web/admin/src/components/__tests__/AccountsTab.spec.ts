@@ -7,6 +7,7 @@ import { createMemoryHistory, createRouter, type Router } from 'vue-router'
 const { get, post, put, del } = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), put: vi.fn(), del: vi.fn() }))
 vi.mock('../../api', () => ({ api: { get, post, put, del }, onUnauthorized: vi.fn(), onTotpSetupRequired: vi.fn() }))
 
+import { currentYM } from '../../logic/llm'
 import { session } from '../../store/session'
 import AccountsTab from '../llm/AccountsTab.vue'
 
@@ -16,7 +17,7 @@ const account = (over: Partial<LLMAccountAdmin> = {}): LLMAccountAdmin => ({
   ...over,
 })
 const key = (over: Partial<LLMKeyAdmin> = {}): LLMKeyAdmin => ({
-  id: 7, user_id: 42, name: '生产', key_hint: 'sk-…abcd', status: 'active', model_slugs: [], monthly_cap: null, month_ym: '2026-10', month_cost_micro: 1_250_000,
+  id: 7, user_id: 42, name: '生产', key_hint: 'sk-…abcd', status: 'active', model_slugs: [], monthly_cap: null, month_ym: currentYM(), month_cost_micro: 1_250_000,
   expires_at: null, last_used_at: null, created_at: '', revoked_at: null, ...over,
 })
 
@@ -42,10 +43,14 @@ const click = async (el: HTMLElement | null) => {
   el!.click()
   await flushPromises()
 }
-async function typeInBody(id: string, v: string) {
+function inputInBody(id: string): HTMLInputElement {
   const host = inBody(id)
   const el = host?.tagName === 'INPUT' ? host : (host?.querySelector('input') ?? null)
   expect(el).not.toBeNull()
+  return el as HTMLInputElement
+}
+async function typeInBody(id: string, v: string) {
+  const el = inputInBody(id)
   ;(el as HTMLInputElement).value = v
   el!.dispatchEvent(new Event('input'))
   await flushPromises()
@@ -74,7 +79,7 @@ afterEach(() => {
 describe('AccountsTab 列表与筛选', () => {
   it('表格：手机号链接到用户详情、金额、限额（默认标注）、停用', async () => {
     await mountTab()
-    expect(accountCalls()[0][1]).toEqual({ q: undefined, blocked: undefined, debt: undefined, page: 1, page_size: 20 })
+    expect(accountCalls()[0][1]).toEqual({ q: undefined, user_id: undefined, blocked: undefined, debt: undefined, page: 1, page_size: 20 })
     const rows = allById('llm-acc-row')
     expect(rows).toHaveLength(2)
     expect(rows[0].text()).toBe('13800001234')
@@ -99,20 +104,38 @@ describe('AccountsTab 列表与筛选', () => {
     expect(accountCalls().at(-1)![1]).toMatchObject({ q: '13800', debt: 'true', page: 1 })
   })
 
-  it('?user_id= 预填搜索并自动展开该用户的 Key', async () => {
+  it('?user_id= 按精确用户 ID 筛选并自动展开该用户的 Key；关闭标签回到全部', async () => {
     await mountTab('/llm?tab=accounts&user_id=42')
-    expect(accountCalls()[0][1]).toMatchObject({ q: '42' })
+    expect(accountCalls()[0][1]).toMatchObject({ q: undefined, user_id: '42' })
+    expect(byId('llm-acc-user-tag').text()).toContain('42')
     expect(get.mock.calls.filter((c) => c[0] === '/llm/keys')[0][1]).toEqual({ user_id: 42 })
     expect(inBody('llm-acc-keys')?.dataset.user).toBe('42')
     expect(allById('llm-key-cost')[0].text()).toBe('¥0.0125')
+    await byId('llm-acc-user-tag').find('.el-tag__close').trigger('click')
+    await flushPromises()
+    expect(accountCalls().at(-1)![1]).toMatchObject({ user_id: undefined })
   })
 
-  it('finance：只读（无编辑 / 停用、无 Key 展开），有用量链接', async () => {
+  it('Key 本月消费：month_ym 不是当前月显示 ¥0.00；有 month_cost 时优先', async () => {
+    get.mockImplementation(async (path: string) => {
+      if (path === '/llm/accounts') return { items: accounts, total: accounts.length }
+      if (path === '/llm/keys') return { items: [key({ month_ym: '2000-01' }), key({ id: 8, month_cost: 250 })] }
+      throw new Error(`unexpected GET ${path}`)
+    })
+    await mountTab('/llm?tab=accounts&user_id=42')
+    expect(allById('llm-key-cost').map((x) => x.text())).toEqual(['¥0.00', '¥2.50'])
+  })
+
+  it('finance：只读（无编辑 / 停用），可展开查看 Key 但不能停用，有用量链接', async () => {
     login('finance')
     await mountTab()
     expect(byId('llm-acc-edit-limits').exists()).toBe(false)
     expect(byId('llm-acc-block').exists()).toBe(false)
-    expect(wrapper!.find('.el-table__expand-icon').exists()).toBe(false)
+    await wrapper!.find('.el-table__expand-icon').trigger('click')
+    await flushPromises()
+    expect(get.mock.calls.filter((c) => c[0] === '/llm/keys')).toHaveLength(1)
+    expect(allById('llm-key-hint')).toHaveLength(2)
+    expect(allById('llm-key-disable')).toHaveLength(0)
     expect(byId('llm-acc-usage-link').attributes('href')).toBe('/llm?tab=usage&user_id=42')
   })
 })
@@ -123,6 +146,7 @@ describe('AccountsTab 操作（ops）', () => {
     await allById('llm-acc-edit-limits')[0].trigger('click')
     await flushPromises()
     await typeInBody('llm-limit-tpm', '')
+    expect(inputInBody('llm-limit-tpm').placeholder).toBe('留空 = 默认 200,000') // 清空后提示平台默认值
     await typeInBody('llm-limit-rpm', '120')
     await click(inBody('llm-limits-submit'))
     expect(put).toHaveBeenCalledTimes(1)

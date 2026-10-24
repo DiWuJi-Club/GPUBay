@@ -235,6 +235,8 @@ export interface LLMKeyAdmin {
   monthly_cap: number | null
   month_ym: string
   month_cost_micro: number
+  /** 当前（北京时间）月的消费，分；后端按当前月计算，旧后端缺省 */
+  month_cost?: number
   expires_at: string | null
   last_used_at: string | null
   created_at: string

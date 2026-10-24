@@ -141,7 +141,7 @@ describe('/llm 账户 / 用量 Tab', () => {
   it('?tab=accounts&user_id= 打开账户 Tab 并预填；用量 Tab 接入', async () => {
     await mountAt('/llm?tab=accounts&user_id=42')
     expect(byId('llm-accounts').exists()).toBe(true)
-    expect(calls('/llm/accounts')[0][1]).toMatchObject({ q: '42' })
+    expect(calls('/llm/accounts')[0][1]).toMatchObject({ user_id: '42' })
     wrapper!.unmount()
     await mountAt('/llm?tab=usage')
     expect(byId('llm-usage').exists()).toBe(true)

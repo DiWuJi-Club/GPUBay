@@ -72,19 +72,17 @@ async function loadDaily(force = false) {
 const summary = computed<DailySummaryRow[]>(() => summarizeDaily(daily.rows, group.value))
 const total = computed(() => sumDaily(summary.value))
 
-/** 当前视图按已生效筛选加载（切换视图 / 查询时） */
-function loadView(reset = true) {
+/** 当前视图按已生效筛选从第 1 页加载（查询时 / 查询后第一次切到该视图） */
+function loadView() {
   if (view.value === 'daily') return void loadDaily(true)
-  const list = view.value === 'detail' ? detail : settlements
-  if (reset) list.reset()
-  else void list.load()
+  ;(view.value === 'detail' ? detail : settlements).reset()
 }
 const loadedViews = new Set<View>()
 watch(view, (v) => {
   if (loadedViews.has(v)) return // 已加载过：筛选没变就不重复请求（查询时会清空这个集合）
   loadedViews.add(v)
   if (v === 'daily') void loadDaily()
-  else loadView(false)
+  else loadView() // 查询后第一次打开该视图：回到第 1 页（旧页码属于上一组筛选）
 })
 watch(group, () => void loadDaily())
 
@@ -209,11 +207,11 @@ const ms = (n: number | null | undefined) => (n == null ? '—' : `${fmtCount(n)
 
     <!-- 汇总 -->
     <template v-else-if="view === 'daily'">
-      <p class="muted">汇总来自已结算的用量（结算约每 10 分钟一次），只按日期范围筛选。</p>
+      <p class="muted">汇总含未结算的用量，只按日期范围筛选。</p>
       <el-alert v-if="daily.error" type="error" :title="daily.error" show-icon :closable="false" class="error" data-testid="llm-daily-error">
         <el-button size="small" :loading="daily.loading" data-testid="llm-daily-retry" @click="loadDaily(true)">重试</el-button>
       </el-alert>
-      <el-table :data="summary" v-loading="daily.loading" row-key="key" size="small" empty-text="这段时间没有已结算的用量" data-testid="llm-daily-table">
+      <el-table :data="summary" v-loading="daily.loading" row-key="key" size="small" empty-text="这段时间没有用量" data-testid="llm-daily-table">
         <el-table-column v-if="group === 'day'" label="日期" width="130"><template #default="{ row }"><span data-testid="llm-daily-key">{{ row.day }}</span></template></el-table-column>
         <el-table-column v-else-if="group === 'model'" label="模型" min-width="160"><template #default="{ row }"><span class="mono" data-testid="llm-daily-key">{{ row.model }}</span></template></el-table-column>
         <el-table-column v-else label="用户" min-width="160">
@@ -231,7 +229,7 @@ const ms = (n: number | null | undefined) => (n == null ? '—' : `${fmtCount(n)
 
     <!-- 结算记录 -->
     <template v-else>
-      <p class="muted">按用户与结算时间筛选；欠费抵扣计入「抵扣欠费」，「实扣」为钱包实际扣款。</p>
+      <p class="muted">按用户与结算时间筛选；「并入欠费」为本次一并结算的历史欠费，「实扣」为钱包实际扣款，不足部分记为欠费。</p>
       <el-alert v-if="settlements.error.value" type="error" :title="settlements.error.value" show-icon :closable="false" class="error" data-testid="llm-settle-error">
         <el-button size="small" :loading="settlements.loading.value" data-testid="llm-settle-retry" @click="settlements.load()">重试</el-button>
       </el-alert>
@@ -243,7 +241,7 @@ const ms = (n: number | null | undefined) => (n == null ? '—' : `${fmtCount(n)
         <el-table-column label="请求数" width="90"><template #default="{ row }">{{ fmtCount(row.requests) }}</template></el-table-column>
         <el-table-column label="输入 / 输出 token" width="160"><template #default="{ row }">{{ tokens(row as LLMSettlementAdmin) }}</template></el-table-column>
         <el-table-column label="用量金额" width="110"><template #default="{ row }"><span data-testid="llm-settle-usage">{{ fmtYuan(row.usage_amount) }}</span></template></el-table-column>
-        <el-table-column label="抵扣欠费" width="100"><template #default="{ row }">{{ fmtYuan(row.debt_amount) }}</template></el-table-column>
+        <el-table-column label="并入欠费" width="100"><template #default="{ row }">{{ fmtYuan(row.debt_amount) }}</template></el-table-column>
         <el-table-column label="实扣" width="110">
           <template #default="{ row }"><span data-testid="llm-settle-charged" :class="{ bad: row.charged < row.usage_amount + row.debt_amount }">{{ fmtYuan(row.charged) }}</span></template>
         </el-table-column>

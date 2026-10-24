@@ -135,6 +135,27 @@ describe('UsageTab 汇总与结算', () => {
     expect(allById('llm-daily-key')[0].text()).toBe('13800001234')
   })
 
+  it('查询后第一次切到某视图从第 1 页加载（旧页码属于上一组筛选）', async () => {
+    get.mockImplementation(async (path: string) => {
+      if (path === '/llm/models') return { items: [] }
+      if (path === '/llm/usage') return { items: [usage()], total: 100 }
+      if (path === '/llm/settlements') return { items: [settlement()], total: 1 }
+      throw new Error(`unexpected GET ${path}`)
+    })
+    await mountTab()
+    await wrapper!.find('[data-testid="llm-usage-pager"] .btn-next').trigger('click')
+    await flushPromises()
+    expect(calls('/llm/usage').at(-1)![1]).toMatchObject({ page: 2 })
+    await pick('llm-usage-view-settlements')
+    await setInput('llm-usage-user', '7')
+    await wrapper!.find('form').trigger('submit')
+    await flushPromises()
+    const n = calls('/llm/usage').length
+    await pick('llm-usage-view-detail')
+    expect(calls('/llm/usage')).toHaveLength(n + 1)
+    expect(calls('/llm/usage').at(-1)![1]).toMatchObject({ user_id: '7', page: 1 })
+  })
+
   it('结算记录：按用户与日期筛选', async () => {
     await mountTab('/llm?tab=usage&user_id=42')
     await pick('llm-usage-view-settlements')
