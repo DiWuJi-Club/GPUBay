@@ -329,3 +329,31 @@ describe('http.del', () => {
     expect(onUnauthorized).toHaveBeenCalledOnce()
   })
 })
+
+describe('X-Device-Id (计划 8)', () => {
+  it('每个请求都带设备头；注入的 deviceId 优先', async () => {
+    const f = fakeFetch(json(200, {}), json(200, {}))
+    const http = createHttp({ base: '/api/v1', onUnauthorized: vi.fn(), fetch: f.fn, deviceId: () => 'dev-1' })
+    await http.get('/me')
+    await http.post('/auth/login', { phone: '1' })
+    for (const c of f.calls) expect((c.init.headers as Record<string, string>)['X-Device-Id']).toBe('dev-1')
+  })
+
+  it('upload / download 也带设备头（upload 仍不设 Content-Type）', async () => {
+    const csv = new Response('a\n', { status: 200, headers: { 'Content-Type': 'text/csv' } })
+    const f = fakeFetch(json(201, { key: 'k' }), csv)
+    const http = createHttp({ base: '/api/v1', onUnauthorized: vi.fn(), fetch: f.fn, deviceId: () => 'dev-2' })
+    await http.upload('/uploads', new File([new Uint8Array([1])], 'a.png', { type: 'image/png' }))
+    await http.download('/export')
+    for (const c of f.calls) expect((c.init.headers as Record<string, string>)['X-Device-Id']).toBe('dev-2')
+    expect((f.calls[0].init.headers as Record<string, string>)['Content-Type']).toBeUndefined()
+  })
+
+  it('二次验证重发的请求同样带设备头', async () => {
+    const f = fakeFetch(json(403, { code: 'totp_required', message: '该操作需要输入动态码' }), json(200, { ok: true }))
+    const http = createHttp({ base: '/admin/api/v1', onUnauthorized: vi.fn(), fetch: f.fn, deviceId: () => 'dev-3', promptTotp: async () => '123456' })
+    await http.post('/x', {})
+    expect(f.calls).toHaveLength(2)
+    for (const c of f.calls) expect((c.init.headers as Record<string, string>)['X-Device-Id']).toBe('dev-3')
+  })
+})

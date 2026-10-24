@@ -32,6 +32,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "referral" {
+		if err := referralMain(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(log); err != nil {
 		log.Error("platform exited", "err", err)
@@ -98,7 +105,7 @@ func run(log *slog.Logger) error {
 	sweeperDone := make(chan struct{})
 	go func() {
 		defer close(sweeperDone)
-		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep)
+		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep, a.Referral.Settle)
 	}()
 	runnerDone := make(chan struct{})
 	if cfg.AppRunner { // 多副本都开也安全：每轮先拿会话级咨询锁，同一时刻只有一个副本在推进部署

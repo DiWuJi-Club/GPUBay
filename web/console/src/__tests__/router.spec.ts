@@ -43,3 +43,17 @@ describe('authorize redirect handling', () => {
     expect(postLoginTarget('//evil.example/api/v1/ingress/authorize')).toEqual({ kind: 'route', path: '/market' })
   })
 })
+
+describe('邀请返利路由 (计划 8)', () => {
+  afterEach(() => {
+    session.status = 'unknown'
+  })
+
+  it('/invite 需要登录：未登录跳登录页并带 redirect', async () => {
+    session.status = 'anon'
+    await router.push('/invite')
+    expect(router.currentRoute.value.path).toBe('/login')
+    expect(router.currentRoute.value.query.redirect).toBe('/invite')
+    expect(router.resolve('/invite').meta).toEqual({ title: '邀请返利', auth: true })
+  })
+})
