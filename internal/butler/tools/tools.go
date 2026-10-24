@@ -28,6 +28,10 @@ type Caller struct {
 	IP      string
 	IdemKey string
 	Now     time.Time // 零值 = Deps.Clock.Now()
+	// QuotedCents 是确认卡上的金额（butler_tool_calls.quote_amount），由 Run 在 Confirm 时填；只对写工具有意义。
+	// 非 nil 时 place_order / renew_instance 执行前重算价格，高于它 → quote_changed；cancel_booking 重算退款，低于它 → quote_changed。
+	// nil = 不比对。
+	QuotedCents *int64
 }
 
 // Tool 是一个工具。Schema 必须是根为 object、additionalProperties=false 的 JSON Schema（注册时编译校验）。

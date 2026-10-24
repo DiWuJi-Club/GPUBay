@@ -12,6 +12,8 @@ import (
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/butler/llm"
 	"spark-cloud/internal/butler/llm/mock"
+	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/secretbox"
 	"spark-cloud/internal/rental"
@@ -134,6 +136,7 @@ func TestRenewSummaryAndQuote(t *testing.T) {
 
 func TestPlaceOrderSummary(t *testing.T) {
 	f := newFakes()
+	f.wallet.balance[ownerID] = 1_000_000
 	r := NewRegistry(f.deps)
 	c := mustCard(t, r, "place_order", `{"product_id":1,"duration":"1d","image_id":2,"count":2,"start_at":"2026-10-27T10:00:00+08:00",
 		"app_id":11,"app_env":{"API_KEY":"sk-real-1"}}`)
@@ -186,6 +189,8 @@ func TestPlaceOrderSummary(t *testing.T) {
 
 func TestDeployAppSecretSplit(t *testing.T) {
 	f := newFakes()
+	f.apps.deps = f.apps.deps[2:] // ins-run 上不留 vLLM 部署、不留用户端口（槽位预检见 TestDeployAppSlots）
+	f.rental.ports = nil
 	r := NewRegistry(f.deps)
 	c := mustCard(t, r, "deploy_app", `{"instance_id":"ins-run","app_slug":"vllm","env":{"MODEL_ID":"Qwen/Qwen3-32B","API_KEY":"sk-secret-42"}}`)
 	if c.SecretEnv["API_KEY"] != "sk-secret-42" || len(c.SecretEnv) != 1 {
@@ -628,4 +633,260 @@ func TestMockRulesParseWriteResults(t *testing.T) {
 			}
 		}
 	})
+}
+
+// ---- 评审补充：确认时价格复核、卡片密文、预检 ----
+
+// 真实服务具备写工具用到的可选能力（签名一变这里编译失败，预检就不会被悄悄跳过）。
+var (
+	_ groupLookup = (*rental.Service)(nil)
+	_ rentChecker = (*identity.Service)(nil)
+)
+
+// groupRental / rentUsers 给 fake 加上可选能力（VisibleGroup / CanRent）。
+type groupRental struct {
+	*fakeRental
+	groups map[int64]fleet.Group
+}
+
+func (g groupRental) VisibleGroup(_ context.Context, id int64) (fleet.Group, error) {
+	gr, ok := g.groups[id]
+	if !ok {
+		return fleet.Group{}, apperr.ErrNotFound
+	}
+	if !gr.Visible {
+		return fleet.Group{}, apperr.ErrGroupNotFound
+	}
+	return gr, nil
+}
+
+type rentUsers struct {
+	*fakeUsers
+	err error
+}
+
+func (u rentUsers) CanRent(context.Context, int64) error { return u.err }
+
+func TestPlaceOrderPrechecks(t *testing.T) {
+	f := newFakes()
+	f.deps.Rental = groupRental{fakeRental: f.rental, groups: map[int64]fleet.Group{3: {ID: 3, Name: "上海一区", Visible: true}, 4: {ID: 4, Name: "内部", Visible: false}}}
+	r := NewRegistry(f.deps)
+	c := mustCard(t, r, "place_order", `{"product_id":1,"duration":"1d","image_id":2,"group_id":3}`)
+	if c.Summary != "租用 DGX Spark 整机 × 1，1 天，镜像 PyTorch，机组 上海一区，预计扣款 ¥69.00" {
+		t.Fatalf("summary = %q", c.Summary)
+	}
+	for _, g := range []string{"4", "9"} {
+		if _, err := card(t, r, "place_order", ownerID, `{"product_id":1,"duration":"1d","image_id":2,"group_id":`+g+`}`); err == nil || codeOf(t, err) != "group_not_found" {
+			t.Errorf("group %s: %v", g, err)
+		}
+	}
+	// 余额 138 元，3 天要 207 元
+	_, err := card(t, r, "place_order", ownerID, `{"product_id":1,"duration":"1d","quantity":3,"image_id":2}`)
+	if err == nil || codeOf(t, err) != "insufficient_balance" || !strings.Contains(err.Error(), "¥207.00") || !strings.Contains(err.Error(), "¥138.00") {
+		t.Fatalf("balance: %v", err)
+	}
+	// 未实名
+	f.deps.Users = rentUsers{fakeUsers: f.users, err: apperr.ErrKYCRequired}
+	r = NewRegistry(f.deps)
+	if _, err := card(t, r, "place_order", ownerID, `{"product_id":1,"duration":"1d","image_id":2}`); err == nil || codeOf(t, err) != "kyc_required" {
+		t.Fatalf("kyc: %v", err)
+	}
+	// 没有可选能力的 fake（如 Task 7 的）照常出卡，机组显示编号
+	f = newFakes()
+	if c := mustCard(t, NewRegistry(f.deps), "place_order", `{"product_id":1,"duration":"1d","image_id":2,"group_id":3}`); !strings.Contains(c.Summary, "机组 #3") {
+		t.Fatalf("summary = %q", c.Summary)
+	}
+}
+
+func TestExecQuoteChanged(t *testing.T) {
+	f := newFakes()
+	f.rental.placeRes = rental.BatchResult{Orders: []rental.Order{{ID: "ord-a", Amount: 6900}}, Instances: []rental.Instance{{ID: "ins-a"}}}
+	r := NewRegistry(f.deps)
+	tool := func(n string) Tool { t2, _ := r.Get(n); return t2 }
+	exec := func(name, args string, quoted int64) (Result, error) {
+		return tool(name).Exec(context.Background(), Caller{UserID: ownerID, IdemKey: "butler:tc-q", QuotedCents: &quoted}, json.RawMessage(args))
+	}
+	place := `{"product_id":1,"duration":"1d","image_id":2,"count":2,"quantity":1}`
+	// 卡片报 ¥100（低于现价 2 × 69）→ 价格已变化
+	res, err := exec("place_order", place, 10000)
+	if failure(t, res, err) != "quote_changed" || !strings.Contains(res.Content, "价格已变化（现为 ¥138.00），请重新发起") || len(f.rental.placeReq) != 0 {
+		t.Fatalf("place: %s, calls %d", res.Content, len(f.rental.placeReq))
+	}
+	// 价格没涨（或降了）→ 照常下单
+	if res, err := exec("place_order", place, 13800); err != nil || !strings.Contains(res.Content, `"ok":true`) || len(f.rental.placeReq) != 1 {
+		t.Fatalf("place same price: %s %v", res.Content, err)
+	}
+	// 续费：3 天 = 207 元 > 卡片 200 元
+	res, err = exec("renew_instance", `{"instance_id":"ins-run","duration":"1d","quantity":3}`, 20000)
+	if failure(t, res, err) != "quote_changed" || len(f.rental.renewCalls) != 0 {
+		t.Fatalf("renew: %s", res.Content)
+	}
+	if res, err := exec("renew_instance", `{"instance_id":"ins-run","duration":"1d","quantity":3}`, 20700); err != nil || !strings.Contains(res.Content, `"ok":true`) {
+		t.Fatalf("renew same: %s %v", res.Content, err)
+	}
+	// 取消：退款从 69 元降到 34.5 元 → 退款金额已变化
+	f.rental.quotes["ins-res"] = rental.CancelQuote{Refund: 3450, Percent: 50, Max: 6900}
+	res, err = exec("cancel_booking", `{"instance_id":"ins-res"}`, 6900)
+	if failure(t, res, err) != "quote_changed" || !strings.Contains(res.Content, "退款金额已变化（现为 ¥34.50），请重新发起") || len(f.rental.cancelled) != 0 {
+		t.Fatalf("cancel: %s", res.Content)
+	}
+	if res, err := exec("cancel_booking", `{"instance_id":"ins-res"}`, 3450); err != nil || !strings.Contains(res.Content, `"ok":true`) {
+		t.Fatalf("cancel same: %s %v", res.Content, err)
+	}
+	// QuotedCents = nil → 不比对
+	if res, err := tool("renew_instance").Exec(context.Background(), Caller{UserID: ownerID, IdemKey: "butler:tc-n"},
+		json.RawMessage(`{"instance_id":"ins-run","duration":"1d","quantity":3}`)); err != nil || !strings.Contains(res.Content, `"ok":true`) {
+		t.Fatalf("nil quote: %s %v", res.Content, err)
+	}
+}
+
+func TestSealCard(t *testing.T) {
+	box, _ := secretbox.New(bytes.Repeat([]byte{9}, 32))
+	if b, err := SealCard(box, nil, "无 secret"); b != nil || err != nil {
+		t.Fatal("no secrets must seal to NULL")
+	}
+	enc, err := SealCard(box, map[string]string{"TOKEN": "tok-abc-123"}, "变量：\n- 访问令牌：tok-abc-123")
+	if err != nil || bytes.Contains(enc, []byte("tok-abc-123")) {
+		t.Fatalf("enc = %q %v", enc, err)
+	}
+	secrets, summary, err := OpenCard(box, enc)
+	if err != nil || secrets["TOKEN"] != "tok-abc-123" || summary != "变量：\n- 访问令牌：tok-abc-123" {
+		t.Fatalf("open = %v %q %v", secrets, summary, err)
+	}
+	if m, err := OpenSecretEnv(box, enc); err != nil || m["TOKEN"] != "tok-abc-123" {
+		t.Fatalf("OpenSecretEnv(new format) = %v %v", m, err)
+	}
+	old, _ := SealSecretEnv(box, map[string]string{"TOKEN": "tok-old-123"})
+	if m, s, err := OpenCard(box, old); err != nil || m["TOKEN"] != "tok-old-123" || s != "" {
+		t.Fatalf("OpenCard(old format) = %v %q %v", m, s, err)
+	}
+	if m, s, err := OpenCard(box, nil); m != nil || s != "" || err != nil {
+		t.Fatal("NULL must open to nothing")
+	}
+	enc[len(enc)-1] ^= 1
+	if _, _, err := OpenCard(box, enc); !errors.Is(err, ErrCardInvalid) || IsBusinessError(err) {
+		t.Fatalf("tampered: %v", err)
+	}
+	if _, err := MergeSecretEnv(json.RawMessage(`{"env":{"A":"x"}}`), map[string]string{"A": "y"}); !errors.Is(err, ErrCardInvalid) {
+		t.Fatalf("merge mismatch: %v", err)
+	}
+}
+
+func TestEnvValuesOnCard(t *testing.T) {
+	f := newFakes()
+	f.apps.deps = f.apps.deps[2:]
+	f.rental.ports = nil
+	r := NewRegistry(f.deps)
+	// 控制字符 / 格式字符（ANSI、零宽空格）→ 参数错误，不出卡
+	for _, v := range []string{`\u001b[31mred`, `abc​def`} {
+		_, err := card(t, r, "deploy_app", ownerID, `{"instance_id":"ins-run","app_slug":"vllm","env":{"MODEL_ID":"`+v+`"}}`)
+		if err == nil || codeOf(t, err) != "invalid_args" || !strings.Contains(err.Error(), "env.MODEL_ID") {
+			t.Errorf("%s: %v", v, err)
+		}
+	}
+	// 长 secret 完整显示（不截断）
+	long := strings.Repeat("k", 250)
+	c := mustCard(t, r, "deploy_app", `{"instance_id":"ins-run","app_slug":"vllm","env":{"API_KEY":"`+long+`"}}`)
+	if !strings.HasSuffix(c.Summary, "- 接口密钥："+long) || !strings.HasSuffix(c.StoredSummary, "- 接口密钥：***") {
+		t.Fatalf("summary = %q", c.Summary)
+	}
+}
+
+func TestDeployAppSlots(t *testing.T) {
+	f := newFakes()
+	r := NewRegistry(f.deps)
+	// 默认数据：ins-run 上已有未卸载的 vLLM（dep-vllm，failed）
+	if _, err := card(t, r, "deploy_app", ownerID, `{"instance_id":"ins-run","app_slug":"vllm"}`); err == nil || codeOf(t, err) != "app_exists" {
+		t.Fatalf("exists: %v", err)
+	}
+	// 用户端口 8000 与 vLLM 的 8000 冲突
+	f.apps.deps = f.apps.deps[2:]
+	if _, err := card(t, r, "deploy_app", ownerID, `{"instance_id":"ins-run","app_slug":"vllm"}`); err == nil || codeOf(t, err) != "app_port_conflict" {
+		t.Fatalf("port conflict: %v", err)
+	}
+	// 其它部署声明的端口也算占用
+	f.rental.ports = nil
+	f.apps.deps = append(f.apps.deps, appdeploy.Deployment{ID: "dep-x", InstanceID: "ins-run", UserID: ownerID, AppID: 12, State: appdeploy.StateQueued})
+	f.apps.views["dep-x"] = appdeploy.View{ID: "dep-x", InstanceID: "ins-run", Spec: appdeploy.Spec{Ports: []appdeploy.PortSpec{{Port: 8000}}}}
+	if _, err := card(t, r, "deploy_app", ownerID, `{"instance_id":"ins-run","app_slug":"vllm"}`); err == nil || codeOf(t, err) != "app_port_conflict" {
+		t.Fatalf("declared port conflict: %v", err)
+	}
+	// 端口总数：已有 5 个用户端口
+	f.apps.deps = f.apps.deps[:1]
+	f.rental.ports = map[string][]rental.Port{}
+	for p := 9001; p <= 9005; p++ {
+		f.rental.ports["ins-run"] = append(f.rental.ports["ins-run"], rental.Port{InstanceID: "ins-run", Port: p})
+	}
+	if _, err := card(t, r, "deploy_app", ownerID, `{"instance_id":"ins-run","app_slug":"vllm"}`); err == nil || codeOf(t, err) != "port_limit" {
+		t.Fatalf("port limit: %v", err)
+	}
+	// 已有 3 个未卸载的部署
+	f.rental.ports = nil
+	for i := range 3 {
+		f.apps.deps = append(f.apps.deps, appdeploy.Deployment{ID: fmt.Sprintf("dep-l%d", i), InstanceID: "ins-run", UserID: ownerID, AppID: int64(30 + i), State: appdeploy.StateRunning})
+	}
+	if _, err := card(t, r, "deploy_app", ownerID, `{"instance_id":"ins-run","app_slug":"vllm"}`); err == nil || codeOf(t, err) != "app_limit" {
+		t.Fatalf("app limit: %v", err)
+	}
+}
+
+func TestRedeployCardEdges(t *testing.T) {
+	f := newFakes()
+	r := NewRegistry(f.deps)
+	// secret 传空串 = 清除；本来没设置的 secret 传空串 = 无变化，不列
+	v := f.apps.views["dep-vllm"]
+	v.Env = map[string]string{"MODEL_ID": "Qwen/Qwen3-8B"}
+	f.apps.views["dep-vllm"] = v
+	c := mustCard(t, r, "redeploy_app", `{"instance_id":"ins-run","deployment_id":"dep-vllm","env":{"MODEL_ID":"Qwen/Qwen3-8B","API_KEY":""}}`)
+	if !strings.HasSuffix(c.Summary, "变量变化：\n- 接口密钥：已设置 → 清除") || c.SecretEnv != nil {
+		t.Fatalf("clear: %q %v", c.Summary, c.SecretEnv)
+	}
+	v.SecretEnv = map[string]bool{}
+	f.apps.views["dep-vllm"] = v
+	c = mustCard(t, r, "redeploy_app", `{"instance_id":"ins-run","deployment_id":"dep-vllm","env":{"MODEL_ID":"Qwen/Qwen3-8B","API_KEY":""}}`)
+	if !strings.HasSuffix(c.Summary, "，沿用现有变量") {
+		t.Fatalf("no-op secret listed: %q", c.Summary)
+	}
+
+	// 排队中：只能改变量；不改变量 → 不出卡
+	f.apps.deps[1].State = appdeploy.StateQueued
+	v.Spec = appdeploy.Spec{Env: f.apps.catalog[0].Version.Env}
+	f.apps.views["dep-vllm"] = v
+	if _, err := card(t, r, "redeploy_app", ownerID, `{"instance_id":"ins-run","deployment_id":"dep-vllm"}`); err == nil || codeOf(t, err) != "app_invalid_state" {
+		t.Fatalf("queued nil env: %v", err)
+	}
+	c = mustCard(t, r, "redeploy_app", `{"instance_id":"ins-run","deployment_id":"dep-vllm","env":{"MODEL_ID":"Qwen/Qwen3-32B"}}`)
+	if !strings.HasPrefix(c.Summary, "重新部署 vLLM 推理服务（实例 ins-run，排队中，只更新变量），变量变化：") {
+		t.Fatalf("queued: %q", c.Summary)
+	}
+
+	// 不改变量升级到最新版本：新版本新增必填变量 → 出卡前失败
+	f.apps.deps[1].State = appdeploy.StateFailed
+	f.apps.catalog[0].Version.Env = append(f.apps.catalog[0].Version.Env, appdeploy.EnvSpec{Name: "HF_TOKEN", Label: "HF 令牌", Type: "string", Required: true, MaxLen: 256})
+	if _, err := card(t, r, "redeploy_app", ownerID, `{"instance_id":"ins-run","deployment_id":"dep-vllm"}`); err == nil || codeOf(t, err) != "app_env_required" || !strings.Contains(err.Error(), "HF 令牌") {
+		t.Fatalf("new required var: %v", err)
+	}
+}
+
+func TestPlaceOrderExecAppEnv(t *testing.T) {
+	f := newFakes()
+	f.wallet.balance[ownerID] = 1_000_000
+	f.rental.placeRes = rental.BatchResult{Orders: []rental.Order{{ID: "ord-a", Amount: 6900}}, Instances: []rental.Instance{{ID: "ins-a"}}}
+	r := NewRegistry(f.deps)
+	c := mustCard(t, r, "place_order", `{"product_id":1,"duration":"1d","image_id":2,"app_id":12,"app_env":{"TOKEN":"tok-real-99"}}`)
+	// 未合并 → 拒绝，不下单
+	res, err := execAs(t, r, "place_order", ownerID, c.ArgsStored, "tc-1")
+	if failure(t, res, err) != "butler_confirm_invalid" || len(f.rental.placeReq) != 0 {
+		t.Fatalf("unmerged: %s", res.Content)
+	}
+	args, err := MergeSecretEnv(c.ArgsStored, c.SecretEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execAs(t, r, "place_order", ownerID, args, "tc-1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.rental.placeReq) != 1 || f.rental.placeReq[0].AppEnv["TOKEN"] != "tok-real-99" || f.rental.placeReq[0].AppID == nil || *f.rental.placeReq[0].AppID != 12 {
+		t.Fatalf("PlaceBatch = %+v", f.rental.placeReq)
+	}
 }

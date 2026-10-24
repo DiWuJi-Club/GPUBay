@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/butler/guard"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/secretbox"
 	"spark-cloud/internal/platform/tz"
@@ -39,6 +41,25 @@ import (
 
 // SecretMask 是 secret 变量在落库 args / summary 里的占位值。
 const SecretMask = "***"
+
+// ErrCardInvalid：MergeSecretEnv / OpenSecretEnv / OpenCard 的失败（密文损坏、args 与密文对不上）都包这个错误
+// （errors.Is 可判断）。它不是业务错误（IsBusinessError = false）；Run 在 Confirm 时把它映射为 apperr.ErrButlerConfirmInvalid，
+// 并照常清空 secret_env_enc。
+var ErrCardInvalid = errors.New("butler tools: confirm card secrets invalid")
+
+// 可选能力（真实服务都有；Task 7 等处的 fake 不必实现）：有就在确认卡前多做一步预检，没有就跳过。
+type groupLookup interface {
+	VisibleGroup(ctx context.Context, id int64) (fleet.Group, error)
+}
+
+type rentChecker interface {
+	CanRent(ctx context.Context, userID int64) error
+}
+
+// quoteChanged：确认时价格 / 退款已与卡片不同（对用户不利的方向），要求重新发起。
+func quoteChanged(what string, now int64) error {
+	return apperr.New("quote_changed", what+"已变化（现为 "+yuan(now)+"），请重新发起", 409)
+}
 
 const propEnv = `{"type": "object", "additionalProperties": {"type": "string", "maxLength": 1024}, "description": "%s"}`
 
@@ -144,6 +165,12 @@ func display(s string) string {
 	return strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(s)
 }
 
+// displayValue 是卡片里的变量值：不截断（值已由 schema 限 1024 字节、splitSecrets / ValidateEnv 保证无控制字符与换行；
+// 默认值来自版本 spec，同样经过校验），只做净化兜底。secret 必须完整显示，用户要照着记下来。
+func displayValue(s string) string {
+	return strings.NewReplacer("\n", " ", "\t", " ").Replace(guard.Sanitize(s))
+}
+
 // ---- secret 变量 ----
 
 func secretNames(env []appdeploy.EnvSpec) map[string]bool {
@@ -164,6 +191,9 @@ func splitSecrets(env map[string]string, secret map[string]bool, field string) (
 	}
 	stored, secrets = map[string]string{}, map[string]string{}
 	for k, v := range env {
+		if guard.Sanitize(v) != v {
+			return nil, nil, &ValidationError{Path: field + "." + k, Reason: "不能包含控制字符、格式字符或换行"}
+		}
 		if secret[k] && v == SecretMask {
 			return nil, nil, &ValidationError{Path: field + "." + k, Reason: "不能是 ***（那是已隐藏的旧值）；需要新密钥时请先调用 generate_secret，沿用旧值时不要填写该变量"}
 		}
@@ -207,15 +237,15 @@ func checkNoMask(env map[string]string, secret map[string]bool) error {
 }
 
 // MergeSecretEnv 是 Task 7 在 Confirm 执行写工具前调用的：把 secret_env_enc 解密出的真实值（Card.SecretEnv 原样）
-// 合并回落库的 args（Card.ArgsStored）。每个键必须在 args 的 env 或 app_env 里且当前值为 ***，否则报错（防止串卡 / 篡改）；
-// secrets 为空时原样返回 args。返回值直接传给 Tool.Exec。
+// 合并回落库的 args（Card.ArgsStored）。每个键必须在 args 的 env 或 app_env 里且当前值为 ***，否则返回包了 ErrCardInvalid 的错误
+// （防止串卡 / 篡改；Run 映射为 butler_confirm_invalid）；secrets 为空时原样返回 args。返回值直接传给 Tool.Exec。
 func MergeSecretEnv(args json.RawMessage, secrets map[string]string) (json.RawMessage, error) {
 	if len(secrets) == 0 {
 		return args, nil
 	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(args, &m); err != nil {
-		return nil, fmt.Errorf("butler tools: merge secret env: %w", err)
+		return nil, fmt.Errorf("%w: args: %v", ErrCardInvalid, err)
 	}
 	envs := map[string]map[string]string{}
 	for _, field := range []string{"env", "app_env"} {
@@ -225,7 +255,7 @@ func MergeSecretEnv(args json.RawMessage, secrets map[string]string) (json.RawMe
 		}
 		var e map[string]string
 		if err := json.Unmarshal(raw, &e); err != nil {
-			return nil, fmt.Errorf("butler tools: merge secret env: %s: %w", field, err)
+			return nil, fmt.Errorf("%w: args.%s: %v", ErrCardInvalid, field, err)
 		}
 		envs[field] = e
 	}
@@ -238,7 +268,7 @@ func MergeSecretEnv(args json.RawMessage, secrets map[string]string) (json.RawMe
 			}
 		}
 		if !placed {
-			return nil, fmt.Errorf("butler tools: merge secret env: %q is not a masked variable in args", k)
+			return nil, fmt.Errorf("%w: %q is not a masked variable in args", ErrCardInvalid, k)
 		}
 	}
 	for field, e := range envs {
@@ -251,7 +281,61 @@ func MergeSecretEnv(args json.RawMessage, secrets map[string]string) (json.RawMe
 	return json.Marshal(m)
 }
 
-// SealSecretEnv 把 Card.SecretEnv 加密为 secret_env_enc 列的值（JSON → secretbox）；空 map → nil（列为 NULL）。
+// sealedCard 是 secret_env_enc 的新格式：secret 真实值 + 含真实值的卡片文案（GET 会话的 pending_tool_call 显示它）。
+type sealedCard struct {
+	Env     map[string]string `json:"env"`
+	Summary string            `json:"summary,omitempty"`
+}
+
+// SealCard 把 Card.SecretEnv 与 Card.Summary（含真实值）一起加密为 secret_env_enc 列的值；没有 secret → nil（列为 NULL，
+// 此时 StoredSummary == Summary，不需要另存）。
+func SealCard(box *secretbox.Box, secrets map[string]string, summary string) ([]byte, error) {
+	if len(secrets) == 0 {
+		return nil, nil
+	}
+	if box == nil {
+		return nil, errors.New("butler tools: secretbox not configured")
+	}
+	b, err := json.Marshal(sealedCard{Env: secrets, Summary: summary})
+	if err != nil {
+		return nil, err
+	}
+	return box.Seal(b), nil
+}
+
+// OpenCard 解密 SealCard（也接受 SealSecretEnv 的旧格式，summary 为空）；nil / 空 → nil, "", nil。
+// 解密 / 解析失败返回包了 ErrCardInvalid 的错误。
+func OpenCard(box *secretbox.Box, enc []byte) (secrets map[string]string, summary string, err error) {
+	if len(enc) == 0 {
+		return nil, "", nil
+	}
+	if box == nil {
+		return nil, "", errors.New("butler tools: secretbox not configured")
+	}
+	b, err := box.Open(enc)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: open: %v", ErrCardInvalid, err)
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return nil, "", fmt.Errorf("%w: decode: %v", ErrCardInvalid, err)
+	}
+	// 新格式的 env 是对象；旧格式（变量名 → 字符串）里不会出现对象值，两者不会混淆
+	if raw, ok := probe["env"]; ok && len(raw) > 0 && raw[0] == '{' {
+		var c sealedCard
+		if err := json.Unmarshal(b, &c); err != nil {
+			return nil, "", fmt.Errorf("%w: decode: %v", ErrCardInvalid, err)
+		}
+		return c.Env, c.Summary, nil
+	}
+	var old map[string]string
+	if err := json.Unmarshal(b, &old); err != nil {
+		return nil, "", fmt.Errorf("%w: decode: %v", ErrCardInvalid, err)
+	}
+	return old, "", nil
+}
+
+// SealSecretEnv 只加密 secret 值（旧格式，不含卡片文案）；新代码用 SealCard。空 map → nil（列为 NULL）。
 func SealSecretEnv(box *secretbox.Box, secrets map[string]string) ([]byte, error) {
 	if len(secrets) == 0 {
 		return nil, nil
@@ -266,23 +350,11 @@ func SealSecretEnv(box *secretbox.Box, secrets map[string]string) ([]byte, error
 	return box.Seal(b), nil
 }
 
-// OpenSecretEnv 解密 secret_env_enc；nil / 空 → nil map。
+// OpenSecretEnv 解密 secret_env_enc 里的 secret 值，SealCard 与 SealSecretEnv 两种格式都接受；nil / 空 → nil map。
+// 失败返回包了 ErrCardInvalid 的错误。
 func OpenSecretEnv(box *secretbox.Box, sealed []byte) (map[string]string, error) {
-	if len(sealed) == 0 {
-		return nil, nil
-	}
-	if box == nil {
-		return nil, errors.New("butler tools: secretbox not configured")
-	}
-	b, err := box.Open(sealed)
-	if err != nil {
-		return nil, err
-	}
-	var out map[string]string
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	secrets, _, err := OpenCard(box, sealed)
+	return secrets, err
 }
 
 // envLines 按变量声明顺序列出将生效的变量（ValidateEnv 的结果，含默认值）；maskSecret 时 secret 显示 ***。
@@ -299,7 +371,7 @@ func envLines(specEnv []appdeploy.EnvSpec, plain, secret map[string]string, mask
 		if !ok {
 			continue
 		}
-		b.WriteString("\n- " + envLabel(e) + "：" + display(v))
+		b.WriteString("\n- " + envLabel(e) + "：" + displayValue(v))
 	}
 	if b.Len() == 0 {
 		return "无"
@@ -380,6 +452,11 @@ func (h writeHandlers) placeOrderCard(ctx context.Context, c Caller, args json.R
 	if a.Quantity > rental.MaxQuantity(d) {
 		return Card{}, apperr.ErrBookingTooLong
 	}
+	if rc, ok := h.d.Users.(rentChecker); ok { // 封禁 / 未实名（与 PlaceBatch 的 CanRent 相同）
+		if err := rc.CanRent(ctx, c.UserID); err != nil {
+			return Card{}, err
+		}
+	}
 	now := h.now(c)
 	var start *time.Time
 	if a.StartAt != "" {
@@ -439,6 +516,21 @@ func (h writeHandlers) placeOrderCard(ctx context.Context, c Caller, args json.R
 		app = &v
 	}
 
+	groupName := ""
+	if a.GroupID != nil {
+		groupName = fmt.Sprintf("#%d", *a.GroupID)
+		if gl, ok := h.d.Rental.(groupLookup); ok {
+			g, err := gl.VisibleGroup(ctx, *a.GroupID) // 不存在 / 不可见 → group_not_found
+			if errors.Is(err, apperr.ErrNotFound) {
+				err = apperr.ErrGroupNotFound
+			}
+			if err != nil {
+				return Card{}, err
+			}
+			groupName = g.Name
+		}
+	}
+
 	av, err := h.d.Rental.Availability(ctx, rental.AvailabilityQuery{ProductID: a.ProductID, GroupID: a.GroupID, StartAt: start,
 		Duration: d, Quantity: a.Quantity})
 	if err != nil {
@@ -452,7 +544,19 @@ func (h writeHandlers) placeOrderCard(ctx context.Context, c Caller, args json.R
 	}
 
 	total := unit * int64(a.Quantity) * int64(a.Count)
+	if h.d.Wallet != nil {
+		bal, err := h.d.Wallet.Balance(ctx, c.UserID)
+		if err != nil {
+			return Card{}, err
+		}
+		if bal < total {
+			return Card{}, apperr.New("insufficient_balance", fmt.Sprintf("余额不足：需要 %s，当前余额 %s，请先充值", yuan(total), yuan(bal)), 402)
+		}
+	}
 	head := fmt.Sprintf("租用 %s × %d，%s，镜像 %s", display(product), a.Count, durationText(d, a.Quantity), display(imageName))
+	if a.GroupID != nil {
+		head += "，机组 " + display(groupName)
+	}
 	if app != nil {
 		head += "，预装 " + display(app.Name)
 	}
@@ -501,6 +605,15 @@ func (h writeHandlers) placeOrder(ctx context.Context, c Caller, args json.RawMe
 		}
 		t = t.UTC()
 		start = &t
+	}
+	if c.QuotedCents != nil {
+		unit, err := h.d.Catalog.Quote(ctx, h.d.Pool, a.ProductID, catalog.Duration(a.Duration))
+		if err != nil {
+			return Result{}, err
+		}
+		if now := unit * int64(a.Quantity) * int64(a.Count); now > *c.QuotedCents {
+			return Result{}, quoteChanged("价格", now)
+		}
 	}
 	res, err := h.d.Rental.PlaceBatch(ctx, rental.BatchRequest{UserID: c.UserID, ProductID: a.ProductID, ImageID: a.ImageID, GroupID: a.GroupID,
 		Count: a.Count, Duration: catalog.Duration(a.Duration), Quantity: a.Quantity, StartAt: start, AutoRenew: a.AutoRenew,
@@ -603,8 +716,18 @@ func (h writeHandlers) renew(ctx context.Context, c Caller, args json.RawMessage
 	if c.IdemKey == "" {
 		return Result{}, errors.New("butler tools: renew_instance requires an idempotency key")
 	}
-	if _, err := h.d.Rental.GetForUser(ctx, c.UserID, a.InstanceID); err != nil {
+	inst, err := h.d.Rental.GetForUser(ctx, c.UserID, a.InstanceID)
+	if err != nil {
 		return Result{}, err
+	}
+	if c.QuotedCents != nil {
+		unit, err := h.d.Catalog.Quote(ctx, h.d.Pool, inst.ProductID, catalog.Duration(a.Duration))
+		if err != nil {
+			return Result{}, err
+		}
+		if now := unit * int64(a.Quantity); now > *c.QuotedCents {
+			return Result{}, quoteChanged("价格", now)
+		}
 	}
 	ord, err := h.d.Rental.RenewQuantity(ctx, c.UserID, a.InstanceID, catalog.Duration(a.Duration), a.Quantity, c.IdemKey)
 	if err != nil {
@@ -695,6 +818,15 @@ func (h writeHandlers) cancel(ctx context.Context, c Caller, args json.RawMessag
 	if _, err := h.d.Rental.GetForUser(ctx, c.UserID, a.InstanceID); err != nil {
 		return Result{}, err
 	}
+	if c.QuotedCents != nil {
+		q, err := h.d.Rental.CancelQuote(ctx, c.UserID, a.InstanceID)
+		if err != nil {
+			return Result{}, err
+		}
+		if q.Refund < *c.QuotedCents {
+			return Result{}, quoteChanged("退款金额", q.Refund)
+		}
+	}
 	inst, err := h.d.Rental.Cancel(ctx, c.UserID, a.InstanceID, c.IP)
 	if err != nil {
 		return Result{}, err
@@ -735,6 +867,9 @@ func (h writeHandlers) deployCard(ctx context.Context, c Caller, args json.RawMe
 	if err := imageCompatible(v, inst.ImageID, imageName); err != nil {
 		return Card{}, err
 	}
+	if err := h.checkSlots(ctx, inst.ID, v); err != nil {
+		return Card{}, err
+	}
 	stored, secrets, err := splitSecrets(a.Env, secretNames(v.Version.Env), "env")
 	if err != nil {
 		return Card{}, err
@@ -754,6 +889,55 @@ func (h writeHandlers) deployCard(ctx context.Context, c Caller, args json.RawMe
 		return Card{}, err
 	}
 	return card, nil
+}
+
+// checkSlots 与 appdeploy.Create 同序同口径的预检：实例上非终态部署 ≥ MaxAppsPerInstance → app_limit；同一应用已部署 → app_exists；
+// 应用端口与实例现有端口（用户端口与部署登记的）或其它非终态部署声明的端口冲突 → app_port_conflict；登记后超过 5 个 → port_limit。
+func (h writeHandlers) checkSlots(ctx context.Context, instanceID string, v appdeploy.CatalogView) error {
+	deps, err := h.d.Apps.ListForInstance(ctx, instanceID) // 调用方已 GetForUser
+	if err != nil {
+		return err
+	}
+	live := make([]appdeploy.Deployment, 0, len(deps))
+	for _, d := range deps {
+		if d.Live() {
+			live = append(live, d)
+		}
+	}
+	if len(live) >= appdeploy.MaxAppsPerInstance {
+		return apperr.ErrAppLimit
+	}
+	if slices.ContainsFunc(live, func(d appdeploy.Deployment) bool { return d.AppID == v.ID }) {
+		return apperr.ErrAppExists
+	}
+	ports, err := h.d.Rental.ListPorts(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	taken := map[int]bool{}
+	for _, p := range ports {
+		taken[p.Port] = true
+	}
+	if len(live) > 0 {
+		views, err := h.d.Apps.Views(ctx, live)
+		if err != nil {
+			return err
+		}
+		for _, lv := range views {
+			for _, p := range lv.Spec.Ports {
+				taken[p.Port] = true
+			}
+		}
+	}
+	for _, p := range v.Version.Ports {
+		if taken[p.Port] {
+			return apperr.AppPortConflict(p.Port)
+		}
+	}
+	if len(taken)+len(v.Version.Ports) > rental.MaxPortsPerInstance {
+		return apperr.ErrPortLimit
+	}
+	return nil
 }
 
 func (h writeHandlers) deploy(ctx context.Context, c Caller, args json.RawMessage) (Result, error) {
@@ -834,6 +1018,9 @@ func (h writeHandlers) redeployCard(ctx context.Context, c Caller, args json.Raw
 	}
 	spec := latest.Version.Env
 	if dep.State == appdeploy.StateQueued { // 排队中只更新变量，版本不变
+		if a.Env == nil {
+			return Card{}, apperr.New("app_invalid_state", "该部署正在排队，不改变量时无需重新部署", 409)
+		}
 		spec = view.Spec.Env
 	}
 	secretSet := secretNames(spec)
@@ -856,6 +1043,24 @@ func (h writeHandlers) redeployCard(ctx context.Context, c Caller, args json.Raw
 			return Card{}, err
 		}
 		changes = envChanges(spec, view, a.Env, plain, secret)
+	} else {
+		// 变量全部沿用到最新版本（mergeEnv envSet = false）：旧普通值只进仍是普通类型的变量、已设置的 secret 沿用；
+		// 新版本新增的必填变量、旧值不再合法等可预见的失败在出卡前报出
+		keep := map[string]string{}
+		reduced := make([]appdeploy.EnvSpec, 0, len(spec))
+		for _, e := range spec {
+			if e.Type == "secret" {
+				if view.SecretEnv[e.Name] {
+					continue
+				}
+			} else if v, ok := view.Env[e.Name]; ok {
+				keep[e.Name] = v
+			}
+			reduced = append(reduced, e)
+		}
+		if _, _, err := appdeploy.ValidateEnv(appdeploy.Spec{Env: reduced}, keep); err != nil {
+			return Card{}, err
+		}
 	}
 	head := fmt.Sprintf("重新部署 %s（实例 %s，", appTitle(view), dep.InstanceID)
 	if dep.State == appdeploy.StateQueued {
@@ -890,15 +1095,13 @@ func envChanges(spec []appdeploy.EnvSpec, view appdeploy.View, req, plain, secre
 			if view.SecretEnv[e.Name] {
 				old = "已设置"
 			}
-			if nv == "" {
-				to := "清除"
-				if _, def := secret[e.Name]; def {
-					to = "恢复默认值"
+			if nv == "" { // 空串 = 清除（secret 不能有默认值，ValidateSpec 保证）；本来就没设置 → 无变化，不列
+				if view.SecretEnv[e.Name] {
+					b.WriteString("\n- " + envLabel(e) + "：已设置 → 清除")
 				}
-				b.WriteString("\n- " + envLabel(e) + "：" + old + " → " + to)
 				continue
 			}
-			b.WriteString("\n- " + envLabel(e) + "：" + old + " → \x00" + display(nv) + "\x00")
+			b.WriteString("\n- " + envLabel(e) + "：" + old + " → \x00" + displayValue(nv) + "\x00")
 			continue
 		}
 		oldV, hadOld := view.Env[e.Name]
@@ -911,7 +1114,7 @@ func envChanges(spec []appdeploy.EnvSpec, view appdeploy.View, req, plain, secre
 			from = display(oldV)
 		}
 		if hasNew {
-			to = display(newV)
+			to = displayValue(newV)
 		}
 		b.WriteString("\n- " + envLabel(e) + "：" + from + " → " + to)
 	}
