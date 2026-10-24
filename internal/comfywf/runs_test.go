@@ -332,10 +332,10 @@ func TestRunsStartBusy(t *testing.T) {
 	_, err = e.start(nil)
 	wantErr(t, err, "workflow_busy", 429)
 
-	// 超过 RunWaitMax 的 queued 不再计数
+	// 超过 RunWaitMax 的 queued 不再计数，并在复查时落成 error（超时）
 	e.clk.Advance(RunWaitMax + time.Second)
 	e.mustStart()
-	if st, _ := e.runState(b.ID); st != RunQueued {
+	if st, _ := e.runState(b.ID); st != RunError {
 		t.Fatalf("b = %s", st)
 	}
 	_ = c
@@ -371,6 +371,16 @@ func TestRunsStartRejected(t *testing.T) {
 	if e.count(`SELECT count(*) FROM comfy_workflow_runs`) != 0 {
 		t.Fatal("rejected run recorded")
 	}
+
+	// 缺自定义节点：node_errors 为空，消息在 error.message / details
+	e.fake.RejectPrompts("")
+	e.fake.RejectMissingNode("FakeNodeType")
+	_, err = e.start(nil)
+	if ae := apperr.As(err); ae == nil || ae.Code != "workflow_prompt_rejected" ||
+		ae.Message != "ComfyUI 拒绝了该任务：Node 'FakeNodeType' not found. The custom node may not be installed.：Node ID '#12'" {
+		t.Fatalf("missing node: %v", err)
+	}
+	e.fake.RejectMissingNode("")
 
 	// node_errors 为空时取 error.message；消息里的控制字符被替换
 	e.setOverride(func(w http.ResponseWriter, r *http.Request) bool {
@@ -578,7 +588,8 @@ func TestRunsOpenFile(t *testing.T) {
 	h := http.Header{}
 	f.SetHeaders(h)
 	if h.Get("Content-Type") != "image/png" || h.Get("X-Content-Type-Options") != "nosniff" || h.Get("Content-Length") != "25" ||
-		h.Get("Cache-Control") != "private, max-age=3600" || h.Get("Content-Disposition") != "inline; filename*=utf-8''%E5%9B%BE%201.png" {
+		h.Get("Cache-Control") != "private, max-age=3600" || h.Get("Content-Disposition") != "inline; filename*=utf-8''%E5%9B%BE%201.png" ||
+		h.Get("Content-Security-Policy") != "default-src 'none'; sandbox" || h.Get("Cross-Origin-Resource-Policy") != "same-origin" {
 		t.Fatalf("headers = %v", h)
 	}
 	vs := e.fake.Views()
@@ -645,9 +656,194 @@ func TestRunsOpenFile(t *testing.T) {
 	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
 	wantErr(t, err, "app_invalid_state", 409)
 	e.exec(`UPDATE instances SET state = 'running' WHERE id = $1`, e.ins)
+	// 终态运行读不到 history：如实报连不上 / 坏响应（不是 404）
 	e.setDialErr(&upstream.DialError{InstanceID: e.ins, Err: errors.New("down")})
 	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
-	wantErr(t, err, "not_found", 404) // history 读不到：没有可给的文件
+	wantErr(t, err, "upstream_unreachable", 503)
+	e.setDialErr(nil)
+	e.setOverride(func(w http.ResponseWriter, r *http.Request) bool {
+		if !strings.HasPrefix(r.URL.Path, "/history/") {
+			return false
+		}
+		io.WriteString(w, `<html>`)
+		return true
+	})
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	wantErr(t, err, "upstream_unreachable", 502)
+	e.setOverride(nil)
+	// history 丢了（ComfyUI 重启）：文件拿不到 → 404
+	e.fake.Forget(run.PromptID)
+	_, err = e.runs.OpenFile(e.ctx, e.getReq(run.ID), 0)
+	wantErr(t, err, "not_found", 404)
+}
+
+func TestRunsLost(t *testing.T) {
+	e := newRunEnv(t)
+	run := e.mustStart()
+	// 队列不可读：不能断定丢失
+	e.fake.Forget(run.PromptID)
+	e.setOverride(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/queue" {
+			return false
+		}
+		io.WriteString(w, `{"queue_running":[],"queue_pending":[],"pad":"`+strings.Repeat("a", maxQueueBytes)+`"}`)
+		return true
+	})
+	if v := e.get(run.ID); v.State != RunQueued {
+		t.Fatalf("unknown queue: %+v", v)
+	}
+	e.setOverride(nil)
+	// history 空、队列里也没有 → 再读一次 history 仍空 → error「任务已丢失」
+	e.clk.Advance(time.Minute)
+	v := e.get(run.ID)
+	if v.State != RunError || v.Message != lostMessage || v.FinishedAt == nil || !v.FinishedAt.Equal(e.clk.Now()) {
+		t.Fatalf("lost: %+v", v)
+	}
+	if st, _ := e.runState(run.ID); st != RunError {
+		t.Fatalf("row = %s", st)
+	}
+	// 终态 error 没有 history 消息时也给这句
+	if v := e.get(run.ID); v.State != RunError || v.Message != lostMessage {
+		t.Fatalf("again: %+v", v)
+	}
+	// 在 queue_pending 里：排队中
+	p := e.mustStart()
+	if v := e.get(p.ID); v.State != RunQueued {
+		t.Fatalf("pending: %+v", v)
+	}
+	// 被中断
+	e.fake.SetHistory(p.PromptID, comfytest.InterruptedState())
+	if v := e.get(p.ID); v.State != RunError || v.Message != "任务已被中断" {
+		t.Fatalf("interrupted: %+v", v)
+	}
+}
+
+func TestRunsTimeout(t *testing.T) {
+	e := newRunEnv(t)
+	a, b := e.mustStart(), e.mustStart()
+	e.clk.Advance(RunWaitMax + time.Second)
+	// 超时前已完成的仍是 done
+	e.fake.SetHistory(b.PromptID, comfytest.DoneN(1))
+	if v := e.get(b.ID); v.State != RunDone {
+		t.Fatalf("b: %+v", v)
+	}
+	// 仍在排队 / 运行：超过 RunWaitMax → error
+	e.fake.SetHistory(a.PromptID, comfytest.RunningState())
+	if v := e.get(a.ID); v.State != RunError || v.Message != timeoutMessage {
+		t.Fatalf("a: %+v", v)
+	}
+	// Start 时遇到的超时 queued 行也落成 error
+	c := e.mustStart()
+	e.clk.Advance(RunWaitMax + time.Second)
+	e.mustStart()
+	if st, _ := e.runState(c.ID); st != RunError {
+		t.Fatalf("c = %s", st)
+	}
+}
+
+func TestRunsStartConcurrent(t *testing.T) {
+	e := newRunEnv(t)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	codes := map[string]int{}
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := e.start(nil)
+			mu.Lock()
+			codes[errCode(err)]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if codes[""] != MaxRunsInFlight || codes["workflow_busy"] != 6-MaxRunsInFlight {
+		t.Fatalf("codes = %v", codes)
+	}
+	if n := e.count(`SELECT count(*) FROM comfy_workflow_runs`); n != MaxRunsInFlight {
+		t.Fatalf("rows = %d", n)
+	}
+}
+
+func TestRunsStartSlowRefresh(t *testing.T) {
+	e := newRunEnv(t)
+	old := refreshProbeTimeout
+	refreshProbeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { refreshProbeTimeout = old })
+	e.mustStart()
+	e.mustStart()
+	e.setOverride(func(w http.ResponseWriter, r *http.Request) bool {
+		if !strings.HasPrefix(r.URL.Path, "/history/") {
+			return false
+		}
+		<-r.Context().Done() // 卡住直到客户端放弃
+		return true
+	})
+	t0 := time.Now()
+	_, err := e.start(nil)
+	wantErr(t, err, "workflow_busy", 429)
+	if d := time.Since(t0); d > 3*time.Second {
+		t.Fatalf("refresh took %v", d)
+	}
+}
+
+type blockingReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	data    *bytes.Reader
+}
+
+func (b *blockingReader) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return b.data.Read(p)
+}
+
+func TestRunsUploadConcurrency(t *testing.T) {
+	e := newRunEnv(t)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, MaxUploadsPerUser)
+	for range MaxUploadsPerUser {
+		br := &blockingReader{started: make(chan struct{}), release: release, data: bytes.NewReader(comfytest.OnePixelPNG)}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := e.runs.Upload(e.ctx, UploadRequest{UserID: e.uid, InstanceID: e.ins, DeploymentID: e.dep, WorkflowID: e.wf.ID, Body: br})
+			errs <- err
+		}()
+		<-br.started
+	}
+	_, err := e.upload(comfytest.OnePixelPNG, 0)
+	wantErr(t, err, "rate_limited", 429)
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.upload(comfytest.OnePixelPNG, 0); err != nil {
+		t.Fatal(err)
+	}
+	// 大文件流式写进 multipart：大小原样到达 ComfyUI
+	big := append(append([]byte{}, comfytest.OnePixelPNG...), make([]byte, 3<<20)...)
+	if _, err := e.upload(big, 0); err != nil {
+		t.Fatal(err)
+	}
+	if ups := e.fake.Uploads(); ups[len(ups)-1].Size != len(big) {
+		t.Fatalf("size = %d", ups[len(ups)-1].Size)
+	}
+}
+
+func TestHistoryErrorMessageSanitized(t *testing.T) {
+	body := `{"p":{"status":{"status_str":"error","completed":false,"messages":[["execution_error",{"exception_message":"bad\u202e\u0007 thing\u2066"}]]},"outputs":{}}}`
+	h, err := ParseHistory([]byte(body), "p", nil)
+	if err != nil || h.State != RunError || h.Message != "bad  thing" {
+		t.Fatalf("h = %+v %v", h, err)
+	}
 }
 
 func TestRejectMessage(t *testing.T) {
@@ -656,7 +852,9 @@ func TestRejectMessage(t *testing.T) {
 		`{"error":"plain string"}`: "plain string",
 		`{}`:                       "工作流校验失败",
 		`garbage`:                  "工作流校验失败",
-		`{"node_errors":{"4":{"errors":[]}},"error":{"message":"Prompt outputs failed validation"}}`: "Prompt outputs failed validation",
+		`{"node_errors":{"4":{"errors":[]}},"error":{"message":"Prompt outputs failed validation"}}`:                    "Prompt outputs failed validation",
+		`{"error":{"type":"no_prompt","message":"No prompt provided","details":"No prompt provided"},"node_errors":[]}`: "No prompt provided",
+		`{"error":{"message":"a\u202eb\u200fc\td"}}`:                                                                    "abc d",
 	} {
 		if got := rejectMessage([]byte(body)); got != want {
 			t.Errorf("rejectMessage(%s) = %q, want %q", body, got, want)

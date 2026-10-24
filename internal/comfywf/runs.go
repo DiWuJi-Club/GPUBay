@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -57,9 +58,19 @@ var (
 const (
 	// maxRejectMessage /prompt 拒绝时错误消息的截断长度（字符，规格 §6.1）。
 	maxRejectMessage = 200
-	// maxRefresh 在飞计数达到上限时，最多复查几个 queued 运行（没人轮询的已完成运行不应一直占名额）。
+	// maxRefresh Start 时最多复查几个 queued 运行（没人轮询的已结束 / 丢失 / 超时的运行不应一直占名额）。
 	maxRefresh = 4
+	// MaxUploadsPerUser 每个用户同时进行的上传数（每个最多占 16MB 内存）；超出 → rate_limited。
+	MaxUploadsPerUser = 2
+	// insertTimeout /prompt 已成功后写运行记录的上限（不随请求取消：ComfyUI 已经在跑了）。
+	insertTimeout = 5 * time.Second
+
+	lostMessage    = "任务已丢失（ComfyUI 可能已重启）"
+	timeoutMessage = "等待超过 30 分钟，平台已停止跟踪；结果可在 ComfyUI 的历史记录里查看"
 )
+
+// refreshProbeTimeout Start 复查单个 queued 运行的上限（变量：测试调小）。整个 Start（复查 + /prompt）共用 ProxyTimeout。
+var refreshProbeTimeout = 5 * time.Second
 
 // Runs 快速出图服务。
 type Runs struct {
@@ -70,6 +81,74 @@ type Runs struct {
 	client *Client
 	log    *slog.Logger
 	rnd    func() int64 // seed 随机源；nil = BuildPrompt 默认（测试注入）
+
+	// 进程内并发控制（假定平台单副本；多副本时在飞 / 频率限制退化为规格 §14 的软限制）。
+	startLocks keyedLock   // 每用户一把：Start 的「计数 → /prompt → INSERT」串行（部署只属于一个用户，同时覆盖每部署在飞与每用户每小时）
+	uploads    userCounter // 每用户同时上传数
+}
+
+// keyedLock 按键的互斥锁，等待可被 ctx 打断；无人持有 / 等待的键自动清掉。
+type keyedLock struct {
+	mu sync.Mutex
+	m  map[int64]*lockEntry
+}
+
+type lockEntry struct {
+	ch   chan struct{}
+	refs int
+}
+
+func (k *keyedLock) lock(ctx context.Context, key int64) (func(), error) {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = map[int64]*lockEntry{}
+	}
+	e := k.m[key]
+	if e == nil {
+		e = &lockEntry{ch: make(chan struct{}, 1)}
+		k.m[key] = e
+	}
+	e.refs++
+	k.mu.Unlock()
+	release := func() {
+		k.mu.Lock()
+		if e.refs--; e.refs == 0 {
+			delete(k.m, key)
+		}
+		k.mu.Unlock()
+	}
+	select {
+	case e.ch <- struct{}{}:
+		return func() { <-e.ch; release() }, nil
+	case <-ctx.Done():
+		release()
+		return nil, ctx.Err()
+	}
+}
+
+// userCounter 每用户并发计数（不等待，满了直接拒绝）。
+type userCounter struct {
+	mu sync.Mutex
+	n  map[int64]int
+}
+
+func (c *userCounter) acquire(key int64, limit int) (func(), bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n == nil {
+		c.n = map[int64]int{}
+	}
+	if c.n[key] >= limit {
+		return nil, false
+	}
+	c.n[key]++
+	return func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.n[key]--; c.n[key] <= 0 {
+			delete(c.n, key)
+		}
+	}, true
 }
 
 func NewRuns(pool *pgxpool.Pool, clk clock.Clock, cat *Catalog, apps *appdeploy.Service, client *Client, log *slog.Logger) *Runs {
@@ -150,6 +229,8 @@ func (f *File) SetHeaders(h http.Header) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Disposition", f.Disposition)
 	h.Set("Cache-Control", "private, max-age=3600")
+	h.Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	h.Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
 // ---- 公共校验 ----
@@ -234,20 +315,28 @@ func (r *Runs) Upload(ctx context.Context, req UploadRequest) (UploadResult, err
 	if req.Size > MaxUploadBytes {
 		return UploadResult{}, ErrUploadTooLarge
 	}
-	data, err := io.ReadAll(io.LimitReader(req.Body, MaxUploadBytes+1))
-	if err != nil {
+	done, ok := r.uploads.acquire(req.UserID, MaxUploadsPerUser)
+	if !ok {
+		return UploadResult{}, apperr.ErrRateLimited
+	}
+	defer done()
+	// 先读 512 字节判类型，其余直接写进 multipart 缓冲（内存里只有一份文件）。
+	head := make([]byte, 512)
+	n, err := io.ReadFull(req.Body, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return UploadResult{}, err
 	}
-	if len(data) > MaxUploadBytes {
-		return UploadResult{}, ErrUploadTooLarge
-	}
-	ctype := http.DetectContentType(data)
+	head = head[:n]
+	ctype := http.DetectContentType(head)
 	ext, ok := uploadExts[ctype]
-	if !ok || len(data) == 0 {
+	if !ok || n == 0 {
 		return UploadResult{}, ErrUploadType
 	}
 	name := randx.ID("", 12) + "." + ext
 	var buf bytes.Buffer
+	if req.Size > 0 {
+		buf.Grow(int(req.Size) + 1024)
+	}
 	mw := multipart.NewWriter(&buf)
 	ph := textproto.MIMEHeader{}
 	ph.Set("Content-Disposition", fmt.Sprintf(`form-data; name="image"; filename=%q`, name))
@@ -256,7 +345,14 @@ func (r *Runs) Upload(ctx context.Context, req UploadRequest) (UploadResult, err
 	if err != nil {
 		return UploadResult{}, err
 	}
-	part.Write(data)
+	part.Write(head)
+	rest, err := io.Copy(part, io.LimitReader(req.Body, MaxUploadBytes+1-int64(n)))
+	if err != nil {
+		return UploadResult{}, err
+	}
+	if int64(n)+rest > MaxUploadBytes {
+		return UploadResult{}, ErrUploadTooLarge
+	}
 	for k, v := range map[string]string{"subfolder": QuickRunSubfolder, "overwrite": "true", "type": "input"} {
 		if err := mw.WriteField(k, v); err != nil {
 			return UploadResult{}, err
@@ -289,7 +385,8 @@ func (r *Runs) Upload(ctx context.Context, req UploadRequest) (UploadResult, err
 // ---- 运行 ----
 
 // Start 提交一次运行：校验表单（BuildPrompt）→ 频率（每用户每小时 RunsPerHour）与在飞（每部署 MaxRunsInFlight）限制 →
-// POST /prompt {prompt, client_id: run id} → 记 comfy_workflow_runs。
+// POST /prompt {prompt, client_id: run id} → 记 comfy_workflow_runs。「计数 → /prompt → INSERT」在每用户进程内锁里串行；
+// 整个过程（含等锁、复查、/prompt）不超过 ProxyTimeout，等锁超时 → ErrWorkflowBusy。
 func (r *Runs) Start(ctx context.Context, req StartRequest) (RunView, error) {
 	rt, ver, err := r.runnable(ctx, req.UserID, req.InstanceID, req.DeploymentID, req.WorkflowID)
 	if err != nil {
@@ -299,16 +396,26 @@ func (r *Runs) Start(ctx context.Context, req StartRequest) (RunView, error) {
 	if err != nil {
 		return RunView{}, err
 	}
+	bctx, cancel := context.WithTimeout(ctx, ProxyTimeout)
+	defer cancel()
+	unlock, err := r.startLocks.lock(bctx, req.UserID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return RunView{}, ctx.Err()
+		}
+		return RunView{}, apperr.ErrWorkflowBusy
+	}
+	defer unlock()
 	now := r.clk.Now()
 	var hourly int
-	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM comfy_workflow_runs WHERE user_id = $1 AND created_at > $2`,
+	if err := r.pool.QueryRow(bctx, `SELECT count(*) FROM comfy_workflow_runs WHERE user_id = $1 AND created_at > $2`,
 		req.UserID, now.Add(-time.Hour)).Scan(&hourly); err != nil {
 		return RunView{}, err
 	}
 	if hourly >= RunsPerHour {
 		return RunView{}, apperr.ErrRateLimited
 	}
-	if err := r.checkInFlight(ctx, rt, now); err != nil {
+	if err := r.checkInFlight(bctx, rt, now); err != nil {
 		return RunView{}, err
 	}
 	runID := randx.ID("run-", 12)
@@ -319,7 +426,7 @@ func (r *Runs) Start(ctx context.Context, req StartRequest) (RunView, error) {
 	if err != nil {
 		return RunView{}, err
 	}
-	status, body, err := r.client.call(ctx, rt.up, rt.port, http.MethodPost, "/prompt", bytes.NewReader(reqBody), "application/json", maxJSONBytes)
+	status, body, err := r.client.call(bctx, rt.up, rt.port, http.MethodPost, "/prompt", bytes.NewReader(reqBody), "application/json", maxJSONBytes)
 	if err != nil {
 		return RunView{}, err
 	}
@@ -335,50 +442,73 @@ func (r *Runs) Start(ctx context.Context, req StartRequest) (RunView, error) {
 	if err := json.Unmarshal(body, &res); err != nil || !promptIDRe.MatchString(res.PromptID) {
 		return RunView{}, badUpstream("/prompt 响应缺少合法的 prompt_id")
 	}
-	if _, err := r.pool.Exec(ctx, `INSERT INTO comfy_workflow_runs (id, deployment_id, user_id, workflow_version_id, prompt_id, seed, state, created_at)
+	// ComfyUI 已接下任务：记录不随请求取消（否则在飞计数漏掉它）。
+	ictx, icancel := context.WithTimeout(context.WithoutCancel(ctx), insertTimeout)
+	defer icancel()
+	if _, err := r.pool.Exec(ictx, `INSERT INTO comfy_workflow_runs (id, deployment_id, user_id, workflow_version_id, prompt_id, seed, state, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7)`, runID, rt.dep.ID, req.UserID, ver.ID, res.PromptID, seed, now); err != nil {
 		return RunView{}, err
 	}
 	return RunView{ID: runID, PromptID: res.PromptID, Seed: seed, State: RunQueued, Files: []FileView{}, CreatedAt: now}, nil
 }
 
-// checkInFlight 在飞（queued 且未超 RunWaitMax）≥ MaxRunsInFlight → ErrWorkflowBusy。达到上限时先复查这些运行的 history
-// （没人轮询的已结束运行就此落成终态），再数一次。软限制：并发提交可能略超（规格 §14）。
+// checkInFlight 在飞（queued 且未超 RunWaitMax）≥ MaxRunsInFlight → ErrWorkflowBusy。先复查（共 ≤ maxRefresh 个，每个
+// ≤ refreshProbeTimeout，出错跳过）：超时的 queued 行，以及在飞已满时的在飞行；结束 / 丢失 / 超时的就此落成终态，再数一次。
 func (r *Runs) checkInFlight(ctx context.Context, rt runTarget, now time.Time) error {
-	ids, err := r.inFlight(ctx, rt.dep.ID, now)
-	if err != nil || len(ids) < MaxRunsInFlight {
+	queued, err := r.queuedRuns(ctx, rt.dep.ID)
+	if err != nil {
 		return err
 	}
-	for _, run := range ids[:min(len(ids), maxRefresh)] {
-		ver, err := r.cat.GetVersion(ctx, run.VersionID)
-		if err != nil {
-			return err
+	var stale, live []Run
+	for _, run := range queued {
+		if now.Sub(run.CreatedAt) >= RunWaitMax {
+			stale = append(stale, run)
+		} else {
+			live = append(live, run)
 		}
-		h, err := r.history(ctx, rt, run.PromptID, ver.Manifest.Outputs)
-		if err != nil {
-			if errors.Is(err, apperr.ErrUpstreamUnreachable) {
+	}
+	probe := stale
+	if len(live) >= MaxRunsInFlight {
+		probe = append(probe, live...)
+	}
+	vers := map[int64]Version{}
+	finished := 0
+	for _, run := range probe[:min(len(probe), maxRefresh)] {
+		if ctx.Err() != nil {
+			break
+		}
+		ver, ok := vers[run.VersionID]
+		if !ok {
+			if ver, err = r.cat.GetVersion(ctx, run.VersionID); err != nil {
 				return err
 			}
-			continue // 响应不可用：这一个不复查
+			vers[run.VersionID] = ver
+		}
+		pctx, cancel := context.WithTimeout(ctx, refreshProbeTimeout)
+		h, err := r.probe(pctx, rt, run, ver.Manifest.Outputs, now)
+		cancel()
+		if err != nil {
+			continue // 复查只是尽力而为
 		}
 		if h.State == RunDone || h.State == RunError {
-			if _, err := r.finish(ctx, run.ID, h.State, now); err != nil {
+			if _, _, err := r.finish(ctx, run.ID, h.State, now); err != nil {
 				return err
+			}
+			if now.Sub(run.CreatedAt) < RunWaitMax {
+				finished++
 			}
 		}
 	}
-	if ids, err = r.inFlight(ctx, rt.dep.ID, now); err != nil {
-		return err
-	}
-	if len(ids) >= MaxRunsInFlight {
+	if len(live)-finished >= MaxRunsInFlight {
 		return apperr.ErrWorkflowBusy
 	}
 	return nil
 }
 
-func (r *Runs) inFlight(ctx context.Context, depID string, now time.Time) ([]Run, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+runCols+` FROM comfy_workflow_runs WHERE deployment_id = $1 AND state = 'queued' AND created_at > $2
-		ORDER BY created_at, id`, depID, now.Add(-RunWaitMax))
+// queuedRuns 部署上全部 queued 的运行（按创建时间；上限 64，正常不超过 MaxRunsInFlight + 少量超时未复查的）。
+func (r *Runs) queuedRuns(ctx context.Context, depID string) ([]Run, error) {
+	rows, err := r.pool.Query(ctx, `SELECT `+runCols+` FROM comfy_workflow_runs WHERE deployment_id = $1 AND state = 'queued'
+		ORDER BY created_at, id LIMIT 64`, depID)
 	if err != nil {
 		return nil, err
 	}
@@ -401,16 +531,18 @@ func rejectMessage(body []byte) string {
 		Details string `json:"details"`
 	}
 	var res struct {
-		Error      json.RawMessage            `json:"error"`
-		NodeErrors map[string]json.RawMessage `json:"node_errors"`
+		Error      json.RawMessage `json:"error"`
+		NodeErrors json.RawMessage `json:"node_errors"`
 	}
 	msg := ""
 	if json.Unmarshal(body, &res) == nil {
-		for _, id := range sortedKeys(res.NodeErrors) {
+		var nodeErrors map[string]json.RawMessage // 真实 ComfyUI 在没有节点错误时可能给 []
+		_ = json.Unmarshal(res.NodeErrors, &nodeErrors)
+		for _, id := range sortedKeys(nodeErrors) {
 			var ne struct {
 				Errors []item `json:"errors"`
 			}
-			if json.Unmarshal(res.NodeErrors[id], &ne) == nil && len(ne.Errors) > 0 && strings.TrimSpace(ne.Errors[0].Message) != "" {
+			if json.Unmarshal(nodeErrors[id], &ne) == nil && len(ne.Errors) > 0 && strings.TrimSpace(ne.Errors[0].Message) != "" {
 				msg = joinDetails(ne.Errors[0].Message, ne.Errors[0].Details)
 				break
 			}
@@ -436,20 +568,10 @@ func rejectMessage(body []byte) string {
 
 func joinDetails(msg, details string) string {
 	msg, details = strings.TrimSpace(msg), strings.TrimSpace(details)
-	if details == "" || msg == "" {
+	if details == "" || msg == "" || details == msg {
 		return msg
 	}
 	return msg + "：" + details
-}
-
-// stripControl 去掉控制字符（容器给的文本进错误消息）。
-func stripControl(s string) string {
-	return strings.Map(func(c rune) rune {
-		if c < 0x20 || c == 0x7f {
-			return ' '
-		}
-		return c
-	}, strings.ToValidUTF8(s, ""))
 }
 
 // ---- 查询 ----
@@ -470,19 +592,21 @@ func baseView(run Run) RunView {
 		FinishedAt: run.FinishedAt}
 }
 
-// Get 查询运行状态（规格 §6.1）：history 有结果 → done / error（同步落库）；没有 → 查 /queue 区分 running / queued。
-// 终态的运行仍查一次 history 取输出文件；查不到（ComfyUI 重启、连不上、实例未运行）只返回缓存的状态。
+// Get 查询运行状态（规格 §6.1）：history 有结果 → done / error（同步落库）；没有 → 查 /queue 区分 running / queued；
+// 两边都没有 → 丢失（error）；超过 RunWaitMax 仍未结束 → error（超时）。终态的运行仍查一次 history 取输出文件；
+// 查不到（ComfyUI 重启、连不上、实例未运行）只返回缓存的状态。
 func (r *Runs) Get(ctx context.Context, req GetRequest) (RunView, error) {
 	rt, err := r.target(ctx, req.UserID, req.InstanceID, req.DeploymentID)
 	if err != nil {
 		return RunView{}, err
 	}
-	v, _, err := r.get(ctx, rt, req)
+	v, _, err := r.get(ctx, rt, req, false)
 	return v, err
 }
 
-// get 是 Get 的主体；另外返回 history 里的输出文件（只在 done 且本次读到 history 时非空，OpenFile 用）。
-func (r *Runs) get(ctx context.Context, rt runTarget, req GetRequest) (RunView, []OutputFile, error) {
+// get 是 Get 的主体；另外返回 history 里的输出文件（只在 done 且本次读到 history 时非空）。
+// needFiles（OpenFile）：实例未运行 / 终态读 history 出错时如实返回错误，不回落缓存状态。
+func (r *Runs) get(ctx context.Context, rt runTarget, req GetRequest, needFiles bool) (RunView, []OutputFile, error) {
 	run, err := scanRun(r.pool.QueryRow(ctx, `SELECT `+qualify(runCols, "r")+` FROM comfy_workflow_runs r
 		JOIN comfy_workflow_versions v ON v.id = r.workflow_version_id
 		WHERE r.id = $1 AND r.deployment_id = $2 AND r.user_id = $3 AND v.workflow_id = $4`, req.RunID, rt.dep.ID, req.UserID, req.WorkflowID))
@@ -492,8 +616,8 @@ func (r *Runs) get(ctx context.Context, rt runTarget, req GetRequest) (RunView, 
 	view := baseView(run)
 	terminal := run.State != RunQueued
 	if !rt.reachable {
-		if terminal {
-			return view, nil, nil
+		if terminal && !needFiles {
+			return withFallback(view), nil, nil
 		}
 		return RunView{}, nil, errNotRunning
 	}
@@ -501,29 +625,32 @@ func (r *Runs) get(ctx context.Context, rt runTarget, req GetRequest) (RunView, 
 	if err != nil {
 		return RunView{}, nil, err
 	}
-	h, err := r.history(ctx, rt, run.PromptID, ver.Manifest.Outputs)
-	if err != nil {
-		if terminal {
+	var h HistoryResult
+	if terminal {
+		if h, err = r.history(ctx, rt, run.PromptID, ver.Manifest.Outputs); err != nil {
+			if needFiles {
+				return RunView{}, nil, err
+			}
 			r.log.Info("comfywf: history unavailable for finished run", "run", run.ID, "err", err)
+			return withFallback(view), nil, nil
+		}
+	} else {
+		now := r.clk.Now()
+		if h, err = r.probe(ctx, rt, run, ver.Manifest.Outputs, now); err != nil {
+			return RunView{}, nil, err
+		}
+		switch h.State {
+		case RunRunning:
+			view.State = RunRunning
+			return view, nil, nil
+		case RunQueued:
 			return view, nil, nil
 		}
-		return RunView{}, nil, err
-	}
-	switch {
-	case h.State == "" && terminal: // history 已丢（ComfyUI 重启）：只给缓存状态
-		return view, nil, nil
-	case h.State == "":
-		if r.queueRunning(ctx, rt, run.PromptID) {
-			view.State = RunRunning
-		}
-		return view, nil, nil
-	}
-	if !terminal {
-		fin, err := r.finish(ctx, run.ID, h.State, r.clk.Now())
+		st, fin, err := r.finish(ctx, run.ID, h.State, now)
 		if err != nil {
 			return RunView{}, nil, err
 		}
-		view.State, view.FinishedAt = h.State, fin
+		view.State, view.FinishedAt = st, fin
 	}
 	if view.State == RunError && h.State == RunError {
 		view.Message = h.Message
@@ -534,18 +661,56 @@ func (r *Runs) get(ctx context.Context, rt runTarget, req GetRequest) (RunView, 
 		}
 		return view, h.Files, nil
 	}
-	return view, nil, nil
+	return withFallback(view), nil, nil
 }
 
-// finish queued → 终态（只改仍是 queued 的行；并发轮询以先写者为准），返回 finished_at。
-func (r *Runs) finish(ctx context.Context, runID, state string, now time.Time) (*time.Time, error) {
-	var fin *time.Time
-	err := r.pool.QueryRow(ctx, `UPDATE comfy_workflow_runs SET state = $2, finished_at = $3 WHERE id = $1 AND state = 'queued' RETURNING finished_at`,
-		runID, state, now).Scan(&fin)
-	if db.IsNoRows(err) {
-		err = r.pool.QueryRow(ctx, `SELECT finished_at FROM comfy_workflow_runs WHERE id = $1`, runID).Scan(&fin)
+// withFallback error 状态没有可用消息（history 已丢 / 读不到）时给「任务已丢失」。
+func withFallback(v RunView) RunView {
+	if v.State == RunError && v.Message == "" {
+		v.Message = lostMessage
 	}
-	return fin, err
+	return v
+}
+
+// probe 查一个 queued 运行的当前状态（不落库）。State：RunDone / RunError（含丢失、超时，Message 已填）/ RunRunning / RunQueued。
+// history 为空时查 /queue：running → RunRunning；pending 或队列不可读 → RunQueued；两边都没有 → 再读一次 history
+// （刚好执行完的竞态），仍为空 → 丢失。超过 RunWaitMax 仍未结束 → 超时。history 读不到 → 错误。
+func (r *Runs) probe(ctx context.Context, rt runTarget, run Run, outputs []OutputSpec, now time.Time) (HistoryResult, error) {
+	h, err := r.history(ctx, rt, run.PromptID, outputs)
+	if err != nil {
+		return HistoryResult{}, err
+	}
+	if h.State == "" {
+		switch r.queueState(ctx, rt, run.PromptID) {
+		case queueRunning:
+			h.State = RunRunning
+		case queuePending, queueUnknown:
+			h.State = RunQueued
+		case queueAbsent:
+			if h, err = r.history(ctx, rt, run.PromptID, outputs); err != nil {
+				return HistoryResult{}, err
+			}
+			if h.State == "" {
+				return HistoryResult{State: RunError, Message: lostMessage}, nil
+			}
+		}
+	}
+	if (h.State == RunQueued || h.State == RunRunning) && now.Sub(run.CreatedAt) >= RunWaitMax {
+		return HistoryResult{State: RunError, Message: timeoutMessage}, nil
+	}
+	return h, nil
+}
+
+// finish queued → 终态（只改仍是 queued 的行；并发轮询以先写者为准），返回行上的实际状态与 finished_at。
+func (r *Runs) finish(ctx context.Context, runID, state string, now time.Time) (string, *time.Time, error) {
+	var st string
+	var fin *time.Time
+	err := r.pool.QueryRow(ctx, `UPDATE comfy_workflow_runs SET state = $2, finished_at = $3 WHERE id = $1 AND state = 'queued'
+		RETURNING state, finished_at`, runID, state, now).Scan(&st, &fin)
+	if db.IsNoRows(err) {
+		err = r.pool.QueryRow(ctx, `SELECT state, finished_at FROM comfy_workflow_runs WHERE id = $1`, runID).Scan(&st, &fin)
+	}
+	return st, fin, err
 }
 
 // history GET /history/{prompt_id}（≤ 1MB）→ ParseHistory。
@@ -564,29 +729,48 @@ func (r *Runs) history(ctx context.Context, rt runTarget, promptID string, outpu
 	return h, nil
 }
 
-// queueRunning GET /queue：prompt_id 在 queue_running 里（元素 [number, prompt_id, …]）。任何错误按「不在运行」处理。
-func (r *Runs) queueRunning(ctx context.Context, rt runTarget, promptID string) bool {
+type queueStatus int
+
+const (
+	queueUnknown queueStatus = iota // 读不到 / 超长 / 不可解析：不能据此断定丢失
+	queueRunning
+	queuePending
+	queueAbsent
+)
+
+// queueState GET /queue（≤ maxQueueBytes）：prompt_id 在 queue_running / queue_pending 里（元素 [number, prompt_id, …]）。
+func (r *Runs) queueState(ctx context.Context, rt runTarget, promptID string) queueStatus {
 	status, body, err := r.client.call(ctx, rt.up, rt.port, http.MethodGet, "/queue", nil, "", maxQueueBytes)
 	if err != nil || status != http.StatusOK {
-		return false
+		return queueUnknown
 	}
 	var q struct {
-		Running []json.RawMessage `json:"queue_running"`
+		Running *[]json.RawMessage `json:"queue_running"`
+		Pending *[]json.RawMessage `json:"queue_pending"`
 	}
-	if json.Unmarshal(body, &q) != nil {
+	if json.Unmarshal(body, &q) != nil || q.Running == nil || q.Pending == nil {
+		return queueUnknown
+	}
+	has := func(items []json.RawMessage) bool {
+		for _, it := range items {
+			var item []json.RawMessage
+			if json.Unmarshal(it, &item) != nil || len(item) < 2 {
+				continue
+			}
+			var id string
+			if json.Unmarshal(item[1], &id) == nil && id == promptID {
+				return true
+			}
+		}
 		return false
 	}
-	for _, it := range q.Running {
-		var item []json.RawMessage
-		if json.Unmarshal(it, &item) != nil || len(item) < 2 {
-			continue
-		}
-		var id string
-		if json.Unmarshal(item[1], &id) == nil && id == promptID {
-			return true
-		}
+	switch {
+	case has(*q.Running):
+		return queueRunning
+	case has(*q.Pending):
+		return queuePending
 	}
-	return false
+	return queueAbsent
 }
 
 // ---- 输出文件 ----
@@ -606,13 +790,7 @@ func (r *Runs) OpenFile(ctx context.Context, req GetRequest, index int) (*File, 
 	if err != nil {
 		return nil, err
 	}
-	if !rt.reachable {
-		if _, _, err := r.get(ctx, rt, req); err != nil { // 归属优先：别人的运行 → not_found
-			return nil, err
-		}
-		return nil, errNotRunning
-	}
-	_, files, err := r.get(ctx, rt, req)
+	_, files, err := r.get(ctx, rt, req, true)
 	if err != nil {
 		return nil, err
 	}

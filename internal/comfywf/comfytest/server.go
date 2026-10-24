@@ -3,10 +3,13 @@
 //
 // 端点与真实 ComfyUI（v0.3.60）的响应形状一致：
 //   - GET  /system_stats        200 {}
-//   - POST /prompt              记录提交；默认 200 {"prompt_id", "number", "node_errors": {}}；RejectPrompts 后 400 + node_errors
-//   - GET  /history/{prompt_id} 按 SetHistory：排队 / 运行中 → {}；完成 → outputs + status.completed；出错 → status_str = error
-//   - GET  /queue               Running 的放 queue_running，Queued 的放 queue_pending
-//   - GET  /view                默认 1×1 PNG（Content-Type: image/png）；SetView 可换成大 body / 不带长度
+//   - POST /prompt              记录提交；默认 200 {"prompt_id", "number", "node_errors": {}}；RejectPrompts / RejectMissingNode
+//     后 400；缺 prompt → 400 no_prompt（node_errors 是数组，同真实 ComfyUI）
+//   - GET  /history/{prompt_id} 按 SetHistory：排队 / 运行中 → {}；完成 → outputs + status.completed；出错 / 中断 → status_str = error。
+//     条目里的 prompt 字段回显真实提交的 prompt 与 client_id
+//   - GET  /queue               Running 的放 queue_running，Queued 的放 queue_pending（元素同真实形状 [number, id, prompt, extra, outputs]）
+//   - GET  /view                只认某个 Done 条目里的文件（否则 404）；默认 1×1 PNG，Content-Type 按扩展名猜（同 mimetypes）、
+//     带 Content-Disposition: filename="…"；SetView 可换成任意类型 / 大 body / 不带长度
 //   - POST /upload/image        multipart image + subfolder + overwrite → {name, subfolder, type: "input"}
 package comfytest
 
@@ -17,9 +20,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -41,11 +46,12 @@ type File struct {
 	Type      string `json:"type"`
 }
 
-// HistoryState 某个 prompt 的状态。Files 只对 Done 有意义，Message 只对 Error 有意义。
+// HistoryState 某个 prompt 的状态。Files 只对 Done 有意义，Message / Interrupted 只对 Error 有意义。
 type HistoryState struct {
-	State   string
-	Files   []File
-	Message string
+	State       string
+	Files       []File
+	Message     string
+	Interrupted bool // execution_interrupted（用户在 ComfyUI 里取消）而不是 execution_error
 }
 
 // QueuedState 已提交、尚未开始（history 为空，在 queue_pending 里）。
@@ -59,6 +65,9 @@ func DoneState(files ...File) HistoryState { return HistoryState{State: Done, Fi
 
 // ErrorState 执行失败（execution_error.exception_message = msg）。
 func ErrorState(msg string) HistoryState { return HistoryState{State: Error, Message: msg} }
+
+// InterruptedState 被中断（status_str = error，messages 里是 execution_interrupted）。
+func InterruptedState() HistoryState { return HistoryState{State: Error, Interrupted: true} }
 
 // PNG 一个 type = output 的图片输出。
 func PNG(name string) File { return File{Filename: name, Type: "output"} }
@@ -120,7 +129,16 @@ type entry struct {
 	state      HistoryState
 	outputNode string
 	number     int
+	prompt     json.RawMessage // 提交的 prompt 原文（SetHistory 建的条目为 {}）
+	clientID   string
 }
+
+// reject 的种类。
+const (
+	rejectNone = iota
+	rejectNode
+	rejectMissingNode
+)
 
 // Server 假 ComfyUI。零值不可用，用 New。
 type Server struct {
@@ -128,6 +146,7 @@ type Server struct {
 	prompts    []Prompt
 	entries    map[string]*entry
 	byClient   map[string]string
+	rejectKind int
 	reject     string
 	uploads    []Upload
 	uploadName string
@@ -152,7 +171,7 @@ func (s *Server) SetHistory(promptID string, h HistoryState) {
 	defer s.mu.Unlock()
 	e := s.entries[promptID]
 	if e == nil {
-		e = &entry{outputNode: "9", number: len(s.entries)}
+		e = &entry{outputNode: "9", number: len(s.entries), prompt: json.RawMessage(`{}`)}
 		s.entries[promptID] = e
 	}
 	h.Files = slices.Clone(h.Files)
@@ -177,7 +196,21 @@ func (s *Server) PromptIDForClient(clientID string) string {
 func (s *Server) RejectPrompts(msg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.reject = msg
+	s.rejectKind, s.reject = rejectNode, msg
+	if msg == "" {
+		s.rejectKind = rejectNone
+	}
+}
+
+// RejectMissingNode 之后的 POST /prompt 返回 400 missing_node_type（node_errors 为空，消息在 error.message / details，
+// 同 ComfyUI 遇到未安装的自定义节点）；nodeType 为空恢复正常。
+func (s *Server) RejectMissingNode(nodeType string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rejectKind, s.reject = rejectMissingNode, nodeType
+	if nodeType == "" {
+		s.rejectKind = rejectNone
+	}
 }
 
 // SetUploadName 之后 /upload/image 返回的 name 固定为 name（测试平台对返回名的校验）；空 = 原样返回上传的文件名。
@@ -233,7 +266,7 @@ func (s *Server) Reset() {
 	defer s.mu.Unlock()
 	s.prompts, s.uploads, s.views, s.requests = nil, nil, nil, nil
 	s.entries, s.byClient = map[string]*entry{}, map[string]string{}
-	s.reject, s.uploadName, s.view = "", "", ViewConfig{}
+	s.rejectKind, s.reject, s.uploadName, s.view = rejectNone, "", "", ViewConfig{}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -264,14 +297,30 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 		Prompt   json.RawMessage `json:"prompt"`
 		ClientID string          `json:"client_id"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&req); err != nil || len(req.Prompt) == 0 {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&req); err != nil {
 		jsonOut(w, http.StatusBadRequest)
-		io.WriteString(w, `{"error":{"type":"invalid_prompt","message":"Cannot parse prompt","details":"","extra_info":{}},"node_errors":{}}`)
+		io.WriteString(w, `{"error":{"type":"invalid_prompt","message":"Cannot parse prompt","details":"","extra_info":{}},"node_errors":[]}`)
+		return
+	}
+	if len(req.Prompt) == 0 || string(req.Prompt) == "null" {
+		jsonOut(w, http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"type":"no_prompt","message":"No prompt provided","details":"No prompt provided","extra_info":{}},"node_errors":[]}`)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.reject != "" {
+	if s.rejectKind == rejectMissingNode {
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{"type": "missing_node_type",
+				"message": fmt.Sprintf("Node '%s' not found. The custom node may not be installed.", s.reject),
+				"details": "Node ID '#12'", "extra_info": map[string]any{"node_id": "12", "class_type": s.reject, "node_title": s.reject}},
+			"node_errors": map[string]any{},
+		})
+		jsonOut(w, http.StatusBadRequest)
+		w.Write(body)
+		return
+	}
+	if s.rejectKind == rejectNode {
 		body, _ := json.Marshal(map[string]any{
 			"error": map[string]any{"type": "prompt_outputs_failed_validation", "message": "Prompt outputs failed validation", "details": "", "extra_info": map[string]any{}},
 			"node_errors": map[string]any{"4": map[string]any{
@@ -285,7 +334,8 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 	id := uuid()
 	n := len(s.prompts)
 	s.prompts = append(s.prompts, Prompt{ID: id, ClientID: req.ClientID, Prompt: append(json.RawMessage(nil), req.Prompt...)})
-	s.entries[id] = &entry{state: QueuedState(), outputNode: outputNode(req.Prompt), number: n}
+	s.entries[id] = &entry{state: QueuedState(), outputNode: outputNode(req.Prompt), number: n,
+		prompt: append(json.RawMessage(nil), req.Prompt...), clientID: req.ClientID}
 	if req.ClientID != "" {
 		s.byClient[req.ClientID] = id
 	}
@@ -325,12 +375,13 @@ func (s *Server) history(w http.ResponseWriter, id string) {
 	s.mu.Lock()
 	e := s.entries[id]
 	var st HistoryState
-	var node string
-	var number int
+	var cp entry
 	if e != nil {
-		st, node, number = e.state, e.outputNode, e.number
+		cp = *e
+		st = e.state
 		st.Files = slices.Clone(st.Files)
 	}
+	node := cp.outputNode
 	s.mu.Unlock()
 	jsonOut(w, http.StatusOK)
 	if e == nil || (st.State != Done && st.State != Error) {
@@ -345,7 +396,7 @@ func (s *Server) history(w http.ResponseWriter, id string) {
 		images[i] = f
 	}
 	item := map[string]any{
-		"prompt": []any{number, id, map[string]any{}, map[string]any{"client_id": ""}, []string{node}},
+		"prompt": cp.queueItem(id),
 		"meta":   map[string]any{},
 	}
 	if st.State == Done {
@@ -359,11 +410,14 @@ func (s *Server) history(w http.ResponseWriter, id string) {
 			[]any{"execution_success", map[string]any{"prompt_id": id}},
 		}}
 	} else {
+		last := []any{"execution_error", map[string]any{"prompt_id": id, "node_id": "3", "node_type": "KSampler",
+			"exception_message": st.Message, "exception_type": "RuntimeError", "traceback": []string{}}}
+		if st.Interrupted {
+			last = []any{"execution_interrupted", map[string]any{"prompt_id": id, "node_id": "3", "node_type": "KSampler", "executed": []string{}}}
+		}
 		item["outputs"] = map[string]any{}
 		item["status"] = map[string]any{"status_str": "error", "completed": false, "messages": []any{
-			[]any{"execution_start", map[string]any{"prompt_id": id}},
-			[]any{"execution_error", map[string]any{"prompt_id": id, "node_id": "3", "node_type": "KSampler",
-				"exception_message": st.Message, "exception_type": "RuntimeError", "traceback": []string{}}},
+			[]any{"execution_start", map[string]any{"prompt_id": id}}, last,
 		}}
 	}
 	body, _ := json.Marshal(map[string]any{id: item})
@@ -374,7 +428,7 @@ func (s *Server) queue(w http.ResponseWriter) {
 	s.mu.Lock()
 	running, pending := []any{}, []any{}
 	for id, e := range s.entries {
-		item := []any{e.number, id, map[string]any{}, map[string]any{}, []string{e.outputNode}}
+		item := e.queueItem(id)
 		switch e.state.State {
 		case Running:
 			running = append(running, item)
@@ -388,12 +442,48 @@ func (s *Server) queue(w http.ResponseWriter) {
 	w.Write(body)
 }
 
+// queueItem 真实 ComfyUI 的队列项 / history 条目 prompt 字段：[number, prompt_id, prompt, extra_data, outputs_to_execute]。
+func (e entry) queueItem(id string) []any {
+	prompt := e.prompt
+	if len(prompt) == 0 {
+		prompt = json.RawMessage(`{}`)
+	}
+	return []any{e.number, id, prompt, map[string]any{"client_id": e.clientID}, []string{e.outputNode}}
+}
+
+// hasOutput 文件是否出现在某个 Done 条目里（真实 ComfyUI 的 /view 只能取到磁盘上已有的文件）。
+func (s *Server) hasOutput(q url.Values) bool {
+	f := File{Filename: q.Get("filename"), Subfolder: q.Get("subfolder"), Type: cmp.Or(q.Get("type"), "output")}
+	for _, e := range s.entries {
+		if e.state.State != Done {
+			continue
+		}
+		for _, x := range e.state.Files {
+			if x.Type == "" {
+				x.Type = "output"
+			}
+			if x == f {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s *Server) serveView(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
 	s.mu.Lock()
-	s.views = append(s.views, cloneValues(r.URL.Query()))
+	s.views = append(s.views, cloneValues(q))
 	v := s.view
+	found := s.hasOutput(q)
 	s.mu.Unlock()
-	w.Header().Set("Content-Type", cmp.Or(v.ContentType, "image/png"))
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	name := q.Get("filename")
+	w.Header().Set("Content-Type", cmp.Or(v.ContentType, mime.TypeByExtension(path.Ext(name)), "application/octet-stream"))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("filename=%q", name))
 	status := v.Status
 	if status == 0 {
 		status = http.StatusOK
