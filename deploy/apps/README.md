@@ -46,6 +46,7 @@ platform admin app import deploy/apps
 - `install`：下载模型等一次性准备，必须幂等（spec 或变量变了会重跑；已下载的文件要能跳过）。用 `spark_status <phase> <progress> <message>` 汇报进度（phase 一般是 `download` / `install`，progress 0～100）。
 - `start`：把服务放后台启动、把服务进程 PID 写进 `$SPARK_APP_DIR/service.pid`，然后自己退出。服务只监听 `127.0.0.1:$SPARK_PORT`（平台经容器内回环访问）。
 - `stop`（可选）：额外的清理；服务进程与整个进程组由 `run.sh` 负责杀掉。
+- 镜像环境：镜像的 Docker `ENV`（`CUDA_HOME`、`LD_LIBRARY_PATH`、`PATH` 等）由平台写进 `image.env` 并先于 `env` 加载，脚本里不必再手工 export（需要 Agent 新版 init.sh；读不到时平台日志有 warn）。
 - 变量：`env` 里的平台保留变量（`SPARK_APP_DIR`、`SPARK_DATA_DIR`、`SPARK_PORT`、`SPARK_MODELS_DIR`、`HF_ENDPOINT`、`MODELSCOPE_CACHE` 等）与 spec 里声明的用户变量都已导出；未填的可选变量不会出现，引用时写 `${NAME:-}`。
 - 只用 POSIX sh（Ubuntu 的 `/bin/sh` 是 dash），不要写 bash 语法。
 

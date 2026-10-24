@@ -1220,3 +1220,56 @@ func TestRunnerHealthExecErrorBackoff(t *testing.T) {
 		t.Fatalf("recovered = %+v", got)
 	}
 }
+
+// TestRunnerImageEnv（验收缺陷 A-1）：部署前读容器里的镜像环境文件，过滤后作为 image.env（0600）随包下发，
+// 应用进程拿得到镜像变量；文件不在（旧版 Agent / 实例没重启过）→ 照常部署、不带 image.env、记一条 warn。
+func TestRunnerImageEnv(t *testing.T) {
+	environ := filepath.Join(t.TempDir(), "spark-image.environ")
+	re := newRunnerEnv(t, 1, func(c *appdeploy.RunnerConfig) { c.ImageEnviron = environ })
+	if err := os.WriteFile(environ, []byte("PATH=/usr/local/cuda/bin:"+os.Getenv("PATH")+"\x00CUDA_HOME=/usr/local/cuda\x00HOME=/root\x00SPARK_APP=evil\x00MODEL_ID=img\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := re.publishedApp("vllm", runnerSpec(8000), `#!/bin/sh
+case "$1" in
+  install) ;;
+  start)
+    printf '%s|%s|%s\n' "${CUDA_HOME:-}" "$MODEL_ID" "$SPARK_APP" > "$SPARK_APP_DIR/seen"
+    sleep 100000 </dev/null >/dev/null 2>&1 &
+    echo $! > "$SPARK_APP_DIR/service.pid" ;;
+esac
+`, []int64{re.imageID})
+	inst := re.instance()
+	d := re.create(inst, a.ID, nil)
+	re.until(d.ID, appdeploy.StateRunning)
+	dir := re.dir(inst.ID, "vllm")
+	ie, err := os.ReadFile(filepath.Join(dir, "image.env"))
+	st, _ := os.Stat(filepath.Join(dir, "image.env"))
+	if err != nil || st.Mode().Perm() != 0o600 || !strings.Contains(string(ie), "export CUDA_HOME='/usr/local/cuda'\n") ||
+		strings.Contains(string(ie), "HOME='/root'") || strings.Contains(string(ie), "SPARK_APP") {
+		t.Fatalf("image.env = %q %v %v", ie, st, err)
+	}
+	if seen, _ := os.ReadFile(filepath.Join(dir, "seen")); string(seen) != "/usr/local/cuda|Qwen/Qwen3-8B|vllm\n" {
+		t.Fatalf("app saw %q", seen)
+	}
+	if strings.Contains(re.logs.String(), "cannot read image environment") {
+		t.Fatalf("unexpected warn:\n%s", re.logs.String())
+	}
+
+	// 文件不在：照常部署到 running，不带 image.env（上一次的保留），一条 warn
+	os.Remove(environ)
+	os.Remove(filepath.Join(dir, "image.env"))
+	if _, err := re.svc.Redeploy(re.ctx, appdeploy.RedeployRequest{UserID: re.userID, InstanceID: inst.ID, DeploymentID: d.ID}); err != nil {
+		t.Fatal(err)
+	}
+	re.until(d.ID, appdeploy.StateInstalling)
+	re.until(d.ID, appdeploy.StateRunning)
+	if _, err := os.Stat(filepath.Join(dir, "image.env")); err == nil {
+		t.Fatal("image.env written although the image environment was unreadable")
+	}
+	if !strings.Contains(re.logs.String(), "cannot read image environment") {
+		t.Fatalf("no warn:\n%s", re.logs.String())
+	}
+	if seen, _ := os.ReadFile(filepath.Join(dir, "seen")); string(seen) != "|Qwen/Qwen3-8B|vllm\n" {
+		t.Fatalf("app saw %q", seen)
+	}
+}

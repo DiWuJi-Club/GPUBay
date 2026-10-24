@@ -264,6 +264,11 @@ ALTER TABLE machines ADD COLUMN cached_images TEXT[] NOT NULL DEFAULT '{}', ADD 
   app.sh          版本脚本：子命令 install / start / stop（stop 可选，缺省按 service.pid 杀进程组）
   spec.json       版本 spec（供 app.sh 读取端口等）
   env             变量文件（0600，§3.3）
+  image.env       镜像环境（0600，验收缺陷 A-1 增补）：镜像的 Docker ENV（CUDA_HOME、LD_LIBRARY_PATH、PATH …）。平台经
+                  sshd 执行 run.sh，会话不继承这些变量；Agent 的 init.sh 在 exec sshd 前把入口进程的环境拷到
+                  /run/spark-image.environ，Runner 部署前读它（base64），过滤（名字合法、去掉 HOME / PWD / SHLVL / IFS /
+                  bash 只读变量 / SPARK_* 等，≤ 256 项、≤ 64KB）后随包下发；run.sh 先加载 image.env 再加载 env，同名以
+                  env 为准。读不到（旧 Agent、实例升级后没重启过）→ 照常部署、不带 image.env、平台记 warn
   status.json     run.sh 写：{"seq":N,"state":"installing|running|stopped|failed","phase":"download","progress":42,"message":"...","pid":<run.sh 进程组>,"service_pid":<服务>,"spec_hash":"...","exit_code":0,"at":"<ISO8601>"}
   log             本次部署 run.sh 与 app.sh 的合并输出（每次 deploy 先把上一次的 log 改名为 log.1，新 log 开头写分隔行
                   "==== deploy #N <时间> ===="）；平台（status 轮询、「查看日志」）只读 log
@@ -277,8 +282,8 @@ ALTER TABLE machines ADD COLUMN cached_images TEXT[] NOT NULL DEFAULT '{}', ADD 
 ```
 数据盘放在 `/root/data` 下是有意的：可写层没有限额也不持久，模型与日志都该在数据盘上；实例停机再启动后文件仍在。
 
-部署包 = tar（`run.sh`、`app.sh`、`spec.json`、`env`），平台在内存里生成，经一条 exec 上传：
-`mkdir -p <dir> && chmod 700 <dir> && tar -x -C <dir> -f - && chmod 600 <dir>/env`（tar 内容走 stdin，≤ 256KB）。目录路径由 `slug` 推导，slug 已限定 `[a-z0-9-]`，命令行里没有任何用户输入。
+部署包 = tar（`run.sh`、`app.sh`、`spec.json`、`env`，读到镜像环境时加 `image.env`），平台在内存里生成，经一条 exec 上传：
+`mkdir -p <dir> && chmod 700 <dir> && tar -x -C <dir> -f - && chmod 600 <dir>/env && { [ ! -e <dir>/image.env ] || chmod 600 <dir>/image.env; }`（tar 内容走 stdin，≤ 256KB）。目录路径由 `slug` 推导，slug 已限定 `[a-z0-9-]`，命令行里没有任何用户输入。
 
 ### 5.2 `run.sh`（平台内置，固定）
 子命令：

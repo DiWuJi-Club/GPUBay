@@ -143,7 +143,7 @@ func TestRunShSyntax(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("sh -n: %v\n%s", err, out)
 	}
-	for _, f := range []string{"testdata/app_ok.sh", "testdata/app_fail.sh"} {
+	for _, f := range []string{"testdata/app_ok.sh", "testdata/app_fail.sh", "testdata/app_env.sh"} {
 		if out, err := exec.Command("/bin/sh", "-n", f).CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v %s", f, err, out)
 		}
@@ -360,6 +360,43 @@ func TestRunShEnvIsNotEvaluated(t *testing.T) {
 	b.waitState("running")
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("env value was executed")
+	}
+}
+
+// image.env（镜像 ENV）先于 env 加载：镜像变量进 install / start 的环境；同名变量以 env 为准（平台保留变量、用户变量）；
+// PATH 取镜像的，仍以应用目录打头（spark_status 可用）；值原样还原、不被求值。没有 image.env 时照旧（其余用例）。
+func TestRunShImageEnvLoadedBeforeEnv(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "pwned")
+	b := newBox(t, "app_env.sh", nil)
+	imgPath := "/opt/img/bin:" + os.Getenv("PATH")
+	kvs := []appdeploy.EnvKV{{"CUDA_HOME", "/usr/local/cuda"}, {"PATH", imgPath}, {"MODEL_ID", "from-image"}, {"SPARK_PORT", "1"},
+		{"HF_ENDPOINT", "https://image.example"}, {"TRITON_X", "$(touch " + marker + ")'`x`"}}
+	if err := os.WriteFile(filepath.Join(b.dir, "image.env"), appdeploy.RenderImageEnv(kvs), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b.run("deploy")
+	b.waitState("running")
+	for _, f := range []string{"install.env", "start.env"} {
+		data, err := os.ReadFile(filepath.Join(b.dir, f))
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", f, err, b.log())
+		}
+		got := map[string]string{}
+		for _, l := range strings.Split(string(data), "\n") {
+			if k, v, ok := strings.Cut(l, "="); ok {
+				got[k] = v
+			}
+		}
+		want := map[string]string{"CUDA_HOME": "/usr/local/cuda", "MODEL_ID": "Qwen/Qwen3-4B", "SPARK_PORT": "18000",
+			"HF_ENDPOINT": "https://hf-mirror.com", "TRITON_X": "$(touch " + marker + ")'`x`", "PATH": b.dir + ":" + imgPath}
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("%s: %s = %q, want %q", f, k, got[k], v)
+			}
+		}
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("image.env value was executed")
 	}
 }
 

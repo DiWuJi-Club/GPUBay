@@ -4,6 +4,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -93,10 +96,89 @@ func TestBundleContents(t *testing.T) {
 	}
 }
 
+// 读到了镜像环境（哪怕是空的）→ 包里带 image.env（0600）；名字不合规的行不写出（纵深防御）。
+func TestBundleImageEnv(t *testing.T) {
+	s := goodSpec()
+	in := appdeploy.BundleInput{Slug: "vllm", InstanceID: "ins-aaaaaaaa", AppRoot: "/root/data", SpecHash: "abc", Spec: s, Script: "echo hi\n",
+		ImageEnv: []appdeploy.EnvKV{{"CUDA_HOME", "/usr/local/cuda"}, {"Q", "it's"}, {"X; touch /tmp/p", "x"}}}
+	files := map[string]string{}
+	modes := map[string]int64{}
+	var names []string
+	b, err := appdeploy.Bundle(in, []byte("#!/bin/sh\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(bytes.NewReader(b))
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(tr)
+		names = append(names, h.Name)
+		files[h.Name], modes[h.Name] = string(body), h.Mode
+	}
+	if strings.Join(names, ",") != "run.sh,app.sh,spec.json,env,image.env" || modes["image.env"] != 0o600 {
+		t.Fatalf("entries = %v modes = %v", names, modes)
+	}
+	if got, want := files["image.env"], "export CUDA_HOME='/usr/local/cuda'\nexport Q='it'\\''s'\n"; got != want {
+		t.Fatalf("image.env = %q, want %q", got, want)
+	}
+	in.ImageEnv = []appdeploy.EnvKV{}
+	if b, err = appdeploy.Bundle(in, []byte("#!/bin/sh\n")); err != nil || !bytes.Contains(b, []byte("image.env")) {
+		t.Fatalf("empty image env must still write image.env: %v", err)
+	}
+}
+
 func TestUploadCommand(t *testing.T) {
 	got := appdeploy.UploadCommand(appdeploy.AppDir("/root/data", "vllm"))
-	want := "mkdir -p '/root/data/.spark-apps/vllm' && chmod 700 '/root/data/.spark-apps/vllm' && tar -x -C '/root/data/.spark-apps/vllm' -f - && chmod 600 '/root/data/.spark-apps/vllm/env'"
+	want := "mkdir -p '/root/data/.spark-apps/vllm' && chmod 700 '/root/data/.spark-apps/vllm' && tar -x -C '/root/data/.spark-apps/vllm' -f - && chmod 600 '/root/data/.spark-apps/vllm/env'" +
+		" && { [ ! -e '/root/data/.spark-apps/vllm/image.env' ] || chmod 600 '/root/data/.spark-apps/vllm/image.env'; }"
 	if got != want {
 		t.Fatalf("UploadCommand =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// 真跑上传命令：有 / 没有 image.env 都成功退出，env 与 image.env 都是 0600（tar 不保留权限时也由 chmod 补上）。
+func TestUploadCommandRuns(t *testing.T) {
+	s := goodSpec()
+	in := appdeploy.BundleInput{Slug: "vllm", InstanceID: "ins-aaaaaaaa", AppRoot: "/root/data", SpecHash: "abc", Spec: s, Script: "echo hi\n"}
+	for _, tc := range []struct {
+		name     string
+		imageEnv []appdeploy.EnvKV
+		stale    bool // 目录里已有上一次的 image.env
+	}{{"without", nil, false}, {"with", []appdeploy.EnvKV{{"CUDA_HOME", "/usr/local/cuda"}}, false}, {"stale", nil, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), ".spark-apps", "vllm")
+			if tc.stale {
+				os.MkdirAll(dir, 0o700)
+				os.WriteFile(filepath.Join(dir, "image.env"), []byte("export A='1'\n"), 0o644)
+			}
+			in.ImageEnv = tc.imageEnv
+			b, err := appdeploy.Bundle(in, []byte("#!/bin/sh\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/sh", "-c", "umask 022; "+appdeploy.UploadCommand(dir))
+			cmd.Stdin = bytes.NewReader(b)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("upload: %v %s", err, out)
+			}
+			for _, f := range []string{"env", "image.env"} {
+				st, err := os.Stat(filepath.Join(dir, f))
+				if f == "image.env" && tc.imageEnv == nil && !tc.stale {
+					if err == nil {
+						t.Fatal("image.env created without image environment")
+					}
+					continue
+				}
+				if err != nil || st.Mode().Perm() != 0o600 {
+					t.Fatalf("%s: %v %v", f, st, err)
+				}
+			}
+		})
 	}
 }

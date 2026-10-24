@@ -1,7 +1,7 @@
 #!/bin/sh
 # Spark Cloud 应用运行时（平台内置，随部署包下发；用户不要修改，重新部署会覆盖）。
 # 用法：sh run.sh deploy|start|stop|status|remove
-# 约定：本文件与 app.sh / spec.json / env 同目录；状态写 status.json（原子），输出追加到 log；
+# 约定：本文件与 app.sh / spec.json / env（/ image.env）同目录；状态写 status.json（原子），输出追加到 log；
 #       app.sh 的子命令 install / start / stop，start 必须把服务放后台并把 PID 写进 service.pid。
 # 只用 POSIX sh（Ubuntu 的 /bin/sh 是 dash），不要写 bash 语法；日志行用 printf（dash 的 echo 会解释反斜杠）。
 set -u
@@ -16,6 +16,10 @@ STOP_APP_S=5 STOP_GROUP_DS=100 STOP_PID_DS=20      # stop / remove（DS = 0.1 �
 DEPLOY_APP_S=2 DEPLOY_GROUP_DS=40 DEPLOY_PID_DS=10 # deploy 前停旧的
 
 load_env() {
+  # image.env = 镜像的 Docker ENV（CUDA_HOME、LD_LIBRARY_PATH、PATH …；平台经 SSH 执行本脚本，会话里没有这些），平台部署前从
+  # 容器读出、过滤后随包下发；先加载它，再加载 env（平台保留变量与用户变量），同名以 env 为准
+  # shellcheck disable=SC1091
+  [ -f "$DIR/image.env" ] && . "$DIR/image.env"
   # shellcheck disable=SC1091
   [ -f "$DIR/env" ] && . "$DIR/env"
   : "${SPARK_APP_DIR:=$DIR}" "${SPARK_DATA_DIR:=/root/data}" "${SPARK_PORT:=0}" "${SPARK_SPEC_HASH:=}" "${SPARK_TIMEOUT_S:=3600}"

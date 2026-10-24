@@ -17,6 +17,9 @@ type BundleInput struct {
 	Env, Secret                         map[string]string
 	HealthAddr                          string // 空 = 127.0.0.1:<主端口>
 	HFEndpoint, PipIndexURL             string
+	// ImageEnv 镜像环境（imageenv.go）：非 nil（含空切片）时包里带 image.env（0600）；nil = 没读到，不带 image.env
+	// （目录里上一次部署留下的 image.env 保留：同一实例的镜像不会变）。
+	ImageEnv []EnvKV
 }
 
 func AppDir(appRoot, slug string) string { return path.Join(appRoot, AppDirName, slug) }
@@ -41,7 +44,8 @@ func ReservedEnv(in BundleInput) []EnvKV {
 	}
 }
 
-// Bundle 生成部署包 tar（run.sh 0755、app.sh 0644、spec.json 0644、env 0600；mtime 固定为 0，输出可重复）。
+// Bundle 生成部署包 tar（run.sh 0755、app.sh 0644、spec.json 0644、env 0600、读到镜像环境时 image.env 0600；
+// mtime 固定为 0，输出可重复）。
 func Bundle(in BundleInput, runSH []byte) ([]byte, error) {
 	if !ValidSlug(in.Slug) {
 		return nil, errors.New("appdeploy: bad slug")
@@ -58,13 +62,18 @@ func Bundle(in BundleInput, runSH []byte) ([]byte, error) {
 		return nil, err
 	}
 	env := RenderEnv(ReservedEnv(in), user)
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	for _, f := range []struct {
+	type entry struct {
 		name string
 		mode int64
 		body []byte
-	}{{"run.sh", 0o755, runSH}, {"app.sh", 0o644, []byte(in.Script)}, {"spec.json", 0o644, specJSON}, {"env", 0o600, env}} {
+	}
+	entries := []entry{{"run.sh", 0o755, runSH}, {"app.sh", 0o644, []byte(in.Script)}, {"spec.json", 0o644, specJSON}, {"env", 0o600, env}}
+	if in.ImageEnv != nil {
+		entries = append(entries, entry{"image.env", 0o600, RenderImageEnv(in.ImageEnv)})
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, f := range entries {
 		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: f.name, Mode: f.mode, Size: int64(len(f.body)), Uid: 0, Gid: 0, Format: tar.FormatPAX}); err != nil {
 			return nil, err
 		}
@@ -82,7 +91,9 @@ func Bundle(in BundleInput, runSH []byte) ([]byte, error) {
 }
 
 // UploadCommand 上传部署包的固定命令；dir 只由 AppRoot 与 slug 拼出，命令行里没有任何用户输入；仍按单引号转义，AppRoot 配置异常也不会被 sh 解释。
+// image.env 不一定在（本次没读到镜像环境、之前也没有）：在才 chmod。
 func UploadCommand(dir string) string {
-	q := ShellQuote(dir)
-	return "mkdir -p " + q + " && chmod 700 " + q + " && tar -x -C " + q + " -f - && chmod 600 " + ShellQuote(dir+"/env")
+	q, ie := ShellQuote(dir), ShellQuote(dir+"/image.env")
+	return "mkdir -p " + q + " && chmod 700 " + q + " && tar -x -C " + q + " -f - && chmod 600 " + ShellQuote(dir+"/env") +
+		" && { [ ! -e " + ie + " ] || chmod 600 " + ie + "; }"
 }

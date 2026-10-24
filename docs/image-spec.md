@@ -19,6 +19,7 @@ Agent 创建容器时用 `--entrypoint /.spark/init.sh` 覆盖镜像入口：`in
 - SSH 端口 22 发布到机器内网 IP 的上游 SSH 端口（`SPARK_UPSTREAM_SSH_PORT`，默认 2222）；用户经平台 SSH 网关（`ssh ins-xxxxxxxx@ssh.<domain>`）登录，Web 端口经平台入口访问，都只由控制面持有的上游私钥连入。
 - sftp 由 sshd 内置实现（`Subsystem sftp internal-sftp`）提供，镜像**不需要** `openssh-sftp-server`；`scp`（OpenSSH ≥ 9 默认走 SFTP）、`sftp`、`rsync` 都可用。
 - 容器主机密钥由平台生成并随开通指令下发（`/.spark/hostkeys/`），平台登录容器时固定校验它；镜像里不得包含 `/etc/ssh/ssh_host_*`。
+- 镜像的 `ENV` 只在容器入口进程里：SSH 会话（用户登录、平台执行的应用部署）由 sshd 重建环境，没有 `CUDA_HOME`、`LD_LIBRARY_PATH` 等。`init.sh` 在启动 sshd 前把入口环境拷到 `/run/spark-image.environ`（`NAME=value\0…`），平台部署应用时据此生成 `image.env` 给应用进程；用户 SSH 会话目前仍拿不到（遗留，见 `docs/superpowers/followups-plan7.md`；需要的镜像可自带 `/etc/profile.d` 脚本）。应用镜像需要 `base64`、`head`（coreutils）。
 
 ## 登记
 后台「价格与镜像」里登记镜像地址（例如 `harbor.local/spark/cuda-ssh:13.0.1`）；上架或启用时平台会向所有在线机器广播预拉取。

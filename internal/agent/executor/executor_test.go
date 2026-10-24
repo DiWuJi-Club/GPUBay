@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -98,10 +99,18 @@ func TestCreateHappyPath(t *testing.T) {
 	}
 	init, _ := os.ReadFile(filepath.Join(ssh, "init.sh"))
 	for _, want := range []string{"#!/bin/sh", "HostKey /.spark/hostkeys/ssh_host_ed25519_key", "AuthorizedKeysFile /.spark/authorized_keys", "StrictModes no", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitRootLogin prohibit-password", "exec /usr/sbin/sshd -D -e",
-		"Subsystem sftp internal-sftp", "AllowTcpForwarding yes", "AllowStreamLocalForwarding no", "GatewayPorts no", "AllowAgentForwarding yes", "X11Forwarding no", "PermitTunnel no", "ClientAliveInterval 60", "ClientAliveCountMax 3", "MaxStartups 50:30:200", "MaxSessions 32"} {
+		"Subsystem sftp internal-sftp", "AllowTcpForwarding yes", "AllowStreamLocalForwarding no", "GatewayPorts no", "AllowAgentForwarding yes", "X11Forwarding no", "PermitTunnel no", "ClientAliveInterval 60", "ClientAliveCountMax 3", "MaxStartups 50:30:200", "MaxSessions 32",
+		// 镜像环境留给平台（appdeploy.DefaultImageEnviron，A-1），且在 exec sshd 之前（之后 PID 1 的 environ 被进程标题覆盖）
+		"cat /proc/$$/environ > /run/spark-image.environ 2>/dev/null || true\n"} {
 		if !strings.Contains(string(init), want) {
 			t.Fatalf("init.sh missing %q:\n%s", want, init)
 		}
+	}
+	if strings.Index(string(init), "/run/spark-image.environ") > strings.Index(string(init), "exec /usr/sbin/sshd") {
+		t.Fatalf("image environ must be saved before exec sshd:\n%s", init)
+	}
+	if out, err := exec.Command("/bin/sh", "-n", filepath.Join(ssh, "init.sh")).CombinedOutput(); err != nil {
+		t.Fatalf("init.sh syntax: %v %s", err, out)
 	}
 	if st, err := os.Stat(filepath.Join(ssh, "init.sh")); err != nil || st.Mode().Perm() != 0o755 {
 		t.Fatalf("init.sh perm = %v %v", st, err)

@@ -251,8 +251,9 @@ func (s *Service) appAndVersion(ctx context.Context, d Deployment) (App, Version
 	return app, ver, nil
 }
 
-// bundleFor 生成部署的部署包（run.sh + app.sh + spec.json + env）。healthAddr 非 nil 时覆盖 run.sh 的健康检查地址（测试）。
-func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, healthAddr func(port int) string) ([]byte, App, error) {
+// bundleFor 生成部署的部署包（run.sh + app.sh + spec.json + env，imageEnv 非 nil 时加 image.env）。
+// healthAddr 非 nil 时覆盖 run.sh 的健康检查地址（测试）。
+func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, healthAddr func(port int) string, imageEnv []EnvKV) ([]byte, App, error) {
 	app, ver, err := s.appAndVersion(ctx, d)
 	if err != nil {
 		return nil, App{}, err
@@ -262,7 +263,7 @@ func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, h
 		return nil, app, &bundleError{err}
 	}
 	in := BundleInput{Slug: app.Slug, InstanceID: d.InstanceID, AppRoot: appRoot, SpecHash: d.SpecHash, Spec: ver.Spec, Script: ver.Script,
-		Env: d.Env, Secret: secret, HFEndpoint: s.d.HFEndpoint, PipIndexURL: s.d.PipIndexURL}
+		Env: d.Env, Secret: secret, HFEndpoint: s.d.HFEndpoint, PipIndexURL: s.d.PipIndexURL, ImageEnv: imageEnv}
 	if healthAddr != nil && len(ver.Spec.Ports) > 0 {
 		in.HealthAddr = healthAddr(ver.Spec.Ports[0].Port)
 	}

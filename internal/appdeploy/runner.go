@@ -32,6 +32,8 @@ type RunnerConfig struct {
 	AppRootFor    func(instanceID string) string
 	HealthAddr    func(port int) string // run.sh 健康检查地址（测试注入）；nil = 127.0.0.1:<主端口>
 	MaxConcurrent int                   // 每轮 exec 并发上限；零值 = MaxExecPerRound（16）
+	// ImageEnviron 容器内镜像环境文件（Agent 的 init.sh 落下，见 imageenv.go）；空 = DefaultImageEnviron（测试注入）。
+	ImageEnviron string
 }
 
 // RunnerStats 是测试 / 运维用的计数。
@@ -62,6 +64,9 @@ func NewRunner(s *Service, up *upstream.Pool, cfg RunnerConfig) *Runner {
 	}
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = MaxExecPerRound
+	}
+	if cfg.ImageEnviron == "" {
+		cfg.ImageEnviron = DefaultImageEnviron
 	}
 	return &Runner{s: s, up: up, cfg: cfg, log: s.d.Log}
 }
@@ -497,9 +502,37 @@ func (r *Runner) deployBusy(ctx context.Context, d Deployment, ut upstream.Targe
 	})
 }
 
+// readImageEnv 读容器的镜像环境（验收缺陷 A-1，见 imageenv.go）。连接层错误原样返回（与上传一样按 unreachable 处理，
+// 反正上传也发不出去）；其余失败（文件不在：旧版 Agent 的 init.sh 不落文件、实例升级 Agent 后还没重启过；命令超时；
+// 输出不是 base64）记 warn 并返回 nil：照常部署，只是包里不带 image.env——镜像环境缺失只影响依赖它的应用，
+// 不应让所有部署都失败；目录里上一次部署留下的 image.env 保留（同一实例的镜像不会变）。
+func (r *Runner) readImageEnv(ctx context.Context, d Deployment, ut upstream.Target) ([]EnvKV, error) {
+	res, err := r.exec(ctx, ut, imageEnvironCmd(r.cfg.ImageEnviron), nil, ExecStatusTimeout)
+	if isDial(err) {
+		return nil, err
+	}
+	if err == nil && res.exit != 0 {
+		err = fmt.Errorf("exit %d", res.exit)
+	}
+	var kvs []EnvKV
+	if err == nil {
+		kvs, err = DecodeImageEnviron(res.stdout)
+	}
+	if err != nil {
+		r.log.Warn("appdeploy: cannot read image environment, deploying without image.env", "deployment", d.ID, "instance", d.InstanceID,
+			"path", r.cfg.ImageEnviron, "err", err)
+		return nil, nil
+	}
+	return kvs, nil
+}
+
 func (r *Runner) stepDeploy(ctx context.Context, d Deployment, ut upstream.Target, tg target, now time.Time) error {
 	root := r.appRoot(d.InstanceID)
-	bundle, app, err := r.s.bundleFor(ctx, d, root, r.cfg.HealthAddr)
+	imageEnv, err := r.readImageEnv(ctx, d, ut)
+	if isDial(err) {
+		return r.unreachable(ctx, d, tg, now, err, true)
+	}
+	bundle, app, err := r.s.bundleFor(ctx, d, root, r.cfg.HealthAddr, imageEnv)
 	dir := AppDir(root, app.Slug)
 	var be *bundleError
 	if errors.As(err, &be) { // 重新部署时旧服务可能还在跑：一并停掉
