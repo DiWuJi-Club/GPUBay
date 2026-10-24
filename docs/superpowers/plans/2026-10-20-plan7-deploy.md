@@ -4781,7 +4781,9 @@ vLLM「重新部署」→ `MODEL_ID = Qwen/Qwen3-8B`（约 16GB）→ 旧服务�
 
 - [ ] **Step 9: Agent 停机 / 容器不可达（§16.4 第 11 项）**
 
-协调人：`s systemctl stop spark-agent`（不停容器）→ 应用健康轮询照常（后台部署详情 `last_polled_at` 持续更新，`health ok`）；`docker stop <容器>`（`imac` 在 docker 组，不需要 root）→ 约 5 分钟（10 轮 × 30 秒）后三个部署 `failed(unreachable)`，后台告警恰一条 `app_deploy_unreachable`；`docker start <容器>` → `s systemctl start spark-agent` → 三个应用「重新部署」→ running（`skip install`）。记录 Agent 停机期间平台日志没有 `agent` 相关报错以外的异常。
+（按验收缺陷 A-3 修订：两个场景分开做，组合场景里 Agent 失联满 5 分钟会先暂停实例，Runner 跳过轮询，到不了 unreachable。）
+(a) Agent 在线，`docker stop <容器>`（`imac` 在 docker 组，不需要 root）→ `container_down` 告警；约 5 分钟（10 轮 × 30 秒）后三个部署 `failed(unreachable)`，后台告警恰一条 `app_deploy_unreachable`；`docker start <容器>` → 三个应用「重新部署」→ running（`skip install`）。
+(b) 协调人 `s systemctl stop spark-agent`（不停容器）→ 应用健康轮询照常（后台部署详情 `last_polled_at` 持续更新，`health ok`），失联满 5 分钟前 `s systemctl start spark-agent`。记录 Agent 停机期间平台日志没有 `agent` 相关报错以外的异常。
 
 - [ ] **Step 10: 安全（§16.4 第 12 项）**
 
@@ -4789,7 +4791,7 @@ vLLM「重新部署」→ `MODEL_ID = Qwen/Qwen3-8B`（约 16GB）→ 旧服务�
 
 - [ ] **Step 11: 对账无噪声（§16.4 第 13 项）**
 
-`$ADM/alerts?resolved=false`：只有第 9 步的一条 `app_deploy_unreachable`（处理掉）；`$PSQL -c "SELECT count(*) FROM ssh_sessions WHERE instance_id='<id>'"` 等于浏览器 / 手工 SSH 的次数（平台 exec 不产生会话行）。释放实例（为 Task 23 腾出唯一机器）→ 部署全部 `removed`，`instance_ports` 行随实例失效。
+`$ADM/alerts?resolved=false`：只有第 9 步 (a) 的 `container_down` 与 `app_deploy_unreachable` 各一条（处理掉）；`$PSQL -c "SELECT count(*) FROM ssh_sessions WHERE instance_id='<id>'"` 等于浏览器 / 手工 SSH 的次数（平台 exec 不产生会话行）。释放实例（为 Task 23 腾出唯一机器）→ 部署全部 `removed`，`instance_ports` 行随实例失效。
 
 - [ ] **Step 12: 记录与提交**
 

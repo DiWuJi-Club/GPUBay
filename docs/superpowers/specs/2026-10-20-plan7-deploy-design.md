@@ -575,9 +575,11 @@ NGC 标签 `25.09` 以实施时能拉到的最近版本为准（实施任务 2 �
 8. **停止 / 启动 / 停机恢复**：停止 vLLM → 端口链接仍在、`curl` 502；启动 → 恢复。`UPDATE instances SET expires_at = now() + interval '1 minute'` → 停机 → 三个应用显示「实例已停机」；续费 → 实例 running 后 3 分钟内三个应用自动回到运行中（不重新下载模型，日志里 `skip install`）。
 9. **ComfyUI**：新开一台实例（spark/comfyui，预装 `comfyui`，SDXL base）→ running ≤ 15 分钟 → 打开链接，加载默认工作流生成一张 512×512 图片，输出在 `/root/data/comfyui-output`；`nvidia-smi` 看到进程。（只有一台机器：先释放第 3 步的实例。）
 10. **卸载**：卸载 ComfyUI → 目录 `/root/data/.spark-apps/comfyui` 消失、端口 8188 从「Web 访问」消失、`/root/data/models` 仍在；再部署一次 → 跳过下载（`.installed` 没了但模型在，`modelscope download` 对已存在文件秒过），≤ 3 分钟 running。
-11. **Agent 停机 / 容器不可达**：负责人 `sudo systemctl stop spark-agent`（不停容器）→ 应用轮询照常（走 SSH，不经 Agent）；`docker stop <容器>`（模拟容器挂掉）→ 10 轮后部署 `failed(unreachable)`，告警一条；`docker start` 后 `systemctl start spark-agent`，重新部署成功。
+11. **容器不可达 / Agent 停机**（两个场景分开验证；验收缺陷 A-3：组合场景里 Agent 失联满 5 分钟必然先触发实例暂停，§6.3 跳过轮询，到不了 unreachable）：
+    - (a) **容器挂掉**：Agent 在线时 `docker stop <容器>`（Agent 不会自动拉起）→ `container_down` 告警（计划 3 既有）；10 轮（约 5 分钟）后部署 `failed(unreachable)`，`app_deploy_unreachable` 告警恰好一条；`docker start` 后逐个重新部署成功（`skip install`）。
+    - (b) **Agent 停机**：负责人 `sudo systemctl stop spark-agent`（不停容器）→ 应用轮询照常（走 SSH，不经 Agent），`last_polled_at` 持续更新、`health ok`；在失联满 5 分钟之前 `sudo systemctl start spark-agent`（满 5 分钟会 `machine_offline` 告警并暂停实例，属于计划 3 的行为，不是本项目标），部署不受影响。
 12. **安全**：在变量里填 `'; touch /tmp/pwned; '`（string 类型、无 pattern 的测试变量——用一个 draft 版本加一个 `NOTE` 变量）→ 部署成功、容器里 `env` 文件是 `export NOTE=''\''; touch /tmp/pwned; '\'''`，`/tmp/pwned` 不存在；后台部署详情里 secret 显示 `***`，日志尾部里 `API_KEY` 的值被替换为 `***`（vLLM 启动日志会打印 api-key 参数）；`iptables -S SPARK-FWD / SPARK-IN` 未变。
-13. **对账无噪声**：全过程后台告警只有第 11 步预期的一条；`ssh_sessions` 没有因平台 exec 产生用户会话行（exec 走上游池，不经网关）。
+13. **对账无噪声**：全过程后台告警只有第 11 步 (a) 预期的 `container_down` 与 `app_deploy_unreachable` 各一条；`ssh_sessions` 没有因平台 exec 产生用户会话行（exec 走上游池，不经网关）。
 
 验收记录写到 `docs/superpowers/acceptance-plan7.md`，格式同计划 6。
 
