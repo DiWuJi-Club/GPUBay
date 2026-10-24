@@ -240,3 +240,11 @@ func TestHasAnyOpenCommandAndPullBroadcast(t *testing.T) {
 		t.Fatalf("online ids = %v", ids)
 	}
 }
+
+// 整机建实例指令的载荷与计划 10 之前逐字节一致（ssh_port / share_slots 为 0 时省略），旧 Agent 与存量数据不受影响。
+func TestWholeMachineCreatePayloadJSONUnchanged(t *testing.T) {
+	b, err := json.Marshal(fleet.CreateInstancePayload{ImageRef: "img:1"})
+	if err != nil || string(b) != `{"image_ref":"img:1"}` {
+		t.Fatalf("payload = %s, %v", b, err)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,7 +56,7 @@ func TestCollectNeverFails(t *testing.T) {
 			return []byte(s), nil
 		}
 		return nil, errors.New("missing")
-	}}
+	}, IsMountPoint: mounted}
 	m, insts := c.Collect(context.Background(), []metrics.InstanceMount{{ID: "ins-a", DataDir: "/var/lib/spark-agent/mnt/ins-a"}})
 	if len(insts) != 1 || insts[0] != (metrics.InstanceMetrics{InstanceID: "ins-a", DataDiskUsed: 5}) {
 		t.Fatalf("instances = %+v", insts)
@@ -68,6 +69,42 @@ func TestCollectNeverFails(t *testing.T) {
 	}
 	if r.Lines() != "nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits\ndf -B1 --output=size,used /\ndf -B1 --output=size,used /var/lib/spark-agent/mnt/ins-a\nnvidia-smi --query-gpu=utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits\ndf -B1 --output=size,used /" {
 		t.Fatalf("calls:\n%s", r.Lines())
+	}
+}
+
+// mounted 把所有数据目录都当成已挂载（测试里的路径并不存在）。
+func mounted(string) bool { return true }
+
+// 数据目录不是挂载点（数据盘没挂上）：df 会报根分区，所以该实例与机器级数据盘已用都记 0，且不跑 df。
+func TestCollectUnmountedDataDirReportsZero(t *testing.T) {
+	plain := t.TempDir() // 普通目录，与上级同一设备
+	other := filepath.Join(t.TempDir(), "ins-b")
+	r := &cmdrun.Recorder{}
+	r.Stub("df -B1 --output=size,used /", "1B-blocks Used\n1000 900\n", nil)
+	r.Stub("df -B1 --output=size,used "+plain, "1B-blocks Used\n1000 900\n", nil)
+	r.Stub("df -B1 --output=size,used "+other, "1B-blocks Used\n2000 7\n", nil)
+	c := &metrics.Collector{Run: r, ReadFile: os.ReadFile}
+	m, insts := c.Collect(context.Background(), []metrics.InstanceMount{{ID: "ins-a", DataDir: plain}})
+	if m.DataDiskUsed != 0 || len(insts) != 1 || insts[0].DataDiskUsed != 0 {
+		t.Fatalf("unmounted dir: machine %d, instances %+v", m.DataDiskUsed, insts)
+	}
+	if strings.Contains(r.Lines(), plain) {
+		t.Fatalf("df ran on unmounted dir:\n%s", r.Lines())
+	}
+	// 注入的检查：只有 other 算已挂载。
+	c.IsMountPoint = func(dir string) bool { return dir == other }
+	m, insts = c.Collect(context.Background(), []metrics.InstanceMount{{ID: "ins-a", DataDir: plain}, {ID: "ins-b", DataDir: other}})
+	if m.DataDiskUsed != 7 || insts[0].DataDiskUsed != 0 || insts[1].DataDiskUsed != 7 {
+		t.Fatalf("mixed: machine %d, instances %+v", m.DataDiskUsed, insts)
+	}
+}
+
+func TestIsMountPoint(t *testing.T) {
+	if metrics.IsMountPoint(t.TempDir()) {
+		t.Fatal("ordinary temp dir reported as mount point")
+	}
+	if metrics.IsMountPoint(filepath.Join(t.TempDir(), "missing")) {
+		t.Fatal("missing dir reported as mount point")
 	}
 }
 
@@ -95,7 +132,7 @@ func TestCollectInstancesFromCgroup(t *testing.T) {
 	r.Stub("df -B1 --output=size,used /mnt/ins-a", "1B-blocks Used\n2000 100\n", nil)
 	r.Stub("df -B1 --output=size,used /mnt/ins-b", "1B-blocks Used\n2000 23\n", nil)
 	now := time.Unix(1000, 0)
-	c := &metrics.Collector{Run: r, ReadFile: os.ReadFile, Now: func() time.Time { return now }}
+	c := &metrics.Collector{Run: r, ReadFile: os.ReadFile, Now: func() time.Time { return now }, IsMountPoint: mounted}
 	mounts := []metrics.InstanceMount{
 		{ID: "ins-a", DataDir: "/mnt/ins-a", CgroupDir: dirA},
 		{ID: "ins-b", DataDir: "/mnt/ins-b", CgroupDir: dirB},

@@ -1085,6 +1085,8 @@ func (x *Heartbeat) GetInstances() []*InstanceMetrics {
 	return nil
 }
 
+// InstanceMetrics：各数值字段 0 表示「未知 / 采不到」，不代表真实用量为 0。例如 Agent 刚重启、
+// 容器 cgroup 目录尚未解析时内存 / CPU 为 0；CPU 首个样本为 0；数据盘未挂载（目录不是挂载点）时 data_disk_used 为 0。
 type InstanceMetrics struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	InstanceId    string                 `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`

@@ -114,6 +114,36 @@ func TestSelfcheckGPUViaRuntimeOrCDI(t *testing.T) {
 	}
 }
 
+// nproc 不足 / 读不出只告警、不让自检失败（只和已搁置的共享机有关）。
+func TestSelfcheckNprocOnlyWarns(t *testing.T) {
+	cases := []struct {
+		name string
+		stub func(r *cmdrun.Recorder)
+		want string
+	}{
+		{"few cpus", func(r *cmdrun.Recorder) { r.Stub("nproc", "2\n", nil) }, "WARN: nproc: 只有 2 个 CPU，少于 4"},
+		{"garbage", func(r *cmdrun.Recorder) { r.Stub("nproc", "x\n", nil) }, "WARN: nproc: 无法解析 nproc 输出"},
+		{"nproc error", func(r *cmdrun.Recorder) { r.Stub("nproc", "", errors.New("boom")) }, "WARN: nproc: boom"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &cmdrun.Recorder{}
+			r.Stub("docker info", `{"nvidia":{"path":"nvidia-container-runtime"}}`, nil)
+			r.Stub("ufw status", "", errors.New("not installed"))
+			r.Stub("df", "Avail\n2000000000000\n", nil)
+			stubShared(r)
+			c.stub(r)
+			var out bytes.Buffer
+			if err := selfcheck(context.Background(), r, "/var/lib/spark-agent", &out); err != nil {
+				t.Fatalf("selfcheck failed on nproc warning: %v\n%s", err, out.String())
+			}
+			if !strings.Contains(out.String(), c.want) || strings.Contains(out.String(), "FAIL") {
+				t.Fatalf("want %q, no FAIL, in:\n%s", c.want, out.String())
+			}
+		})
+	}
+}
+
 // stubShared 给共享机相关的自检项（nproc、cgroup v2）打上 DGX Spark 的正常输出。
 func stubShared(r *cmdrun.Recorder) {
 	r.Stub("nproc", "20\n", nil)
@@ -128,7 +158,6 @@ func TestSelfcheckSharedMachineItems(t *testing.T) {
 		want string
 	}{
 		{"ok", func(*cmdrun.Recorder) {}, ""},
-		{"few cpus", func(r *cmdrun.Recorder) { r.Stub("nproc", "2\n", nil) }, "FAIL: nproc: 只有 2 个 CPU，少于 4"},
 		{"cgroup v1", func(r *cmdrun.Recorder) { r.Stub("docker info --format {{.CgroupVersion}}", "1\n", nil) }, "FAIL: cgroup v2: docker 的 Cgroup Version 为 \"1\"，需要 2"},
 		{"no pids controller", func(r *cmdrun.Recorder) {
 			r.Stub("cat /sys/fs/cgroup/cgroup.controllers", "cpuset cpu io memory\n", nil)

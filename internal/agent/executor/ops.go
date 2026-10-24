@@ -31,8 +31,17 @@ func checkID(id string) error {
 
 func (e *Executor) sshDir(id string) string { return filepath.Join(e.d.StateDir, "ssh", id) }
 
-// slots 是指令的份数：0 / 1（及非法的负数）都按整机。
+// slots 是指令的份数：0 / 1 都按整机（其它非法值已被 checkSlots 拒绝）。
 func slots(c Command) int { return max(1, c.ShareSlots) }
+
+// checkSlots：份数只接受 0 / 1（整机）、2、4（规格 §6.2 的商品档位）。
+func checkSlots(n int) error {
+	switch n {
+	case 0, 1, 2, 4:
+		return nil
+	}
+	return fmt.Errorf("不支持的份数 %d", n)
+}
 
 // spec 按份数 N 等分配额（规格 §6.2）：内存 (MemTotal − 8GiB) / N、shm 为内存上限的一半、CPU nproc / N、
 // pids 32768 / N，共享机去掉 SYS_NICE。N = 1 时与整机完全一致（不传 --cpus，shm = min(MemTotal/2, 内存上限)）。
@@ -54,12 +63,24 @@ func (e *Executor) spec(c Command, cfg Config) (runtime.Spec, error) {
 		MemoryBytes: int64(memLimit), ShmBytes: int64(shm), CPUs: cpus, PidsLimit: MaxPids / n, DropNice: n > 1}, nil
 }
 
-// portConflict：本机状态文件里别的实例已占用该 SSH 端口（平台分配槽位出错时的兜底）。
-func (e *Executor) portConflict(c Command) error {
+// portConflict：本机别的实例已占用该 SSH 端口（平台分配槽位出错时的兜底）。
+// 只有容器仍存在的状态条目才算占用：容器已不在的残留条目（例如洗机失败后人工清理过容器）忽略并告警，
+// 否则整机以后每次创建都会被它挡住（每次失败都会把机器标故障并退款）。
+// inspect 出错时无法判断，直接让创建失败（不放行，也不报成端口冲突）：docker 不可用时后面的步骤本来也做不成。
+func (e *Executor) portConflict(ctx context.Context, c Command) error {
 	for _, inst := range e.d.State.Instances() {
-		if inst.ID != c.InstanceID && inst.SSHPort == c.SSHPort {
-			return fmt.Errorf("SSH 端口冲突：%d 已被实例 %s 使用", c.SSHPort, inst.ID)
+		if inst.ID == c.InstanceID || inst.SSHPort != c.SSHPort {
+			continue
 		}
+		cur, err := e.d.Runtime.Inspect(ctx, inst.ID)
+		if err != nil {
+			return fmt.Errorf("检查 SSH 端口 %d 占用失败（实例 %s）：%w", c.SSHPort, inst.ID, err)
+		}
+		if !cur.Exists {
+			e.d.Log.Warn("ignoring stale state entry on same ssh port (container gone)", "instance", inst.ID, "port", c.SSHPort, "creating", c.InstanceID)
+			continue
+		}
+		return fmt.Errorf("SSH 端口冲突：%d 已被实例 %s 使用", c.SSHPort, inst.ID)
 	}
 	return nil
 }
@@ -67,6 +88,9 @@ func (e *Executor) portConflict(c Command) error {
 // create 的每一步都先自检：Agent 在任意一步重启后整条重跑也不会出错。
 func (e *Executor) create(ctx context.Context, c Command) error {
 	if err := checkID(c.InstanceID); err != nil {
+		return err
+	}
+	if err := checkSlots(c.ShareSlots); err != nil {
 		return err
 	}
 	cfg := e.Config()
@@ -79,7 +103,7 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 	if c.SSHPort <= 0 {
 		c.SSHPort = 2222
 	}
-	if err := e.portConflict(c); err != nil {
+	if err := e.portConflict(ctx, c); err != nil {
 		return err
 	}
 	// 数据盘按份等分（向下取整到 GiB）；之后的余量检查、建盘与本地记录都用等分后的大小。

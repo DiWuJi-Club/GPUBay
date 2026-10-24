@@ -105,6 +105,8 @@ message Heartbeat {
   repeated InstanceMetrics instances = 2;
 }
 
+// InstanceMetrics：各数值字段 0 表示「未知 / 采不到」，不代表真实用量为 0。例如 Agent 刚重启、
+// 容器 cgroup 目录尚未解析时内存 / CPU 为 0；CPU 首个样本为 0；数据盘未挂载（目录不是挂载点）时 data_disk_used 为 0。
 message InstanceMetrics {
   string instance_id = 1;
   uint64 mem_current = 2;     // 容器 cgroup memory.current（字节）

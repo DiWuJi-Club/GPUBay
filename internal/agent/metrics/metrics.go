@@ -5,10 +5,12 @@ package metrics
 import (
 	"context"
 	"math"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"spark-cloud/internal/agent/cmdrun"
@@ -52,6 +54,9 @@ type Collector struct {
 	Run      cmdrun.Runner
 	ReadFile func(string) ([]byte, error)
 	Now      func() time.Time // nil → time.Now；测试注入
+	// IsMountPoint 判断数据目录是否为挂载点；nil → 包级 IsMountPoint。数据盘没挂上时目录只是根分区里的普通目录，
+	// df 会报根分区用量，所以非挂载点记 0（也不跑 df）。
+	IsMountPoint func(dir string) bool
 
 	mu   sync.Mutex
 	prev map[string]cpuSample // 实例 ID → 上一次 CPU 样本；不在本次 mounts 里的实例被丢弃
@@ -64,7 +69,35 @@ func (c *Collector) now() time.Time {
 	return time.Now()
 }
 
-// Collect 永不失败：采不到的项为 0。机器级 DataDiskUsed 为各实例数据盘已用之和（语义与单实例时一致）。
+func (c *Collector) isMountPoint(dir string) bool {
+	if c.IsMountPoint != nil {
+		return c.IsMountPoint(dir)
+	}
+	return IsMountPoint(dir)
+}
+
+// IsMountPoint：dir 与其上级目录不在同一设备上即为挂载点（数据盘是 loop 设备上的 ext4，设备号与宿主机根分区不同）。
+// 只做两次 stat，比 exec findmnt / mountpoint 便宜；目录不存在或 stat 失败按非挂载点处理。
+func IsMountPoint(dir string) bool {
+	dir = filepath.Clean(dir)
+	parent := filepath.Dir(dir)
+	if parent == dir {
+		return false
+	}
+	a, err := os.Stat(dir)
+	if err != nil || !a.IsDir() {
+		return false
+	}
+	b, err := os.Stat(parent)
+	if err != nil {
+		return false
+	}
+	sa, ok1 := a.Sys().(*syscall.Stat_t)
+	sb, ok2 := b.Sys().(*syscall.Stat_t)
+	return ok1 && ok2 && sa.Dev != sb.Dev
+}
+
+// Collect 永不失败：采不到的项为 0（数据目录不是挂载点时该实例数据盘已用也为 0）。机器级 DataDiskUsed 为各实例数据盘已用之和（语义与单实例时一致）。
 func (c *Collector) Collect(ctx context.Context, mounts []InstanceMount) (Metrics, []InstanceMetrics) {
 	var m Metrics
 	if out, err := c.Run.Run(ctx, "nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"); err == nil {
@@ -79,7 +112,7 @@ func (c *Collector) Collect(ctx context.Context, mounts []InstanceMount) (Metric
 	insts := make([]InstanceMetrics, 0, len(mounts))
 	for _, mt := range mounts {
 		im := InstanceMetrics{InstanceID: mt.ID}
-		if mt.DataDir != "" {
+		if mt.DataDir != "" && c.isMountPoint(mt.DataDir) {
 			if out, err := c.Run.Run(ctx, "df", "-B1", "--output=size,used", mt.DataDir); err == nil {
 				_, im.DataDiskUsed = ParseDF(string(out))
 			}

@@ -1360,3 +1360,67 @@ func TestMountsCgroupUnknownUntilInspected(t *testing.T) {
 		t.Fatalf("after recover = %+v", m)
 	}
 }
+
+// 状态文件里残留的同端口条目（容器已不在，例如洗机失败后人工清理过）不算冲突：否则整机以后每次创建都会失败。
+func TestCreateIgnoresStalePortEntry(t *testing.T) {
+	e := newEnv(t)
+	if err := e.st.PutInstance(state.Instance{ID: "ins-aaaaaaaa", Desired: "running", ImageRef: "nvcr.io/x:1", SSHPort: 2222, DataSizeGiB: 2048}); err != nil {
+		t.Fatal(err)
+	}
+	if res := e.run(create("ins-bbbbbbbb")); len(res) != 1 || !res[0].OK {
+		t.Fatalf("create over stale entry = %+v", res)
+	}
+	if _, ok := e.rt.Containers()["ins-bbbbbbbb"]; !ok {
+		t.Fatal("container not created")
+	}
+}
+
+// 容器仍在的同端口实例（整机）：拒绝创建。
+func TestCreateRejectsLivePortEntryWholeMachine(t *testing.T) {
+	e := newEnv(t)
+	if res := e.run(create("ins-aaaaaaaa")); !res[0].OK {
+		t.Fatalf("first = %+v", res[0])
+	}
+	res := e.run(create("ins-bbbbbbbb"))
+	if res[0].OK || res[0].Message != "SSH 端口冲突：2222 已被实例 ins-aaaaaaaa 使用" {
+		t.Fatalf("conflict = %+v", res[0])
+	}
+}
+
+// 查同端口实例的容器时 inspect 出错：创建失败（不当成残留放行），且不建盘。
+func TestCreatePortCheckInspectErrorFails(t *testing.T) {
+	e := newEnv(t)
+	if err := e.st.PutInstance(state.Instance{ID: "ins-aaaaaaaa", Desired: "running", ImageRef: "nvcr.io/x:1", SSHPort: 2222, DataSizeGiB: 2048}); err != nil {
+		t.Fatal(err)
+	}
+	e.rt.FailNext("inspect", errors.New("docker daemon down"))
+	res := e.run(create("ins-bbbbbbbb"))
+	if res[0].OK || !strings.Contains(res[0].Message, "docker daemon down") || !strings.Contains(res[0].Message, "ins-aaaaaaaa") {
+		t.Fatalf("result = %+v", res[0])
+	}
+	if created, _ := e.disk.State("ins-bbbbbbbb"); created {
+		t.Fatal("data disk created despite inspect error")
+	}
+}
+
+// 份数只接受 0 / 1 / 2 / 4；其它值在动 docker / 磁盘之前就失败。
+func TestCreateRejectsUnsupportedShareSlots(t *testing.T) {
+	for _, n := range []int{-1, 3, 5, 8} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			e := newEnv(t)
+			res := e.run(createShared("ins-aaaaaaaa", 2223, n))
+			if res[0].OK || res[0].Message != fmt.Sprintf("不支持的份数 %d", n) {
+				t.Fatalf("result = %+v", res[0])
+			}
+			if ops := e.rt.Ops(); len(ops) != 0 {
+				t.Fatalf("runtime touched: %v", ops)
+			}
+			if created, _ := e.disk.State("ins-aaaaaaaa"); created {
+				t.Fatal("data disk created")
+			}
+			if _, ok := e.st.Instance("ins-aaaaaaaa"); ok {
+				t.Fatal("state written")
+			}
+		})
+	}
+}
