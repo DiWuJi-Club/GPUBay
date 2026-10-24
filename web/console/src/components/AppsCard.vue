@@ -8,15 +8,17 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
 import { usePolling } from '../composables/usePolling'
 import {
-  MAX_APPS, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, instanceAppHint,
+  MAX_APPS, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, instanceAppHint, isWorkflowHost,
 } from '../logic/apps'
 import { notifyError } from '../logic/notify'
 import AppDeployDialog from './AppDeployDialog.vue'
 import AppDialog from './AppDialog.vue'
 import AppLogDrawer from './AppLogDrawer.vue'
+import WorkflowsPanel from './WorkflowsPanel.vue'
 
 /**
  * 实例详情「应用」卡片：部署列表（进度、打开、操作菜单）、添加 / 重新部署弹窗、日志抽屉、卸载确认。
+ * ComfyUI 部署行下方嵌「工作流」子区块（计划 11，WorkflowsPanel），其增删改后 refresh → 重新加载。
  * 每次加载后 emit('deployments') 给详情页（「动态」合并部署事件、端口刷新）。
  */
 const props = defineProps<{ instance: Instance; apps: AppCatalogItem[] }>()
@@ -189,6 +191,8 @@ function onCommand(d: Deployment, cmd: string) {
           </template>
         </el-dropdown>
       </div>
+
+      <WorkflowsPanel v-if="isWorkflowHost(d) && d.state !== 'removing'" :instance="instance" :deployment="d" @refresh="load" />
     </div>
 
     <template v-if="canAdd && loaded">
