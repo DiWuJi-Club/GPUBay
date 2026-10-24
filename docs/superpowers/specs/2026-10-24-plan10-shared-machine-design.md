@@ -1,7 +1,7 @@
 # Spark Cloud — 计划 10：共享机（一台 Spark 分给多位用户）设计文档
 
 - 日期：2026-10-24
-- 状态：待评审（负责人已授权设计方裁定、不逐项询问；代负责人作出的裁定集中列在 §1.3，可事后推翻）
+- 状态：**PoC no-go，共享机商品搁置**（2026-10-25，裁定 S13 / S14）；负责人已授权设计方裁定、不逐项询问；代负责人作出的裁定集中列在 §1.3，可事后推翻
 - 上位文档：`2026-10-14-spark-cloud-mvp-design.md`（下称「总设计」）§4、路线图第 4 项「共享容器（k3s + HAMi，需 PoC）」、附录竞品调研；`2026-10-18-plan2-agent-design.md`（下称「计划 2」）§3、§4；`2026-10-18-plan3-access-design.md`（下称「计划 3」）§5.3；`2026-10-19-plan6-booking-design.md`（下称「计划 6」）§1.1、§4
 - 范围：**先做真机 PoC 决定技术路线**（§3，含 go / no-go 标准与失败后的备选方案）；通过后实现「共享机」商品：一台 DGX Spark 同时出租给 2 或 4 位用户，每位用户得到一份内存（含 GPU 可用内存）/ CPU / 数据盘配额与共享的 GPU 算力，价格低于整机；共享实例与整机实例在下单、预订、续费、退款、接入层、后台处置上行为一致；Agent 支持一台机器多个容器；控制台与后台页面；测试与真机验收。
 - 不在范围：见 §15。
@@ -102,6 +102,8 @@
 | S10 | 旧 Agent 承载共享机的保护：Agent 在 `Hello` 里上报能力位图 `features`（`FeatureSharedSlots = 1`），网关写 `machines.agent_features`；共享商品的候选谓词要求 `(agent_features & 1) <> 0`。不用 `agent_version` 比较（它是 git 短哈希，无法比大小） | 用能力位比版本号可靠；也让「机器切成共享机但 Agent 没升级」在下单时就被排除，而不是开通失败退款 |
 | S11 | PoC 期间用的 CUDA 测试程序放 `deploy/poc/shared/`（C + nvcc，在 `nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04` 里编译），**提交进仓库**，验收时复用 | 验收第 3、4 项要重跑同样的测试 |
 | S12 | HAMi-core 的构建尝试限 2 小时时间盒、只记录不阻塞；MPS 只在 C 路线 no-go 时才做 | 不为「评估完整性」烧时间 |
+| S13 | **PoC 判定（2026-10-25 实测，记录见 `acceptance-plan10.md`）：路线 C no-go、MPS no-go → 共享机搁置**。C：`--memory 32g` 容器里 `cudaMalloc` 分配并写满 48 GiB 成功，cgroup `memory.current` 只涨约 100 MiB（托管内存则计入 cgroup 并被 OOM 杀）。MPS：§3.5 字面各项都过了（单进程 27 GiB 处被拦、P2 96.8%、P3 连累但 <1 秒恢复、P5 通过），但 pinned limit 是**每个客户端进程**一份，同一容器两个进程合计 54 GiB；且默认计算模式下不设 `CUDA_MPS_PIPE_DIRECTORY` 就能完全绕过（需 `EXCLUSIVE_PROCESS` 才能堵）。按 §1.1「限额强制、租户绕不过」的第一标准判为 no-go | 「每位租户的内存配额」是定价与宿主机安全的前提；按进程计的限额对容器内 root 不成立，4 位租户各起 2 个进程即可让宿主机 OOM。负责人可推翻（例如接受「每容器只允许一个 GPU 进程」的运营约束），推翻时从计划 Task 4 继续 |
+| S14 | 搁置后保留的范围（§3.5 第 2 条的落地）：协议三处新增（Hello.features、CreateInstance.share_slots、Heartbeat.instances）；Agent 按份配额能力（平台目前只发 share_slots = 1）、多实例指标（`Mounts()` / 每实例 cgroup）、SSH 端口冲突兜底、selfcheck；平台侧 `rental.Instance.SSHPort(base)`（暂恒为基准端口）、Create 指令显式带 `ssh_port / share_slots = 1`、`upstream.Target.Port`、`sshtest` 多端口、心跳每实例指标写入 `last_metrics.instances`。**不做**：迁移 00023（编号保留未用）、槽位、两个共享商品、`agent_features` 列与告警、后台 / 控制台页面 | 只做对未来（共享机复活、双机互联、维护容器）都有用、对现有整机行为零变化的部分 |
 
 ### 1.4 不做的替代方案（评审时不必再提）
 - 「k3s + HAMi（总设计路线图原文）」：200 台机器引入 Kubernetes 只为共享 GPU，与计划 2 自研 Agent 的架构完全冲突；HAMi 在 k8s 里的限额同样是 `LD_PRELOAD` 合作式；放弃。

@@ -23,7 +23,9 @@
 - 每个任务结束前必须实际运行并通过：`go vet ./... && go test ./...`；涉及 proto 的任务再加 `make proto && git diff --exit-code internal/agentpb`（生成物已提交且一致）；涉及前端的任务再加 `cd web && npm test && npm run build`；页面任务再加该任务列出的 Playwright 用例。证据是命令输出。
 - 提交信息结尾空一行加 `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`。
 
-**PoC 结论：** （Task 3 结束时由协调人填写：`go` / `no-go → MPS go` / `no-go → 搁置`，附 `acceptance-plan10-poc.md` 的提交哈希）
+**PoC 结论：** **`no-go → 搁置`**（2026-10-25，192.168.1.221；记录合并在 `docs/superpowers/acceptance-plan10.md` 而非单独的 `acceptance-plan10-poc.md`）。路线 C：`cudaMalloc` 不计入容器 cgroup（P1 在 32g 容器里分配到 48 GiB）；MPS：限额按进程计，一个容器两个进程合计 54 GiB（规格裁定 S13）。
+
+**备选路线任务改写（搁置）：** 只执行 Task 1～3、Task 8 的协议部分（另加 `convert` 取指令端口、心跳每实例指标写入 `last_metrics.instances`，不做 `agent_features` 落库与内存压力告警）、Task 9（Agent 按份配额能力保留，平台只发 `share_slots = 1`）、Task 10（`Instance.SSHPort(base)` 暂恒为基准端口；不做「钩子造共享机」）、Task 19（收尾）；真机验收改为验证新 Agent 与整机实例行为不变、多容器能力（规格裁定 S14）。Task 4～7、11～18 不执行，迁移 00023 不落库。
 
 ## Global Constraints
 
