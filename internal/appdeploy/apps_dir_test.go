@@ -42,6 +42,7 @@ type importAppJSON struct {
 	Category    string   `json:"category"`
 	Icon        string   `json:"icon"`
 	Sort        int      `json:"sort"`
+	Internal    bool     `json:"internal"`
 	Version     string   `json:"version"`
 	Images      []string `json:"images"`
 	Changelog   string   `json:"changelog"`
@@ -61,13 +62,149 @@ func TestAppsDir(t *testing.T) {
 			slugs = append(slugs, e.Name())
 		}
 	}
-	for _, want := range []string{"comfyui", "jupyterlab", "open-webui", "vllm"} {
+	for _, want := range []string{"comfyui", "jupyterlab", "open-webui", "vllm", "vllm-node"} {
 		if !slices.Contains(slugs, want) {
 			t.Errorf("deploy/apps/%s 不存在", want)
 		}
 	}
 	for _, slug := range slugs {
 		t.Run(slug, func(t *testing.T) { checkAppDir(t, slug, filepath.Join(appsDir, slug)) })
+	}
+}
+
+// TestVLLMNodeApp 计划 9 的内部应用 vllm-node：internal、平台填的变量齐全、节点密钥必填且是 secret。
+func TestVLLMNodeApp(t *testing.T) {
+	dir := filepath.Join(appsDir, "vllm-node")
+	var meta importAppJSON
+	raw, err := os.ReadFile(filepath.Join(dir, "app.json"))
+	if err != nil || json.Unmarshal(raw, &meta) != nil {
+		t.Fatalf("app.json: %v", err)
+	}
+	if !meta.Internal || meta.Category != "llm" || !slices.Equal(meta.Images, []string{"LLM Serving"}) {
+		t.Errorf("app.json = %+v", meta)
+	}
+	for _, slug := range []string{"comfyui", "jupyterlab", "open-webui", "vllm"} {
+		var m importAppJSON
+		b, _ := os.ReadFile(filepath.Join(appsDir, slug, "app.json"))
+		if json.Unmarshal(b, &m) != nil || m.Internal {
+			t.Errorf("%s 不应是内部应用", slug)
+		}
+	}
+	var spec appdeploy.Spec
+	raw, err = os.ReadFile(filepath.Join(dir, "spec.json"))
+	if err != nil || json.Unmarshal(raw, &spec) != nil {
+		t.Fatalf("spec.json: %v", err)
+	}
+	if err := appdeploy.ValidateSpec(&spec); err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Ports) != 1 || spec.Ports[0].Port != 8000 || spec.Ports[0].HealthPath != "/health" || spec.Ports[0].Path != "/docs" ||
+		spec.TimeoutMinutes != 120 || spec.MinDataFreeGiB != 80 {
+		t.Errorf("spec = %+v", spec)
+	}
+	env := map[string]appdeploy.EnvSpec{}
+	for _, e := range spec.Env {
+		env[e.Name] = e
+	}
+	for _, name := range []string{"MODEL_ID", "MODEL_SOURCE", "SERVED_MODEL_NAME", "MAX_MODEL_LEN", "API_KEY", "GPU_MEMORY_UTILIZATION",
+		"MAX_NUM_SEQS", "QUANTIZATION", "REASONING_PARSER", "TOOL_CALL_PARSER", "TASK", "MODEL_SIZE_GB"} {
+		if _, ok := env[name]; !ok {
+			t.Errorf("spec 缺少变量 %s", name)
+		}
+	}
+	if k := env["API_KEY"]; k.Type != "secret" || !k.Required || k.Pattern != "^[A-Za-z0-9_-]{32,128}$" {
+		t.Errorf("API_KEY = %+v", k)
+	}
+	if m := env["MODEL_ID"]; !m.Required || m.Type != "string" {
+		t.Errorf("MODEL_ID = %+v", m)
+	}
+	if s := env["SERVED_MODEL_NAME"]; !s.Required || s.Pattern != "^[a-z0-9][a-z0-9.-]{1,63}$" {
+		t.Errorf("SERVED_MODEL_NAME = %+v", s)
+	}
+	// 平台生成的节点密钥（32 字节 base64url 无填充，43 字符）能过校验；缺省值齐全时只需平台填的那几个
+	key := strings.Repeat("aB3_-", 8) + "xyz"
+	plain, secret, err := appdeploy.ValidateEnv(spec, map[string]string{"MODEL_ID": "Qwen/Qwen3-8B", "SERVED_MODEL_NAME": "qwen3-8b", "API_KEY": key})
+	if err != nil || secret["API_KEY"] != key || plain["MODEL_SIZE_GB"] != "20" || plain["GPU_MEMORY_UTILIZATION"] != "0.85" || plain["TOOL_CALL_PARSER"] != "hermes" {
+		t.Errorf("ValidateEnv = %v %v %v", plain, secret, err)
+	}
+	if _, _, err := appdeploy.ValidateEnv(spec, map[string]string{"MODEL_ID": "Qwen/Qwen3-8B", "SERVED_MODEL_NAME": "qwen3-8b"}); err == nil {
+		t.Error("API_KEY 必填")
+	}
+	if _, _, err := appdeploy.ValidateEnv(spec, map[string]string{"MODEL_ID": "Qwen/Qwen3-8B", "SERVED_MODEL_NAME": "qwen3-8b", "API_KEY": "short-key-123"}); err == nil {
+		t.Error("API_KEY 少于 32 字符必须拒绝")
+	}
+}
+
+// runVLLMNodeStart 用假的 vllm 真跑 deploy/apps/vllm-node/app.sh start，返回 vllm 收到的参数。
+func runVLLMNodeStart(t *testing.T, extraEnv ...string) string {
+	t.Helper()
+	appDir, bin := t.TempDir(), t.TempDir()
+	argsFile := filepath.Join(appDir, "args")
+	fake := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + appdeploy.ShellQuote(argsFile) + "\nexec sleep 30\n"
+	if err := os.WriteFile(filepath.Join(bin, "vllm"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script, err := filepath.Abs(filepath.Join(appsDir, "vllm-node", "app.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/sh", script, "start")
+	cmd.Dir = appDir
+	cmd.Env = append(append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "SPARK_APP_DIR="+appDir, "SPARK_MODELS_DIR="+filepath.Join(appDir, "models"),
+		"SPARK_PORT=8000", "MODEL_ID=Qwen/Qwen3-8B", "SERVED_MODEL_NAME=qwen3-8b", "MAX_MODEL_LEN=40960", "API_KEY=node-key-0123456789abcdefghijklmnop"), extraEnv...)
+	outFile, err := os.Create(filepath.Join(appDir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+	cmd.Stdout, cmd.Stderr = outFile, outFile
+	err = cmd.Run()
+	t.Cleanup(func() {
+		for _, f := range []string{"service.pid", "tail.pid"} {
+			if b, err := os.ReadFile(filepath.Join(appDir, f)); err == nil {
+				exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+			}
+		}
+	})
+	if err != nil {
+		b, _ := os.ReadFile(filepath.Join(appDir, "log"))
+		t.Fatalf("app.sh start: %v %s", err, b)
+	}
+	var args []string
+	// 假 vllm 在后台启动后才写参数；机器负载高时 sh 启动可能要几秒，放宽到 15 秒
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		b, _ := os.ReadFile(argsFile)
+		if args = strings.Fields(string(b)); len(args) > 0 || time.Now().After(deadline) {
+			break
+		}
+	}
+	if !strings.HasPrefix(strings.Join(args, " "), "serve "+filepath.Join(appDir, "models", "modelscope", "Qwen/Qwen3-8B")+" ") {
+		t.Errorf("vllm args = %v", args)
+	}
+	return strings.Join(args, " ")
+}
+
+func TestVLLMNodeStartArgs(t *testing.T) {
+	joined := runVLLMNodeStart(t)
+	for _, want := range []string{"--host 127.0.0.1", "--port 8000", "--served-model-name qwen3-8b", "--max-model-len 40960",
+		"--gpu-memory-utilization 0.85", "--max-num-seqs 64", "--api-key node-key-0123456789abcdefghijklmnop", "--enable-auto-tool-choice --tool-call-parser hermes"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("vllm args missing %q: %s", want, joined)
+		}
+	}
+	for _, absent := range []string{"--task", "--quantization", "--reasoning-parser"} {
+		if strings.Contains(joined, absent) {
+			t.Errorf("vllm args should not have %q by default: %s", absent, joined)
+		}
+	}
+	joined = runVLLMNodeStart(t, "TASK=embed", "QUANTIZATION=fp8", "REASONING_PARSER=qwen3", "TOOL_CALL_PARSER=none", "GPU_MEMORY_UTILIZATION=0.6", "MAX_NUM_SEQS=16")
+	for _, want := range []string{"--task embed", "--quantization fp8", "--reasoning-parser qwen3", "--gpu-memory-utilization 0.6", "--max-num-seqs 16"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("vllm args missing %q: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "--tool-call-parser") || strings.Contains(joined, "--enable-auto-tool-choice") {
+		t.Errorf("TOOL_CALL_PARSER=none must not enable tool calls: %s", joined)
 	}
 }
 
