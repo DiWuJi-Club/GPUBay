@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -94,11 +96,23 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	upstream, err := sshtest.New(sshtest.Options{AuthorizedKey: upSigner.PublicKey(), HostKey: hostSigner})
+	// shell 模式：exec 在临时目录（充当容器的 /）里用本机 /bin/sh 真执行，应用部署的 run.sh 在这里跑；echo 等命令的输出与回显模式相同
+	upstream, err := sshtest.New(sshtest.Options{AuthorizedKey: upSigner.PublicKey(), HostKey: hostSigner, Shell: true})
 	if err != nil {
 		return err
 	}
 	defer upstream.Close()
+	// fake 应用的「服务」：run.sh 的健康检查（AppHealthAddr）与 /hooks/apps/seed 登记的各应用端口（ingress / Runner 健康检查）都打到它
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "spark-app-ok|path=%s", r.URL.Path)
+	}))
+	defer health.Close()
+	healthAddr := strings.TrimPrefix(health.URL, "http://")
+	// 所有实例共用一个假容器：应用根目录按实例分开（<Root>/<实例 ID>/root/data）。run.sh 用 setsid 把 fake 服务移出了
+	// sshtest 的进程组，Close 杀不到：退出前（defer 逆序，先于 upstream.Close 删目录）逐个 run.sh stop
+	appRoot := upstream.Root()
+	defer e2ehooks.StopFakeApps(appRoot)
 	cfg := config.Config{
 		Env: "dev", HTTPAddr: publicAddr, AdminAddr: adminAddr, DatabaseURL: dbURL, Domain: "spark.test",
 		SecretKey: bytes.Repeat([]byte("e"), 32), SMSDriver: "mock", KYCDriver: "mock", PayDriver: "mock", PDUDriver: "mock",
@@ -110,8 +124,11 @@ func run() error {
 	}
 	clk := clock.NewFake(time.Now())
 	kycSwitch := &e2ehooks.SwitchableKYC{}
+	// 不启动应用部署 Runner（SPARK_APP_RUNNER 不适用于此进程）：由 /hooks/apps/tick 按假时钟逐轮驱动
 	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: kycSwitch, DisableRateLimits: true, AgentTick: 50 * time.Millisecond,
-		HostKeyGen: func() (string, []byte, error) { return hostPub, hostPEM, nil }})
+		HostKeyGen:    func() (string, []byte, error) { return hostPub, hostPEM, nil },
+		AppHealthAddr: func(int) string { return healthAddr },
+		AppRootFor:    func(id string) string { return filepath.Join(appRoot, id, "root", "data") }})
 	if err != nil {
 		return err
 	}
@@ -136,7 +153,8 @@ func run() error {
 	go func() { defer close(loopsDone); a.RunAccessLoops(gwCtx) }() // 路由表 2 秒刷新、活动流撤销
 	// 在 fake Agent 停掉之后（defer 逆序）先取消 gwCtx，再等 Agent 网关、SSH 网关与接入层循环全部退出
 	defer func() { stopGW(); <-gwErr; <-sshErr; <-loopsDone; a.Upstream.Close() }()
-	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr, SSHAddr: sshAddr, Upstream: upstream}
+	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr, SSHAddr: sshAddr, Upstream: upstream,
+		HealthAddr: healthAddr}
 	defer hooksSrv.Close()
 
 	public, adminSrv := a.Servers(cfg) // 与 cmd/platform 完全相同的监听与路由；不启动定时清扫器，清扫由钩子触发

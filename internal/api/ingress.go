@@ -4,8 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"sync"
-	"time"
 
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
@@ -14,33 +12,6 @@ import (
 )
 
 const defaultAuthorizeLimit = 60 // 每用户每分钟
-
-// authorizeLimiter 进程内按用户限流 authorize（票据签发），也限住了 nonce 表的增长速度。
-type authorizeLimiter struct {
-	mu    sync.Mutex
-	limit int
-	hits  map[int64][]time.Time
-}
-
-func (l *authorizeLimiter) allow(userID int64, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.hits == nil {
-		l.hits = map[int64][]time.Time{}
-	}
-	ts := l.hits[userID]
-	i := 0
-	for i < len(ts) && now.Sub(ts[i]) >= time.Minute {
-		i++
-	}
-	ts = ts[i:]
-	if len(ts) >= l.limit {
-		l.hits[userID] = ts
-		return false
-	}
-	l.hits[userID] = append(ts, now)
-	return true
-}
 
 // handleIngressAuthorize：控制台域上的票据签发（浏览器整页跳转，所以回 HTML 页 / 302，不回 JSON）。
 //   - target 不合法 → 400 页；未登录 → 登录页（redirect 回本端点）；

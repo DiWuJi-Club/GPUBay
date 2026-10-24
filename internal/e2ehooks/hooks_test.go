@@ -42,7 +42,11 @@ type env struct {
 	up  *sshtest.Server
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { t.Helper(); return newEnvWith(t, false) }
+
+// newEnvWith(apps = true) 与 cmd/e2e-server 的应用部署配置相同：假容器 sshd 用 shell 模式、每实例一个应用根目录、
+// 健康检查 / 应用 Web 打到一个 httptest；结束时先停掉容器里 setsid 出去的 fake 服务进程。
+func newEnvWith(t *testing.T, apps bool) *env {
 	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
@@ -65,15 +69,30 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	up, err := sshtest.New(sshtest.Options{AuthorizedKey: upSigner.PublicKey(), HostKey: hostSigner})
+	upOpts := sshtest.Options{AuthorizedKey: upSigner.PublicKey(), HostKey: hostSigner}
+	if apps {
+		upOpts.Shell, upOpts.Root = true, t.TempDir()
+	}
+	up, err := sshtest.New(upOpts)
 	if err != nil {
 		t.Fatal(err)
+	}
+	opt := app.Options{Clock: clk, KYC: k, DisableRateLimits: true, AgentTick: 20 * time.Millisecond,
+		HostKeyGen: func() (string, []byte, error) { return hostPub, hostPEM, nil }}
+	healthAddr := ""
+	if apps {
+		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "spark-app-ok|path=%s", r.URL.Path) }))
+		t.Cleanup(health.Close)
+		healthAddr = strings.TrimPrefix(health.URL, "http://")
+		root := up.Root()
+		opt.AppHealthAddr = func(int) string { return healthAddr }
+		opt.AppRootFor = func(id string) string { return filepath.Join(root, id, "root", "data") }
+		t.Cleanup(func() { e2ehooks.StopFakeApps(root) })
 	}
 	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(),
 		AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200, AgentDNSServers: []string{"223.5.5.5"}, UpstreamSSHKeyFile: keyFile,
 		UpstreamSSHPort: up.Port()}
-	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: k, DisableRateLimits: true, AgentTick: 20 * time.Millisecond,
-		HostKeyGen: func() (string, []byte, error) { return hostPub, hostPEM, nil }})
+	a, err := app.Build(cfg, pool, log, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +109,8 @@ func newEnv(t *testing.T) *env {
 	go func() { defer close(done); _ = a.Gateway.Serve(ctx, lis) }()
 	sshDone := make(chan struct{})
 	go func() { defer close(sshDone); _ = a.SSH.Serve(ctx, sshLis) }()
-	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String(), SSHAddr: sshLis.Addr().String(), Upstream: up}
+	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String(), SSHAddr: sshLis.Addr().String(), Upstream: up,
+		HealthAddr: healthAddr}
 	ts := httptest.NewServer(hooks.Handler())
 	t.Cleanup(func() {
 		ts.Close()

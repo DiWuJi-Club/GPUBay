@@ -32,6 +32,9 @@ type BatchRequest struct {
 	AutoRenew         bool
 	AutoRenewDuration catalog.Duration // 空 = Duration
 	IdempotencyKey    string
+	// 计划 7：开通时预装应用（nil = 不预装）；每台实例在同一事务里插入一条 queued 部署，校验失败整单不下
+	AppID  *int64
+	AppEnv map[string]string
 }
 
 type Batch struct {
@@ -73,6 +76,9 @@ func validateBatch(req *BatchRequest, now time.Time) (int64, error) {
 	}
 	if err := checkIdempotencyKey(req.IdempotencyKey); err != nil {
 		return 0, err
+	}
+	if req.AppID == nil && len(req.AppEnv) > 0 {
+		return 0, apperr.BadRequest("未选择预装应用时不能填写应用变量")
 	}
 	if req.StartAt != nil {
 		start := req.StartAt.UTC()
@@ -127,6 +133,13 @@ func (s *Service) placeBatch(ctx context.Context, req BatchRequest, withBatch bo
 			if err != nil {
 				return err
 			}
+			// 预装校验在挑机器、扣款之前：应用 / 镜像不兼容 / 变量错误整单失败（4xx）
+			var plan InstallPlan
+			if req.AppID != nil {
+				if plan, err = s.apps().PrepareInstall(ctx, tx, *req.AppID, req.ImageID, req.AppEnv); err != nil {
+					return err
+				}
+			}
 			if req.GroupID != nil {
 				var visible bool
 				if err := tx.QueryRow(ctx, `SELECT visible FROM machine_groups WHERE id = $1`, *req.GroupID).Scan(&visible); db.IsNoRows(err) || (err == nil && !visible) {
@@ -169,6 +182,11 @@ func (s *Service) placeBatch(ctx context.Context, req BatchRequest, withBatch bo
 				}
 				if _, err := insertLease(ctx, sp, mid, inst.ID, spec.Lower, spec.Upper, status, now); err != nil {
 					return err
+				}
+				if req.AppID != nil {
+					if err := s.apps().QueueInstall(ctx, sp, inst, plan, now); err != nil {
+						return err
+					}
 				}
 				insts = append(insts, inst)
 				return nil

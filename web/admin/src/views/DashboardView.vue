@@ -79,6 +79,14 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
           <li><span>本月</span><b data-testid="dash-order-month">{{ fmtYuan(data.order_month) }}</b></li>
         </ul>
       </el-card>
+      <el-card header="应用部署">
+        <ul class="kv">
+          <li><span>部署中（含排队）</span><b data-testid="dash-apps-installing">{{ data.apps_installing ?? 0 }}</b></li>
+          <li><span>运行中</span><b data-testid="dash-apps-running">{{ data.apps_running ?? 0 }}</b></li>
+          <li><span>24 小时内失败</span><b data-testid="dash-apps-failed" :class="{ bad: (data.apps_failed_24h ?? 0) > 0 }">{{ data.apps_failed_24h ?? 0 }}</b></li>
+        </ul>
+        <router-link to="/deployments" class="more" data-testid="dash-apps-link">查看部署</router-link>
+      </el-card>
     </div>
     <el-card header="近 30 天出租率（最后一根为今天，截至当前）">
       <el-empty v-if="bars.length === 0" description="暂无出租率数据" :image-size="60" data-testid="dash-chart-empty" />
@@ -98,9 +106,11 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
 
 <style scoped>
 .dash { display: grid; gap: 16px; }
-.grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+.grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; }
 .big { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
 .kv { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .kv li { display: flex; justify-content: space-between; }
+.bad { color: var(--el-color-danger); }
+.more { display: inline-block; margin-top: 8px; font-size: 13px; }
 .chart { width: 100%; height: 200px; }
 </style>

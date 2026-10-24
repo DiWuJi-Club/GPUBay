@@ -770,3 +770,23 @@ test('A-MCH-09 接入状态与指标：列表两列、详情接入 / 连接 / �
     await expect(page.getByTestId('mdetail-enrolled')).toHaveText('未接入')
   })
 })
+
+test('A-MCH-10 机器详情「已缓存镜像」：Agent 上报后列出镜像与上报时间', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const ctx = await adminApi(admin)
+  const [mid] = await hooks.machines(1, undefined, `C${runStamp}`)
+  await adminPost(ctx, admin, `/admin/api/v1/machines/${mid}/maintenance`, { on: true }) // 不影响其它用例的空闲数
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/machines/${mid}`)
+  await expect(page.getByTestId('machine-cached-images')).toBeVisible()
+  await expect(page.getByTestId('machine-cached-image')).toHaveCount(0)
+  const refs = [`e2e.local/spark/cached-a-${runStamp}:1`, `e2e.local/spark/cached-b-${runStamp}:2`]
+  await hooks.agent({ machine_id: mid, images: refs })
+  const m = (await getJSON<{ machine: { cached_images: string[]; cached_images_at: string } }>(ctx, `/admin/api/v1/machines/${mid}`)).machine
+  expect(m.cached_images).toEqual(refs)
+  await page.reload()
+  await expect(page.getByTestId('machine-cached-image')).toHaveText(refs)
+  await expect(page.getByTestId('machine-cached-images-at')).toHaveText(`上报于 ${cstTime(m.cached_images_at)}`)
+  await expect(page.getByTestId('machine-cached-images-none')).toHaveCount(0)
+  await expect(page.getByTestId('machine-cached-images-note')).toContainText('只统计在线机器')
+})

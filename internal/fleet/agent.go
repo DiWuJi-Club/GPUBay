@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/imageref"
 )
 
 // Agent 上报的容器阶段。
@@ -21,9 +22,17 @@ type InstanceState struct {
 }
 
 // StateReport 是 Agent 上报的本机实例集合，原文存入 machines.last_state_report。
+// Images 不进 last_state_report，由 RecordCachedImages 写 machines.cached_images。
 type StateReport struct {
 	Instances []InstanceState `json:"instances"`
+	Images    []string        `json:"-"` // 计划 7：已缓存镜像；nil = 旧 Agent 未上报（不覆盖 machines.cached_images）
 }
+
+// 已缓存镜像的截断规则（与 Agent 侧相同，见 imageref）。
+const (
+	MaxCachedImages   = imageref.MaxItems
+	MaxCachedImageLen = imageref.MaxLen
+)
 
 // RunningIDs 返回报告中阶段为 running 的实例 ID。
 func (r StateReport) RunningIDs() []string {
@@ -107,6 +116,22 @@ func (s *Service) RecordMetrics(ctx context.Context, machineID int64, version st
 		SET agent_version = CASE WHEN $2 = '' THEN agent_version ELSE $2 END,
 		    last_metrics = COALESCE($3::jsonb, last_metrics), updated_at = $4
 		WHERE id = $1`, machineID, version, m, s.clock.Now())
+	return err
+}
+
+// RecordCachedImages 写 machines.cached_images / cached_images_at；images 为 nil 时不写（旧 Agent）。
+// 网关侧按 imageref.Normalize 再规范化一遍（不信任 Agent 的截断与形态）。
+// 每分钟每台机器一次：列表没变时保留原值（不重写数组，updated_at 也不动），只刷新 cached_images_at。
+func (s *Service) RecordCachedImages(ctx context.Context, machineID int64, images []string) error {
+	if images == nil {
+		return nil
+	}
+	now := s.clock.Now()
+	_, err := s.pool.Exec(ctx, `UPDATE machines SET
+		cached_images = CASE WHEN cached_images = $2::text[] THEN cached_images ELSE $2::text[] END,
+		updated_at = CASE WHEN cached_images = $2::text[] THEN updated_at ELSE $3 END,
+		cached_images_at = $3
+		WHERE id = $1`, machineID, imageref.Normalize(images), now)
 	return err
 }
 

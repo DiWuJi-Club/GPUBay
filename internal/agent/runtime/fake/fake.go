@@ -15,6 +15,7 @@ type Runtime struct {
 	mu         sync.Mutex
 	containers map[string]*entry
 	pulled     []string
+	images     []string // Images 的返回值（SetImages 设置；nil 表示不上报）
 	failNext   map[string]error
 	blocked    map[string]bool
 	ops        []string // 改动类调用的顺序记录（"start ins-x"），供断言调用顺序
@@ -36,7 +37,7 @@ func (r *Runtime) FailNext(op string, err error) {
 }
 
 // Block 打开 / 关闭某个操作的阻塞：打开后该操作一直等到 ctx 结束并返回 ctx 的错误（模拟 dockerd 卡死）。
-// op 与 FailNext 相同：network / pull / create / connect / start / stop / remove / inspect / list / veth。
+// op 与 FailNext 相同：network / pull / create / connect / start / stop / remove / inspect / list / veth / images。
 func (r *Runtime) Block(op string, on bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -295,6 +296,25 @@ func (r *Runtime) SetDataSource(id, src string) {
 		e.c.DataMounted = src != ""
 		e.c.DataSource = src
 	}
+}
+
+// SetImages 设置 Images 的返回值；nil 模拟旧 Agent / 拿不到列表（StateReport 不带 images）。
+func (r *Runtime) SetImages(imgs []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.images = slices.Clone(imgs)
+}
+
+func (r *Runtime) Images(ctx context.Context) ([]string, error) {
+	if err := r.wait(ctx, "images"); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.fail("images"); err != nil {
+		return nil, err
+	}
+	return slices.Clone(r.images), nil
 }
 
 func (r *Runtime) Pulled() []string {

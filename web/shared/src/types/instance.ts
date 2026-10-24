@@ -1,3 +1,4 @@
+import type { AppsSummaryItem } from './apps'
 import type { Duration } from './catalog'
 
 export type InstanceState = 'reserved' | 'creating' | 'running' | 'stopped' | 'wiping' | 'released' | 'failed' | 'cancelled'
@@ -41,6 +42,8 @@ export interface Instance {
   auto_renew_failed_reason: string
   renewable_until: string | null
   renew_options: RenewOption[]
+  /** 非终态应用部署的摘要（列表 / 详情；后端总是返回数组，旧数据与测试夹具可省略） */
+  apps_summary?: AppsSummaryItem[]
   created_at: string
 }
 

@@ -2,6 +2,7 @@ import { expect, test, type APIRequestContext, type Page } from '@playwright/tes
 import {
   adminApi, clickTwiceSync, createAdmin, drainIdleMachines, drainTasks, enterTotpDialog, expectAdminUrl, expectStillOpen, fail500, failOnce, getJSON, isPath, loginAdmin, logout, pick, recordRequests, type SeededAdmin, totpNow, trackToasts,
 } from '../helpers/admin'
+import { cleanupApps, deployViaApi, ownInstance, seedApps, tickUntil } from '../helpers/apps'
 import { bookViaApi, privateGroup, startAfter } from '../helpers/booking'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
@@ -32,6 +33,9 @@ const eventText = (e: Detail['events'][number]) => `${e.from_state || '—'} →
 const balanceOf = async (api: APIRequestContext) => ((await (await api.get('/api/v1/wallet')).json()) as { balance: number }).balance
 
 const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestId('ainst-id') })
+
+// A-INS-14 部署了应用：afterEach 卸载（其余用例没有部署，清理是空操作）
+test.afterEach(cleanupApps)
 const rowOf = (page: Page, id: string) => rows(page).filter({ has: page.getByTestId('ainst-id').getByText(id, { exact: true }) })
 
 test('A-INS-01 实例列表：状态 / 用户 / 机器筛选作为查询参数、地址栏预填、重置、超过一页翻页、首次加载失败可重试', async ({ page }) => {
@@ -957,4 +961,38 @@ test('A-INS-13 实例详情显示预订字段与只读自动续费；财务无�
   await expect(page.getByTestId('adetail-state')).toHaveText('已预订')
   await expect(page.getByTestId('adetail-reassign-btn')).toBeVisible()
   await expect(page.getByTestId('adetail-cancel-booking-btn')).toBeVisible()
+})
+
+test('A-INS-14 实例详情「应用」卡片：部署状态、进度 / 错误、详情链接到部署抽屉；运维可强制卸载，财务不可', async ({ page }) => {
+  const apps = await seedApps()
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  ownInstance(api, id)
+  const vllm = await deployViaApi(api, id, apps.vllm.id)
+  await tickUntil(api, id, vllm.id, 'running')
+  const webui = await deployViaApi(api, id, apps['open-webui'].id)
+  await tickUntil(api, id, webui.id, 'installing')
+  const app = (dep: string) => page.locator(`[data-testid="admin-instance-app"][data-dep="${dep}"]`)
+
+  await loginAdmin(page, await createAdmin('finance'))
+  await page.goto(`/admin/instances/${id}`)
+  await expect(page.getByTestId('admin-instance-app')).toHaveCount(2)
+  await expect(app(vllm.id)).toHaveAttribute('data-state', 'running')
+  await expect(app(vllm.id).getByTestId('admin-instance-app-name')).toHaveText('vLLM 推理服务 · 1.0.0')
+  await expect(app(vllm.id).getByTestId('admin-instance-app-state')).toHaveText('运行中')
+  await expect(app(webui.id)).toHaveAttribute('data-state', 'installing')
+  await expect(app(webui.id).getByTestId('admin-instance-app-state')).toHaveText('部署中')
+  await expect(app(webui.id).getByTestId('admin-instance-app-progress')).toHaveText(/%$/)
+  await expect(page.getByTestId('admin-instance-app-force-remove')).toHaveCount(0) // 财务只读
+  await expect(page.getByTestId('admin-instance-apps-all')).toHaveAttribute('href', `/admin/deployments?instance_id=${id}`)
+  await app(vllm.id).getByTestId('admin-instance-app-detail').click()
+  await expectAdminUrl(page, '/deployments', { instance_id: id, dep: vllm.id })
+  await expect(page.getByTestId('deployment-app')).toContainText('vLLM 推理服务')
+  await expect(page.getByTestId('deployment-state')).toHaveAttribute('data-state', 'running')
+
+  await logout(page)
+  await loginAdmin(page, await createAdmin('ops'))
+  await page.goto(`/admin/instances/${id}`)
+  await expect(app(vllm.id).getByTestId('admin-instance-app-force-remove')).toBeVisible()
+  await expect(app(webui.id).getByTestId('admin-instance-app-force-remove')).toBeVisible()
 })
