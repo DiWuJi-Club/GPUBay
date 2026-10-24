@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -456,7 +457,7 @@ func TestQuickRunFlow(t *testing.T) {
 	if code, out := c.uploadFile(base+"/uploads", []byte("not an image at all")); code != 415 || out["code"] != "unsupported_file_type" {
 		t.Fatalf("upload text = %d %v", code, out)
 	}
-	if code, out := c.uploadFile(base+"/uploads", bytes.Repeat([]byte{0}, comfywf.MaxUploadBytes+10)); code != 413 || out["code"] != "file_too_large" {
+	if code, out := c.uploadFile(base+"/uploads", append(slices.Clone(comfytest.OnePixelPNG), make([]byte, comfywf.MaxUploadBytes)...)); code != 413 || out["code"] != "file_too_large" {
 		t.Fatalf("upload too large = %d %v", code, out)
 	}
 
