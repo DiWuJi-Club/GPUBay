@@ -187,10 +187,7 @@ func (i *Installer) ListInstalled(ctx context.Context, depID string) ([]Installe
 // installable 取可安装的 {工作流, 版本}：工作流须已上架（否则 notPublished）；vid 给定 → 须是该工作流的版本（否则 workflow_not_found）
 // 且已发布（否则 workflow_unavailable）；nil → published_at 最新的已发布版本（没有 → workflow_unavailable）。
 func (c *Catalog) installable(ctx context.Context, q db.Querier, wfID int64, vid *int64, notPublished error) (Workflow, Version, error) {
-	w, err := scanWorkflow(q.QueryRow(ctx, `SELECT `+wfCols+` FROM comfy_workflows WHERE id = $1`, wfID))
-	if errors.Is(err, apperr.ErrNotFound) {
-		return Workflow{}, Version{}, apperr.ErrWorkflowNotFound
-	}
+	w, err := scanWorkflow(q.QueryRow(ctx, `SELECT `+wfCols+` FROM comfy_workflows WHERE id = $1`, wfID)) // 不存在 → workflow_not_found
 	if err != nil {
 		return Workflow{}, Version{}, err
 	}
