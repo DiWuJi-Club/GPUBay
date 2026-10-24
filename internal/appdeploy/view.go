@@ -353,10 +353,10 @@ func (s *Service) CatalogViews(ctx context.Context, withDescription bool) ([]Cat
 	return out, nil
 }
 
-// CatalogViewBySlug 单个已上架应用（带说明）；不存在、未上架或没有已发布版本 → app_not_found（与列表口径一致）。
+// CatalogViewBySlug 单个已上架应用（带说明）；不存在、未上架、内部应用或没有已发布版本 → app_not_found（与列表口径一致）。
 func (s *Service) CatalogViewBySlug(ctx context.Context, slug string) (CatalogView, error) {
 	a, err := s.d.Catalog.AppBySlug(ctx, slug)
-	if errors.Is(err, apperr.ErrNotFound) || (err == nil && a.Status != StatusPublished) {
+	if errors.Is(err, apperr.ErrNotFound) || (err == nil && (a.Status != StatusPublished || a.Internal)) {
 		return CatalogView{}, apperr.ErrAppNotFound
 	}
 	if err != nil {

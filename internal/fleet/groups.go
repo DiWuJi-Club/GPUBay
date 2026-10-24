@@ -24,17 +24,34 @@ type Group struct {
 	Description string    `json:"description"`
 	Sort        int       `json:"sort"`
 	Visible     bool      `json:"visible"`
+	Purpose     string    `json:"purpose"` // rental（普通机组）/ llm（Token 服务池，唯一、不可见，规格 §3.3）
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// 机组用途（machine_groups.purpose）。
+const (
+	GroupPurposeRental = "rental"
+	GroupPurposeLLM    = "llm"
+)
+
+// GroupInput 建 / 改机组的输入。Purpose：建组时空 = rental，只能是 rental（池由迁移建好，不能经接口创建）；
+// 改组时空 = 不改，非空且与现值不同 → 拒绝（用途不可修改）。
 type GroupInput struct {
 	Name        string
 	Region      string
 	Description string
 	Sort        int
 	Visible     bool
+	Purpose     string
 }
+
+var (
+	errCreateLLMGroup   = apperr.BadRequest("不能创建 Token 服务池机组")
+	errPoolVisible      = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能对用户可见", apperr.ErrInvalidState.Status)
+	errPurposeImmutable = apperr.New(apperr.ErrInvalidState.Code, "机组用途不能修改", apperr.ErrInvalidState.Status)
+	errPoolNotDeletable = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能删除", apperr.ErrInvalidState.Status)
+)
 
 // GroupRow 列表行：机组加机器数与现空闲台数。
 type GroupRow struct {
@@ -43,11 +60,11 @@ type GroupRow struct {
 	IdleNow      int `json:"idle_now"`
 }
 
-const groupCols = `id, name, region, description, sort, visible, created_at, updated_at`
+const groupCols = `id, name, region, description, sort, visible, purpose, created_at, updated_at`
 
 func scanGroup(row pgx.Row) (Group, error) {
 	var g Group
-	err := row.Scan(&g.ID, &g.Name, &g.Region, &g.Description, &g.Sort, &g.Visible, &g.CreatedAt, &g.UpdatedAt)
+	err := row.Scan(&g.ID, &g.Name, &g.Region, &g.Description, &g.Sort, &g.Visible, &g.Purpose, &g.CreatedAt, &g.UpdatedAt)
 	if db.IsNoRows(err) {
 		return Group{}, apperr.ErrGroupNotFound
 	}
@@ -132,7 +149,7 @@ func (s *Service) ListGroups(ctx context.Context, visibleOnly bool, productID *i
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (GroupRow, error) {
 		var g GroupRow
-		err := r.Scan(&g.ID, &g.Name, &g.Region, &g.Description, &g.Sort, &g.Visible, &g.CreatedAt, &g.UpdatedAt, &g.MachineCount, &g.IdleNow)
+		err := r.Scan(&g.ID, &g.Name, &g.Region, &g.Description, &g.Sort, &g.Visible, &g.Purpose, &g.CreatedAt, &g.UpdatedAt, &g.MachineCount, &g.IdleNow)
 		return g, err
 	})
 }
@@ -141,10 +158,27 @@ func (s *Service) GetGroup(ctx context.Context, q db.Querier, id int64) (Group, 
 	return scanGroup(q.QueryRow(ctx, `SELECT `+groupCols+` FROM machine_groups WHERE id = $1`, id))
 }
 
+// LLMPoolGroupID 返回 Token 服务池（purpose='llm'，迁移建好的唯一一个）的 ID；不存在 → apperr.ErrNotFound。
+func (s *Service) LLMPoolGroupID(ctx context.Context, q db.Querier) (int64, error) {
+	var id int64
+	err := q.QueryRow(ctx, `SELECT id FROM machine_groups WHERE purpose = 'llm'`).Scan(&id)
+	if db.IsNoRows(err) {
+		return 0, apperr.ErrNotFound
+	}
+	return id, err
+}
+
 func (s *Service) CreateGroup(ctx context.Context, actor audit.Actor, in GroupInput) (Group, error) {
 	in, err := in.normalize()
 	if err != nil {
 		return Group{}, err
+	}
+	switch in.Purpose {
+	case "", GroupPurposeRental:
+	case GroupPurposeLLM:
+		return Group{}, errCreateLLMGroup
+	default:
+		return Group{}, apperr.BadRequest("机组用途无效")
 	}
 	now := s.clock.Now()
 	var g Group
@@ -176,6 +210,12 @@ func (s *Service) UpdateGroup(ctx context.Context, actor audit.Actor, id int64, 
 		if err != nil {
 			return err
 		}
+		if in.Purpose != "" && in.Purpose != before.Purpose {
+			return errPurposeImmutable
+		}
+		if before.Purpose == GroupPurposeLLM && in.Visible {
+			return errPoolVisible
+		}
 		g, err = scanGroup(tx.QueryRow(ctx, `UPDATE machine_groups SET name = $2, region = $3, description = $4, sort = $5, visible = $6, updated_at = $7
 			WHERE id = $1 RETURNING `+groupCols, id, in.Name, in.Region, in.Description, in.Sort, in.Visible, now))
 		if db.IsUniqueViolation(err) {
@@ -190,11 +230,19 @@ func (s *Service) UpdateGroup(ctx context.Context, actor audit.Actor, id int64, 
 	return g, err
 }
 
-// DeleteGroupIn 删除没有机器的机组（实例引用由 rental.AdminDeleteGroup 在同一事务里先检查）。
+// DeleteGroupIn 删除没有机器的机组（实例引用由 rental.AdminDeleteGroup 在同一事务里先检查）；Token 服务池不能删除。
 func (s *Service) DeleteGroupIn(ctx context.Context, q db.Querier, id int64) error {
+	var purpose string
 	var machines int
-	if err := q.QueryRow(ctx, `SELECT count(*) FROM machines WHERE group_id = $1`, id).Scan(&machines); err != nil {
+	err := q.QueryRow(ctx, `SELECT purpose, (SELECT count(*) FROM machines WHERE group_id = $1) FROM machine_groups WHERE id = $1`, id).Scan(&purpose, &machines)
+	if db.IsNoRows(err) {
+		return apperr.ErrGroupNotFound
+	}
+	if err != nil {
 		return err
+	}
+	if purpose == GroupPurposeLLM {
+		return errPoolNotDeletable
 	}
 	if machines > 0 {
 		return apperr.ErrGroupNotEmpty

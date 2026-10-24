@@ -23,6 +23,7 @@ type appJSON struct {
 	Category    string   `json:"category"`
 	Icon        string   `json:"icon"`
 	Sort        int      `json:"sort"`
+	Internal    bool     `json:"internal"` // 平台内部应用（只在新建应用时写入）
 	Version     string   `json:"version"`
 	Images      []string `json:"images"`
 	Changelog   string   `json:"changelog"`
@@ -136,7 +137,7 @@ func (c *Catalog) importApp(ctx context.Context, actor audit.Actor, dir, slug st
 	app, err := c.AppBySlug(ctx, slug)
 	if errors.Is(err, apperr.ErrNotFound) {
 		app, err = c.CreateApp(ctx, actor, AppInput{Slug: slug, Name: meta.Name, Summary: meta.Summary, Description: meta.Description,
-			Category: meta.Category, Icon: meta.Icon, Sort: meta.Sort, Status: StatusDraft})
+			Category: meta.Category, Icon: meta.Icon, Sort: meta.Sort, Status: StatusDraft, Internal: meta.Internal})
 		res.Created = err == nil
 	}
 	if err != nil {

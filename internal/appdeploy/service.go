@@ -49,6 +49,8 @@ type Deps struct {
 	// AppRootFor 按实例给出应用根目录（测试 / e2e 多实例共用一个假容器时各用各的目录）；nil → AppRoot。
 	AppRootFor              func(instanceID string) string
 	HFEndpoint, PipIndexURL string
+	// SystemUserID 系统账号（users.system，计划 9）：只有它能部署内部应用；0 = 未配置，谁都不能部署内部应用。
+	SystemUserID int64
 }
 
 type Service struct {
@@ -101,6 +103,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Deployment, er
 		app, ver, err := s.resolveVersion(ctx, tx, req.AppID, req.VersionID)
 		if err != nil {
 			return err
+		}
+		if app.Internal && (s.d.SystemUserID == 0 || req.UserID != s.d.SystemUserID) {
+			return apperr.ErrAppNotFound // 内部应用对用户按不存在处理
 		}
 		if err := s.checkImage(ctx, tx, ver, inst.ImageID); err != nil {
 			return err
