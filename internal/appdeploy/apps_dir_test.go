@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -208,4 +210,73 @@ func assignedVars(file *syntax.File) map[string]bool {
 		return true
 	})
 	return out
+}
+
+// TestVLLMStartArgs 用假的 vllm 真跑 deploy/apps/vllm/app.sh start：开了工具调用（验收缺陷 A-2，Open WebUI 默认带
+// tool_choice=auto）；每次启动先把旧 vllm.log 改名为 vllm.log.1（O-3：并入部署日志的 tail 只有本次运行的输出）；
+// 「打开」指向 /docs（A-4：vLLM 根路径 404）。
+func TestVLLMStartArgs(t *testing.T) {
+	appDir, bin := t.TempDir(), t.TempDir()
+	argsFile := filepath.Join(appDir, "args")
+	fake := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + appdeploy.ShellQuote(argsFile) + "\necho fresh-run\nexec sleep 30\n"
+	if err := os.WriteFile(filepath.Join(bin, "vllm"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(appDir, "vllm.log"), []byte("previous-run\n"), 0o644)
+	script, err := filepath.Abs(filepath.Join(appsDir, "vllm", "app.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/sh", script, "start")
+	cmd.Dir = appDir
+	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "SPARK_APP_DIR="+appDir, "SPARK_MODELS_DIR="+filepath.Join(appDir, "models"),
+		"SPARK_PORT=8000", "MODEL_ID=Qwen/Qwen3-4B", "API_KEY=abcdefgh")
+	// start 把 vllm.log 的 tail 并进 stdout（run.sh 的部署日志）且留在后台：输出写文件，不能等管道关闭
+	outFile, err := os.Create(filepath.Join(appDir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+	cmd.Stdout, cmd.Stderr = outFile, outFile
+	err = cmd.Run()
+	t.Cleanup(func() {
+		for _, f := range []string{"service.pid", "tail.pid"} {
+			if b, err := os.ReadFile(filepath.Join(appDir, f)); err == nil {
+				exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+			}
+		}
+	})
+	if err != nil {
+		b, _ := os.ReadFile(filepath.Join(appDir, "log"))
+		t.Fatalf("app.sh start: %v %s", err, b)
+	}
+	var args []string
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		b, _ := os.ReadFile(argsFile)
+		if args = strings.Fields(string(b)); len(args) > 0 || time.Now().After(deadline) {
+			break
+		}
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"serve " + filepath.Join(appDir, "models", "modelscope", "Qwen/Qwen3-4B"), "--host 127.0.0.1", "--port 8000",
+		"--served-model-name Qwen/Qwen3-4B", "--enable-auto-tool-choice", "--tool-call-parser hermes", "--api-key abcdefgh"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("vllm args missing %q: %s", want, joined)
+		}
+	}
+	if old, _ := os.ReadFile(filepath.Join(appDir, "vllm.log.1")); string(old) != "previous-run\n" {
+		t.Errorf("vllm.log.1 = %q", old)
+	}
+	if cur, _ := os.ReadFile(filepath.Join(appDir, "vllm.log")); strings.Contains(string(cur), "previous-run") {
+		t.Errorf("vllm.log still has the previous run: %q", cur)
+	}
+	var spec appdeploy.Spec
+	raw, _ := os.ReadFile(filepath.Join(appsDir, "vllm", "spec.json"))
+	if err := json.Unmarshal(raw, &spec); err != nil || spec.Ports[0].Path != "/docs" {
+		t.Errorf("vllm ports[0].path = %+v %v", spec.Ports, err)
+	}
+	df, _ := os.ReadFile("../../deploy/image/apps/llm-serving/Dockerfile")
+	if !regexp.MustCompile(`ARG OPEN_WEBUI_VERSION=0\.12\.3\b`).Match(df) || !bytes.Contains(df, []byte(`"open-webui==${OPEN_WEBUI_VERSION}"`)) {
+		t.Error("llm-serving Dockerfile must pin Open WebUI to the version verified on the Spark (0.12.3)")
+	}
 }

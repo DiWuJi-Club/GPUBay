@@ -7,7 +7,7 @@
 
 | 镜像 | 基础镜像 | 用途 / 额外内容 |
 |---|---|---|
-| `spark/llm-serving:<TAG>` | `nvcr.io/nvidia/vllm:<TAG>-py3` | 大模型推理：NGC 自带的 `vllm`；Open WebUI 装在独立 venv `/opt/open-webui`（依赖与 vLLM 冲突），用 `/opt/open-webui/bin/open-webui` 启动 |
+| `spark/llm-serving:<TAG>` | `nvcr.io/nvidia/vllm:<TAG>-py3` | 大模型推理：NGC 自带的 `vllm`；Open WebUI（锁 `0.12.3`，构建参数 `OPEN_WEBUI_VERSION`）装在独立 venv `/opt/open-webui`（依赖与 vLLM 冲突），用 `/opt/open-webui/bin/open-webui` 启动 |
 | `spark/comfyui:<TAG>` | `nvcr.io/nvidia/pytorch:<TAG>-py3` | 文生图：ComfyUI 固定 ref 克隆到 `/opt/ComfyUI`（requirements 里的 torch 系过滤掉，用 NGC 的）；不装 ComfyUI-Manager |
 | `spark/pytorch:<TAG>` | `nvcr.io/nvidia/pytorch:<TAG>-py3` | 通用 PyTorch 开发环境，替换 images 种子里的 PyTorch 占位条目 |
 

@@ -65,9 +65,14 @@ case "${1:-}" in
     ;;
   start)
     _dir=$(model_dir)
+    # 工具调用：Open WebUI 默认 function_calling = native，请求带 tool_choice=auto，vLLM 不开 auto tool choice 会回 400；
+    # hermes 解析器适用于目录里的 Qwen3 / Qwen2.5
     set -- vllm serve "$_dir" --host 127.0.0.1 --port "$SPARK_PORT" --served-model-name "$MODEL_ID" \
-      --max-model-len "${MAX_MODEL_LEN:-32768}" --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.7}"
+      --max-model-len "${MAX_MODEL_LEN:-32768}" --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.7}" \
+      --enable-auto-tool-choice --tool-call-parser hermes
     if [ -n "${API_KEY:-}" ]; then set -- "$@" --api-key "$API_KEY"; fi
+    # 每次启动换新的 vllm.log（上一次的留一份 vllm.log.1）：下面的 tail -n 200 只并入本次运行的输出
+    if [ -f "$SPARK_APP_DIR/vllm.log" ]; then mv -f "$SPARK_APP_DIR/vllm.log" "$SPARK_APP_DIR/vllm.log.1"; fi
     "$@" </dev/null >>"$SPARK_APP_DIR/vllm.log" 2>&1 &
     echo $! > "$SPARK_APP_DIR/service.pid"
     echo "vllm serve started, pid $(cat "$SPARK_APP_DIR/service.pid"); log: $SPARK_APP_DIR/vllm.log"

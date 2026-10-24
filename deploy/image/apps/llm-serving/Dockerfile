@@ -16,10 +16,13 @@ RUN apt-get update \
 RUN pip install -i ${PIP_INDEX_URL} modelscope jupyterlab \
  && if [ "${VLLM_FROM_PIP}" = "1" ]; then pip install -i ${PIP_INDEX_URL} vllm; fi \
  && python3 -c "import vllm; print('vllm', vllm.__version__)"
-# Open WebUI 依赖与 vLLM 的依赖互相冲突，放进独立 venv；app.sh 用 /opt/open-webui/bin/open-webui 启动
+# Open WebUI 依赖与 vLLM 的依赖互相冲突，放进独立 venv；app.sh 用 /opt/open-webui/bin/open-webui 启动。
+# 锁版本：0.12.3 是计划 7 验收时实装、验证过的版本（默认 function_calling = native，请求带 tool_choice=auto，
+# vLLM 应用 1.0.4 起开了 --enable-auto-tool-choice）；升级前在真机上复测对话
+ARG OPEN_WEBUI_VERSION=0.12.3
 RUN python3 -m venv /opt/open-webui \
  && /opt/open-webui/bin/pip install -i ${PIP_INDEX_URL} --upgrade pip \
- && /opt/open-webui/bin/pip install -i ${PIP_INDEX_URL} open-webui \
+ && /opt/open-webui/bin/pip install -i ${PIP_INDEX_URL} "open-webui==${OPEN_WEBUI_VERSION}" \
  && /opt/open-webui/bin/open-webui --help >/dev/null
 # NGC 基础镜像自带 ENTRYPOINT /opt/nvidia/nvidia_entrypoint.sh，规范要求应用镜像不设入口，清空
 ENTRYPOINT []

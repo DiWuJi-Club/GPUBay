@@ -1,5 +1,5 @@
 {
-  "ports": [{"port": 8000, "label": "OpenAI 兼容接口", "path": "/v1", "health_path": "/health"}],
+  "ports": [{"port": 8000, "label": "OpenAI 兼容接口", "path": "/docs", "health_path": "/health"}],
   "timeout_minutes": 90,
   "min_data_free_gib": 40,
   "env": [
