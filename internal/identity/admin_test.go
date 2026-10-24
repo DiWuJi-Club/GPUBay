@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"spark-cloud/internal/audit"
@@ -23,7 +24,8 @@ func TestAdminListUsers(t *testing.T) {
 	dbtest.CreateUser(t, pool, "13900000002", false)
 	dbtest.CreateUser(t, pool, "13800000003", false)
 	all, total, err := svc.AdminListUsers(ctx, identity.UserFilter{}, paging.Page{})
-	if err != nil || total != 3 || len(all) != 3 {
+	// 迁移 00022 种子：系统账号 system:llm（已实名）。后台列表默认隐藏系统账号在计划 9 Task 13（include_system）实现
+	if err != nil || total != 4 || len(all) != 4 {
 		t.Fatalf("all = %d, %v", total, err)
 	}
 	if list, total, _ := svc.AdminListUsers(ctx, identity.UserFilter{Q: "13900000002"}, paging.Page{}); total != 1 || list[0].Phone != "13900000002" {
@@ -35,10 +37,11 @@ func TestAdminListUsers(t *testing.T) {
 	if _, _, err := svc.AdminListUsers(ctx, identity.UserFilter{Q: "张三"}, paging.Page{}); apperr.As(err) == nil {
 		t.Fatal("non-numeric q must be rejected")
 	}
-	if list, total, _ := svc.AdminListUsers(ctx, identity.UserFilter{Q: itoa(a)}, paging.Page{}); total != 1 || list[0].ID != a {
+	// 数字 q 同时匹配 ID 与手机号尾号：系统账号占了 ID 1 后 a = 2，「2」也命中 13900000002
+	if list, _, _ := svc.AdminListUsers(ctx, identity.UserFilter{Q: itoa(a)}, paging.Page{}); !slices.ContainsFunc(list, func(u identity.User) bool { return u.ID == a }) {
 		t.Fatalf("q=id = %+v", list)
 	}
-	if _, total, _ := svc.AdminListUsers(ctx, identity.UserFilter{KYCStatus: "verified"}, paging.Page{}); total != 1 {
+	if _, total, _ := svc.AdminListUsers(ctx, identity.UserFilter{KYCStatus: "verified"}, paging.Page{}); total != 2 {
 		t.Fatalf("verified = %d", total)
 	}
 	if _, _, err := svc.AdminListUsers(ctx, identity.UserFilter{Status: "zombie"}, paging.Page{}); apperr.As(err) == nil {

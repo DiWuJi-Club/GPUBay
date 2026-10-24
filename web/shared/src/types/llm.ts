@@ -1,0 +1,214 @@
+// 计划 9：Token 商城（规格 §10）。金额单位：价格「分 / 百万 token」，费用 cost_micro「微分」（1 分 = 10^6 微分），其余金额「分」。
+
+export type LLMModelKind = 'chat' | 'embedding'
+export type LLMModelSource = 'modelscope' | 'hf-mirror'
+export type LLMModelStatus = 'draft' | 'online' | 'offline'
+export type LLMNodeState = 'provisioning' | 'ready' | 'unhealthy' | 'draining' | 'removing' | 'removed' | 'failed'
+export type LLMKeyStatus = 'active' | 'disabled' | 'revoked'
+export type LLMUsageStatus = 'ok' | 'client_abort' | 'upstream_error' | 'upstream_timeout' | 'no_node'
+export type LLMEndpoint = 'chat' | 'completions' | 'embeddings'
+
+// ---- 控制台（/api/v1/llm/*）----
+
+/** GET /llm/models 的条目（只含 online 模型）。 */
+export interface LLMModelPublic {
+  slug: string
+  name: string
+  description: string
+  kind: LLMModelKind
+  context_len: number
+  max_output_tokens: number
+  input_price: number
+  output_price: number
+  features: string[]
+  /** 有 ready 节点 */
+  available: boolean
+}
+export interface LLMModelsResponse { items: LLMModelPublic[]; base_url: string }
+
+/** GET /llm/account */
+export interface LLMAccount {
+  debt: number
+  /** ceil(unsettled_micro / 10^6) */
+  unsettled: number
+  today_cost: number
+  month_cost: number
+  month_tokens: number
+  limits: { rpm: number; tpm: number; concurrency: number }
+  blocked: boolean
+  blocked_reason: string
+  kyc_verified: boolean
+  base_url: string
+}
+
+/** GET /llm/keys 的条目（只有 key_hint，没有明文）。 */
+export interface LLMKey {
+  id: number
+  name: string
+  key_hint: string
+  status: LLMKeyStatus
+  /** 空 = 全部在线模型 */
+  model_slugs: string[]
+  monthly_cap: number | null
+  month_cost: number
+  expires_at: string | null
+  last_used_at: string | null
+  created_at: string
+}
+export interface LLMKeyInput {
+  name: string
+  model_slugs?: string[]
+  monthly_cap?: number | null
+  expires_at?: string | null
+}
+export interface LLMKeyUpdate {
+  name?: string
+  status?: 'active' | 'disabled'
+  model_slugs?: string[]
+  monthly_cap?: number | null
+}
+/** POST /llm/keys → 201：明文 key 只返回这一次。 */
+export interface LLMKeyCreated { key: string; item: LLMKey }
+
+/** GET /llm/usage 的条目。 */
+export interface LLMUsageRow {
+  request_id: string
+  created_at: string
+  model: string
+  key_name: string
+  endpoint: LLMEndpoint
+  stream: boolean
+  prompt_tokens: number
+  completion_tokens: number
+  estimated: boolean
+  cost_micro: number
+  status: LLMUsageStatus
+  http_status: number
+  latency_ms: number
+  ttft_ms: number | null
+}
+
+/** GET /llm/usage/daily 的条目（day 为北京时间 YYYY-MM-DD）。 */
+export interface LLMDailyRow {
+  day: string
+  model: string
+  requests: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost_micro: number
+}
+
+/** GET /llm/settlements 的条目。 */
+export interface LLMSettlement {
+  id: number
+  created_at: string
+  requests: number
+  prompt_tokens: number
+  completion_tokens: number
+  usage_amount: number
+  debt_amount: number
+  charged: number
+  wallet_ledger_id: number | null
+  period_from: string | null
+  period_to: string | null
+}
+
+// ---- 后台（/admin/api/v1/llm/*）----
+
+/** GET /llm/models 的条目：全部字段 + 节点计数。 */
+export interface LLMModelAdmin {
+  id: number
+  slug: string
+  name: string
+  description: string
+  kind: LLMModelKind
+  source: LLMModelSource
+  source_id: string
+  image_id: number
+  app_version_id: number | null
+  context_len: number
+  max_output_tokens: number
+  default_max_tokens: number
+  input_price: number
+  output_price: number
+  node_env: Record<string, string>
+  replicas: number
+  max_concurrency: number
+  features: string[]
+  status: LLMModelStatus
+  sort: number
+  created_at: string
+  updated_at: string
+  nodes: { ready: number; total: number }
+}
+/** POST /llm/models（PUT 不含 slug）。 */
+export type LLMModelInput = Omit<LLMModelAdmin, 'id' | 'status' | 'created_at' | 'updated_at' | 'nodes'>
+
+/** GET /llm/nodes 的条目。 */
+export interface LLMNode {
+  id: string
+  model_id: number
+  model_slug: string
+  machine_id: number
+  machine_name: string
+  instance_id: string | null
+  deployment_id: string | null
+  state: LLMNodeState
+  deployment: { state: string; health: string; phase: string; progress: number } | null
+  inflight: number
+  probe_fail_count: number
+  rebuild_count: number
+  unhealthy_since: string | null
+  drain_since: string | null
+  last_probe_at: string | null
+  last_ready_at: string | null
+  error: string
+  created_at: string
+  updated_at: string
+}
+export interface LLMNodeEvent {
+  id: number
+  node_id: string
+  at: string
+  from_state: string
+  to_state: string
+  detail: string
+}
+/** GET /llm/nodes/{id}：详情 + 最近 50 条节点事件 + 部署事件。 */
+export interface LLMNodeDetail {
+  node: LLMNode
+  events: LLMNodeEvent[]
+  deployment_events: { id: number; at: string; from_state: string; to_state: string; detail: string }[]
+}
+
+/** GET /llm/pool 的机器行。 */
+export interface LLMPoolMachine {
+  machine: { id: number; serial: string; display_name: string; state: string; agent_online: boolean }
+  node?: { id: string; model_slug: string; state: LLMNodeState }
+  /** 机器上仍有租约时的到期时间（「等待租约结束」） */
+  lease_until?: string
+}
+export interface LLMPool { group_id: number; machines: LLMPoolMachine[]; free: number; total: number }
+
+/** GET /llm/accounts 的条目。 */
+export interface LLMAccountAdmin {
+  user_id: number
+  phone: string
+  keys: number
+  month_cost: number
+  unsettled: number
+  debt: number
+  rpm_limit: number | null
+  tpm_limit: number | null
+  concurrency_limit: number | null
+  blocked: boolean
+  blocked_reason: string
+}
+
+/** GET /llm/summary（仪表盘卡片）。 */
+export interface LLMSummary {
+  nodes: { ready: number; total: number; unhealthy: number }
+  today: { requests: number; prompt_tokens: number; completion_tokens: number; settled_amount: number; unsettled_estimate: number }
+  debt_total: number
+  debt_users: number
+}

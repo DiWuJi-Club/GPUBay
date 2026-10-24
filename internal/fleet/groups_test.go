@@ -36,7 +36,8 @@ func TestGroupCRUDAndAssign(t *testing.T) {
 		t.Fatalf("unknown machine = %v", err)
 	}
 	rows, err := svc.ListGroups(ctx, false, nil)
-	if err != nil || len(rows) != 1 || rows[0].MachineCount != 2 || rows[0].IdleNow != 2 {
+	// 迁移 00022 种子：不可见的「Token 服务池」（sort 1000，排在最后）
+	if err != nil || len(rows) != 2 || rows[0].ID != g.ID || rows[0].MachineCount != 2 || rows[0].IdleNow != 2 || rows[1].Name != "Token 服务池" {
 		t.Fatalf("list = %+v, %v", rows, err)
 	}
 	if err := svc.DeleteGroupIn(ctx, pool, g.ID); !errors.Is(err, apperr.ErrGroupNotEmpty) {

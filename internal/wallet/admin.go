@@ -28,7 +28,7 @@ type AdminLedgerRow struct {
 	OperatorID *int64 `json:"operator_id"`
 }
 
-var ledgerKinds = []string{string(KindRecharge), string(KindAdminAdjust), string(KindOrderPay), string(KindRefund)}
+var ledgerKinds = []string{string(KindRecharge), string(KindAdminAdjust), string(KindOrderPay), string(KindRefund), string(KindLLMPay)}
 
 func (f LedgerFilter) where() (db.Where, error) {
 	var w db.Where

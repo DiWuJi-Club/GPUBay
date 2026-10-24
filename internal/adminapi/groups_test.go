@@ -43,7 +43,8 @@ func TestGroupAPI(t *testing.T) {
 	}
 	code, out = fin.do("GET", "/groups", nil)
 	items := out["items"].([]any)
-	if code != 200 || len(items) != 1 {
+	// 迁移 00022 种子：不可见的「Token 服务池」（sort 1000，排在最后）
+	if code != 200 || len(items) != 2 || items[1].(map[string]any)["name"] != "Token 服务池" {
 		t.Fatalf("list = %d %v", code, out)
 	}
 	row := items[0].(map[string]any)
@@ -71,7 +72,7 @@ func TestGroupAPI(t *testing.T) {
 	if code, _ := ops.do("DELETE", "/groups/"+itoa(gid), map[string]any{}); code != 200 {
 		t.Fatalf("delete = %d", code)
 	}
-	if code, out := ops.do("GET", "/groups", nil); code != 200 || len(out["items"].([]any)) != 0 {
+	if code, out := ops.do("GET", "/groups", nil); code != 200 || len(out["items"].([]any)) != 1 { // 只剩种子「Token 服务池」
 		t.Fatalf("after delete = %d %v", code, out)
 	}
 	if code, out := ops.do("PUT", "/machines/"+itoa(m1), map[string]any{"group_id": gid}); code != 404 || codeOf(out) != "group_not_found" {

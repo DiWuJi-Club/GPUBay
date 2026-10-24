@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { alertKindLabel, auditActions, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel } from '../labels'
+import {
+  alertKindLabel, auditActions, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel, llmKeyStatusLabel, llmModelStatusLabel,
+  llmNodeStateLabel, llmNodeStateType, llmUsageStatusLabel,
+} from '../labels'
+import type { LLMNodeState, LLMUsageStatus } from '../types'
 
 describe('labels', () => {
   it('实例状态中文与颜色', () => {
@@ -21,12 +25,31 @@ describe('labels', () => {
     expect(labelOf(alertKindLabel, 'container_down')).toBe('容器未运行')
   })
   it('审计动作列表与后端写入值一致', () => {
-    expect(auditActions).toHaveLength(60)
+    expect(auditActions).toHaveLength(72)
     expect(new Set(auditActions).size).toBe(auditActions.length)
     expect(auditActions).toContain('instance.port_force_private')
     expect(auditActions).toContain('ssh_key.delete')
     expect(auditActions).toContain('instance.refund_release')
     expect(auditActions).toContain('wallet.manual_recharge')
     expect(auditActions).toContain('booking.cancel')
+  })
+  it('Token 商城文案', () => {
+    expect(labelOf(ledgerKindLabel, 'llm_pay')).toBe('Token 消费')
+    expect(llmModelStatusLabel).toEqual({ draft: '草稿', online: '已上线', offline: '已下线' })
+    const states: LLMNodeState[] = ['provisioning', 'ready', 'unhealthy', 'draining', 'removing', 'removed', 'failed']
+    expect(Object.keys(llmNodeStateLabel).sort()).toEqual([...states].sort())
+    for (const st of states) expect(llmNodeStateType[st]).toBeTruthy()
+    expect(labelOf(llmNodeStateType, 'ready')).toBe('success')
+    expect(labelOf(llmNodeStateType, 'failed')).toBe('danger')
+    const usage: LLMUsageStatus[] = ['ok', 'client_abort', 'upstream_error', 'upstream_timeout', 'no_node']
+    expect(usage.map((u) => llmUsageStatusLabel[u])).toEqual(['成功', '客户端中断', '上游错误', '上游超时', '无可用节点'])
+    expect(Object.keys(llmKeyStatusLabel).sort()).toEqual(['active', 'disabled', 'revoked'])
+    for (const k of ['llm_pool_short', 'llm_node_unhealthy', 'llm_node_failed', 'llm_usage_record_failed']) {
+      expect(labelOf(alertKindLabel, k)).not.toBe(k)
+    }
+    for (const a of [
+      'llm.model.create', 'llm.model.update', 'llm.model.status', 'llm.model.delete', 'llm.node.drain', 'llm.node.rebuild', 'llm.node.remove',
+      'llm.account.update', 'llm.key.create', 'llm.key.update', 'llm.key.revoke', 'llm.key.admin_disable',
+    ]) expect(auditActions).toContain(a)
   })
 })

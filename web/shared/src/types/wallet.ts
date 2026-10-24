@@ -1,4 +1,4 @@
-export type LedgerKind = 'recharge' | 'order_pay' | 'refund' | 'admin_adjust' | (string & {})
+export type LedgerKind = 'recharge' | 'order_pay' | 'refund' | 'admin_adjust' | 'llm_pay' | (string & {})
 
 export interface LedgerRow {
   id: number
