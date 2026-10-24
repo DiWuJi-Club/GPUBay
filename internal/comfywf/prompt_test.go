@@ -135,7 +135,14 @@ func TestBuildPromptSeed(t *testing.T) {
 	if *seed != 0 {
 		t.Fatalf("seed = %d", *seed)
 	}
-	for _, v := range []any{-2.0, 1.5, "12", float64(1 << 53), true} {
+	// 数字字符串也接受。
+	for v, want := range map[string]int64{"-1": 7, "123": 123, " 5 ": 5} {
+		_, seed, err := BuildPrompt(api, m.Inputs, map[string]any{"image": img, "seed": v}, fixedRnd(7))
+		if err != nil || *seed != want {
+			t.Fatalf("seed %q: %v %v", v, seed, err)
+		}
+	}
+	for _, v := range []any{-2.0, 1.5, "abc", "1.5", "-2", float64(1 << 53), true} {
 		_, _, err := BuildPrompt(api, m.Inputs, map[string]any{"image": img, "seed": v}, fixedRnd(1))
 		wantInputInvalid(t, err, "种子")
 	}

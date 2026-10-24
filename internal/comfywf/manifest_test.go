@@ -146,7 +146,10 @@ func graphWith(nodes ...string) json.RawMessage {
 func TestGraphRefs(t *testing.T) {
 	models := []ModelSpec{
 		{Name: "a.safetensors", Dir: "clip", SizeGB: 1, HF: &RepoFile{Repo: "x/y", File: "a.safetensors"}},
-		{Name: "b.safetensors", Dir: "clip", SizeGB: 1, HF: &RepoFile{Repo: "x/y", File: "b.safetensors"}},
+		{Name: "b.safetensors", Dir: "text_encoders", SizeGB: 1, HF: &RepoFile{Repo: "x/y", File: "b.safetensors"}},
+		{Name: "v.safetensors", Dir: "vae", SizeGB: 1, HF: &RepoFile{Repo: "x/y", File: "v.safetensors"}},
+		{Name: "u.safetensors", Dir: "diffusion_models", SizeGB: 1, HF: &RepoFile{Repo: "x/y", File: "u.safetensors"}},
+		{Name: "c.safetensors", Dir: "checkpoints", SizeGB: 1, HF: &RepoFile{Repo: "x/y", File: "c.safetensors"}},
 	}
 	cases := []struct {
 		name  string
@@ -155,9 +158,9 @@ func TestGraphRefs(t *testing.T) {
 		path  string // "" = 通过
 	}{
 		{"dual clip both declared", graphWith(`{"id":1,"type":"DualCLIPLoader","properties":{"cnr_id":"comfy-core"},"widgets_values":["a.safetensors","b.safetensors","flux","default"]}`), nil, ""},
-		{"dual clip second missing", graphWith(`{"id":1,"type":"DualCLIPLoader","widgets_values":["a.safetensors","c.safetensors","flux"]}`), nil, "graph.nodes[0]"},
+		{"dual clip second missing", graphWith(`{"id":1,"type":"DualCLIPLoader","widgets_values":["a.safetensors","z.safetensors","flux"]}`), nil, "graph.nodes[0]"},
 		{"triple clip third missing", graphWith(`{"id":1,"type":"TripleCLIPLoader","widgets_values":["a.safetensors","b.safetensors","t5.safetensors"]}`), nil, "graph.nodes[0]"},
-		{"widgets_values object skipped", graphWith(`{"id":1,"type":"CheckpointLoaderSimple","widgets_values":{"ckpt_name":"zzz"}}`), nil, ""},
+		{"widgets_values object checked", graphWith(`{"id":1,"type":"CheckpointLoaderSimple","widgets_values":{"ckpt_name":"zzz"}}`), nil, "graph.nodes[0]"},
 		{"empty model name skipped", graphWith(`{"id":1,"type":"VAELoader","widgets_values":[""]}`), nil, ""},
 		{"vae missing", graphWith(`{"id":1,"type":"VAELoader","widgets_values":["ae.safetensors"]}`), nil, "graph.nodes[0]"},
 		{"frontend virtual nodes", graphWith(`{"id":1,"type":"Reroute"}`, `{"id":2,"type":"Note","widgets_values":["x"]}`, `{"id":3,"type":"MarkdownNote"}`, `{"id":4,"type":"PrimitiveNode"}`), nil, ""},
@@ -173,11 +176,18 @@ func TestGraphRefs(t *testing.T) {
 		{"node without type", graphWith(`{"id":1}`), nil, "graph.nodes[0]"},
 		{"node not object", graphWith(`7`), nil, "graph.nodes[0]"},
 		{"subgraph instance + inner nodes", json.RawMessage(`{"nodes":[{"id":1,"type":"0b7c5a3e-1111-4c2d-8e9f-123456789abc"}],"links":[],
-			"definitions":{"subgraphs":[{"id":"0b7c5a3e-1111-4c2d-8e9f-123456789abc","nodes":[{"id":5,"type":"VAELoader","widgets_values":["a.safetensors"]}]}]}}`), nil, ""},
+			"definitions":{"subgraphs":[{"id":"0b7c5a3e-1111-4c2d-8e9f-123456789abc","nodes":[{"id":5,"type":"VAELoader","widgets_values":["v.safetensors"]}]}]}}`), nil, ""},
+		{"subgraph id not uuid", json.RawMessage(`{"nodes":[{"id":1,"type":"KSampler"},{"id":2,"type":"s1"}],"links":[],
+			"definitions":{"subgraphs":[{"id":"s1","nodes":[]}]}}`), nil, "graph.nodes[1]"},
+		{"widgets_values object by input name", graphWith(`{"id":1,"type":"VAELoader","widgets_values":{"vae_name":"zz.safetensors"}}`), nil, "graph.nodes[0]"},
+		{"widgets_values object declared", graphWith(`{"id":1,"type":"DualCLIPLoader","widgets_values":{"clip_name1":"a.safetensors","clip_name2":"b.safetensors","type":"flux"}}`), nil, ""},
+		{"model wrong dir for loader", graphWith(`{"id":1,"type":"KSampler"}`, `{"id":2,"type":"VAELoader","widgets_values":["a.safetensors"]}`), nil, "manifest.models[0].dir"},
+		{"unet in diffusion_models ok", graphWith(`{"id":1,"type":"UNETLoader","widgets_values":["u.safetensors","default"]}`), nil, ""},
+		{"lora in checkpoints dir", graphWith(`{"id":1,"type":"LoraLoaderModelOnly","widgets_values":["c.safetensors",1]}`), nil, "manifest.models[4].dir"},
 		{"subgraph inner missing model", json.RawMessage(`{"nodes":[],"links":[],
-			"definitions":{"subgraphs":[{"id":"s1","nodes":[{"id":5,"type":"KSampler"},{"id":6,"type":"VAELoader","widgets_values":["zz.safetensors"]}]}]}}`), nil, "graph.definitions.subgraphs[0].nodes[1]"},
+			"definitions":{"subgraphs":[{"id":"0b7c5a3e-1111-4c2d-8e9f-123456789abc","nodes":[{"id":5,"type":"KSampler"},{"id":6,"type":"VAELoader","widgets_values":["zz.safetensors"]}]}]}}`), nil, "graph.definitions.subgraphs[0].nodes[1]"},
 		{"subgraph inner custom", json.RawMessage(`{"nodes":[],"links":[],
-			"definitions":{"subgraphs":[{"id":"s1","nodes":[{"id":5,"type":"Foo"}]}]}}`), nil, "graph.definitions.subgraphs[0].nodes[0]"},
+			"definitions":{"subgraphs":[{"id":"0b7c5a3e-1111-4c2d-8e9f-123456789abc","nodes":[{"id":5,"type":"Foo"}]}]}}`), nil, "graph.definitions.subgraphs[0].nodes[0]"},
 		{"graph not object", json.RawMessage(`[]`), nil, "graph"},
 		{"graph invalid json", json.RawMessage(`{"nodes":`), nil, "graph"},
 		{"graph empty", nil, nil, "graph"},
@@ -252,6 +262,8 @@ func TestValidateManifestRules(t *testing.T) {
 		{"model no source", func(m *Manifest) { m.Models[0].ModelScope = nil; m.Models[0].HF = nil }, "manifest.models[0]"},
 		{"model hf only ok", func(m *Manifest) { m.Models[0].ModelScope = nil }, ""},
 		{"model repo bad", func(m *Manifest) { m.Models[0].ModelScope.Repo = "stable-diffusion" }, "manifest.models[0].modelscope.repo"},
+		{"model repo too long", func(m *Manifest) { m.Models[0].HF.Repo = "a/" + strings.Repeat("b", 127) }, "manifest.models[0].hf.repo"},
+		{"model repo 128 ok", func(m *Manifest) { m.Models[0].HF.Repo = "a/" + strings.Repeat("b", 126) }, ""},
 		{"model repo 3 parts", func(m *Manifest) { m.Models[0].HF.Repo = "a/b/c" }, "manifest.models[0].hf.repo"},
 		{"model file dotdot", func(m *Manifest) { m.Models[0].HF.File = "a/../b.safetensors" }, "manifest.models[0].hf.file"},
 		{"model file dotdot inside", func(m *Manifest) { m.Models[0].HF.File = "a..b" }, "manifest.models[0].hf.file"},
@@ -278,6 +290,25 @@ func TestValidateManifestRules(t *testing.T) {
 		{"node git port", func(m *Manifest) { n := usduNode(); n.Git = "https://github.com:8443/a/b.git"; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].git"},
 		{"node git query", func(m *Manifest) { n := usduNode(); n.Git = "https://github.com/a/b.git?x=1"; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].git"},
 		{"node git path", func(m *Manifest) { n := usduNode(); n.Git = "https://github.com/a/b/c"; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].git"},
+		{"node git userinfo host", func(m *Manifest) {
+			n := usduNode()
+			n.Git = "https://github.com@evil.com/a/b.git"
+			m.Nodes = []NodeSpec{n}
+		}, "manifest.nodes[0].git"},
+		{"node git host suffix", func(m *Manifest) {
+			n := usduNode()
+			n.Git = "https://github.com.evil.com/a/b.git"
+			m.Nodes = []NodeSpec{n}
+		}, "manifest.nodes[0].git"},
+		{"node git uppercase scheme", func(m *Manifest) { n := usduNode(); n.Git = "HTTPS://github.com/a/b.git"; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].git"},
+		{"node git dot segment", func(m *Manifest) { n := usduNode(); n.Git = "https://github.com/../b.git"; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].git"},
+		{"node git dot repo", func(m *Manifest) { n := usduNode(); n.Git = "https://github.com/a/.."; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].git"},
+		{"node git leading dot", func(m *Manifest) {
+			n := usduNode()
+			n.Git = "https://github.com/a/.hidden.git"
+			m.Nodes = []NodeSpec{n}
+		}, "manifest.nodes[0].git"},
+		{"node git single dot", func(m *Manifest) { n := usduNode(); n.Git = "https://github.com/./b"; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].git"},
 		{"node git quote", func(m *Manifest) { n := usduNode(); n.Git = "https://github.com/a/b'c"; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].git"},
 		{"node commit short", func(m *Manifest) { n := usduNode(); n.Commit = "a5547db"; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].commit"},
 		{"node types empty", func(m *Manifest) { n := usduNode(); n.NodeTypes = nil; m.Nodes = []NodeSpec{n} }, "manifest.nodes[0].node_types"},
@@ -379,6 +410,21 @@ func TestValidateManifestRules(t *testing.T) {
 		{"bool ok", func(m *Manifest) {
 			m.Inputs = append(m.Inputs, InputSpec{Key: "flag", Label: "x", Type: InputBool, Node: "12", Input: "enabled", Default: true})
 		}, ""},
+		// 模型加载入参只能用 enum，且选项都是声明的模型
+		{"loader input as text", func(m *Manifest) {
+			m.Inputs = append(m.Inputs, InputSpec{Key: "ckpt", Label: "模型", Type: InputText, Node: "4", Input: "ckpt_name"})
+		}, "manifest.inputs[9].type"},
+		{"loader input as textarea", func(m *Manifest) {
+			m.Inputs = append(m.Inputs, InputSpec{Key: "ckpt", Label: "模型", Type: InputTextarea, Node: "4", Input: "ckpt_name"})
+		}, "manifest.inputs[9].type"},
+		{"loader enum undeclared option", func(m *Manifest) {
+			m.Inputs = append(m.Inputs, InputSpec{Key: "ckpt", Label: "模型", Type: InputEnum, Node: "4", Input: "ckpt_name",
+				Options: []string{"sd_xl_base_1.0.safetensors", "other.safetensors"}})
+		}, "manifest.inputs[9].options[1]"},
+		{"loader enum declared ok", func(m *Manifest) {
+			m.Inputs = append(m.Inputs, InputSpec{Key: "ckpt", Label: "模型", Type: InputEnum, Node: "4", Input: "ckpt_name",
+				Default: "sd_xl_base_1.0.safetensors", Options: []string{"sd_xl_base_1.0.safetensors"}})
+		}, ""},
 		// outputs
 		{"outputs empty ok", func(m *Manifest) { m.Outputs = nil }, ""},
 		{"output not in api", func(m *Manifest) { m.Outputs[0].Node = "99" }, "manifest.outputs[0].node"},
@@ -438,6 +484,7 @@ func TestValidateAPIPrompt(t *testing.T) {
 		{"model undeclared", `{"4":{"class_type":"CheckpointLoaderSimple","inputs":{"ckpt_name":"other.safetensors"}}}`, "api_prompt.4.inputs.ckpt_name"},
 		{"lora undeclared", `{"4":{"class_type":"LoraLoader","inputs":{"lora_name":"x.safetensors","model":["1",0]}}}`, "api_prompt.4.inputs.lora_name"},
 		{"too big", `{"3":{"class_type":"KSampler","inputs":{"x":"` + strings.Repeat("a", MaxAPIPromptBytes) + `"}}}`, "api_prompt"},
+		{"model wrong dir", `{"4":{"class_type":"VAELoader","inputs":{"vae_name":"sd_xl_base_1.0.safetensors"}}}`, "manifest.models[0].dir"},
 		{"ok", `{"4":{"class_type":"CheckpointLoaderSimple","inputs":{"ckpt_name":"sd_xl_base_1.0.safetensors"}}}`, ""},
 	}
 	for _, c := range cases {

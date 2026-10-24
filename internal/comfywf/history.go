@@ -1,6 +1,7 @@
 package comfywf
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"path"
@@ -29,6 +30,9 @@ const (
 	KindVideo = "video"
 	// maxRunMessage 错误消息截断长度（字符）。
 	maxRunMessage = 500
+	// maxRunFiles 一次运行最多收集的输出文件数。
+	maxRunFiles      = 64
+	malformedHistory = "ComfyUI 返回了无法解析的结果"
 )
 
 // outputKeys 收集输出文件的键（顺序即同一节点内的输出顺序）。ComfyUI v0.3.60：SaveImage / SaveAnimatedWEBP /
@@ -41,7 +45,8 @@ var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".web
 
 // ParseHistory 解析 ComfyUI GET /history/{prompt_id} 的响应（形如 {"<id>": {"prompt": […], "outputs": {…}, "status":
 // {"status_str", "completed", "messages": [[event, {…}], …]}, "meta": {…}}}；任务结束前是 {}）。outputs 非空时只取
-// 声明的节点（按声明顺序），否则取全部节点（按节点 id 数值顺序）。只收 type = output 的文件；文件名 / 子目录不安全的跳过。
+// 声明的节点（按声明顺序），否则取全部节点（按节点 id 数值顺序）。只收 type = output、扩展名是已知图片 / 视频的文件，
+// 文件名 / 子目录不安全（路径穿越、控制字符、引号）的跳过，最多 maxRunFiles 个。条目不是对象 → RunError。
 // 响应体视为不可信，长度（≤ 1MB）由调用方保证。
 func ParseHistory(body []byte, promptID string, outputs []OutputSpec) (HistoryResult, error) {
 	var all map[string]json.RawMessage
@@ -60,8 +65,20 @@ func ParseHistory(body []byte, promptID string, outputs []OutputSpec) (HistoryRe
 		} `json:"status"`
 		Outputs map[string]json.RawMessage `json:"outputs"`
 	}
+	if t := bytes.TrimSpace(raw); len(t) == 0 || t[0] != '{' {
+		return HistoryResult{State: RunError, Message: malformedHistory}, nil
+	}
 	if err := json.Unmarshal(raw, &h); err != nil {
-		return HistoryResult{}, errors.New("comfywf: history 条目格式不对")
+		// 字段类型不对（如 outputs 是数组）：按字段逐个容错，不让前端一直轮询。
+		var loose struct {
+			Status  json.RawMessage `json:"status"`
+			Outputs json.RawMessage `json:"outputs"`
+		}
+		if json.Unmarshal(raw, &loose) != nil {
+			return HistoryResult{State: RunError, Message: malformedHistory}, nil
+		}
+		_ = json.Unmarshal(loose.Status, &h.Status)
+		_ = json.Unmarshal(loose.Outputs, &h.Outputs)
 	}
 	if h.Status != nil && h.Status.StatusStr == "error" {
 		return HistoryResult{State: RunError, Message: errorMessage(h.Status.Messages)}, nil
@@ -90,6 +107,9 @@ func ParseHistory(body []byte, promptID string, outputs []OutputSpec) (HistoryRe
 				continue
 			}
 			for _, it := range items {
+				if len(res.Files) >= maxRunFiles {
+					break
+				}
 				var f struct {
 					Filename  string `json:"filename"`
 					Subfolder string `json:"subfolder"`
@@ -98,38 +118,50 @@ func ParseHistory(body []byte, promptID string, outputs []OutputSpec) (HistoryRe
 				if json.Unmarshal(it, &f) != nil || f.Type != "output" || !safeFilename(f.Filename) || !safeSubfolder(f.Subfolder) {
 					continue
 				}
+				kind := fileKind(f.Filename)
+				if kind == "" {
+					continue
+				}
 				res.Files = append(res.Files, OutputFile{Index: len(res.Files), Filename: f.Filename, Subfolder: f.Subfolder,
-					Type: f.Type, Kind: fileKind(key, f.Filename)})
+					Type: f.Type, Kind: kind})
 			}
 		}
 	}
 	return res, nil
 }
 
-// fileKind 按扩展名判断（images 下也可能是 SaveVideo 的 .mp4）；未知扩展名：images → image，gifs / videos → video。
-// 动图 .gif / .webp 记为 image（<img> 能直接播放）。
-func fileKind(key, filename string) string {
+// fileKind 只按扩展名判断（images 下也可能是 SaveVideo 的 .mp4）；动图 .gif / .webp 记为 image（<img> 能直接播放）；
+// 未知扩展名 → ""（跳过：代理 /view 只为图片 / 视频服务）。
+func fileKind(filename string) string {
 	ext := strings.ToLower(path.Ext(filename))
 	switch {
 	case videoExts[ext]:
 		return KindVideo
 	case imageExts[ext]:
 		return KindImage
-	case key == "images":
-		return KindImage
 	}
-	return KindVideo
+	return ""
+}
+
+// hasUnsafeChars 控制字符（< 0x20、0x7f）、引号、反斜杠（会进 Content-Disposition 与 /view 查询参数）。
+func hasUnsafeChars(s string) bool {
+	for _, c := range s {
+		if c < 0x20 || c == 0x7f || c == '"' || c == '\\' {
+			return true
+		}
+	}
+	return false
 }
 
 func safeFilename(s string) bool {
-	return s != "" && len(s) <= 255 && s != "." && s != ".." && !strings.ContainsAny(s, "/\\\x00")
+	return s != "" && len(s) <= 255 && s != "." && s != ".." && !strings.Contains(s, "/") && !hasUnsafeChars(s)
 }
 
 func safeSubfolder(s string) bool {
 	if s == "" {
 		return true
 	}
-	if len(s) > 255 || strings.HasPrefix(s, "/") || strings.ContainsAny(s, "\\\x00") {
+	if len(s) > 255 || strings.HasPrefix(s, "/") || hasUnsafeChars(s) {
 		return false
 	}
 	for _, seg := range strings.Split(s, "/") {

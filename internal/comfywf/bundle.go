@@ -70,6 +70,13 @@ func BundleFiles(ws []BundleWorkflow) ([]appdeploy.BundleFile, error) {
 		if len(w.Graph) == 0 || !json.Valid(w.Graph) {
 			return nil, invalid("workflows."+w.Slug+".graph", "graph 不是合法 JSON")
 		}
+		// 纵深防御：app.sh 按空格分隔的行读清单，字段必须仍满足清单正则（版本入库时已校验，这里再查一遍）。
+		if _, err := validateModels(w.Manifest.Models); err != nil {
+			return nil, err
+		}
+		if _, err := validateNodes(w.Manifest.Nodes); err != nil {
+			return nil, err
+		}
 		e := bundleEntry{Slug: w.Slug, Version: w.Version, File: w.Slug + ".json",
 			Models: make([]ModelSpec, 0, len(w.Manifest.Models)), Nodes: make([]bundleNode, 0, len(w.Manifest.Nodes))}
 		for _, md := range w.Manifest.Models {
