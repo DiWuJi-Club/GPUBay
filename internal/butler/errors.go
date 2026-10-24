@@ -1,6 +1,7 @@
 package butler
 
 import (
+	"errors"
 	"strings"
 
 	"spark-cloud/internal/platform/apperr"
@@ -17,3 +18,12 @@ func disabledErr(notice string) error {
 	e := apperr.ErrButlerDisabled
 	return apperr.New(e.Code, e.Message+"："+notice, e.Status)
 }
+
+// errGlobalBusy：本副本同时进行的轮次已满（MaxConcurrentRuns）；错误码与 butler_busy 相同，文案不同。
+var errGlobalBusy = apperr.New(apperr.ErrButlerBusy.Code, "管家正忙，请稍后", apperr.ErrButlerBusy.Status)
+
+// errStaleRun：回写时 run_token 已不匹配（清扫器已接管或另一轮已开始），本轮的结果丢弃。
+var errStaleRun = errors.New("butler: stale run token")
+
+// errNoPending：对话没有待确认的工具调用。
+var errNoPending = errors.New("butler: no pending tool call")
