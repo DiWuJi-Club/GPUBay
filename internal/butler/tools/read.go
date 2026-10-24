@@ -56,7 +56,7 @@ func readTools(d Deps) []Tool {
 				`"count": {"type": "integer", "minimum": 1, "maximum": 8, "default": 1, "description": "需要的台数"}`,
 				`"start_at": {"type": "string", "maxLength": 40, "description": "预订开始时间（RFC3339，北京时间整点，如 2026-10-20T10:00:00+08:00）；不填表示立即租用"}`,
 				`"group_id": {"type": "integer", "minimum": 1, "description": "机组 ID（可选）"}`),
-			Description: "查询某套餐在指定时段可租的台数（立即租用或预订）。"},
+			Description: "查询某套餐在一个租用时段内可租的台数（立即租用或预订）。返回 start_at / end_at = 所查时段的开始与结束（北京时间；立即租用从现在起算）、available = 该时段可租台数、enough = 是否够 count 台。不提供最早可开始时间：不够时换一个 start_at 再查。"},
 		{Name: "list_apps", Kind: Read, Exec: h.listApps, Schema: json.RawMessage(noArgs),
 			Description: "列出可一键部署的应用目录（slug、名称、简介、分类、兼容镜像）。"},
 		{Name: "get_app", Kind: Read, Exec: h.getApp,
@@ -120,18 +120,27 @@ func userAttrs(c Caller) map[string]string {
 	return map[string]string{"user": strconv.FormatInt(c.UserID, 10)}
 }
 
-// wrapOne 包裹单个对象；字段都已各自截断，整段超限只会在异常数据时发生，此时按字节硬截断兜底。
+// wrapOne 包裹单个对象；超限时按 fitJSON 降级字段（从不按字节截断 JSON）。
 func wrapOne(name string, c Caller, v any, limit int, ref string) (Result, error) {
-	s, err := guard.JSONWrap(name, userAttrs(c), v, 0)
+	s, err := fitJSON(name, c, v, limit)
 	if err != nil {
 		return Result{}, err
 	}
-	if len(s) > limit {
-		if s, err = guard.JSONWrap(name, userAttrs(c), v, limit); err != nil {
+	return Result{Content: s, Ref: ref}, nil
+}
+
+// wrapLevels 依次尝试 build(0..levels-1)（越往后越精简），取第一个放得下的；都放不下时对最后一级做通用降级。
+func wrapLevels(name string, c Caller, levels int, build func(level int) any, limit int, ref string) (Result, error) {
+	for l := 0; l < levels-1; l++ {
+		s, err := guard.JSONWrap(name, userAttrs(c), build(l), 0)
+		if err != nil {
 			return Result{}, err
 		}
+		if len(s) <= limit {
+			return Result{Content: s, Ref: ref}, nil
+		}
 	}
-	return Result{Content: s, Ref: ref}, nil
+	return wrapOne(name, c, build(levels-1), limit, ref)
 }
 
 // wrapList 包裹含列表的对象：build(k) 返回只含前 k 项的结果；超出 limit 时二分找最多能放下的项数。
@@ -268,11 +277,17 @@ func (h readHandlers) checkAvailability(ctx context.Context, c Caller, args json
 	if err != nil {
 		return Result{}, err
 	}
+	// 只回所查的租用时段本身（立即租用从现在起算）；Availability 的 Lower / Upper 含开通准备与尾段，给模型容易误读，不输出。
+	// 最早可开始时间 Availability 算不出来：不够时让模型换个时段再查。
+	quantity := max(a.Quantity, 1)
+	begin := h.now(c)
+	if start != nil {
+		begin = *start
+	}
 	out := map[string]any{
-		"product_id": a.ProductID, "duration": a.Duration, "quantity": a.Quantity, "count": a.Count,
-		"start_at": tsp(start), "immediate": start == nil, "group_id": a.GroupID,
+		"product_id": a.ProductID, "duration": a.Duration, "quantity": quantity, "count": a.Count, "group_id": a.GroupID,
+		"immediate": start == nil, "start_at": ts(begin), "end_at": ts(begin.Add(catalog.Duration(a.Duration).Length() * time.Duration(quantity))),
 		"available": av.Available, "enough": av.Available >= a.Count,
-		"occupy_from": ts(av.Lower), "occupy_until": ts(av.Upper),
 	}
 	return wrapOne("check_availability", c, out, smallLimit, "")
 }
@@ -318,25 +333,82 @@ func (h readHandlers) getApp(ctx context.Context, c Caller, args json.RawMessage
 	if err != nil {
 		return Result{}, err
 	}
-	// 复制后净化（不改调用方 / 缓存里的视图）：说明、简介、变量的标签与帮助都是应用作者写的文本
-	v.Name, v.Summary, v.Description = clean(v.Name, textLimit), clean(v.Summary, textLimit), clean(v.Description, descLimit)
-	env := make([]appdeploy.EnvSpec, 0, len(v.Version.Env))
+	// 超限时逐级精简（先截 enum 选项，再缩短说明与帮助），始终输出合法 JSON
+	return wrapLevels("get_app", c, len(appLevels), func(l int) any { return appView(v, appLevels[l]) }, largeLimit, a.Slug)
+}
+
+// appLevel 是 get_app 的一级精简：选项最多几个、说明 / 帮助 / 其它文本最多多少字节。
+type appLevel struct{ options, desc, help, text int }
+
+var appLevels = []appLevel{
+	{options: 0, desc: descLimit, help: textLimit, text: textLimit}, // 0 = 不限选项数
+	{options: 8, desc: descLimit, help: textLimit, text: textLimit},
+	{options: 8, desc: 1024, help: 256, text: 256},
+	{options: 3, desc: 256, help: 64, text: 128},
+}
+
+// envOut 是 get_app 的变量声明：EnvSpec 全部字段 + 选项被截断时的标记。
+type envOut struct {
+	appdeploy.EnvSpec
+	OptionsTruncated bool `json:"options_truncated,omitempty"`
+	OptionsTotal     int  `json:"options_total,omitempty"`
+}
+
+type appVersionOut struct {
+	ID             int64                `json:"id"`
+	Version        string               `json:"version"`
+	Ports          []appdeploy.PortSpec `json:"ports"`
+	Env            []envOut             `json:"env"`
+	Links          []appdeploy.LinkSpec `json:"links"`
+	TimeoutMinutes int                  `json:"timeout_minutes"`
+}
+
+type appOut struct {
+	ID          int64                  `json:"id"`
+	Slug        string                 `json:"slug"`
+	Name        string                 `json:"name"`
+	Summary     string                 `json:"summary"`
+	Description string                 `json:"description"`
+	Category    string                 `json:"category"`
+	Icon        string                 `json:"icon"`
+	Version     appVersionOut          `json:"version"`
+	Images      []appdeploy.ImageBrief `json:"images"`
+}
+
+// appView 按精简级别组装 get_app 结果（复制后净化，不改调用方的视图）：说明、简介、变量的标签与帮助都是应用作者写的文本。
+func appView(v appdeploy.CatalogView, lv appLevel) appOut {
+	out := appOut{ID: v.ID, Slug: v.Slug, Name: clean(v.Name, lv.text), Summary: clean(v.Summary, lv.text),
+		Description: clean(v.Description, lv.desc), Category: v.Category, Icon: v.Icon, Images: v.Images,
+		Version: appVersionOut{ID: v.Version.ID, Version: v.Version.Version, Ports: v.Version.Ports, Env: []envOut{},
+			Links: []appdeploy.LinkSpec{}, TimeoutMinutes: v.Version.TimeoutMinutes}}
+	if out.Images == nil {
+		out.Images = []appdeploy.ImageBrief{}
+	}
+	if out.Version.Ports == nil {
+		out.Version.Ports = []appdeploy.PortSpec{}
+	}
 	for _, e := range v.Version.Env {
-		e.Label, e.Help, e.Default = clean(e.Label, textLimit), clean(e.Help, textLimit), clean(e.Default, textLimit)
-		e.Options = append([]string(nil), e.Options...)
-		env = append(env, e)
+		e.Label, e.Help, e.Default = clean(e.Label, lv.text), clean(e.Help, lv.help), clean(e.Default, lv.text)
+		eo := envOut{EnvSpec: e}
+		opts := e.Options
+		if lv.options > 0 && len(opts) > lv.options {
+			opts = opts[:lv.options]
+			eo.OptionsTruncated, eo.OptionsTotal = true, len(e.Options)
+		}
+		eo.Options = make([]string, 0, len(opts))
+		for _, o := range opts {
+			eo.Options = append(eo.Options, clean(o, lv.text))
+		}
+		if len(e.Options) == 0 {
+			eo.Options = nil // 保持 omitempty：非 enum 变量不输出 options
+		}
+		out.Version.Env = append(out.Version.Env, eo)
 	}
-	v.Version.Env = env
-	links := make([]appdeploy.LinkSpec, 0, len(v.Version.Links))
 	for _, l := range v.Version.Links {
-		l.Label = clean(l.Label, textLimit)
-		links = append(links, l)
+		l.Label = clean(l.Label, lv.text)
+		out.Version.Links = append(out.Version.Links, l)
 	}
-	v.Version.Links = links
-	if v.Images == nil {
-		v.Images = []appdeploy.ImageBrief{}
-	}
-	return wrapOne("get_app", c, v, largeLimit, a.Slug)
+	return out
 }
 
 // ---- list_instances / get_instance ----
@@ -390,6 +462,7 @@ type instanceDetail struct {
 	PasswordAuth          bool                 `json:"password_auth"`
 	SSHCommand            string               `json:"ssh_command"`
 	RetainUntil           *string              `json:"retain_until"`
+	ScheduledEndAt        *string              `json:"scheduled_end_at"`
 	CancellableUntil      *string              `json:"cancellable_until"`
 	GroupID               *int64               `json:"group_id"`
 	BatchID               *string              `json:"batch_id"`
@@ -432,8 +505,15 @@ func (h readHandlers) getInstance(ctx context.Context, c Caller, args json.RawMe
 	if inst.State == rental.StateStopped && inst.StoppedAt != nil && inst.PendingSeconds == 0 {
 		v.RetainUntil = tsp(new(inst.StoppedAt.Add(rental.RetainAfterStop)))
 	}
-	if inst.State == rental.StateReserved && inst.ScheduledStartAt != nil {
-		v.CancellableUntil = tsp(new(inst.ScheduledStartAt.Add(-rental.PrepLead)))
+	if inst.ScheduledStartAt != nil { // 与 api.view 一致：已开机的以 expires_at 为准，开机前按开始时刻 + 待开始时长推算
+		if (inst.State == rental.StateRunning || inst.State == rental.StateStopped) && inst.ExpiresAt != nil {
+			v.ScheduledEndAt = tsp(inst.ExpiresAt)
+		} else {
+			v.ScheduledEndAt = tsp(new(inst.ScheduledStartAt.Add(time.Duration(inst.PendingSeconds) * time.Second)))
+		}
+		if inst.State == rental.StateReserved {
+			v.CancellableUntil = tsp(new(inst.ScheduledStartAt.Add(-rental.PrepLead)))
+		}
 	}
 	if renewable(inst.State) {
 		info, err := h.d.Rental.RenewInfoFor(ctx, inst)
@@ -631,13 +711,23 @@ func (h readHandlers) getDeploymentLog(ctx context.Context, c Caller, args json.
 		if len(s) <= largeLimit || budget == 0 {
 			break
 		}
-		budget -= len(s) - largeLimit + 128 // JSON 转义（\n、引号）使结果比日志本身长，收紧后重试
-		if budget < 0 {
-			budget = 0
+		// JSON 转义（\n、引号、反斜杠）使结果比日志本身长：按实测转义比例收紧日志预算
+		esc, _ := encodeValue(inner)
+		other := len(s) - (len(esc) - 2)                   // 外层包裹与其它字段
+		ratio := float64(len(esc)-2) / float64(len(inner)) // 转义后 / 转义前
+		wrapper := len(inner) - len(tail)                  // 内层包裹与省略标记
+		next := int(float64(largeLimit-other-64)/ratio) - wrapper
+		if next >= budget {
+			next = budget - (len(s)-largeLimit)/2 - 1
 		}
+		budget = max(next, 0)
 	}
-	if len(s) > largeLimit { // 兜底（理论上不会发生）
-		s = guard.Truncate(s, largeLimit)
+	if len(s) > largeLimit { // 兜底：不截 JSON，只丢日志正文
+		out := map[string]any{"instance_id": a.InstanceID, "deployment_id": a.DeploymentID, "live": res.Live, "at": ts(res.At),
+			"omitted_bytes": len(full), "log": guard.Wrap("deployment_log", map[string]string{"instance": a.InstanceID, "deployment": a.DeploymentID}, "（日志过长，已省略）", 0)}
+		if s, err = guard.JSONWrap("get_deployment_log", userAttrs(c), out, 0); err != nil {
+			return Result{}, err
+		}
 	}
 	return Result{Content: s, Ref: a.DeploymentID}, nil
 }
@@ -746,9 +836,10 @@ func (h readHandlers) listOrders(ctx context.Context, c Caller, args json.RawMes
 	if err := decodeArgs(args, &a); err != nil {
 		return Result{}, err
 	}
-	if a.Limit <= 0 || a.Limit > 20 {
+	if a.Limit <= 0 {
 		a.Limit = 10
 	}
+	a.Limit = min(a.Limit, 20)
 	orders, err := h.d.Rental.ListOrders(ctx, c.UserID, a.Limit)
 	if err != nil {
 		return Result{}, err

@@ -205,12 +205,18 @@ func TestCheckAvailability(t *testing.T) {
 	f := newFakes()
 	r := NewRegistry(f.deps)
 	v := mustRun(t, r, "check_availability", `{"product_id":1,"duration":"1d","count":2}`)
-	if v["available"] != float64(3) || v["enough"] != true || v["immediate"] != true || v["quantity"] != float64(1) || v["start_at"] != nil {
+	if v["available"] != float64(3) || v["enough"] != true || v["immediate"] != true || v["quantity"] != float64(1) ||
+		v["start_at"] != "2026-10-25T10:00:00+08:00" || v["end_at"] != "2026-10-26T10:00:00+08:00" {
 		t.Fatalf("immediate = %v", v)
 	}
 	v = mustRun(t, r, "check_availability", `{"product_id":1,"duration":"1w","quantity":2,"count":5,"start_at":"2026-10-27T10:00:00+08:00","group_id":4}`)
-	if v["enough"] != false || v["immediate"] != false || v["start_at"] != "2026-10-27T10:00:00+08:00" || v["occupy_from"] != "2026-10-27T09:00:00+08:00" {
+	if v["enough"] != false || v["immediate"] != false || v["start_at"] != "2026-10-27T10:00:00+08:00" || v["end_at"] != "2026-11-10T10:00:00+08:00" {
 		t.Fatalf("booking = %v", v)
+	}
+	for _, k := range []string{"occupy_from", "occupy_until", "lower", "upper"} {
+		if _, has := v[k]; has {
+			t.Fatalf("%s must not be exposed: %v", k, v)
+		}
 	}
 	q := f.rental.availQ[len(f.rental.availQ)-1]
 	if q.ProductID != 1 || q.Quantity != 2 || q.GroupID == nil || *q.GroupID != 4 || q.StartAt == nil || q.StartAt.Location().String() != "UTC" || q.StartAt.Hour() != 2 {

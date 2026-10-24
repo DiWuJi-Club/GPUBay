@@ -18,7 +18,7 @@ import (
 // 支持：type ∈ object|string|integer|number|boolean|array、properties、required、additionalProperties（false 或 schema）、
 // enum、minimum / maximum、minLength / maxLength（按字符计）、pattern（RE2）、items（单 schema）、minItems / maxItems、default。
 // 规范化：对象里值为 null 的字段视为缺失（去掉），缺失字段按 default 填入；integer 接受整数值的小数（3.0）与数字字符串（"3"），
-// 统一输出为整数。未知关键字在编译时报错（工具 schema 写错立即暴露，而不是静默放行）。
+// 统一输出为整数；number 接受数字字符串（"0.5"）；boolean 接受 "true" / "false"。未知关键字在编译时报错（工具 schema 写错立即暴露，而不是静默放行）。
 
 // ValidationError 是参数校验失败；Error() 即回填给模型的文案「参数 <path>：<原因>」。
 type ValidationError struct {
@@ -295,7 +295,7 @@ func (s *Schema) validate(v any, path string) (any, error) {
 		}
 		out = n
 	case "number":
-		f, ok := toNumber(v)
+		f, ok := toNumberArg(v)
 		if !ok {
 			return nil, &ValidationError{Path: path, Reason: "应为数字"}
 		}
@@ -304,7 +304,7 @@ func (s *Schema) validate(v any, path string) (any, error) {
 		}
 		out = f
 	case "boolean":
-		b, ok := v.(bool)
+		b, ok := toBool(v)
 		if !ok {
 			return nil, &ValidationError{Path: path, Reason: "应为布尔值"}
 		}
@@ -385,6 +385,34 @@ func toInteger(v any) (int64, bool) {
 		return x, true
 	}
 	return 0, false
+}
+
+// toNumberArg：JSON 数字或十进制数字字符串（"0.5"；与 integer 同样宽松）；NaN / Inf 不接受。
+func toNumberArg(v any) (float64, bool) {
+	if str, ok := v.(string); ok {
+		f, err := strconv.ParseFloat(strings.TrimSpace(str), 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0, false
+		}
+		return f, true
+	}
+	return toNumber(v)
+}
+
+// toBool：JSON 布尔或字符串 "true" / "false"（小模型常把布尔写成字符串）。
+func toBool(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		switch strings.TrimSpace(x) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		}
+	}
+	return false, false
 }
 
 func toNumber(v any) (float64, bool) {
