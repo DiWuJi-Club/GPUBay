@@ -86,8 +86,11 @@ export interface InstalledWorkflow {
   version: string
   state: WorkflowInstallState
   latest_version_id: number | null
+  latest_version: string
   update_available: boolean
   quick_run: boolean
+  added_at: string
+  installed_at: string | null
 }
 
 export interface QuickRunFile { index: number; filename: string; kind: 'image' | 'video'; url: string }
@@ -100,4 +103,6 @@ export interface QuickRun {
   state: QuickRunState
   files: QuickRunFile[]
   message: string
+  created_at: string
+  finished_at: string | null
 }
