@@ -338,9 +338,13 @@ func (s *Service) RedeployInTx(ctx context.Context, tx pgx.Tx, inst rental.Insta
 	default:
 		return Deployment{}, apperr.ErrAppInvalidState
 	}
-	ver, err := s.pickVersion(ctx, tx, d.AppID, req.VersionID)
-	if err != nil {
-		return Deployment{}, err
+	// 显式指定部署自己的当前版本 = 原样重新部署，即使该版本已下线（计划 11：改工作流集合后不换应用版本）；
+	// 其它显式版本仍须已发布（pickVersion）。
+	ver := cur
+	if req.VersionID == nil || *req.VersionID != d.AppVersionID {
+		if ver, err = s.pickVersion(ctx, tx, d.AppID, req.VersionID); err != nil {
+			return Deployment{}, err
+		}
 	}
 	if err := s.checkImage(ctx, tx, ver, inst.ImageID); err != nil {
 		return Deployment{}, err
