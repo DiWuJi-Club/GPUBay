@@ -14,8 +14,9 @@ import (
 // 在 machineID 上一个已 running 的系统实例上直接插一个 ready 节点（deployment_id NULL、last_ready_at = now、随机节点密钥加密存储）
 // 并写一条事件。生产路径（Controller / 后台）不调用它。
 //
-// 这种节点没有部署：Prober 每轮对它计一次失败（「节点没有部署」），连续 ProbeFailThreshold 轮后转 unhealthy，
-// Controller 随后因无法重建而把它置为 failed 并释放实例；后台「重建」对它返回 llm_node_invalid_state。
+// 这种节点没有部署：Prober 跳过部署检查、直接经上游做 HTTP 探测，所以它的健康跟随假容器上的 FakeVLLM
+// （探测失败照常计数 → unhealthy；恢复 → ready）。但它不能重建：后台「重建」返回 llm_node_invalid_state，
+// unhealthy 之后 Controller 因没有部署可 Redeploy 而把它置为 failed 并释放实例。
 // 实例不是该机器上 running 的系统实例 → apperr.ErrInvalidState；机器上已有非终态节点 → apperr.ErrMachineUnavailable。
 func (s *Service) SeedReadyNode(ctx context.Context, modelID, machineID int64, instanceID string) (Node, error) {
 	if _, err := s.GetModel(ctx, modelID); err != nil {

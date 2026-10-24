@@ -158,7 +158,9 @@ func (s *Service) InvalidateKey(hash string) {
 	s.keyCache.m.Delete(hash)
 }
 
-// InvalidateUser 本进程内立即失效该用户全部 Key 的缓存（账户限额 / 停用、欠费变化、封禁 / 解封、实名变化后在事务提交后调用）。
+// InvalidateUser 本进程内立即失效该用户全部 Key 的缓存。在事务提交后调用的地方：后台改账户限额 / 停用（AdminUpdateAccount）、
+// 结算改变欠费 / 未结算（Settle）、后台封禁 / 解封（adminapi handleBan / handleUnban）。实名状态变化不调用（只会从未实名变为已实名，
+// 最多 KeyCacheTTL 后生效）；其它进程一律最多 KeyCacheTTL 后生效。
 func (s *Service) InvalidateUser(userID int64) {
 	s.keyCache.gen.Add(1)
 	s.keyCache.m.Range(func(k, v any) bool {

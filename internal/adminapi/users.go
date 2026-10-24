@@ -130,6 +130,9 @@ func (s *Server) handleBan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	if s.LLM != nil { // 计划 9：本进程网关的 Key 鉴权缓存立即失效，封禁即刻生效（其它进程最多 llm.KeyCacheTTL）
+		s.LLM.InvalidateUser(id)
+	}
 	httpx.OK(w)
 }
 
@@ -142,6 +145,9 @@ func (s *Server) handleUnban(w http.ResponseWriter, r *http.Request) {
 	if err := s.Identity.Unban(r.Context(), s.actor(r), id); err != nil {
 		s.writeError(w, r, err)
 		return
+	}
+	if s.LLM != nil {
+		s.LLM.InvalidateUser(id)
 	}
 	httpx.OK(w)
 }

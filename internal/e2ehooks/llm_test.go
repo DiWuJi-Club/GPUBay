@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/llm"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/rental"
 )
 
@@ -118,8 +120,22 @@ func TestLLMHooks(t *testing.T) {
 	if rep := e.must("POST", "/hooks/llm/tick", map[string]any{}); rep["error"] != "" {
 		t.Fatalf("tick = %v", rep)
 	}
-	if n := node(); n.State != llm.NodeReady || n.ProbeFailCount != 1 || !strings.Contains(n.Error, "没有部署") {
+	if n := node(); n.State != llm.NodeReady || n.ProbeFailCount != 0 || n.LastProbeAt == nil || n.Error != "" {
 		t.Fatalf("node after probe = %+v", n)
+	}
+	// 健康跟随 FakeVLLM：served 里没有该模型 → 探测失败计数；后台重建对无部署的钩子节点不可用
+	e.must("POST", "/hooks/llm/upstream", map[string]any{"served": []string{"other-model"}})
+	e.must("POST", "/hooks/llm/tick", map[string]any{})
+	if n := node(); n.State != llm.NodeReady || n.ProbeFailCount != 1 || !strings.Contains(n.Error, "not served") {
+		t.Fatalf("node after failed probe = %+v", n)
+	}
+	e.must("POST", "/hooks/llm/upstream", map[string]any{})
+	e.must("POST", "/hooks/llm/tick", map[string]any{})
+	if n := node(); n.ProbeFailCount != 0 {
+		t.Fatalf("node after recovered probe = %+v", n)
+	}
+	if _, err := e.a.LLM.AdminRebuildNode(ctx, audit.Actor{}, nodeID); !errors.Is(err, apperr.ErrLLMNodeInvalidState) {
+		t.Fatalf("rebuild hook node: err = %v, want llm_node_invalid_state", err)
 	}
 
 	// 结算：推进 10 分钟 + /hooks/sweep

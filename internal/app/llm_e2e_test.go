@@ -1132,7 +1132,7 @@ func TestLLMUnassignBusyMachineRejected(t *testing.T) {
 	}
 }
 
-// 封禁与撤销（规格 §16.2 第 7 组）：封禁用户 → 鉴权缓存（30 秒）过期后 403 account_banned；解封后恢复；
+// 封禁与撤销（规格 §16.2 第 7 组）：后台封禁 → 本进程立即 403 account_banned（不经本进程失效时最多 30 秒后）；解封后恢复；
 // 撤销 Key → 立即 401 invalid_api_key（本进程内缓存即时失效）。
 func TestLLMBanAndRevoke(t *testing.T) {
 	e := newLLMEnv(t, 1)
@@ -1143,17 +1143,24 @@ func TestLLMBanAndRevoke(t *testing.T) {
 	plain, keyID := u.createKey(nil)
 	e.mustChat(plain, nil)
 
+	// 后台封禁（同进程网关的鉴权缓存立即失效）→ 立即 403；后台解封 → 立即恢复
+	ac, _ := e.adminLogin()
+	ac.do("POST", fmt.Sprintf("/users/%d/ban", u.id), map[string]any{"reason": "e2e 封禁"})
+	if r := e.chat(plain, nil); r.status != http.StatusForbidden || r.code() != "account_banned" {
+		t.Fatalf("banned via admin = %d %s", r.status, r.body)
+	}
+	ac.do("POST", fmt.Sprintf("/users/%d/unban", u.id), map[string]any{})
+	e.mustChat(plain, nil)
+
+	// 不经本进程失效（如另一个进程的后台封禁）：最多 KeyCacheTTL 后生效
 	if err := e.a.Identity.Ban(e.ctx, audit.Actor{}, u.id, "e2e 封禁"); err != nil {
 		t.Fatal(err)
 	}
 	e.clk.Advance(llm.KeyCacheTTL + time.Second)
 	if r := e.chat(plain, nil); r.status != http.StatusForbidden || r.code() != "account_banned" {
-		t.Fatalf("banned = %d %s", r.status, r.body)
+		t.Fatalf("banned after KeyCacheTTL = %d %s", r.status, r.body)
 	}
-	if err := e.a.Identity.Unban(e.ctx, audit.Actor{}, u.id); err != nil {
-		t.Fatal(err)
-	}
-	e.clk.Advance(llm.KeyCacheTTL + time.Second)
+	ac.do("POST", fmt.Sprintf("/users/%d/unban", u.id), map[string]any{})
 	e.mustChat(plain, nil)
 
 	if err := e.a.LLM.RevokeKey(e.ctx, u.id, keyID, "127.0.0.1"); err != nil {
@@ -1162,5 +1169,5 @@ func TestLLMBanAndRevoke(t *testing.T) {
 	if r := e.chat(plain, nil); r.status != http.StatusUnauthorized || r.code() != "invalid_api_key" {
 		t.Fatalf("revoked = %d %s", r.status, r.body)
 	}
-	e.waitUsage(u.id, 2)
+	e.waitUsage(u.id, 3)
 }
