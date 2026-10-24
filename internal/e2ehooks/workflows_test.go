@@ -224,12 +224,26 @@ func TestWorkflowSeedMany(t *testing.T) {
 		t.Fatalf("not idempotent: %v then %v", c0, c1)
 	}
 	w, err := e.a.Workflows.GetWorkflow(ctx, int64(c1["id"].(float64)))
-	if err != nil || w.Status != comfywf.StatusPublished || w.HasCover || w.Category != comfywf.CategoryOther {
+	if err != nil || w.Status != comfywf.StatusPublished || w.HasCover || w.Category != comfywf.CategoryOther || w.Name != "E2E 工作流 C" ||
+		w.Sort != 100 || w.Summary != "fake 额外工作流（上限用例）" || w.Slug != "e2e-wf-c" {
 		t.Fatalf("C = %+v %v", w, err)
 	}
 	v, err := e.a.Workflows.GetVersion(ctx, int64(c1["version_id"].(float64)))
 	if err != nil || len(v.Manifest.Nodes) != 0 || v.Manifest.Models[0].Name != "e2e-c.safetensors" || len(v.Manifest.Inputs) != 3 {
 		t.Fatalf("C version = %+v %v", v, err)
+	}
+	if e := e2ehooks.ExtraWorkflow(6); e.Slug != "e2e-wf-i" || e.Sort != 106 || e.Model != "e2e-i.safetensors" {
+		t.Fatalf("ExtraWorkflow(6) = %+v", e)
+	}
+	for _, i := range []int{-1, e2ehooks.MaxExtraWorkflows} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("ExtraWorkflow(%d) did not panic", i)
+				}
+			}()
+			e2ehooks.ExtraWorkflow(i)
+		}()
 	}
 	for _, n := range []int{0, 8} {
 		if code, _ := e.call("POST", "/hooks/workflows/seed-many", map[string]any{"n": n}); code != 400 {

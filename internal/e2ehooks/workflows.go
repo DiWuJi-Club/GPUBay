@@ -248,7 +248,11 @@ func SeedWorkflows(ctx context.Context, a *app.App) ([]SeededWorkflow, error) {
 const MaxExtraWorkflows = 7
 
 // ExtraWorkflow 返回第 i 个（0 起）额外 fake 工作流：e2e-wf-c、e2e-wf-d…，分类「其它」、无封面、无节点、模型 e2e-<x>.safetensors 0.5GB。
+// i 超出 [0, MaxExtraWorkflows) 是调用方的错（钩子已校验 n），直接 panic。
 func ExtraWorkflow(i int) FakeWorkflow {
+	if i < 0 || i >= MaxExtraWorkflows {
+		panic(fmt.Sprintf("ExtraWorkflow(%d): 超出 0～%d", i, MaxExtraWorkflows-1))
+	}
 	x := string(rune('c' + i))
 	return FakeWorkflow{Slug: "e2e-wf-" + x, Name: "E2E 工作流 " + strings.ToUpper(x), Summary: "fake 额外工作流（上限用例）",
 		Category: comfywf.CategoryOther, Model: "e2e-" + x + ".safetensors", SizeGB: 0.5, Sort: 100 + i}
@@ -256,6 +260,9 @@ func ExtraWorkflow(i int) FakeWorkflow {
 
 // SeedExtraWorkflows 幂等地建前 n 个额外工作流（按顺序返回）。
 func SeedExtraWorkflows(ctx context.Context, a *app.App, n int) ([]SeededWorkflow, error) {
+	if n < 0 || n > MaxExtraWorkflows {
+		return nil, fmt.Errorf("SeedExtraWorkflows: n = %d 超出 0～%d", n, MaxExtraWorkflows)
+	}
 	out := []SeededWorkflow{}
 	for i := 0; i < n; i++ {
 		s, err := CreateFakeWorkflow(ctx, a, ExtraWorkflow(i))

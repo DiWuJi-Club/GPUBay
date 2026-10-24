@@ -114,6 +114,15 @@ export async function installedRunning(s: Pick<ComfySetup, 'api' | 'id' | 'dep'>
   return list
 }
 
+/** 点击 click 触发的下单（POST /api/v1/orders）的响应里的实例 ID；调用方紧接着 ownInstance，断言失败也会清理。 */
+export async function placedInstance(page: Page, click: () => Promise<void>): Promise<string> {
+  const resp = page.waitForResponse((r) => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/v1/orders')
+  await click()
+  const r = await resp
+  if (r.status() !== 201) throw new Error(`POST /orders ${r.status()} ${await r.text()}`)
+  return ((await r.json()) as { instance: { id: string } }).instance.id
+}
+
 /** 实例详情工作流子区块里某个工作流的行。 */
 export const wfRow = (page: Page, slug: string): Locator => page.getByTestId(`wf-row-${slug}`)
 
@@ -126,5 +135,5 @@ export async function wfMenu(page: Page, slug: string, action: 'update' | 'remov
 /** 图片真的加载出来了（naturalWidth > 0）。 */
 export async function expectImageLoaded(img: Locator) {
   await expect(img).toBeVisible()
-  await expect.poll(() => img.evaluate((el) => (el as HTMLImageElement).complete && (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
+  await expect.poll(() => img.evaluate((el) => ((el as HTMLImageElement).complete ? (el as HTMLImageElement).naturalWidth : 0))).toBeGreaterThan(0)
 }

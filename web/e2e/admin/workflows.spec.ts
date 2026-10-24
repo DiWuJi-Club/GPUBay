@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
-import { adminApi, adminPost, createAdmin, enterTotpDialog, expectAdminUrl, getJSON, loginAdmin, pick, type SeededAdmin } from '../helpers/admin'
+import { adminApi, adminPost, createAdmin, drainTasks, enterTotpDialog, expectAdminUrl, getJSON, loginAdmin, pick, recordRequests, type SeededAdmin } from '../helpers/admin'
 import { cleanupApps } from '../helpers/apps'
 import { toast } from '../helpers/console'
 import { runStamp } from '../helpers/phone'
@@ -53,8 +53,11 @@ test('A-WF-01 新建 / 编辑工作流：必填校验、详情信息、slug 不�
   await page.getByTestId('adm-wf-new').click()
   await expect(page.getByTestId('adm-wf-dialog')).toBeVisible()
   await expect(page.getByTestId('adm-wf-status')).toHaveCount(0) // 状态只在编辑时可改
+  const creates = recordRequests(page, 'POST', '/workflows')
   await page.getByTestId('adm-wf-submit').click()
-  await expect(page.getByTestId('adm-wf-form-error')).toBeVisible() // 空表单不发请求
+  await expect(page.getByTestId('adm-wf-form-error')).toBeVisible()
+  await drainTasks(page)
+  expect(creates).toHaveLength(0) // 空表单在本地拦下，不发请求
 
   const slug = nextSlug()
   await page.getByTestId('adm-wf-slug').fill(slug)
@@ -70,7 +73,7 @@ test('A-WF-01 新建 / 编辑工作流：必填校验、详情信息、slug 不�
   await expect(page.getByTestId('adm-wf-detail-status')).toHaveText('草稿')
   await expect(page.getByTestId('adm-wf-detail-slug')).toHaveText(slug)
   await expect(page.getByTestId('adm-wf-detail-category')).toHaveText('视频')
-  await expect(page.getByTestId('adm-wf-detail-tags')).toHaveText('SDXL入门')
+  await expect(page.getByTestId('adm-wf-detail-tags').locator('.el-tag')).toHaveText(['SDXL', '入门'])
   await expect(page.getByTestId('adm-wf-detail-summary')).toHaveText('一句话简介')
 
   await page.getByTestId('adm-wf-detail-edit').click()
@@ -280,14 +283,17 @@ test('A-WF-07 仪表盘：已安装工作流数与 24 小时快速出图数随�
   const admin = await createAdmin('ops')
   const ctx = await adminApi(admin)
   type Dash = { workflow_installs: number; workflow_runs_24h: number }
-  const before = await getJSON<Dash>(ctx, '/admin/api/v1/dashboard')
+  // 两个计数都是全库口径（admin project 串行，没有别的用例同时改）：各自在变化前一刻取基线。
+  // 24 小时窗口按假时钟算，comfySetup / tick 会推进时钟，所以运行数的基线放到 startRunViaApi 前一刻
+  const installsBefore = (await getJSON<Dash>(ctx, '/admin/api/v1/dashboard')).workflow_installs
   const s = await comfySetup()
   await installedRunning(s, s.wf.a.id, s.wf.b.id)
+  const runsBefore = (await getJSON<Dash>(ctx, '/admin/api/v1/dashboard')).workflow_runs_24h
   const run = await startRunViaApi(s.api, s.id, s.dep.id, s.wf.a.id, { prompt: 'dashboard' })
   await setComfyHistory(run.id, 'done')
   const after = await getJSON<Dash>(ctx, '/admin/api/v1/dashboard')
-  expect(after.workflow_installs).toBe(before.workflow_installs + 2)
-  expect(after.workflow_runs_24h).toBe(before.workflow_runs_24h + 1)
+  expect(after.workflow_installs).toBe(installsBefore + 2)
+  expect(after.workflow_runs_24h).toBe(runsBefore + 1)
 
   await loginAdmin(page, admin)
   await expect(page.getByTestId('dash-workflow-installs')).toHaveText(String(after.workflow_installs))

@@ -1,18 +1,22 @@
 import { expect, test, type Page } from '@playwright/test'
-import { cleanupApps, expectRowState, listDeployments, ownInstance, seedApps, tickUntil } from '../helpers/apps'
+import { appAction, cleanupApps, expectRowState, listDeployments, ownInstance, seedApps, tickUntil } from '../helpers/apps'
 import { isMobile, loginConsole, seedUser, settle, toast } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runStamp } from '../helpers/phone'
 import {
-  comfySetup, expectImageLoaded, installedRunning, installedWorkflows, installWorkflowViaApi, seedExtraWorkflows, seedWorkflows, setComfyHistory, wfMenu, wfRow,
+  comfySetup, expectImageLoaded, installedRunning, installedWorkflows, installWorkflowViaApi, placedInstance, seedExtraWorkflows, seedWorkflows, setComfyHistory, wfMenu,
+  wfRow,
   type ComfySetup,
 } from '../helpers/workflows'
 
 // 工作流市场（计划 11）：市场页 / 详情 / 一键安装 / 实例详情工作流子区块 / 快速出图。约定见 helpers/workflows.ts。
 // 造了部署的用例 afterEach 卸载；拒绝 /prompt 的用例（C-WF-11）结束时恢复 fake ComfyUI。
 test.afterEach(async () => {
-  await hooks.comfyReject('')
-  await cleanupApps()
+  try {
+    await hooks.comfyReject('') // 全局开关：即使恢复失败也要卸载部署
+  } finally {
+    await cleanupApps()
+  }
 })
 
 const card = (page: Page, slug: string) => page.getByTestId(`wf-card-${slug}`)
@@ -37,6 +41,8 @@ test('C-WF-01 市场页卡片：未登录可见；封面 / 分类占位、下载
   const a = card(page, 'e2e-wf-a')
   const b = card(page, 'e2e-wf-b')
   await expect(a.getByTestId('wf-card-name')).toHaveText('E2E 文生图 A')
+  await expect(a).toContainText('fake 工作流 A（无自定义节点）') // 简介
+  await expect(a.locator('.el-tag').filter({ hasText: /^e2e$/ })).toHaveCount(1) // 标签
   await expect(a.getByTestId('wf-card-size')).toHaveText('需下载约 2.5 GB')
   await expect(a.getByTestId('wf-card-nodes')).toHaveCount(0)
   await expect(a.getByTestId('wf-card-quickrun')).toHaveText('支持快速出图')
@@ -47,6 +53,7 @@ test('C-WF-01 市场页卡片：未登录可见；封面 / 分类占位、下载
   await expect(b.getByTestId('wf-card-nodes')).toHaveText('含 1 个自定义节点')
   await expect(b.getByTestId('wf-cover-placeholder')).toHaveText('放大修复') // 无封面：按分类占位
   await expect(b.locator('img')).toHaveCount(0)
+  await expect(b.getByTestId('wf-card-quickrun')).toHaveText('支持快速出图')
   await expect(a.getByTestId('wf-install-btn')).toHaveText('一键安装')
   // sort 10 的 A 排在 sort 20 的 B 前面
   const order = await page.locator('[data-testid^="wf-card-e2e-wf-"]').evaluateAll((els) => els.map((e) => e.getAttribute('data-testid')))
@@ -54,8 +61,17 @@ test('C-WF-01 市场页卡片：未登录可见；封面 / 分类占位、下载
   expect(order.indexOf('wf-card-e2e-wf-a')).toBeLessThan(order.indexOf('wf-card-e2e-wf-b'))
 })
 
-test('C-WF-02 分类筛选与搜索：只在前端过滤，无结果时给出空状态', async ({ page }) => {
+test('C-WF-02 分类筛选与搜索（名称 / 标签）：只在前端过滤，不再请求列表；无结果时给出空状态', async ({ page }) => {
   await seedWorkflows()
+  // 列表只拉一次；给 B 加一个名称里没有的标签，验证按标签搜索
+  let listRequests = 0
+  await page.route((u) => u.pathname === '/api/v1/workflows', async (route) => {
+    listRequests += 1
+    const res = await route.fetch()
+    const body = (await res.json()) as { items: { slug: string; tags: string[] }[] }
+    for (const w of body.items) if (w.slug === 'e2e-wf-b') w.tags = [...w.tags, '独家标签']
+    await route.fulfill({ response: res, json: body })
+  })
   await page.goto('/workflows')
   await expect(card(page, 'e2e-wf-a')).toBeVisible()
   await expect(page.getByTestId('wf-category-all')).toHaveAttribute('aria-pressed', 'true')
@@ -70,11 +86,16 @@ test('C-WF-02 分类筛选与搜索：只在前端过滤，无结果时给出空
   await page.getByTestId('wf-search').fill('节点工作流')
   await expect(card(page, 'e2e-wf-b')).toBeVisible()
   await expect(card(page, 'e2e-wf-a')).toHaveCount(0)
+  await page.getByTestId('wf-search').fill('独家标签')
+  await expect(card(page, 'e2e-wf-b')).toBeVisible()
+  await expect(card(page, 'e2e-wf-a')).toHaveCount(0)
   await page.getByTestId('wf-search').fill('没有这个工作流')
   await expect(page.getByTestId('wf-market-empty')).toContainText('没有符合条件的工作流')
   await page.getByTestId('wf-search').fill('')
   await expect(card(page, 'e2e-wf-a')).toBeVisible()
   await expect(card(page, 'e2e-wf-b')).toBeVisible()
+  await settle(page)
+  expect(listRequests).toBe(1)
 })
 
 test('C-WF-03 详情页：版本、下载量、模型 / 节点 / 快速出图参数表、更新说明；不存在的工作流给出提示', async ({ page }) => {
@@ -86,14 +107,15 @@ test('C-WF-03 详情页：版本、下载量、模型 / 节点 / 快速出图参
   await expect(page.getByTestId('wf-detail-version')).toHaveText('v1.0.0')
   await expect(page.getByTestId('wf-detail-size')).toHaveText('1.2 GB')
   await expect(page.getByTestId('wf-detail-description')).toContainText('e2e 用的 fake 工作流')
-  const models = page.getByTestId('wf-detail-models')
-  await expect(models).toContainText('e2e-b.safetensors')
-  await expect(models).toContainText('models/checkpoints')
-  await expect(models).toContainText('ModelScope spark-e2e/fake-models')
-  const nodes = page.getByTestId('wf-detail-nodes')
-  await expect(nodes).toContainText('FakeNode')
-  await expect(nodes).toContainText('https://github.com/spark-e2e/FakeNode.git')
-  await expect(nodes).toContainText('aaaaaaaa')
+  const modelRow = page.getByTestId('wf-detail-models').getByRole('row').filter({ hasText: 'e2e-b.safetensors' })
+  await expect(modelRow).toHaveCount(1)
+  await expect(modelRow.getByRole('cell').nth(1)).toHaveText('models/checkpoints')
+  await expect(modelRow.getByRole('cell').nth(2)).toHaveText('1.2 GB')
+  await expect(modelRow.getByRole('cell').nth(3)).toContainText('spark-e2e/fake-models')
+  const nodeRow = page.getByTestId('wf-detail-nodes').getByRole('row').filter({ hasText: 'FakeNode' })
+  await expect(nodeRow).toHaveCount(1)
+  await expect(nodeRow.getByRole('link', { name: 'https://github.com/spark-e2e/FakeNode.git' })).toHaveAttribute('href', 'https://github.com/spark-e2e/FakeNode.git')
+  await expect(nodeRow.getByRole('cell').nth(2)).toHaveText('aaaaaaaa')
   const inputs = page.getByTestId('wf-detail-inputs')
   for (const t of ['提示词', '步数', '种子', '1～50', '留空随机']) await expect(inputs).toContainText(t)
   await expect(page.getByTestId('wf-detail-changelog')).toContainText('首个版本')
@@ -177,18 +199,19 @@ test('C-WF-06 没有 ComfyUI：「新开一台实例」打开租用对话框，�
   await page.getByTestId('rent-next').click()
   await expect(page.getByTestId('rent-confirm-workflows')).toHaveText('E2E 文生图 A（合计需下载约 2.5 GB）')
   const req = page.waitForRequest((r) => r.method() === 'POST' && new URL(r.url()).pathname === '/api/v1/orders')
-  await page.getByTestId('market-confirm-ok').click()
+  const id = await placedInstance(page, () => page.getByTestId('market-confirm-ok').click())
+  ownInstance(page.request, id) // 先登记再断言：断言失败也会卸载部署
   const body = (await req).postDataJSON() as { app_id: number; app_env: Record<string, string>; app_workflow_ids: number[] }
   expect(body.app_id).toBe(apps.comfyui.id)
   expect(body.app_env.MODEL_ID).toBe('none') // D15：工作流自带模型，不下预置模型
   expect(body.app_workflow_ids).toEqual([a.id])
   await toast(page, '下单成功，正在开通，ComfyUI 与工作流会自动安装')
-  await expect(page).toHaveURL((url) => /^\/instances\/ins-[a-z0-9]+$/.test(url.pathname) && url.searchParams.get('highlight') === 'workflows')
-  const id = new URL(page.url()).pathname.split('/').pop()!
-  ownInstance(page.request, id)
+  await expect(page).toHaveURL((url) => url.pathname === `/instances/${id}` && url.searchParams.get('highlight') === 'workflows')
   const deps = await listDeployments(page.request, id)
   expect(deps.map((d) => d.app_slug)).toEqual(['comfyui'])
   await expect(wfRow(page, 'e2e-wf-a')).toHaveAttribute('data-state', 'pending')
+  // 安装过程由 C-WF-07 / C-MKT-13 覆盖；这里只让 Agent 开通实例，afterEach 在运行中的实例上卸载（不留开通中的实例与排队的部署）
+  await hooks.agent()
 })
 
 test('C-WF-07 安装后应用卡片：部署中显示进度与「正在安装工作流」，运行后工作流「已安装」并可打开 / 快速出图', async ({ page }) => {
@@ -199,6 +222,9 @@ test('C-WF-07 安装后应用卡片：部署中显示进度与「正在安装工
   await expect(page.getByTestId('wf-state-e2e-wf-b')).toHaveText('待安装')
   await tickUntil(s.api, s.id, s.dep.id, 'installing')
   await expectRowState(page, s.dep.id, 'installing')
+  await expect(page.getByTestId('detail-app-progress')).toBeVisible()
+  // fake app.sh 的进度汇报（「下载模型 e2e-b.safetensors」「安装节点 FakeNode」）在一轮 tick 之内就跑完，下一轮部署已是 running，
+  // 卡片上看不到中间的进度消息；这些汇报同时记进部署日志（run.sh cmd_report），在最后的日志里核对
   await expect(page.getByTestId('wf-installing')).toHaveText('正在安装工作流…（随应用进度）')
   await expect(page.getByTestId('wf-quickrun-e2e-wf-b')).toHaveCount(0) // 部署中不给操作
   await tickUntil(s.api, s.id, s.dep.id, 'running')
@@ -210,6 +236,11 @@ test('C-WF-07 安装后应用卡片：部署中显示进度与「正在安装工
   await expect(page.getByTestId('wf-open-e2e-wf-b')).toBeEnabled()
   await expect(page.getByTestId('wf-quickrun-e2e-wf-b')).toBeEnabled()
   await expect(page.getByTestId('wf-add')).toBeVisible()
+  await appAction(page, s.dep.id, 'log') // 部署日志：模型「下载」与节点安装（钉死的 commit）
+  await expect(page.getByTestId('app-log-text')).toContainText('[spark_status] download 40% 下载模型 e2e-b.safetensors')
+  await expect(page.getByTestId('app-log-text')).toContainText('[spark_status] install 75% 安装节点 FakeNode')
+  await expect(page.getByTestId('app-log-text')).toContainText('model checkpoints/e2e-b.safetensors')
+  await expect(page.getByTestId('app-log-text')).toContainText(`node FakeNode ${'a'.repeat(40)}`)
 })
 
 test('C-WF-08 每个 ComfyUI 最多 8 个工作流：满了不显示「添加」，安装弹窗灰显目标，API 第 9 个返回 409 workflow_limit', async ({ page }) => {
@@ -237,11 +268,11 @@ test('C-WF-08 每个 ComfyUI 最多 8 个工作流：满了不显示「添加」
   await expect(page.getByTestId('wf-install-confirm')).toBeDisabled()
 })
 
-test('C-WF-09 后台发布新版本后工作流行显示「有新版本」，更新确认含更新说明，更新后版本变为新版本', async ({ page }) => {
+test('C-WF-09 后台发布新版本后工作流行显示「有新版本」，更新确认含更新说明，更新后版本变为新版本', async ({ page }, info) => {
   const [c] = await seedExtraWorkflows(1)
   const s = await comfySetup()
   const [before] = await installedRunning(s, c.id)
-  const changelog = `e2e 更新说明 ${runStamp}`
+  const changelog = `e2e 更新说明 ${runStamp} ${info.project.name}` // 两个 project 都给 C 发版：带上 project 名区分
   const nv = await hooks.workflowsVersion({ slug: c.slug, changelog })
   await openDetail(page, s)
   await expect(page.getByTestId(`wf-update-tag-${c.slug}`)).toHaveText(`有新版本 v${nv.version}`)

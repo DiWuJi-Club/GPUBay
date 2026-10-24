@@ -3,7 +3,7 @@ import { adminApi, createAdmin, drainIdleMachines } from '../helpers/admin'
 import { appRow, captureWindowOpen, cleanupApps, expectRowState, listDeployments, ownInstance, seedApps, tickUntil } from '../helpers/apps'
 import { dialog, loginConsole, nav, placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { CONSOLE_URL, hooks } from '../helpers/hooks'
-import { seedWorkflows } from '../helpers/workflows'
+import { placedInstance, seedWorkflows } from '../helpers/workflows'
 
 // C-MKT-12 / 13 下单预装应用：afterEach 卸载它的部署（其余用例没有部署，清理是空操作）
 test.afterEach(cleanupApps)
@@ -325,14 +325,13 @@ test('C-MKT-12 下单预装 vLLM：开通前排队，开通后部署中显示进
   await page.getByTestId('rent-next').click()
   await expect(page.getByTestId('market-confirm-app')).toHaveText('vLLM 推理服务（Qwen/Qwen3-8B）')
   const req = page.waitForRequest((r) => r.method() === 'POST' && new URL(r.url()).pathname === '/api/v1/orders')
-  await page.getByTestId('market-confirm-ok').click()
+  const id = await placedInstance(page, () => page.getByTestId('market-confirm-ok').click())
+  ownInstance(page.request, id) // 先登记再断言：断言失败也会卸载部署（page.request 与浏览器共享会话 Cookie）
   const body = (await req).postDataJSON() as { app_id: number; app_env: Record<string, string> }
   expect(body.app_id).toBe(apps.vllm.id)
   expect(body.app_env.API_KEY).toMatch(/^[A-Za-z0-9]{32}$/)
   await toast(page, '下单成功，正在开通')
-  await expect(page).toHaveURL(/\/instances\/ins-[a-z0-9]+$/)
-  const id = page.url().split('/').pop()!
-  ownInstance(page.request, id) // page.request 与浏览器共享会话 Cookie
+  await expect(page).toHaveURL(new RegExp(`/instances/${id}$`))
   const deps = await listDeployments(page.request, id)
   expect(deps).toHaveLength(1)
   const dep = deps[0].id
@@ -381,14 +380,13 @@ test('C-MKT-13 预装 ComfyUI 时可多选预装工作流：合计下载量、�
   await expect(page.getByTestId('market-confirm-app')).toContainText('ComfyUI 图像生成')
   await expect(page.getByTestId('rent-confirm-workflows')).toHaveText('E2E 节点工作流 B、E2E 文生图 A（合计需下载约 3.7 GB）')
   const req = page.waitForRequest((r) => r.method() === 'POST' && new URL(r.url()).pathname === '/api/v1/orders')
-  await page.getByTestId('market-confirm-ok').click()
+  const id = await placedInstance(page, () => page.getByTestId('market-confirm-ok').click())
+  ownInstance(page.request, id) // 先登记再断言：断言失败也会卸载部署
   const body = (await req).postDataJSON() as { app_id: number; app_workflow_ids: number[] }
   expect(body.app_id).toBe(apps.comfyui.id)
   expect(body.app_workflow_ids).toEqual([b.id, a.id]) // 按选择顺序
   await toast(page, '下单成功，正在开通')
-  await expect(page).toHaveURL(/\/instances\/ins-[a-z0-9]+$/)
-  const id = page.url().split('/').pop()!
-  ownInstance(page.request, id)
+  await expect(page).toHaveURL(new RegExp(`/instances/${id}$`))
   const deps = await listDeployments(page.request, id)
   expect(deps.map((d) => d.app_slug)).toEqual(['comfyui'])
   await expect(page.getByTestId('wf-row-e2e-wf-a')).toHaveAttribute('data-state', 'pending')
