@@ -105,6 +105,8 @@ export interface AdminInstance {
   auto_renew_failed_reason: string
   provisioned_at: string | null
   cancelled_at: string | null
+  /** 计划 9：Token 商城的系统实例（平台节点）：不计费、不到期，后台不能退款 / 延长 / 换机 / 改派 */
+  system?: boolean
 }
 
 export interface MachineDetail {
@@ -128,8 +130,11 @@ export interface AdminGroup {
   machine_count: number
   idle_now: number
   reserved_upcoming: number
+  /** 计划 9：'llm' = Token 服务池（唯一、不可见）；旧后端不返回时按 'rental' */
+  purpose?: GroupPurpose
 }
-export type AdminGroupBrief = Pick<AdminGroup, 'id' | 'name' | 'region' | 'visible'>
+export type GroupPurpose = 'rental' | 'llm'
+export type AdminGroupBrief = Pick<AdminGroup, 'id' | 'name' | 'region' | 'visible' | 'purpose'>
 export interface GroupInput {
   name: string
   region: string
@@ -278,6 +283,8 @@ export interface UserDetail {
   ledger: LedgerRow[]
   kyc: AdminKYCRecord[]
   ssh_keys: SshKey[]
+  /** 计划 9：Token 商城概况（金额为分）；后端未提供时缺省 */
+  llm?: { keys: number; month_cost: number; unsettled: number; debt: number; blocked: boolean }
 }
 
 export interface AdminPrice {
@@ -342,6 +349,8 @@ export interface Dashboard {
   apps_installing: number
   apps_running: number
   apps_failed_24h: number
+  /** 计划 9：Token 商城卡片（= /llm/summary 的子集，金额为分）；后端未提供时缺省 */
+  llm?: { nodes_ready: number; nodes_total: number; today_requests: number; today_settled_amount: number }
 }
 
 /** 后台应用列表的一行（GET /admin/api/v1/apps）；POST / PUT 返回的应用不带 versions / deployments_live。 */
@@ -360,6 +369,8 @@ export interface AdminApp {
   versions: number
   /** 非终态（不是 removed / lost）的部署数 */
   deployments_live: number
+  /** 计划 9：平台内部应用（如 vllm-node），控制台目录不展示 */
+  internal?: boolean
 }
 
 /** 兼容镜像在在线机器上的缓存情况（unknown：缓存上报超过 5 分钟或旧 Agent 未上报）。 */

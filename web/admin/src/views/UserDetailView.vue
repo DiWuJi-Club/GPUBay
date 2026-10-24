@@ -199,6 +199,25 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
         </div>
       </el-card>
 
+      <!-- 计划 9：Token 商城概况（后端返回 llm 时显示），链接到 Token 商城的账户 Tab -->
+      <el-card v-if="data.llm" data-testid="udetail-llm">
+        <template #header>
+          <div class="card-head">
+            <span>Token 商城</span>
+            <router-link :to="{ path: '/llm', query: { tab: 'accounts', user_id: data.user.id } }" data-testid="udetail-llm-link">查看账户</router-link>
+          </div>
+        </template>
+        <el-descriptions :column="5" border>
+          <el-descriptions-item label="Key 数"><span data-testid="udetail-llm-keys">{{ data.llm.keys }}</span></el-descriptions-item>
+          <el-descriptions-item label="本月消费"><span data-testid="udetail-llm-month">{{ fmtYuan(data.llm.month_cost) }}</span></el-descriptions-item>
+          <el-descriptions-item label="未结算"><span data-testid="udetail-llm-unsettled">{{ fmtYuan(data.llm.unsettled) }}</span></el-descriptions-item>
+          <el-descriptions-item label="欠费"><span data-testid="udetail-llm-debt" :class="{ 'money-minus': data.llm.debt > 0 }">{{ fmtYuan(data.llm.debt) }}</span></el-descriptions-item>
+          <el-descriptions-item label="Token 服务">
+            <el-tag :type="data.llm.blocked ? 'danger' : 'success'" data-testid="udetail-llm-blocked">{{ data.llm.blocked ? '已停用' : '正常' }}</el-tag>
+          </el-descriptions-item>
+        </el-descriptions>
+      </el-card>
+
       <el-card>
         <el-tabs v-model="tab">
           <el-tab-pane label="实例" name="instances">
@@ -342,6 +361,7 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; font-size: 13px; }
 .actions { display: flex; gap: 12px; margin-top: 16px; }
+.card-head { display: flex; justify-content: space-between; align-items: center; }
 .error { color: var(--el-color-danger); font-size: 13px; }
 .more { display: inline-block; margin-top: 12px; }
 .money-plus { color: var(--el-color-success); }

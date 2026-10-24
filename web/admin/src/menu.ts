@@ -28,6 +28,7 @@ export const menu: MenuItem[] = [
   { key: 'recharges', path: '/recharges', label: '充值单', roles: FIN_ROLES },
   { key: 'apps', path: '/apps', label: '应用', roles: ALL_ROLES },
   { key: 'deployments', path: '/deployments', label: '应用部署', roles: ALL_ROLES },
+  { key: 'llm', path: '/llm', label: 'Token 商城', roles: ALL_ROLES },
   { key: 'catalog', path: '/catalog', label: '价格与镜像', roles: SUPER_ONLY },
   { key: 'admins', path: '/admins', label: '管理员', roles: SUPER_ONLY },
   { key: 'audit', path: '/audit', label: '审计日志', roles: ALL_ROLES },

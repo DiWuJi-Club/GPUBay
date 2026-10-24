@@ -47,7 +47,8 @@ function resetFilter() {
   Object.assign(filter, { state: '', user_id: '', machine_id: '' })
   list.reset()
 }
-const timeText = (i: AdminInstance) => (i.state === 'running' ? `剩余 ${fmtDuration(i.remaining_seconds)}` : i.pending_seconds > 0 ? `待开始 ${fmtDuration(i.pending_seconds)}` : '—')
+// 平台节点（系统实例）不计时、不到期
+const timeText = (i: AdminInstance) => (i.system ? '不计时' : i.state === 'running' ? `剩余 ${fmtDuration(i.remaining_seconds)}` : i.pending_seconds > 0 ? `待开始 ${fmtDuration(i.pending_seconds)}` : '—')
 </script>
 
 <template>
@@ -68,7 +69,7 @@ const timeText = (i: AdminInstance) => (i.state === 'running' ? `剩余 ${fmtDur
       <el-button size="small" :loading="list.loading.value" data-testid="ainst-retry" @click="list.load()">重试</el-button>
     </el-alert>
     <el-table :data="list.items.value" v-loading="list.loading.value" row-key="id">
-      <el-table-column label="实例" min-width="160"><template #default="{ row }"><span data-testid="ainst-id"><IdLink kind="instance" :id="row.id" /></span></template></el-table-column>
+      <el-table-column label="实例" min-width="160"><template #default="{ row }"><span data-testid="ainst-id"><IdLink kind="instance" :id="row.id" /></span><el-tag v-if="row.system" type="info" size="small" class="tag-gap" data-testid="ainst-system">平台节点</el-tag></template></el-table-column>
       <el-table-column label="用户" width="90"><template #default="{ row }"><span data-testid="ainst-user"><IdLink kind="user" :id="row.user_id" /></span></template></el-table-column>
       <el-table-column label="机器" width="90"><template #default="{ row }"><span data-testid="ainst-machine"><IdLink kind="machine" :id="row.machine_id" :disabled="isFinance" /></span></template></el-table-column>
       <el-table-column label="镜像" min-width="140"><template #default="{ row }"><span data-testid="ainst-image">{{ imageName.get(row.image_id) ?? row.image_id }}</span></template></el-table-column>
@@ -94,4 +95,5 @@ const timeText = (i: AdminInstance) => (i.state === 'running' ? `剩余 ${fmtDur
 .error { margin-bottom: 12px; }
 .pager-row { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
 .muted { color: #909399; }
+.tag-gap { margin-left: 6px; }
 </style>
