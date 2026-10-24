@@ -3,7 +3,7 @@ import {
   deploymentStateLabel, deploymentStateType, fmtTime, isApiError, labelOf, workflowStateLabel, workflowStateType, type AdminWorkflow,
   type AdminWorkflowInstall, type Paged,
 } from '@spark/shared'
-import { onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
@@ -12,20 +12,32 @@ import { notifyError } from '../logic/notify'
 
 // 某个工作流的安装列表（计划 11 规格 §12）：部署、实例、用户、版本、安装状态与时间；按加入时间倒序。所有角色可看。
 const route = useRoute()
-const wfId = Number(route.params.id)
+const wfId = computed(() => Number(route.params.id))
 const wf = ref<AdminWorkflow | null>(null)
 const notFound = ref(false)
-const list = usePaged<AdminWorkflowInstall>((page, size) => api.get<Paged<AdminWorkflowInstall>>(`/workflows/${wfId}/installs`, { page, page_size: size }))
+const list = usePaged<AdminWorkflowInstall>((page, size) => api.get<Paged<AdminWorkflowInstall>>(`/workflows/${wfId.value}/installs`, { page, page_size: size }))
 
-onMounted(async () => {
-  void list.load()
+async function loadWorkflow(id: number) {
   try {
-    wf.value = await api.get<AdminWorkflow>(`/workflows/${wfId}`)
+    const w = await api.get<AdminWorkflow>(`/workflows/${id}`)
+    if (id === wfId.value) wf.value = w
   } catch (e) {
-    if (isApiError(e) && e.code === 'workflow_not_found') notFound.value = true
+    if (isApiError(e) && e.code === 'workflow_not_found') notFound.value = id === wfId.value
     else notifyError(e)
   }
-})
+}
+// 同一组件内换工作流也重新加载（回到第一页）；离开本页（id 变为 undefined）时不加载
+watch(
+  wfId,
+  (id) => {
+    if (!Number.isInteger(id) || id <= 0) return
+    wf.value = null
+    notFound.value = false
+    list.reset()
+    void loadWorkflow(id)
+  },
+  { immediate: true },
+)
 
 const depType = (s: string) => labelOf(deploymentStateType, s) as 'primary'
 const wfType = (s: string) => labelOf(workflowStateType, s) as 'primary'

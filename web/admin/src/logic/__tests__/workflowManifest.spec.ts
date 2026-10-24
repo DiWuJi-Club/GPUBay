@@ -6,7 +6,7 @@ import {
   COMFY_MIN_RE, COMMIT_RE, collectRefs, compareNodeID, coverIssue, downloadGB, emptyInputRow, emptyManifest, emptyModelRow, FILE_SEG_RE,
   formToManifest, GIT_HOSTS, GIT_PATH_RE, gitIssue, INPUT_KEY_RE, INPUT_TYPES, manifestIssues, manifestToForm, missingRefs, MODEL_DIRS,
   MODEL_LOADERS, MODEL_NAME_RE, NODE_NAME_RE, NODE_TYPE_RE, OUTPUT_CLASS_TYPES, parseApiFile, parseGraphFile, parseTags, pathToCell,
-  REPO_RE, SHA256_RE, SLUG_RE, splitFieldError, suggestInput, hasNaN, VERSION_RE, versionIssues, workflowIssue, type ApiNode, type ManifestForm,
+  REPO_RE, SHA256_RE, SLUG_RE, splitFieldError, suggestInput, hasNaN, nonFiniteIssue, VERSION_RE, versionIssues, workflowIssue, type ApiNode, type ManifestForm,
 } from '../workflowManifest'
 
 const root = join(__dirname, '../../../../..')
@@ -409,5 +409,48 @@ describe('suggestInput / hasNaN', () => {
     expect(hasNaN(manifest())).toBe(false)
     expect(hasNaN(manifest({ models: [{ ...goodModel, size_gb: NaN }] }))).toBe(true)
     expect(hasNaN(manifest({ inputs: [input({ min: NaN })] as never }))).toBe(true)
+  })
+})
+
+describe('T14 评审修正', () => {
+  it('I-1：text / textarea 没有默认值（必填）往返后仍没有默认值；有空串默认值的仍是空串', () => {
+    const m = manifest({
+      inputs: [
+        { key: 'a', label: 'A', type: 'textarea', node: '6', input: 'text', max_len: 1000 },
+        { key: 'b', label: 'B', type: 'text', node: '6', input: 'text', default: '', max_len: 1000 },
+      ],
+    })
+    const f = manifestToForm(m)
+    expect(f.inputs.map((r) => r.required)).toEqual([true, false])
+    expect(formToManifest(f)).toEqual(m)
+    expect('default' in formToManifest(f).inputs[0]).toBe(false)
+  })
+  it('I-1：必填的 text 即使表单里残留默认值也不写 default；其它类型 required 无影响', () => {
+    const out = formToManifest({
+      comfyui_min: '', models: [], nodes: [], outputs: [],
+      inputs: [
+        { ...emptyInputRow(), key: 'a', label: 'A', type: 'text', node: '6', input: 'text', default: 'x', required: true },
+        { ...emptyInputRow(), key: 'b', label: 'B', type: 'int', node: '3', input: 'steps', default: '5', min: '1', max: '9', required: true },
+      ],
+    }).inputs
+    expect('default' in out[0]).toBe(false)
+    expect(out[1].default).toBe(5)
+    expect(emptyInputRow().required).toBe(false)
+  })
+  it('非有限数（Infinity）也当作不能提交，并给出具体字段', () => {
+    expect(hasNaN(manifest({ models: [{ ...goodModel, size_gb: Infinity }] }))).toBe(true)
+    expect(nonFiniteIssue(manifest({ models: [{ ...goodModel, size_gb: Infinity }] }))).toEqual({ path: 'manifest.models[0].size_gb', reason: '需为数字' })
+    expect(nonFiniteIssue(manifest({ models: [{ ...goodModel, size_gb: NaN }] }))).toEqual({ path: 'manifest.models[0].size_gb', reason: '请填写大小（GB）' })
+    expect(nonFiniteIssue(manifest({ inputs: [input({ max: NaN })] as never }))).toEqual({ path: 'manifest.inputs[0].max', reason: '需为数字' })
+    expect(nonFiniteIssue(manifest())).toBeNull()
+    expect(paths(manifest({ inputs: [input({ max: Infinity })] as never }))).toEqual(['manifest.inputs[0].max'])
+    expect(paths(manifest({ models: [{ ...goodModel, size_gb: Infinity }] }))).toEqual(['manifest.models[0].size_gb'])
+  })
+  it('suggestInput：文本输入建议 max_len（不小于现值长度，上限 4000）', () => {
+    const long = parseApiFile(JSON.stringify({ 6: { class_type: 'CLIPTextEncode', inputs: { text: 'x'.repeat(1500) } } })).nodes[0]
+    expect(suggestInput({ ...emptyInputRow(), node: '6', input: 'text' }, long)).toMatchObject({ type: 'text', max_len: '1500' })
+    const short = api.find((n) => n.id === '6')
+    expect(suggestInput({ ...emptyInputRow(), node: '6', input: 'text' }, short)).toMatchObject({ type: 'text', max_len: '1000' })
+    expect(suggestInput({ ...emptyInputRow(), node: '6', input: 'text', max_len: '200' }, short).max_len).toBeUndefined()
   })
 })

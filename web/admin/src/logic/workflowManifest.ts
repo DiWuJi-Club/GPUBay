@@ -263,6 +263,8 @@ export interface InputRow {
   input: string
   /** bool 为 'true' / 'false'；image 不用 */
   default: string
+  /** text / textarea：必填（清单里不写 default，用户必须自己填）；其它类型不用 */
+  required: boolean
   min: string
   max: string
   step: string
@@ -284,7 +286,9 @@ export interface ManifestForm {
 export const emptyManifest = (): WorkflowManifestPublic => ({ models: [], nodes: [], inputs: [], outputs: [] })
 export const emptyModelRow = (): ModelRow => ({ name: '', dir: 'checkpoints', size_gb: '', ms_repo: '', ms_file: '', hf_repo: '', hf_file: '', sha256: '' })
 export const emptyNodeRow = (): NodeRow => ({ name: '', git: '', commit: '', node_types: '' })
-export const emptyInputRow = (): InputRow => ({ key: '', label: '', type: 'text', node: '', input: '', default: '', min: '', max: '', step: '', max_len: '', options: '' })
+export const emptyInputRow = (): InputRow => ({
+  key: '', label: '', type: 'text', node: '', input: '', default: '', required: false, min: '', max: '', step: '', max_len: '', options: '',
+})
 export const emptyOutputRow = (): OutputRow => ({ node: '' })
 
 /** 各类型的输入有哪些列。 */
@@ -306,7 +310,8 @@ export function manifestToForm(m: WorkflowManifestPublic): ManifestForm {
     })),
     nodes: (m.nodes ?? []).map((n) => ({ name: n.name, git: n.git, commit: n.commit, node_types: (n.node_types ?? []).join(', ') })),
     inputs: (m.inputs ?? []).map((i) => ({
-      key: i.key, label: i.label, type: i.type, node: i.node, input: i.input, default: str(i.default), min: str(i.min), max: str(i.max),
+      key: i.key, label: i.label, type: i.type, node: i.node, input: i.input, default: str(i.default),
+      required: (i.type === 'text' || i.type === 'textarea') && i.default === undefined, min: str(i.min), max: str(i.max),
       step: str(i.step), max_len: str(i.max_len), options: (i.options ?? []).join('\n'),
     })),
     outputs: (m.outputs ?? []).map((o) => ({ node: o.node })),
@@ -319,7 +324,7 @@ export const splitList = (s: string, sep: RegExp) => s.split(sep).map((x) => x.t
 
 /**
  * 表单 → manifest JSON（与后端规范化一致：去空白、dir / sha256 / commit 小写）。
- * 默认值：text / textarea 一律带（可为空串）；其余类型空串 = 不设默认；image 没有默认值。
+ * 默认值：text / textarea 不是「必填」时一律带（可为空串），「必填」时不写；其余类型空串 = 不设默认；image 没有默认值。
  */
 export function formToManifest(f: ManifestForm): WorkflowManifestPublic {
   const m: WorkflowManifestPublic = {
@@ -333,7 +338,9 @@ export function formToManifest(f: ManifestForm): WorkflowManifestPublic {
     inputs: f.inputs.map((r) => {
       const t = r.type
       const i: WorkflowInput = { key: r.key.trim(), label: r.label.trim(), type: t, node: r.node.trim(), input: r.input.trim() }
-      if (t === 'text' || t === 'textarea') i.default = r.default
+      if (t === 'text' || t === 'textarea') {
+        if (!r.required) i.default = r.default
+      }
       else if (t === 'bool') {
         const d = r.default.trim()
         if (d) i.default = d === 'true' ? true : d === 'false' ? false : d
@@ -363,9 +370,12 @@ export function formToManifest(f: ManifestForm): WorkflowManifestPublic {
 }
 
 /**
- * 在输入表里选定「节点 / 输入」后的建议（只填还空着的格子）：key 取入参名、类型按现值猜（seed / noise_seed → seed，
- * 整数 → int，小数 → float，布尔 → bool，LoadImage.image → image，模型文件名 → enum，其余字符串 → text），
- * 默认值取现值（image / seed 除外），数值给一个包含现值的范围。
+ * 在输入表里选定「节点 / 输入」后的建议：
+ * - key（入参名合法时）/ 名称（入参名）/ 选项（enum：现值）/ 范围 / 最长：只填还空着的格子；
+ * - 类型与默认值总是按现值重设：seed / noise_seed 且为数字 → seed（默认值留空 = 随机），整数 → int，小数 → float，布尔 → bool，
+ *   LoadImage.image → image（无默认值），模型加载节点的文件名入参 → enum，其余字符串 → text（默认值取现值）；
+ * - int / float 的范围给一个包含现值的区间（min ≤ min(0, 现值)，max ≥ 现值 × 4）；
+ * - text 的最长取 max(1000, 现值长度)，不超过 4000。
  */
 export function suggestInput(row: InputRow, node: ApiNode | undefined): Partial<InputRow> {
   if (!node || !(row.input in node.values)) return {}
@@ -383,6 +393,7 @@ export function suggestInput(row: InputRow, node: ApiNode | undefined): Partial<
   if (type === 'image' || type === 'seed') out.default = ''
   else out.default = str(cur)
   if (type === 'enum' && !row.options) out.options = str(cur)
+  if (type === 'text' && typeof cur === 'string' && !row.max_len) out.max_len = String(Math.min(LIMITS.maxLen, Math.max(LIMITS.defaultMaxLen, runes(cur))))
   if ((type === 'int' || type === 'float') && typeof cur === 'number') {
     if (!row.min) out.min = String(Math.min(0, cur))
     if (!row.max) out.max = String(Math.max(cur * 4, type === 'int' ? 100 : 10))
@@ -390,11 +401,26 @@ export function suggestInput(row: InputRow, node: ApiNode | undefined): Partial<
   return out
 }
 
-/** 表单里有没法发给后端的值（非数字的大小 / 范围 / 默认值，会被 JSON 序列化成 null）。 */
-export function hasNaN(m: WorkflowManifestPublic): boolean {
-  const bad = (v: unknown) => typeof v === 'number' && Number.isNaN(v)
-  return m.models.some((x) => bad(x.size_gb)) || m.inputs.some((i) => [i.default, i.min, i.max, i.step, i.max_len].some(bad))
+/**
+ * 第一个没法发给后端的值（非有限数：空 / 非数字的大小、范围、默认值，JSON 会把 NaN / Infinity 序列化成 null）；没有返回 null。
+ * 路径与 manifestIssues 一致。
+ */
+export function nonFiniteIssue(m: WorkflowManifestPublic): FieldIssue | null {
+  const bad = (v: unknown) => typeof v === 'number' && !Number.isFinite(v)
+  for (let i = 0; i < m.models.length; i++) {
+    const v = m.models[i].size_gb
+    if (bad(v)) return { path: `manifest.models[${i}].size_gb`, reason: Number.isNaN(v) ? '请填写大小（GB）' : '需为数字' }
+  }
+  for (let i = 0; i < m.inputs.length; i++) {
+    for (const k of ['default', 'min', 'max', 'step', 'max_len'] as const) {
+      if (bad(m.inputs[i][k])) return { path: `manifest.inputs[${i}].${k}`, reason: '需为数字' }
+    }
+  }
+  return null
 }
+
+/** 表单里有没法发给后端的值（见 nonFiniteIssue）。 */
+export const hasNaN = (m: WorkflowManifestPublic): boolean => nonFiniteIssue(m) !== null
 
 /** 下载量（GB）：Σ size_gb，两位小数（与后端 DownloadGB 一致；非数字的行不计）。 */
 export function downloadGB(models: { size_gb: number | string }[]): number {
@@ -435,15 +461,15 @@ function inputAttrIssues(p: string, i: WorkflowInput, out: FieldIssue[]) {
   const push = (path: string, reason: string) => out.push({ path, reason })
   if (inputHas.range(i.type)) {
     if (i.min === undefined) return push(`${p}.min`, '数值参数必须设 min')
-    if (Number.isNaN(i.min)) return push(`${p}.min`, '需为数字')
+    if (!Number.isFinite(i.min)) return push(`${p}.min`, '需为数字')
     if (i.max === undefined) return push(`${p}.max`, '数值参数必须设 max')
-    if (Number.isNaN(i.max)) return push(`${p}.max`, '需为数字')
+    if (!Number.isFinite(i.max)) return push(`${p}.max`, '需为数字')
     if (i.min > i.max) return push(`${p}.min`, 'min 不能大于 max')
     if (i.type === 'int' && !isInt(i.min)) return push(`${p}.min`, 'int 参数的 min 必须是整数')
     if (i.type === 'int' && !isInt(i.max)) return push(`${p}.max`, 'int 参数的 max 必须是整数')
-    if (i.step !== undefined && (Number.isNaN(i.step) || i.step <= 0 || (i.type === 'int' && !isInt(i.step)))) return push(`${p}.step`, 'step 必须为正（int 参数为正整数）')
+    if (i.step !== undefined && (!Number.isFinite(i.step) || i.step <= 0 || (i.type === 'int' && !isInt(i.step)))) return push(`${p}.step`, 'step 必须为正（int 参数为正整数）')
   }
-  if (inputHas.maxLen(i.type) && i.max_len !== undefined && (!isInt(i.max_len) || i.max_len < 1 || i.max_len > LIMITS.maxLen)) {
+  if (inputHas.maxLen(i.type) && i.max_len !== undefined && (!Number.isFinite(i.max_len) || !isInt(i.max_len) || i.max_len < 1 || i.max_len > LIMITS.maxLen)) {
     return push(`${p}.max_len`, `max_len 应在 1～${LIMITS.maxLen}`)
   }
   if (i.type === 'enum') {
@@ -466,7 +492,7 @@ function inputAttrIssues(p: string, i: WorkflowInput, out: FieldIssue[]) {
     }
     case 'int':
     case 'float': {
-      if (typeof d !== 'number' || Number.isNaN(d)) return push(`${p}.default`, '默认值需为数字')
+      if (typeof d !== 'number' || !Number.isFinite(d)) return push(`${p}.default`, '默认值需为数字')
       if (i.type === 'int' && !isInt(d)) return push(`${p}.default`, '默认值必须是整数')
       if ((i.min !== undefined && d < i.min) || (i.max !== undefined && d > i.max)) return push(`${p}.default`, `默认值应在 ${i.min}～${i.max}`)
       if (i.type === 'int' && i.step !== undefined && i.step > 0 && (d - (i.min ?? 0)) % i.step !== 0) {
@@ -523,6 +549,7 @@ export function manifestIssues(m: WorkflowManifestPublic, api: ApiNode[] | null)
     names.add(md.name)
     if (!(MODEL_DIRS as readonly string[]).includes(md.dir)) push(`${p}.dir`, `目录只能是 ${MODEL_DIRS.join(' / ')}`)
     if (Number.isNaN(md.size_gb)) push(`${p}.size_gb`, '请填写大小（GB）')
+    else if (!Number.isFinite(md.size_gb)) push(`${p}.size_gb`, '需为数字')
     else if (round2(md.size_gb) < 0.01 || md.size_gb > 200) push(`${p}.size_gb`, '大小应在 0.01～200 GB')
     if (!md.modelscope && !md.hf) push(p, 'modelscope 与 hf 至少给一个')
     for (const [key, rf] of [['modelscope', md.modelscope], ['hf', md.hf]] as const) {
