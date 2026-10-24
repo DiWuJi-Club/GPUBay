@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 )
@@ -35,13 +36,16 @@ func (s *Service) AdminDeleteGroup(ctx context.Context, actor audit.Actor, id in
 	now := s.d.Clock.Now()
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 		// 先锁机组行：与并发的分配 / 改组 / 下单（外键 KEY SHARE）互斥。
-		var name, region string
-		err := tx.QueryRow(ctx, `SELECT name, region FROM machine_groups WHERE id = $1 FOR UPDATE`, id).Scan(&name, &region)
+		var name, region, purpose string
+		err := tx.QueryRow(ctx, `SELECT name, region, purpose FROM machine_groups WHERE id = $1 FOR UPDATE`, id).Scan(&name, &region, &purpose)
 		if db.IsNoRows(err) {
 			return apperr.ErrGroupNotFound
 		}
 		if err != nil {
 			return err
+		}
+		if purpose == fleet.GroupPurposeLLM { // Token 服务池（计划 9）：不能删除，即使里面有系统实例也先报这个
+			return fleet.ErrPoolNotDeletable
 		}
 		var busy bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM instances WHERE group_id = $1

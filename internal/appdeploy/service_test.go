@@ -3,6 +3,7 @@ package appdeploy_test
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -889,5 +890,63 @@ func TestConcurrentCreatesRespectLimits(t *testing.T) {
 	slices.Sort(codes)
 	if codes[0] != "" || codes[1] != "app_port_conflict" {
 		t.Fatalf("concurrent creates on same port = %v", codes)
+	}
+}
+
+// 计划 9：内部应用只有系统账号能部署；普通用户（含预装）按不存在处理。
+func TestInternalAppCreateOnlySystemUser(t *testing.T) {
+	e := newEnv(t, 3)
+	a, err := e.cat.CreateApp(e.ctx, e.actor(), appdeploy.AppInput{Slug: "vllm-node", Name: "节点", Category: "llm", Status: appdeploy.StatusPublished, Internal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.publish(a.ID, "1.0.0", goodSpec(), goodScript, []int64{e.imageID})
+
+	inst := e.runningInstance()
+	if _, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.userID, InstanceID: inst.ID, AppID: a.ID}); codeOf(err) != "app_not_found" {
+		t.Fatalf("user create internal = %v", err)
+	}
+	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, a.ID, e.imageID, nil); codeOf(err) != "app_not_found" {
+		t.Fatalf("preinstall internal = %v", err)
+	}
+	if n := e.count(`SELECT count(*) FROM app_deployments`); n != 0 {
+		t.Fatalf("deployments = %d", n)
+	}
+	// 系统账号的实例（直接改归属，模拟 PlaceSystem 的结果）
+	sys := e.runningInstance()
+	e.exec(`UPDATE instances SET user_id = $2 WHERE id = $1`, sys.ID, e.systemID)
+	d, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.systemID, InstanceID: sys.ID, AppID: a.ID, Env: map[string]string{"API_KEY": "node-secret-0123456789"}})
+	if err != nil || d.UserID != e.systemID || d.AppID != a.ID || d.State != appdeploy.StateQueued {
+		t.Fatalf("system create = %+v, %v", d, err)
+	}
+	// 后台视图带 internal；用户视图不输出
+	avs, err := e.svc.AdminViews(e.ctx, []appdeploy.Deployment{d})
+	if err != nil || len(avs) != 1 || !avs[0].Internal {
+		t.Fatalf("AdminViews = %+v, %v", avs, err)
+	}
+	if b, _ := json.Marshal(avs[0]); !strings.Contains(string(b), `"internal":true`) {
+		t.Fatalf("admin view json = %s", b)
+	}
+	uvs, err := e.svc.Views(e.ctx, []appdeploy.Deployment{d})
+	if b, _ := json.Marshal(uvs); err != nil || strings.Contains(string(b), "internal") {
+		t.Fatalf("user view json = %s, %v", b, err)
+	}
+	// 没有已发布版本的内部应用：对用户也是 app_not_found（不是 app_unavailable）
+	bare, err := e.cat.CreateApp(e.ctx, e.actor(), appdeploy.AppInput{Slug: "bare-node", Name: "bare", Category: "llm", Status: appdeploy.StatusPublished, Internal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.userID, InstanceID: inst.ID, AppID: bare.ID}); codeOf(err) != "app_not_found" {
+		t.Fatalf("user create bare internal = %v", err)
+	}
+	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, bare.ID, e.imageID, nil); codeOf(err) != "app_not_found" {
+		t.Fatalf("preinstall bare internal = %v", err)
+	}
+	// SystemUserID 未配置（0）时谁都不能部署内部应用
+	svc0 := appdeploy.NewService(appdeploy.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet})
+	other := e.runningInstance()
+	e.exec(`UPDATE instances SET user_id = $2 WHERE id = $1`, other.ID, e.systemID)
+	if _, err := svc0.Create(e.ctx, appdeploy.CreateRequest{UserID: e.systemID, InstanceID: other.ID, AppID: a.ID}); codeOf(err) != "app_not_found" {
+		t.Fatalf("unconfigured system user = %v", err)
 	}
 }
