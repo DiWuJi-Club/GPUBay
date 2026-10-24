@@ -257,7 +257,8 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
         <template #header>
           <div class="head"><span class="mono" data-testid="adetail-id">{{ inst.id }}</span>
             <span><el-tag :type="labelOf(instanceStateType, inst.state) as 'primary'" data-testid="adetail-state">{{ labelOf(instanceStateLabel, inst.state) }}</el-tag>
-              <el-tag v-if="inst.suspended" type="warning" data-testid="adetail-suspended">计时已暂停</el-tag></span>
+              <el-tag v-if="inst.suspended" type="warning" data-testid="adetail-suspended">计时已暂停</el-tag>
+              <el-tag v-if="inst.system" type="info" class="tag-gap" data-testid="adetail-system">平台节点</el-tag></span>
           </div>
         </template>
         <el-descriptions :column="3" border>
@@ -276,12 +277,12 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
           <el-descriptions-item label="自动续费"><span data-testid="adetail-auto-renew">{{ inst.auto_renew ? `开启（${labelOf(durationLabel, inst.auto_renew_duration)}）` : '关闭' }}{{ inst.auto_renew_failed_reason ? ` · 最近失败：${inst.auto_renew_failed_reason}` : '' }}</span></el-descriptions-item>
         </el-descriptions>
         <div class="actions">
-          <el-button v-if="showExtend(role, inst.state)" data-testid="adetail-extend-btn" @click="openExtend">免费延长</el-button>
-          <el-button v-if="showMigrate(role, inst.state)" data-testid="adetail-migrate-btn" @click="openMigrate">换机</el-button>
+          <el-button v-if="showExtend(role, inst.state, inst.system)" data-testid="adetail-extend-btn" @click="openExtend">免费延长</el-button>
+          <el-button v-if="showMigrate(role, inst.state, inst.system)" data-testid="adetail-migrate-btn" @click="openMigrate">换机</el-button>
           <el-button v-if="showRewipe(role, inst.state)" data-testid="adetail-rewipe-btn" @click="rewipe.visible = true">重新洗机</el-button>
-          <el-button v-if="showRefund(role, inst.state)" type="danger" plain :loading="refund.quoting" data-testid="adetail-refund-btn" @click="openRefund">退款并释放</el-button>
-          <el-button v-if="showReassign(role, inst.state)" data-testid="adetail-reassign-btn" @click="openReassign">改派</el-button>
-          <el-button v-if="showCancelBooking(role, inst.state)" type="danger" plain data-testid="adetail-cancel-booking-btn" @click="openCancelBooking">取消预订</el-button>
+          <el-button v-if="showRefund(role, inst.state, inst.system)" type="danger" plain :loading="refund.quoting" data-testid="adetail-refund-btn" @click="openRefund">退款并释放</el-button>
+          <el-button v-if="showReassign(role, inst.state, inst.system)" data-testid="adetail-reassign-btn" @click="openReassign">改派</el-button>
+          <el-button v-if="showCancelBooking(role, inst.state, inst.system)" type="danger" plain data-testid="adetail-cancel-booking-btn" @click="openCancelBooking">取消预订</el-button>
         </div>
       </el-card>
 

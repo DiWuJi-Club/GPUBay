@@ -105,6 +105,8 @@ export interface AdminInstance {
   auto_renew_failed_reason: string
   provisioned_at: string | null
   cancelled_at: string | null
+  /** 计划 9：Token 商城的系统实例（平台节点）：不计费、不到期，后台不能退款 / 延长 / 换机 / 改派 */
+  system?: boolean
 }
 
 export interface MachineDetail {
@@ -128,8 +130,11 @@ export interface AdminGroup {
   machine_count: number
   idle_now: number
   reserved_upcoming: number
+  /** 计划 9：'llm' = Token 服务池（唯一、不可见）；旧后端不返回时按 'rental' */
+  purpose?: GroupPurpose
 }
-export type AdminGroupBrief = Pick<AdminGroup, 'id' | 'name' | 'region' | 'visible'>
+export type GroupPurpose = 'rental' | 'llm'
+export type AdminGroupBrief = Pick<AdminGroup, 'id' | 'name' | 'region' | 'visible' | 'purpose'>
 export interface GroupInput {
   name: string
   region: string

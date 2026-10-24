@@ -69,6 +69,8 @@ beforeEach(() => {
     if (path === '/apps') return { items: [{ id: 2, slug: 'vllm' }, { id: 1, slug: 'vllm-node' }] }
     if (path === '/images') return { items: [{ id: 5, name: 'LLM Serving', ref: '', description: '', enabled: true, sort: 1 }, { id: 6, name: 'Other', enabled: true, sort: 2 }] }
     if (path === '/apps/1/versions') return { items: [version] }
+    if (path === '/llm/pool') return { group_id: 9, machines: [], free: 0, total: 0 }
+    if (path === '/llm/nodes') return { items: [] }
     throw new Error(`unexpected GET ${path}`)
   })
   post.mockResolvedValue({})
@@ -100,15 +102,37 @@ describe('LlmView Tab 与总览', () => {
     expect(byId('llm-overview-model-wanted').text()).toBe('0') // 草稿：期望 0
   })
 
-  it('?tab= 选中 Tab；无权的 Tab 回到总览；占位 Tab 可见', async () => {
+  it('?tab= 选中 Tab；无权的 Tab 回到总览', async () => {
     login('ops')
     await mountAt('/llm?tab=nodes')
-    expect(byId('llm-nodes-placeholder').exists()).toBe(true)
+    expect(byId('llm-nodes').exists()).toBe(true)
+    expect(getPaths()).toContain('/llm/pool')
     expect(getPaths()).not.toContain('/llm/summary') // 总览没打开就不加载
     wrapper!.unmount()
     login('finance')
     await mountAt('/llm?tab=nodes')
     expect(byId('llm-overview').exists()).toBe(true)
+  })
+
+  it('节点 Tab 切走后停止自动刷新，切回来恢复', async () => {
+    vi.useFakeTimers()
+    try {
+      login('ops')
+      await mountAt('/llm?tab=nodes')
+      const pools = () => getPaths().filter((p) => p === '/llm/pool').length
+      expect(pools()).toBe(1)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(pools()).toBe(2)
+      await router.push('/llm?tab=models')
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(pools()).toBe(2)
+      await router.push('/llm?tab=nodes')
+      await flushPromises()
+      expect(pools()).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('finance 看模型：只读（无新建 / 上下线），可查看详情', async () => {

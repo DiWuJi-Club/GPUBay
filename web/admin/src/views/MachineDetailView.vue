@@ -5,6 +5,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
+import { isPoolGroup } from '../logic/llm'
 import { fmtBytes, fmtPercent, fmtTemp } from '../logic/metrics'
 import { notifyError } from '../logic/notify'
 
@@ -23,6 +24,8 @@ const groups = ref<AdminGroup[]>([])
 const edit = reactive({ visible: false, groupId: '' as string, displayName: '', busy: false })
 /** Agent 上报的镜像（repository:tag），按文本显示 */
 const cachedImages = computed(() => data.value?.machine.cached_images ?? [])
+/** 机器在 Token 服务池（purpose='llm' 的机组）：显示标签与节点页链接（详情的 group 或 GET /groups 带 purpose） */
+const inPool = computed(() => isPoolGroup(data.value?.machine.group_id ?? null, data.value?.group ?? null, groups.value))
 const inMaintenance = computed(() => data.value?.machine.state === 'maintenance' || data.value?.machine.state === 'faulty')
 
 let seq = 0
@@ -179,7 +182,12 @@ async function revokeEnrollment() {
           <el-descriptions-item label="内网 IP"><span class="mono">{{ data.machine.lan_ip }}</span></el-descriptions-item>
           <el-descriptions-item label="在线"><span data-testid="mdetail-online">{{ data.machine.agent_online ? '在线' : '离线' }}</span>（{{ fmtTime(data.machine.last_seen_at) || '从未心跳' }}）</el-descriptions-item>
           <el-descriptions-item label="PDU">{{ data.machine.pdu_id ? `#${data.machine.pdu_id} 插座 ${data.machine.pdu_outlet}` : '未配置' }}</el-descriptions-item>
-          <el-descriptions-item label="机组"><span data-testid="mdetail-group">{{ data.group?.name ?? '未分组' }}</span></el-descriptions-item>
+          <el-descriptions-item label="机组"><span data-testid="mdetail-group">{{ data.group?.name ?? '未分组' }}</span>
+            <template v-if="inPool">
+              <el-tag size="small" type="warning" class="pool-tag" data-testid="mdetail-pool-tag">Token 服务池</el-tag>
+              <router-link :to="{ path: '/llm', query: { tab: 'nodes' } }" class="pool-link" data-testid="mdetail-pool-link">查看节点</router-link>
+            </template>
+          </el-descriptions-item>
           <el-descriptions-item label="展示名"><span data-testid="mdetail-display">{{ data.machine.display_name || `机器 #${data.machine.id}` }}</span></el-descriptions-item>
           <el-descriptions-item label="登记时间">{{ fmtTime(data.machine.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="当前实例">
@@ -302,6 +310,8 @@ async function revokeEnrollment() {
 
 <style scoped>
 .detail { display: grid; gap: 16px; }
+.pool-tag { margin-left: 6px; }
+.pool-link { margin-left: 6px; font-size: 13px; }
 .head { display: flex; justify-content: space-between; align-items: center; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; }

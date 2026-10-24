@@ -1,8 +1,9 @@
-import type { AdminAppVersion, AdminImage, AppEnvSpec, LLMModelAdmin } from '@spark/shared'
+import { fmtTime, type AdminAppVersion, type AdminImage, type AppEnvSpec, type LLMModelAdmin, type LLMNodeState } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
   compatibleImages, emptyModelForm, extraEnvKeys, fenToYuanInput, fmtPrice, imageNote, latestPublished, modelToForm, nodeEnvSpec, nodeParamsChanged, staleNodesWarning,
   tabFromQuery, validateEnvValue, validateModelForm, visibleTabs, wantedReplicas, yuanInputToFen, type ModelForm,
+  canDrainNode, canRebuildNode, canRemoveNode, isPoolGroup, nodeDeployText, poolCandidateQuery, poolLeaseText, validateNodeRemoveReason,
 } from '../llm'
 
 const model = (over: Partial<LLMModelAdmin> = {}): LLMModelAdmin => ({
@@ -240,5 +241,51 @@ describe('Tab 按角色显示', () => {
     ['super', 'bogus', 'overview'], ['super', ['models', 'usage'], 'models'],
   ] as const)('%s ?tab=%j → %s', (role, q, want) => {
     expect(tabFromQuery(q as string | string[] | undefined, role)).toBe(want)
+  })
+})
+
+describe('节点与机器池', () => {
+  it('行操作按状态（与后端 drain / rebuild / remove 允许的状态一致）', () => {
+    const states: LLMNodeState[] = ['provisioning', 'ready', 'unhealthy', 'draining', 'removing', 'removed', 'failed']
+    const ops = Object.fromEntries(states.map((s) => [s, [canDrainNode(s) && 'drain', canRebuildNode(s) && 'rebuild', canRemoveNode(s) && 'remove'].filter(Boolean)]))
+    expect(ops).toEqual({
+      provisioning: ['drain', 'remove'],
+      ready: ['drain', 'rebuild', 'remove'],
+      unhealthy: ['drain', 'rebuild', 'remove'],
+      draining: ['remove'],
+      removing: [],
+      removed: [],
+      failed: ['rebuild', 'remove'],
+    })
+  })
+  it('移除原因：必填、去空白、≤ 200 字', () => {
+    expect(validateNodeRemoveReason('  ')).toBe('请填写移除原因')
+    expect(validateNodeRemoveReason(' 机器下架 ')).toBeNull()
+    expect(validateNodeRemoveReason('字'.repeat(200))).toBeNull()
+    expect(validateNodeRemoveReason('字'.repeat(201))).toBe('原因最多 200 个字符')
+  })
+  it('部署进度文本', () => {
+    expect(nodeDeployText({ deployment: null })).toBe('—')
+    expect(nodeDeployText({ deployment: { state: 'installing', health: 'unknown', phase: 'download', progress: 42 } })).toBe('下载模型 42%')
+    expect(nodeDeployText({ deployment: { state: 'installing', health: 'unknown', phase: '', progress: 5 } })).toBe('5%')
+    expect(nodeDeployText({ deployment: { state: 'queued', health: 'unknown', phase: 'busy', progress: 0 } })).toBe('等待上一次部署结束')
+    expect(nodeDeployText({ deployment: { state: 'running', health: 'ok', phase: '', progress: 100 } })).toBe('运行中')
+  })
+  it('租约到期：没有节点时「等待租约结束」', () => {
+    const at = '2026-11-01T02:00:00Z'
+    expect(poolLeaseText({})).toBe('—')
+    expect(poolLeaseText({ lease_until: at })).toBe(`等待租约结束（${fmtTime(at)}）`)
+    expect(poolLeaseText({ lease_until: at, node: { id: 'n1', model_slug: 'm', state: 'ready' } })).toBe(fmtTime(at))
+  })
+  it('池机组识别：详情 group 带 purpose 优先，否则查 GET /groups', () => {
+    expect(isPoolGroup(null, null, [{ id: 1, purpose: 'llm' }])).toBe(false)
+    expect(isPoolGroup(1, { id: 1, purpose: 'llm' }, [])).toBe(true)
+    expect(isPoolGroup(1, { id: 1, purpose: 'rental' }, [{ id: 1, purpose: 'llm' }])).toBe(false)
+    expect(isPoolGroup(1, { id: 1 }, [{ id: 1, purpose: 'llm' }])).toBe(true)
+    expect(isPoolGroup(2, null, [{ id: 1, purpose: 'llm' }, { id: 2 }])).toBe(false)
+  })
+  it('候选机器查询：未分组 / 某机组 + 机柜', () => {
+    expect(poolCandidateQuery('none', ' ', 1)).toEqual({ group_id: 'none', rack: undefined, page: 1, page_size: 50 })
+    expect(poolCandidateQuery(3, 'A01', 2)).toEqual({ group_id: 3, rack: 'A01', page: 2, page_size: 50 })
   })
 })

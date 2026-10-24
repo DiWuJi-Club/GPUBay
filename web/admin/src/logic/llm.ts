@@ -1,6 +1,8 @@
 import {
   centsToYuanInput, fmtYuan, yuanToCents,
-  type AdminAppVersion, type AdminImage, type AppEnvSpec, type LLMModelAdmin, type LLMModelInput, type LLMModelKind, type LLMModelSource, type Role,
+  deploymentPhaseLabel, deploymentStateLabel, fmtTime, labelOf,
+  type AdminAppVersion, type AdminGroup, type AdminGroupBrief, type AdminImage, type AppEnvSpec, type LLMModelAdmin, type LLMModelInput, type LLMModelKind, type LLMModelSource,
+  type LLMNode, type LLMNodeState, type LLMPoolMachine, type Role,
 } from '@spark/shared'
 import { ALL_ROLES, FIN_ROLES, OPS_ROLES } from '../menu'
 
@@ -269,3 +271,53 @@ export function imageNote(v: AdminAppVersion | undefined, img: AdminImage): stri
 
 /** 实际期望副本：只有上线的模型按 replicas 建节点（草稿 / 下线为 0）。总览与模型表共用。 */
 export const wantedReplicas = (m: Pick<LLMModelAdmin, 'status' | 'replicas'>): number => (m.status === 'online' ? m.replicas : 0)
+
+// ---- 节点与机器池（规格 §5.1、§10.2、§11）----
+
+/** 节点 Tab 自动刷新间隔（Tab 可见时）。 */
+export const NODES_REFRESH_MS = 10_000
+
+/** 机器所在机组是不是 Token 服务池：详情里的 group 带 purpose 时直接用，否则按 GET /groups 的 purpose 找。 */
+export function isPoolGroup(groupId: number | null, brief: Pick<AdminGroupBrief, 'id' | 'purpose'> | null, groups: Pick<AdminGroup, 'id' | 'purpose'>[]): boolean {
+  if (groupId == null) return false
+  if (brief?.id === groupId && brief.purpose) return brief.purpose === 'llm'
+  return groups.find((g) => g.id === groupId)?.purpose === 'llm'
+}
+
+/** 排空：ready / unhealthy / provisioning → draining（后端同规则，其余 llm_node_invalid_state）。 */
+export const canDrainNode = (s: LLMNodeState) => s === 'ready' || s === 'unhealthy' || s === 'provisioning'
+/** 重建：ready / unhealthy → Redeploy；failed → 在同机器新建节点行。 */
+export const canRebuildNode = (s: LLMNodeState) => s === 'ready' || s === 'unhealthy' || s === 'failed'
+/** 移除：任何状态都可立即释放；已在移除 / 已移除的不再显示。 */
+export const canRemoveNode = (s: LLMNodeState) => s !== 'removing' && s !== 'removed'
+
+/** 移除原因上限（字符，去首尾空白后），与强制卸载一致。 */
+export const NODE_REMOVE_REASON_MAX = 200
+export function validateNodeRemoveReason(reason: string): string | null {
+  const r = reason.trim()
+  if (!r) return '请填写移除原因'
+  if ([...r].length > NODE_REMOVE_REASON_MAX) return `原因最多 ${NODE_REMOVE_REASON_MAX} 个字符`
+  return null
+}
+
+/** 节点表「部署进度」：未建部署「—」；部署中「阶段 百分比」；排队且在等上一次部署「阶段」；其余显示部署状态中文。 */
+export function nodeDeployText(n: Pick<LLMNode, 'deployment'>): string {
+  const d = n.deployment
+  if (!d) return '—'
+  if (d.state === 'installing') return `${d.phase ? labelOf(deploymentPhaseLabel, d.phase) + ' ' : ''}${d.progress}%`
+  if (d.state === 'queued' && d.phase) return labelOf(deploymentPhaseLabel, d.phase)
+  return labelOf(deploymentStateLabel, d.state)
+}
+
+/** 机器池「租约到期」：有租约且还没有节点 →「等待租约结束（时间）」；有节点时只显示时间；没有租约「—」。 */
+export function poolLeaseText(m: Pick<LLMPoolMachine, 'lease_until' | 'node'>): string {
+  if (!m.lease_until) return '—'
+  return m.node ? fmtTime(m.lease_until) : `等待租约结束（${fmtTime(m.lease_until)}）`
+}
+
+/** 加入机器对话框的候选来源：'none' = 未分组；数字 = 某个出租机组（加入会把机器移出原机组）。 */
+export type PoolCandidateSource = 'none' | number
+export const POOL_CANDIDATE_PAGE = 50
+export function poolCandidateQuery(source: PoolCandidateSource, rack: string, page: number): Record<string, string | number | undefined> {
+  return { group_id: source, rack: rack.trim() || undefined, page, page_size: POOL_CANDIDATE_PAGE }
+}

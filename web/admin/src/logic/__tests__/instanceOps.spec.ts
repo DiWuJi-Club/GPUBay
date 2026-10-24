@@ -84,3 +84,28 @@ describe('showPortActions', () => {
     expect(showPortActions('finance')).toBe(false)
   })
 })
+
+describe('系统实例（平台节点，规格 §4.2）', () => {
+  const states: InstanceState[] = ['reserved', 'creating', 'running', 'stopped', 'wiping', 'released', 'failed']
+  it('任何角色、任何状态都不显示退款 / 延长 / 换机 / 改派 / 取消预订', () => {
+    for (const role of ['super', 'ops', 'finance'] as Role[]) {
+      for (const s of states) {
+        expect(showExtend(role, s, true), `${role} ${s} extend`).toBe(false)
+        expect(showMigrate(role, s, true), `${role} ${s} migrate`).toBe(false)
+        expect(showRefund(role, s, true), `${role} ${s} refund`).toBe(false)
+        expect(showReassign(role, s, true), `${role} ${s} reassign`).toBe(false)
+        expect(showCancelBooking(role, s, true), `${role} ${s} cancel`).toBe(false)
+      }
+    }
+  })
+  it('system=false / 缺省时与原判定一致', () => {
+    expect(showExtend('ops', 'running', false)).toBe(true)
+    expect(showMigrate('ops', 'running', false)).toBe(true)
+    expect(showRefund('finance', 'running', false)).toBe(true)
+    expect(showReassign('ops', 'reserved', false)).toBe(true)
+    expect(showCancelBooking('ops', 'reserved', undefined)).toBe(true)
+  })
+  it('重新洗机不受影响（系统实例也会洗机）', () => {
+    expect(showRewipe('ops', 'wiping')).toBe(true)
+  })
+})

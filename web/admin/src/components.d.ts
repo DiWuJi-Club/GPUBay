@@ -11,6 +11,7 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AddPoolMachineDialog: typeof import('./components/llm/AddPoolMachineDialog.vue')['default']
     AppFormDialog: typeof import('./components/AppFormDialog.vue')['default']
     BatchLink: typeof import('./components/BatchLink.vue')['default']
     BookingOpsDialogs: typeof import('./components/BookingOpsDialogs.vue')['default']
@@ -50,6 +51,8 @@ declare module 'vue' {
     IdLink: typeof import('./components/IdLink.vue')['default']
     ModelDrawer: typeof import('./components/llm/ModelDrawer.vue')['default']
     ModelsTab: typeof import('./components/llm/ModelsTab.vue')['default']
+    NodeDrawer: typeof import('./components/llm/NodeDrawer.vue')['default']
+    NodesTab: typeof import('./components/llm/NodesTab.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     TotpDialog: typeof import('./components/TotpDialog.vue')['default']
