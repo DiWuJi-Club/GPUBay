@@ -81,7 +81,7 @@
 ### V1 真机多容器（`deploy/poc/shared/multicheck`，2026-10-25 03:08～03:10）
 
 - 环境：Agent 二进制取自本分支 `fe81c48`（`make agent`，SHA-256 `9a411bdd132a7e584e29e6913d8f840fb881acdac75ae4b0d2fe7993946ea79d`），工具用同一提交交叉编译。执行前先停掉 `spark-agent`，然后 `sudo /tmp/multicheck --lan-ip 192.168.1.221`。工具使用独立的状态目录 `/var/tmp/spark-multicheck/<ts>`，并通过真实的 executor 调用 docker、loop 设备、iptables 和 tc。当时机器上还有计划 11 的整机实例 `ins-o3xpibdh`（端口 2222），本步骤全程没有碰它。
-- 结果 `RESULT: PASS`（exit 0），全部 64 项检查通过。原文摘录：
+- 结果 `RESULT: PASS`（exit 0），全部 56 项检查通过。原文摘录：
   - A（4 份，端口 2223）与 B（4 份，端口 2224）：
     - `Memory=30517760000 MemorySwap=30517760000 NanoCpus=5000000000 PidsLimit=8192 ShmSize=15258880000 CapAdd=[CAP_IPC_LOCK CAP_SYS_PTRACE] PortBindings=map[22/tcp:[{192.168.1.221 2223}]]`。其中 `(130660974592 − 8 GiB) / 4 = 30517760000`；没有 `SYS_NICE`。
     - 数据盘镜像 `549755813888 = 512 GiB`，挂载在 `/dev/loop18` 和 `/dev/loop19`（各 502.9G）。
