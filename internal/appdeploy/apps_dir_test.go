@@ -251,7 +251,7 @@ func TestVLLMStartArgs(t *testing.T) {
 		t.Fatalf("app.sh start: %v %s", err, b)
 	}
 	var args []string
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) { // 新建的可执行文件首次启动可能被系统扫描拖慢数秒
 		b, _ := os.ReadFile(argsFile)
 		if args = strings.Fields(string(b)); len(args) > 0 || time.Now().After(deadline) {
 			break
@@ -335,7 +335,7 @@ func TestOpenWebUIOfflineEmbedding(t *testing.T) {
 				t.Fatalf("start: %v %s", err, out)
 			}
 			var got string
-			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) { // 新建的可执行文件首次启动可能被系统扫描拖慢数秒
 				b, _ := os.ReadFile(envFile)
 				if got = string(b); strings.Contains(got, "OFFLINE_MODE=") || time.Now().After(deadline) {
 					break
