@@ -93,6 +93,7 @@ type Key struct {
 }
 
 // Usage 是 llm_usage 一行（不含请求 / 补全内容）。CostMicro 单位微分；价格是当时快照。
+// 也是 RecordUsage 的输入：ID / SettlementID 忽略；CreatedAt 即请求时间（零值 = 当前时钟），日界 / 月界按它算。
 type Usage struct {
 	ID               int64     `json:"id"`
 	RequestID        string    `json:"request_id"`
@@ -139,6 +140,7 @@ type DailyRow struct {
 	Day              time.Time `json:"day"`
 	UserID           int64     `json:"user_id"`
 	ModelID          int64     `json:"model_id"`
+	ModelSlug        string    `json:"model,omitempty"` // 不是表列：DailyUsage 联表带出，方便视图
 	Requests         int64     `json:"requests"`
 	PromptTokens     int64     `json:"prompt_tokens"`
 	CompletionTokens int64     `json:"completion_tokens"`
