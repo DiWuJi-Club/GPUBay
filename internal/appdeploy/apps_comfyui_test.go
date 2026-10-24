@@ -2,7 +2,7 @@
 
 package appdeploy_test
 
-// deploy/apps/comfyui/app.sh（1.1.0，计划 11 Task 7）用假的 modelscope / hf / git / pip / python3 真跑 install / start：
+// deploy/apps/comfyui/app.sh（1.1.0，计划 11 Task 7）用假的 modelscope / hf / git / python3（含 python3 -m pip）真跑 install / start：
 // 临时目录充当容器的 /root/data，部署包里的 workflows/ 由 comfywf.BundleFiles 生成（与平台下发的形状一致）。
 //
 // python3：app.sh 用镜像自带的 python3 解析 manifest.json（`python3 -I - <清单> <目录表>`），start 用它跑 `python3 main.py …`。
@@ -37,13 +37,18 @@ const (
 
 // 假命令：调用逐行记进 $FAKE_CALLS（参数用空格连接）。
 const fakeDownloader = `#!/bin/sh
-# modelscope / hf 的替身：<cmd> download <repo> <file> --local-dir <dir> → 写 <dir>/<file>，内容 "fake:<repo>/<file>"
+# modelscope / hf 的替身：<cmd> download <repo> <file> --local-dir <dir> → 写 <dir>/<file>，内容 "fake:<repo>/<file>"。
+# 只认 --local-dir 这一种写法（真机核实过的拼写），其它参数报错；FAKE_DL_FAIL=<命令名> 时该命令下载失败
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_CALLS"
 [ "$1" = download ] || exit 64
+[ "${FAKE_DL_FAIL:-}" = "$(basename "$0")" ] && { echo "download failed" >&2; exit 1; }
 repo=$2; file=$3; dir=
 shift 3
 while [ $# -gt 0 ]; do
-  case "$1" in --local-dir|--local_dir) dir=$2; shift ;; esac
+  case "$1" in
+    --local-dir) dir=$2; shift ;;
+    *) echo "unknown argument $1" >&2; exit 66 ;;
+  esac
   shift
 done
 [ -n "$dir" ] || exit 65
@@ -67,7 +72,7 @@ case "$1" in
     shift
     while [ $# -gt 2 ]; do shift; done
     url=$1; dst=$2
-    if [ "${FAKE_GIT_FAIL_MIRROR:-}" = 1 ]; then case "$url" in *gh-proxy*) echo "fatal: mirror down" >&2; exit 128 ;; esac; fi
+    if [ "${FAKE_GIT_FAIL_MIRROR:-}" = clone ]; then case "$url" in *gh-proxy*) echo "fatal: mirror down" >&2; exit 128 ;; esac; fi
     mkdir -p "$dst/.git"
     name=$(basename "$url" .git)
     if [ -d "${FAKE_GIT_SRC:-/nonexistent}/$name" ]; then cp -R "$FAKE_GIT_SRC/$name/." "$dst/"; fi
@@ -78,17 +83,24 @@ case "$1" in
     done
     ;;
   submodule)
-    if [ "${FAKE_GIT_FAIL_MIRROR:-}" = 1 ]; then case "$cfg" in *gh-proxy*) echo "fatal: mirror down" >&2; exit 1 ;; esac; fi
+    if [ "${FAKE_GIT_FAIL_MIRROR:-}" = submodule ]; then case "$cfg" in *gh-proxy*) echo "fatal: mirror down" >&2; exit 1 ;; esac; fi
     mkdir -p "$dir/repositories/ultimate_sd_upscale"
     ;;
   *) exit 64 ;;
 esac
 `
 
-const fakePip = `#!/bin/sh
-printf 'pip %s\n' "$*" >> "$FAKE_CALLS"
-[ "${FAKE_PIP_FAIL:-}" = 1 ] && exit 1
-exit 0
+// fakePyPip 假 python3 里 `python3 -m pip …` 的部分：list 输出一份已装包（约束文件应只挑出 torch / numpy / nvidia-* 等），
+// install 记录参数，FAKE_PIP_FAIL=1 时失败。
+const fakePyPip = `if [ "${1:-}" = -m ] && [ "${2:-}" = pip ]; then
+  shift 2
+  printf 'pip %s\n' "$*" >> "$FAKE_CALLS"
+  case "${1:-}" in
+    list) printf 'foo==1.0\ntorch==2.9.0a0+50eac811a6.nv25.9\nnumpy==1.26.4\nnvidia-cudnn-cu12==9.1.0\nTransformers==4.56.0\ntorchvisionx==1\n' ;;
+    install) [ "${FAKE_PIP_FAIL:-}" = 1 ] && exit 1 ;;
+  esac
+  exit 0
+fi
 `
 
 type comfyBox struct {
@@ -107,10 +119,10 @@ func comfyFakeBin(t *testing.T) string {
 		t.Skip("python3 not found")
 	}
 	bin := t.TempDir()
-	fakePy := "#!/bin/sh\nif [ \"${1:-}\" = main.py ]; then\n  pwd > \"$FAKE_PY_ARGS.cwd\"\n  printf '%s\\n' \"$@\" > \"$FAKE_PY_ARGS\"\n  echo fresh-run\n  exec sleep 30\nfi\nexec " +
+	fakePy := "#!/bin/sh\n" + fakePyPip + "if [ \"${1:-}\" = main.py ]; then\n  pwd > \"$FAKE_PY_ARGS.cwd\"\n  printf '%s\\n' \"$@\" > \"$FAKE_PY_ARGS\"\n  echo fresh-run\n  exec sleep 30\nfi\nexec " +
 		appdeploy.ShellQuote(realPy) + " \"$@\"\n"
 	sparkStatus := "#!/bin/sh\nDIR=$(dirname \"$0\"); [ -n \"${SPARK_APP_DIR:-}\" ] && DIR=$SPARK_APP_DIR\nexec sh \"$DIR/run.sh\" _status \"${1:-}\" \"${2:-}\" \"${3:-}\"\n"
-	for name, body := range map[string]string{"modelscope": fakeDownloader, "hf": fakeDownloader, "git": fakeGit, "pip": fakePip,
+	for name, body := range map[string]string{"modelscope": fakeDownloader, "hf": fakeDownloader, "git": fakeGit,
 		"python3": fakePy, "spark_status": sparkStatus} {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
@@ -118,7 +130,7 @@ func comfyFakeBin(t *testing.T) string {
 	}
 	// 预热（并行触发上面说的首次执行检查）：带一个不会被当成正常调用的参数，结果不管
 	var wg sync.WaitGroup
-	for _, name := range []string{"modelscope", "hf", "git", "pip", "python3", "spark_status"} {
+	for _, name := range []string{"modelscope", "hf", "git", "python3", "spark_status"} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -147,6 +159,7 @@ func newComfyBox(t *testing.T, bin string) *comfyBox {
 		filepath.Join(b.app, "app.sh"):                                                 string(script),
 		filepath.Join(b.app, "run.sh"):                                                 string(runtime.RunSH),
 		filepath.Join(b.comfy, "input", "example.png"):                                 "png",
+		filepath.Join(root, "image-constraint.txt"):                                    "torch==2.4.0\n",
 		filepath.Join(root, "gitsrc", "ComfyUI_UltimateSDUpscale", "requirements.txt"): "numpy\n",
 		filepath.Join(root, "gitsrc", "ComfyUI_UltimateSDUpscale", ".gitmodules"):      "[submodule \"repositories/ultimate_sd_upscale\"]\n",
 		filepath.Join(root, "gitsrc", "ComfyUI_UltimateSDUpscale", "__init__.py"):      "",
@@ -170,6 +183,8 @@ func newComfyBox(t *testing.T, bin string) *comfyBox {
 		"FAKE_CALLS":             b.calls,
 		"FAKE_GIT_SRC":           filepath.Join(root, "gitsrc"),
 		"FAKE_PY_ARGS":           filepath.Join(root, "py-args"),
+		// 镜像 ENV 的 pip 约束（NVIDIA 镜像有）；第二个路径不存在，应被跳过
+		"PIP_CONSTRAINT": filepath.Join(root, "image-constraint.txt") + " " + filepath.Join(root, "missing.txt"),
 	}
 	t.Cleanup(func() {
 		if raw, err := os.ReadFile(filepath.Join(b.app, "service.pid")); err == nil {
@@ -315,6 +330,10 @@ func TestComfyApp(t *testing.T) {
 		{"InstallRejectsBadManifest", comfyInstallRejectsBadManifest},
 		{"InstallPresetModel", comfyInstallPresetModel},
 		{"Start", comfyStart},
+		{"InstallLeftoverTmp", comfyInstallLeftoverTmp},
+		{"InstallDanglingLink", comfyInstallDanglingLink},
+		{"InstallSourceRetry", comfyInstallSourceRetry},
+		{"InstallProgressMonotonic", comfyInstallProgressMonotonic},
 	} {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, bin) })
 	}
@@ -353,10 +372,11 @@ func comfyInstallWorkflows(t *testing.T, bin string) {
 		t.Errorf("upscale link -> %s", got)
 	}
 
-	// 节点：镜像 clone 一次，checkout 指定 commit，子模块经镜像（insteadOf），requirements.txt 用 pip 装
+	// 节点：镜像 clone 一次（临时目录在 custom_nodes 外），checkout 指定 commit，子模块经镜像（insteadOf），
+	// requirements.txt 用 python3 -m pip 装且带约束文件
 	node := b.cdata("custom_nodes", "ComfyUI_UltimateSDUpscale")
-	tmp := b.cdata("custom_nodes", ".tmp-ComfyUI_UltimateSDUpscale")
-	if n := b.countCalls("git clone --quiet --filter=blob:none " + testMirror + usduGit + " " + tmp); n != 1 || b.countCalls("git clone") != 1 {
+	tmp := b.cdata(".tmp-nodes", "ComfyUI_UltimateSDUpscale")
+	if n := b.countCalls("git clone --quiet --no-checkout " + testMirror + usduGit + " " + tmp); n != 1 || b.countCalls("git clone") != 1 {
 		t.Errorf("clone calls:\n%s", strings.Join(b.callLines(), "\n"))
 	}
 	if b.countCalls("git -C "+tmp+" checkout --quiet "+usduCommit) != 1 {
@@ -366,8 +386,16 @@ func comfyInstallWorkflows(t *testing.T, bin string) {
 		b.countCalls("git -C "+tmp+" submodule") != 0 {
 		t.Errorf("submodule calls:\n%s", strings.Join(b.callLines(), "\n"))
 	}
-	if b.countCalls("pip install -r "+tmp+"/requirements.txt") != 1 {
+	constraints := filepath.Join(b.app, ".pip-constraints.txt")
+	if b.countCalls("pip install -c "+constraints+" -r "+tmp+"/requirements.txt") != 1 || b.countCalls("pip list --format=freeze") != 1 {
 		t.Errorf("pip calls:\n%s", strings.Join(b.callLines(), "\n"))
+	}
+	// 约束 = 镜像的 PIP_CONSTRAINT 文件 + 已装的 torch / numpy / transformers / nvidia-*（大小写不敏感），别的包不钉
+	if c, _ := os.ReadFile(constraints); string(c) != "torch==2.4.0\n\ntorch==2.9.0a0+50eac811a6.nv25.9\nnumpy==1.26.4\nnvidia-cudnn-cu12==9.1.0\nTransformers==4.56.0\n" {
+		t.Errorf(".pip-constraints.txt = %q", c)
+	}
+	if _, err := os.Stat(b.cdata(".tmp-nodes")); !os.IsNotExist(err) {
+		t.Errorf(".tmp-nodes left behind: %v", err)
 	}
 	if c, _ := os.ReadFile(filepath.Join(node, ".spark-commit")); string(c) != usduCommit+"\n" {
 		t.Errorf(".spark-commit = %q", c)
@@ -467,32 +495,45 @@ func comfyInstallSourceFallback(t *testing.T, bin string) {
 	}
 }
 
-// 镜像 clone 失败 → 直连（两次 clone），子模块也先镜像后直连；成功安装。
+// 经镜像的任一步失败 → 清掉临时目录，整套（clone + checkout + 子模块）直连重来；成功安装。
 func comfyInstallGitMirrorFallback(t *testing.T, bin string) {
-	b := newComfyBox(t, bin)
-	b.env["FAKE_GIT_FAIL_MIRROR"] = "1"
-	b.bundle(wfUpscale())
-	if out, code := b.run("install"); code != 0 {
-		t.Fatalf("install = %d:\n%s", code, out)
-	}
-	tmp := b.cdata("custom_nodes", ".tmp-ComfyUI_UltimateSDUpscale")
-	var clones, subs []string
-	for _, l := range b.callLines() {
-		if strings.HasPrefix(l, "git clone") {
-			clones = append(clones, l)
-		}
-		if strings.Contains(l, " submodule ") {
-			subs = append(subs, l)
-		}
-	}
-	if len(clones) != 2 || !strings.Contains(clones[0], testMirror+usduGit) || clones[1] != "git clone --quiet --filter=blob:none "+usduGit+" "+tmp {
-		t.Errorf("clones = %q", clones)
-	}
-	if len(subs) != 2 || !strings.Contains(subs[0], "insteadOf") || subs[1] != "git -C "+tmp+" submodule update --init --recursive" {
-		t.Errorf("submodule calls = %q", subs)
-	}
-	if _, err := os.Stat(b.cdata("custom_nodes", "ComfyUI_UltimateSDUpscale", ".spark-commit")); err != nil {
-		t.Error("node not installed")
+	for _, tc := range []struct {
+		failAt     string
+		wantSubs   int // 子模块调用次数（镜像 clone 失败时镜像那一轮没走到子模块）
+		wantChecks int
+	}{{"clone", 1, 1}, {"submodule", 2, 2}} {
+		t.Run(tc.failAt, func(t *testing.T) {
+			b := newComfyBox(t, bin)
+			b.env["FAKE_GIT_FAIL_MIRROR"] = tc.failAt
+			b.bundle(wfUpscale())
+			if out, code := b.run("install"); code != 0 {
+				t.Fatalf("install = %d:\n%s", code, out)
+			}
+			tmp := b.cdata(".tmp-nodes", "ComfyUI_UltimateSDUpscale")
+			var clones, subs []string
+			for _, l := range b.callLines() {
+				if strings.HasPrefix(l, "git clone") {
+					clones = append(clones, l)
+				}
+				if strings.Contains(l, " submodule ") {
+					subs = append(subs, l)
+				}
+			}
+			if len(clones) != 2 || clones[0] != "git clone --quiet --no-checkout "+testMirror+usduGit+" "+tmp ||
+				clones[1] != "git clone --quiet --no-checkout "+usduGit+" "+tmp {
+				t.Errorf("clones = %q", clones)
+			}
+			if len(subs) != tc.wantSubs || subs[len(subs)-1] != "git -C "+tmp+" submodule update --init --recursive" ||
+				(tc.wantSubs == 2 && !strings.Contains(subs[0], "insteadOf")) {
+				t.Errorf("submodule calls = %q", subs)
+			}
+			if n := b.countCalls("git -C " + tmp + " checkout"); n != tc.wantChecks {
+				t.Errorf("checkouts = %d", n)
+			}
+			if _, err := os.Stat(b.cdata("custom_nodes", "ComfyUI_UltimateSDUpscale", ".spark-commit")); err != nil {
+				t.Error("node not installed")
+			}
+		})
 	}
 }
 
@@ -504,7 +545,7 @@ func comfyInstallNoGitMirror(t *testing.T, bin string) {
 	if out, code := b.run("install"); code != 0 {
 		t.Fatalf("install = %d:\n%s", code, out)
 	}
-	if b.countCalls("git clone") != 1 || b.countCalls("git clone --quiet --filter=blob:none "+usduGit+" ") != 1 ||
+	if b.countCalls("git clone") != 1 || b.countCalls("git clone --quiet --no-checkout "+usduGit+" ") != 1 ||
 		b.countCalls("git -C") != 2 || strings.Contains(strings.Join(b.callLines(), "\n"), "insteadOf") {
 		t.Errorf("calls:\n%s", strings.Join(b.callLines(), "\n"))
 	}
@@ -530,7 +571,7 @@ func comfyInstallNodeFailures(t *testing.T, bin string) {
 			if _, err := os.Stat(b.cdata("custom_nodes", "ComfyUI_UltimateSDUpscale")); !os.IsNotExist(err) {
 				t.Errorf("node dir present after failure: %v", err)
 			}
-			if _, err := os.Stat(b.cdata("custom_nodes", ".tmp-ComfyUI_UltimateSDUpscale")); !os.IsNotExist(err) {
+			if _, err := os.Stat(b.cdata(".tmp-nodes", "ComfyUI_UltimateSDUpscale")); !os.IsNotExist(err) {
 				t.Errorf("tmp clone left behind: %v", err)
 			}
 			if !strings.Contains(out, "ComfyUI_UltimateSDUpscale") {
@@ -677,6 +718,12 @@ func comfyInstallRejectsBadManifest(t *testing.T, bin string) {
 		"slug":        `{"workflows":[{"slug":"../a","version":"1","file":"../a.json","models":[],"nodes":[]}]}`,
 		"file":        `{"workflows":[{"slug":"a-b","version":"1","file":"other.json","models":[],"nodes":[]}]}`,
 		"not json":    `{"workflows":[`,
+		"top array":   `[]`,
+		"models obj":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":{"a":1},"nodes":[]}]}`,
+		"model item":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[1],"nodes":[]}]}`,
+		"source str":  `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[{"name":"x","dir":"vae","size_gb":1,"sha256":"","hf":"a/b"}],"nodes":[]}]}`,
+		"node item":   `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":["x"]}]}`,
+		"wf item":     `{"workflows":["a-b"]}`,
 		"node commit": `{"workflows":[{"slug":"a-b","version":"1","file":"a-b.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/b","commit":"` + usduCommit + `"}]},{"slug":"c-d","version":"1","file":"c-d.json","models":[],"nodes":[{"name":"n","git":"https://github.com/a/b","commit":"` + strings.Repeat("b", 40) + `"}]}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -685,7 +732,7 @@ func comfyInstallRejectsBadManifest(t *testing.T, bin string) {
 			os.WriteFile(filepath.Join(b.app, "workflows", "manifest.json"), []byte(body), 0o644)
 			os.WriteFile(filepath.Join(b.app, "workflows", "a-b.json"), []byte("{}"), 0o644)
 			out, code := b.run("install")
-			if code == 0 || !strings.Contains(out, "manifest.json") {
+			if code == 0 || !strings.Contains(out, "manifest.json") || strings.Contains(out, "Traceback") {
 				t.Fatalf("install = %d:\n%s", code, out)
 			}
 			if raw, _ := os.ReadFile(b.calls); len(raw) != 0 {
@@ -751,7 +798,7 @@ func comfyStart(t *testing.T, bin string) {
 	}
 
 	var args []string
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) {
 		raw, _ := os.ReadFile(b.env["FAKE_PY_ARGS"])
 		if args = strings.Split(strings.TrimRight(string(raw), "\n"), "\n"); len(raw) > 0 || time.Now().After(deadline) {
 			break
@@ -788,7 +835,7 @@ func comfyStart(t *testing.T, bin string) {
 	if pid <= 1 || syscall.Kill(pid, 0) != nil {
 		t.Fatalf("service.pid = %q not alive", raw)
 	}
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) {
 		cur, _ := os.ReadFile(filepath.Join(b.app, "comfyui.log"))
 		if strings.Contains(string(cur), "fresh-run") || time.Now().After(deadline) {
 			if strings.Contains(string(cur), "previous-run") || !strings.Contains(string(cur), "fresh-run") {
@@ -840,5 +887,123 @@ func TestComfyAppSpec(t *testing.T) {
 	raw, _ = os.ReadFile(filepath.Join(appsDir, "comfyui", "app.json"))
 	if err := json.Unmarshal(raw, &meta); err != nil || meta.Version != "1.1.0" {
 		t.Errorf("app.json version = %q %v", meta.Version, err)
+	}
+}
+
+// 上次中断留下的临时目录（旧版的 custom_nodes/.tmp-*、新版的 .tmp-nodes/*）在装节点前清掉。
+func comfyInstallLeftoverTmp(t *testing.T, bin string) {
+	b := newComfyBox(t, bin)
+	for _, d := range []string{b.cdata("custom_nodes", ".tmp-ComfyUI_Old"), b.cdata(".tmp-nodes", "Stale")} {
+		os.MkdirAll(d, 0o755)
+		os.WriteFile(filepath.Join(d, "x.py"), nil, 0o644)
+	}
+	b.bundle(wfUpscale())
+	if out, code := b.run("install"); code != 0 {
+		t.Fatalf("install = %d:\n%s", code, out)
+	}
+	for _, d := range []string{b.cdata("custom_nodes", ".tmp-ComfyUI_Old"), b.cdata(".tmp-nodes")} {
+		if _, err := os.Stat(d); !os.IsNotExist(err) {
+			t.Errorf("%s left behind: %v", d, err)
+		}
+	}
+	if _, err := os.Stat(b.cdata("custom_nodes", "ComfyUI_UltimateSDUpscale", ".spark-commit")); err != nil {
+		t.Error("node not installed")
+	}
+}
+
+// 目标是失效的软链（缓存被清掉）→ 不算已存在，重新下载并改链。
+func comfyInstallDanglingLink(t *testing.T, bin string) {
+	b := newComfyBox(t, bin)
+	dst := b.cdata("models", "checkpoints", "sd_xl_base_1.0.safetensors")
+	os.MkdirAll(filepath.Dir(dst), 0o755)
+	if err := os.Symlink(filepath.Join(b.root, "gone", "sd_xl_base_1.0.safetensors"), dst); err != nil {
+		t.Fatal(err)
+	}
+	b.bundle(wfTxt2Img())
+	if out, code := b.run("install"); code != 0 {
+		t.Fatalf("install = %d:\n%s", code, out)
+	}
+	if b.countCalls("modelscope download ") != 1 {
+		t.Errorf("calls:\n%s", strings.Join(b.callLines(), "\n"))
+	}
+	if got := readLink(t, dst); got != filepath.Join(b.root, "models", "modelscope", "AI-ModelScope/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0.safetensors") {
+		t.Errorf("link -> %s", got)
+	}
+}
+
+// 所选来源下载失败、另一个来源存在 → 换它再试；只有一个来源时直接失败。
+func comfyInstallSourceRetry(t *testing.T, bin string) {
+	b := newComfyBox(t, bin)
+	b.env["FAKE_DL_FAIL"] = "modelscope"
+	b.bundle(wfTxt2Img())
+	if out, code := b.run("install"); code != 0 {
+		t.Fatalf("install = %d:\n%s", code, out)
+	}
+	if b.countCalls("modelscope download ") != 1 || b.countCalls("hf download stabilityai/stable-diffusion-xl-base-1.0 ") != 1 {
+		t.Errorf("calls:\n%s", strings.Join(b.callLines(), "\n"))
+	}
+	if got := readLink(t, b.cdata("models", "checkpoints", "sd_xl_base_1.0.safetensors")); got !=
+		filepath.Join(b.root, "models", "hf", "stabilityai/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0.safetensors") {
+		t.Errorf("link -> %s", got)
+	}
+
+	b = newComfyBox(t, bin)
+	b.env["FAKE_DL_FAIL"] = "modelscope"
+	b.bundle(comfywf.BundleWorkflow{Slug: "t5-only", Version: "1.0.0", Graph: json.RawMessage(`{"nodes":[],"links":[]}`),
+		Manifest: comfywf.Manifest{Models: []comfywf.ModelSpec{t5ModelMSOnly()}}})
+	out, code := b.run("install")
+	if code == 0 || !strings.Contains(out, "t5xxl_fp8_e4m3fn.safetensors") || b.countCalls("hf ") != 0 {
+		t.Fatalf("install = %d:\n%s\ncalls: %v", code, out, b.callLines())
+	}
+}
+
+// 预置模型 + 工作流清单都有：预置模型占 5～35、工作流模型 35～70、节点 70～78、最后 79，进度不回退；中间不报 78。
+// sha256 校验前也有一条进度。
+func comfyInstallProgressMonotonic(t *testing.T, bin string) {
+	b := newComfyBox(t, bin)
+	b.env["MODEL_ID"] = "AI-ModelScope/FLUX.1-schnell"
+	w := wfUpscale()
+	m := upscaleModelHFOnly()
+	sum := sha256.Sum256([]byte("fake:" + m.HF.Repo + "/" + m.HF.File + "\n"))
+	m.SHA256 = hex.EncodeToString(sum[:])
+	w.Manifest.Models = []comfywf.ModelSpec{sdxlModel(), m}
+	b.bundle(w)
+	if out, code := b.run("install"); code != 0 {
+		t.Fatalf("install = %d:\n%s", code, out)
+	}
+	raw, _ := os.ReadFile(filepath.Join(b.app, "log"))
+	var pcts []int
+	var msgs []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(l)
+		if len(f) < 3 || f[0] != "[spark_status]" {
+			continue
+		}
+		p, err := strconv.Atoi(strings.TrimSuffix(f[2], "%"))
+		if err != nil {
+			t.Fatalf("log line %q", l)
+		}
+		pcts = append(pcts, p)
+		msgs = append(msgs, strings.Join(f[3:], " "))
+	}
+	if len(pcts) < 5 || pcts[0] != 5 || pcts[len(pcts)-1] != 79 {
+		t.Fatalf("progress = %v %q", pcts, msgs)
+	}
+	for i := 1; i < len(pcts); i++ {
+		if pcts[i] < pcts[i-1] || pcts[i] == 78 {
+			t.Fatalf("progress not monotonic / reported 78: %v %q", pcts, msgs)
+		}
+	}
+	joined := strings.Join(msgs, "|")
+	for _, want := range []string{"预置模型就绪", "下载模型 sd_xl_base_1.0.safetensors（1/2", "校验 sha256：4x-UltraSharp.pth", "安装节点 ComfyUI_UltimateSDUpscale"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("status messages missing %q: %q", want, msgs)
+		}
+	}
+	// 预置模型之后的第一条工作流模型进度从 35 起
+	for i, msg := range msgs {
+		if strings.HasPrefix(msg, "下载模型 sd_xl_base") && pcts[i] != 35 {
+			t.Errorf("first workflow model at %d%%, want 35", pcts[i])
+		}
 	}
 }
