@@ -55,8 +55,14 @@ export const hooks = {
     if (!r.ok()) throw new Error(`hook /hooks/agent/status -> ${r.status()} ${await r.text()}`)
     return (await r.json()) as { connected: boolean }
   },
-  users(opts: { phone?: string; verified?: boolean; balance?: number; ledger_rows?: number } = {}) {
-    return post<{ id: number; phone: string }>('/hooks/users', opts)
+  /** 造用户。带 invite_code / device_id / ip 任一时走真实注册路径（发码 + 登录，ip 缺省 127.0.0.1），invite 为绑定结果；
+   *  手机号已存在时只是再登录一次（记设备），不改实名、不入账。 */
+  users(opts: { phone?: string; verified?: boolean; balance?: number; ledger_rows?: number; invite_code?: string; device_id?: string; ip?: string } = {}) {
+    return post<{ id: number; phone: string; invite?: { bound: boolean; reason: string; inviter?: string } | null }>('/hooks/users', opts)
+  },
+  /** 插一版费率（生效时间 = 现在），未给的字段沿用当前版本。费率是全局的，改了要在 finally 里恢复（helpers/referral.ts restoreRate）。 */
+  referralConfig(opts: { rate_bp?: number; max_per_invitee?: number; max_per_inviter_30d?: number; hold_days?: number; period_days?: number }) {
+    return post<{ id: number }>('/hooks/referral/config', opts)
   },
   admins(opts: { username: string; role: Role; bind_totp: boolean }) {
     return post<{ id: number; password: string; totp_secret?: string; recovery_codes?: string[] }>('/hooks/admins', opts)
@@ -83,4 +89,33 @@ export const hooks = {
   appsTick(n = 1) {
     return post<{ rounds: number; processed: number }>('/hooks/apps/tick', { n })
   },
+  // ---- 计划 11：工作流与 fake ComfyUI（见 internal/e2ehooks/workflows.go）----
+  /** 幂等地建并发布 fake 工作流 A（e2e-wf-a）、B（e2e-wf-b），并把所有实例的 8188 转到进程内 fake ComfyUI。 */
+  workflowsSeed() {
+    return post<{ workflows: SeededWorkflow[] }>('/hooks/workflows/seed', {})
+  },
+  /** 幂等地建前 n 个（1～7）额外 fake 工作流 e2e-wf-c、e2e-wf-d…（分类「其它」、0.5 GB、无节点）。 */
+  workflowsSeedMany(n: number) {
+    return post<{ workflows: SeededWorkflow[] }>('/hooks/workflows/seed-many', { n })
+  },
+  /** 以最新已发布版本的内容发布新版本（version 缺省 1.0.<已有版本数>）。 */
+  workflowsVersion(opts: { slug: string; version?: string; changelog?: string }) {
+    return post<SeededWorkflow>('/hooks/workflows/version', opts)
+  },
+  /** 设置 fake ComfyUI 对某次快速出图运行（run_id）的 /history：queued / running / done（files 个输出，默认 1）/ error（message）。 */
+  comfyHistory(opts: { run_id: string; state: 'queued' | 'running' | 'done' | 'error'; files?: number; message?: string }) {
+    return post<{ prompt_id: string; state: string }>('/hooks/comfy/history', opts)
+  },
+  /** fake ComfyUI 收到的全部 /prompt 提交（按顺序；client_id = 运行 id）。 */
+  async comfyPrompts(): Promise<{ id: string; client_id: string; prompt: Record<string, { class_type: string; inputs: Record<string, unknown> }> }[]> {
+    const r = await (await api()).get('/hooks/comfy/prompts')
+    if (!r.ok()) throw new Error(`hook /hooks/comfy/prompts -> ${r.status()} ${await r.text()}`)
+    return ((await r.json()) as { prompts: [] }).prompts
+  },
+  /** 之后的 /prompt 提交返回 400 node_errors（消息 message）；空串恢复正常。 */
+  async comfyReject(message: string): Promise<void> {
+    await post('/hooks/comfy/reject', { message })
+  },
 }
+
+export type SeededWorkflow = { id: number; slug: string; version_id: number; version: string }

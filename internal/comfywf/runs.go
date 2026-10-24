@@ -213,18 +213,28 @@ type FileView struct {
 // Body 已限长：读到第 MaxViewBytes+1 个字节时返回 ErrFileTooLarge（此时响应头已发出，调用方只能中断连接）。
 // 响应头全部由平台生成（Content-Type 按扩展名，不透传容器的 Content-Type）。
 type File struct {
-	Body        io.ReadCloser
-	ContentType string
-	Length      int64 // -1 = 未知
-	Filename    string
-	Disposition string // inline; filename=…（mime.FormatMediaType，非 ASCII 用 RFC 2231 编码）
+	Body         io.ReadCloser
+	Status       int // 200，或按 Range 取一段时 206
+	ContentType  string
+	Length       int64  // 本次返回的字节数；-1 = 未知
+	ContentRange string // Status 206 时：bytes <首>-<尾>/<总长>（按校验过的数字重新生成）
+	AcceptRanges bool   // ComfyUI 支持 Range（回了 206 或 Accept-Ranges: bytes）
+	Filename     string
+	Disposition  string // inline; filename=…（mime.FormatMediaType，非 ASCII 用 RFC 2231 编码）
 }
 
-// SetHeaders 写下载响应头：Content-Type、Content-Length（已知时）、X-Content-Type-Options、Content-Disposition、Cache-Control。
+// SetHeaders 写下载响应头：Content-Type、Content-Length（已知时）、Content-Range / Accept-Ranges（有时）、
+// X-Content-Type-Options、Content-Disposition、Cache-Control、CSP。状态码用 f.Status。
 func (f *File) SetHeaders(h http.Header) {
 	h.Set("Content-Type", f.ContentType)
 	if f.Length >= 0 {
 		h.Set("Content-Length", strconv.FormatInt(f.Length, 10))
+	}
+	if f.ContentRange != "" {
+		h.Set("Content-Range", f.ContentRange)
+	}
+	if f.AcceptRanges {
+		h.Set("Accept-Ranges", "bytes")
 	}
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Disposition", f.Disposition)
@@ -783,9 +793,14 @@ var viewTypes = map[string]string{
 }
 
 // OpenFile 代理第 index 个输出文件：GET /view?filename=&subfolder=&type=output（参数全部取自 history）。
-// 运行未完成 / index 越界 / 容器里文件不在 → not_found；Content-Length > MaxViewBytes → ErrFileTooLarge。
+// 运行未完成 / index 越界 / 容器里文件不在 → not_found；文件超过 MaxViewBytes → ErrFileTooLarge。
+//
+// rangeHdr 是客户端的 Range 头（视频拖动进度条）：只认单段 bytes=a-b / bytes=a-（parseRange），原样转给 /view；
+// 其余（多段、后缀、不合法）不转发，按完整文件返回 200。ComfyUI 回 206 时校验 Content-Range（起点与请求一致、终点不超过
+// 请求的终点与文件尾、总长已知且 ≤ MaxViewBytes、Content-Length 与区间一致，否则 502）；回 416（起点超出文件尾）时
+// 不带 Range 重取完整文件；回 200（不支持 Range）照常返回。
 // 返回的 Body 超时 ViewTimeout，调用方必须 Close。
-func (r *Runs) OpenFile(ctx context.Context, req GetRequest, index int) (*File, error) {
+func (r *Runs) OpenFile(ctx context.Context, req GetRequest, index int, rangeHdr string) (*File, error) {
 	rt, err := r.target(ctx, req.UserID, req.InstanceID, req.DeploymentID)
 	if err != nil {
 		return nil, err
@@ -802,14 +817,24 @@ func (r *Runs) OpenFile(ctx context.Context, req GetRequest, index int) (*File, 
 	if !ok {
 		return nil, apperr.ErrNotFound
 	}
+	rng, hasRange := parseRange(rangeHdr)
 	q := url.Values{"filename": {f.Filename}, "subfolder": {f.Subfolder}, "type": {f.Type}}
 	vctx, cancel := context.WithTimeout(ctx, ViewTimeout)
-	hreq, err := http.NewRequestWithContext(vctx, http.MethodGet, "/view?"+q.Encode(), nil)
-	if err != nil {
-		cancel()
-		return nil, err
+	fetch := func(withRange bool) (*http.Response, error) {
+		hreq, err := http.NewRequestWithContext(vctx, http.MethodGet, "/view?"+q.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		if withRange {
+			hreq.Header.Set("Range", rng.header())
+		}
+		return r.client.do(vctx, rt.up, rt.port, hreq)
 	}
-	resp, err := r.client.do(vctx, rt.up, rt.port, hreq)
+	resp, err := fetch(hasRange)
+	if err == nil && hasRange && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		resp.Body.Close()
+		resp, err = fetch(false)
+	}
 	if err != nil {
 		cancel()
 		return nil, err
@@ -819,25 +844,81 @@ func (r *Runs) OpenFile(ctx context.Context, req GetRequest, index int) (*File, 
 		cancel()
 		return nil, err
 	}
+	out := &File{Status: http.StatusOK, ContentType: ctype, Length: resp.ContentLength, Filename: f.Filename,
+		AcceptRanges: resp.StatusCode == http.StatusPartialContent || strings.EqualFold(strings.TrimSpace(resp.Header.Get("Accept-Ranges")), "bytes")}
+	limit := int64(MaxViewBytes)
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		return fail(apperr.ErrNotFound)
+	case resp.StatusCode == http.StatusPartialContent && hasRange:
+		got, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		switch {
+		case !ok || got.start != rng.start || got.end < got.start || got.end >= total || (rng.end >= 0 && got.end > rng.end):
+			return fail(badUpstream("/view 返回的 Content-Range 不合法：%.64q", resp.Header.Get("Content-Range")))
+		case total > MaxViewBytes:
+			return fail(ErrFileTooLarge)
+		}
+		limit = got.end - got.start + 1
+		if resp.ContentLength >= 0 && resp.ContentLength != limit {
+			return fail(badUpstream("/view 206 的 Content-Length %d 与区间长度 %d 不符", resp.ContentLength, limit))
+		}
+		out.Status, out.Length = http.StatusPartialContent, limit
+		out.ContentRange = fmt.Sprintf("bytes %d-%d/%d", got.start, got.end, total)
 	case resp.StatusCode != http.StatusOK:
 		return fail(badUpstream("/view 返回 %d", resp.StatusCode))
 	case resp.ContentLength > MaxViewBytes:
 		return fail(ErrFileTooLarge)
 	}
-	disp := mime.FormatMediaType("inline", map[string]string{"filename": f.Filename})
-	if disp == "" {
-		disp = "inline"
+	out.Disposition = mime.FormatMediaType("inline", map[string]string{"filename": f.Filename})
+	if out.Disposition == "" {
+		out.Disposition = "inline"
 	}
-	return &File{
-		Body:        &limitedBody{r: resp.Body, left: MaxViewBytes, closeFn: func() error { err := resp.Body.Close(); cancel(); return err }},
-		ContentType: ctype,
-		Length:      resp.ContentLength,
-		Filename:    f.Filename,
-		Disposition: disp,
-	}, nil
+	out.Body = &limitedBody{r: resp.Body, left: limit, closeFn: func() error { err := resp.Body.Close(); cancel(); return err }}
+	return out, nil
+}
+
+// byteRange 单段字节区间；end = -1 表示到文件尾（bytes=a-）。
+type byteRange struct{ start, end int64 }
+
+func (b byteRange) header() string {
+	if b.end < 0 {
+		return fmt.Sprintf("bytes=%d-", b.start)
+	}
+	return fmt.Sprintf("bytes=%d-%d", b.start, b.end)
+}
+
+var (
+	rangeRE        = regexp.MustCompile(`^bytes=([0-9]{1,15})-([0-9]{0,15})$`)
+	contentRangeRE = regexp.MustCompile(`^bytes ([0-9]{1,15})-([0-9]{1,15})/([0-9]{1,15})$`)
+)
+
+// parseRange 只认单段 bytes=a-b（a ≤ b）/ bytes=a-，数字最多 15 位；其余（多段、后缀 bytes=-n、空白、其他单位）→ false。
+func parseRange(h string) (byteRange, bool) {
+	m := rangeRE.FindStringSubmatch(h)
+	if m == nil {
+		return byteRange{}, false
+	}
+	start, _ := strconv.ParseInt(m[1], 10, 64)
+	end := int64(-1)
+	if m[2] != "" {
+		end, _ = strconv.ParseInt(m[2], 10, 64)
+		if end < start {
+			return byteRange{}, false
+		}
+	}
+	return byteRange{start, end}, true
+}
+
+// parseContentRange 解析 206 的 Content-Range: bytes a-b/total（总长须已知）。
+func parseContentRange(h string) (byteRange, int64, bool) {
+	m := contentRangeRE.FindStringSubmatch(h)
+	if m == nil {
+		return byteRange{}, 0, false
+	}
+	start, _ := strconv.ParseInt(m[1], 10, 64)
+	end, _ := strconv.ParseInt(m[2], 10, 64)
+	total, _ := strconv.ParseInt(m[3], 10, 64)
+	return byteRange{start, end}, total, true
 }
 
 // limitedBody 最多读 left 字节；还有更多时返回 ErrFileTooLarge。

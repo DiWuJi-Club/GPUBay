@@ -6,11 +6,11 @@ const ROLE_LABEL: Record<Role, string> = { super: '超级管理员', ops: '运�
 
 test('A-NAV-01 菜单按角色过滤', async ({ page }) => {
   await page.clock.install() // 角标 60 秒刷新用；pauseClock 之前时间照常流逝
-  // 计划 7 增加「应用」「应用部署」两项（全部角色可见），与 admin/src/__tests__/menu.spec.ts 的 17 / 12 / 11 一致
+  // 计划 7 增加「应用」「应用部署」两项（全部角色可见）；计划 11 加「工作流」（全部角色），与 admin/src/__tests__/menu.spec.ts 一致
   const cases: [Role, number, string[]][] = [
-    ['super', 17, []],
-    ['ops', 12, ['orders', 'ledger', 'recharges', 'catalog', 'admins']],
-    ['finance', 11, ['machines', 'pdus', 'groups', 'kyc', 'catalog', 'admins']],
+    ['super', 19, []], // 计划 7 加「应用」「应用部署」（全部角色）；计划 8 加「邀请返利」（super / finance）；计划 11 加「工作流」（全部角色）
+    ['ops', 13, ['orders', 'ledger', 'recharges', 'referral', 'catalog', 'admins']],
+    ['finance', 13, ['machines', 'pdus', 'groups', 'kyc', 'catalog', 'admins']],
   ]
   for (const [role, count, missing] of cases) {
     const admin = await createAdmin(role)
@@ -32,7 +32,13 @@ test('A-NAV-01 菜单按角色过滤', async ({ page }) => {
     await expect(page.getByTestId('menu-catalog')).toHaveText('价格与镜像')
     await page.getByTestId('layout-collapse').click()
     await expect(page.getByTestId('menu-catalog')).toHaveText('价格')
-    const storage = () => page.evaluate(() => ({ local: Object.entries(localStorage), session: Object.entries(sessionStorage) }))
+    // 计划 8：共享请求层给每个请求带 X-Device-Id，设备 ID（v4 UUID）存在 sc_device；除此之外只存折叠状态
+    const storage = async () => {
+      const s = await page.evaluate(() => ({ local: Object.entries(localStorage), session: Object.entries(sessionStorage) }))
+      const device = s.local.filter(([k]) => k === 'sc_device')
+      expect(device.every(([, v]) => /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(v))).toBe(true)
+      return { local: s.local.filter(([k]) => k !== 'sc_device'), session: s.session }
+    }
     expect(await storage()).toEqual({ local: [['sc_admin_sidebar_collapsed', '1']], session: [] })
     await page.reload()
     await expect(page.getByTestId('layout-username')).toHaveText(admin.username)

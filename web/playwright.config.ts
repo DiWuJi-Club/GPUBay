@@ -57,6 +57,10 @@ export default defineConfig({
   // 每个用例最多推进约 1 天（C-DET-22 / 23 推进 23 小时，C-BKG-08 推进 3 小时，到点开通的用例推进 2～3 小时；没有用例推进到 3 天以上），
   // 预订都下在自己新建的机组（helpers/booking.ts privateGroup）里的新机器上，不依赖共享机器池；C-BKG-11 与 C-MKT-06 一样用
   // drainIdleMachines 把当时所有空闲机器置为维护（构造旧接口 /orders 的 no_capacity）。
+  // 计划 8 的返利用例（C-REF-07 / 08、C-ACC-03、C-WAL-05、A-REF-01～06、A-FIN-05）都只用自己新造的邀请人 / 被邀请人与新登记的机器；
+  // 其中 C-REF-07、C-ACC-03、A-REF-03 / 05 / 06、A-FIN-05 各推进 7 天让返利到期（C-REF-08 / C-WAL-05 临时改为 0 天发放延迟）；
+  // A-REF-03 冻结 / 解冻只作用于自己的邀请人。费率是全局的：C-REF-08、C-WAL-05、A-REF-04 改费率后在 finally 里恢复初始版本
+  // （helpers/referral.ts restoreRate）；A-REF-01 留下一条自己的搁置绑定（待审核队列按 ID 精确定位，不受影响）。
   // 计划 7 的应用部署用例（C-MKT-09～12 / C-APP / C-ING-07 / A-APP / A-INS-14）：e2e-server 不自己跑 Runner，用例用
   // hooks.appsTick 逐轮推进，每轮把假时钟推进 5 秒（一个部署从排队到运行中约 5～10 轮，即不到 1 分钟）；只有 C-APP-08 推进
   // 25 小时（让 1 天的实例到期停机，与 C-INS-01 同量级）。部署都在用例自己 runningInstance 新开的实例上（机器来自 hooks.machines），
@@ -66,6 +70,13 @@ export default defineConfig({
   // privateApp 建自己的已上架应用，结束时改为已退役，不动共享的四个 fake 应用。A-APP-04 新建一个启用的镜像，并用
   // hooks.agent({images}) 把所有在线 fake Agent 的已缓存镜像整体设为它（覆盖率断言要求全部在线机器都上报过）；
   // A-MCH-10 只设自己那台机器。
+  // 计划 11 的工作流用例（C-WF / C-MKT-13 / A-WF / A-INS-15）：fake 工作流 A（e2e-wf-a）、B（e2e-wf-b）由 /hooks/workflows/seed 幂等创建，
+  // 永远只有 1.0.0；「8 个上限」「发布新版本」用 /hooks/workflows/seed-many 的额外工作流 e2e-wf-c～i（创建后整轮保留，市场页、RentDialog、
+  // 添加工作流列表里都会多出这几项，所以用例不断言卡片总数）。C-WF-09（每个控制台 project 各一次）与 A-INS-15 都给 e2e-wf-c 发新版本，
+  // 它的最新版本号随运行递增：断言一律用钩子返回的版本号。fake ComfyUI 是全局的：/hooks/comfy/reject 打开后所有实例的 /prompt 都被拒，
+  // console/workflows.spec.ts 的 afterEach 在 try / finally 里先恢复它再卸载部署；快速出图历史按运行 ID 设置，互不影响。
+  // A-WF-06 / 07 读后台全库计数（安装数、24 小时快速出图数）：admin project 串行执行，基线在变化前一刻读取（24 小时窗口按假时钟），
+  // 不依赖别的用例留下的数据。部署都在用例自己的 ComfyUI 镜像实例上（helpers/workflows.ts comfySetup），afterEach 卸载。
   projects: [
     {
       name: 'console-desktop',

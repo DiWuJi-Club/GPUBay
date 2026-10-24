@@ -138,7 +138,7 @@ describe('WorkflowsPanel', () => {
     expect(w.emitted('refresh')).toHaveLength(2)
   })
 
-  it('安装失败且无新版本：「重试安装」= PUT 不带 version_id', async () => {
+  it('安装失败且无新版本：「重试安装」= PUT 明确带当前已装版本', async () => {
     mountPanel(dep({ workflows: [wf({ state: 'failed', update_available: false, latest_version_id: 50, latest_version: '1.0.0' })] }))
     await flushPromises()
     expect(q('wf-failed-sdxl')).toBeTruthy()
@@ -150,7 +150,21 @@ describe('WorkflowsPanel', () => {
     expect(q('wf-confirm-text')!.textContent).toContain('重新安装「SDXL」v1.0.0')
     q('wf-confirm-ok')!.click()
     await flushPromises()
-    expect(m.updateDeploymentWorkflow).toHaveBeenCalledWith('ins-1', 'dep-1', 5, null)
+    expect(m.updateDeploymentWorkflow).toHaveBeenCalledWith('ins-1', 'dep-1', 5, 50)
+  })
+
+  it('重试安装：已装的是更新的已下线版本（最新已发布版本更旧）时也只重试已装版本，不换成最新版本', async () => {
+    mountPanel(dep({ workflows: [wf({ state: 'failed', version_id: 52, version: '1.2.0', update_available: false, latest_version_id: 50, latest_version: '1.0.0' })] }))
+    await flushPromises()
+    ;(q('wf-more-sdxl') as HTMLElement).click()
+    await flushPromises()
+    expect(q('wf-update-sdxl')!.textContent).toContain('重试安装')
+    q('wf-update-sdxl')!.click()
+    await flushPromises()
+    expect(q('wf-confirm-text')!.textContent).toContain('重新安装「SDXL」v1.2.0')
+    q('wf-confirm-ok')!.click()
+    await flushPromises()
+    expect(m.updateDeploymentWorkflow).toHaveBeenCalledWith('ins-1', 'dep-1', 5, 52)
   })
 
   it('实例停机：添加 / 更新 / 移除置灰并说明原因，点了也不发请求', async () => {

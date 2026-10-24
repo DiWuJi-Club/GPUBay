@@ -2,6 +2,7 @@ package comfytest
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -88,6 +89,30 @@ func TestServer(t *testing.T) {
 		resp.Header.Get("Content-Disposition") != `filename="ComfyUI_00001_.png"` {
 		t.Fatalf("view: %v %d", resp.Header, len(b))
 	}
+
+	// Range（同真实 ComfyUI 的 aiohttp FileResponse）：206 + Content-Range；Size 模式也支持
+	rangeGet := func(rng string) (*http.Response, []byte) {
+		t.Helper()
+		req, _ := http.NewRequest("GET", ts.URL+"/view?filename=ComfyUI_00001_.png&type=output", nil)
+		req.Header.Set("Range", rng)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, b
+	}
+	if resp, b := rangeGet("bytes=1-3"); resp.StatusCode != 206 || string(b) != string(OnePixelPNG[1:4]) ||
+		resp.Header.Get("Content-Range") != fmt.Sprintf("bytes 1-3/%d", len(OnePixelPNG)) || resp.Header.Get("Accept-Ranges") != "bytes" ||
+		resp.Header.Get("Content-Type") != "image/png" {
+		t.Fatalf("range view: %d %v %q", resp.StatusCode, resp.Header, b)
+	}
+	s.SetView(ViewConfig{Size: 100, ContentType: "video/mp4"})
+	if resp, b := rangeGet("bytes=90-"); resp.StatusCode != 206 || len(b) != 10 || resp.Header.Get("Content-Range") != "bytes 90-99/100" {
+		t.Fatalf("range sized view: %d %v %q", resp.StatusCode, resp.Header, b)
+	}
+	s.SetView(ViewConfig{})
 
 	// 队列项与 history 回显提交的 prompt 与 client_id
 	var full map[string]struct {

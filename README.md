@@ -31,6 +31,10 @@ SPARK_DATABASE_URL=... SPARK_SECRET_KEY=... go run ./cmd/platform admin create -
 按提示输入两次密码（至少 12 位），用验证器 App 扫描终端里的二维码并输入一次动态码完成绑定，然后离线保存打印出的 8 个恢复码。
 管理员丢失手机时用 `platform admin reset-totp --username <名称>` 重置，下次登录重新绑定。
 
+计划 8（邀请返利）上线后执行一次 `platform referral backfill-fingerprints`：为存量已实名用户计算同身份指纹（用 `SPARK_SECRET_KEY` 解密身份证号，必须与服务用同一把密钥），之后「同一身份证 / 营业执照互相邀请」的判定才对老用户生效。回填命令本身不撤销绑定，但有了指纹之后，存量同身份绑定在下一笔待发放返利到期时会被发放前的同身份复查自动撤销（审计 `referral.auto_revoke`，待发放作废）；没有待发放返利的同身份绑定由后台「邀请返利」人工处置。可重复执行（只补没有指纹的记录）。子命令与服务读同样的环境变量，启动时会先执行迁移。
+
+邀请返利的财务操作：后台撤销绑定后，已发放的返利不会自动扣回。如果对应订单**仍可能退款**，不要用「调账」手工扣回：订单退款时系统会自动扣回这笔返利（余额不足记欠账），再手工调账就会扣两次。只对已经不能再退款的订单手工调账。后台「撤销并扣回已发放」列为后续事项。
+
 ### 前端开发
 
 ```bash
@@ -134,6 +138,9 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - 预订与自动续费的短信模板（`SPARK_SMS_TPL_AUTO_RENEW_FAILED`、`SPARK_SMS_TPL_BOOKING_CANCELLED`）在阿里云侧申请通过后再切 `SPARK_SMS_DRIVER=aliyun`，否则启动校验失败。
 - 发布计划 6 前先在生产库执行下面的检查，结果必须为 0 行，再让迁移 `00019` 运行（空占用时段只允许出现在已结束、实例已释放或失败的记录上）：
   `SELECT l.id, l.status, i.state FROM machine_leases l JOIN instances i ON i.id = l.instance_id WHERE isempty(l.period) AND (l.status <> 'ended' OR i.state NOT IN ('released','failed'));`
+- 计划 8（邀请返利）发布：迁移 `00021`（设计文档写作 `00020`，计划 7 先占用了该编号）在存在 `referral_rebate / referral_clawback` 流水时拒绝回滚；多副本滚动期间旧副本的登录接口不认 `invite_code`，窗口内注册的用户不会绑定（窗口很短，可接受；一次性重启全部副本可消除）；发布后执行 `platform referral backfill-fingerprints`；`SPARK_PUBLIC_BASE_URL` 必须是用户可访问的控制台地址（邀请链接据此生成）。
+- 计划 8 必须在计划 7 合入 `main` 之后发布（goose 不接受乱序迁移：`00021` 先于 `00020` 落库后，`00020` 再也不会执行）。迁移 `00021` 扩展 `wallet_ledger.kind` 的 CHECK 约束，会对 `wallet_ledger` 持有 ACCESS EXCLUSIVE 锁并全表校验，随后在同一事务里建 `wallet_ledger_order_scan_idx`（非 CONCURRENTLY）：迁移期间所有充值 / 扣款 / 退款都会等待。先 `SELECT count(*) FROM wallet_ledger` 估算耗时，选低峰窗口发布。
+- 邀请返利的「同 IP」标记与邀请码查询限流（每 IP 每分钟 60 次）都按客户端 IP：platform 在反向代理之后时必须设 `SPARK_TRUST_PROXY=true`（及 `SPARK_TRUSTED_PROXY_HOPS`），否则所有绑定都带「同IP」、所有用户共用一个查码额度。即便设对了，同一 NAT 出口（公司 / 校园网）的邀请也会带「同IP」——该标记只提示、不搁置。
 
 ### 应用一键部署（计划 7）
 
@@ -164,7 +171,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 
 ### ComfyUI 工作流市场（计划 11）
 
-- **发布顺序**：只发 platform（迁移 `00024_comfy_workflows.sql`，四张新表），不改 Agent。发布后依次：
+- **发布顺序**：只发 platform（迁移 `00024_comfy_workflows.sql`：四张新表，并修改 `uploads`——`purpose` 允许 `workflow_cover`、`user_id` 可空、加约束「封面 ⇔ `user_id` 为空」），不改 Agent。发布后依次：
   1. 导入 comfyui 应用 **1.1.0**（`supports_workflows`、`MODEL_ID` 默认 `none`、模型 / 自定义节点 / 用户目录放到数据盘 `/root/data/comfyui`）。**只导入 comfyui 一个目录**：`app import` 按目录名顺序导入、遇到第一个失败的目录（例如已导入过的 vllm 1.0.0，同版本号重复导入报错）就停止，整个 `deploy/apps` 再导一遍会报错退出。用一次性容器只读挂载 `deploy/apps/comfyui`（在 `deploy/compose/` 下执行）：
 
      ```bash
@@ -183,8 +190,8 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
   3. 后台「工作流」逐个检查版本（模型 / 节点 / 快速出图参数）并发布（super + TOTP，发布后不可变），再把工作流状态改为「上架」，控制台 `/workflows` 才能看到。
 - **国内网络**：模型从 ModelScope（或 `SPARK_APP_HF_ENDPOINT` 的 hf-mirror）下载；自定义节点从 GitHub 经 `SPARK_APP_GIT_MIRROR` 前缀 clone，镜像失效时改这个变量（或设 `off` 直连）后用户重新部署即可。若指向内网镜像站，网段要加进 `SPARK_AGENT_ALLOW_CIDRS`。
 - **安全**：自定义节点是第三方代码，在用户容器里以 root 安装运行；只有 super 能发布工作流版本，Git 主机限 github.com / gitee.com / gitcode.com 且钉死 commit，导入前须评审节点仓库。
-- **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。
-- **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），容器内文件不受影响。
+- **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。这些限制与每用户同时上传数、每小时运行尝试数用的是进程内锁与计数（「计数 → `/prompt` → 入库」靠进程内锁串行化），**假设 platform 只有一个副本**；多副本部署时它们只是每个副本各自的软上限（落在不同副本上的并发请求可以同时通过检查）。
+- **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），并删除 `uploads` 里的封面登记（`workflow_cover` 行）、把 `uploads` 的约束还原（`purpose` 只允许 `license`、`user_id` 非空）；`SPARK_UPLOAD_DIR` 里的封面文件留在磁盘上（可手工清理），容器内文件不受影响。
 
 ## API 约定
 
@@ -198,3 +205,4 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - `GET /api/v1/kyc` 返回用户最近一条实名记录（含驳回原因），没有记录时 `record` 为 `null`；个人姓名只保留首字。
 - 实例视图含 `product_name`、`image_name`（镜像停用后仍返回名称）；充值单视图含 `remaining_seconds`（服务器计算的剩余支付秒数）。
 - 后台 `GET /admin/api/v1/products`、`GET /admin/api/v1/images` 对全部角色可读；`GET /admin/api/v1/audit` 每条含 `actor_name`。
+- `POST /api/v1/auth/login` 可带 `invite_code`（只在首次登录即注册时绑定邀请关系；码无效 / 老用户 / 邀请人冻结都不影响登录，响应 `invite: {bound, inviter?, reason?}`），请求头 `X-Device-Id`（控制台生成的 UUID）用于风险标记。`GET /api/v1/me`（控制台会话启动）也按 `X-Device-Id` 与客户端 IP 补记设备和最近登录（同一设备 / 登录信息一小时内最多写一次，失败不影响响应），上线前就已登录的邀请人也能触发「同设备」搁置。

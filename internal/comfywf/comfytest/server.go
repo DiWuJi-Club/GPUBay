@@ -10,11 +10,13 @@
 //     条目里的 prompt 字段回显真实提交的 prompt 与 client_id
 //   - GET  /queue               Running 的放 queue_running，Queued 的放 queue_pending（元素同真实形状 [number, id, prompt, extra, outputs]）
 //   - GET  /view                只认某个 Done 条目里的文件（否则 404）；默认 1×1 PNG，Content-Type 按扩展名猜（同 mimetypes）、
-//     带 Content-Disposition: filename="…"；SetView 可换成任意类型 / 大 body / 不带长度
+//     带 Content-Disposition: filename="…"；SetView 可换成任意类型 / 大 body / 不带长度；200 且带长度时经 http.ServeContent
+//     支持 Range（206 + Content-Range、Accept-Ranges: bytes，同 aiohttp FileResponse）
 //   - POST /upload/image        multipart image + subfolder + overwrite → {name, subfolder, type: "input"}
 package comfytest
 
 import (
+	"bytes"
 	"cmp"
 	"crypto/rand"
 	"encoding/hex"
@@ -30,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 运行状态（HistoryState.State）。
@@ -501,6 +504,19 @@ func (s *Server) serveView(w http.ResponseWriter, r *http.Request) {
 	if status == 0 {
 		status = http.StatusOK
 	}
+	if status == http.StatusOK && !v.NoLength {
+		// 同真实 ComfyUI（aiohttp FileResponse）：支持单段 / 多段 Range（206 + Content-Range，Accept-Ranges: bytes）
+		body := v.Body
+		if len(body) == 0 {
+			body = OnePixelPNG
+		}
+		var rs io.ReadSeeker = bytes.NewReader(body)
+		if v.Size > 0 {
+			rs = io.NewSectionReader(zeros{}, 0, v.Size)
+		}
+		http.ServeContent(w, r, "", time.Time{}, rs)
+		return
+	}
 	if v.Size > 0 {
 		if !v.NoLength {
 			w.Header().Set("Content-Length", strconv.FormatInt(v.Size, 10))
@@ -533,6 +549,8 @@ func (zeros) Read(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+func (zeros) ReadAt(p []byte, _ int64) (int, error) { return zeros{}.Read(p) }
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {

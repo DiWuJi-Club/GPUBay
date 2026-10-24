@@ -54,7 +54,8 @@ type Deps struct {
 
 	// 计划 11 扩展点（comfywf 实现、app.go 接线；appdeploy 不 import comfywf）。都可为 nil。
 
-	// BundleExtra 给支持工作流的版本（Spec.SupportsWorkflows）追加部署包文件；错误按部署包生成失败处理（upload_failed）。
+	// BundleExtra 给支持工作流的版本（Spec.SupportsWorkflows）追加部署包文件；apperr 错误按部署包生成失败处理（upload_failed），
+	// 其余错误视为临时错误，部署留在原状态由 Runner 下一轮重试。
 	BundleExtra func(ctx context.Context, d Deployment, ver Version) ([]BundleFile, error)
 	// OnTransition 在 Runner 把部署写成 running（stepPoll）或 failed（markFailed）的同一回写事务里调用；d 是更新前的行，to 为目标状态。
 	OnTransition func(ctx context.Context, tx pgx.Tx, d Deployment, to string, now time.Time) error

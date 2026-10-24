@@ -234,7 +234,8 @@ func (s *Server) handleWorkflowCover(w http.ResponseWriter, r *http.Request) {
 	h.Set("Content-Length", strconv.FormatInt(up.Size, 10))
 	h.Set("Content-Disposition", "inline")
 	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("Cache-Control", "private, max-age=86400") // 覆盖 API 的 no-store：cover_url 带 ?v=，换封面后地址改变
+	h.Set("Content-Security-Policy", "default-src 'none'; sandbox") // 直接打开时也不能执行任何东西（同控制台封面）
+	h.Set("Cache-Control", "private, max-age=86400")                // 覆盖 API 的 no-store：cover_url 带 ?v=，换封面后地址改变
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, rc); err != nil {
 		s.Log.Warn("serve workflow cover aborted", "workflow", id, "err", err)

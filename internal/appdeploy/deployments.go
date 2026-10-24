@@ -268,7 +268,14 @@ func (s *Service) setRemoved(ctx context.Context, q db.Querier, cur Deployment, 
 // bundleError 部署包无法生成（版本 / 变量数据问题，或敏感变量无法解密；重试无用）：Runner 把部署标为 upload_failed。
 type bundleError struct{ err error }
 
-func (e *bundleError) Error() string { return e.err.Error() }
+// Error 给 apperr 只用其文案（不带错误码），其余原样。
+func (e *bundleError) Error() string {
+	var ae *apperr.Error
+	if errors.As(e.err, &ae) {
+		return ae.Message
+	}
+	return e.err.Error()
+}
 func (e *bundleError) Unwrap() error { return e.err }
 
 // appAndVersion 取部署的应用与版本（含脚本）。
@@ -285,7 +292,8 @@ func (s *Service) appAndVersion(ctx context.Context, d Deployment) (App, Version
 }
 
 // bundleFor 生成部署的部署包（run.sh + app.sh + spec.json + env，imageEnv 非 nil 时加 image.env；
-// 版本支持工作流且接了 Deps.BundleExtra 时追加它给出的文件，其错误同样是 bundleError）。
+// 版本支持工作流且接了 Deps.BundleExtra 时追加它给出的文件：其 apperr 错误（内容问题，如 workflow_version_invalid）
+// 是 bundleError，其余（库连不上等临时错误）原样返回，Runner 下一轮重试，不把部署标失败）。
 // healthAddr 非 nil 时覆盖 run.sh 的健康检查地址（测试）。
 func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, healthAddr func(port int) string, imageEnv []EnvKV) ([]byte, App, error) {
 	app, ver, err := s.appAndVersion(ctx, d)
@@ -300,7 +308,11 @@ func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, h
 		Env: d.Env, Secret: secret, HFEndpoint: s.d.HFEndpoint, PipIndexURL: s.d.PipIndexURL, GitMirror: s.d.GitMirror, ImageEnv: imageEnv}
 	if ver.Spec.SupportsWorkflows && s.d.BundleExtra != nil {
 		if in.Extra, err = s.d.BundleExtra(ctx, d, ver); err != nil {
-			return nil, app, &bundleError{err}
+			var ae *apperr.Error
+			if errors.As(err, &ae) {
+				return nil, app, &bundleError{err}
+			}
+			return nil, app, fmt.Errorf("bundle extra: %w", err)
 		}
 	}
 	if healthAddr != nil && len(ver.Spec.Ports) > 0 {

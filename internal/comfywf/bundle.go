@@ -39,7 +39,7 @@ type bundleNode struct {
 // （graph 原文）。按 slug 排序，输出可重复。
 //
 //   - 模型按目标位置 <dir>/<name> 去重：多个工作流引用同一文件时，后出现的条目改用先出现的那条（同名不同来源以先出现的
-//     为准），各工作流仍各自列出（app.sh 再按目标路径去重）。
+//     为准），各工作流仍各自列出（app.sh 再按目标路径去重）；两边都给了 sha256 且不同 → workflow_version_invalid。
 //   - 节点按 name（custom_nodes 下的目录名）去重：Git 地址或 commit 不同 → workflow_version_invalid。
 //   - ws 为空时仍生成 {"workflows":[]}：app.sh 据此清掉 user/default/workflows 里残留的 spark-*.json（移除最后一个工作流）。
 func BundleFiles(ws []BundleWorkflow) ([]appdeploy.BundleFile, error) {
@@ -51,7 +51,11 @@ func BundleFiles(ws []BundleWorkflow) ([]appdeploy.BundleFile, error) {
 
 	out := bundleManifest{Workflows: make([]bundleEntry, 0, len(sorted))}
 	files := []appdeploy.BundleFile{{}} // [0] 留给 manifest.json
-	models := map[string]ModelSpec{}    // <dir>/<name> → 先出现的条目
+	type modelSeen struct {
+		slug string
+		m    ModelSpec
+	}
+	models := map[string]modelSeen{} // <dir>/<name> → 先出现的条目
 	type nodeSeen struct {
 		slug string
 		n    NodeSpec
@@ -82,9 +86,13 @@ func BundleFiles(ws []BundleWorkflow) ([]appdeploy.BundleFile, error) {
 		for _, md := range w.Manifest.Models {
 			key := md.Dir + "/" + md.Name
 			if first, ok := models[key]; ok {
-				md = first
+				if first.m.SHA256 != "" && md.SHA256 != "" && first.m.SHA256 != md.SHA256 {
+					return nil, invalid("manifest.models", fmt.Sprintf("模型 %s 在两个工作流里 sha256 不同（%s：%s，%s：%s）",
+						key, first.slug, first.m.SHA256, w.Slug, md.SHA256))
+				}
+				md = first.m
 			} else {
-				models[key] = md
+				models[key] = modelSeen{slug: w.Slug, m: md}
 			}
 			e.Models = append(e.Models, md)
 		}

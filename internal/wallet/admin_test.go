@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/paging"
@@ -41,5 +42,26 @@ func TestAdminListLedgerAndExport(t *testing.T) {
 	}
 	if len(users) != 2 || users[0] != a {
 		t.Fatalf("export = %v", users)
+	}
+}
+
+func TestLedgerFilterAcceptsReferralKinds(t *testing.T) {
+	svc, pool := newEnv(t)
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13800000077", true)
+	if _, err := apply(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: 500, Kind: wallet.KindReferralRebate, RefType: "referral", RefID: "ord-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := apply(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -200, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "ord-a-c1"}); err != nil {
+		t.Fatal(err)
+	}
+	for kind, want := range map[string]int{"referral_rebate": 1, "referral_clawback": 1, "order_pay": 0} {
+		list, total, err := svc.AdminListLedger(ctx, wallet.LedgerFilter{UserID: uid, Kind: kind}, paging.Page{Number: 1, Size: 10})
+		if err != nil || total != want || len(list) != want {
+			t.Fatalf("kind %s: %d %d %v", kind, total, len(list), err)
+		}
+	}
+	if _, _, err := svc.AdminListLedger(ctx, wallet.LedgerFilter{Kind: "bogus"}, paging.Page{Number: 1, Size: 10}); apperr.As(err) == nil {
+		t.Fatalf("bogus kind must be rejected, got %v", err)
 	}
 }

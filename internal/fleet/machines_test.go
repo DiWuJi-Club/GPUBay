@@ -90,6 +90,36 @@ func TestHeartbeatAndOfflineDetection(t *testing.T) {
 	}
 }
 
+// MarkOfflineStale 不等别的事务锁着的机器行（SKIP LOCKED）：多行 UPDATE 不定序加锁会与锁机器行的事务死锁。
+// 被跳过的机器在锁释放后的下一轮判定。
+func TestMarkOfflineStaleSkipsLockedRows(t *testing.T) {
+	svc, pool, clk := newEnv(t)
+	ctx := context.Background()
+	a := dbtest.CreateMachine(t, pool, "SN-A")
+	b := dbtest.CreateMachine(t, pool, "SN-B")
+	clk.Advance(5*time.Minute + time.Second)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `SELECT id FROM machines WHERE id = $1 FOR UPDATE`, b); err != nil {
+		t.Fatal(err)
+	}
+	quick, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	offline, err := svc.MarkOfflineStale(quick, 5*time.Minute)
+	if err != nil || len(offline) != 1 || offline[0] != a {
+		t.Fatalf("with B locked: offline = %v, %v; want [%d] without waiting", offline, err, a)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if offline, err = svc.MarkOfflineStale(ctx, 5*time.Minute); err != nil || len(offline) != 1 || offline[0] != b {
+		t.Fatalf("after unlock: offline = %v, %v; want [%d]", offline, err, b)
+	}
+}
+
 func TestMarkFaultyAndAlert(t *testing.T) {
 	svc, pool, _ := newEnv(t)
 	ctx := context.Background()

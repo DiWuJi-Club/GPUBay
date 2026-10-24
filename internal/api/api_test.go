@@ -36,6 +36,7 @@ import (
 	"spark-cloud/internal/plugins/kyc"
 	"spark-cloud/internal/plugins/pay"
 	"spark-cloud/internal/plugins/sms"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
@@ -136,13 +137,15 @@ func buildTestEnv(t *testing.T, mode envMode, tweak func(*api.Server)) *testEnv 
 		Providers:     map[string]pay.Provider{pay.ChannelWechat: payMock, pay.ChannelAlipay: payMock},
 		NotifyBaseURL: "https://spark.test",
 	})
+	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Wallet: w, Users: ids, Orders: r})
+	ids.SetReferral(ref)
 	auth, err := ingress.NewAuth(dbtest.Key, "http://spark.test", "spark.test", false, clk)
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := &api.Server{Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Uploads: uploads, Clock: clk,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "spark.test", SSHHost: "ssh.spark.test", PublicBaseURL: "http://spark.test",
-		Billing: bill, DevPay: true, Ingress: auth}
+		Billing: bill, Referral: ref, DevPay: true, Ingress: auth}
 	var apps *appdeploy.Service
 	var appCat *appdeploy.Catalog
 	appLog := &lockedBuffer{}

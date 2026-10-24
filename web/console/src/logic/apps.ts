@@ -291,7 +291,7 @@ export interface WorkflowRowActions {
   quickRun: boolean
   /** 实例不在运行（停机等）时快速出图置灰 */
   quickRunDisabled: boolean
-  /** 更多菜单：有新版本 → 更新；安装失败且无新版本 → 重试安装（PUT 同版本 = 重试）；部署中、没有已发布版本时不提供 */
+  /** 更多菜单：有新版本 → 更新；安装失败且无新版本 → 重试安装（PUT 明确带已装版本 = 重试）；部署中、没有已发布版本时不提供 */
   update: 'update' | 'retry' | null
   remove: boolean
   /** 更新 / 移除暂不可用的原因（实例非运行等）：菜单项置灰并显示原因 */

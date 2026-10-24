@@ -25,8 +25,6 @@ const (
 	ProxyTimeout              = 30 * time.Second
 	ViewTimeout               = 120 * time.Second
 	RunWaitMax                = 30 * time.Minute
-	// InstalledFilePrefix 平台放进 user/default/workflows/ 的文件名前缀（spark-<slug>.json）；app.sh 只清理带此前缀的旧文件。
-	InstalledFilePrefix = "spark-"
 	// ComfyPort 只用于 fake ComfyUI / 测试默认；真实端口取部署 spec.ports[0]。
 	ComfyPort = 8188
 	// DataDirName 容器内数据盘下的 ComfyUI 目录名（/root/data/comfyui）。
