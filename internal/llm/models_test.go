@@ -2,11 +2,14 @@ package llm_test
 
 import (
 	"errors"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/llm"
 	"spark-cloud/internal/platform/apperr"
 )
@@ -25,7 +28,8 @@ func TestCreateModelValidationMatrix(t *testing.T) {
 		t.Fatal("create audit missing")
 	}
 
-	disabled := e.insertImage("Old", "old:1", false)
+	disabled := e.insertImage("Old", "old:1", false) // 在兼容列表里但已下架
+	e.exec(`UPDATE app_versions SET image_ids = image_ids || $2::bigint WHERE id = $1`, e.versionID, disabled)
 	draftVer := e.addNodeVersion("2.0.0-draft", "draft", e.imageID)
 	otherApp := e.queryInt(`INSERT INTO apps (slug, name, category, status, created_at, updated_at) VALUES ('other', 'Other', 'tool', 'published', $1, $1) RETURNING id`, e.clk.Now())
 	otherVer := e.queryInt(`INSERT INTO app_versions (app_id, version, status, image_ids, spec, script, spec_hash, published_at, created_at, updated_at)
@@ -97,12 +101,12 @@ func TestCreateModelValidationMatrix(t *testing.T) {
 	// 合法边界：零值补默认、node_env 白名单内的值、显式 app_version_id、embedding、hf-mirror
 	ok := e.createModel("bge-m3", func(in *llm.ModelInput) {
 		in.Kind, in.Source, in.SourceID = llm.KindEmbedding, "hf-mirror", "BAAI/bge-m3"
-		in.ContextLen, in.MaxOutputTokens, in.DefaultMaxTokens, in.MaxConcurrency = 8192, 0, 0, 0
+		in.ContextLen, in.MaxOutputTokens, in.DefaultMaxTokens, in.MaxConcurrency = 2048, 0, 0, 0
 		in.OutputPrice, in.Features = 0, nil
 		in.NodeEnv = map[string]string{"GPU_MEMORY_UTILIZATION": "0.5", "MAX_NUM_SEQS": "128", "QUANTIZATION": "fp8", "MODEL_SIZE_GB": "3", "TOOL_CALL_PARSER": ""}
 		in.AppVersionID = &e.versionID
 	})
-	if ok.MaxOutputTokens != 8192 || ok.DefaultMaxTokens != 4096 || ok.MaxConcurrency != llm.DefaultNodeConcurrency {
+	if ok.MaxOutputTokens != 2048 || ok.DefaultMaxTokens != 2048 || ok.MaxConcurrency != llm.DefaultNodeConcurrency {
 		t.Fatalf("defaults: %+v", ok)
 	}
 	if ok.Features == nil || len(ok.Features) != 0 {
@@ -178,6 +182,12 @@ func TestModelStatusMachine(t *testing.T) {
 	if _, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); errCode(err) != "llm_model_invalid" {
 		t.Fatalf("online replicas 0: %v", err)
 	}
+	// 只有 draft 能改 kind
+	in.Replicas, in.Kind = 2, llm.KindEmbedding
+	if _, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); errCode(err) != "llm_model_invalid" || !strings.HasPrefix(apperr.As(err).Message, "kind：") {
+		t.Fatalf("online kind change: %v", err)
+	}
+	in.Kind = llm.KindChat
 	if _, err := e.svc.SetModelStatus(e.ctx, e.admin(), m.ID, llm.ModelDraft); !errors.Is(err, apperr.ErrInvalidState) {
 		t.Fatalf("online → draft: %v", err)
 	}
@@ -348,5 +358,103 @@ func TestUpdateModelAuditsPriceDiff(t *testing.T) {
 	}
 	if _, err := e.svc.GetModel(e.ctx, 999999); !errors.Is(err, apperr.ErrLLMModelNotFound) {
 		t.Fatalf("GetModel missing: %v", err)
+	}
+}
+
+// draft 模型可以改 kind。
+func TestUpdateModelKindWhileDraft(t *testing.T) {
+	e := newEnv(t)
+	m := e.createModel("bge-m3")
+	in := e.modelInput("bge-m3")
+	in.Kind = llm.KindEmbedding
+	got, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in)
+	if err != nil || got.Kind != llm.KindEmbedding {
+		t.Fatalf("draft kind change: %+v %v", got, err)
+	}
+}
+
+// 节点参数只在变化时复核：vllm-node 版本全部下架 / 镜像下架后，只改价仍成功；改 node_env 或 image 就要过校验。
+func TestUpdateModelRevalidatesNodeParamsOnlyWhenChanged(t *testing.T) {
+	e := newEnv(t)
+	m := e.createModel("qwen3-4b", func(in *llm.ModelInput) { in.NodeEnv = map[string]string{"MAX_NUM_SEQS": "32"} })
+	e.exec(`UPDATE app_versions SET status = 'retired' WHERE app_id = $1`, e.appID)
+	e.exec(`UPDATE images SET enabled = false WHERE id = $1`, e.imageID)
+
+	in := e.modelInput("qwen3-4b")
+	in.NodeEnv = map[string]string{"MAX_NUM_SEQS": "32"}
+	in.InputPrice = 999
+	got, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in)
+	if err != nil || got.InputPrice != 999 {
+		t.Fatalf("price-only update: %+v %v", got, err)
+	}
+	in.NodeEnv = map[string]string{"MAX_NUM_SEQS": "48"}
+	if _, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); errCode(err) != "llm_model_invalid" || !strings.Contains(apperr.As(err).Message, llm.NodeAppSlug) {
+		t.Fatalf("node_env change without published vllm-node: %v", err)
+	}
+	// 重新发布 vllm-node 后：镜像仍下架 → image_id 报错（node_env 变了触发整体复核）
+	e.exec(`UPDATE app_versions SET status = 'published' WHERE id = $1`, e.versionID)
+	if _, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); errCode(err) != "llm_model_invalid" || !strings.HasPrefix(apperr.As(err).Message, "image_id：") {
+		t.Fatalf("node_env change with disabled image: %v", err)
+	}
+	e.exec(`UPDATE images SET enabled = true WHERE id = $1`, e.imageID)
+	if got, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); err != nil || got.NodeEnv["MAX_NUM_SEQS"] != "48" {
+		t.Fatalf("node_env change after recovery: %+v %v", got, err)
+	}
+	if n := e.auditCount("llm.model.update", strconv.FormatInt(m.ID, 10)); n != 2 {
+		t.Fatalf("update audits = %d, want 2", n)
+	}
+}
+
+// node_env 按 app_version_id 固定的版本的 spec 校验；未固定时按最新已发布版本。
+func TestNodeEnvValidatedAgainstPinnedVersion(t *testing.T) {
+	e := newEnv(t)
+	full := e.versionID
+	reduced := vllmNodeSpec(t)
+	reduced.Env = slices.DeleteFunc(reduced.Env, func(v appdeploy.EnvSpec) bool { return v.Name == "QUANTIZATION" })
+	e.clk.Advance(time.Minute)
+	latest := e.addNodeVersionSpec("1.1.0", "published", reduced, e.imageID) // 最新版本不再声明 QUANTIZATION
+
+	env := map[string]string{"QUANTIZATION": "fp8"}
+	_, err := e.svc.CreateModel(e.ctx, e.admin(), func() llm.ModelInput { in := e.modelInput("a-1"); in.NodeEnv = env; return in }())
+	if errCode(err) != "llm_model_invalid" || !strings.HasPrefix(apperr.As(err).Message, "node_env：") {
+		t.Fatalf("latest version lacks QUANTIZATION: %v", err)
+	}
+	m := e.createModel("a-2", func(in *llm.ModelInput) { in.NodeEnv, in.AppVersionID = env, &full })
+	if m.AppVersionID == nil || *m.AppVersionID != full || m.NodeEnv["QUANTIZATION"] != "fp8" {
+		t.Fatalf("pinned full version: %+v", m)
+	}
+	// 改为固定到新版本 → 按新版本 spec 复核
+	in := e.modelInput("a-2")
+	in.NodeEnv, in.AppVersionID = env, &latest
+	if _, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); errCode(err) != "llm_model_invalid" || !strings.HasPrefix(apperr.As(err).Message, "node_env：") {
+		t.Fatalf("repin to reduced version: %v", err)
+	}
+}
+
+// 平台填写的节点变量与合并结果（平台值优先）。
+func TestPlatformNodeEnv(t *testing.T) {
+	chat := llm.Model{Slug: "qwen3-4b", Kind: llm.KindChat, Source: "modelscope", SourceID: "Qwen/Qwen3-4B", ContextLen: 32768,
+		NodeEnv: map[string]string{"MAX_NUM_SEQS": "128", "TASK": "embed", "MODEL_ID": "evil/evil"}}
+	key := strings.Repeat("k", 43)
+	p := llm.PlatformNodeEnv(chat, key)
+	want := map[string]string{"MODEL_ID": "Qwen/Qwen3-4B", "MODEL_SOURCE": "modelscope", "SERVED_MODEL_NAME": "qwen3-4b",
+		"MAX_MODEL_LEN": "32768", "API_KEY": key, "TASK": "generate"}
+	if !maps.Equal(p, want) {
+		t.Fatalf("PlatformNodeEnv = %v", p)
+	}
+	keys := slices.Sorted(maps.Keys(p))
+	if !slices.Equal(keys, slices.Sorted(slices.Values(llm.NodeReservedEnv))) {
+		t.Fatalf("platform keys %v != NodeReservedEnv %v", keys, llm.NodeReservedEnv)
+	}
+	all := llm.NodeEnv(chat, key)
+	if all["MAX_NUM_SEQS"] != "128" || all["TASK"] != "generate" || all["MODEL_ID"] != "Qwen/Qwen3-4B" || len(all) != 7 {
+		t.Fatalf("NodeEnv = %v", all)
+	}
+	if chat.NodeEnv["TASK"] != "embed" {
+		t.Fatal("NodeEnv mutated the model's node_env")
+	}
+	emb := llm.Model{Slug: "bge-m3", Kind: llm.KindEmbedding, Source: "hf-mirror", SourceID: "BAAI/bge-m3", ContextLen: 8192}
+	if got := llm.NodeEnv(emb, key); got["TASK"] != "embed" || got["MODEL_SOURCE"] != "hf-mirror" || got["MAX_MODEL_LEN"] != "8192" || len(got) != 6 {
+		t.Fatalf("embedding NodeEnv = %v", got)
 	}
 }

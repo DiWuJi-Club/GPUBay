@@ -101,28 +101,34 @@ func (e *env) newService(mod func(*llm.Deps)) *llm.Service {
 	return llm.NewService(d)
 }
 
-// vllmNodeSpec 按规格 §3.2 的变量表构造 vllm-node 的 spec（已过 ValidateSpec，与导入后入库的形态一致）。
+// vllmNodeSpecJSON 是 deploy/apps/vllm-node/spec.json（p9/apps 分支）的逐字副本；两个分支合并后可改为直接读该文件。
+const vllmNodeSpecJSON = `{
+  "ports": [{"port": 8000, "label": "OpenAI 兼容接口", "path": "/docs", "health_path": "/health"}],
+  "timeout_minutes": 120,
+  "min_data_free_gib": 80,
+  "env": [
+    {"name": "MODEL_ID", "label": "模型", "type": "string", "required": true, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "help": "仓库 ID（平台按模型目录的 source_id 填写）"},
+    {"name": "MODEL_SOURCE", "label": "下载源", "type": "enum", "options": ["modelscope", "hf-mirror"], "default": "modelscope"},
+    {"name": "SERVED_MODEL_NAME", "label": "对外模型名", "type": "string", "required": true, "pattern": "^[a-z0-9][a-z0-9.-]{1,63}$", "help": "vLLM --served-model-name（平台按模型 slug 填写）"},
+    {"name": "MAX_MODEL_LEN", "label": "最大上下文", "type": "int", "min": 1024, "max": 1048576, "default": "32768"},
+    {"name": "API_KEY", "label": "节点密钥", "type": "secret", "required": true, "pattern": "^[A-Za-z0-9_-]{32,128}$", "help": "平台网关访问节点用的密钥（平台生成）"},
+    {"name": "GPU_MEMORY_UTILIZATION", "label": "显存占用比例", "type": "string", "pattern": "^0\\.[3-9][0-9]?$", "default": "0.85"},
+    {"name": "MAX_NUM_SEQS", "label": "最大并发序列", "type": "int", "min": 1, "max": 512, "default": "64"},
+    {"name": "QUANTIZATION", "label": "量化", "type": "enum", "options": ["none", "fp8", "awq", "gptq"], "default": "none"},
+    {"name": "REASONING_PARSER", "label": "推理内容解析", "type": "enum", "options": ["none", "qwen3", "deepseek_r1"], "default": "none"},
+    {"name": "TOOL_CALL_PARSER", "label": "工具调用解析", "type": "enum", "options": ["none", "hermes"], "default": "hermes"},
+    {"name": "TASK", "label": "任务类型", "type": "enum", "options": ["generate", "embed"], "default": "generate", "help": "embed 对应向量模型（vllm serve --task embed）"},
+    {"name": "MODEL_SIZE_GB", "label": "模型大小（GB）", "type": "int", "min": 1, "max": 2000, "default": "20", "help": "只用于估算下载进度"}
+  ],
+  "links": [{"label": "接口文档", "path": "/docs"}, {"label": "模型列表", "path": "/v1/models"}]
+}`
+
+// vllmNodeSpec 解析 vllmNodeSpecJSON 并过 ValidateSpec（与导入后入库的形态一致）。
 func vllmNodeSpec(t *testing.T) appdeploy.Spec {
 	t.Helper()
-	i64 := func(v int64) *int64 { return &v }
-	s := appdeploy.Spec{
-		Ports:          []appdeploy.PortSpec{{Port: llm.NodePort, Label: "OpenAI API", Path: "/docs", HealthPath: "/health"}},
-		TimeoutMinutes: 120,
-		MinDataFreeGiB: 80,
-		Env: []appdeploy.EnvSpec{
-			{Name: "MODEL_ID", Type: "string", Required: true, Pattern: `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`},
-			{Name: "MODEL_SOURCE", Type: "enum", Options: []string{"modelscope", "hf-mirror"}, Default: "modelscope"},
-			{Name: "SERVED_MODEL_NAME", Type: "string", Required: true, Pattern: `^[a-z0-9][a-z0-9.-]{1,63}$`},
-			{Name: "MAX_MODEL_LEN", Type: "int", Min: i64(1024), Max: i64(1048576), Default: "32768"},
-			{Name: "API_KEY", Type: "secret", Required: true, Pattern: `^[A-Za-z0-9_-]{32,128}$`},
-			{Name: "GPU_MEMORY_UTILIZATION", Type: "string", Pattern: `^0\.[3-9][0-9]?$`, Default: "0.85"},
-			{Name: "MAX_NUM_SEQS", Type: "int", Min: i64(1), Max: i64(512), Default: "64"},
-			{Name: "QUANTIZATION", Type: "enum", Options: []string{"none", "fp8", "awq", "gptq"}, Default: "none"},
-			{Name: "REASONING_PARSER", Type: "enum", Options: []string{"none", "qwen3", "deepseek_r1"}, Default: "none"},
-			{Name: "TOOL_CALL_PARSER", Type: "enum", Options: []string{"none", "hermes"}, Default: "hermes"},
-			{Name: "TASK", Type: "enum", Options: []string{"generate", "embed"}, Default: "generate"},
-			{Name: "MODEL_SIZE_GB", Type: "int", Min: i64(1), Max: i64(2048), Default: "20"},
-		},
+	var s appdeploy.Spec
+	if err := json.Unmarshal([]byte(vllmNodeSpecJSON), &s); err != nil {
+		t.Fatalf("vllm-node spec json: %v", err)
 	}
 	if err := appdeploy.ValidateSpec(&s); err != nil {
 		t.Fatalf("vllm-node spec: %v", err)
@@ -133,7 +139,12 @@ func vllmNodeSpec(t *testing.T) appdeploy.Spec {
 // addNodeVersion 给 vllm-node 插一个版本（published 时 published_at = 当前假时钟，成为最新已发布版本）。
 func (e *env) addNodeVersion(version, status string, imageIDs ...int64) int64 {
 	e.t.Helper()
-	spec := vllmNodeSpec(e.t)
+	return e.addNodeVersionSpec(version, status, vllmNodeSpec(e.t), imageIDs...)
+}
+
+// addNodeVersionSpec 同 addNodeVersion，但用给定的 spec。
+func (e *env) addNodeVersionSpec(version, status string, spec appdeploy.Spec, imageIDs ...int64) int64 {
+	e.t.Helper()
 	b, err := json.Marshal(spec)
 	if err != nil {
 		e.t.Fatal(err)

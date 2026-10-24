@@ -19,7 +19,7 @@ import (
 )
 
 // ModelInput 是后台创建 / 修改模型的输入（规格 §10.2）。价格单位：分 / 百万 token。
-// 零值补默认：Source → modelscope、MaxOutputTokens → 8192、DefaultMaxTokens → min(4096, MaxOutputTokens)、MaxConcurrency → 32。
+// 零值补默认：Source → modelscope、MaxOutputTokens → min(8192, ContextLen)、DefaultMaxTokens → min(4096, MaxOutputTokens)、MaxConcurrency → 32。
 // UpdateModel 忽略 Slug（创建后不可改）。NodeEnv 里值为空串的条目视为「用 spec 默认值」，不保存。
 type ModelInput struct {
 	Slug, Name, Description, Kind, Source, SourceID string
@@ -96,7 +96,7 @@ func validateModelInput(in *ModelInput, create bool) error {
 		in.Source = ModelSources[0]
 	}
 	if in.MaxOutputTokens == 0 {
-		in.MaxOutputTokens = defaultMaxOutputTokens
+		in.MaxOutputTokens = min(defaultMaxOutputTokens, in.ContextLen)
 	}
 	if in.DefaultMaxTokens == 0 {
 		in.DefaultMaxTokens = min(defaultDefaultMaxTokens, in.MaxOutputTokens)
@@ -207,6 +207,34 @@ func (s *Service) checkNodeParams(ctx context.Context, q db.Querier, in ModelInp
 	return validateNodeEnv(ver.Spec, in.NodeEnv)
 }
 
+// PlatformNodeEnv 是建节点时平台填写的 vllm-node 变量（NodeReservedEnv 全部）：
+// MODEL_ID = source_id、MODEL_SOURCE = source、SERVED_MODEL_NAME = slug、MAX_MODEL_LEN = context_len、API_KEY = 节点密钥、
+// TASK = embed（kind = embedding）/ generate。
+func PlatformNodeEnv(m Model, apiKey string) map[string]string {
+	task := "generate"
+	if m.Kind == KindEmbedding {
+		task = "embed"
+	}
+	return map[string]string{
+		"MODEL_ID":          m.SourceID,
+		"MODEL_SOURCE":      m.Source,
+		"SERVED_MODEL_NAME": m.Slug,
+		"MAX_MODEL_LEN":     strconv.Itoa(m.ContextLen),
+		"API_KEY":           apiKey,
+		"TASK":              task,
+	}
+}
+
+// NodeEnv 是传给 appdeploy 的完整变量表 = 模型 node_env ∪ PlatformNodeEnv（同名时平台值优先）。
+func NodeEnv(m Model, apiKey string) map[string]string {
+	out := maps.Clone(m.NodeEnv)
+	if out == nil {
+		out = map[string]string{}
+	}
+	maps.Copy(out, PlatformNodeEnv(m, apiKey))
+	return out
+}
+
 // validateNodeEnv node_env 白名单 = spec 声明的变量 − NodeReservedEnv（敏感变量也不接受：node_env 明文存库、后台可见）。
 func validateNodeEnv(spec appdeploy.Spec, env map[string]string) error {
 	declared := map[string]appdeploy.EnvSpec{}
@@ -282,6 +310,9 @@ func (s *Service) UpdateModel(ctx context.Context, actor audit.Actor, id int64, 
 		before, err := scanModel(tx.QueryRow(ctx, `SELECT `+modelCols+` FROM llm_models WHERE id = $1 FOR UPDATE`, id))
 		if err != nil {
 			return err
+		}
+		if before.Status != ModelDraft && in.Kind != before.Kind {
+			return apperr.LLMModelInvalid("kind", "只有草稿模型可以修改类型")
 		}
 		if before.Status == ModelOnline && in.Replicas < 1 {
 			return apperr.LLMModelInvalid("replicas", "在线模型至少 1 个副本（要停止服务请下线）")
