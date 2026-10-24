@@ -40,7 +40,7 @@ message Hello {
   string agent_version = 1;
   string hostname = 2;
   repeated string ips = 3;    // 本机全部 IPv4 地址
-  // 能力位图（internal/agent/features）：bit0 = 支持 CreateInstance.share_slots。计划 10 新增，旧 Agent 为 0。
+  // 能力位图（internal/agent/features）：bit0 = 支持 CreateInstance.share_slots。计划 10 新增，旧 Agent 为 0；平台目前不读取（共享机已搁置）。
   uint32 features = 4;
 }
 

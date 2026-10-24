@@ -9,7 +9,7 @@
 ## 0. 现状与约束（实现时不必再查）
 
 **机器事实（计划 2 勘查与验收，192.168.1.221 `spark-3479`）**
-- GB10，`MemTotal = 130660978688` 字节（约 121.7 GiB），**CPU 与 GPU 共用一池统一内存**；`nvidia-smi` 的显存列为 `[N/A]`（NVIDIA FAQ：只有独立显存时才报显存；NVML 的内存查询返回 `NOT_SUPPORTED`）。20 核 Arm（10×X925 + 10×A725）。
+- GB10，`MemTotal = 130660974592` 字节（127598608 kB，计划 10 PoC 实测）（约 121.7 GiB），**CPU 与 GPU 共用一池统一内存**；`nvidia-smi` 的显存列为 `[N/A]`（NVIDIA FAQ：只有独立显存时才报显存；NVML 的内存查询返回 `NOT_SUPPORTED`）。20 核 Arm（10×X925 + 10×A725）。
 - Ubuntu 24.04，Docker 29.6.2（GPU 走 CDI，`--gpus all`），cgroup v2，驱动 580.x / **CUDA 13.0**，arm64。单块 3.7 TB NVMe，根分区 ext4，overlay2 可写层无法限额。
 - 机器上 Docker Hub 不可达；nvcr.io、docker.m.daocloud.io、ports.ubuntu.com 可达。**没有 BMC**，机器重启靠 PDU。
 

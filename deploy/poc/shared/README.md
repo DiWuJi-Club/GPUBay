@@ -1,6 +1,6 @@
 # 共享机 PoC 工具（计划 10 Task 1～2）
 
-验证「GB10 统一内存下 CUDA 分配受容器 cgroup `memory.max` 约束」等前提（规格 `docs/superpowers/specs/2026-10-24-plan10-shared-machine-design.md` §3）。结果记录在 `docs/superpowers/acceptance-plan10-poc.md`。
+验证「GB10 统一内存下 CUDA 分配受容器 cgroup `memory.max` 约束」等前提（规格 `docs/superpowers/specs/2026-10-24-plan10-shared-machine-design.md` §3）。结果记录在 `docs/superpowers/acceptance-plan10.md`（原计划的 `acceptance-plan10-poc.md` 合并进了该文件）。
 
 ## 文件
 

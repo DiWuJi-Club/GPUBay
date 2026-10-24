@@ -326,7 +326,7 @@ type Hello struct {
 	AgentVersion string                 `protobuf:"bytes,1,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
 	Hostname     string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	Ips          []string               `protobuf:"bytes,3,rep,name=ips,proto3" json:"ips,omitempty"` // 本机全部 IPv4 地址
-	// 能力位图（internal/agent/features）：bit0 = 支持 CreateInstance.share_slots。计划 10 新增，旧 Agent 为 0。
+	// 能力位图（internal/agent/features）：bit0 = 支持 CreateInstance.share_slots。计划 10 新增，旧 Agent 为 0；平台目前不读取（共享机已搁置）。
 	Features      uint32 `protobuf:"varint,4,opt,name=features,proto3" json:"features,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

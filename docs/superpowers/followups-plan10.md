@@ -30,4 +30,6 @@
 - `NumCPU` 默认取 Go 的 `runtime.NumCPU()`，即 Agent 进程可用的 CPU 数。若以后给 `spark-agent.service` 设 `CPUAffinity`，它会小于 `nproc`。目前只影响按份配额，而按份配额没有启用。
 - 数据盘是否挂载，用「目录与父目录的 `st_dev` 不同」来判断。以后若改成 bind mount 或同设备挂载，会把已挂载的盘判成未挂载、报 0（只影响指标，不影响开通）。
 - 端口冲突兜底在 `docker inspect` 出错（dockerd 短暂不可用）时会让开通失败，报错原文是「检查 SSH 端口 … 占用失败」。目前这样处理，是因为在这种状态下后续的 docker 步骤本来也会失败；若误报偏多，可以改成「出错时放行」。
-- appdeploy 构造 `upstream.Target` 时没有带 `Port`，用的是连接池的默认端口。槽位上线时要跟 sshgw / ingress 一样从 rental 取实例端口。`ListIngressRoutes` 目前用裸的 `Instance{ID}` 算端口，届时也要带上槽位。
+- 实例端口目前由 `rental.Instance.SSHPort`、`rental.Service.InstanceSSHPort`（appdeploy 用）与 `ListIngressRoutes`（用裸的 `Instance{ID}`）三处计算，槽位上线时三处要一起带上槽位。
+- 整机机器上若残留另一个实例 ID 的容器（例如开通失败后机器被标故障、实例改派，管理员在对账清理孤儿容器之前就把机器恢复为空闲），新 Agent 的端口冲突兜底会让下一次开通失败（「SSH 端口冲突」，机器再次被标故障、订单改派）；旧 Agent 会直接再建一个容器。运维上要求：孤儿容器清扫完成后再把机器恢复为空闲。
+- `selfcheck` 的 cgroup 检查要求 cpu / memory / pids 三个控制器（硬性）；整机容器只用到 memory / pids，cpu 只和已搁置的 `--cpus` 有关。DGX OS 默认三者都有，暂不区分。

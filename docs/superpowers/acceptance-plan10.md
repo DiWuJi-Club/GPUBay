@@ -23,7 +23,7 @@
 | P2 | 两个容器各 `--memory 56g`，同时 `burn 60` | `1571.4 + 1575.2 = 3146.6`，是基线的 **86.8%**。宿主机 `nvidia-smi` 看到两个 `burn` 进程（PID 855027 / 855034），两边都 `exit=0` | 通过（≥ 85%） |
 | P3 | A 跑 `burn 120`；20 秒后 B 跑 `fault` | B：`fault: cudaErrorIllegalAddress`，`exit=5`。A：`t_lines=120 max_t_gap=1 min_gflops=3269.0 avg_gflops=3595.8`，`exit=0`。之后宿主机 `nvidia-smi` 正常 | 通过 |
 | P4 | 两个容器同时 `burn 60`（公平性，只记录） | 1568.8 / 1567.9，各占 **50.0%** | 记录 |
-| P5 | 两个容器各 `--memory 56g`，同时 `alloc 60 1 --touch` | **未执行**。P1 已经证明 `cudaMalloc` 不受 cgroup 约束，两个容器合计 120 GiB 会超过整机 121.7 GiB，宿主机会被 OOM；机器没有 BMC，只能靠 PDU 重启 | 视为不通过（由 P1 推出） |
+| P5 | 两个容器各 `--memory 56g`，同时 `alloc 60 1 --touch` | **未执行**。P1 已经证明 `cudaMalloc` 不受 cgroup 约束，两个容器合计 120 GiB，超过宿主机的 `MemAvailable`（开始时约 118 GiB，即 123724928 kB），宿主机会被 OOM；机器没有 BMC，只能靠 PDU 重启 | 视为不通过（由 P1 推出） |
 | P6 | P4 运行中，在 B 里跑 `nvidia-smi` 和 `ps aux` | 容器内 `nvidia-smi` 进程表**只有自己**（`1 C burn 362MiB`，`--query-compute-apps` 也只返回 `1, burn, 362 MiB`），看不到邻居。`ps aux` 只有 `burn 60` 和 `ps` 本身 | 记录：邻居的 GPU 进程不可见 |
 | P7 | A：`--cpus 5` 跑 `stress --cpu 20 --timeout 60`；B 同时跑 `burn 60` | `docker stats` 里 A 一直在 496.0%～498.3%。B：`avg_gflops=3616.8 min_gflops=3596.6`，比基线低 0.3% | 通过 |
 
