@@ -51,8 +51,12 @@ declare module 'vue' {
     ElTimelineItem: typeof import('element-plus/es')['ElTimelineItem']
     ElUpload: typeof import('element-plus/es')['ElUpload']
     GuideDialog: typeof import('./components/GuideDialog.vue')['default']
+    QuickRunDrawer: typeof import('./components/QuickRunDrawer.vue')['default']
+    QuickRunForm: typeof import('./components/QuickRunForm.vue')['default']
     RentDialog: typeof import('./components/RentDialog.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    WorkflowAddDialog: typeof import('./components/WorkflowAddDialog.vue')['default']
+    WorkflowsPanel: typeof import('./components/WorkflowsPanel.vue')['default']
   }
 }

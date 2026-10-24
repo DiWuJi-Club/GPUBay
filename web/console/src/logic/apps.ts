@@ -1,6 +1,7 @@
 import {
-  deploymentErrorLabel, deploymentPhaseLabel, deploymentStateLabel, deploymentStateType, labelOf,
-  type AppCatalogItem, type AppEnvSpec, type AppsSummaryItem, type Deployment, type DeploymentEvent, type Image, type InstanceState, type UserEvent,
+  deploymentErrorLabel, deploymentPhaseLabel, deploymentStateLabel, deploymentStateType, formatGB, labelOf,
+  type AppCatalogItem, type AppEnvSpec, type AppsSummaryItem, type Deployment, type DeploymentEvent, type Image, type InstalledWorkflow, type InstanceState,
+  type UserEvent, type WorkflowCatalogItem,
 } from '@spark/shared'
 
 // 与 internal/appdeploy 保持一致：MinSecretLen、max_len 缺省值
@@ -243,4 +244,73 @@ export function mergeTimeline(inst: UserEvent[], apps: { name: string; events: D
   for (const a of apps) for (const e of [...a.events].reverse()) out.push({ at: e.at, kind: 'app', text: `${a.name}：${e.detail}` })
   // 稳定排序：同一时刻保持原顺序（实例事件本就新到旧，部署事件已反转为新到旧）
   return out.map((x, i) => ({ x, i, t: Date.parse(x.at) })).sort((a, b) => b.t - a.t || a.i - b.i).map((y) => y.x)
+}
+
+// ---- 计划 11：ComfyUI 部署上的工作流（实例详情「应用」卡片的工作流子区块） ----
+
+/** 每个 ComfyUI 部署最多安装的工作流数（与 comfywf.MaxWorkflowsPerDeployment 一致）。 */
+export const MAX_WORKFLOWS = 8
+
+/** 显示工作流子区块的部署：应用 slug 为 comfyui（与后端 Installer 按 slug 判断一致）。 */
+export const isWorkflowHost = (d: Pick<Deployment, 'app_slug'>) => d.app_slug === 'comfyui'
+
+/** 部署视图里的已装工作流；字段缺省（非 comfyui 部署 / 旧接口）或 null 时为空数组。 */
+export function deploymentWorkflows(d: Pick<Deployment, 'workflows'>): InstalledWorkflow[] {
+  return Array.isArray(d.workflows) ? d.workflows : []
+}
+
+/** 安装 / 更新 / 移除工作流只在部署 queued / running / stopped / failed 时可用（否则后端 app_invalid_state）。 */
+export const canChangeWorkflows = (d: Pick<Deployment, 'state'>) =>
+  d.state === 'queued' || d.state === 'running' || d.state === 'stopped' || d.state === 'failed'
+
+/** 部署中时子区块顶部的提示（有工作流时；进度条沿用应用行的渲染）。 */
+export function workflowPanelNotice(d: Pick<Deployment, 'state' | 'workflows'>): string | null {
+  return d.state === 'installing' && deploymentWorkflows(d).length ? '正在安装工作流…（随应用进度）' : null
+}
+
+export interface WorkflowRowActions {
+  /** 「打开 ComfyUI」：部署运行中且端口在 */
+  open: boolean
+  /** 「快速出图」：版本支持（quick_run）、该工作流已安装、部署运行中 */
+  quickRun: boolean
+  /** 实例不在运行（停机等）时快速出图置灰 */
+  quickRunDisabled: boolean
+  /** 更多菜单：有新版本 → 更新；安装失败且无新版本 → 重试安装（PUT 同版本 = 重试）；部署中不可 */
+  update: 'update' | 'retry' | null
+  remove: boolean
+}
+
+export function workflowRowActions(w: InstalledWorkflow, d: Pick<Deployment, 'state' | 'url'>, instanceState: InstanceState): WorkflowRowActions {
+  const change = canChangeWorkflows(d)
+  return {
+    open: d.state === 'running' && !!d.url,
+    quickRun: w.quick_run && w.state === 'installed' && d.state === 'running',
+    quickRunDisabled: instanceState !== 'running',
+    update: !change ? null : w.update_available ? 'update' : w.state === 'failed' ? 'retry' : null,
+    remove: change,
+  }
+}
+
+/** 「添加工作流」选择器里的灰显原因（null = 可选）。 */
+export function addWorkflowReason(item: Pick<WorkflowCatalogItem, 'id'>, installed: Pick<InstalledWorkflow, 'workflow_id'>[]): string | null {
+  return installed.some((w) => w.workflow_id === item.id) ? '已安装' : null
+}
+
+const RESTART_NOTE = '会重启实例上的 ComfyUI，正在生成的任务会中断' // D9
+
+/** 安装确认文案（D9：重启 ComfyUI；需下载量）。 */
+export function workflowAddConfirmText(item: Pick<WorkflowCatalogItem, 'name' | 'version'>): string {
+  const gb = item.version.download_gb
+  return `安装「${item.name}」${RESTART_NOTE}${gb > 0 ? `；需下载约 ${formatGB(gb)} 模型` : ''}`
+}
+
+/** 更新 / 重试确认文案。 */
+export function workflowUpdateConfirmText(w: Pick<InstalledWorkflow, 'name' | 'version' | 'latest_version' | 'update_available'>): string {
+  if (w.update_available) return `将「${w.name}」从 v${w.version} 更新到 v${w.latest_version}，${RESTART_NOTE}`
+  return `重新安装「${w.name}」v${w.version}，${RESTART_NOTE}`
+}
+
+/** 移除确认文案（D8：模型与节点保留）。 */
+export function workflowRemoveConfirmText(w: Pick<InstalledWorkflow, 'name'>): string {
+  return `移除「${w.name}」后模型与节点保留在 /root/data/comfyui（可手动删除释放空间）；${RESTART_NOTE}`
 }
