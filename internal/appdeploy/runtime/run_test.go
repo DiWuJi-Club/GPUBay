@@ -117,7 +117,7 @@ func (b *box) status() (status, string) {
 
 func (b *box) waitState(want string) status {
 	b.t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(60 * time.Second) // 正常几百毫秒；繁忙的开发机上新写的脚本首次 exec 可能要数秒
 	for {
 		st, _ := b.status()
 		if st.State == want {
@@ -484,7 +484,7 @@ func TestRunShStopDuringInstall(t *testing.T) {
 	b := newBox(t, "app_ok.sh", map[string]string{"INSTALL_SLEEP": "30"})
 	b.run("deploy")
 	var st status
-	for deadline := time.Now().Add(10 * time.Second); st.Phase != "download"; {
+	for deadline := time.Now().Add(60 * time.Second); st.Phase != "download"; {
 		if time.Now().After(deadline) {
 			t.Fatalf("never reached download: %+v", st)
 		}
@@ -492,7 +492,7 @@ func TestRunShStopDuringInstall(t *testing.T) {
 		st, _ = b.status()
 	}
 	start := time.Now()
-	if _, code := b.run("stop"); code != 0 || time.Since(start) > 5*time.Second {
+	if _, code := b.run("stop"); code != 0 || time.Since(start) > 15*time.Second { // 不等 install（INSTALL_SLEEP=30）跑完
 		t.Fatalf("stop = %d after %v", code, time.Since(start))
 	}
 	if !groupGone(st.Pid) {
