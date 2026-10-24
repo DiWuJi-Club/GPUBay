@@ -65,6 +65,12 @@ type runnerEnv struct {
 // run.sh 用 setsid 脱离会话，sshtest.Close 杀不到：Cleanup 在宿主机上对每个应用目录执行 run.sh stop。
 func newRunnerEnv(t *testing.T, machines int, tweak ...func(*appdeploy.RunnerConfig)) *runnerEnv {
 	t.Helper()
+	return newRunnerEnvDeps(t, machines, nil, tweak...)
+}
+
+// newRunnerEnvDeps 同 newRunnerEnv，dt 非 nil 时在组装部署服务前改 Deps（计划 11 的钩子）。
+func newRunnerEnvDeps(t *testing.T, machines int, dt func(*appdeploy.Deps), tweak ...func(*appdeploy.RunnerConfig)) *runnerEnv {
+	t.Helper()
 	e := newEnv(t, machines)
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -94,8 +100,12 @@ func newRunnerEnv(t *testing.T, machines int, tweak ...func(*appdeploy.RunnerCon
 	srv.SetTarget(8000, re.healthAddr)
 	root := srv.Root()
 	appRootFor := func(id string) string { return filepath.Join(root, id, "root", "data") }
-	re.svc = appdeploy.NewService(appdeploy.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Log: slog.New(slog.NewTextHandler(re.logs, nil)),
-		Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet, Upstream: up, AppRootFor: appRootFor})
+	deps := appdeploy.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Log: slog.New(slog.NewTextHandler(re.logs, nil)),
+		Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet, Upstream: up, AppRootFor: appRootFor}
+	if dt != nil {
+		dt(&deps)
+	}
+	re.svc = appdeploy.NewService(deps)
 	re.cfg = appdeploy.RunnerConfig{AppRootFor: appRootFor, HealthAddr: func(int) string { return re.healthAddr }}
 	for _, f := range tweak {
 		f(&re.cfg)

@@ -70,9 +70,18 @@ func newEnv(t *testing.T, machines int) *env {
 
 // newService 用给定的上游连接池与 AppRoot 组装部署服务（nil / 空 = 无上游 / DefaultAppRoot）。
 func (e *env) newService(up *upstream.Pool, appRoot string) *appdeploy.Service {
-	return appdeploy.NewService(appdeploy.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet, Upstream: up, AppRoot: appRoot,
-		PortURL: func(id string, port int) string { return fmt.Sprintf("https://%s-%d.apps.test/", id, port) }})
+	return e.serviceWith(func(d *appdeploy.Deps) { d.Upstream, d.AppRoot = up, appRoot })
+}
+
+// serviceWith 组装部署服务（无上游、DefaultAppRoot），tweak 改 Deps（计划 11 的钩子等）。
+func (e *env) serviceWith(tweak func(*appdeploy.Deps)) *appdeploy.Service {
+	d := appdeploy.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet,
+		PortURL: func(id string, port int) string { return fmt.Sprintf("https://%s-%d.apps.test/", id, port) }}
+	if tweak != nil {
+		tweak(&d)
+	}
+	return appdeploy.NewService(d)
 }
 
 func (e *env) actor() audit.Actor { return audit.Actor{AdminID: 1} }

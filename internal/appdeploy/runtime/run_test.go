@@ -143,7 +143,7 @@ func TestRunShSyntax(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("sh -n: %v\n%s", err, out)
 	}
-	for _, f := range []string{"testdata/app_ok.sh", "testdata/app_fail.sh", "testdata/app_env.sh"} {
+	for _, f := range []string{"testdata/app_ok.sh", "testdata/app_fail.sh", "testdata/app_env.sh", "testdata/app_disk.sh"} {
 		if out, err := exec.Command("/bin/sh", "-n", f).CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v %s", f, err, out)
 		}
@@ -753,5 +753,99 @@ func TestRunShDeployLock(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(lock + ".stale.*"); len(left) != 0 {
 		t.Fatalf("stale lock temp names left: %v", left)
+	}
+}
+
+// 计划 11：install_key 第三段是 workflows/manifest.json 的 cksum —— 集合不变跳过 install，manifest 出现 / 变化都重跑。
+func TestRunShInstallKeyFollowsWorkflowManifest(t *testing.T) {
+	b := newBox(t, "app_ok.sh", nil)
+	marker := filepath.Join(b.dir, "installed.marker")
+	deploy := func() {
+		t.Helper()
+		os.Remove(marker)
+		b.run("deploy")
+		b.waitState("installing")
+		b.waitState("running")
+	}
+	installed := func() bool { _, err := os.Stat(marker); return err == nil }
+	deploy()
+	if !installed() {
+		t.Fatal("first deploy did not install")
+	}
+	got, _ := os.ReadFile(filepath.Join(b.dir, ".installed"))
+	if parts := strings.Split(strings.TrimRight(string(got), "\n"), " "); len(parts) != 3 || parts[0] != "hash-1" || parts[2] != "" {
+		t.Fatalf(".installed without manifest = %q", got)
+	}
+	deploy()
+	if installed() {
+		t.Fatal("install re-run with nothing changed")
+	}
+	os.MkdirAll(filepath.Join(b.dir, "workflows"), 0o700)
+	writeManifest := func(body string) {
+		os.WriteFile(filepath.Join(b.dir, "workflows", "manifest.json"), []byte(body), 0o644)
+	}
+	writeManifest(`{"workflows":[{"slug":"a"}]}`)
+	deploy()
+	if !installed() {
+		t.Fatal("install not re-run after manifest appeared")
+	}
+	got, _ = os.ReadFile(filepath.Join(b.dir, ".installed"))
+	if parts := strings.Fields(string(got)); len(parts) != 3 {
+		t.Fatalf(".installed with manifest = %q", got)
+	}
+	deploy()
+	if installed() {
+		t.Fatal("install re-run with the same manifest")
+	}
+	writeManifest(`{"workflows":[{"slug":"a"},{"slug":"b"}]}`)
+	deploy()
+	if !installed() {
+		t.Fatal("install not re-run after manifest changed")
+	}
+	// 集合清空（UploadCommand 删掉 workflows/）→ 也是变化
+	os.RemoveAll(filepath.Join(b.dir, "workflows"))
+	deploy()
+	if !installed() {
+		t.Fatal("install not re-run after workflows removed")
+	}
+}
+
+// 升级兼容：计划 7 写下的两段式 .installed（「spec_hash env_cksum」）在没有 manifest 时仍算匹配，存量部署恢复时不重跑 install。
+func TestRunShLegacyInstalledKeyStillMatches(t *testing.T) {
+	b := newBox(t, "app_ok.sh", nil)
+	cmd := exec.Command("/bin/sh", "-c", `cksum < env | awk '{print $1 "-" $2}'`)
+	cmd.Dir = b.dir
+	ck, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(b.dir, ".installed"), []byte("hash-1 "+strings.TrimSpace(string(ck))+"\n"), 0o644)
+	b.run("deploy")
+	b.waitState("running")
+	if _, err := os.Stat(filepath.Join(b.dir, "installed.marker")); err == nil {
+		t.Fatalf("legacy .installed not honoured; log:\n%s", b.log())
+	}
+	if !strings.Contains(b.log(), "skip install") {
+		t.Fatalf("log:\n%s", b.log())
+	}
+	// 但旧键 + 新出现的 manifest → 重跑
+	os.WriteFile(filepath.Join(b.dir, ".installed"), []byte("hash-1 "+strings.TrimSpace(string(ck))+"\n"), 0o644)
+	os.MkdirAll(filepath.Join(b.dir, "workflows"), 0o700)
+	os.WriteFile(filepath.Join(b.dir, "workflows", "manifest.json"), []byte(`{}`), 0o644)
+	b.run("deploy")
+	b.waitState("installing")
+	b.waitState("running")
+	if _, err := os.Stat(filepath.Join(b.dir, "installed.marker")); err != nil {
+		t.Fatal("legacy key + manifest must re-run install")
+	}
+}
+
+// 计划 11 D7：install 失败前最后一次汇报的消息以 disk: 开头 → failed 状态沿用它（平台映射为错误码 disk）。
+func TestRunShInstallDiskMessageKept(t *testing.T) {
+	b := newBox(t, "app_disk.sh", nil)
+	b.run("deploy")
+	st := b.waitState("failed")
+	if !strings.HasPrefix(st.Message, "disk:") || st.Message != "disk: 剩余 1GiB，需要 12GiB" || st.Phase != "download" || st.ExitCode != 2 {
+		t.Fatalf("failed status = %+v", st)
 	}
 }
