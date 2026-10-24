@@ -1,3 +1,3 @@
-{"name": "Open WebUI 对话界面", "summary": "类 ChatGPT 的网页对话界面，连接本实例上的 vLLM 或任意 OpenAI 兼容接口", "category": "llm", "icon": "chat", "sort": 20, "version": "1.0.0",
- "images": ["LLM Serving"], "changelog": "初始版本",
+{"name": "Open WebUI 对话界面", "summary": "类 ChatGPT 的网页对话界面，连接本实例上的 vLLM 或任意 OpenAI 兼容接口", "category": "llm", "icon": "chat", "sort": 20, "version": "1.0.1",
+ "images": ["LLM Serving"], "changelog": "知识库向量模型改从 ModelScope 下载，启动不再访问 HuggingFace（经 hf-mirror 会卡在健康检查）",
  "description": "在实例上启动 Open WebUI，默认连接同一实例上的 vLLM 推理服务（http://127.0.0.1:8000/v1）。对话记录、用户等数据保存在 /root/data/.spark-apps/open-webui/data，卸载应用会一并删除。\n\n- 首个注册用户成为管理员：部署完成后请先自己打开一次并注册。\n- vLLM 设置了接口密钥时，把同一个密钥填进「接口密钥」。\n- 接口地址与密钥只在首次启动时写入 Open WebUI 的设置，之后可在其「管理员设置 → 外部连接」里修改。"}

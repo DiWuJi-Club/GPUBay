@@ -119,7 +119,7 @@ func checkWorkflowDir(t *testing.T, slug, dir string) (BundleWorkflow, bool) {
 			}
 			cover = name
 		default:
-			t.Errorf("多余的文件 %s（导入只认 %s 与 cover.png|jpg|webp）", name, strings.Join(workflowDirFiles, " "))
+			t.Errorf("多余的文件 %s（导入只认 %s 与 cover.png|jpg|jpeg|webp）", name, strings.Join(workflowDirFiles, " "))
 		}
 	}
 	read := func(name string) []byte {
@@ -181,6 +181,7 @@ func checkWorkflowDir(t *testing.T, slug, dir string) (BundleWorkflow, bool) {
 		t.Fatalf("api.json: %v", err)
 	}
 	checkAPIMatchesGraph(t, g, apiNodes)
+	checkWidgetsMatchAPI(t, g, apiNodes)
 	checkInputDefaults(t, m, apiNodes)
 
 	// 只填图片、其余全用默认值也能生成 prompt（快速出图表单的「直接点生成」）。
@@ -270,11 +271,12 @@ type uiOutput struct {
 }
 
 type uiNode struct {
-	ID      int64      `json:"id"`
-	Type    string     `json:"type"`
-	Mode    int        `json:"mode"`
-	Inputs  []uiInput  `json:"inputs"`
-	Outputs []uiOutput `json:"outputs"`
+	ID      int64           `json:"id"`
+	Type    string          `json:"type"`
+	Mode    int             `json:"mode"`
+	Inputs  []uiInput       `json:"inputs"`
+	Outputs []uiOutput      `json:"outputs"`
+	Widgets json.RawMessage `json:"widgets_values"`
 }
 
 type uiLink struct {
@@ -362,6 +364,103 @@ func checkGraphLinks(t *testing.T, g *uiGraph) {
 			}
 		}
 	}
+}
+
+// widgetNames UI 格式 widgets_values 的顺序（= ComfyUI v0.3.60 INPUT_TYPES 里 widget 输入的顺序，连线输入不占位）。
+// "@ctl" 是前端给 seed 加的 control_after_generate 小部件，"@upload" 是 LoadImage 的上传按钮：两者只在 UI 格式里。
+// 新工作流用到表外的节点类型时在这里补上（顺序以 ComfyUI 源码的 INPUT_TYPES 为准）。
+var widgetNames = map[string][]string{
+	"KSampler":                {"seed", "@ctl", "steps", "cfg", "sampler_name", "scheduler", "denoise"},
+	"CheckpointLoaderSimple":  {"ckpt_name"},
+	"EmptyLatentImage":        {"width", "height", "batch_size"},
+	"EmptySD3LatentImage":     {"width", "height", "batch_size"},
+	"CLIPTextEncode":          {"text"},
+	"VAEDecode":               {},
+	"VAEEncode":               {},
+	"SaveImage":               {"filename_prefix"},
+	"LoadImage":               {"image", "@upload"},
+	"ImageScaleToTotalPixels": {"upscale_method", "megapixels"},
+	"UNETLoader":              {"unet_name", "weight_dtype"},
+	"CLIPLoader":              {"clip_name", "type", "device"},
+	"VAELoader":               {"vae_name"},
+	"ModelSamplingAuraFlow":   {"shift"},
+	"ModelSamplingSD3":        {"shift"},
+	"Wan22ImageToVideoLatent": {"width", "height", "length", "batch_size"},
+	"CreateVideo":             {"fps"},
+	"SaveVideo":               {"filename_prefix", "format", "codec"},
+	"UpscaleModelLoader":      {"model_name"},
+	"UltimateSDUpscale": {"upscale_by", "seed", "@ctl", "steps", "cfg", "sampler_name", "scheduler", "denoise", "mode_type",
+		"tile_width", "tile_height", "mask_blur", "tile_padding", "seam_fix_mode", "seam_fix_denoise", "seam_fix_width",
+		"seam_fix_mask_blur", "seam_fix_padding", "force_uniform_tiles", "tiled_decode", "batch_size"},
+}
+
+// checkWidgetsMatchAPI 启用节点的 widgets_values 与 api.json 的同名输入值一一相等（ComfyUI 界面里打开运行与快速出图跑的是同一组参数），
+// 且 api 里没有 widgets 之外的非连线输入。
+func checkWidgetsMatchAPI(t *testing.T, g *uiGraph, api map[string]apiNode) {
+	t.Helper()
+	for i := range g.Nodes {
+		n := &g.Nodes[i]
+		if !activeNode(n) {
+			continue
+		}
+		id := strconv.FormatInt(n.ID, 10)
+		an, ok := api[id]
+		if !ok {
+			continue // checkAPIMatchesGraph 已报
+		}
+		names, ok := widgetNames[n.Type]
+		if !ok {
+			t.Errorf("节点 %s 的类型 %s 不在 widgetNames 表里，请补上它的 widget 顺序", id, n.Type)
+			continue
+		}
+		var wv []any
+		if t0 := bytes.TrimSpace(n.Widgets); len(t0) > 0 && string(t0) != "null" {
+			if err := decodeNumber(t0, &wv); err != nil {
+				t.Errorf("节点 %s widgets_values 应为数组：%v", id, err)
+				continue
+			}
+		}
+		if len(wv) != len(names) {
+			t.Errorf("节点 %s（%s）widgets_values 有 %d 项，应为 %d 项 %v", id, n.Type, len(wv), len(names), names)
+			continue
+		}
+		widgetInputs := map[string]bool{}
+		for k, name := range names {
+			switch name {
+			case "@ctl":
+				if s, _ := wv[k].(string); !slices.Contains([]string{"fixed", "increment", "decrement", "randomize"}, s) {
+					t.Errorf("节点 %s 的 control_after_generate = %v", id, wv[k])
+				}
+				continue
+			case "@upload":
+				if wv[k] != "image" {
+					t.Errorf("节点 %s 的上传小部件 = %v", id, wv[k])
+				}
+				continue
+			}
+			widgetInputs[name] = true
+			got, ok := an.Inputs[name]
+			if !ok {
+				t.Errorf("api 节点 %s 缺输入 %s（graph 里是 %v）", id, name, wv[k])
+			} else if !sameJSONValue(wv[k], got) {
+				t.Errorf("节点 %s.%s：graph %v ≠ api %v", id, name, wv[k], got)
+			}
+		}
+		for name, v := range an.Inputs {
+			if _, isLink := v.([]any); !isLink && !widgetInputs[name] {
+				t.Errorf("api 节点 %s 的输入 %s 在 graph 的 widgets_values 里没有对应项", id, name)
+			}
+		}
+	}
+}
+
+// sameJSONValue 数字按数值比较（1 与 1.0 相等），其余按值比较。
+func sameJSONValue(a, b any) bool {
+	if fa, ok := toFloat(a); ok {
+		fb, ok := toFloat(b)
+		return ok && fa == fb
+	}
+	return a == b
 }
 
 func activeNode(n *uiNode) bool {

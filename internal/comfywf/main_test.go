@@ -74,7 +74,7 @@ func (e *catEnv) workflow(slug, status string) Workflow {
 // goodVersion 与 testdata/graph_sdxl_ok.json + api_sdxl.json 配套的合法版本输入。
 func goodVersion(t *testing.T, ver string) VersionInput {
 	return VersionInput{Version: ver, Graph: fixture(t, "graph_sdxl_ok.json"), APIPrompt: fixture(t, "api_sdxl.json"), Manifest: okManifest(),
-		Changelog: "说明 " + ver}
+		Changelog: ptr("说明 " + ver)}
 }
 
 // version 在工作流下建一个合法 draft 版本。

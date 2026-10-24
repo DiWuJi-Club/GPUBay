@@ -1,7 +1,7 @@
 {
   "name": "Wan2.2 5B 文 / 图生视频",
   "summary": "通义万相 Wan2.2 TI2V 5B，输入提示词生成 720p、24fps 的约 5 秒视频（MP4）。",
-  "description": "ComfyUI 官方「Wan 2.2 5B Video Generation」工作流（文生视频 / 图生视频合一）。\n\n- 模型：wan2.2_ti2v_5B_fp16.safetensors（diffusion_models，约 10.0 GB）、umt5_xxl_fp8_e4m3fn_scaled.safetensors（text_encoders，约 6.74 GB）、wan2.2_vae.safetensors（vae，约 1.41 GB），合计约 18.15 GB，许可 Apache-2.0\n- 默认 1280×704、121 帧（24fps 约 5 秒）、20 步；帧数取 4 的倍数加 1（如 49、81、121），宽高取 32 的倍数\n- 快速出图只做文生视频；图生视频请在 ComfyUI 里选中 Load Image 节点按 Ctrl + B 启用、上传首帧后运行\n- 生成一段 121 帧视频需要数分钟，请耐心等待\n- 快速出图可调：提示词、反向提示词、宽、高、帧数、步数、种子",
+  "description": "ComfyUI 官方「Wan 2.2 5B Video Generation」工作流（文生视频 / 图生视频合一）。\n\n- 模型：wan2.2_ti2v_5B_fp16.safetensors（diffusion_models，约 10.0 GB）、umt5_xxl_fp8_e4m3fn_scaled.safetensors（text_encoders，约 6.74 GB）、wan2.2_vae.safetensors（vae，约 1.41 GB），合计约 18.15 GB，许可 Apache-2.0\n- 默认 1280×704、121 帧（24fps 约 5 秒）、20 步；帧数取 4 的倍数加 1（如 49、81、121），宽高取 32 的倍数；快速出图宽高最大 1280、帧数最大 121\n- 快速出图只做文生视频；图生视频请在 ComfyUI 里选中 Load Image 节点按 Ctrl + B 启用、上传首帧后运行\n- 生成一段 121 帧视频需要数分钟，请耐心等待\n- 快速出图可调：提示词、反向提示词、宽、高、帧数、步数、种子",
   "category": "video",
   "tags": [
     "Wan2.2",

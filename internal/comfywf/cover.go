@@ -67,7 +67,7 @@ func (c *Catalog) SetCover(ctx context.Context, actor audit.Actor, wfID int64, r
 		return Workflow{}, err
 	}
 	if old != nil {
-		c.deleteUpload(ctx, *old)
+		c.deleteUpload(context.WithoutCancel(ctx), *old)
 	}
 	return out, nil
 }
@@ -77,7 +77,7 @@ func (c *Catalog) deleteUpload(ctx context.Context, key string) {
 	if c.uploads == nil {
 		return
 	}
-	if err := c.uploads.Delete(ctx, key); err != nil {
+	if err := c.uploads.Delete(ctx, key, storage.PurposeWorkflowCover); err != nil {
 		c.log.Warn("workflow cover delete failed", "key", key, "err", err)
 	}
 }
@@ -85,7 +85,7 @@ func (c *Catalog) deleteUpload(ctx context.Context, key string) {
 // OpenCover 控制台取封面（匿名）：工作流不存在或是草稿 → workflow_not_found；没有封面 → not_found。调用方负责关闭。
 func (c *Catalog) OpenCover(ctx context.Context, slug string) (storage.Upload, io.ReadCloser, error) {
 	w, err := c.WorkflowBySlug(ctx, slug)
-	if errors.Is(err, apperr.ErrNotFound) || (err == nil && w.Status == StatusDraft) {
+	if err == nil && w.Status == StatusDraft {
 		return storage.Upload{}, nil, apperr.ErrWorkflowNotFound
 	}
 	if err != nil {
@@ -94,7 +94,7 @@ func (c *Catalog) OpenCover(ctx context.Context, slug string) (storage.Upload, i
 	return c.openCover(ctx, w)
 }
 
-// OpenCoverByID 后台取封面（任意状态）：工作流不存在或没有封面 → not_found。调用方负责关闭。
+// OpenCoverByID 后台取封面（任意状态）：工作流不存在 → workflow_not_found；没有封面 → not_found。调用方负责关闭。
 func (c *Catalog) OpenCoverByID(ctx context.Context, id int64) (storage.Upload, io.ReadCloser, error) {
 	w, err := c.GetWorkflow(ctx, id)
 	if err != nil {

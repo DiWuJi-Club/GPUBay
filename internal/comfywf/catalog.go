@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -69,7 +70,7 @@ func scanWorkflow(row pgx.Row, extra ...any) (Workflow, error) {
 		&w.CreatedAt, &w.UpdatedAt}, extra...)
 	err := row.Scan(dest...)
 	if db.IsNoRows(err) {
-		return Workflow{}, apperr.ErrNotFound
+		return Workflow{}, apperr.ErrWorkflowNotFound
 	}
 	if w.Tags == nil {
 		w.Tags = []string{}
@@ -134,13 +135,35 @@ type WorkflowInput struct {
 	Status                                     string // 空 = draft
 }
 
-// normalizeWorkflow 按规格 §2 的列注释校验并规范化（去空白、标签去空去重）；checkSlug 为 false 时（更新）忽略 Slug。
+// hasControl 报告 s 是否含控制字符（含 NUL）或不是合法 UTF-8；allowNewline 时放行 \n 与 \t（说明是多行 Markdown）。
+func hasControl(s string, allowNewline bool) bool {
+	if !utf8.ValidString(s) {
+		return true
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) && !(allowNewline && (r == '\n' || r == '\t')) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeWorkflow 按规格 §2 的列注释校验并规范化（去空白、说明的 \r\n → \n、标签去空去重）；名称 / 简介 / 标签不能含控制字符，
+// 说明只允许换行与制表符。checkSlug 为 false 时（更新）不校验 Slug（UpdateWorkflow 另外要求它为空或等于原值）。
 func normalizeWorkflow(in WorkflowInput, checkSlug bool) (WorkflowInput, error) {
 	in.Slug = strings.TrimSpace(in.Slug)
 	in.Name = strings.TrimSpace(in.Name)
 	in.Summary = strings.TrimSpace(in.Summary)
-	in.Description = strings.TrimSpace(in.Description)
+	in.Description = strings.TrimSpace(strings.ReplaceAll(in.Description, "\r\n", "\n"))
 	in.Category = strings.TrimSpace(in.Category)
+	switch {
+	case hasControl(in.Name, false):
+		return in, apperr.BadRequest("名称不能包含控制字符")
+	case hasControl(in.Summary, false):
+		return in, apperr.BadRequest("简介不能包含控制字符")
+	case hasControl(in.Description, true):
+		return in, apperr.BadRequest("说明不能包含换行以外的控制字符")
+	}
 	if in.Status == "" {
 		in.Status = StatusDraft
 	}
@@ -149,6 +172,9 @@ func normalizeWorkflow(in WorkflowInput, checkSlug bool) (WorkflowInput, error) 
 		t = strings.TrimSpace(t)
 		if t == "" || slices.Contains(tags, t) {
 			continue
+		}
+		if hasControl(t, false) {
+			return in, apperr.BadRequest("标签不能包含控制字符")
 		}
 		if runeLen(t) > maxTagLen {
 			return in, apperr.BadRequest(fmt.Sprintf("标签「%s」超过 %d 个字符", t, maxTagLen))
@@ -180,6 +206,7 @@ func normalizeWorkflow(in WorkflowInput, checkSlug bool) (WorkflowInput, error) 
 var (
 	errSlugExists    = apperr.New(apperr.ErrDuplicate.Code, "slug 已存在", apperr.ErrDuplicate.Status)
 	errVersionExists = apperr.New(apperr.ErrDuplicate.Code, "版本号已存在", apperr.ErrDuplicate.Status)
+	errSlugImmutable = apperr.BadRequest("slug 不可修改")
 )
 
 func (c *Catalog) CreateWorkflow(ctx context.Context, actor audit.Actor, in WorkflowInput) (Workflow, error) {
@@ -210,7 +237,7 @@ func (c *Catalog) insertWorkflow(ctx context.Context, tx pgx.Tx, actor audit.Act
 	return w, audit.Record(ctx, tx, now, actor.Entry("workflow.create", "workflow", target(w.ID), w))
 }
 
-// UpdateWorkflow 修改展示信息、排序与状态；slug 创建后不可改（in.Slug 被忽略）。
+// UpdateWorkflow 修改展示信息、排序与状态；slug 创建后不可改：in.Slug 为空或等于原值，否则 bad_request。
 func (c *Catalog) UpdateWorkflow(ctx context.Context, actor audit.Actor, id int64, in WorkflowInput) (Workflow, error) {
 	in, err := normalizeWorkflow(in, false)
 	if err != nil {
@@ -221,6 +248,9 @@ func (c *Catalog) UpdateWorkflow(ctx context.Context, actor audit.Actor, id int6
 		before, err := scanWorkflow(tx.QueryRow(ctx, `SELECT `+wfCols+` FROM comfy_workflows WHERE id = $1 FOR UPDATE`, id))
 		if err != nil {
 			return err
+		}
+		if in.Slug != "" && in.Slug != before.Slug {
+			return errSlugImmutable
 		}
 		now := c.clock.Now()
 		w, err := scanWorkflow(tx.QueryRow(ctx, `UPDATE comfy_workflows SET name = $2, summary = $3, description = $4, category = $5, tags = $6,
@@ -236,39 +266,47 @@ func (c *Catalog) UpdateWorkflow(ctx context.Context, actor audit.Actor, id int6
 }
 
 // DeleteWorkflow 只能删除没有任何版本的草稿工作流（其余用 retired 下线）；有封面时一并删除封面文件（失败只记日志）。
+// 版本数在拿到行锁之后单独查（同一条语句里的子查询用的是锁等待之前的快照）；锁住期间插入的版本因外键检查要等本事务，
+// 本事务删除后它们会失败；万一仍有引用（外键违例）→ invalid_state。
 func (c *Catalog) DeleteWorkflow(ctx context.Context, actor audit.Actor, id int64) error {
 	var cover *string
 	err := db.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
 		var status, slug string
-		var versions int
-		err := tx.QueryRow(ctx, `SELECT status, slug, cover_key, (SELECT count(*) FROM comfy_workflow_versions WHERE workflow_id = $1)
-			FROM comfy_workflows WHERE id = $1 FOR UPDATE`, id).Scan(&status, &slug, &cover, &versions)
+		err := tx.QueryRow(ctx, `SELECT status, slug, cover_key FROM comfy_workflows WHERE id = $1 FOR UPDATE`, id).Scan(&status, &slug, &cover)
 		if db.IsNoRows(err) {
-			return apperr.ErrNotFound
+			return apperr.ErrWorkflowNotFound
 		}
 		if err != nil {
+			return err
+		}
+		var versions int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM comfy_workflow_versions WHERE workflow_id = $1`, id).Scan(&versions); err != nil {
 			return err
 		}
 		if status != StatusDraft || versions > 0 {
 			return apperr.ErrInvalidState
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM comfy_workflows WHERE id = $1`, id); err != nil {
+		_, err = tx.Exec(ctx, `DELETE FROM comfy_workflows WHERE id = $1`, id)
+		if db.IsForeignKeyViolation(err) {
+			return apperr.ErrInvalidState
+		}
+		if err != nil {
 			return err
 		}
 		return audit.Record(ctx, tx, c.clock.Now(), actor.Entry("workflow.delete", "workflow", target(id), map[string]any{"slug": slug}))
 	})
 	if err == nil && cover != nil {
-		c.deleteUpload(ctx, *cover)
+		c.deleteUpload(context.WithoutCancel(ctx), *cover)
 	}
 	return err
 }
 
-// GetWorkflow 按 id 读工作流（任意状态）；不存在 → not_found。
+// GetWorkflow 按 id 读工作流（任意状态）；不存在 → workflow_not_found。
 func (c *Catalog) GetWorkflow(ctx context.Context, id int64) (Workflow, error) {
 	return scanWorkflow(c.pool.QueryRow(ctx, `SELECT `+wfCols+` FROM comfy_workflows WHERE id = $1`, id))
 }
 
-// WorkflowBySlug 按 slug 读工作流（任意状态）；不存在 → not_found。
+// WorkflowBySlug 按 slug 读工作流（任意状态）；不存在 → workflow_not_found。
 func (c *Catalog) WorkflowBySlug(ctx context.Context, slug string) (Workflow, error) {
 	return scanWorkflow(c.pool.QueryRow(ctx, `SELECT `+wfCols+` FROM comfy_workflows WHERE slug = $1`, slug))
 }
@@ -355,39 +393,40 @@ func (c *Catalog) ListPublished(ctx context.Context, category string) ([]Catalog
 	if category != "" && !ValidCategory(category) {
 		return nil, apperr.BadRequest("分类无效")
 	}
-	rows, err := c.pool.Query(ctx, `SELECT DISTINCT ON (w.id) `+qualify(wfCols, "w")+`, `+verCols("v")+`,
+	// 每个工作流只取当前版本的摘要列（LATERAL + LIMIT 1 走 (workflow_id, status, published_at DESC) 索引），不读 graph / api_prompt 本体
+	rows, err := c.pool.Query(ctx, `SELECT `+qualify(wfCols, "w")+`, v.id, v.version, v.download_gb::text, v.models, v.nodes, v.quick_run, v.comfyui_min,
 		(SELECT count(*) FROM deployment_workflows dw JOIN app_deployments d ON d.id = dw.deployment_id
 			WHERE dw.workflow_id = w.id AND `+liveInstallsCond+`)
-		FROM comfy_workflows w JOIN comfy_workflow_versions v ON v.workflow_id = w.id AND v.status = 'published'
+		FROM comfy_workflows w CROSS JOIN LATERAL (
+			SELECT `+versionSummaryCols+` FROM comfy_workflow_versions v
+			WHERE v.workflow_id = w.id AND v.status = 'published' ORDER BY v.published_at DESC, v.id DESC LIMIT 1) v
 		WHERE w.status = 'published' AND ($1 = '' OR w.category = $1)
-		ORDER BY w.id, v.published_at DESC, v.id DESC`, category)
+		ORDER BY w.sort, w.id`, category)
 	if err != nil {
 		return nil, err
 	}
 	items, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (CatalogItem, error) {
-		var v Version
-		var installs int
-		dest, finish := versionDest(&v)
-		w, err := scanWorkflow(r, append(dest, &installs)...)
+		var it CatalogItem
+		var gb string
+		vs := &it.Version
+		w, err := scanWorkflow(r, &vs.ID, &vs.Version, &gb, &vs.Models, &vs.Nodes, &vs.QuickRun, &vs.ComfyUIMin, &it.Installs)
 		if err != nil {
 			return CatalogItem{}, err
 		}
-		if err := finish(); err != nil {
-			return CatalogItem{}, err
-		}
-		return CatalogItem{CatalogBase: catalogBase(w, installs), Version: Summarize(v)}, nil
+		vs.DownloadGB = Version{DownloadGB: gb}.DownloadGBValue()
+		it.CatalogBase = catalogBase(w, it.Installs)
+		return it, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	slices.SortStableFunc(items, func(x, y CatalogItem) int {
-		if x.Sort != y.Sort {
-			return x.Sort - y.Sort
-		}
-		return int(x.ID - y.ID)
-	})
 	return items, nil
 }
+
+// versionSummaryCols 是版本摘要列（别名 v）：不含 graph / api_prompt 本体，模型数 / 节点数 / 是否支持快速出图在库里算。
+const versionSummaryCols = `v.id, v.version, v.download_gb, v.status, v.manifest_hash, v.changelog, v.published_at, v.created_at, v.updated_at,
+	v.workflow_id, jsonb_array_length(COALESCE(v.manifest->'models', '[]')) AS models, jsonb_array_length(COALESCE(v.manifest->'nodes', '[]')) AS nodes,
+	v.api_prompt IS NOT NULL AS quick_run, COALESCE(v.manifest->>'comfyui_min', '') AS comfyui_min`
 
 // DetailVersion 是详情页的当前版本：摘要 + 清单（Manifest 本身不含 api_prompt）+ 更新说明。
 type DetailVersion struct {
@@ -415,7 +454,7 @@ type Detail struct {
 // DetailBySlug 单个已上架工作流（与 ListPublished 同一口径）；不存在、未上架或没有已发布版本 → workflow_not_found。
 func (c *Catalog) DetailBySlug(ctx context.Context, slug string) (Detail, error) {
 	w, err := c.WorkflowBySlug(ctx, slug)
-	if errors.Is(err, apperr.ErrNotFound) || (err == nil && w.Status != StatusPublished) {
+	if err == nil && w.Status != StatusPublished {
 		return Detail{}, apperr.ErrWorkflowNotFound
 	}
 	if err != nil {
@@ -464,13 +503,14 @@ func (c *Catalog) liveInstalls(ctx context.Context, wfID int64) (int, error) {
 //     = 不要快速出图）；Changelog 不复制。
 //   - Status 只用于修改已发布版本（空 = 不改，"retired" = 下线）；草稿的 Status 只能为空或 draft（发布走 PublishVersion）。
 //   - 修改已发布版本时，Version / Graph / APIPrompt / Manifest 为空或零值 = 不改；给了就必须与当前内容相同（规范化后比较），
-//     否则 workflow_version_frozen。Changelog 总是写入。
+//     否则 workflow_version_frozen。
+//   - Changelog 为 nil = 不改（建版本时为空串；改草稿 / 已发布版本时保留原值，例如只下线不动更新说明）。
 type VersionInput struct {
 	Version   string
 	Graph     json.RawMessage
 	APIPrompt json.RawMessage
 	Manifest  Manifest
-	Changelog string
+	Changelog *string
 	CopyFrom  *int64
 	Status    string
 }
@@ -512,11 +552,68 @@ func apiOrNil(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
+// normalizeChangelog 去空白、\r\n → \n 并校验更新说明（≤ 1000 字符，只允许换行 / 制表符这两种控制字符）。
+func normalizeChangelog(s string) (string, error) {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n"))
+	if runeLen(s) > MaxChangelogLen {
+		return "", invalid("changelog", fmt.Sprintf("最多 %d 个字符", MaxChangelogLen))
+	}
+	if hasControl(s, true) {
+		return "", invalid("changelog", "不能包含换行以外的控制字符")
+	}
+	return s, nil
+}
+
+// checkJSONText 在写库前拒绝 PostgreSQL JSONB 存不下的文本：非法 UTF-8、字符串或键里的 NUL（\u0000）。
+// 不是合法 JSON 时不报错（交给形状校验给出更准确的消息）。
+func checkJSONText(path string, raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	if !utf8.Valid(raw) {
+		return invalid(path, "不是合法的 UTF-8 文本")
+	}
+	if !bytes.Contains(raw, []byte(`\u0000`)) { // NUL 在 JSON 里只能以转义出现（原始 0x00 不是合法 JSON）
+		return nil
+	}
+	var v any
+	if err := decodeNumber(raw, &v); err != nil {
+		return nil
+	}
+	if hasNUL(v) {
+		return invalid(path, "不能包含 NUL 字符（\\u0000）")
+	}
+	return nil
+}
+
+func hasNUL(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.ContainsRune(t, 0)
+	case map[string]any:
+		for k, x := range t {
+			if strings.ContainsRune(k, 0) || hasNUL(x) {
+				return true
+			}
+		}
+	case []any:
+		for _, x := range t {
+			if hasNUL(x) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // validateVersionInput 完整校验版本（草稿保存也要过，规格 §3.3），就地规范化 in（Version / Changelog 去空白、Manifest 规范化、
-// Graph / APIPrompt 压缩空白、APIPrompt 的 null → nil），返回将写入的 manifest_hash / download_gb 与提示。
-func validateVersionInput(in *VersionInput) (ValidateResult, error) {
+// Graph / APIPrompt 压缩空白、APIPrompt 的 null → nil；Changelog 为 nil 时取 keep），返回将写入的 manifest_hash / download_gb 与提示。
+func validateVersionInput(in *VersionInput, keep string) (ValidateResult, error) {
 	in.Version = strings.TrimSpace(in.Version)
-	in.Changelog = strings.TrimSpace(in.Changelog)
+	changelog := keep
+	if in.Changelog != nil {
+		changelog = *in.Changelog
+	}
 	in.Graph = compactJSON(in.Graph) // ComfyUI 导出的文件常带缩进：按紧凑形式计大小
 	in.APIPrompt = compactJSON(apiOrNil(in.APIPrompt))
 	if !ValidVersion(in.Version) {
@@ -525,10 +622,23 @@ func validateVersionInput(in *VersionInput) (ValidateResult, error) {
 	if len(bytes.TrimSpace(in.Graph)) == 0 {
 		return ValidateResult{}, invalid("graph", "不能为空")
 	}
-	if runeLen(in.Changelog) > MaxChangelogLen {
-		return ValidateResult{}, invalid("changelog", fmt.Sprintf("最多 %d 个字符", MaxChangelogLen))
+	changelog, err := normalizeChangelog(changelog)
+	if err != nil {
+		return ValidateResult{}, err
+	}
+	in.Changelog = &changelog
+	if err := checkJSONText("graph", in.Graph); err != nil {
+		return ValidateResult{}, err
+	}
+	if err := checkJSONText("api_prompt", in.APIPrompt); err != nil {
+		return ValidateResult{}, err
 	}
 	m := cloneManifest(in.Manifest)
+	if mb, err := json.Marshal(m); err == nil {
+		if err := checkJSONText("manifest", mb); err != nil {
+			return ValidateResult{}, err
+		}
+	}
 	if err := ValidateManifest(&m, in.Graph, in.APIPrompt); err != nil {
 		return ValidateResult{}, err
 	}
@@ -589,7 +699,7 @@ func (c *Catalog) CreateVersion(ctx context.Context, actor audit.Actor, wfID int
 	if err != nil {
 		return Version{}, err
 	}
-	res, err := validateVersionInput(&in)
+	res, err := validateVersionInput(&in, "")
 	if err != nil {
 		return Version{}, err
 	}
@@ -611,10 +721,10 @@ func (c *Catalog) insertVersion(ctx context.Context, tx pgx.Tx, actor audit.Acto
 	v, err := scanVersion(tx.QueryRow(ctx, `INSERT INTO comfy_workflow_versions
 		(workflow_id, version, status, graph, api_prompt, manifest, download_gb, manifest_hash, changelog, created_at, updated_at)
 		VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $9) RETURNING `+verCols(""),
-		wfID, in.Version, []byte(in.Graph), jsonArg(in.APIPrompt), manifest, res.DownloadGB, res.ManifestHash, in.Changelog, now))
+		wfID, in.Version, []byte(in.Graph), jsonArg(in.APIPrompt), manifest, res.DownloadGB, res.ManifestHash, *in.Changelog, now))
 	switch {
 	case db.IsForeignKeyViolation(err):
-		return Version{}, apperr.ErrNotFound
+		return Version{}, apperr.ErrWorkflowNotFound
 	case db.IsUniqueViolation(err):
 		return Version{}, errVersionExists
 	case err != nil:
@@ -642,7 +752,7 @@ func (c *Catalog) ValidateVersion(ctx context.Context, wfID int64, in VersionInp
 	if err != nil {
 		return ValidateResult{}, err
 	}
-	return validateVersionInput(&in)
+	return validateVersionInput(&in, "")
 }
 
 // UpdateVersion：草稿整体可改（完整校验）；已发布版本只能改 Changelog 或下线（Status = "retired"），见 VersionInput 与 publishedEdit；
@@ -657,7 +767,7 @@ func (c *Catalog) UpdateVersion(ctx context.Context, actor audit.Actor, wfID, vi
 		if in.Status != "" && in.Status != StatusDraft {
 			return Version{}, apperr.ErrInvalidState // 发布走 PublishVersion（需动态码）
 		}
-		if res, err = validateVersionInput(&in); err != nil {
+		if res, err = validateVersionInput(&in, pre.Changelog); err != nil {
 			return Version{}, err
 		}
 	}
@@ -680,7 +790,7 @@ func (c *Catalog) UpdateVersion(ctx context.Context, actor audit.Actor, wfID, vi
 			}
 			v, err = scanVersion(tx.QueryRow(ctx, `UPDATE comfy_workflow_versions SET version = $2, graph = $3, api_prompt = $4, manifest = $5,
 				download_gb = $6, manifest_hash = $7, changelog = $8, updated_at = $9 WHERE id = $1 RETURNING `+verCols(""),
-				vid, in.Version, []byte(in.Graph), jsonArg(in.APIPrompt), manifest, res.DownloadGB, res.ManifestHash, in.Changelog, now))
+				vid, in.Version, []byte(in.Graph), jsonArg(in.APIPrompt), manifest, res.DownloadGB, res.ManifestHash, *in.Changelog, now))
 			if db.IsUniqueViolation(err) {
 				return errVersionExists
 			}
@@ -710,7 +820,7 @@ func (c *Catalog) UpdateVersion(ctx context.Context, actor audit.Actor, wfID, vi
 }
 
 // publishedEdit 是已发布版本的修改规则：给出的 Version / Graph / APIPrompt / Manifest 须与当前内容相同（规范化后比较），
-// Status 只能为空 / published（不改）或 retired；返回修改后的状态与更新说明。
+// Status 只能为空 / published（不改）或 retired；返回修改后的状态与更新说明（Changelog 为 nil 时为原值）。
 func publishedEdit(cur Version, in VersionInput) (string, string, error) {
 	if v := strings.TrimSpace(in.Version); v != "" && v != cur.Version {
 		return "", "", apperr.ErrWorkflowVersionFrozen
@@ -738,9 +848,12 @@ func publishedEdit(cur Version, in VersionInput) (string, string, error) {
 	default:
 		return "", "", apperr.ErrWorkflowVersionFrozen
 	}
-	changelog := strings.TrimSpace(in.Changelog)
-	if runeLen(changelog) > MaxChangelogLen {
-		return "", "", invalid("changelog", fmt.Sprintf("最多 %d 个字符", MaxChangelogLen))
+	if in.Changelog == nil { // 不改更新说明（例如只下线）
+		return status, cur.Changelog, nil
+	}
+	changelog, err := normalizeChangelog(*in.Changelog)
+	if err != nil {
+		return "", "", err
 	}
 	return status, changelog, nil
 }
@@ -757,7 +870,7 @@ func (c *Catalog) ValidateVersionUpdate(ctx context.Context, wfID, vid int64, in
 		if in.Status != "" && in.Status != StatusDraft {
 			return ValidateResult{}, apperr.ErrInvalidState
 		}
-		return validateVersionInput(&in)
+		return validateVersionInput(&in, cur.Changelog)
 	case StatusPublished:
 		if _, _, err := publishedEdit(cur, in); err != nil {
 			return ValidateResult{}, err
@@ -781,8 +894,8 @@ func (c *Catalog) PublishVersion(ctx context.Context, actor audit.Actor, wfID, v
 		if cur.Status != StatusDraft {
 			return apperr.ErrInvalidState
 		}
-		in := VersionInput{Version: cur.Version, Graph: cur.Graph, APIPrompt: cur.APIPrompt, Manifest: cur.Manifest, Changelog: cur.Changelog}
-		res, err := validateVersionInput(&in)
+		in := VersionInput{Version: cur.Version, Graph: cur.Graph, APIPrompt: cur.APIPrompt, Manifest: cur.Manifest, Changelog: &cur.Changelog}
+		res, err := validateVersionInput(&in, cur.Changelog)
 		if err != nil {
 			return err
 		}
@@ -852,13 +965,12 @@ type VersionRow struct {
 
 // ListVersionRows 按创建倒序返回工作流的版本表（后台 GET /workflows/{id}/versions）。
 func (c *Catalog) ListVersionRows(ctx context.Context, wfID int64) ([]VersionRow, error) {
-	rows, err := c.pool.Query(ctx, `SELECT v.id, v.workflow_id, v.version, v.status, v.download_gb::text, v.manifest_hash, v.changelog,
-		jsonb_array_length(COALESCE(v.manifest->'models', '[]')), jsonb_array_length(COALESCE(v.manifest->'nodes', '[]')),
-		v.api_prompt IS NOT NULL, COALESCE(v.manifest->>'comfyui_min', ''),
+	rows, err := c.pool.Query(ctx, `SELECT s.id, s.workflow_id, s.version, s.status, s.download_gb::text, s.manifest_hash, s.changelog,
+		s.models, s.nodes, s.quick_run, s.comfyui_min,
 		(SELECT count(*) FROM deployment_workflows dw JOIN app_deployments d ON d.id = dw.deployment_id
-			WHERE dw.workflow_version_id = v.id AND `+liveInstallsCond+`),
-		v.published_at, v.created_at, v.updated_at
-		FROM comfy_workflow_versions v WHERE v.workflow_id = $1 ORDER BY v.id DESC`, wfID)
+			WHERE dw.workflow_version_id = s.id AND `+liveInstallsCond+`),
+		s.published_at, s.created_at, s.updated_at
+		FROM (SELECT `+versionSummaryCols+` FROM comfy_workflow_versions v WHERE v.workflow_id = $1) s ORDER BY s.id DESC`, wfID)
 	if err != nil {
 		return nil, err
 	}
