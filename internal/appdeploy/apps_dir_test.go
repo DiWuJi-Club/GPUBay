@@ -280,3 +280,77 @@ func TestVLLMStartArgs(t *testing.T) {
 		t.Error("llm-serving Dockerfile must pin Open WebUI to the version verified on the Spark (0.12.3)")
 	}
 }
+
+// TestOpenWebUIOfflineEmbedding 用假的 modelscope / open-webui 真跑 deploy/apps/open-webui/app.sh：
+// install 从 ModelScope 下载向量模型（只要 safetensors 与配置），start 带 OFFLINE_MODE=True 并把 RAG_EMBEDDING_MODEL
+// 指向本地目录——Open WebUI 默认启动时经 hf-mirror 拉 all-MiniLM-L6-v2，被重定向到 HF 的 xet CDN 后卡死在健康检查（验收 A 复测）。
+// 下载失败不阻塞部署：install 照常结束，start 仍是离线模式（对话可用，只是知识库不可用）。
+func TestOpenWebUIOfflineEmbedding(t *testing.T) {
+	script, err := filepath.Abs(filepath.Join(appsDir, "open-webui", "app.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		downloadOK bool
+	}{{"download ok", true}, {"download fails", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			appDir, bin, models := t.TempDir(), t.TempDir(), t.TempDir()
+			msArgs, envFile := filepath.Join(appDir, "ms-args"), filepath.Join(appDir, "webui-env")
+			ms := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + appdeploy.ShellQuote(msArgs) + "\n"
+			if tc.downloadOK {
+				ms += "while [ $# -gt 0 ]; do if [ \"$1\" = --local-dir ]; then mkdir -p \"$2\" && : > \"$2/model.safetensors\"; fi; shift; done\n"
+			} else {
+				ms += "exit 1\n"
+			}
+			webui := "#!/bin/sh\nenv > " + appdeploy.ShellQuote(envFile) + "\nexec sleep 30\n"
+			for name, body := range map[string]string{"modelscope": ms, "open-webui": webui, "spark_status": "#!/bin/sh\nexit 0\n"} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			env := append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "SPARK_APP_DIR="+appDir, "SPARK_MODELS_DIR="+models,
+				"SPARK_PORT=3000", "OPEN_WEBUI_BIN="+filepath.Join(bin, "open-webui"), "OPENAI_API_BASE_URL=http://127.0.0.1:8000/v1", "OPENAI_API_KEY=", "HF_ENDPOINT=")
+			install := exec.Command("/bin/sh", script, "install")
+			install.Dir, install.Env = appDir, env
+			if out, err := install.CombinedOutput(); err != nil {
+				t.Fatalf("install: %v %s", err, out)
+			}
+			args, _ := os.ReadFile(msArgs)
+			embedDir := filepath.Join(models, "modelscope", "sentence-transformers/all-MiniLM-L6-v2")
+			for _, want := range []string{"download\nsentence-transformers/all-MiniLM-L6-v2\n", "--local-dir\n" + embedDir + "\n", "--exclude\nonnx/*\nopenvino/*\n*.bin\n"} {
+				if !strings.Contains(string(args), want) {
+					t.Errorf("modelscope args missing %q:\n%s", want, args)
+				}
+			}
+
+			start := exec.Command("/bin/sh", script, "start")
+			start.Dir, start.Env = appDir, env
+			t.Cleanup(func() {
+				if b, err := os.ReadFile(filepath.Join(appDir, "service.pid")); err == nil {
+					exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+				}
+			})
+			if out, err := start.CombinedOutput(); err != nil {
+				t.Fatalf("start: %v %s", err, out)
+			}
+			var got string
+			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+				b, _ := os.ReadFile(envFile)
+				if got = string(b); strings.Contains(got, "OFFLINE_MODE=") || time.Now().After(deadline) {
+					break
+				}
+			}
+			if !strings.Contains(got, "\nOFFLINE_MODE=True\n") && !strings.HasPrefix(got, "OFFLINE_MODE=True\n") {
+				t.Errorf("open-webui started without OFFLINE_MODE=True")
+			}
+			hasEmbed := strings.Contains(got, "RAG_EMBEDDING_MODEL="+embedDir+"\n")
+			if hasEmbed != tc.downloadOK {
+				t.Errorf("RAG_EMBEDDING_MODEL=<local dir> set = %v, want %v", hasEmbed, tc.downloadOK)
+			}
+			if strings.Contains(got, "\nHF_ENDPOINT=") {
+				t.Errorf("empty HF_ENDPOINT should be unset")
+			}
+		})
+	}
+}
