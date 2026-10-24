@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  deploymentErrorLabel, deploymentPhaseLabel, labelOf, messageOf,
+  deploymentErrorText, deploymentPhaseLabel, labelOf, messageOf,
   type AppCatalogItem, type Deployment, type Instance, type Listed,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
@@ -8,7 +8,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
 import { usePolling } from '../composables/usePolling'
 import {
-  MAX_APPS, appOpBlockReason, canAddApp, deploymentActions, deploymentBusy, deploymentStatusText, instanceAppHint,
+  MAX_APPS, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, instanceAppHint,
 } from '../logic/apps'
 import { notifyError } from '../logic/notify'
 import AppDeployDialog from './AppDeployDialog.vue'
@@ -52,10 +52,7 @@ const hint = computed(() => instanceAppHint(props.instance.state))
 const canAdd = computed(() => canAddApp(props.instance.state))
 const atLimit = computed(() => items.value.length >= MAX_APPS)
 
-function rowStatus(d: Deployment) {
-  // 状态标签只反映部署本身；实例非运行的原因单独一行（detail-app-instance-hint）
-  return deploymentStatusText(d, 'running')
-}
+const rowStatus = (d: Deployment) => appRowStatus(d, props.instance.state)
 const phaseText = (d: Deployment) => labelOf(deploymentPhaseLabel, d.phase)
 
 function open(url: string) {
@@ -155,7 +152,7 @@ function onCommand(d: Deployment, cmd: string) {
       </div>
 
       <p v-if="d.state === 'failed'" class="danger small" data-testid="detail-app-error">
-        {{ d.error_code ? labelOf(deploymentErrorLabel, d.error_code) : '部署失败' }}<template v-if="d.message">：{{ d.message }}</template>
+        {{ deploymentErrorText(d.error_code, d.message, '部署失败') }}
         <el-button link type="primary" size="small" data-testid="detail-app-error-log" @click="openLog(d)">查看日志</el-button>
       </p>
       <p v-if="hint" class="muted small" data-testid="detail-app-instance-hint">{{ hint }}</p>

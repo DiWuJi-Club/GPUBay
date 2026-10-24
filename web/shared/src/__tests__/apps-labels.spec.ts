@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  alertKindLabel, appCategoryLabel, appStatusLabel, auditActions, deploymentErrorLabel, deploymentPhaseLabel, deploymentStateLabel,
+  alertKindLabel, appCategoryLabel, appStatusLabel, auditActions, deploymentErrorLabel, deploymentErrorText, deploymentPhaseLabel, deploymentStateLabel,
   deploymentStateType, labelOf,
 } from '../labels'
 import type { AppCategory, DeploymentState } from '../types'
@@ -24,6 +24,15 @@ describe('应用部署文案', () => {
     expect(Object.keys(deploymentErrorLabel).sort()).toEqual([...errorCodes].sort())
     for (const c of errorCodes) expect(deploymentErrorLabel[c]).toBeTruthy()
     expect(labelOf(deploymentErrorLabel, 'deploy_busy')).toBe('上一次部署长时间未结束')
+  })
+  it('失败原因：message 与错误码中文相同时不重复（验收观察 O-7）', () => {
+    expect(deploymentErrorText('crashed', '服务进程已退出')).toBe('服务进程已退出')
+    expect(deploymentErrorText('health_failed', '服务进程已退出')).toBe('健康检查未通过：服务进程已退出')
+    expect(deploymentErrorText('script_failed', '')).toBe('脚本执行失败')
+    expect(deploymentErrorText('', 'boom', '部署失败')).toBe('部署失败：boom')
+    expect(deploymentErrorText('', '', '部署失败')).toBe('部署失败')
+    expect(deploymentErrorText('', 'boom')).toBe('boom')
+    expect(deploymentErrorText('new_code', 'x')).toBe('new_code：x')
   })
   it('6 个阶段都有中文', () => {
     expect(Object.keys(deploymentPhaseLabel).sort()).toEqual([...phases].sort())

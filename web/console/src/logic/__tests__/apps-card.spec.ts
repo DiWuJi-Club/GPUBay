@@ -1,7 +1,7 @@
 import type { AppCatalogItem, Deployment, DeploymentEvent, UserEvent } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  addPickReason, appOpBlockReason, canAddApp, deploymentActions, deploymentBusy, instanceAppHint, mergeTimeline, redeployEnv, redeployForm,
+  addPickReason, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, instanceAppHint, mergeTimeline, redeployEnv, redeployForm,
   redeployVersions, summaryTag,
 } from '../apps'
 
@@ -76,6 +76,16 @@ describe('summaryTag', () => {
     const a = { id: 'd', name: 'vLLM', state: 'running' as const, progress: 100, url: 'https://x/' }
     expect(summaryTag(a, 'stopped')).toEqual({ text: '已停机', type: 'info' })
     expect(summaryTag({ ...a, state: 'failed' }, 'stopped')).toEqual({ text: '失败', type: 'danger' })
+  })
+})
+
+describe('appRowStatus（实例详情应用行的状态标签）', () => {
+  it('停机实例上仍是运行中的部署显示灰色「已停机」（O-4），其余按部署本身', () => {
+    expect(appRowStatus(dep({ state: 'running' }), 'stopped')).toEqual({ text: '已停机', type: 'info' })
+    expect(appRowStatus(dep({ state: 'running' }), 'running')).toEqual({ text: '运行中', type: 'success' })
+    expect(appRowStatus(dep({ state: 'stopped' }), 'stopped')).toEqual({ text: '已停止', type: 'info' })
+    expect(appRowStatus(dep({ state: 'failed', error_code: 'crashed' }), 'stopped')).toEqual({ text: '失败：服务进程已退出', type: 'danger' })
+    expect(appRowStatus(dep({ state: 'installing', progress: 40, phase: 'download' }), 'stopped')).toEqual({ text: '部署中 40% · 下载模型', type: 'primary' })
   })
 })
 

@@ -190,6 +190,8 @@ test('C-APP-08 实例到期停机：每个应用行提示实例已停机，启�
   await openDetail(page, u.phone, id)
   await expect(rows(page)).toHaveCount(2)
   await expect(page.getByTestId('detail-app-instance-hint')).toHaveText(['实例已停机，续费后自动恢复', '实例已停机，续费后自动恢复'])
+  // 部署仍记为 running（规格 §6.3），状态标签显示灰色「已停机」而不是绿色「运行中」（验收观察 O-4）
+  await expect(appRow(page, a.id).getByTestId('detail-app-state')).toHaveText('已停机')
   await expect(appRow(page, a.id).getByTestId('detail-app-open')).toBeDisabled()
   await appRow(page, a.id).getByTestId('detail-app-actions').click()
   await expect(appMenuItem(page, 'redeploy')).toHaveAttribute('aria-disabled', 'true')

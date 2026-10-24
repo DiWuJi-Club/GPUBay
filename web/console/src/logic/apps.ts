@@ -128,6 +128,15 @@ export function deploymentStatusText(d: Deployment, instanceState: InstanceState
   return { text: labelOf(deploymentStateLabel, d.state), type: labelOf(deploymentStateType, d.state) }
 }
 
+/**
+ * 实例详情应用行的状态标签：只反映部署本身（实例非运行的原因单独一行 detail-app-instance-hint），
+ * 但实例停机时仍记为 running 的部署（state 按规格 §6.3 不变）显示灰色「已停机」，与列表摘要一致（验收观察 O-4）。
+ */
+export function appRowStatus(d: Deployment, instanceState: InstanceState): { text: string; type: string } {
+  if (instanceState === 'stopped' && d.state === 'running') return { text: '已停机', type: 'info' }
+  return deploymentStatusText(d, 'running')
+}
+
 /** 每个实例最多部署的应用数（与 internal/appdeploy.MaxAppsPerInstance 一致）。 */
 export const MAX_APPS = 3
 

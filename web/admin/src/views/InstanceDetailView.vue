@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  centsToYuanInput, commandStatusLabel, commandTypeLabel, deploymentErrorLabel, deploymentStateLabel, deploymentStateType, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
+  centsToYuanInput, commandStatusLabel, commandTypeLabel, deploymentErrorText, deploymentStateLabel, deploymentStateType, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
   orderKindLabel, orderStatusLabel, type AdminDeployment, type AdminImage, type AdminInstance, type AdminInstanceDetail, type AdminProduct, type AdminSshSession, type InstancePort, type Listed, type Paged, type RefundQuote,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
@@ -340,7 +340,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
               <td data-testid="admin-instance-app-name">{{ a.app_name }} · {{ a.version }}<el-tag v-if="a.update_available" size="small" type="warning" class="tag-gap">有新版本</el-tag></td>
               <td><el-tag size="small" :type="labelOf(deploymentStateType, a.state) as 'primary'" data-testid="admin-instance-app-state">{{ labelOf(deploymentStateLabel, a.state) }}</el-tag></td>
               <td>
-                <span v-if="a.error_code" class="error" data-testid="admin-instance-app-error" :data-code="a.error_code">{{ labelOf(deploymentErrorLabel, a.error_code) }}{{ a.message ? `：${a.message}` : '' }}</span>
+                <span v-if="a.error_code" class="error" data-testid="admin-instance-app-error" :data-code="a.error_code">{{ deploymentErrorText(a.error_code, a.message) }}</span>
                 <span v-else data-testid="admin-instance-app-progress">{{ progressText(a) || '—' }}</span>
               </td>
               <td>{{ a.port }}</td>

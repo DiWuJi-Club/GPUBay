@@ -77,5 +77,14 @@ export const deploymentErrorLabel: LabelMap = {
   port_conflict: '端口冲突', port_limit: '端口数量超限', instance_gone: '实例已不存在', crashed: '服务进程已退出', disk: '数据盘空间不足',
   deploy_busy: '上一次部署长时间未结束',
 }
+/**
+ * 部署失败原因：错误码中文 + 「：message」；message 与错误码中文相同（如 crashed「服务进程已退出」）时只显示一次。
+ * 没有错误码时用 fallback。
+ */
+export function deploymentErrorText(code: string, message: string, fallback = ''): string {
+  const label = code ? labelOf(deploymentErrorLabel, code) : fallback
+  if (!message || message === label) return label
+  return label ? `${label}：${message}` : message
+}
 export const appCategoryLabel: LabelMap = { llm: '大模型', image: '图像生成', notebook: 'Notebook', tool: '工具' }
 export const appStatusLabel: LabelMap = { draft: '草稿', published: '已发布', retired: '已退役' }
