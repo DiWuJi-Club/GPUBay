@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"path"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -24,7 +23,7 @@ type BundleInput struct {
 	// ImageEnv 镜像环境（imageenv.go）：非 nil（含空切片）时包里带 image.env（0600）；nil = 没读到，不带 image.env
 	// （目录里上一次部署留下的 image.env 保留：同一实例的镜像不会变）。
 	ImageEnv []EnvKV
-	// Extra 调用方追加的文件（计划 11：comfywf 生成的 workflows/…），按给定顺序写在固定文件之后；名字规则见 checkExtraName。
+	// Extra 调用方追加的文件（计划 11：comfywf 生成的 workflows/…），按给定顺序写在固定文件之后；名字规则见 extraNames.check。
 	Extra []BundleFile
 }
 
@@ -38,7 +37,7 @@ type BundleFile struct {
 
 func AppDir(appRoot, slug string) string { return path.Join(appRoot, AppDirName, slug) }
 
-// ReservedEnv 平台注入的保留变量（顺序固定，写在用户变量之前）。
+// ReservedEnv 平台注入的保留变量（顺序固定，写在用户变量之前；SPARK_GIT_MIRROR 只对 Spec.SupportsWorkflows 的版本，在最后）。
 func ReservedEnv(in BundleInput) []EnvKV {
 	models := path.Join(in.AppRoot, ModelsDirName)
 	port2 := ""
@@ -49,37 +48,53 @@ func ReservedEnv(in BundleInput) []EnvKV {
 	if health == "" {
 		health = "127.0.0.1:" + strconv.Itoa(in.Spec.Ports[0].Port)
 	}
-	return []EnvKV{
+	kvs := []EnvKV{
 		{"SPARK_APP", in.Slug}, {"SPARK_APP_DIR", AppDir(in.AppRoot, in.Slug)}, {"SPARK_DATA_DIR", in.AppRoot},
 		{"SPARK_PORT", strconv.Itoa(in.Spec.Ports[0].Port)}, {"SPARK_PORT_2", port2}, {"SPARK_INSTANCE_ID", in.InstanceID},
 		{"SPARK_MODELS_DIR", models}, {"SPARK_SPEC_HASH", in.SpecHash}, {"SPARK_TIMEOUT_S", strconv.Itoa(in.Spec.TimeoutMinutes * 60)},
 		{"SPARK_HEALTH_PATH", in.Spec.Ports[0].HealthPath}, {"SPARK_MIN_FREE_GIB", strconv.Itoa(in.Spec.MinDataFreeGiB)}, {"SPARK_HEALTH_ADDR", health},
 		{"HF_ENDPOINT", in.HFEndpoint}, {"MODELSCOPE_CACHE", path.Join(models, "modelscope")}, {"HF_HOME", path.Join(models, "hf")}, {"PIP_INDEX_URL", in.PipIndexURL},
-		{"SPARK_GIT_MIRROR", in.GitMirror},
 	}
+	// 计划 11：只给支持工作流的版本。其它部署的 env 必须与计划 7 逐字节相同：env 的 cksum 是 run.sh install_key 的一部分，
+	// 多一行会让所有存量部署在升级 platform 后的第一次恢复里重跑 install。
+	if in.Spec.SupportsWorkflows {
+		kvs = append(kvs, EnvKV{"SPARK_GIT_MIRROR", in.GitMirror})
+	}
+	return kvs
 }
 
-// fixedBundleFiles 是 Bundle 自己写的文件名；Extra 不得与之重名。
-var fixedBundleFiles = []string{"run.sh", "app.sh", "spec.json", "env", "image.env"}
+// ExtraDir 是 Extra 文件唯一允许的包内目录（UploadCommand 每次解包前清空它，app.sh 只从这里读）。
+const ExtraDir = "workflows"
 
 var extraNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9/._-]{0,127}$`)
 
-// checkExtraName：包内相对路径，字符集 [a-z0-9/._-]、首字符字母或数字、≤ 128；每段非空且不是 . / ..（不能逃出应用目录）；
-// 不与固定文件、其它 Extra 重名。
-func checkExtraName(name string, seen map[string]bool) error {
-	if !extraNameRe.MatchString(name) {
+// extraNames 记录已加入的 Extra 文件与它们的上级目录，用于拒绝重名与「同一路径既是文件又是目录」（x 与 x/y）。
+type extraNames struct{ files, dirs map[string]bool }
+
+// check：包内相对路径，字符集 [a-z0-9/._-]、首字符字母或数字、≤ 128，必须在 workflows/ 下（因此不会与固定文件冲突）；
+// 每段非空且不是 . / ..（不能逃出应用目录）；不与已有 Extra 重名，也不与已有 Extra 的文件 / 目录互为前缀。
+func (n *extraNames) check(name string) error {
+	if !extraNameRe.MatchString(name) || !strings.HasPrefix(name, ExtraDir+"/") {
 		return fmt.Errorf("appdeploy: bad extra file name %q", name)
 	}
-	for _, seg := range strings.Split(name, "/") {
+	segs := strings.Split(name, "/")
+	for _, seg := range segs {
 		if seg == "" || seg == "." || seg == ".." {
 			return fmt.Errorf("appdeploy: bad extra file name %q", name)
 		}
 	}
-	top, _, nested := strings.Cut(name, "/")
-	if seen[name] || (nested && slices.Contains(fixedBundleFiles, top)) {
+	if n.files[name] || n.dirs[name] {
 		return fmt.Errorf("appdeploy: duplicate bundle file %q", name)
 	}
-	seen[name] = true
+	for k := 1; k < len(segs); k++ {
+		if dir := strings.Join(segs[:k], "/"); n.files[dir] {
+			return fmt.Errorf("appdeploy: bundle file %q is under file %q", name, dir)
+		}
+	}
+	n.files[name] = true
+	for k := 1; k < len(segs); k++ {
+		n.dirs[strings.Join(segs[:k], "/")] = true
+	}
 	return nil
 }
 
@@ -110,12 +125,9 @@ func Bundle(in BundleInput, runSH []byte) ([]byte, error) {
 	if in.ImageEnv != nil {
 		entries = append(entries, entry{"image.env", 0o600, RenderImageEnv(in.ImageEnv)})
 	}
-	seen := map[string]bool{}
-	for _, n := range fixedBundleFiles {
-		seen[n] = true
-	}
+	names := extraNames{files: map[string]bool{}, dirs: map[string]bool{}}
 	for _, f := range in.Extra {
-		if err := checkExtraName(f.Name, seen); err != nil {
+		if err := names.check(f.Name); err != nil {
 			return nil, err
 		}
 		mode := f.Mode & 0o777

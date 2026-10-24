@@ -55,7 +55,7 @@ func TestBundleContents(t *testing.T) {
 		"export SPARK_PORT_2=''", "export SPARK_INSTANCE_ID='ins-aaaaaaaa'", "export SPARK_MODELS_DIR='/root/data/models'", "export SPARK_SPEC_HASH='abc'",
 		"export SPARK_TIMEOUT_S='3600'", "export SPARK_HEALTH_PATH='/health'", "export SPARK_MIN_FREE_GIB='0'", "export SPARK_HEALTH_ADDR='127.0.0.1:8000'",
 		"export HF_ENDPOINT='https://hf-mirror.com'", "export MODELSCOPE_CACHE='/root/data/models/modelscope'", "export HF_HOME='/root/data/models/hf'",
-		"export PIP_INDEX_URL='https://pypi.tuna.tsinghua.edu.cn/simple'", "export SPARK_GIT_MIRROR='https://gh-proxy.com/'",
+		"export PIP_INDEX_URL='https://pypi.tuna.tsinghua.edu.cn/simple'",
 		"export MODEL_ID='Qwen/Qwen3-8B'", "export API_KEY='abcdefgh'",
 	} {
 		if !strings.Contains(env, line+"\n") {
@@ -233,13 +233,26 @@ func TestBundleExtra(t *testing.T) {
 	for _, name := range []string{
 		"", "Workflows/x.json", "/etc/passwd", "../x", "workflows/../../x", "workflows/./x", "workflows//x", "workflows/", ".installed",
 		"workflows/x y.json", "workflows/" + strings.Repeat("a", 120), // 超过 128
-		"run.sh", "app.sh", "spec.json", "env", "image.env", "env/x", "workflows/manifest.json", // 与固定文件 / 前一个 Extra 重名
+		"run.sh", "app.sh", "spec.json", "env", "image.env", "env/x", "models/x.json", "x.json", // 必须在 workflows/ 下
+		"workflows/manifest.json",                                  // 与前一个 Extra 重名
+		"workflows/manifest.json/x", "workflows/manifest.json/a/b", // 前一个 Extra 是文件，不能再当目录
 	} {
 		bad := in
 		bad.Extra = append(slices.Clone(in.Extra[:1]), appdeploy.BundleFile{Name: name, Body: []byte("x")})
 		if _, err := appdeploy.Bundle(bad, []byte("#!/bin/sh\n")); err == nil {
 			t.Errorf("extra name %q accepted", name)
 		}
+	}
+	// 反过来：先有 workflows/a/b，再来 workflows/a（目录与文件同名）
+	dirFirst := in
+	dirFirst.Extra = []appdeploy.BundleFile{{Name: "workflows/a/b.json", Body: []byte("x")}, {Name: "workflows/a", Body: []byte("x")}}
+	if _, err := appdeploy.Bundle(dirFirst, []byte("#!/bin/sh\n")); err == nil {
+		t.Error("file shadowing an earlier directory accepted")
+	}
+	nested := in
+	nested.Extra = []appdeploy.BundleFile{{Name: "workflows/a/b.json", Body: []byte("x")}, {Name: "workflows/a/c.json", Body: []byte("y")}}
+	if _, err := appdeploy.Bundle(nested, []byte("#!/bin/sh\n")); err != nil {
+		t.Errorf("siblings in a subdirectory rejected: %v", err)
 	}
 	big := in
 	big.Extra = []appdeploy.BundleFile{{Name: "workflows/big.json", Body: bytes.Repeat([]byte("x"), appdeploy.MaxBundleBytes)}}
@@ -253,8 +266,16 @@ func TestBundleExtra(t *testing.T) {
 	}
 }
 
+// SPARK_GIT_MIRROR 只写进支持工作流的版本的 env：其它部署的 env 与计划 7 逐字节相同（env 的 cksum 是 install_key 的一部分，
+// 多一行会让所有存量部署在升级后重跑 install）。
 func TestReservedEnvGitMirror(t *testing.T) {
 	in := appdeploy.BundleInput{Slug: "comfyui", AppRoot: "/root/data", Spec: goodSpec(), GitMirror: "https://gh-proxy.com/"}
+	for _, kv := range appdeploy.ReservedEnv(in) {
+		if kv.Name == "SPARK_GIT_MIRROR" {
+			t.Fatalf("non-workflow version got %+v", kv)
+		}
+	}
+	in.Spec.SupportsWorkflows = true
 	kvs := appdeploy.ReservedEnv(in)
 	if last := kvs[len(kvs)-1]; last.Name != "SPARK_GIT_MIRROR" || last.Value != "https://gh-proxy.com/" {
 		t.Fatalf("last reserved = %+v", last)
@@ -268,6 +289,40 @@ func TestReservedEnvGitMirror(t *testing.T) {
 	if _, err := appdeploy.Bundle(appdeploy.BundleInput{Slug: "comfyui", AppRoot: "/root/data", Spec: goodSpec(), Env: map[string]string{"SPARK_GIT_MIRROR": "x"}},
 		[]byte("#!/bin/sh\n")); err == nil {
 		t.Fatal("user env SPARK_GIT_MIRROR accepted")
+	}
+}
+
+// plan7Env 是计划 7（升级前）的 env 渲染结果，逐行写死：不支持工作流的部署包必须与之逐字节相同。
+const plan7Env = "export SPARK_APP='vllm'\nexport SPARK_APP_DIR='/root/data/.spark-apps/vllm'\nexport SPARK_DATA_DIR='/root/data'\n" +
+	"export SPARK_PORT='8000'\nexport SPARK_PORT_2=''\nexport SPARK_INSTANCE_ID='ins-aaaaaaaa'\nexport SPARK_MODELS_DIR='/root/data/models'\n" +
+	"export SPARK_SPEC_HASH='abc'\nexport SPARK_TIMEOUT_S='3600'\nexport SPARK_HEALTH_PATH='/health'\nexport SPARK_MIN_FREE_GIB='0'\n" +
+	"export SPARK_HEALTH_ADDR='127.0.0.1:8000'\nexport HF_ENDPOINT='https://hf-mirror.com'\nexport MODELSCOPE_CACHE='/root/data/models/modelscope'\n" +
+	"export HF_HOME='/root/data/models/hf'\nexport PIP_INDEX_URL='https://pypi.tuna.tsinghua.edu.cn/simple'\n" +
+	"export MODEL_ID='Qwen/Qwen3-8B'\nexport API_KEY='abcdefgh'\n"
+
+func TestBundleEnvByteIdenticalToPlan7(t *testing.T) {
+	s := goodSpec()
+	if err := appdeploy.ValidateSpec(&s); err != nil {
+		t.Fatal(err)
+	}
+	in := appdeploy.BundleInput{Slug: "vllm", InstanceID: "ins-aaaaaaaa", AppRoot: "/root/data", SpecHash: "abc", Spec: s, Script: "echo hi\n",
+		Env: map[string]string{"MODEL_ID": "Qwen/Qwen3-8B"}, Secret: map[string]string{"API_KEY": "abcdefgh"},
+		HFEndpoint: "https://hf-mirror.com", PipIndexURL: "https://pypi.tuna.tsinghua.edu.cn/simple", GitMirror: "https://gh-proxy.com/"}
+	b, err := appdeploy.Bundle(in, []byte("#!/bin/sh\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, files, _ := readTar(t, b); files["env"] != plan7Env {
+		t.Fatalf("env =\n%s\nwant (plan 7)\n%s", files["env"], plan7Env)
+	}
+	in.Spec.SupportsWorkflows = true
+	b, err = appdeploy.Bundle(in, []byte("#!/bin/sh\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(plan7Env, "export MODEL_ID=", "export SPARK_GIT_MIRROR='https://gh-proxy.com/'\nexport MODEL_ID=", 1)
+	if _, files, _ := readTar(t, b); files["env"] != want {
+		t.Fatalf("workflow env =\n%s\nwant\n%s", files["env"], want)
 	}
 }
 

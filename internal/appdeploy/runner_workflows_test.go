@@ -171,4 +171,42 @@ func TestRunnerOnTransitionOnScriptFailure(t *testing.T) {
 	if failing {
 		t.Fatal("hook error path not exercised")
 	}
+	if logs := re.logs.String(); !strings.Contains(logs, "level=ERROR") || !strings.Contains(logs, "OnTransition") || !strings.Contains(logs, "deployment="+d.ID) {
+		t.Fatalf("hook failure not logged at error level:\n%s", logs)
+	}
+}
+
+// queued 部署的集合在本轮打包之后、回写之前变了（comfywf 对 queued 只改集合并 TouchDeployment）：本轮回写被丢弃，下一轮重新打包。
+func TestRunnerRebundlesAfterTouch(t *testing.T) {
+	h := &workflowHooks{extraErr: map[string]error{}}
+	re := newRunnerEnvDeps(t, 1, h.install)
+	spec := runnerSpec(8000)
+	spec.SupportsWorkflows = true
+	a, _ := re.publishedApp("comfyui", spec, runnerScript, []int64{re.imageID})
+	inst := re.instance()
+	d := re.create(inst, a.ID, nil)
+	var once sync.Once
+	appdeploy.SetBeforeWriteback(re.r, func(appdeploy.Deployment) {
+		once.Do(func() {
+			if err := appdeploy.TouchDeployment(re.ctx, re.pool, d.ID, re.clk.Now()); err != nil {
+				t.Errorf("TouchDeployment: %v", err)
+			}
+		})
+	})
+	re.tick()
+	if got := re.dep(d.ID); got.State != appdeploy.StateQueued {
+		t.Fatalf("stale round not discarded: %+v", got)
+	}
+	if !strings.Contains(re.logs.String(), "stale writeback discarded") {
+		t.Fatalf("no stale log:\n%s", re.logs.String())
+	}
+	if _, calls := h.snapshot(); len(calls) != 1 {
+		t.Fatalf("BundleExtra calls after first round = %v", calls)
+	}
+	appdeploy.SetBeforeWriteback(re.r, nil)
+	got := re.until(d.ID, appdeploy.StateRunning)
+	trs, calls := h.snapshot()
+	if len(calls) < 2 || len(trs) != 1 || trs[0].to != appdeploy.StateRunning {
+		t.Fatalf("after re-bundle: calls %v transitions %+v (dep %+v)", calls, trs, got)
+	}
 }

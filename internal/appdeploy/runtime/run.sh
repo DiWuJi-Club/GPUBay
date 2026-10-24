@@ -343,7 +343,9 @@ cmd_bg_deploy() {
       # phase 取 app.sh 最后一次 spark_status 汇报的阶段（如 download），失败点更具体
       _ph=$(sed -n 's/.*"phase":"\([A-Za-z0-9_.-]*\)".*/\1/p' "$DIR/status.json" 2>/dev/null)
       # app.sh 磁盘预检失败时最后一次汇报的消息以 disk: 开头（计划 11 D7）：沿用它，平台据前缀映射为错误码 disk
-      _msg=$(sed -n 's/.*"message":"\(disk:[^"]*\)".*/\1/p' "$DIR/status.json" 2>/dev/null)
+      # 取 "message":"…","pid": 之间（write_status 的字段顺序：message 后紧跟 pid；消息里的引号已转义成 \"，不会提前匹配），
+      # 再还原 json_escape 的转义（先 \" → "，再 \\ → \），fail_exit 写回时重新转义
+      _msg=$(sed -n 's/.*"message":"\(disk:.*\)","pid":.*/\1/p' "$DIR/status.json" 2>/dev/null | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g')
       fail_exit "${_ph:-install}" 0 "${_msg:-install 失败，退出码 $_rc}" 0 "$_rc"
     fi
     put "$DIR/.installed" "$_key"
