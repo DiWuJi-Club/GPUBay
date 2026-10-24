@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"spark-cloud/internal/butler/llm"
 	"spark-cloud/internal/butler/tools"
 	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/randx"
 )
 
@@ -29,6 +32,20 @@ func (s *Service) Confirm(ctx context.Context, userID int64, ip, convID, tcID st
 	}
 	if !st.Enabled {
 		return Conversation{}, disabledErr(st.Notice)
+	}
+	// 只读预检：明显无效（他人 / 不存在 / 已不是待确认）的请求不占运行名额
+	var convStatus, callStatus string
+	err = s.pool.QueryRow(ctx, `SELECT c.status, coalesce(t.status, '') FROM butler_conversations c
+		LEFT JOIN butler_tool_calls t ON t.id = $3 AND t.conversation_id = c.id
+		WHERE c.id = $1 AND c.user_id = $2`, convID, userID, tcID).Scan(&convStatus, &callStatus)
+	if db.IsNoRows(err) {
+		return Conversation{}, apperr.ErrNotFound
+	}
+	if err != nil {
+		return Conversation{}, err
+	}
+	if convStatus != ConvAwaitingConfirm || callStatus != CallPending {
+		return Conversation{}, apperr.ErrButlerConfirmInvalid
 	}
 	if err := s.acquire(userID); err != nil {
 		return Conversation{}, err
@@ -94,7 +111,8 @@ func (s *Service) Confirm(ctx context.Context, userID int64, ip, convID, tcID st
 	s.log.Info("butler: confirm", "conversation", conv.ID, "tool_call", tc.ID, "tool", tc.Tool, "approve", approve)
 	sink.Emit(EvStart, StartEvent{ConversationID: conv.ID})
 
-	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), RunTimeout)
+	// 续跑不检查每日预算（预算只在 Send 开始时判断，一轮内允许超出）。
+	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.runTimeout)
 	defer cancel()
 	r := &run{userID: userID, convID: conv.ID, instanceID: conv.Context.InstanceID, token: token, ip: ip, sink: sink,
 		used: used, limit: st.DailyTokenLimit, secrets: map[string]string{}}
@@ -104,9 +122,16 @@ func (s *Service) Confirm(ctx context.Context, userID int64, ip, convID, tcID st
 	return s.finalConv(ctx, userID, conv.ID)
 }
 
-// executeCall 执行已批准的写工具并回写结果。tool_calls 行状态 + 审计 butler.tool_execute 无条件提交（操作已经发生）；
-// tool 消息只在 run_token 仍匹配时写入。返回 false 表示本轮到此为止（被接管或内部错误）。
-func (s *Service) executeCall(ctx context.Context, r *run, tc ToolCall) bool {
+// executeCall 执行已批准的写工具并回写结果：tool_calls 行状态 + 审计 butler.tool_execute + 结果 tool 消息在一个事务里无条件提交
+// （操作已经发生；清扫器已把它标 interrupted 时以真实结果覆盖），失败重试一次，仍失败则单独更新调用行兜底。
+// 返回 false 表示本轮到此为止（run_token 已被接管、内部错误或 panic）。
+func (s *Service) executeCall(ctx context.Context, r *run, tc ToolCall) (cont bool) {
+	defer func() {
+		if p := recover(); p != nil {
+			s.internalFail(ctx, r, fmt.Errorf("panic: %v\n%s", p, debug.Stack()))
+			cont = false
+		}
+	}()
 	now := s.d.Clock.Now()
 	var res tools.Result
 	var execErr error
@@ -118,11 +143,14 @@ func (s *Service) executeCall(ctx context.Context, r *run, tc ToolCall) bool {
 	case !ok || t.Kind != tools.Write:
 		res = tools.ErrorResult(apperr.ErrButlerConfirmInvalid)
 	default:
-		args, err := s.openArgs(tc)
+		args, secrets, err := s.openArgs(tc)
 		if err != nil {
 			s.log.Error("butler: open secret env", "conversation", r.convID, "tool_call", tc.ID, "err", err)
 			res = tools.ErrorResult(apperr.ErrButlerConfirmInvalid)
 			break
+		}
+		for _, v := range secrets {
+			r.addSecret(v)
 		}
 		wctx, cancel := context.WithTimeout(ctx, WriteToolTimeout)
 		res, execErr = t.Exec(wctx, tools.Caller{UserID: r.userID, IP: r.ip, IdemKey: "butler:" + tc.ID, Now: now, QuotedCents: tc.QuoteAmount}, args)
@@ -138,62 +166,87 @@ func (s *Service) executeCall(ctx context.Context, r *run, tc ToolCall) bool {
 		status, okRes, code = CallFailed, false, c
 	}
 	result := resultJSON(res.Content)
-	argsJSON := validJSONOr(tc.Args, `{}`)
-	diff := map[string]any{"tool": tc.Tool, "args": argsJSON, "status": status, "result_ref": res.Ref,
+	diff := map[string]any{"tool": tc.Tool, "args": validJSONOr(tc.Args, `{}`), "status": status, "result_ref": res.Ref,
 		"conversation_id": tc.ConversationID, "error_code": code}
+	blk := Block{Type: BlockToolResult, ToolCallID: tc.ID, ProviderCallID: tc.ProviderCallID, Name: tc.Tool, OK: okRes, Content: res.Content}
 
-	stale := false
-	wctx, cancel := dbctx(ctx)
-	defer cancel()
-	err := s.withTx(wctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(wctx, `UPDATE butler_conversations SET updated_at = $3 WHERE id = $1 AND run_token = $2`, r.convID, r.token, now)
-		if err != nil {
+	// 回写：调用行状态 + 审计 + 事实结果的 tool 消息都无条件提交（操作已经发生）；run_token 不匹配只意味着不再续跑。
+	record := func() (stale bool, err error) {
+		wctx, cancel := dbctx(ctx)
+		defer cancel()
+		err = s.withTx(wctx, func(tx pgx.Tx) error {
+			if _, err := s.lockConversation(wctx, tx, 0, r.convID); err != nil {
+				return err
+			}
+			tag, err := tx.Exec(wctx, `UPDATE butler_conversations SET updated_at = $3 WHERE id = $1 AND run_token = $2`, r.convID, r.token, now)
+			if err != nil {
+				return err
+			}
+			stale = tag.RowsAffected() == 0
+			if _, err := tx.Exec(wctx, `UPDATE butler_tool_calls SET status = $2, result = $3, result_ref = $4, executed_at = $5,
+				secret_env_enc = NULL WHERE id = $1`, tc.ID, status, []byte(result), res.Ref, now); err != nil {
+				return err
+			}
+			if err := audit.Record(wctx, tx, now, audit.Actor{UserID: r.userID, IP: r.ip}.Entry(AuditToolExecute, AuditTargetCall, tc.ID, diff)); err != nil {
+				return err
+			}
+			_, err = s.appendMessage(wctx, tx, r.convID, RoleTool, []Block{blk}, llm.EstimateTokens(res.Content), now)
 			return err
-		}
-		stale = tag.RowsAffected() == 0
-		if _, err := tx.Exec(wctx, `UPDATE butler_tool_calls SET status = $2, result = $3, result_ref = $4, executed_at = $5,
-			secret_env_enc = NULL WHERE id = $1`, tc.ID, status, []byte(result), res.Ref, now); err != nil {
-			return err
-		}
-		if err := audit.Record(wctx, tx, now, audit.Actor{UserID: r.userID, IP: r.ip}.Entry(AuditToolExecute, AuditTargetCall, tc.ID, diff)); err != nil {
-			return err
-		}
-		if err := s.AddUsage(wctx, tx, r.userID, s.DayOf(now), Usage{ToolCalls: 1}); err != nil {
-			return err
-		}
-		if stale {
-			return nil
-		}
-		blk := Block{Type: BlockToolResult, ToolCallID: tc.ID, ProviderCallID: tc.ProviderCallID, Name: tc.Tool, OK: okRes, Content: res.Content}
-		_, err = s.appendMessage(wctx, tx, r.convID, RoleTool, []Block{blk}, llm.EstimateTokens(res.Content), now)
-		return err
-	})
+		})
+		return stale, err
+	}
+	stale, err := record()
 	if err != nil {
+		s.log.Warn("butler: record tool result, retrying", "conversation", r.convID, "tool_call", tc.ID, "err", err)
+		stale, err = record()
+	}
+	if u := s.addUsageNow(ctx, r, Usage{ToolCalls: 1}); u != nil {
+		s.log.Error("butler: add usage", "conversation", r.convID, "err", u)
+	}
+	if err != nil {
+		// 兜底：至少把调用行定下来（真实结果）并清掉密文，审计尽力而为；本轮按内部错误结束
+		wctx, cancel := dbctx(ctx)
+		if _, e := s.pool.Exec(wctx, `UPDATE butler_tool_calls SET status = $2, result = $3, result_ref = $4, executed_at = $5,
+			secret_env_enc = NULL WHERE id = $1`, tc.ID, status, []byte(result), res.Ref, now); e != nil {
+			s.log.Error("butler: record tool result fallback", "tool_call", tc.ID, "err", e)
+		}
+		if e := audit.Record(wctx, s.pool, now, audit.Actor{UserID: r.userID, IP: r.ip}.Entry(AuditToolExecute, AuditTargetCall, tc.ID, diff)); e != nil {
+			s.log.Error("butler: audit fallback", "tool_call", tc.ID, "err", e)
+		}
+		cancel()
 		s.internalFail(ctx, r, err)
+		return false
+	}
+	if stale {
+		s.log.Warn("butler: stale run discarded", "conversation", r.convID)
 		return false
 	}
 	ev := ToolEvent{ID: tc.ID, Name: tc.Tool, Label: tools.Label(tc.Tool), Status: "ok"}
 	if !okRes {
 		ev.Status, ev.Message = "error", errMessage(res.Content)
 	}
-	if stale {
-		s.log.Warn("butler: stale run discarded", "conversation", r.convID)
-		return false
-	}
 	r.sink.Emit(EvTool, ev)
 	return true
 }
 
-// openArgs 把 secret_env_enc 里的真实值合并回落库的 args（*** 占位）。
-func (s *Service) openArgs(tc ToolCall) (json.RawMessage, error) {
+// addUsageNow 直接累加用量（不随 run_token 丢弃）。
+func (s *Service) addUsageNow(ctx context.Context, r *run, u Usage) error {
+	wctx, cancel := dbctx(ctx)
+	defer cancel()
+	return s.AddUsage(wctx, s.pool, r.userID, s.DayOf(s.d.Clock.Now()), u)
+}
+
+// openArgs 把 secret_env_enc 里的真实值合并回落库的 args（*** 占位），同时返回这些值（用于抹掉后续落库文本里的明文）。
+func (s *Service) openArgs(tc ToolCall) (json.RawMessage, map[string]string, error) {
 	if len(tc.SecretEnvEnc) == 0 {
-		return tc.Args, nil
+		return tc.Args, nil, nil
 	}
 	secrets, _, err := tools.OpenCard(s.d.Box, tc.SecretEnvEnc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return tools.MergeSecretEnv(tc.Args, secrets)
+	args, err := tools.MergeSecretEnv(tc.Args, secrets)
+	return args, secrets, err
 }
 
 // expireCall 把 pending 调用标 expired（清 secret_env_enc）并追加 tool 消息 {"ok":false,"code":"expired","message":msg}。

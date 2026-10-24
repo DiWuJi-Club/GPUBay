@@ -54,6 +54,8 @@ type Service struct {
 	running map[int64]struct{} // 本副本正在运行轮次的用户（每用户同时 1 轮）
 	sem     chan struct{}      // 本副本全局并发（MaxConcurrentRuns）
 
+	runTimeout time.Duration // 整轮超时（RunTimeout；测试可缩短）
+
 	failMu     sync.Mutex
 	failStreak int // 连续 LLM 失败次数（进程内）；成功一次清零
 }
@@ -74,6 +76,8 @@ func NewService(d Deps) *Service {
 		log:     d.Log,
 		running: map[int64]struct{}{},
 		sem:     make(chan struct{}, MaxConcurrentRuns),
+
+		runTimeout: RunTimeout,
 	}
 }
 

@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"runtime/debug"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -25,6 +28,7 @@ const (
 	TextIterationLimit = "这个问题我查了太多次还没有结论，请换个方式描述或联系客服"
 	TextRefusal        = "抱歉，这个问题我无法回答。"
 	TextInterrupted    = "本轮处理中断，请重试"
+	TextRunTimeout     = "这次处理时间太长，已停止，请重试"
 )
 
 // 写工具未执行时回填模型的结果文案（code：rejected / expired；mock 规则按 code 收尾）。
@@ -154,7 +158,7 @@ func (s *Service) Send(ctx context.Context, req SendRequest, sink Sink) (Convers
 	s.log.Info("butler: send", "conversation", conv.ID, "user", req.UserID, "chars", utf8.RuneCountInString(text))
 	sink.Emit(EvStart, StartEvent{ConversationID: conv.ID, MessageID: userMsg.ID})
 
-	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), RunTimeout)
+	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.runTimeout)
 	defer cancel()
 	s.runLoop(runCtx, &run{userID: req.UserID, convID: conv.ID, instanceID: req.Context.InstanceID, token: token, ip: req.IP,
 		sink: sink, used: used, limit: st.DailyTokenLimit, secrets: map[string]string{}})
@@ -169,7 +173,8 @@ func (s *Service) finalConv(ctx context.Context, userID int64, id string) (Conve
 }
 
 // run 是一轮（Send 或 Confirm 之后的续跑）的状态。secrets：本轮 generate_secret 的明文结果（tool_call_id → 内容），
-// 只在内存里替换历史中落库的 ***，让模型能在同一轮里用它部署。
+// 只在内存里替换历史中落库的 ***，让模型能在同一轮里用它部署。secretVals：本轮出现过的密钥明文（生成的密钥、
+// 确认卡 / 执行时的 secret 变量值），落库的 assistant 文本里把它们换成 ***（已流式推出的 delta 不变）。
 type run struct {
 	userID     int64
 	convID     string
@@ -180,6 +185,27 @@ type run struct {
 	used       int64 // 今日已用（轮开始时 + 本轮累加）
 	limit      int64
 	secrets    map[string]string
+	secretVals []string
+}
+
+// addSecret 记下一个需要从落库文本里抹掉的密钥明文（过短的值不记，避免误伤普通文字）。
+func (r *run) addSecret(v string) {
+	if len(v) >= 6 && !slices.Contains(r.secretVals, v) {
+		r.secretVals = append(r.secretVals, v)
+	}
+}
+
+// mask 把文本里出现的本轮密钥明文换成 ***（长的先换）。
+func (r *run) mask(text string) string {
+	if len(r.secretVals) == 0 || text == "" {
+		return text
+	}
+	vals := append([]string(nil), r.secretVals...)
+	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
+	for _, v := range vals {
+		text = strings.ReplaceAll(text, v, tools.SecretMask)
+	}
+	return text
 }
 
 type chatOut struct {
@@ -190,8 +216,19 @@ type chatOut struct {
 }
 
 // runLoop 是工具循环（规格 §5.2 第 4 步）：至多 MaxIterations 次模型请求；每次回写都比对 run_token，不匹配即放弃本轮。
+// 整轮超时（RunTimeout）→ 固定文案「这次处理时间太长，已停止，请重试」结束（不计 LLM 失败）；panic → 内部错误结束。
+// 续跑（Confirm 之后）不再检查每日预算：预算只在轮开始（Send）时判断，一轮内允许超出。
 func (s *Service) runLoop(ctx context.Context, r *run) {
+	defer func() {
+		if p := recover(); p != nil {
+			s.internalFail(ctx, r, fmt.Errorf("panic: %v\n%s", p, debug.Stack()))
+		}
+	}()
 	for iter := 0; iter < MaxIterations; iter++ {
+		if ctx.Err() != nil {
+			s.finishText(ctx, r, "", TextRunTimeout, 0, 0, DoneEndTurn)
+			return
+		}
 		hist, err := s.loadHistory(ctx, r.convID, r.secrets)
 		if err != nil {
 			s.internalFail(ctx, r, err)
@@ -203,11 +240,15 @@ func (s *Service) runLoop(ctx context.Context, r *run) {
 			Messages:      hist,
 			MaxTokens:     s.d.MaxOutputTokens,
 		}
-		if s.d.ToolsEnabled && s.d.Tools != nil {
+		if s.toolsOn() {
 			req.Tools = s.d.Tools.Defs()
 		}
 		out, err := s.chat(ctx, r, req)
 		if err != nil {
+			if ctx.Err() != nil { // 整轮超时（不是模型单次请求超时）：不算模型失败
+				s.finishText(ctx, r, out.text, TextRunTimeout, 0, 0, DoneEndTurn)
+				return
+			}
 			s.llmFailed(ctx, r, err)
 			return
 		}
@@ -342,12 +383,13 @@ func (s *Service) finishText(ctx context.Context, r *run, text, fixed string, in
 		extra += fixed
 		full += extra
 	}
+	stored := r.mask(full)
 	err := s.writeback(ctx, r, func(ctx context.Context, tx pgx.Tx, now time.Time) error {
 		if err := addConvTokens(ctx, tx, r.convID, in, outTok); err != nil {
 			return err
 		}
-		if full != "" {
-			if _, err := s.appendMessage(ctx, tx, r.convID, RoleAssistant, []Block{{Type: BlockText, Text: full}}, int(outTok), now); err != nil {
+		if stored != "" {
+			if _, err := s.appendMessage(ctx, tx, r.convID, RoleAssistant, []Block{{Type: BlockText, Text: stored}}, int(outTok), now); err != nil {
 				return err
 			}
 		}
@@ -379,7 +421,9 @@ func (s *Service) llmFailed(ctx context.Context, r *run, err error) {
 		s.log.Error("butler: add usage", "conversation", r.convID, "err", e)
 	}
 	s.noteFailure(wctx)
-	if e := s.writeback(ctx, r, func(ctx context.Context, tx pgx.Tx, now time.Time) error { return setStatus(ctx, tx, r.convID, ConvIdle, now) }); e != nil {
+	if e := s.writeback(ctx, r, func(ctx context.Context, tx pgx.Tx, now time.Time) error {
+		return setStatus(ctx, tx, r.convID, ConvIdle, now)
+	}); e != nil {
 		if !errors.Is(e, errStaleRun) {
 			s.log.Error("butler: reset after llm failure", "conversation", r.convID, "err", e)
 		}
@@ -392,7 +436,9 @@ func (s *Service) llmFailed(ctx context.Context, r *run, err error) {
 // internalFail：本轮的内部错误（数据库等）——记日志、尽力回到 idle、推 error 事件。
 func (s *Service) internalFail(ctx context.Context, r *run, err error) {
 	s.log.Error("butler: run failed", "conversation", r.convID, "err", err)
-	if e := s.writeback(ctx, r, func(ctx context.Context, tx pgx.Tx, now time.Time) error { return setStatus(ctx, tx, r.convID, ConvIdle, now) }); e != nil {
+	if e := s.writeback(ctx, r, func(ctx context.Context, tx pgx.Tx, now time.Time) error {
+		return setStatus(ctx, tx, r.convID, ConvIdle, now)
+	}); e != nil {
 		if !errors.Is(e, errStaleRun) {
 			s.log.Error("butler: reset after run failure", "conversation", r.convID, "err", e)
 		}
@@ -487,11 +533,9 @@ func (s *Service) handleTools(ctx context.Context, r *run, out chatOut, in, outT
 	caller := tools.Caller{UserID: r.userID, IP: r.ip, Now: now}
 	var uses, results []Block
 	var rows []ToolCall
+	var events []ToolEvent
 	var card *pendingCard
 	executed := 0
-	if out.text != "" {
-		uses = append(uses, Block{Type: BlockText, Text: out.text})
-	}
 	for _, c := range out.calls {
 		tcID := randx.ID("tc-", 12)
 		use := Block{Type: BlockToolUse, ToolCallID: tcID, ProviderCallID: c.ProviderCallID, Name: c.Name, Args: validJSONOr(c.Args, `{}`)}
@@ -504,7 +548,7 @@ func (s *Service) handleTools(ctx context.Context, r *run, out chatOut, in, outT
 		}
 		var t tools.Tool
 		known := false
-		if s.d.Tools != nil {
+		if s.toolsOn() { // SPARK_LLM_TOOLS=off：模型仍发来的工具调用一律按未知工具回填
 			t, known = s.d.Tools.Get(c.Name)
 		}
 		var norm json.RawMessage
@@ -540,6 +584,7 @@ func (s *Service) handleTools(ctx context.Context, r *run, out chatOut, in, outT
 					res.OK, res.Content, row.ResultRef = true, got.Content, got.Ref
 					if got.Secret {
 						r.secrets[tcID] = got.Content
+						r.addSecret(secretValue(got.Content))
 						res.Content = secretStored
 					}
 				}
@@ -566,6 +611,9 @@ func (s *Service) handleTools(ctx context.Context, r *run, out chatOut, in, outT
 					}
 					fail(tools.ErrorResult(err).Content)
 				} else {
+					for _, v := range cd.SecretEnv {
+						r.addSecret(v)
+					}
 					args := cd.ArgsStored
 					if len(args) == 0 || !json.Valid(args) {
 						args = norm
@@ -582,14 +630,20 @@ func (s *Service) handleTools(ctx context.Context, r *run, out chatOut, in, outT
 				}
 			}
 			if res.Content != "" {
+				// 没生成确认卡的写提议也落一行 failed（参数脱敏），后台轨迹与写操作数里能看到
 				use.Args = maskEnvArgs(use.Args)
+				rows = append(rows, ToolCall{ID: tcID, ConversationID: r.convID, UserID: r.userID, ProviderCallID: c.ProviderCallID,
+					Tool: c.Name, Kind: KindWrite, Args: use.Args, Status: CallFailed, Result: json.RawMessage(res.Content), CreatedAt: now})
 			}
 		}
 		uses = append(uses, use)
 		if res.Content != "" {
 			results = append(results, res)
-			r.sink.Emit(EvTool, ev)
+			events = append(events, ev)
 		}
+	}
+	if text := r.mask(out.text); text != "" {
+		uses = append([]Block{{Type: BlockText, Text: text}}, uses...)
 	}
 
 	err := s.writeback(ctx, r, func(ctx context.Context, tx pgx.Tx, now time.Time) error {
@@ -618,21 +672,26 @@ func (s *Service) handleTools(ctx context.Context, r *run, out chatOut, in, outT
 				return err
 			}
 		}
-		if executed > 0 {
-			if err := s.AddUsage(ctx, tx, r.userID, s.DayOf(now), Usage{ToolCalls: executed}); err != nil {
-				return err
-			}
-		}
 		if card != nil {
 			return setStatus(ctx, tx, r.convID, ConvAwaitingConfirm, now)
 		}
 		return nil
 	})
+	if executed > 0 { // 读工具确实执行了：计数不随 run_token 丢弃
+		wctx, cancel := dbctx(ctx)
+		if e := s.AddUsage(wctx, s.pool, r.userID, s.DayOf(now), Usage{ToolCalls: executed}); e != nil {
+			s.log.Error("butler: add usage", "conversation", r.convID, "err", e)
+		}
+		cancel()
+	}
 	if err != nil {
 		if !errors.Is(err, errStaleRun) {
 			s.internalFail(ctx, r, err)
 		}
 		return false
+	}
+	for _, ev := range events { // 提交之后再推，前端看到的步骤都已落库
+		r.sink.Emit(EvTool, ev)
 	}
 	if card != nil {
 		row := card.row
@@ -643,6 +702,18 @@ func (s *Service) handleTools(ctx context.Context, r *run, out chatOut, in, outT
 	}
 	return true
 }
+
+// secretValue 取 generate_secret 结果里的 secret 值。
+func secretValue(content string) string {
+	var m struct {
+		Secret string `json:"secret"`
+	}
+	_ = json.Unmarshal([]byte(StripWrapper(content)), &m)
+	return m.Secret
+}
+
+// toolsOn：开放工具（SPARK_LLM_TOOLS=on 且有注册表）。
+func (s *Service) toolsOn() bool { return s.d.ToolsEnabled && s.d.Tools != nil }
 
 // errMessage 取错误结果 JSON 的 message（取不到返回空）。
 func errMessage(content string) string {

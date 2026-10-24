@@ -250,8 +250,8 @@ func TestUserButlerStats(t *testing.T) {
 	}
 	tc := func(id, conv string, msg, user int64, kind, status string, at time.Time) {
 		t.Helper()
-		mustExec(`INSERT INTO butler_tool_calls (id, conversation_id, message_id, user_id, provider_call_id, tool, kind, args, status, created_at)
-			VALUES ($1, $2, $3, $4, 'call', 'renew_instance', $5, '{}', $6, $7)`, id, conv, msg, user, kind, status, at)
+		mustExec(`INSERT INTO butler_tool_calls (id, conversation_id, message_id, user_id, provider_call_id, tool, kind, args, status, created_at, decided_at)
+			VALUES ($1, $2, $3, $4, 'call', 'renew_instance', $5, '{}', $6, $7, CASE WHEN $5 = 'write' AND $6 <> 'pending' AND $6 <> 'expired' THEN $7::timestamptz END)`, id, conv, msg, user, kind, status, at)
 	}
 	tc("tc-1", "cv-a", msgA, uid, KindWrite, CallExecuted, now)
 	tc("tc-2", "cv-a", msgA, uid, KindWrite, CallFailed, now.Add(-time.Hour))
@@ -260,6 +260,8 @@ func TestUserButlerStats(t *testing.T) {
 	tc("tc-5", "cv-a", msgA, uid, KindRead, CallExecuted, now)                    // 读工具：不计
 	tc("tc-6", "cv-a", msgA, uid, KindWrite, CallExecuted, since.Add(-time.Hour)) // 早于 since：不计
 	tc("tc-7", "cv-c", msgC, other, KindWrite, CallExecuted, now)                 // 他人：不计
+	mustExec(`INSERT INTO butler_tool_calls (id, conversation_id, message_id, user_id, provider_call_id, tool, kind, args, status, created_at)
+		VALUES ('tc-8', 'cv-a', $1, $2, 'call', 'renew_instance', 'write', '{}', 'failed', $3)`, msgA, uid, now) // 没生成确认卡的写提议：不计
 
 	if err := s.AddUsage(ctx, s.pool, uid, s.DayOf(now), Usage{InputTokens: 100, OutputTokens: 20}); err != nil {
 		t.Fatal(err)

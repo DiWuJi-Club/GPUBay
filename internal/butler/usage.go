@@ -147,7 +147,8 @@ func (s *Store) UsageByUser(ctx context.Context, day time.Time, p paging.Page) (
 // UserButlerStats 返回用户的管家统计。两个时间窗口径不同：
 //   - token 来自按日汇总的 butler_usage，从 since 所在东八区自然日的 00:00 算起（含当天整天）；
 //   - 写操作按 butler_tool_calls.created_at ≥ since 的精确时刻计，只计用户确认过的
-//     （approved 执行中 / executed / failed），pending / rejected / expired 不计。
+//     （approved 执行中 / executed / failed，且 decided_at 非空），pending / rejected / expired 与没生成确认卡就失败的写提议
+//     （failed 但 decided_at 为空）不计。
 //
 // 对话数不受 since 限制。
 func (s *Store) UserButlerStats(ctx context.Context, userID int64, since time.Time) (UserStats, error) {
@@ -156,7 +157,7 @@ func (s *Store) UserButlerStats(ctx context.Context, userID int64, since time.Ti
 		(SELECT count(*) FROM butler_conversations WHERE user_id = $1),
 		(SELECT coalesce(sum(input_tokens + output_tokens), 0) FROM butler_usage WHERE user_id = $1 AND day >= $2::date),
 		(SELECT count(*) FROM butler_tool_calls WHERE user_id = $1 AND kind = 'write'
-			AND status IN ('approved', 'executed', 'failed') AND created_at >= $3)`,
+			AND status IN ('approved', 'executed', 'failed') AND decided_at IS NOT NULL AND created_at >= $3)`,
 		userID, dateParam(since), since).Scan(&st.Conversations, &st.Tokens30d, &st.WriteCalls30d)
 	return st, err
 }

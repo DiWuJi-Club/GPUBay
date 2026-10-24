@@ -10,6 +10,11 @@ import (
 // OmittedContent 是历史超出 token 上限时替换旧工具结果的内容。
 const OmittedContent = "（已省略）"
 
+// historyReserve 是 MaxPromptTokens 里留给系统提示与 23 个工具声明的 token；历史的预算 = MaxPromptTokens − historyReserve。
+const historyReserve = 6000
+
+const historyBudget = MaxPromptTokens - historyReserve
+
 // msgTokens 估算一条消息的 token（文本 + 工具参数 + 工具结果，每条另加固定开销）。
 func msgTokens(m Message) int {
 	var b strings.Builder
@@ -24,7 +29,7 @@ func msgTokens(m Message) int {
 // trimHistory 按「已做出的裁定·历史裁剪」裁剪 seq 升序的历史（输入不被修改）：
 //  1. 取最近 MaxHistoryMessages 条；窗口开头的 tool 消息（它们的 tool_use 在窗口外）一起丢掉，保证 tool_use / tool_result 成对；
 //  2. 对话的第一条 user 消息不在窗口里时放到最前面；
-//  3. 估算 token > MaxPromptTokens 时，从旧到新把 tool_result 的 content 换成「（已省略）」；
+//  3. 估算 token > historyBudget（MaxPromptTokens 减去系统提示与工具声明的预留）时，从旧到新把 tool_result 的 content 换成「（已省略）」；
 //  4. 仍超时从旧到新丢整条（第一条 user 消息与最后一条消息不丢；丢 assistant 时连同紧随其后的 tool 消息一起丢）。
 func trimHistory(msgs []Message) []Message {
 	if len(msgs) == 0 {
@@ -51,11 +56,11 @@ func trimHistory(msgs []Message) []Message {
 	for _, m := range out {
 		total += msgTokens(m)
 	}
-	if total <= MaxPromptTokens {
+	if total <= historyBudget {
 		return out
 	}
 	// 3. 省略旧工具结果（复制块，不改调用方的切片）
-	for i := 0; i < len(out) && total > MaxPromptTokens; i++ {
+	for i := 0; i < len(out) && total > historyBudget; i++ {
 		if out[i].Role != RoleTool {
 			continue
 		}
@@ -78,7 +83,7 @@ func trimHistory(msgs []Message) []Message {
 	if len(out) > 0 && out[0].Role == RoleUser {
 		lo = 1
 	}
-	for total > MaxPromptTokens {
+	for total > historyBudget {
 		i := lo
 		if i >= len(out)-1 {
 			break

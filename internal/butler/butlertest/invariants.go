@@ -21,7 +21,7 @@ type block struct {
 //   - awaiting_confirm 的对话恰有 1 条 pending 调用；idle 的对话没有 pending；
 //   - running 的对话 run_token 非空；非 running 的对话 run_token 为空；
 //   - 每个 tool_use 块都有对应的 tool_result（pending / approved 的写调用除外）；
-//   - secret_env_enc 只出现在 pending / approved 的调用上；
+//   - approved（已确认、执行中）的调用只出现在 running 的对话里；secret_env_enc 只出现在 pending 或「approved 且对话 running」的调用上；
 //   - generate_secret 的成功结果落库为 {"secret":"***"}（明文不落库）。
 func CheckInvariants(t testing.TB, pool *pgxpool.Pool) {
 	t.Helper()
@@ -62,11 +62,19 @@ func CheckInvariants(t testing.TB, pool *pgxpool.Pool) {
 	}
 
 	var bad int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM butler_tool_calls WHERE secret_env_enc IS NOT NULL AND status NOT IN ('pending', 'approved')`).Scan(&bad); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM butler_tool_calls t JOIN butler_conversations c ON c.id = t.conversation_id
+		WHERE t.secret_env_enc IS NOT NULL AND NOT (t.status = 'pending' OR (t.status = 'approved' AND c.status = 'running'))`).Scan(&bad); err != nil {
 		t.Fatalf("invariants: %v", err)
 	}
 	if bad != 0 {
 		t.Errorf("invariant: %d 条已结束的工具调用仍有 secret_env_enc", bad)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM butler_tool_calls t JOIN butler_conversations c ON c.id = t.conversation_id
+		WHERE t.status = 'approved' AND c.status <> 'running'`).Scan(&bad); err != nil {
+		t.Fatalf("invariants: %v", err)
+	}
+	if bad != 0 {
+		t.Errorf("invariant: %d 条 approved 调用所在的对话不在 running", bad)
 	}
 
 	open := map[string]bool{} // pending / approved：允许没有 tool_result

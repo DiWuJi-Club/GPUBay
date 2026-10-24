@@ -34,6 +34,7 @@ type fakeRental struct {
 	renewRes   rental.Order
 	renewErr   error
 	released   []string
+	onRenew    func() // 执行续费时先调用（模拟执行期间的外部变化）
 }
 
 func (f *fakeRental) own(userID int64, id string) (rental.Instance, error) {
@@ -73,7 +74,7 @@ func (f *fakeRental) CancelQuote(context.Context, int64, string) (rental.CancelQ
 	return rental.CancelQuote{}, apperr.ErrCancelNotAllowed
 }
 func (f *fakeRental) ListOrders(context.Context, int64, int) ([]rental.Order, error) { return nil, nil }
-func (f *fakeRental) AvailableNow(context.Context, int64) (int, error)              { return 1, nil }
+func (f *fakeRental) AvailableNow(context.Context, int64) (int, error)               { return 1, nil }
 func (f *fakeRental) Availability(context.Context, rental.AvailabilityQuery) (rental.Availability, error) {
 	return rental.Availability{}, nil
 }
@@ -81,6 +82,9 @@ func (f *fakeRental) PlaceBatch(context.Context, rental.BatchRequest) (rental.Ba
 	return rental.BatchResult{}, apperr.ErrNoCapacity
 }
 func (f *fakeRental) RenewQuantity(_ context.Context, _ int64, _ string, _ catalog.Duration, _ int, idem string) (rental.Order, error) {
+	if f.onRenew != nil {
+		f.onRenew()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.renewCalls = append(f.renewCalls, idem)
@@ -112,7 +116,9 @@ type fakeApps struct {
 	created []appdeploy.CreateRequest
 }
 
-func (f *fakeApps) CatalogViews(context.Context, bool) ([]appdeploy.CatalogView, error) { return f.catalog, nil }
+func (f *fakeApps) CatalogViews(context.Context, bool) ([]appdeploy.CatalogView, error) {
+	return f.catalog, nil
+}
 func (f *fakeApps) CatalogViewBySlug(_ context.Context, slug string) (appdeploy.CatalogView, error) {
 	for _, v := range f.catalog {
 		if v.Slug == slug {
@@ -121,8 +127,12 @@ func (f *fakeApps) CatalogViewBySlug(_ context.Context, slug string) (appdeploy.
 	}
 	return appdeploy.CatalogView{}, apperr.ErrAppNotFound
 }
-func (f *fakeApps) ListForInstance(context.Context, string) ([]appdeploy.Deployment, error) { return nil, nil }
-func (f *fakeApps) Views(context.Context, []appdeploy.Deployment) ([]appdeploy.View, error) { return nil, nil }
+func (f *fakeApps) ListForInstance(context.Context, string) ([]appdeploy.Deployment, error) {
+	return nil, nil
+}
+func (f *fakeApps) Views(context.Context, []appdeploy.Deployment) ([]appdeploy.View, error) {
+	return nil, nil
+}
 func (f *fakeApps) Summaries(context.Context, []string) (map[string][]appdeploy.Summary, error) {
 	return map[string][]appdeploy.Summary{}, nil
 }
@@ -164,8 +174,10 @@ func (fakeCatalog) Quote(_ context.Context, _ db.Querier, _ int64, d catalog.Dur
 	}
 	return 0, apperr.BadRequest("该规格暂不支持此租期")
 }
-func (fakeCatalog) ProductName(context.Context, int64) (string, error) { return "DGX Spark 整机", nil }
-func (fakeCatalog) ImageName(context.Context, int64) (string, error)   { return "PyTorch", nil }
+func (fakeCatalog) ProductName(context.Context, int64) (string, error) {
+	return "DGX Spark 整机", nil
+}
+func (fakeCatalog) ImageName(context.Context, int64) (string, error)    { return "PyTorch", nil }
 func (fakeCatalog) ListImages(context.Context) ([]catalog.Image, error) { return nil, nil }
 
 type fakeWallet struct{}
@@ -357,3 +369,44 @@ func codeOf(err error) string {
 }
 
 var errInsufficient = apperr.ErrInsufficientBalance
+
+// funcProvider 用函数生成每次回复（需要读请求内容的测试用）。
+type funcProvider struct {
+	name  string
+	mu    sync.Mutex
+	calls int
+	fn    func(n int, req llm.Request, emit func(llm.Event)) error
+}
+
+func (p *funcProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "mock"
+}
+func (p *funcProvider) Model() string { return "fn" }
+func (p *funcProvider) Chat(ctx context.Context, req llm.Request, emit func(llm.Event)) error {
+	p.mu.Lock()
+	p.calls++
+	n := p.calls
+	p.mu.Unlock()
+	return p.fn(n, req, emit)
+}
+
+func emitText(emit func(llm.Event), text string) {
+	emit(llm.Event{Type: llm.EvText, Text: text})
+	emit(llm.Event{Type: llm.EvUsage, Usage: &llm.Usage{InputTokens: 10, OutputTokens: 5}})
+	emit(llm.Event{Type: llm.EvDone, StopReason: llm.StopEndTurn})
+}
+
+func emitCalls(emit func(llm.Event), calls ...llm.ToolCall) {
+	for i := range calls {
+		c := calls[i]
+		if c.ProviderCallID == "" {
+			c.ProviderCallID = "fn-" + c.Name
+		}
+		emit(llm.Event{Type: llm.EvTool, ToolCall: &c})
+	}
+	emit(llm.Event{Type: llm.EvUsage, Usage: &llm.Usage{InputTokens: 10, OutputTokens: 5}})
+	emit(llm.Event{Type: llm.EvDone, StopReason: llm.StopToolUse})
+}

@@ -311,8 +311,16 @@ func TestSecondWriteRejected(t *testing.T) {
 	if len(res) != 2 || res[0].OK || !strings.Contains(res[0].Content, `"code":"one_write_at_a_time"`) || !res[1].OK {
 		t.Fatalf("results = %+v", res)
 	}
-	if n := e.count(`SELECT count(*) FROM butler_tool_calls WHERE conversation_id = $1 AND kind = 'write'`, c.ID); n != 1 {
+	// 待确认 1 行 + 被拒的第二个写提议 1 行（failed，没有 decided_at）
+	if n := e.count(`SELECT count(*) FROM butler_tool_calls WHERE conversation_id = $1 AND kind = 'write'`, c.ID); n != 2 {
 		t.Fatalf("write rows = %d", n)
+	}
+	if n := e.count(`SELECT count(*) FROM butler_tool_calls WHERE conversation_id = $1 AND tool = 'release_instance' AND status = 'failed'
+		AND decided_at IS NULL AND result->>'code' = 'one_write_at_a_time'`, c.ID); n != 1 {
+		t.Fatal("被拒的写提议没有落 failed 行")
+	}
+	if st, _ := e.svc.UserButlerStats(context.Background(), e.owner, e.clk.Now().Add(-time.Hour)); st.WriteCalls30d != 0 {
+		t.Fatalf("未确认的写提议计入了写操作数: %+v", st)
 	}
 	butlertest.CheckInvariants(t, e.svc.pool)
 }
@@ -354,8 +362,13 @@ func TestInvalidArgsFedBack(t *testing.T) {
 			t.Fatalf("tool event = %+v", ev)
 		}
 	}
-	if n := e.count(`SELECT count(*) FROM butler_tool_calls WHERE conversation_id = $1`, c.ID); n != 2 { // 两个读工具 failed；未知工具 / 未成卡的写工具不落行
+	// 两个读工具 failed + 未成卡的写提议 failed（参数脱敏）；未知工具不落行
+	if n := e.count(`SELECT count(*) FROM butler_tool_calls WHERE conversation_id = $1 AND status = 'failed'`, c.ID); n != 3 {
 		t.Fatalf("tool_call rows = %d", n)
+	}
+	if n := e.count(`SELECT count(*) FROM butler_tool_calls WHERE conversation_id = $1 AND kind = 'write' AND tool = 'renew_instance'
+		AND result->>'code' = 'not_found'`, c.ID); n != 1 {
+		t.Fatal("未成卡的写提议没有落行")
 	}
 	butlertest.CheckInvariants(t, e.svc.pool)
 }

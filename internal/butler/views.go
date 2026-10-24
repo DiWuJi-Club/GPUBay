@@ -99,7 +99,7 @@ func ResultSummary(content string) string {
 }
 
 // toolStatuses 计算每个 tool_use 的前端状态（ok | error | rejected | expired | pending | running）：
-// 写调用按 butler_tool_calls.status（executed → ok，failed → error，rejected / expired 原样，pending / approved → pending）；
+// 写调用按 butler_tool_calls.status（executed → ok，failed → error，rejected / expired 原样，pending → pending，approved（执行中）→ running）；
 // 读调用（及没有行的调用）按对应 tool_result.ok；还没有结果时对话 running → running，否则 error。
 func toolStatuses(msgs []Message, calls []ToolCall, convStatus string) map[string]string {
 	results := map[string]bool{}
@@ -129,7 +129,9 @@ func toolStatuses(msgs []Message, calls []ToolCall, convStatus string) map[strin
 					out[id] = "error"
 				case CallRejected, CallExpired:
 					out[id] = row.Status
-				default: // pending / approved
+				case CallApproved: // 已确认、正在执行
+					out[id] = "running"
+				default: // pending
 					out[id] = "pending"
 				}
 				continue

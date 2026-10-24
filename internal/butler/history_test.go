@@ -97,8 +97,9 @@ func TestHistoryTokenBudget(t *testing.T) {
 			}
 		}
 	}
-	// 总 ≈ 78k > 60k：从旧到新省略，省到 ≤ 60k 为止 → 恰好省略最旧的 1 条
-	if omitted != 1 || out[2].Content[0].Content != OmittedContent || out[8].Content[0].Content != big {
+	// 总 ≈ 78k > 历史预算 54k（60k − 6k 预留）：从旧到新省略，省到 ≤ 54k 为止 → 恰好省略最旧的 2 条
+	if omitted != 2 || out[2].Content[0].Content != OmittedContent || out[4].Content[0].Content != OmittedContent ||
+		out[6].Content[0].Content != big || out[8].Content[0].Content != big {
 		t.Fatalf("omitted = %d", omitted)
 	}
 	if msgs[2].Content[0].Content != big {
