@@ -1,10 +1,9 @@
 package adminapi
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/csvx"
 	"spark-cloud/internal/platform/httpx"
+	"spark-cloud/internal/platform/tz"
 )
 
 // llmRoutes Token 商城后台接口（计划 9 规格 §10.2）。角色：模型只读全员、改动 super（上下线另要 TOTP）；
@@ -173,13 +173,21 @@ func (s *Server) handleLLMNodes(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	list, err := s.LLM.ListNodes(r.Context(), llm.NodeFilter{ModelID: mid, State: r.URL.Query().Get("state")})
+	state := r.URL.Query().Get("state")
+	if state != "" && state != "all" && !slices.Contains(llmNodeStates, state) {
+		s.writeError(w, r, apperr.BadRequest("state 只能是节点状态或 all"))
+		return
+	}
+	list, err := s.LLM.ListNodes(r.Context(), llm.NodeFilter{ModelID: mid, State: state})
 	if err != nil {
 		s.writeError(w, r, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.List(list))
 }
+
+var llmNodeStates = []string{llm.NodeProvisioning, llm.NodeReady, llm.NodeUnhealthy, llm.NodeDraining, llm.NodeRemoving,
+	llm.NodeRemoved, llm.NodeFailed}
 
 func (s *Server) handleLLMNode(w http.ResponseWriter, r *http.Request) {
 	d, err := s.LLM.GetNode(r.Context(), chi.URLParam(r, "id"))
@@ -227,45 +235,6 @@ func (s *Server) handleLLMRemoveNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, n)
-}
-
-// checkPoolLeave 机组变更前调用：ids 中当前在 Token 服务池、且将离开池（target 不是池）的机器上有非终态节点或未结束的系统实例
-// → apperr.ErrLLMPoolMachineBusy（规格 §3.3）。from 非 nil 时只处理从该机组移出的情形（DELETE /groups/{id}/machines）。
-// LLM 未装配或没有池机组时不检查。检查在机组事务之外（裁定：rental / fleet 不依赖 llm）。
-func (s *Server) checkPoolLeave(ctx context.Context, ids []int64, from, target *int64) error {
-	if s.LLM == nil || len(ids) == 0 {
-		return nil
-	}
-	poolID, err := s.Fleet.LLMPoolGroupID(ctx, s.Fleet.Pool())
-	if errors.Is(err, apperr.ErrNotFound) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if (from != nil && *from != poolID) || (target != nil && *target == poolID) {
-		return nil
-	}
-	for _, id := range ids {
-		m, err := s.Fleet.Get(ctx, s.Fleet.Pool(), id)
-		if errors.Is(err, apperr.ErrNotFound) {
-			continue // 不存在的机器交给机组操作本身处理
-		}
-		if err != nil {
-			return err
-		}
-		if m.GroupID == nil || *m.GroupID != poolID {
-			continue
-		}
-		busy, err := s.LLM.MachineHasLiveNode(ctx, id)
-		if err != nil {
-			return err
-		}
-		if busy {
-			return apperr.ErrLLMPoolMachineBusy
-		}
-	}
-	return nil
 }
 
 // ---- 账户与 Key ----
@@ -455,8 +424,22 @@ func (s *Server) handleLLMUsageExport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLLMUsageDaily 按天汇总：缺省 from = 末日（to 所在自然日，缺省今天）往前 6 天的 0 点，即含今天共 7 个自然日。
 func (s *Server) handleLLMUsageDaily(w http.ResponseWriter, r *http.Request) {
-	from, to, err := s.llmWindow(r)
+	fromP, toP, err := parseRange(r)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	if fromP == nil {
+		last := s.Clock.Now()
+		if toP != nil {
+			last = toP.Add(-time.Nanosecond)
+		}
+		d := tz.DayStart(last).AddDate(0, 0, -6)
+		fromP = &d
+	}
+	from, to, err := llm.UsageWindow(fromP, toP, s.Clock.Now())
 	if err != nil {
 		s.writeError(w, r, err)
 		return

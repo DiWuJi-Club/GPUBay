@@ -3,6 +3,7 @@ package adminapi_test
 import (
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"spark-cloud/internal/llm"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/randx"
+	"spark-cloud/internal/platform/tz"
 	"spark-cloud/internal/rental"
 )
 
@@ -275,6 +277,12 @@ func TestAdminLLMPoolAndNodes(t *testing.T) {
 	if code, out := ops.do("GET", "/llm/nodes?state=draining", nil); code != 200 || len(out["items"].([]any)) != 0 {
 		t.Fatalf("nodes draining = %d %v", code, out)
 	}
+	if code, out := ops.do("GET", "/llm/nodes?state=all", nil); code != 200 || len(out["items"].([]any)) != 1 {
+		t.Fatalf("nodes all = %d %v", code, out)
+	}
+	if code, out := ops.do("GET", "/llm/nodes?state=bogus", nil); code != 400 || codeOf(out) != "bad_request" {
+		t.Fatalf("nodes bogus state = %d %v", code, out)
+	}
 	if code, out := ops.do("GET", "/llm/nodes/node-missing", nil); code != 404 || codeOf(out) != "llm_node_not_found" {
 		t.Fatalf("missing node = %d %v", code, out)
 	}
@@ -330,7 +338,8 @@ func TestAdminLLMAccountsUsageExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := e.llm.CreateKey(e.ctx, other, llm.KeyInput{Name: "测试"}, "1.2.3.4"); err != nil {
+	_, otherKey, err := e.llm.CreateKey(e.ctx, other, llm.KeyInput{Name: "测试"}, "1.2.3.4")
+	if err != nil {
 		t.Fatal(err)
 	}
 	record := func(req string, cost int64) {
@@ -496,6 +505,26 @@ func TestAdminLLMAccountsUsageExport(t *testing.T) {
 		out["items"].([]any)[0].(map[string]any)["user_id"].(float64) != float64(other) {
 		t.Fatalf("accounts debt = %d %v", code, out)
 	}
+
+	// 按天汇总的缺省窗口 = 含今天共 7 个自然日（from = 今天 0 点 − 6 天）
+	start := tz.DayStart(e.clk.Now()).AddDate(0, 0, -6)
+	for i, at := range []time.Time{start.Add(time.Minute), start.Add(-time.Minute)} {
+		if err := e.llm.RecordUsage(e.ctx, llm.Usage{RequestID: fmt.Sprintf("req-old%013d", i), UserID: other, KeyID: otherKey.ID, ModelID: m.ID,
+			Endpoint: llm.EndpointChat, PromptTokens: 1, CompletionTokens: 1, InputPrice: 100, OutputPrice: 400, CostMicro: 500,
+			Status: llm.UsageOK, HTTPStatus: 200, CreatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out = fin.do("GET", "/llm/usage/daily?group_by=user", nil)
+	var days []string
+	for _, x := range out["items"].([]any) {
+		if r := x.(map[string]any); r["user_id"].(float64) == float64(other) {
+			days = append(days, r["day"].(string))
+		}
+	}
+	if code != 200 || !slices.Equal(days, []string{start.In(cstZone).Format("2006-01-02")}) {
+		t.Fatalf("daily default window = %d %v (other's days %v)", code, out, days)
+	}
 }
 
 var cstZone = time.FixedZone("CST", 8*3600)
@@ -539,6 +568,9 @@ func TestAdminUsersHideSystem(t *testing.T) {
 	sys := itoa(e.systemUserID)
 	if code, out := ops.do("POST", "/users/"+sys+"/ban", map[string]any{"reason": "测试"}); code != 409 || codeOf(out) != "invalid_state" {
 		t.Fatalf("ban system = %d %v", code, out)
+	}
+	if code, out := ops.do("POST", "/users/"+sys+"/unban", map[string]any{}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("unban system = %d %v", code, out)
 	}
 	if code, out := fin.do("POST", "/users/"+sys+"/adjust", map[string]any{"amount": 100, "remark": "x", "totp": fin.totp()}); code != 409 || codeOf(out) != "invalid_state" {
 		t.Fatalf("adjust system = %d %v", code, out)

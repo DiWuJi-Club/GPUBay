@@ -122,11 +122,6 @@ func (s *Server) handleAssignMachines(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	// 加入别的机组 = 移出 Token 服务池：池里有节点的机器不能被挪走
-	if err := s.checkPoolLeave(r.Context(), req.MachineIDs, nil, &id); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
 	if err := s.Fleet.AssignMachines(r.Context(), s.actor(r), id, req.MachineIDs); err != nil {
 		s.writeError(w, r, err)
 		return
@@ -142,10 +137,6 @@ func (s *Server) handleUnassignMachines(w http.ResponseWriter, r *http.Request) 
 	}
 	var req machineIDsRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	if err := s.checkPoolLeave(r.Context(), req.MachineIDs, &id, nil); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
@@ -192,12 +183,6 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 	if !in.SetGroup && in.DisplayName == nil {
 		s.writeError(w, r, apperr.BadRequest("请提供 group_id 或 display_name"))
 		return
-	}
-	if in.SetGroup {
-		if err := s.checkPoolLeave(r.Context(), []int64{id}, nil, in.GroupID); err != nil {
-			s.writeError(w, r, err)
-			return
-		}
 	}
 	m, err := s.Fleet.UpdateMachine(r.Context(), s.actor(r), id, in)
 	if err != nil {

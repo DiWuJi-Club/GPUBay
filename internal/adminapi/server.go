@@ -65,7 +65,7 @@ type Server struct {
 	Gateway       *agentgw.Server    // 机器接入命令与撤销（计划 2）
 	Apps          *appdeploy.Service // 应用部署（计划 7）：部署列表 / 详情 / 强制卸载、实例详情与仪表盘
 	AppCatalog    *appdeploy.Catalog // 应用目录（计划 7）：应用、版本、发布、预拉取、覆盖率
-	LLM           *llm.Service       // Token 商城（计划 9）；nil 时不注册 /llm/*，仪表盘 / 用户详情不带 llm 字段，机组变更不做节点检查
+	LLM           *llm.Service       // Token 商城（计划 9）；nil 时不注册 /llm/*，仪表盘 / 用户详情不带 llm 字段（池机器移出的节点检查在 fleet 的机组事务里）
 	Clock         clock.Clock
 	Log           *slog.Logger
 	SecureCookie  bool                                     // 生产环境为 true：Cookie 仅经 HTTPS 发送

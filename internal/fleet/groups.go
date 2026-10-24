@@ -291,6 +291,9 @@ func (s *Service) AssignMachines(ctx context.Context, actor audit.Actor, groupID
 		if len(previous) != len(ids) {
 			return apperr.BadRequest("有机器不存在")
 		}
+		if err := poolLeaveBusy(ctx, tx, ids, &groupID); err != nil {
+			return err
+		}
 		// 机组在 GetGroup 之后被并发删除时外键检查失败，按机组不存在处理。
 		if _, err := tx.Exec(ctx, `UPDATE machines SET group_id = $1, updated_at = $3 WHERE id = ANY($2)`, groupID, ids, now); err != nil {
 			if db.IsForeignKeyViolation(err) {
@@ -301,6 +304,30 @@ func (s *Service) AssignMachines(ctx context.Context, actor audit.Actor, groupID
 		return audit.Record(ctx, tx, now, actor.Entry("group.assign", "group", strconv.FormatInt(groupID, 10),
 			map[string]any{"machine_ids": ids, "previous_group_ids": previous}))
 	})
+}
+
+// poolLeaveBusy 机组变更（计划 9 规格 §3.3）：ids 中当前在 Token 服务池（purpose='llm'）、且将离开池（target 为 nil 或不是池）的机器上
+// 有未结束的系统实例或非终态节点（llm_nodes，按 SQL 读，不依赖 llm 包）→ apperr.ErrLLMPoolMachineBusy。
+// 调用方须已在本事务里对这些机器行 FOR NO KEY UPDATE：rental.PlaceSystem 也先锁机器行并复核 group_id，
+// 所以检查与改组之间不会有新的系统实例 / 节点插进来。
+func poolLeaveBusy(ctx context.Context, tx pgx.Tx, ids []int64, target *int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	var busy bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM machines m JOIN machine_groups g ON g.id = m.group_id AND g.purpose = 'llm'
+		WHERE m.id = ANY($1) AND ($2::bigint IS NULL OR g.id <> $2)
+			AND (EXISTS (SELECT 1 FROM instances i WHERE i.machine_id = m.id AND i.system
+					AND i.state IN ('creating', 'running', 'stopped', 'wiping'))
+				OR EXISTS (SELECT 1 FROM llm_nodes n WHERE n.machine_id = m.id AND n.state NOT IN ('removed', 'failed'))))`,
+		ids, target).Scan(&busy)
+	if err != nil {
+		return err
+	}
+	if busy {
+		return apperr.ErrLLMPoolMachineBusy
+	}
+	return nil
 }
 
 // UnassignMachines 把机器移出机组（只影响当前确实在该组的机器；审计只记实际移出的）。
@@ -314,7 +341,19 @@ func (s *Service) UnassignMachines(ctx context.Context, actor audit.Actor, group
 		if _, err := s.GetGroup(ctx, tx, groupID); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `UPDATE machines SET group_id = NULL, updated_at = $3 WHERE id = ANY($2) AND group_id = $1 RETURNING id`, groupID, ids, now)
+		// 先锁住确实在该组的机器（与 rental.PlaceSystem 同一把机器行锁），再查池内节点
+		rows, err := tx.Query(ctx, `SELECT id FROM machines WHERE id = ANY($2) AND group_id = $1 ORDER BY id FOR NO KEY UPDATE`, groupID, ids)
+		if err != nil {
+			return err
+		}
+		inGroup, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			return err
+		}
+		if err := poolLeaveBusy(ctx, tx, inGroup, nil); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `UPDATE machines SET group_id = NULL, updated_at = $3 WHERE id = ANY($2) AND group_id = $1 RETURNING id`, groupID, ids, now)
 		if err != nil {
 			return err
 		}
@@ -365,6 +404,9 @@ func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64
 				if _, err := s.GetGroup(ctx, tx, *groupID); err != nil {
 					return err
 				}
+			}
+			if err := poolLeaveBusy(ctx, tx, []int64{id}, groupID); err != nil {
+				return err
 			}
 		}
 		if in.DisplayName != nil {
