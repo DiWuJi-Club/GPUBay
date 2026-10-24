@@ -1,8 +1,10 @@
 -- +goose Up
 -- 计划 9：Token 商城。系统账号（users.system）与系统实例（instances.system）、Token 服务池（machine_groups.purpose='llm'）、
 -- 内部应用（apps.internal）、模型 / 节点 / 账户 / API Key / 结算 / 用量明细 / 按天汇总、钱包流水类型 llm_pay。
--- Down 在以下情况拒绝：仍有 Token 消费流水（wallet_ledger kind='llm_pay'，流水只追加）；仍有非终态节点（请先在后台下线）。
+-- Down 在以下情况拒绝：仍有 Token 消费流水（wallet_ledger kind='llm_pay'，流水只追加）；仍有非终态节点（请先在后台下线）；
+-- 仍有未结束的系统实例（节点已 failed / removed 但 ReleaseSystem 尚未洗完）。
 -- Down 保留系统账号行与池机组行（前者仍无法登录，后者变成普通不可见机组）；因此 Up 对这两行按唯一键 upsert，往返可重放。
+-- 注意：若运营此前恰好手工建过名为「Token 服务池」的机组，Up 会把它接管为池（purpose='llm'、不可见）。
 
 -- 系统账号与系统实例
 ALTER TABLE users ADD COLUMN system BOOLEAN NOT NULL DEFAULT false;      -- 平台内部账号：不能登录、不在用户列表默认筛选里
@@ -189,6 +191,9 @@ BEGIN
     END IF;
     IF EXISTS (SELECT 1 FROM llm_nodes WHERE state NOT IN ('removed', 'failed')) THEN
         RAISE EXCEPTION '仍有运行中的节点，请先在后台下线';
+    END IF;
+    IF EXISTS (SELECT 1 FROM instances WHERE system AND state IN ('creating', 'running', 'stopped', 'wiping')) THEN
+        RAISE EXCEPTION '仍有平台节点实例，请先等待释放完成';
     END IF;
 END $$;
 -- +goose StatementEnd

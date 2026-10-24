@@ -71,6 +71,7 @@ var invariants = []invariant{
 		LIMIT 5`}},
 	// 5. llm_usage_daily 各列 == 已结算 llm_usage 按 (day, user, model) 的聚合。
 	//    只核对仍有已结算明细的最早一天及之后（更早的明细已按 90 天清理）。
+	//    注意：清理按批删除，最早剩余的那一天可能只删了一部分——与第 2 条一样，本条只在清理开始前严格成立。
 	{5, []string{`
 		WITH agg AS (
 			SELECT (created_at AT TIME ZONE 'Asia/Shanghai')::date AS day, user_id, model_id,

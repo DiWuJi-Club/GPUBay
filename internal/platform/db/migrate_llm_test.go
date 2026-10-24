@@ -115,6 +115,12 @@ func TestMigration00022RoundTrip(t *testing.T) {
 		t.Fatalf("down with ready node: err = %v", err)
 	}
 	exec(`UPDATE llm_nodes SET state = 'failed' WHERE id = 'node-000000000002'`)
+	// Down：节点已终态但系统实例仍未释放 → 拒绝
+	exec(`UPDATE instances SET system = true WHERE id = 'ins-aaaaaaaa'`)
+	if _, err := p.Down(ctx); err == nil || !strings.Contains(err.Error(), "平台节点实例") {
+		t.Fatalf("down with live system instance: err = %v", err)
+	}
+	exec(`UPDATE instances SET system = false WHERE id = 'ins-aaaaaaaa'`)
 	if _, err := p.Down(ctx); err != nil {
 		t.Fatal(err)
 	}
