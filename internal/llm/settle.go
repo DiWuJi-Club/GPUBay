@@ -148,6 +148,7 @@ func (s *Service) settleTx(ctx context.Context, tx pgx.Tx, userID int64, now tim
 	unsettled, carry := a.UnsettledMicro, a.CarryMicro
 	var usageAmount int64
 	if dueUsage {
+		// 自然日口径与不变量 5 / DailyUsage 相同。TODO: usage.go 的 usageDaySQL 常量合入后改为引用它（同一表达式）。
 		rows, err := tx.Query(ctx, `WITH m AS (
 				UPDATE llm_usage SET settlement_id = $3
 				WHERE user_id = $1 AND settlement_id IS NULL AND id <= $2
