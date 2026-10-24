@@ -10,6 +10,7 @@
   - e2e：`coverage.json`、`coverage.spec.ts`、`nav.spec.ts`、`playwright.config.ts`。
   - `cmd/platform/main.go`、`rental/sweeper.go` 能自动合并；合并后的 `RunSweeper` 必须仍带 `a.Referral.Settle`，`rental.SweeperLockKey` 仍导出（e2e 钩子用）。
   - 解决冲突后必须跑一遍完整的 `make check`。
+  - **已完成（2026-10-24）**：计划 7 经 PR #8 合入 `main` 后，本分支合入了 `main`。冲突按上面的做法解决，两边的接线都保留了。合并后的计数为：后台菜单 super 18 / ops 12 / finance 12，审计动作 70，e2e 覆盖表控制台 118 / 后台 87 / 共 205。`make check`（`go test -count=1`）全部通过。
   - 在此之前，**不要**让本分支连共享开发库 `:5433` 或任何持久库。
 - **迁移 `00021` 会锁住钱包流水表**：它重建 `wallet_ledger_kind_check`，并在同一事务里建 `wallet_ledger_order_scan_idx`（非 CONCURRENTLY），整个迁移期间对 `wallet_ledger` 持有 ACCESS EXCLUSIVE 锁，充值、扣款、退款都会等待。发布前先 `SELECT count(*) FROM wallet_ledger` 估算耗时，并选低峰窗口。
 - **执行 `platform referral backfill-fingerprints`**：给存量已实名用户补同身份指纹。必须与服务使用同一个 `SPARK_SECRET_KEY`。回填命令本身不撤销任何绑定，但有了指纹之后，发放前的同身份复查会**自动撤销**匹配的存量绑定：该绑定下一笔待发放返利到期时撤销绑定（审计 `referral.auto_revoke`），待发放作废。没有待发放返利的同身份绑定不会被复查，由后台人工处置。回填可以重复执行。
@@ -53,7 +54,7 @@
 - **超长事务**：一个写 `order` 流水的事务如果开着超过 62 分钟才提交（1 小时回看 + 2 分钟滞后），它的流水可能落在发现窗口之外而漏扫。用后台「重扫」把水位拨回 N 天即可补上，因为 `source_ledger_id` 唯一，重扫不会重复计提。正常事务只有几秒。
 - **NAT 下普遍带「同IP」**：同一 NAT 出口（家庭、公司、校园网）的每个绑定都会带「同IP」。R8 规定这个标记只提示、不搁置。后台列表不要把它当作「可疑」的默认筛选。
 - **`identity.AdminListUsers` 的 LIKE 没有转义**（计划 4 起就存在）：搜索词里的 `%`、`_` 会按通配符匹配。只影响后台用户搜索的结果范围，没有注入风险（参数化）。referral 自己的搜索已经转义。
-- **e2e 清扫钩子**：`/hooks/sweep` 先拿进程内互斥，再在专用连接上拿 `pg_advisory_lock(rental.SweeperLockKey)`（Task 17 已处理），否则两个重叠的 `Rental.Sweep` 会在 `fleet.MarkOfflineStale` 上自己死锁。生产环境由 `RunSweeper` 的同一把咨询锁保护。可选的加固是让 `MarkOfflineStale` 按 id 顺序先锁候选行。
+- **e2e 清扫钩子**：`/hooks/sweep` 先拿进程内互斥，再在专用连接上拿 `pg_advisory_lock(rental.SweeperLockKey)`（Task 17 已处理），否则两个重叠的 `Rental.Sweep` 会在 `fleet.MarkOfflineStale` 上自己死锁。生产环境由 `RunSweeper` 的同一把咨询锁保护。`MarkOfflineStale` 已改为按 id 顺序锁候选行并跳过别的事务锁着的行（`FOR UPDATE SKIP LOCKED`）：合并计划 7 后的 `make check` 里，`TestReferralConcurrentFundsConsistent` 出现过一次它与锁机器行的业务事务形成的三方死锁，修复后清扫一侧不再等待。
 - **没有 `TestInvariantsAgainstDevDB`**：规格 §16.4 第 12 项要求的、连开发库只读执行的用例没有实现。验收时用临时工具做了等价的只读调用（`CheckInvariants`），结果 OK。建议改为加一个 CLI：`platform referral check-invariants`，供生产库只读核对。不过 `CheckInvariants` 第 4 条要求静止态（没有待处理流水），在生产库执行前要等一轮清扫，或者改为只检查 `created_at < now − 1h` 的流水。
 - **永久跳过的流水**：
   - 扣款对应的订单查不到时，先暂时跳过：钉住水位，每轮都会在日志里记 Error。过了 `SkipGrace` 后写 `void` 占位。
