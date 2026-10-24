@@ -1,9 +1,9 @@
 import {
   labelOf, workflowCategoryLabel,
-  type AppCatalogItem, type Deployment, type DeploymentState, type Duration, type Instance, type Product, type WorkflowCatalogItem, type WorkflowCategory, type WorkflowModel,
+  type AppCatalogItem, type Deployment, type DeploymentState, type Duration, type Instance, type InstanceState, type Product, type WorkflowCatalogItem, type WorkflowCategory, type WorkflowModel,
 } from '@spark/shared'
 
-import { addWorkflowReason, canChangeWorkflows, deploymentWorkflows, isWorkflowHost, MAX_WORKFLOWS, WORKFLOW_APP_SLUG, workflowAddConfirmText } from './apps'
+import { addWorkflowReason, canChangeWorkflows, deploymentWorkflows, isWorkflowHost, MAX_WORKFLOWS, WORKFLOW_APP_SLUG, workflowAddConfirmText, workflowChangeBlockReason } from './apps'
 
 /** 每个 ComfyUI 部署最多装的工作流数与应用 slug（定义在 logic/apps.ts）；开通时预装同样上限。 */
 export { MAX_WORKFLOWS, WORKFLOW_APP_SLUG }
@@ -78,6 +78,8 @@ export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) =>
 export interface InstallTarget {
   instanceId: string
   instanceName: string
+  /** 实例状态：非排队的部署装工作流 = 重新部署，实例须在运行（同实例详情的工作流子区块） */
+  instanceState: InstanceState
   deploymentId: string
   state: DeploymentState
   installedCount: number
@@ -94,6 +96,7 @@ export function installTargets(entries: { instance: Instance; deployments: Deplo
       return {
         instanceId: instance.id,
         instanceName: `${instance.product_name} · ${instance.id}`,
+        instanceState: instance.state,
         deploymentId: d.id,
         state: d.state,
         installedCount: ws.length,
@@ -103,10 +106,15 @@ export function installTargets(entries: { instance: Instance; deployments: Deplo
   )
 }
 
-/** 能否装到该部署（与后端 app_invalid_state / workflow_limit / workflow_exists 同口径，后端为准）。 */
+/**
+ * 能否装到该部署（与后端 app_invalid_state / workflow_limit / workflow_exists 同口径，后端为准）。实例状态的限制与原因文案同实例详情
+ * 工作流子区块（workflowChangeBlockReason）：非排队的部署要求实例运行中。
+ */
 export function canInstallTo(t: InstallTarget): { ok: boolean; reason: string } {
   if (t.installed) return { ok: false, reason: '已安装' }
   if (!canChangeWorkflows(t)) return { ok: false, reason: t.state === 'installing' ? 'ComfyUI 正在部署，请稍后再装' : '当前状态不能安装' }
+  const blocked = workflowChangeBlockReason(t, t.instanceState)
+  if (blocked) return { ok: false, reason: blocked }
   if (t.installedCount >= MAX_WORKFLOWS) return { ok: false, reason: `已装满 ${MAX_WORKFLOWS} 个工作流` }
   return { ok: true, reason: '' }
 }

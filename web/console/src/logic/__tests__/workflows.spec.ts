@@ -1,6 +1,6 @@
 import type { AppCatalogItem, Deployment, Instance, Product, WorkflowCatalogItem, WorkflowModel } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
-import { workflowAddConfirmText } from '../apps'
+import { workflowAddConfirmText, workflowChangeBlockReason } from '../apps'
 import {
   canInstallTo, mapLimit, safeGitUrl, targetHint, coverOrPlaceholder, filterWorkflows, installCandidates, installConfirmText, installTargets, isWorkflowApp,
   markdownBlocks, MAX_WORKFLOWS, modelSource, presetEnvFor, rentChoice, shortCommit, sortWorkflows, toggleWorkflow, totalDownloadGB,
@@ -94,15 +94,15 @@ describe('installCandidates / installTargets / canInstallTo', () => {
   it('目标：只挑 comfyui 部署，带已装数与是否已装', () => {
     const t = installTargets([
       { instance: inst({ id: 'ins-a', product_name: 'DGX Spark' }), deployments: [dep({ id: 'd1', workflows: [installed(7), installed(8)] }), dep({ id: 'd2', app_slug: 'vllm' })] },
-      { instance: inst({ id: 'ins-b' }), deployments: [dep({ id: 'd3', instance_id: 'ins-b', state: 'installing', workflows: undefined })] },
+      { instance: inst({ id: 'ins-b', state: 'stopped' }), deployments: [dep({ id: 'd3', instance_id: 'ins-b', state: 'installing', workflows: undefined })] },
       { instance: inst({ id: 'ins-c' }), deployments: [dep({ id: 'd4', instance_id: 'ins-c', state: 'removed' })] },
     ], 7)
     expect(t).toEqual([
-      { instanceId: 'ins-a', instanceName: 'DGX Spark · ins-a', deploymentId: 'd1', state: 'running', installedCount: 2, installed: true },
-      { instanceId: 'ins-b', instanceName: 'DGX Spark · ins-b', deploymentId: 'd3', state: 'installing', installedCount: 0, installed: false },
+      { instanceId: 'ins-a', instanceName: 'DGX Spark · ins-a', instanceState: 'running', deploymentId: 'd1', state: 'running', installedCount: 2, installed: true },
+      { instanceId: 'ins-b', instanceName: 'DGX Spark · ins-b', instanceState: 'stopped', deploymentId: 'd3', state: 'installing', installedCount: 0, installed: false },
     ])
   })
-  const target = (over: Partial<InstallTarget> = {}): InstallTarget => ({ instanceId: 'i', instanceName: 'n', deploymentId: 'd', state: 'running', installedCount: 0, installed: false, ...over })
+  const target = (over: Partial<InstallTarget> = {}): InstallTarget => ({ instanceId: 'i', instanceName: 'n', instanceState: 'running', deploymentId: 'd', state: 'running', installedCount: 0, installed: false, ...over })
   it('canInstallTo：状态、上限、已装', () => {
     for (const s of ['queued', 'running', 'stopped', 'failed'] as const) expect(canInstallTo(target({ state: s }))).toEqual({ ok: true, reason: '' })
     expect(canInstallTo(target({ state: 'installing' }))).toEqual({ ok: false, reason: 'ComfyUI 正在部署，请稍后再装' })
@@ -110,6 +110,26 @@ describe('installCandidates / installTargets / canInstallTo', () => {
     expect(canInstallTo(target({ installedCount: 8 }))).toEqual({ ok: false, reason: '已装满 8 个工作流' })
     expect(canInstallTo(target({ installedCount: 7 })).ok).toBe(true)
     expect(canInstallTo(target({ installed: true }))).toEqual({ ok: false, reason: '已安装' })
+  })
+  it('canInstallTo：实例状态同实例详情工作流子区块（workflowChangeBlockReason）', () => {
+    // 非排队的部署：装工作流 = 重新部署，实例须在运行
+    for (const s of ['running', 'stopped', 'failed'] as const) {
+      expect(canInstallTo(target({ state: s, instanceState: 'stopped' }))).toEqual({ ok: false, reason: '实例已停机，续费后可操作' })
+      expect(canInstallTo(target({ state: s, instanceState: 'creating' }))).toEqual({ ok: false, reason: '实例开通后可操作' })
+      expect(canInstallTo(target({ state: s, instanceState: 'reserved' }))).toEqual({ ok: false, reason: '实例开通后可操作' })
+    }
+    // 排队中的部署只改集合，不受实例状态限制
+    expect(canInstallTo(target({ state: 'queued', instanceState: 'reserved' }))).toEqual({ ok: true, reason: '' })
+    expect(canInstallTo(target({ state: 'queued', instanceState: 'stopped' }))).toEqual({ ok: true, reason: '' })
+    // 与子区块同一函数
+    for (const st of ['running', 'stopped', 'failed', 'queued'] as const) {
+      for (const is of ['running', 'stopped', 'creating', 'reserved'] as const) {
+        const blocked = workflowChangeBlockReason({ state: st }, is)
+        expect(canInstallTo(target({ state: st, instanceState: is }))).toEqual({ ok: blocked == null, reason: blocked ?? '' })
+      }
+    }
+    // 已安装优先于实例状态
+    expect(canInstallTo(target({ installed: true, instanceState: 'stopped' })).reason).toBe('已安装')
   })
   it('targetHint：排队 / 失败的部署给出说明', () => {
     expect(targetHint('queued')).toBe('排队中：随 ComfyUI 部署一起安装')
