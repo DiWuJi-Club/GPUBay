@@ -1,0 +1,118 @@
+{
+  "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a": {
+    "prompt": [
+      7,
+      "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a",
+      {
+        "57": {
+          "inputs": {
+            "filename_prefix": "video/ComfyUI",
+            "format": "auto",
+            "codec": "auto",
+            "video": [
+              "58",
+              0
+            ]
+          },
+          "class_type": "SaveVideo",
+          "_meta": {
+            "title": "Save Video"
+          }
+        }
+      },
+      {
+        "client_id": "r7k2m9q4x1z8"
+      },
+      [
+        "57"
+      ]
+    ],
+    "outputs": {
+      "57": {
+        "images": [
+          {
+            "filename": "ComfyUI_00001_.mp4",
+            "subfolder": "video",
+            "type": "output"
+          }
+        ],
+        "animated": [
+          true
+        ]
+      },
+      "60": {
+        "gifs": [
+          {
+            "filename": "AnimateDiff_00001.webm",
+            "subfolder": "",
+            "type": "output",
+            "format": "video/webm",
+            "frame_rate": 16.0,
+            "workflow": "AnimateDiff_00001.png",
+            "fullpath": "/root/data/comfyui-output/AnimateDiff_00001.webm"
+          }
+        ]
+      },
+      "61": {
+        "images": [
+          {
+            "filename": "ComfyUI_00001_.webp",
+            "subfolder": "",
+            "type": "output"
+          }
+        ],
+        "animated": [
+          true
+        ]
+      }
+    },
+    "status": {
+      "status_str": "success",
+      "completed": true,
+      "messages": [
+        [
+          "execution_start",
+          {
+            "prompt_id": "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a",
+            "timestamp": 1761300000000
+          }
+        ],
+        [
+          "execution_cached",
+          {
+            "nodes": [],
+            "prompt_id": "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a",
+            "timestamp": 1761300000002
+          }
+        ],
+        [
+          "execution_success",
+          {
+            "prompt_id": "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a",
+            "timestamp": 1761300600000
+          }
+        ]
+      ]
+    },
+    "meta": {
+      "57": {
+        "node_id": "57",
+        "display_node": "57",
+        "parent_node": null,
+        "real_node_id": "57"
+      },
+      "60": {
+        "node_id": "60",
+        "display_node": "60",
+        "parent_node": null,
+        "real_node_id": "60"
+      },
+      "61": {
+        "node_id": "61",
+        "display_node": "61",
+        "parent_node": null,
+        "real_node_id": "61"
+      }
+    }
+  }
+}
