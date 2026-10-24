@@ -423,6 +423,7 @@ func (r *Runner) redactor(d Deployment) func(string) string {
 // ---- 步骤 ----
 
 // unreachable 连续 DialError 计数；达到 UnreachableFailAfter → failed(unreachable) + 告警一次（卸载则仍标 removed）。
+// running 的部署从第一次连不上起健康未知（验收观察 O-5：此前计数期间一直显示 ok）。
 // undoAttempt：上传命令没发出去（DialError 只在命令送达前出现），认领时加的 attempt 退回。
 func (r *Runner) unreachable(ctx context.Context, d Deployment, tg target, now time.Time, cause error, undoAttempt bool) error {
 	r.log.Warn("appdeploy: container unreachable", "deployment", d.ID, "instance", d.InstanceID, "count", d.UnreachableCount+1, "err", cause)
@@ -433,7 +434,8 @@ func (r *Runner) unreachable(ctx context.Context, d Deployment, tg target, now t
 	return r.writeback(ctx, d, func(tx pgx.Tx, cur Deployment) error {
 		n := cur.UnreachableCount + 1
 		if _, err := tx.Exec(ctx, `UPDATE app_deployments SET unreachable_count = $2, attempt = GREATEST(attempt - $3, 0), next_poll_at = $4, updated_at = $5,
-			row_version = row_version + 1 WHERE id = $1`, cur.ID, n, undo, now.Add(UnreachableRetry), now); err != nil {
+			health = CASE WHEN state = 'running' THEN 'unknown' ELSE health END, row_version = row_version + 1 WHERE id = $1`,
+			cur.ID, n, undo, now.Add(UnreachableRetry), now); err != nil {
 			return err
 		}
 		if n < UnreachableFailAfter {

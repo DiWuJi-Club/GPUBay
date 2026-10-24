@@ -1273,3 +1273,29 @@ esac
 		t.Fatalf("app saw %q", seen)
 	}
 }
+
+// TestRunnerRunningUnreachableHealthUnknown（验收观察 O-5）：running 的部署第一次连不上容器就把健康置为未知
+// （state 不变、计数 1）；连上之后健康检查恢复 ok、计数清零。
+func TestRunnerRunningUnreachableHealthUnknown(t *testing.T) {
+	re := newRunnerEnv(t, 1)
+	a := re.app("vllm", 8000)
+	inst := re.instance()
+	d := re.create(inst, a.ID, nil)
+	re.until(d.ID, appdeploy.StateRunning)
+	if got := re.dep(d.ID); got.Health != appdeploy.HealthOK {
+		t.Fatalf("running = %+v", got)
+	}
+	re.exec(`UPDATE machines SET lan_ip = '127.0.0.2' WHERE id = $1`, inst.MachineID) // 连接被拒：DialError
+	re.clk.Advance(appdeploy.HealthInterval)
+	re.tick()
+	got := re.dep(d.ID)
+	if got.State != appdeploy.StateRunning || got.Health != appdeploy.HealthUnknown || got.UnreachableCount != 1 {
+		t.Fatalf("after first dial error = %+v", got)
+	}
+	re.exec(`UPDATE machines SET lan_ip = '127.0.0.1' WHERE id = $1`, inst.MachineID)
+	re.clk.Advance(appdeploy.UnreachableRetry)
+	re.tick()
+	if got := re.dep(d.ID); got.State != appdeploy.StateRunning || got.Health != appdeploy.HealthOK || got.UnreachableCount != 0 {
+		t.Fatalf("recovered = %+v", got)
+	}
+}

@@ -320,7 +320,7 @@ ALTER TABLE machines ADD COLUMN cached_images TEXT[] NOT NULL DEFAULT '{}', ADD 
 
 - 日志尾部：每次 `status` 轮询把 `tail -c 65536` 的内容经**脱敏**（替换所有 secret 值为 `***`，再把平台上游公钥行去掉——它本来也不会出现）写进 `log_tail`；`installing` 期间每 5 秒 64KB 的写入量对 200 台可接受（实际同时部署的实例远少于 200）。
 - 事件（`app_deploy_events`）：queued（创建 / 重新部署）、installing、running、stopped、failed（detail = 错误码中文 + message）、removed、lost；控制台「动态」只显示这些。
-- 告警：`RaiseAlertOnce(warning, app_deploy_unreachable, machine, instance, "实例 <id> 的应用部署无法连接容器，详情见日志")`（连续 DialError 10 次时）；其它失败是用户可见的，不告警。
+- 告警：`RaiseAlertOnce(warning, app_deploy_unreachable, machine, instance, "实例 <id> 的应用部署无法连接容器，详情见日志")`（连续 DialError 10 次时）；其它失败是用户可见的，不告警。running 的部署从第一次 DialError 起 `health = unknown`（验收观察 O-5）。
 - 进程内节流：同一轮对同一实例最多处理 3 个部署（D2 的上限本来就是 3）；每轮总 exec 并发 ≤ 16（`semaphore`），超出的留到下一轮。
 
 ### 5.4 与 rental 的衔接（钩子接口）
