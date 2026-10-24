@@ -96,12 +96,7 @@ type reqToolDef struct {
 func strp(s string) *string { return &s }
 
 // callID 取模型给的调用 ID；历史里缺失时退回本系统的 tool_call_id（两端一致即可配对）。
-func callID(b llm.Block) string {
-	if b.ProviderCallID != "" {
-		return b.ProviderCallID
-	}
-	return b.ToolCallID
-}
+func callID(b llm.Block) string { return llm.CallID(b) }
 
 func (p *Provider) buildBody(req llm.Request) ([]byte, error) {
 	maxTokens := req.MaxTokens
@@ -119,10 +114,19 @@ func (p *Provider) buildBody(req llm.Request) ([]byte, error) {
 		Temperature:   temperature,
 		Messages:      []reqMessage{},
 	}
-	if req.System != "" {
-		body.Messages = append(body.Messages, reqMessage{Role: "system", Content: strp(req.System)})
+	// 固定前缀 + 动态快照段拼成一条 system 消息（OpenAI 兼容端点只认一条 system）
+	sys := req.System
+	if req.SystemDynamic != "" {
+		if sys != "" {
+			sys += "\n\n"
+		}
+		sys += req.SystemDynamic
 	}
-	for _, m := range req.Messages {
+	if sys != "" {
+		body.Messages = append(body.Messages, reqMessage{Role: "system", Content: strp(sys)})
+	}
+	// 防御：每个 tool_call 必须紧跟其结果，孤立结果丢弃（否则端点 400）
+	for _, m := range llm.PairToolCalls(req.Messages) {
 		body.Messages = append(body.Messages, mapMessage(m)...)
 	}
 	// 裁定：Tools 为空（SPARK_LLM_TOOLS=off）时不发 tools / tool_choice

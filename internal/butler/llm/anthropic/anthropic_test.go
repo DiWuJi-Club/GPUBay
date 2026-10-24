@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/anthropics/anthropic-sdk-go/option"
 
@@ -78,7 +79,8 @@ func types(evs []llm.Event) []string {
 	return out
 }
 
-const toolSchema = `{"type":"object","properties":{"state":{"type":"string","enum":["running","stopped"]}},"required":["state"],"additionalProperties":false}`
+// 含 strict 模式不支持的关键字（minimum / maxLength / maxItems / map 形 additionalProperties）：原样透传
+const toolSchema = `{"type":"object","properties":{"state":{"type":"string","enum":["running","stopped"]},"hours":{"type":"integer","minimum":1,"maximum":720},"name":{"type":"string","maxLength":64},"ids":{"type":"array","items":{"type":"string"},"maxItems":10},"env":{"type":"object","additionalProperties":{"type":"string"}}},"required":["state"],"additionalProperties":false}`
 
 var sampleTools = []llm.ToolDef{{Name: "list_instances", Description: "查询实例", Schema: json.RawMessage(toolSchema)}}
 
@@ -104,7 +106,8 @@ func TestAnthropicStreamAndRequest(t *testing.T) {
 		t.Fatalf("name/model = %s/%s", p.Name(), p.Model())
 	}
 	req := llm.Request{
-		System: "你是 AI 管家",
+		System:        "你是 AI 管家",
+		SystemDynamic: "用户：手机尾号 1234",
 		Messages: []llm.Message{
 			{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "我的实例"}, {Type: llm.BlockContext, InstanceID: "ins-1"}}},
 			{Role: llm.RoleAssistant, Blocks: []llm.Block{
@@ -161,16 +164,24 @@ func TestAnthropicStreamAndRequest(t *testing.T) {
 			t.Fatalf("不应发送 %s", k)
 		}
 	}
-	sys := b["system"].([]any)[0].(map[string]any)
-	if sys["text"] != "你是 AI 管家" || sys["cache_control"].(map[string]any)["type"] != "ephemeral" {
-		t.Fatalf("system = %v", sys)
+	sysArr := b["system"].([]any)
+	sys := sysArr[0].(map[string]any)
+	if len(sysArr) != 2 || sys["text"] != "你是 AI 管家" || sys["cache_control"].(map[string]any)["type"] != "ephemeral" {
+		t.Fatalf("system = %v", sysArr)
+	}
+	// 动态快照段在缓存断点之后，不带 cache_control
+	if dyn := sysArr[1].(map[string]any); dyn["text"] != "用户：手机尾号 1234" || dyn["cache_control"] != nil {
+		t.Fatalf("system[1] = %v", dyn)
 	}
 	if oc := b["output_config"].(map[string]any); oc["effort"] != "low" {
 		t.Fatalf("output_config = %v", oc)
 	}
 	tool := b["tools"].([]any)[0].(map[string]any)
-	if tool["name"] != "list_instances" || tool["description"] != "查询实例" || tool["strict"] != true {
+	if tool["name"] != "list_instances" || tool["description"] != "查询实例" {
 		t.Fatalf("tool = %v", tool)
+	}
+	if _, has := tool["strict"]; has {
+		t.Fatalf("不应发送 strict: %v", tool)
 	}
 	var wantSchema, gotSchema any
 	_ = json.Unmarshal([]byte(toolSchema), &wantSchema)
@@ -257,8 +268,8 @@ func TestAnthropicMessageMerging(t *testing.T) {
 	// 连续同角色消息合并；合并后的 user 消息里 tool_result 块排在最前；空文本、context 块不发送；空结果不发空文本块
 	msgs := []llm.Message{
 		{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "a"}}},
-		{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockContext, InstanceID: "ins-1"}, {Type: llm.BlockText, Text: ""}}},
-		{Role: llm.RoleAssistant, Blocks: []llm.Block{{Type: llm.BlockToolUse, ProviderCallID: "toolu_x", Name: "get_wallet", Args: json.RawMessage(`not json`)}}},
+		{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockContext, InstanceID: "ins-1"}, {Type: llm.BlockText, Text: ""}, {Type: llm.BlockText, Text: " \n\t "}}},
+		{Role: llm.RoleAssistant, Blocks: []llm.Block{{Type: llm.BlockText, Text: "\n  "}, {Type: llm.BlockToolUse, ProviderCallID: "toolu_x", Name: "get_wallet", Args: json.RawMessage(`not json`)}}},
 		{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "还在吗"}}},
 		{Role: llm.RoleTool, Blocks: []llm.Block{{Type: llm.BlockToolResult, ProviderCallID: "toolu_x", OK: true, Content: ""}}},
 	}
@@ -274,6 +285,9 @@ func TestAnthropicMessageMerging(t *testing.T) {
 	}
 	if c := got[0]["content"].([]any); len(c) != 1 {
 		t.Fatalf("msg0 = %s", raw)
+	}
+	if c := got[1]["content"].([]any); len(c) != 1 {
+		t.Fatalf("空白文本块应丢弃: %s", raw)
 	}
 	if in := got[1]["content"].([]any)[0].(map[string]any)["input"].(map[string]any); len(in) != 0 {
 		t.Fatalf("非法 Args 应发送 {}: %s", raw)
@@ -291,7 +305,7 @@ func TestAnthropicRefusal(t *testing.T) {
 	f := &fakeServer{}
 	srv := f.start(t, 200, []string{
 		sse("message_start", `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":10,"cache_read_input_tokens":30,"cache_creation_input_tokens":5,"output_tokens":0}}}`),
-		sse("message_delta", `{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}`),
+		sse("message_delta", `{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"input_tokens":10,"output_tokens":3}}`),
 		sse("message_stop", `{"type":"message_stop"}`),
 	})
 	evs, err := collect(t, newProvider(srv.URL), llm.Request{Messages: []llm.Message{{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "x"}}}}})
@@ -301,7 +315,7 @@ func TestAnthropicRefusal(t *testing.T) {
 	if got := types(evs); !reflect.DeepEqual(got, []string{llm.EvUsage, llm.EvDone}) {
 		t.Fatalf("events = %v", got)
 	}
-	// 输入 token 计入缓存读写（总输入 = input + cache_read + cache_creation）
+	// 输入 token 计入缓存读写（总输入 = input + cache_read + cache_creation）；message_delta 里更小的 input_tokens 不覆盖
 	if u := evs[0].Usage; u.InputTokens != 45 || u.OutputTokens != 3 {
 		t.Fatalf("usage = %+v", u)
 	}
@@ -366,7 +380,7 @@ func TestAnthropicInvalidToolJSON(t *testing.T) {
 func TestAnthropicErrors(t *testing.T) {
 	req := llm.Request{Messages: []llm.Message{{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "x"}}}}}
 
-	for _, st := range []int{529, 500, 429} {
+	for _, st := range []int{529, 500, 503, 429, 408, 409} {
 		f := &fakeServer{}
 		srv := f.start(t, st, nil)
 		_, err := collect(t, newProvider(srv.URL), req)
@@ -454,5 +468,185 @@ func TestAnthropicIgnoresEnvironmentCredentials(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.calls != 1 || f.header.Get("Authorization") != "" || f.header.Get("X-Api-Key") != "test-key" {
 		t.Fatalf("calls=%d auth=%q key=%q", f.calls, f.header.Get("Authorization"), f.header.Get("X-Api-Key"))
+	}
+}
+
+func userMsg(s string) []llm.Message {
+	return []llm.Message{{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: s}}}}
+}
+
+func TestAnthropicManyTools(t *testing.T) {
+	// 23 个工具（超过 strict 模式的 20 个上限）照常发送，均不带 strict
+	f := &fakeServer{}
+	srv := f.start(t, 200, toolUseScript)
+	var defs []llm.ToolDef
+	for i := 0; i < 23; i++ {
+		defs = append(defs, llm.ToolDef{Name: "tool_" + string(rune('a'+i)), Description: "d", Schema: json.RawMessage(toolSchema)})
+	}
+	if _, err := collect(t, newProvider(srv.URL), llm.Request{Messages: userMsg("x"), Tools: defs}); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tools := f.body["tools"].([]any)
+	if len(tools) != 23 {
+		t.Fatalf("tools = %d", len(tools))
+	}
+	for _, tl := range tools {
+		if _, has := tl.(map[string]any)["strict"]; has {
+			t.Fatalf("strict sent: %v", tl)
+		}
+	}
+	// schema 缺 additionalProperties / 为空时补 false
+	s, err := inputSchema(json.RawMessage(`{"type":"object","properties":{"a":{"type":"string"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(s)
+	if string(raw) != `{"properties":{"a":{"type":"string"}},"type":"object","additionalProperties":false}` {
+		t.Fatalf("schema = %s", raw)
+	}
+	s, _ = inputSchema(nil)
+	if raw, _ = json.Marshal(s); string(raw) != `{"properties":{},"type":"object","additionalProperties":false}` {
+		t.Fatalf("empty schema = %s", raw)
+	}
+}
+
+func TestAnthropicInvalidSchema(t *testing.T) {
+	f := &fakeServer{}
+	srv := f.start(t, 200, toolUseScript)
+	for _, sc := range []string{`{bad`, `[1,2]`, `null`} {
+		_, err := collect(t, newProvider(srv.URL), llm.Request{Messages: userMsg("x"), Tools: []llm.ToolDef{{Name: "broken", Schema: json.RawMessage(sc)}}})
+		var re *llm.RequestError
+		if !errors.As(err, &re) || !strings.Contains(re.Body, "broken") {
+			t.Fatalf("%s → %T %v", sc, err, err)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.calls != 0 {
+		t.Fatalf("schema 无效时不应发请求: %d", f.calls)
+	}
+}
+
+func TestAnthropicToolPairing(t *testing.T) {
+	f := &fakeServer{}
+	srv := f.start(t, 200, toolUseScript)
+	req := llm.Request{Messages: []llm.Message{
+		{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "hi"}}},
+		{Role: llm.RoleAssistant, Blocks: []llm.Block{
+			{Type: llm.BlockToolUse, ProviderCallID: "toolu_1", Name: "list_instances"},
+			{Type: llm.BlockToolUse, ProviderCallID: "toolu_2", Name: "get_wallet"},
+		}},
+		{Role: llm.RoleTool, Blocks: []llm.Block{
+			{Type: llm.BlockToolResult, ProviderCallID: "toolu_1", OK: true, Content: "[]"},
+			{Type: llm.BlockToolResult, ProviderCallID: "toolu_9", OK: true, Content: "孤立"},
+		}},
+		{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "继续"}}},
+	}}
+	if _, err := collect(t, newProvider(srv.URL), req); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	msgs := f.body["messages"].([]any)
+	f.mu.Unlock()
+	// user, assistant, user[tool_result toolu_1, tool_result toolu_2（补的错误结果）, text 继续]；toolu_9 丢弃
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	c := msgs[2].(map[string]any)["content"].([]any)
+	if len(c) != 3 {
+		t.Fatalf("content = %v", c)
+	}
+	r1, r2, tx := c[0].(map[string]any), c[1].(map[string]any), c[2].(map[string]any)
+	if r1["tool_use_id"] != "toolu_1" || r2["tool_use_id"] != "toolu_2" || r2["is_error"] != true ||
+		r2["content"].([]any)[0].(map[string]any)["text"] != llm.MissingToolResult || tx["text"] != "继续" {
+		t.Fatalf("content = %v", c)
+	}
+}
+
+func TestAnthropicMaxTokensDropsToolCalls(t *testing.T) {
+	f := &fakeServer{}
+	srv := f.start(t, 200, []string{
+		sse("message_start", `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`),
+		sse("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_wallet","input":{}}}`),
+		sse("content_block_stop", `{"type":"content_block_stop","index":0}`),
+		sse("content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"get_instance","input":{}}}`),
+		sse("content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"id\":"}}`),
+		sse("message_delta", `{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}`),
+		sse("message_stop", `{"type":"message_stop"}`),
+	})
+	evs, err := collect(t, newProvider(srv.URL), llm.Request{Messages: userMsg("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := types(evs); !reflect.DeepEqual(got, []string{llm.EvUsage, llm.EvDone}) || evs[1].StopReason != llm.StopMaxTokens {
+		t.Fatalf("events = %v %+v", got, evs)
+	}
+}
+
+func TestAnthropicToolsEmittedAfterStreamEnd(t *testing.T) {
+	// 工具块已结束但流随后断开 → 不发任何 tool 事件
+	f := &fakeServer{}
+	srv := f.start(t, 200, toolUseScript[:8])
+	var evs []llm.Event
+	err := newProvider(srv.URL).Chat(context.Background(), llm.Request{Messages: userMsg("x")}, func(e llm.Event) { evs = append(evs, e) })
+	var ue *llm.UnavailableError
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %T %v", err, err)
+	}
+	for _, e := range evs {
+		if e.Type == llm.EvTool {
+			t.Fatal("断流时不应发出工具调用")
+		}
+	}
+}
+
+func TestAnthropicStartInputFallback(t *testing.T) {
+	f := &fakeServer{}
+	srv := f.start(t, 200, []string{
+		sse("message_start", `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`),
+		sse("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_instance","input":{"id":"ins-1"}}}`),
+		sse("content_block_stop", `{"type":"content_block_stop","index":0}`),
+		sse("message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}`),
+		sse("message_stop", `{"type":"message_stop"}`),
+	})
+	evs, err := collect(t, newProvider(srv.URL), llm.Request{Messages: userMsg("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evs[0].Type != llm.EvTool || string(evs[0].ToolCall.Args) != `{"id":"ins-1"}` {
+		t.Fatalf("events = %+v", evs)
+	}
+}
+
+func TestAnthropicNonJSONErrorBody(t *testing.T) {
+	for _, st := range []int{502, 400} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(st)
+			_, _ = io.WriteString(w, "<html>oops</html>")
+		}))
+		_, err := collect(t, newProvider(srv.URL), llm.Request{Messages: userMsg("x")})
+		srv.Close()
+		var ue *llm.UnavailableError
+		var re *llm.RequestError
+		switch {
+		case errors.As(err, &ue):
+			if ue.Status != st || ue.Cause == nil || ue.Cause.Error() == "" {
+				t.Fatalf("%d → %+v", st, ue)
+			}
+		case errors.As(err, &re):
+			if re.Status != st || re.Body == "" {
+				t.Fatalf("%d → %+v", st, re)
+			}
+		default:
+			t.Fatalf("%d → %T %v", st, err, err)
+		}
+	}
+	// UTF-8 安全截断
+	s := strings.Repeat("好", 2000) // 6000 字节
+	if c := cutUTF8(s, maxErrBodyBytes); len(c) > maxErrBodyBytes || !utf8.ValidString(c) {
+		t.Fatalf("cut = %d valid=%v", len(c), utf8.ValidString(c))
 	}
 }

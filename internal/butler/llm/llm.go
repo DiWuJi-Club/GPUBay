@@ -20,11 +20,13 @@ type ToolDef struct {
 }
 
 // Request 是一次模型调用。Tools 为空表示不开放工具（SPARK_LLM_TOOLS=off）。
+// System 是固定前缀（可被提供方缓存）；SystemDynamic 是每轮重算的用户快照段（D10），不进缓存前缀。
 type Request struct {
-	System    string
-	Messages  []Message
-	Tools     []ToolDef
-	MaxTokens int
+	System        string
+	SystemDynamic string
+	Messages      []Message
+	Tools         []ToolDef
+	MaxTokens     int
 }
 
 // ToolCall 是模型发起的一次工具调用；Args 已由适配器拼接为完整 JSON。

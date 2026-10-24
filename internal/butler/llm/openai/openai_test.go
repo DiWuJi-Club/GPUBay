@@ -511,3 +511,56 @@ func TestOpenAIBodyMarshalError(t *testing.T) {
 		t.Fatalf("err = %#v", err)
 	}
 }
+
+func TestOpenAISystemDynamic(t *testing.T) {
+	user := []llm.Message{{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "hi"}}}}
+	cases := []struct{ sys, dyn, want string }{
+		{"固定", "快照", "固定\n\n快照"},
+		{"固定", "", "固定"},
+		{"", "快照", "快照"},
+	}
+	for _, c := range cases {
+		f := &fakeServer{}
+		srv := f.start(t, 200, []string{`data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`, `data: [DONE]`})
+		if _, err := collect(t, newProvider(srv.URL), llm.Request{System: c.sys, SystemDynamic: c.dyn, Messages: user}); err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		m0 := f.body["messages"].([]any)[0].(map[string]any)
+		f.mu.Unlock()
+		if m0["role"] != "system" || m0["content"] != c.want {
+			t.Fatalf("%q+%q → %v", c.sys, c.dyn, m0)
+		}
+	}
+}
+
+func TestOpenAIToolPairing(t *testing.T) {
+	f := &fakeServer{}
+	srv := f.start(t, 200, []string{`data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`, `data: [DONE]`})
+	req := llm.Request{Messages: []llm.Message{
+		{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "hi"}}},
+		{Role: llm.RoleAssistant, Blocks: []llm.Block{
+			{Type: llm.BlockToolUse, ProviderCallID: "call_1", Name: "list_instances"},
+			{Type: llm.BlockToolUse, ProviderCallID: "call_2", Name: "get_wallet"},
+		}},
+		{Role: llm.RoleTool, Blocks: []llm.Block{
+			{Type: llm.BlockToolResult, ProviderCallID: "call_1", OK: true, Content: "[]"},
+			{Type: llm.BlockToolResult, ProviderCallID: "call_9", OK: true, Content: "孤立"},
+		}},
+		{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "继续"}}},
+	}}
+	if _, err := collect(t, newProvider(srv.URL), req); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	msgs := f.body["messages"].([]any)
+	f.mu.Unlock()
+	// user, assistant, tool(call_1), tool(call_2 补的错误结果), user；call_9 丢弃
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	m := func(i int) map[string]any { return msgs[i].(map[string]any) }
+	if m(2)["tool_call_id"] != "call_1" || m(3)["role"] != "tool" || m(3)["tool_call_id"] != "call_2" || m(3)["content"] != llm.MissingToolResult || m(4)["role"] != "user" {
+		t.Fatalf("messages = %v", msgs)
+	}
+}
