@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/platform/apperr"
 )
 
 type transition struct {
@@ -100,15 +101,30 @@ func TestRunnerWorkflowHooks(t *testing.T) {
 		t.Fatalf("after plain deploy: calls %v transitions %+v", calls, trs)
 	}
 
-	// BundleExtra 出错 → 部署包生成失败（upload_failed，消息带原因）；markFailed 里 OnTransition(failed) 一次
+	// BundleExtra 临时错误（库连不上等，非 apperr）→ 不是部署包错误：部署留在 queued，本轮 Tick 报错，下一轮重试
 	h.mu.Lock()
-	h.extraErr[d.ID] = errors.New("workflow 7 version gone")
+	h.extraErr[d.ID] = errors.New("conn reset")
 	h.mu.Unlock()
 	if _, err := re.svc.Redeploy(re.ctx, appdeploy.RedeployRequest{UserID: re.userID, InstanceID: inst.ID, DeploymentID: d.ID}); err != nil {
 		t.Fatal(err)
 	}
+	if _, locked, err := re.r.Tick(re.ctx); !locked || err == nil || !strings.Contains(err.Error(), "conn reset") {
+		t.Fatalf("Tick = %v %v", locked, err)
+	}
+	if got := re.dep(d.ID); got.State != appdeploy.StateQueued || got.ErrorCode != "" {
+		t.Fatalf("transient BundleExtra error changed deployment: %+v", got)
+	}
+	if trs, calls = h.snapshot(); len(trs) != 2 || len(calls) != 2 {
+		t.Fatalf("after transient error: calls %v transitions %+v", calls, trs)
+	}
+
+	// BundleExtra 永久错误（apperr，如 workflow_version_invalid）→ 部署包生成失败（upload_failed，消息是 apperr 的文案）；
+	// markFailed 里 OnTransition(failed) 一次
+	h.mu.Lock()
+	h.extraErr[d.ID] = apperr.WorkflowVersionInvalid("manifest.nodes", "节点冲突")
+	h.mu.Unlock()
 	got := re.until(d.ID, appdeploy.StateFailed)
-	if got.ErrorCode != appdeploy.ErrCodeUploadFailed || got.Message != "部署包生成失败：workflow 7 version gone" {
+	if got.ErrorCode != appdeploy.ErrCodeUploadFailed || got.Message != "部署包生成失败：manifest.nodes：节点冲突" {
 		t.Fatalf("failed = %+v", got)
 	}
 	trs, _ = h.snapshot()
