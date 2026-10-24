@@ -6,16 +6,20 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"spark-cloud/internal/butler/llm"
 )
 
 // Reply 是 mock 的一轮回复。Err 非 nil → Chat 不发任何事件、直接返回该错误（钩子 error: true 用 *llm.UnavailableError）。
+// Usage 为零值时上报 DefaultUsage（{1000, 100}）；要上报 0 用量无法表达，测试也不需要。
+// ChunkDelay > 0 时每段文本之后等待该时长（尊重 ctx），供「客户端中途断开」类测试制造时间窗口。
 type Reply struct {
-	Text      string
-	ToolCalls []llm.ToolCall
-	Usage     llm.Usage // 全零 → 默认 {1000, 100}
-	Err       error
+	Text       string
+	ToolCalls  []llm.ToolCall
+	Usage      llm.Usage
+	Err        error
+	ChunkDelay time.Duration
 }
 
 // DefaultUsage 是 Reply.Usage 未设置时上报的用量。
@@ -42,6 +46,13 @@ func (m *Mock) Enqueue(r Reply) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.queue = append(m.queue, r)
+}
+
+// Reset 清空尚未使用的队列（e2e 钩子在用例之间调用）；调用计数与 LastRequest 保留。
+func (m *Mock) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.queue = nil
 }
 
 // Queued 返回队列里尚未使用的回复数。
@@ -121,6 +132,15 @@ func (m *Mock) Chat(ctx context.Context, req llm.Request, emit func(llm.Event)) 
 		end := min(i+textChunkRunes, len(runes))
 		if err := send(llm.Event{Type: llm.EvText, Text: string(runes[i:end])}); err != nil {
 			return err
+		}
+		if r.ChunkDelay > 0 {
+			timer := time.NewTimer(r.ChunkDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	for i := range r.ToolCalls {

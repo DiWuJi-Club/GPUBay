@@ -103,7 +103,7 @@ func callID(b llm.Block) string {
 	return b.ToolCallID
 }
 
-func (p *Provider) buildBody(req llm.Request) []byte {
+func (p *Provider) buildBody(req llm.Request) ([]byte, error) {
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = p.cfg.MaxTokens
@@ -136,8 +136,8 @@ func (p *Provider) buildBody(req llm.Request) []byte {
 		}
 		body.ToolChoice = "auto"
 	}
-	b, _ := json.Marshal(body) // 字段全是可序列化类型；Schema 非法 JSON 时 Marshal 失败 → 空体，由服务端 4xx 暴露
-	return b
+	// 只有工具 Schema / 历史 Args 不是合法 JSON 时会失败：属于本地配置 / 数据错误，不是模型不可用
+	return json.Marshal(body)
 }
 
 // mapMessage 把一条内部消息映射为 0..n 条 OpenAI 消息：user / assistant 一条，tool 每个结果一条。
@@ -203,9 +203,38 @@ type chunk struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
 		CompletionTokens int64 `json:"completion_tokens"`
 	} `json:"usage"`
-	Error *struct {
+	// 有的实现用 {"error": {...}} 或 {"error": "…"}，vLLM 用 {"object": "error", "message": "…"}
+	Object  string          `json:"object"`
+	Message string          `json:"message"`
+	Error   json.RawMessage `json:"error"`
+}
+
+// streamError 返回 chunk 里携带的错误描述；没有错误 → ""。
+func (c *chunk) streamError() string {
+	if c.Object == "error" {
+		if c.Message != "" {
+			return c.Message
+		}
+		return "模型返回错误"
+	}
+	raw := strings.TrimSpace(string(c.Error))
+	if raw == "" || raw == "null" {
+		return ""
+	}
+	var str string
+	if json.Unmarshal(c.Error, &str) == nil {
+		if str == "" {
+			return "模型返回错误"
+		}
+		return str
+	}
+	var obj struct {
 		Message string `json:"message"`
-	} `json:"error"`
+	}
+	if json.Unmarshal(c.Error, &obj) == nil && obj.Message != "" {
+		return obj.Message
+	}
+	return raw
 }
 
 type partialCall struct {
@@ -231,7 +260,11 @@ func validOrMarker(s string) json.RawMessage {
 }
 
 func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Event)) error {
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.BaseURL+"/chat/completions", bytes.NewReader(p.buildBody(req)))
+	body, err := p.buildBody(req)
+	if err != nil {
+		return &llm.RequestError{Status: 0, Body: "请求体序列化失败: " + err.Error()}
+	}
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return &llm.UnavailableError{Cause: err}
 	}
@@ -258,25 +291,26 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
-	calls := map[int]*partialCall{} // index → 累积中的调用
-	var order []int
+	// 调用按出现顺序放进 calls；cur 把增量里的 index 映射到当前累积中的调用。
+	// 有的实现并行调用都不带 index（默认 0）：同一 index 上出现另一个非空 id → 视为新调用。
+	var calls []*partialCall
+	cur := map[int]int{}
 	var usage *llm.Usage
 	stop := llm.StopEndTurn
 	finished := false // 收到 [DONE] 或 finish_reason；都没有就断流 → 不可用
 	flushCalls := func() {
-		for _, i := range order {
-			c := calls[i]
+		for i, c := range calls {
 			id := c.id
 			if id == "" {
 				id = fmt.Sprintf("call_%d", i)
 			}
 			emit(llm.Event{Type: llm.EvTool, ToolCall: &llm.ToolCall{ProviderCallID: id, Name: c.name, Args: validOrMarker(c.args.String())}})
 		}
-		calls = map[int]*partialCall{}
-		order = nil
+		calls = nil
+		cur = map[int]int{}
 	}
 	for sc.Scan() {
-		line := sc.Text()
+		line := sc.Text() // ScanLines 已去掉行尾 \r（CRLF）
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -289,8 +323,8 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 		if err := json.Unmarshal([]byte(data), &ch); err != nil {
 			continue
 		}
-		if ch.Error != nil {
-			return &llm.UnavailableError{Cause: errors.New(ch.Error.Message)}
+		if msg := ch.streamError(); msg != "" {
+			return &llm.UnavailableError{Cause: errors.New(msg)}
 		}
 		if ch.Usage != nil {
 			usage = &llm.Usage{InputTokens: ch.Usage.PromptTokens, OutputTokens: ch.Usage.CompletionTokens}
@@ -300,12 +334,16 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 				emit(llm.Event{Type: llm.EvText, Text: c.Delta.Content})
 			}
 			for _, tc := range c.Delta.ToolCalls {
-				pc, ok := calls[tc.Index]
-				if !ok {
-					pc = &partialCall{}
-					calls[tc.Index] = pc
-					order = append(order, tc.Index)
+				pos, ok := cur[tc.Index]
+				if ok && tc.ID != "" && calls[pos].id != "" && calls[pos].id != tc.ID {
+					ok = false
 				}
+				if !ok {
+					calls = append(calls, &partialCall{})
+					pos = len(calls) - 1
+					cur[tc.Index] = pos
+				}
+				pc := calls[pos]
 				if tc.ID != "" {
 					pc.id = tc.ID
 				}
@@ -321,8 +359,11 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 				finished = true
 				flushCalls()
 			case "length":
+				// 输出被 max_tokens 截断：半截的工具调用直接丢弃（参数不完整，不能执行），停止原因保持 max_tokens
 				stop = llm.StopMaxTokens
 				finished = true
+				calls = nil
+				cur = map[int]int{}
 			case "content_filter":
 				stop = llm.StopRefusal
 				finished = true
@@ -332,19 +373,17 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 			}
 		}
 	}
-	if err := sc.Err(); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return &llm.UnavailableError{Cause: err}
-	}
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	// finish_reason 已到达后尾部读错误（连接被对端提前关闭等）不影响结果，照常收尾
+	if err := sc.Err(); err != nil && !finished {
+		return &llm.UnavailableError{Cause: err}
 	}
 	if !finished {
 		return &llm.UnavailableError{Cause: errors.New("模型响应流意外结束")}
 	}
-	if len(order) > 0 { // 某些实现不发 finish_reason=tool_calls
+	if len(calls) > 0 { // 某些实现不发 finish_reason=tool_calls
 		stop = llm.StopToolUse
 		flushCalls()
 	}

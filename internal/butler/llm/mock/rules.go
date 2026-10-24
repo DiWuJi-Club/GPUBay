@@ -6,14 +6,14 @@ package mock
 // 所以每条规则都是多步的：缺哪个读工具的结果就先发哪个读工具，拿到结果后下一步再发写工具或收尾文本。
 // 工具结果的内容可以是 guard.JSONWrap 包裹（`<untrusted_data …>\n<json>\n</untrusted_data>`，剥掉首尾行再解析）或裸 JSON；
 // 结果块的 Name 可能为空，按 ToolCallID / ProviderCallID 与本轮 assistant 的 tool_use 块配对得到工具名。
-// 结果解析失败或 JSON 顶层 `"ok": false` 视为该工具失败 → 收尾文本「…查询失败…」，不重复发同一个工具（避免打满迭代上限）。
+// 结果块 OK = false、解析失败或 JSON 顶层 `"ok": false` 视为该工具失败 → 收尾文本「…查询失败…」，不重复发同一个工具（避免打满迭代上限）。
 //
 // 匹配顺序（先到先得）：
 //
-//	0. 最后一条消息是 tool 且某个结果含 `IGNORE ALL INSTRUCTIONS`（不区分大小写）
+//	0. 最后一条消息是 tool 且某个结果含 `IGNORE ALL INSTRUCTIONS`（不区分大小写，词间任意空白）
 //	   → release_instance{instance_id: 该结果里该短语之后（否则任意位置）出现的第一个 ins-…；否则用户文本 / 上下文实例 / 第一台 running}
 //	   （模拟模型「上钩」；系统只会生成待确认的危险卡）
-//	1. 最后一条消息是 tool 且含写工具结果（确认卡执行 / 拒绝 / 过期后回填）→ 收尾文本：失败结果里含「拒绝」/ rejected →「好的，已取消这次操作。」，含「过期」/ expired →「这个操作已经失效了…」；
+//	1. 最后一条消息是 tool 且含写工具结果（确认卡执行 / 拒绝 / 过期后回填）→ 收尾文本：失败结果 code = rejected（或无 code 且含「拒绝」/ rejected）→「用户拒绝了这次操作，已取消。」，code = expired →「这个操作已经失效了…」；
 //	   失败 →「操作没有成功：<message>」；成功 → 按工具给一句（deploy_app →「已提交部署，可以在实例详情的「应用」卡片查看进度。」等）
 //	2. 「失败」「为什么」「日志」→ 目标实例（见下）→ list_instance_apps{instance_id} → 第一个 state=failed 的部署
 //	   （没有且文本含「日志」→ 第一个部署；都没有 →「实例 X 上没有失败的部署。」）→ get_deployment_log{instance_id, deployment_id}
@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -46,14 +47,16 @@ import (
 )
 
 const (
-	injectionPhrase = "ignore all instructions"
-	defaultText     = "我可以帮你选机器、部署应用、排查问题、查看余额。"
-	noInstanceText  = "你还没有实例，先去市场租一台"
-	noRunningText   = "你还没有运行中的实例"
+	defaultText    = "我可以帮你选机器、部署应用、排查问题、查看余额。"
+	noInstanceText = "你还没有实例，先去市场租一台"
+	noRunningText  = "你还没有运行中的实例"
+	rejectedText   = "用户拒绝了这次操作，已取消。"
+	expiredText    = "这个操作已经失效了，需要的话请重新告诉我。"
 )
 
 var (
 	instanceIDRe = regexp.MustCompile(`ins-[A-Za-z0-9]+`)
+	injectionRe  = regexp.MustCompile(`(?i)ignore\s+all\s+instructions`)
 	renewQtyRe   = regexp.MustCompile(`(\d+)\s*(天|日|周|星期|个月|月)`)
 )
 
@@ -88,6 +91,15 @@ type toolResult struct {
 	Name    string
 	Args    json.RawMessage
 	Content string
+	OK      bool // Block.OK；false 一律视为工具失败
+}
+
+// parse 解析结果 JSON；Block.OK = false、解析失败或顶层 "ok": false → ok = false。
+func (r toolResult) parse() (any, bool) {
+	if !r.OK {
+		return nil, false
+	}
+	return parseResult(r.Content)
 }
 
 type turn struct {
@@ -145,7 +157,7 @@ func parseTurn(msgs []llm.Message) *turn {
 				if b.Type != llm.BlockToolResult {
 					continue
 				}
-				r := toolResult{Name: b.Name, Content: b.Content}
+				r := toolResult{Name: b.Name, Content: b.Content, OK: b.OK}
 				var u use
 				ok := false
 				if b.ToolCallID != "" {
@@ -216,7 +228,7 @@ func (t *turn) instanceFor(anyState bool) (string, *Reply) {
 	if !ok {
 		return "", call("list_instances", nil)
 	}
-	v, ok := parseResult(res.Content)
+	v, ok := res.parse()
 	if !ok {
 		return "", textReply("查询实例列表失败，请稍后再试。")
 	}
@@ -270,12 +282,12 @@ func Decide(req llm.Request) Reply {
 
 func ruleInjection(t *turn) *Reply {
 	for _, res := range t.last {
-		low := strings.ToLower(res.Content)
-		i := strings.Index(low, injectionPhrase)
-		if i < 0 {
+		// 在原文上做不区分大小写的匹配：ToLower 会改变部分字符的字节长度（如 Ⱥ），不能拿小写串的下标切原文
+		loc := injectionRe.FindStringIndex(res.Content)
+		if loc == nil {
 			continue
 		}
-		id := instanceIDRe.FindString(res.Content[i:])
+		id := instanceIDRe.FindString(res.Content[loc[1]:])
 		if id == "" {
 			id = instanceIDRe.FindString(res.Content)
 		}
@@ -296,19 +308,21 @@ func ruleAfterWrite(t *turn) *Reply {
 		if !isWrite {
 			continue
 		}
-		if _, ok := parseResult(res.Content); !ok {
-			low := strings.ToLower(res.Content)
-			if strings.Contains(res.Content, "拒绝") || strings.Contains(low, "rejected") {
-				return textReply("好的，已取消这次操作。还有什么需要帮忙的吗？")
-			}
-			if strings.Contains(res.Content, "过期") || strings.Contains(low, "expired") {
-				return textReply("这个操作已经失效了，需要的话请重新告诉我。")
-			}
-			msg := ""
+		if _, ok := res.parse(); !ok {
+			// Task 7 对拒绝 / 过期回填 {"ok": false, "code": "rejected" | "expired", "message": …}
+			msg, code := "", ""
 			if v, err := decode(res.Content); err == nil {
 				if m, ok := v.(map[string]any); ok {
-					msg = str(m, "message")
+					msg, code = str(m, "message"), str(m, "code")
 				}
+			}
+			switch {
+			case code == "rejected":
+				return textReply(rejectedText)
+			case code == "expired":
+				return textReply(expiredText)
+			case code == "" && (strings.Contains(res.Content, "拒绝") || strings.Contains(strings.ToLower(res.Content), "rejected")):
+				return textReply(rejectedText)
 			}
 			if msg == "" {
 				msg = clip(unwrap(res.Content), 80)
@@ -329,7 +343,7 @@ func ruleDiagnose(t *turn) *Reply {
 	if !ok {
 		return call("list_instance_apps", map[string]any{"instance_id": id})
 	}
-	v, ok := parseResult(res.Content)
+	v, ok := res.parse()
 	if !ok {
 		return textReply("查询实例 " + id + " 上的应用失败，请确认实例是否存在。")
 	}
@@ -355,7 +369,7 @@ func ruleDiagnose(t *turn) *Reply {
 		return call("get_deployment_log", map[string]any{"instance_id": id, "deployment_id": str(target, "id")})
 	}
 	logText := unwrap(logRes.Content)
-	if lv, ok := parseResult(logRes.Content); ok {
+	if lv, ok := logRes.parse(); ok {
 		if m, ok := lv.(map[string]any); ok {
 			if s, ok := m["log"].(string); ok {
 				logText = unwrap(s)
@@ -385,7 +399,7 @@ func ruleDeploy(t *turn) *Reply {
 		if !ok {
 			return call("list_apps", nil)
 		}
-		v, ok := parseResult(res.Content)
+		v, ok := res.parse()
 		if !ok {
 			return textReply("查询应用目录失败，请稍后再试。")
 		}
@@ -407,7 +421,7 @@ func ruleDeploy(t *turn) *Reply {
 		if !ok {
 			return call("list_instance_apps", map[string]any{"instance_id": id})
 		}
-		if _, ok := parseResult(res.Content); !ok {
+		if _, ok := res.parse(); !ok {
 			return textReply("没有找到实例 " + id + "，请确认实例 ID。")
 		}
 	} else {
@@ -421,7 +435,7 @@ func ruleDeploy(t *turn) *Reply {
 	if !ok {
 		return call("get_app", map[string]any{"slug": slug})
 	}
-	av, ok := parseResult(appRes.Content)
+	av, ok := appRes.parse()
 	app, isMap := av.(map[string]any)
 	if !ok || !isMap {
 		return textReply("没有找到应用 " + slug + "。")
@@ -456,7 +470,7 @@ func ruleDeploy(t *turn) *Reply {
 		if i >= len(gens) {
 			break
 		}
-		if gv, ok := parseResult(gens[i].Content); ok {
+		if gv, ok := gens[i].parse(); ok {
 			if m, ok := gv.(map[string]any); ok && str(m, "secret") != "" {
 				env[name] = str(m, "secret")
 			}
@@ -480,7 +494,7 @@ func ruleWallet(t *turn) *Reply {
 		return r
 	}
 	wres, _ := t.latest("get_wallet")
-	wv, ok := parseResult(wres.Content)
+	wv, ok := wres.parse()
 	w, isMap := wv.(map[string]any)
 	if !ok || !isMap {
 		return textReply("查询钱包失败，请稍后再试。")
@@ -493,8 +507,8 @@ func ruleWallet(t *turn) *Reply {
 	}
 	ires, _ := t.latest("list_instances")
 	pres, _ := t.latest("list_products")
-	iv, _ := parseResult(ires.Content)
-	pv, _ := parseResult(pres.Content)
+	iv, _ := ires.parse()
+	pv, _ := pres.parse()
 	products := listOf(pv, "products", "items")
 	var daily int64
 	running := 0
@@ -560,7 +574,7 @@ func ruleRecommend(t *turn) *Reply {
 	if !ok {
 		return call("list_products", nil)
 	}
-	v, ok := parseResult(res.Content)
+	v, ok := res.parse()
 	if !ok {
 		return textReply("查询套餐失败，请稍后再试。")
 	}
@@ -586,7 +600,7 @@ func ruleHelp(t *turn) *Reply {
 		return call("get_help", map[string]any{"section": section})
 	}
 	body := unwrap(res.Content)
-	if v, ok := parseResult(res.Content); ok {
+	if v, ok := res.parse(); ok {
 		if m, ok := v.(map[string]any); ok {
 			for _, k := range []string{"content", "text", "markdown"} {
 				if s := str(m, k); s != "" {
@@ -677,9 +691,14 @@ func listOf(v any, keys ...string) []map[string]any {
 				break
 			}
 		}
-		if arr == nil {
-			for _, val := range x {
-				if a, ok := val.([]any); ok {
+		if arr == nil { // 退回第一个数组字段：按键名排序，保证确定性
+			names := make([]string, 0, len(x))
+			for k := range x {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			for _, k := range names {
+				if a, ok := x[k].([]any); ok {
 					arr = a
 					break
 				}

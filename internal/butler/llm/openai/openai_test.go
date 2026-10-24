@@ -408,3 +408,106 @@ func TestOpenAIMessageMapping(t *testing.T) {
 		t.Fatalf("tool fallback id = %v", m(6))
 	}
 }
+
+func TestOpenAIParallelCallsWithoutIndex(t *testing.T) {
+	f := &fakeServer{}
+	srv := f.start(t, 200, []string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"c1","function":{"name":"get_app","arguments":"{\"slug\":"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"c1","function":{"arguments":"\"vllm\"}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"c2","function":{"name":"list_instances","arguments":"{}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	})
+	evs, err := collect(t, newProvider(srv.URL), llm.Request{Tools: sampleTools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(types(evs), ","); got != "tool_use,tool_use,done" {
+		t.Fatalf("events = %s", got)
+	}
+	if a := evs[0].ToolCall; a.ProviderCallID != "c1" || string(a.Args) != `{"slug":"vllm"}` {
+		t.Fatalf("a = %+v %s", a, a.Args)
+	}
+	if b := evs[1].ToolCall; b.ProviderCallID != "c2" || b.Name != "list_instances" || string(b.Args) != `{}` {
+		t.Fatalf("b = %+v %s", b, b.Args)
+	}
+}
+
+func TestOpenAILengthDropsPartialCall(t *testing.T) {
+	f := &fakeServer{}
+	srv := f.start(t, 200, []string{
+		`data: {"choices":[{"index":0,"delta":{"content":"好"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"deploy_app","arguments":"{\"instance_id\":\"ins"}}]},"finish_reason":"length"}]}`,
+		`data: [DONE]`,
+	})
+	evs, err := collect(t, newProvider(srv.URL), llm.Request{Tools: sampleTools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(types(evs), ","); got != "text_delta,done" || evs[1].StopReason != llm.StopMaxTokens {
+		t.Fatalf("events = %s / %s", got, evs[len(evs)-1].StopReason)
+	}
+}
+
+func TestOpenAIStreamFraming(t *testing.T) {
+	// CRLF 行尾、data: 后不带空格、id 晚于参数到达
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, ": keep-alive\r\n\r\n"+
+			`data:{"choices":[{"index":0,"delta":{"content":"a"}}]}`+"\r\n\r\n"+
+			`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"get_app","arguments":"{\"slug\""}}]}}]}`+"\r\n\r\n"+
+			`data:{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"late","function":{"arguments":":\"x\"}"}}]},"finish_reason":"tool_calls"}]}`+"\r\n\r\n"+
+			"data:[DONE]\r\n\r\n")
+	}))
+	defer srv.Close()
+	evs, err := collect(t, newProvider(srv.URL), llm.Request{Tools: sampleTools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(types(evs), ","); got != "text_delta,tool_use,done" {
+		t.Fatalf("events = %s", got)
+	}
+	if c := evs[1].ToolCall; c.ProviderCallID != "late" || string(c.Args) != `{"slug":"x"}` {
+		t.Fatalf("call = %+v %s", c, c.Args)
+	}
+}
+
+func TestOpenAIErrorChunkShapes(t *testing.T) {
+	for _, line := range []string{
+		`data: {"object":"error","message":"model overloaded","code":503}`,
+		`data: {"error":"model overloaded"}`,
+		`data: {"error":{"message":"model overloaded","type":"server_error"}}`,
+	} {
+		srv := (&fakeServer{}).start(t, 200, []string{line})
+		_, err := collect(t, newProvider(srv.URL), llm.Request{})
+		var ue *llm.UnavailableError
+		if !errors.As(err, &ue) || !strings.Contains(err.Error(), "model overloaded") {
+			t.Fatalf("%s → err = %#v", line, err)
+		}
+	}
+}
+
+func TestOpenAITailErrorAfterFinish(t *testing.T) {
+	big := `data: {"choices":[],"x":"` + strings.Repeat("a", 1<<20+10) + `"}`
+	srv := (&fakeServer{}).start(t, 200, []string{
+		`data: {"choices":[{"index":0,"delta":{"content":"完"},"finish_reason":"stop"}]}`,
+		big,
+	})
+	evs, err := collect(t, newProvider(srv.URL), llm.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(types(evs), ","); got != "text_delta,done" || evs[1].StopReason != llm.StopEndTurn {
+		t.Fatalf("events = %s", got)
+	}
+}
+
+func TestOpenAIBodyMarshalError(t *testing.T) {
+	srv := (&fakeServer{}).start(t, 200, []string{`data: [DONE]`})
+	_, err := collect(t, newProvider(srv.URL), llm.Request{Tools: []llm.ToolDef{{Name: "x", Schema: json.RawMessage(`{bad`)}}})
+	var re *llm.RequestError
+	if !errors.As(err, &re) || re.Status != 0 {
+		t.Fatalf("err = %#v", err)
+	}
+}
