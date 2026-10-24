@@ -24,6 +24,6 @@ describe('HelpView AI 管家章节', () => {
     const vue = vueItems(read('../HelpView.vue'))
     expect(md.length).toBeGreaterThanOrEqual(5)
     expect(vue).toEqual(md)
-    expect(read('../HelpView.vue')).toContain('<h2 data-testid="help-butler">AI 管家</h2>')
+    expect(read('../HelpView.vue')).toContain('<h2 id="butler" data-testid="help-butler">AI 管家</h2>')
   })
 })

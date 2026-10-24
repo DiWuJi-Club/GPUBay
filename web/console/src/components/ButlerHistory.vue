@@ -10,8 +10,9 @@ const emit = defineEmits<{ select: [id: string]; remove: [item: ConversationBrie
   <div class="list" data-testid="butler-list">
     <p v-if="!loading && !items.length" class="muted" data-testid="butler-list-empty">还没有对话</p>
     <div
-      v-for="c in items" :key="c.id" class="item" :class="{ active: c.id === current }" data-testid="butler-list-item" :data-id="c.id"
-      @click="emit('select', c.id)"
+      v-for="c in items" :key="c.id" class="item" :class="{ active: c.id === current }" role="button" tabindex="0"
+      :aria-current="c.id === current ? 'true' : undefined" data-testid="butler-list-item" :data-id="c.id"
+      @click="emit('select', c.id)" @keydown.enter.self.prevent="emit('select', c.id)" @keydown.space.self.prevent="emit('select', c.id)"
     >
       <div class="main">
         <div class="t">{{ c.title || '新对话' }}</div>
@@ -25,7 +26,8 @@ const emit = defineEmits<{ select: [id: string]; remove: [item: ConversationBrie
 <style scoped>
 .list { display: flex; flex-direction: column; }
 .item { display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: pointer; border-bottom: 1px solid #f2f3f5; min-height: 44px; box-sizing: border-box; }
-.item:hover { background: #f5f7fa; }
+.item:hover, .item:focus-visible { background: #f5f7fa; }
+.item:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: -2px; }
 .item.active { background: #ecf5ff; }
 .main { flex: 1; min-width: 0; }
 .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }

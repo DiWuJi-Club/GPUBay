@@ -12,7 +12,9 @@ import {
   formatCountdown,
   rollbackUser,
   sendErrorKind,
+  charCount,
   stepText,
+  withoutRetry,
   confirmAmountText,
   confirmSummaryLines,
   confirmTitle,
@@ -397,4 +399,28 @@ it('stepText：✓ 成功 / ✗ 失败 / … 进行中', () => {
   expect(stepText({ label: '查询套餐', status: 'ok' })).toBe('✓ 查询套餐')
   expect(stepText({ label: '读取部署日志', status: 'error' })).toBe('✗ 读取部署日志失败')
   expect(stepText({ label: '查询钱包', status: 'running' })).toBe('… 查询钱包')
+})
+
+it('stepText：确认卡结局与进行中', () => {
+  expect(stepText({ label: '释放实例', status: 'rejected' })).toBe('已取消 释放实例')
+  expect(stepText({ label: '释放实例', status: 'expired' })).toBe('已失效 释放实例')
+  expect(stepText({ label: '续费实例', status: 'pending' })).toBe('待确认 续费实例')
+})
+
+it('fromDetail：tool 块的 rejected / expired / pending / running 原样保留，未知值按 ok', () => {
+  const tool = (id: string, status: string) => ({ type: 'tool' as const, id, name: 'release_instance', label: '释放实例', status: status as 'ok' })
+  const d: ConversationDetail = {
+    conversation: { id: 'cv-1', title: 't', status: 'running', last_message_at: null, created_at: '2026-10-25T00:00:00Z' },
+    messages: [{ id: 1, seq: 1, role: 'assistant', content: [tool('a', 'rejected'), tool('b', 'expired'), tool('c', 'pending'), tool('d', 'running'), tool('e', 'weird')] }],
+    pending_tool_call: null,
+  }
+  expect(fromDetail(d).items.map((it) => (it.kind === 'tool' ? it.status : ''))).toEqual(['rejected', 'expired', 'pending', 'running', 'ok'])
+})
+
+it('withoutRetry 去掉错误行的重试文本；charCount 按码点', () => {
+  const s = appendError(appendUser(emptyState(), '续费'), 'butler_llm_unavailable', '不可用', '续费')
+  const r = withoutRetry(s)
+  expect(r.items[r.items.length - 1]).toEqual({ kind: 'error', code: 'butler_llm_unavailable', message: '不可用' })
+  expect(withoutRetry(r)).toBe(r)
+  expect(charCount('a😀中')).toBe(3)
 })

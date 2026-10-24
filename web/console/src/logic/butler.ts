@@ -12,6 +12,7 @@ import {
   type ButlerToolEvent,
   type ButlerUsageEvent,
   type ConversationDetail,
+  type ButlerStepStatus,
   type PendingToolCall,
   type SSEEvent,
 } from '@spark/shared'
@@ -21,7 +22,7 @@ export type ConfirmState = 'pending' | 'approved' | 'rejected' | 'expired' | 'ex
 export type ChatItem =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string; streaming: boolean; truncated?: boolean }
-  | { kind: 'tool'; id: string; name: string; label: string; status: 'ok' | 'error' | 'running'; summary?: string }
+  | { kind: 'tool'; id: string; name: string; label: string; status: ButlerStepStatus; summary?: string }
   | { kind: 'confirm'; card: PendingToolCall; state: ConfirmState; message?: string }
   | { kind: 'error'; code: string; message: string; retryText?: string }
 
@@ -51,6 +52,12 @@ function endStreaming(items: ChatItem[]): ChatItem[] {
 /** 步骤的中文名：没有工具名时显示「工具」。 */
 function toolLabel(name: string): string {
   return name ? labelOf(butlerToolLabel, name) : '工具'
+}
+
+const STEP_STATUSES = new Set<ButlerStepStatus>(['ok', 'error', 'rejected', 'expired', 'pending', 'running'])
+/** 详情块的步骤状态；未知值按 ok（老数据只有 ok / error）。 */
+function stepStatusOf(v: unknown): ButlerStepStatus {
+  return STEP_STATUSES.has(v as ButlerStepStatus) ? (v as ButlerStepStatus) : 'ok'
 }
 
 function lastUserText(items: ChatItem[]): string | undefined {
@@ -204,7 +211,7 @@ export function fromDetail(d: ConversationDetail, prev?: Pick<ChatState, 'dayUse
         }
       } else if (b.type === 'tool') {
         const name = typeof b.name === 'string' ? b.name : ''
-        const step: ChatItem = { kind: 'tool', id: b.id, name, label: b.label || toolLabel(name), status: b.status === 'error' ? 'error' : 'ok' }
+        const step: ChatItem = { kind: 'tool', id: b.id, name, label: b.label || toolLabel(name), status: stepStatusOf(b.status) }
         if (b.summary) step.summary = b.summary
         const at = stepIndex.get(b.id)
         if (at !== undefined) items[at] = { ...(items[at] as Extract<ChatItem, { kind: 'tool' }>), ...step }
@@ -336,8 +343,35 @@ export function bannerOfStatus(st: { enabled: boolean; notice: string }): string
 }
 
 /** 工具步骤行文案：「✓ 查询套餐」/「✗ 读取部署日志失败」/「… 查询钱包」。 */
-export function stepText(it: { label: string; status: 'ok' | 'error' | 'running' }): string {
-  if (it.status === 'error') return `✗ ${it.label}失败`
-  if (it.status === 'running') return `… ${it.label}`
-  return `✓ ${it.label}`
+export function stepText(it: { label: string; status: ButlerStepStatus }): string {
+  switch (it.status) {
+    case 'error':
+      return `✗ ${it.label}失败`
+    case 'running':
+      return `… ${it.label}`
+    case 'rejected':
+      return `已取消 ${it.label}`
+    case 'expired':
+      return `已失效 ${it.label}`
+    case 'pending':
+      return `待确认 ${it.label}`
+    default:
+      return `✓ ${it.label}`
+  }
+}
+
+/** 确认流里的错误行不带重试文本（重试会把上一条用户消息再发一遍，不是重做确认）。 */
+export function withoutRetry(s: ChatState): ChatState {
+  let changed = false
+  const items = s.items.map((it) => {
+    if (it.kind !== 'error' || it.retryText === undefined) return it
+    changed = true
+    return { kind: 'error' as const, code: it.code, message: it.message }
+  })
+  return changed ? { ...s, items } : s
+}
+
+/** 消息长度按字符（Unicode 码点）计，与服务端 2000 字上限同口径。 */
+export function charCount(text: string): number {
+  return Array.from(text).length
 }

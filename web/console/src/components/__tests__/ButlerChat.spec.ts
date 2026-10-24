@@ -2,6 +2,7 @@ import { ApiError, type ButlerStatus, type ConversationDetail, type PendingToolC
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createMemoryHistory, createRouter, type Router } from 'vue-router'
 
 type Handler = (e: SSEEvent) => void
 const mocks = vi.hoisted(() => ({
@@ -33,9 +34,12 @@ let detail: ConversationDetail
 /** 每次 streamPost 依次取一个脚本：事件数组，或要抛出的错误 */
 let scripts: (SSEEvent[] | Error)[]
 let wrapper: VueWrapper | null = null
+let router: Router
 
 async function render(props: Record<string, unknown> = {}) {
-  wrapper = mount(ButlerChat, { props, attachTo: document.body, global: { plugins: [ElementPlus] } })
+  router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:p(.*)*', component: { template: '<div />' } }] })
+  await router.push('/market')
+  wrapper = mount(ButlerChat, { props, attachTo: document.body, global: { plugins: [ElementPlus, router] } })
   await flushPromises()
   return wrapper
 }
@@ -262,5 +266,97 @@ describe('ButlerChat', () => {
     expect($('butler-msg-user')).toBeNull()
     expect($('butler-suggest-0')).not.toBeNull()
     expect(w.emitted('update:conversationId')!.at(-1)).toEqual([null])
+  })
+
+  it('确认已失效后回到 idle：可以直接发新消息', async () => {
+    detail = { ...detail, conversation: { ...detail.conversation, status: 'awaiting_confirm' }, pending_tool_call: card }
+    await render({ conversationId: 'cv-1' })
+    scripts.push(new ApiError(409, 'butler_confirm_invalid', '该操作已失效，请重新发起', ''))
+    await click('butler-confirm-ok')
+    scripts.push([ev('start', { conversation_id: 'cv-1', message_id: 5 }), ev('delta', { text: '好的' }), ev('done', { reason: 'end_turn' })])
+    await type('那算了')
+    expect(($('butler-send') as HTMLButtonElement).disabled).toBe(false)
+    await click('butler-send')
+    expect(mocks.stream.mock.calls[1][1]).toBe('/butler/conversations/cv-1/messages')
+    expect($('butler-msg-assistant')!.textContent).toContain('好的')
+  })
+
+  it('确认流里的 SSE error 不带重试（重试不会重发上一条用户消息）', async () => {
+    detail = { ...detail, conversation: { ...detail.conversation, status: 'awaiting_confirm' }, pending_tool_call: card, messages: [{ id: 1, seq: 1, role: 'user', content: [{ type: 'text', text: '续费' }] }] }
+    await render({ conversationId: 'cv-1' })
+    scripts.push([ev('tool', { id: 'tc-1', name: 'renew_instance', label: '续费实例', status: 'ok' }), ev('error', { code: 'butler_llm_unavailable', message: 'AI 管家暂时不可用，请稍后再试' })])
+    await click('butler-confirm-ok')
+    expect($('butler-confirm-result')!.textContent).toBe('已执行')
+    expect($('butler-error')!.textContent).toContain('AI 管家暂时不可用')
+    expect($('butler-retry')).toBeNull()
+  })
+
+  it('发送在服务端收下之前失败：恢复发送前的状态（待确认卡不被本地判为失效）', async () => {
+    detail = { ...detail, conversation: { ...detail.conversation, status: 'awaiting_confirm' }, pending_tool_call: card }
+    await render({ conversationId: 'cv-1' })
+    scripts.push(new ApiError(409, 'butler_busy', '上一条消息还在处理中，请稍候', ''))
+    await type('再说一句')
+    await click('butler-send')
+    expect($('butler-confirm-card')!.dataset.state).toBe('pending')
+    expect($('butler-confirm-countdown')).not.toBeNull()
+    expect($('butler-error')).not.toBeNull()
+  })
+
+  it('站内链接走前端路由，实例域名链接不拦截', async () => {
+    await render()
+    scripts.push([
+      ev('start', { conversation_id: 'cv-1', message_id: 1 }),
+      ev('delta', { text: '看 [实例](/instances/ins-abc) 或 [文档](https://ins-abc-8000.spark.test/docs)' }),
+      ev('done', { reason: 'end_turn' }),
+    ])
+    await type('看看')
+    await click('butler-send')
+    const links = [...$('butler-msg-assistant')!.querySelectorAll('a')]
+    expect(links).toHaveLength(2)
+    const inSite = new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 })
+    links[0].dispatchEvent(inSite)
+    await flushPromises()
+    expect(inSite.defaultPrevented).toBe(true)
+    expect(router.currentRoute.value.fullPath).toBe('/instances/ins-abc')
+    const external = new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 })
+    links[1].dispatchEvent(external)
+    expect(external.defaultPrevented).toBe(false)
+    expect(links[1].getAttribute('target')).toBe('_blank')
+  })
+
+  it('流式中切换对话：旧流的迟到事件被丢弃', async () => {
+    let late: Handler | null = null
+    let release: () => void = () => {}
+    mocks.stream.mockImplementationOnce(async (_b: string, _p: string, _body: unknown, onEvent: Handler) => {
+      onEvent(ev('start', { conversation_id: 'cv-1', message_id: 1 }))
+      onEvent(ev('delta', { text: '旧对话的回答' }))
+      late = onEvent
+      await new Promise<void>((r) => (release = r))
+    })
+    const w = await render()
+    await type('第一问')
+    await click('butler-send')
+    expect($('butler-msg-assistant')!.textContent).toContain('旧对话的回答')
+    detail = { ...detail, conversation: { ...detail.conversation, id: 'cv-2', title: '另一段' }, messages: [{ id: 9, seq: 1, role: 'user', content: [{ type: 'text', text: '另一段的问题' }] }] }
+    await w.setProps({ conversationId: 'cv-2' })
+    await flushPromises()
+    expect(mocks.get).toHaveBeenCalledWith('/butler/conversations/cv-2')
+    late!(ev('delta', { text: '迟到的文字' }))
+    late!(ev('done', { reason: 'end_turn' }))
+    release()
+    await flushPromises()
+    expect($('butler-msg-user')!.textContent).toBe('另一段的问题')
+    expect(document.body.textContent).not.toContain('迟到的文字')
+    expect(document.body.textContent).not.toContain('旧对话的回答')
+  })
+
+  it('字数按字符计；超过 2000 字发送按钮禁用', async () => {
+    await render()
+    await type('😀'.repeat(1000))
+    expect($('butler-count')!.textContent).toBe('1000/2000')
+    expect(($('butler-send') as HTMLButtonElement).disabled).toBe(false)
+    await type('字'.repeat(2001))
+    expect($('butler-count')!.textContent).toBe('2001/2000')
+    expect(($('butler-send') as HTMLButtonElement).disabled).toBe(true)
   })
 })

@@ -2,11 +2,12 @@
 import { ApiError, isApiError, messageOf, streamPost, type ButlerStatus, type ConversationDetail, type PendingToolCall, type SSEEvent } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { api } from '../api'
 import { usePolling } from '../composables/usePolling'
 import {
-  SUGGESTIONS, appendError, appendUser, applyEvent, bannerOfStatus, clearErrors, emptyState, formatQuota, fromDetail, markConfirm,
-  rollbackUser, sendErrorKind, stepText, type ChatItem, type ChatState,
+  SUGGESTIONS, appendError, appendUser, applyEvent, bannerOfStatus, charCount, clearErrors, emptyState, formatQuota, fromDetail, markConfirm,
+  rollbackUser, sendErrorKind, stepText, withoutRetry, type ChatItem, type ChatState,
 } from '../logic/butler'
 import { renderMarkdown } from '../logic/markdown'
 import { notifyError } from '../logic/notify'
@@ -34,7 +35,9 @@ const emit = defineEmits<{
 }>()
 
 const MAX_CHARS = 2000
-const BANNER_CODES = new Set(['butler_quota_exceeded', 'butler_disabled', 'butler_turn_limit'])
+/** 距底部小于这个像素时新内容自动滚到底；用户往上翻看历史时不打扰 */
+const NEAR_BOTTOM_PX = 80
+const router = useRouter()
 
 const state = ref<ChatState>(emptyState())
 const title = ref('')
@@ -50,13 +53,36 @@ let ctrl: AbortController | null = null
 let loadSeq = 0
 
 const disabled = computed(() => status.value?.enabled === false)
-const busy = computed(() => streaming.value || polling.value || state.value.status === 'running')
+const busy = computed(() => streaming.value || polling.value || loadingDetail.value || state.value.status === 'running')
 const quota = computed(() => formatQuota(state.value.dayUsed, state.value.dayLimit))
 const ingressDomain = computed(() => status.value?.ingress_domain ?? '')
-const canSend = computed(() => !disabled.value && !busy.value && text.value.trim().length > 0 && text.value.length <= MAX_CHARS)
+const count = computed(() => charCount(text.value))
+const canSend = computed(() => !disabled.value && !busy.value && text.value.trim().length > 0 && count.value <= MAX_CHARS)
 const empty = computed(() => !state.value.items.length && !loadingDetail.value)
 
-const md = (src: string) => renderMarkdown(src, { ingressDomain: ingressDomain.value })
+// 渲染结果按「域名 + 文本」缓存：流式时只有最后一个气泡在变，其余气泡不必每个 delta 重新渲染
+const mdCache = new Map<string, string>()
+function md(src: string): string {
+  const key = `${ingressDomain.value}\n${src}`
+  let html = mdCache.get(key)
+  if (html === undefined) {
+    if (mdCache.size > 200) mdCache.clear()
+    html = renderMarkdown(src, { ingressDomain: ingressDomain.value })
+    mdCache.set(key, html)
+  }
+  return html
+}
+
+/** 站内链接（/instances/… 等，无 target）走前端路由，不整页刷新；实例域名链接（target=_blank）照常打开新标签。 */
+function onMessagesClick(e: MouseEvent) {
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+  const a = (e.target as HTMLElement | null)?.closest?.('a')
+  if (!a || a.getAttribute('target')) return
+  const href = a.getAttribute('href') ?? ''
+  if (!href.startsWith('/') || href.startsWith('//') || !router) return
+  e.preventDefault()
+  void router.push(href)
+}
 
 function setState(next: ChatState) {
   const prevId = state.value.conversationId
@@ -100,7 +126,7 @@ async function loadDetail(id: string) {
       emit('settled')
       void loadStatus() // 轮次结束：刷新今日额度
     }
-    scrollToBottom()
+    scrollToBottom(!wasPolling)
   } catch (e) {
     if (mine !== loadSeq) return
     if (isApiError(e) && e.status === 404) {
@@ -169,10 +195,14 @@ onMounted(() => {
 })
 onBeforeUnmount(() => abortStream())
 
-function scrollToBottom() {
+/** 在状态更新之后、DOM 更新之前调用：只有原本就在底部附近（或 force）时才滚到底。 */
+function scrollToBottom(force = false) {
+  const el = listEl.value
+  if (!el) return
+  const near = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX
+  if (!force && !near) return
   void nextTick(() => {
-    const el = listEl.value
-    if (el) el.scrollTop = el.scrollHeight
+    el.scrollTop = el.scrollHeight
   })
 }
 
@@ -183,14 +213,22 @@ interface StreamOpts {
   retryText?: string
   /** 确认流：卡片 id */
   confirmId?: string
+  /** 发送消息：appendUser 之前的状态，服务端没收下消息时整体恢复（含被本地标为失效的待确认卡） */
+  before?: ChatState
   onStart?: () => void
+}
+
+/** 服务端没收下这条消息：恢复发送前的状态（保留最新额度）；没有快照时撤回末尾的用户气泡。 */
+function restoreBefore(opt: StreamOpts): ChatState {
+  if (!opt.before) return rollbackUser(state.value)
+  return { ...opt.before, dayUsed: state.value.dayUsed, dayLimit: state.value.dayLimit }
 }
 
 /** 流在 done / error 之前结束：服务端仍在跑，拉详情刷新并在 running 时轮询。 */
 function interrupted(opt: StreamOpts) {
   const id = state.value.conversationId
   if (!id) {
-    setState(appendError(rollbackUser(state.value), 'network', '网络异常，请稍后重试', opt.retryText))
+    setState(appendError(restoreBefore(opt), 'network', '网络异常，请稍后重试', opt.retryText))
     return
   }
   polling.value = true
@@ -202,7 +240,7 @@ function onStreamError(err: unknown, accepted: boolean, opt: StreamOpts) {
   const kind = sendErrorKind(e.status, e.code)
   if (kind === 'ignore') return
   if (kind === 'auth') {
-    setState(rollbackUser(state.value))
+    setState(opt.confirmId ? state.value : restoreBefore(opt))
     handleUnauthorized()
     return
   }
@@ -213,7 +251,8 @@ function onStreamError(err: unknown, accepted: boolean, opt: StreamOpts) {
   }
   if (opt.confirmId) {
     if (e.code === 'butler_confirm_invalid') {
-      setState(markConfirm(state.value, opt.confirmId, 'expired'))
+      // 卡片已失效：本地也没有待确认的了，回到 idle 才能继续发消息
+      setState({ ...markConfirm(state.value, opt.confirmId, 'expired'), status: 'idle' })
       ElMessage.warning(e.message)
       return
     }
@@ -224,7 +263,7 @@ function onStreamError(err: unknown, accepted: boolean, opt: StreamOpts) {
     return
   }
   // 建立流之前失败：消息没有被服务端收下，撤回本地气泡
-  const s = rollbackUser(state.value)
+  const s = restoreBefore(opt)
   if (kind === 'banner') {
     setState(s)
     showBanner(e)
@@ -246,6 +285,8 @@ async function runStream(path: string, body: unknown, opt: StreamOpts) {
   ctrl = c
   streaming.value = true
   polling.value = false
+  loadSeq++ // 进行中的详情请求作废：迟到的旧详情不能覆盖流式状态
+  loadingDetail.value = false
   let accepted = !!opt.confirmId
   let finished = false
   try {
@@ -261,7 +302,8 @@ async function runStream(path: string, body: unknown, opt: StreamOpts) {
         } else if (ev.event === 'done' || ev.event === 'error') finished = true
         else accepted = true
         const wasNew = !state.value.conversationId
-        setState(applyEvent(state.value, ev))
+        const next = applyEvent(state.value, ev)
+        setState(opt.confirmId && ev.event === 'error' ? withoutRetry(next) : next)
         if (wasNew && state.value.conversationId && opt.retryText) title.value = Array.from(opt.retryText).slice(0, 30).join('')
         scrollToBottom()
       },
@@ -283,15 +325,17 @@ async function runStream(path: string, body: unknown, opt: StreamOpts) {
 
 async function send(raw?: string) {
   const t = (raw ?? text.value).trim()
-  if (!t || t.length > MAX_CHARS || disabled.value || busy.value) return
+  if (!t || charCount(t) > MAX_CHARS || disabled.value || busy.value) return
   if (raw === undefined) text.value = ''
   if (banner.value && banner.value.code !== 'butler_disabled') banner.value = null
-  setState(appendUser(clearErrors(state.value), t))
-  scrollToBottom()
+  const before = clearErrors(state.value)
+  setState(appendUser(before, t))
+  scrollToBottom(true)
   const ctx = props.context
   const id = state.value.conversationId
   await runStream(`/butler/conversations/${id ?? 'new'}/messages`, ctx ? { text: t, context: ctx } : { text: t }, {
     retryText: t,
+    before,
     onStart: () => {
       if (ctx) emit('context-used')
     },
@@ -352,7 +396,7 @@ function keyOf(it: ChatItem, i: number): string {
       <el-button size="small" data-testid="butler-new" @click="newConversation">新对话</el-button>
     </div>
 
-    <div ref="listEl" class="messages" data-testid="butler-messages">
+    <div ref="listEl" class="messages" role="log" aria-live="polite" data-testid="butler-messages" @click="onMessagesClick">
       <div v-if="empty" class="welcome" data-testid="butler-welcome">
         <p>您好，我是 AI 管家，可以帮您挑选机器、部署应用、排查问题、查询余额与计费。任何花钱或删除的操作都会先请您确认。</p>
         <div class="chips">
@@ -379,7 +423,13 @@ function keyOf(it: ChatItem, i: number): string {
           </div>
         </div>
         <div v-else-if="it.kind === 'tool'" class="step" :class="it.status" data-testid="butler-step" :data-name="it.name" :data-status="it.status">
-          <span :data-testid="`butler-step-${it.name}`" :class="{ link: !!it.summary }" @click="it.summary && toggleStep(it.id)">{{ stepText(it) }}</span>
+          <button
+            v-if="it.summary" type="button" class="step-btn" :aria-expanded="opened.has(it.id)" :data-testid="`butler-step-${it.name}`"
+            @click="toggleStep(it.id)"
+          >
+            {{ stepText(it) }}
+          </button>
+          <span v-else :data-testid="`butler-step-${it.name}`">{{ stepText(it) }}</span>
           <pre v-if="it.summary && opened.has(it.id)" class="step-summary" data-testid="butler-step-summary">{{ it.summary }}</pre>
         </div>
         <ButlerConfirmCard
@@ -398,11 +448,12 @@ function keyOf(it: ChatItem, i: number): string {
     <div class="composer">
       <p v-if="context" class="muted small" data-testid="butler-context">将带上实例 {{ context.instance_id }} 的信息</p>
       <el-input
-        v-model="text" type="textarea" :autosize="{ minRows: 2, maxRows: 6 }" :maxlength="MAX_CHARS" show-word-limit resize="none"
-        :disabled="disabled" placeholder="问问 AI 管家（Enter 发送，Shift+Enter 换行）" data-testid="butler-input" @keydown="onKeydown"
+        v-model="text" type="textarea" :autosize="{ minRows: 2, maxRows: 6 }" resize="none" :disabled="disabled"
+        placeholder="问问 AI 管家（Enter 发送，Shift+Enter 换行）" aria-label="给 AI 管家发消息" data-testid="butler-input" @keydown="onKeydown"
       />
       <div class="send-row">
         <span class="muted small">{{ status?.provider_label }}</span>
+        <span class="count" :class="{ over: count > MAX_CHARS }" data-testid="butler-count">{{ count }}/{{ MAX_CHARS }}</span>
         <el-button type="primary" size="small" :disabled="!canSend" :loading="busy" data-testid="butler-send" @click="send()">发送</el-button>
       </div>
     </div>
@@ -436,7 +487,11 @@ function keyOf(it: ChatItem, i: number): string {
 .truncated { margin-top: 6px; font-size: 12px; color: var(--el-color-warning); }
 .step { font-size: 12px; color: #909399; }
 .step.error { color: var(--el-color-danger); }
-.step .link { cursor: pointer; text-decoration: underline dotted; }
+.step-btn { padding: 0; border: none; background: none; font: inherit; color: inherit; cursor: pointer; text-decoration: underline dotted; }
+.step.running span, .step.running .step-btn { animation: blink 1.2s steps(1) infinite; }
+.step.rejected, .step.expired, .step.pending { color: #a8abb2; }
+.count { margin-left: auto; margin-right: 8px; font-size: 12px; color: #909399; }
+.count.over { color: var(--el-color-danger); }
 .step-summary { margin: 4px 0 0; padding: 6px 8px; background: #fff; border: 1px solid #ebeef5; border-radius: 6px; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; font-size: 12px; }
 .err { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--el-color-danger); background: #fef0f0; padding: 6px 10px; border-radius: 6px; }
 .banner { border-radius: 0; }

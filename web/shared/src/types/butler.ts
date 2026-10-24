@@ -24,10 +24,16 @@ export interface ConversationBrief {
   created_at: string
 }
 
+/**
+ * 详情里工具步骤的状态：ok / error（读工具结果、写工具执行结果）；rejected / expired / pending（写工具确认卡的结局）；
+ * running（对话仍在 running 时尚无结果的读工具）。
+ */
+export type ButlerStepStatus = 'ok' | 'error' | 'rejected' | 'expired' | 'pending' | 'running'
+
 /** 前端消息块（服务端已把落库的块转换：tool_use → tool，tool_result 只给 ≤ 2KB 摘要，context 不输出）。 */
 export type ButlerBlock =
   | { type: 'text'; text: string }
-  | { type: 'tool'; id: string; name: string; label: string; status: 'ok' | 'error'; summary?: string }
+  | { type: 'tool'; id: string; name: string; label: string; status: ButlerStepStatus; summary?: string }
   | { type: 'tool_result'; tool_call_id: string; summary: string }
 
 export interface ButlerMessage {

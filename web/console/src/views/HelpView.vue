@@ -5,7 +5,7 @@ import { brand } from '@spark/shared'
 <template>
   <div class="help" data-testid="help-page">
     <el-card>
-      <h2 data-testid="help-ssh">怎么用 SSH 连接</h2>
+      <h2 id="ssh" data-testid="help-ssh">怎么用 SSH 连接</h2>
       <ol>
         <li>实例状态变为「运行中」后，在实例详情页复制 SSH 命令（形如 <code>ssh ins-xxxxxxxx@ssh.您的域名</code>）。</li>
         <li>点击「显示」查看 SSH 密码并复制；密码只在您点击时才会显示，离开页面后需要重新查看。</li>
@@ -13,7 +13,7 @@ import { brand } from '@spark/shared'
       </ol>
     </el-card>
     <el-card>
-      <h2 data-testid="help-ssh-keys">用公钥登录、关闭密码登录</h2>
+      <h2 id="ssh-keys" data-testid="help-ssh-keys">用公钥登录、关闭密码登录</h2>
       <ol>
         <li>在「我的 → SSH 公钥」粘贴您电脑的公钥（<code>~/.ssh/id_ed25519.pub</code> 的内容，一行），之后 <code>ssh -i ~/.ssh/id_ed25519 ins-xxxxxxxx@…</code> 免密登录。</li>
         <li>添加公钥后可在实例详情关闭密码登录；在容器里执行 <code>ssh-copy-id</code> 或修改 <code>~/.ssh/authorized_keys</code> 不会生效，公钥只在控制台管理。</li>
@@ -21,7 +21,7 @@ import { brand } from '@spark/shared'
       </ol>
     </el-card>
     <el-card>
-      <h2 data-testid="help-forward">端口转发与文件传输</h2>
+      <h2 id="forward" data-testid="help-forward">端口转发与文件传输</h2>
       <ul>
         <li><code>scp</code> / <code>sftp</code> / <code>rsync</code> 都可用（走同一条 SSH 连接）；大文件请放到 <code>/root/data</code>。</li>
         <li>本地转发 <code>ssh -L 8888:127.0.0.1:8888 ins-xxxxxxxx@…</code> 可在本机浏览器访问容器里的服务；<code>-R</code>、<code>-A</code>（agent 转发）也支持；不支持 X11。</li>
@@ -29,7 +29,7 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
-      <h2 data-testid="help-web">Web 访问（端口开放）</h2>
+      <h2 id="web" data-testid="help-web">Web 访问（端口开放）</h2>
       <ul>
         <li>在实例详情「Web 访问」添加端口后，会得到形如 <code>https://ins-xxxxxxxx-8888.…/</code> 的网址；默认<b>私有</b>：只有您在本站登录后才能打开。</li>
         <li>设为<b>公开</b>后任何人都能访问，平台不做鉴权与限流，请确认应用自带密码；平台可在收到滥用举报后将端口限制为私有。</li>
@@ -38,7 +38,7 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
-      <h2 data-testid="help-apps">一键部署</h2>
+      <h2 id="apps" data-testid="help-apps">一键部署</h2>
       <ul>
         <li>在算力市场的「一键部署」或实例详情的「应用」卡片里选择应用（vLLM、Open WebUI、ComfyUI、JupyterLab），平台会在您的实例里把它装好并启动。应用以进程形式运行在实例里，不另收费。</li>
         <li>首次部署需要下载模型，速度受实例出网限速影响（16GB 约 15 分钟）；进度在「应用」卡片里显示，可随时「查看日志」。</li>
@@ -53,7 +53,7 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
-      <h2 data-testid="help-booking">档期预订</h2>
+      <h2 id="booking" data-testid="help-booking">档期预订</h2>
       <ul>
         <li>可提前 2 小时～60 天预订，开始时间为北京时间整点；开始前 1 小时系统自动开通，开通后即可登录，开始时刻起计费。</li>
         <li>预订下单时扣款，价格按下单时锁定，之后改价不影响已付订单。</li>
@@ -63,13 +63,13 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
-      <h2 data-testid="help-batch">一次多台</h2>
+      <h2 id="batch" data-testid="help-batch">一次多台</h2>
       <ul>
         <li>一单最多 8 台，整单要么全部成功要么全部失败；成功后逐台管理，批次页可一键取消未开通的预订。</li>
       </ul>
     </el-card>
     <el-card>
-      <h2 data-testid="help-auto-renew">自动续费</h2>
+      <h2 id="auto-renew" data-testid="help-auto-renew">自动续费</h2>
       <ul>
         <li>到期前 1 小时自动扣款续 1 个单位；余额不足会每分钟重试到到期，首次失败发短信提醒。</li>
         <li>被后续预订挡住时按能放下的档位办理（1 月 → 1 周 → 1 天），都放不下则失败并提示。</li>
@@ -77,14 +77,14 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
-      <h2 data-testid="help-retention">数据保留规则</h2>
+      <h2 id="retention" data-testid="help-retention">数据保留规则</h2>
       <ul>
         <li>到期停机后数据保留 6 小时，期间续费可恢复运行并保留数据。</li>
         <li>超过保留期或主动释放，数据立即清除且已付费用不退。</li>
       </ul>
     </el-card>
     <el-card>
-      <h2 data-testid="help-referral">邀请返利</h2>
+      <h2 id="referral" data-testid="help-referral">邀请返利</h2>
       <ul>
         <li>在「我的 → 邀请返利」获取您的邀请码与链接；好友通过链接注册（首次登录）即绑定，老用户不能再绑定。</li>
         <li>绑定后的返利期内（默认 12 个月），好友每笔实付租用金额（新购、续费、预订）的一定比例（默认 10%，以邀请页显示为准）返到您的余额，可用于租用，<b>不可提现、不可转让</b>。</li>
@@ -95,7 +95,7 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
-      <h2 data-testid="help-billing">计费规则</h2>
+      <h2 id="billing" data-testid="help-billing">计费规则</h2>
       <ul>
         <li>预付包时长：1 天 / 1 周 / 1 月（按 30 天计），从开通成功开始计时。</li>
         <li>机器故障期间暂停计时，恢复后自动补回暂停的时长。</li>
@@ -105,7 +105,7 @@ import { brand } from '@spark/shared'
     </el-card>
     <el-card>
       <!-- 与 internal/butler/help/butler.md（get_help 的语料）同文，两边手工保持一致 -->
-      <h2 data-testid="help-butler">AI 管家</h2>
+      <h2 id="butler" data-testid="help-butler">AI 管家</h2>
       <ul>
         <li><b>能做什么</b>：帮您挑选套餐和可租时段、租用或续费实例、取消预订、释放实例；在实例上部署 / 重新部署 / 停止 / 启动 / 卸载应用；读取部署日志与事件帮您排查问题；查询余额、订单与计费规则，回答帮助页里的问题。</li>
         <li><b>不能做什么</b>：查看或修改 SSH 密码、管理 SSH 公钥、开放 / 公开 / 删除端口、开关自动续费、充值、实名认证、邀请返利相关操作。遇到这些需求，管家会告诉您在控制台的哪个页面自己操作。</li>
