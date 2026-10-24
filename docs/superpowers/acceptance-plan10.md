@@ -75,3 +75,32 @@
 ## 机器复原（PoC 结束时）
 
 `docker ps -a` 为空；`/sys/fs/cgroup/system.slice/` 下没有 `docker-*.scope`；MPS 已 `quit`，没有 `nvidia-cuda-mps*` 进程，`/tmp/spark-mps` 已删除；计算模式已恢复为 `Default`；`/tmp/poc`、`/tmp/poc-src` 已删除。保留了镜像 `spark/poc-shared:1` 和 `nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04`，验收时复用。`spark-agent` 为 `active`，版本 `9f0e8f0`。
+
+## 验收（搁置后的范围：Agent 多容器 + 按实例端口，规格裁定 S14）
+
+### V1 真机多容器（`deploy/poc/shared/multicheck`，2026-10-25 03:08～03:10）
+
+- 环境：Agent 二进制取自本分支 `fe81c48`（`make agent`，SHA-256 `9a411bdd132a7e584e29e6913d8f840fb881acdac75ae4b0d2fe7993946ea79d`），工具用同一提交交叉编译。执行前先停掉 `spark-agent`，然后 `sudo /tmp/multicheck --lan-ip 192.168.1.221`。工具使用独立的状态目录 `/var/tmp/spark-multicheck/<ts>`，并通过真实的 executor 调用 docker、loop 设备、iptables 和 tc。当时机器上还有计划 11 的整机实例 `ins-o3xpibdh`（端口 2222），本步骤全程没有碰它。
+- 结果 `RESULT: PASS`（exit 0），全部 64 项检查通过。原文摘录：
+  - A（4 份，端口 2223）与 B（4 份，端口 2224）：
+    - `Memory=30517760000 MemorySwap=30517760000 NanoCpus=5000000000 PidsLimit=8192 ShmSize=15258880000 CapAdd=[CAP_IPC_LOCK CAP_SYS_PTRACE] PortBindings=map[22/tcp:[{192.168.1.221 2223}]]`。其中 `(130660974592 − 8 GiB) / 4 = 30517760000`；没有 `SYS_NICE`。
+    - 数据盘镜像 `549755813888 = 512 GiB`，挂载在 `/dev/loop18` 和 `/dev/loop19`（各 502.9G）。
+  - C 用已被占用的 2223 开通，被拒：`SSH 端口冲突：2223 已被实例 ins-mtnfejia 使用`。没有留下容器，也没有留下数据盘。
+  - `Mounts()` 返回 2 项，cgroup 目录 `/sys/fs/cgroup/system.slice/docker-<64 位 id>.scope` 存在。指标：
+    - 空闲时 `mem_current=3506176 mem_max=30517760000 cpu_percent=0.0 data_disk_used=28672`；
+    - 在 A 里跑两个空转循环时，A 为 `cpu_percent=200.0`，B 为 `cpu_percent=0.0`。
+  - 容器内 `memory.max = 30517760000`，`cpu.max = "500000 100000"`。
+  - 隔离：
+    - A 连不通 B 的 `10.200.0.4:22`（`exit 124`，因为 `enable_icc=false`）；
+    - A 连不通宿主机的 `192.168.1.221:2224`（`exit 124`）；
+    - 宿主机能连上 2223 和 2224。
+  - 整机实例 D（`share_slots 1`，端口 2225）：`Memory=122071040000 NanoCpus=0 PidsLimit=32768 ShmSize=65330487296 CapAdd=[CAP_IPC_LOCK CAP_SYS_NICE CAP_SYS_PTRACE]`，数据盘 `2199023255552 = 2048 GiB`。与现有整机参数一致：`MemTotal − 8 GiB`，shm 为 `MemTotal / 2`。
+  - 清理：A / B / C / D 全部清除，`container=false img_gone=true loops=[] mounted=false ssh_gone=true`。
+- 结束后启动 `spark-agent`（状态 `active`），删除工具的状态目录。
+
+### V2 新 Agent + 旧 platform 兼容（03:09～03:11）
+
+- 先在机器上运行 `spark-agent selfcheck`（`fe81c48`），全部为 `ok`，新增的两项是 `ok: nproc 20`、`ok: cgroup v2 cpu memory pids`，`selfcheck_rc=0`。然后 `install -m 755` 替换 `/usr/local/bin/spark-agent` 并重启服务。日志：`"spark-agent running","platform":"192.168.1.218:9443","version":"fe81c48"`。
+- 当时连着的是计划 11 的验收 platform（旧协议，库 `spark_p11`）。机器 1 的记录：`agent_version = fe81c48`，`agent_online = true`，`last_seen_at` 持续刷新。`last_metrics` 的机器级字段照常（`data_disk_used = 72518127616`：实例数据盘是挂载点，判定正确，计入了合计）。没有新告警，也没有新的 Agent 指令（最后一条仍是 01:40 的 `create_instance`）。实例 `ins-o3xpibdh` 一直 `running`。
+- 也就是说，新 Agent 向旧 platform 上报的新字段（`Hello.features`、`Heartbeat.instances`）被安全忽略。
+- 验证完成后换回原来的 `9f0e8f0`（`active`），保持其他计划的验收环境不变。
