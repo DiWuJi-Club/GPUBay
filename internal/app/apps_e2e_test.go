@@ -206,11 +206,20 @@ func (e *appsEnv) dep(id string) appdeploy.Deployment {
 func (e *appsEnv) until(id, what string, maxRounds int, ok func(appdeploy.Deployment) bool) appdeploy.Deployment {
 	e.t.Helper()
 	d := e.dep(id)
+	stalled := false
 	for i := 0; i < maxRounds && !ok(d); i++ {
 		e.clk.Advance(appdeploy.PollInterval)
-		time.Sleep(50 * time.Millisecond)
+		// 部署中且上一轮没有进展时多等一会儿真实时间：假时钟每轮走 30 秒，机器繁忙时（新写的脚本首次 exec 可能要数秒）
+		// 只等 50ms 会让 10 分钟的部署超时在脚本真正跑完之前到点
+		if stalled && (d.State == appdeploy.StateQueued || d.State == appdeploy.StateInstalling) {
+			time.Sleep(500 * time.Millisecond)
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
 		e.tick()
+		prev := d
 		d = e.dep(id)
+		stalled = d.State == prev.State && d.Phase == prev.Phase && d.Progress == prev.Progress && d.Message == prev.Message
 	}
 	if !ok(d) {
 		e.t.Fatalf("deployment %s: %s not reached: state %s phase %q error %q message %q\nlog:\n%s", id, what, d.State, d.Phase, d.ErrorCode, d.Message, d.LogTail)

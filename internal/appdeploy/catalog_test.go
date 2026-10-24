@@ -574,3 +574,67 @@ func TestCoverageMatchesTruncatedRef(t *testing.T) {
 		t.Fatalf("coverage = %+v %v", cov, err)
 	}
 }
+
+// 计划 9：内部应用（apps.internal）不在用户目录里出现，后台列表照常可见并带 internal。
+func TestInternalAppHiddenFromPublished(t *testing.T) {
+	e := newEnv(t, 0)
+	pub := func(a appdeploy.App) {
+		v := e.version(a.ID, "1.0.0")
+		if _, _, err := e.cat.PublishVersion(e.ctx, e.actor(), a.ID, v.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shown := e.app("shown", appdeploy.StatusPublished)
+	pub(shown)
+	node, err := e.cat.CreateApp(e.ctx, e.actor(), appdeploy.AppInput{Slug: "vllm-node", Name: "节点", Category: "llm", Status: appdeploy.StatusPublished, Internal: true})
+	if err != nil || !node.Internal {
+		t.Fatalf("create internal = %+v, %v", node, err)
+	}
+	pub(node)
+	items, err := e.cat.ListPublished(e.ctx)
+	if err != nil || len(items) != 1 || items[0].Slug != "shown" || items[0].Internal {
+		t.Fatalf("ListPublished = %+v, %v", items, err)
+	}
+	views, err := e.svc.CatalogViews(e.ctx, false)
+	if err != nil || len(views) != 1 || views[0].Slug != "shown" {
+		t.Fatalf("CatalogViews = %+v, %v", views, err)
+	}
+	if _, err := e.svc.CatalogViewBySlug(e.ctx, "vllm-node"); codeOf(err) != "app_not_found" {
+		t.Fatalf("CatalogViewBySlug internal = %v", err)
+	}
+	// 后台：列表带 internal；UpdateApp 不改 internal（与 slug 一样创建后不变）
+	rows, err := e.cat.ListAppsAdmin(e.ctx)
+	if err != nil || len(rows) != 2 || rows[0].Internal || !rows[1].Internal {
+		t.Fatalf("ListAppsAdmin = %+v, %v", rows, err)
+	}
+	b, _ := json.Marshal(rows[1])
+	if !strings.Contains(string(b), `"internal":true`) {
+		t.Fatalf("admin row json = %s", b)
+	}
+	up, err := e.cat.UpdateApp(e.ctx, e.actor(), node.ID, appdeploy.AppInput{Name: "节点 2", Category: "llm", Status: appdeploy.StatusPublished})
+	if err != nil || !up.Internal || up.Name != "节点 2" {
+		t.Fatalf("UpdateApp = %+v, %v", up, err)
+	}
+	if got, err := e.cat.AppBySlug(e.ctx, "vllm-node"); err != nil || !got.Internal {
+		t.Fatalf("AppBySlug = %+v, %v", got, err)
+	}
+}
+
+func TestImportReadsInternal(t *testing.T) {
+	e := newEnv(t, 0)
+	root := t.TempDir()
+	writeApp(t, root, "plain", map[string]any{"name": "普通", "category": "llm", "version": "1.0.0", "images": []string{"PyTorch"}})
+	writeApp(t, root, "vllm-node", map[string]any{"name": "节点", "category": "llm", "internal": true, "version": "1.0.0", "images": []string{"PyTorch"}})
+	res, err := e.cat.ImportDir(e.ctx, e.actor(), root)
+	if err != nil || len(res) != 2 || !res[0].Created || !res[1].Created {
+		t.Fatalf("import = %+v, %v", res, err)
+	}
+	plain, err := e.cat.AppBySlug(e.ctx, "plain")
+	if err != nil || plain.Internal {
+		t.Fatalf("plain = %+v, %v", plain, err)
+	}
+	node, err := e.cat.AppBySlug(e.ctx, "vllm-node")
+	if err != nil || !node.Internal || node.Status != appdeploy.StatusDraft {
+		t.Fatalf("vllm-node = %+v, %v", node, err)
+	}
+}

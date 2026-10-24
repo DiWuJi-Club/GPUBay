@@ -57,31 +57,45 @@ func nextReservedLower(ctx context.Context, q db.Querier, machineID int64, exclu
 }
 
 // occupiedUntil 估算实例对机器的占用结束时间（machine_leases 的上界），任何分支都至少 now + 1 秒（时段不能为空）。
-func occupiedUntil(inst Instance, now time.Time) time.Time {
+// lower 是实例自己 lease 的下界，只有系统实例用到：未进入洗机的系统实例占到 lower + SystemLeaseHorizon（即上界不变）；
+// 洗机中的系统实例与普通实例相同（now + WipeBuffer），洗机失败留在 wiping 时不再占着 10 年。
+func occupiedUntil(inst Instance, lower, now time.Time) time.Time {
 	pending := time.Duration(inst.PendingSeconds) * time.Second
 	var end time.Time
-	switch inst.State {
-	case StateCreating:
+	switch {
+	case inst.System && inst.State != StateWiping:
+		end = lower.Add(SystemLeaseHorizon)
+	case inst.State == StateCreating:
 		end = now.Add(CreateTimeout + pending + Tail)
-	case StateRunning:
+	case inst.State == StateRunning:
 		if inst.Suspended() && inst.PausedRemaining != nil {
 			end = inst.resumeBase(now).Add(time.Duration(*inst.PausedRemaining)*time.Second + Tail)
 		} else if inst.ExpiresAt != nil {
 			end = inst.ExpiresAt.Add(Tail)
 		}
-	case StateStopped:
+	case inst.State == StateStopped:
 		if pending > 0 {
 			end = now.Add(CreateTimeout + pending + Tail)
 		} else if inst.StoppedAt != nil {
 			end = inst.StoppedAt.Add(Tail)
 		}
-	case StateWiping:
+	case inst.State == StateWiping:
 		end = now.Add(WipeBuffer)
 	}
 	if !end.After(now) {
 		end = now.Add(time.Second)
 	}
 	return end
+}
+
+// ownLeaseLower 实例最新一条 active lease 的下界；没有 → now。
+func ownLeaseLower(ctx context.Context, q db.Querier, id string, now time.Time) (time.Time, error) {
+	var lower time.Time
+	err := q.QueryRow(ctx, `SELECT lower(period) FROM machine_leases WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`, id).Scan(&lower)
+	if db.IsNoRows(err) {
+		return now, nil
+	}
+	return lower, err
 }
 
 // refreshLease 在实例状态变化后同步占用时段：结束的实例关闭时段，其余按 occupiedUntil 更新上界，
@@ -97,7 +111,13 @@ func (s *Service) refreshLease(ctx context.Context, tx pgx.Tx, id string, now ti
 	if inst.Booked() && (inst.State == StateReserved || inst.State == StateCreating) {
 		return nil
 	}
-	desired, status := occupiedUntil(inst, now), "active"
+	var lower time.Time
+	if inst.System {
+		if lower, err = ownLeaseLower(ctx, tx, id, now); err != nil {
+			return err
+		}
+	}
+	desired, status := occupiedUntil(inst, lower, now), "active"
 	if inst.State == StateReleased || inst.State == StateFailed || inst.State == StateCancelled {
 		desired, status = now, "ended"
 	}

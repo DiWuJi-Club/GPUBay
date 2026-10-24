@@ -40,6 +40,7 @@ type env struct {
 	svc       *appdeploy.Service
 	imageID   int64
 	userID    int64
+	systemID  int64 // 迁移 00022 的系统账号（system:llm）
 	productID int64
 	machines  []int64
 }
@@ -62,6 +63,9 @@ func newEnv(t *testing.T, machines int) *env {
 		e.machines = append(e.machines, dbtest.CreateMachine(t, pool, fmt.Sprintf("SN%03d", i)))
 	}
 	e.exec(`UPDATE machines SET agent_online = true`)
+	if err := pool.QueryRow(e.ctx, `SELECT id FROM users WHERE system AND phone = 'system:llm'`).Scan(&e.systemID); err != nil {
+		t.Fatal(err)
+	}
 	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: box})
 	e.rental = rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: wallet.NewService(pool, clk), Catalog: c, Fleet: f})
 	e.svc = e.newService(nil, "")
@@ -71,7 +75,7 @@ func newEnv(t *testing.T, machines int) *env {
 // newService 用给定的上游连接池与 AppRoot 组装部署服务（nil / 空 = 无上游 / DefaultAppRoot）。
 func (e *env) newService(up *upstream.Pool, appRoot string) *appdeploy.Service {
 	return appdeploy.NewService(appdeploy.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet, Upstream: up, AppRoot: appRoot,
+		Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet, Upstream: up, AppRoot: appRoot, SystemUserID: e.systemID,
 		PortURL: func(id string, port int) string { return fmt.Sprintf("https://%s-%d.apps.test/", id, port) }})
 }
 

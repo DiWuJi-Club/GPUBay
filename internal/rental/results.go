@@ -128,11 +128,29 @@ func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from
 	if from == StateCreating && inst.Booked() && inst.ProvisionedAt != nil {
 		return s.startBooked(ctx, tx, inst, now)
 	}
+	if inst.System {
+		return s.startSystem(ctx, tx, inst, from, reason, now)
+	}
 	expires := now.Add(time.Duration(inst.PendingSeconds) * time.Second)
 	r24, r1 := reminderFlags(expires.Sub(now))
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'running', expires_at = $2, pending_seconds = 0,
 			stopped_at = NULL, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
 		inst.ID, expires, r24, r1, now); err != nil {
+		return err
+	}
+	if err := recordEvent(ctx, tx, inst.ID, from, StateRunning, reason, now); err != nil {
+		return err
+	}
+	if err := s.apps().OnInstanceRunning(ctx, tx, inst.ID, now); err != nil {
+		return err
+	}
+	return s.refreshLease(ctx, tx, inst.ID, now)
+}
+
+// startSystem 系统实例进入 running（规格 §4.2）：不计时——expires_at 保持 NULL、pending_seconds 本就是 0、不动提醒标记；
+// 照常调 AppHooks.OnInstanceRunning（节点重建 / 机器恢复时让部署回 queued）；refreshLease 的上界保持 lower + SystemLeaseHorizon。
+func (s *Service) startSystem(ctx context.Context, tx pgx.Tx, inst Instance, from, reason string, now time.Time) error {
+	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'running', stopped_at = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 		return err
 	}
 	if err := recordEvent(ctx, tx, inst.ID, from, StateRunning, reason, now); err != nil {

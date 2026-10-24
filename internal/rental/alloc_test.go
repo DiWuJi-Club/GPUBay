@@ -494,3 +494,20 @@ func TestPlaceLockRetryBounds(t *testing.T) {
 		t.Fatalf("machine really taken: err=%v retries=%d, want no_capacity without retry", err, retries)
 	}
 }
+
+// 计划 9：Token 服务池（purpose='llm'，visible=false）里的机器不进「不限机组」的候选集，即时与预订分支都不选。
+func TestPickMachinesSkipsLLMPool(t *testing.T) {
+	e := newEnv(t, 2)
+	pooled, free := e.machines[0], e.machines[1]
+	e.toPool(pooled)
+	now := e.clock.Now()
+	for _, immediate := range []bool{true, false} {
+		spec := rental.PickSpec{ProductID: e.productID, Immediate: immediate, Lower: now, Upper: now.Add(24 * time.Hour)}
+		if got := pick(e, spec); !slices.Equal(got, []int64{free}) {
+			t.Fatalf("immediate=%v: candidates = %v, want [%d]", immediate, got, free)
+		}
+		if n, err := rental.CountAvailable(e.ctx, e.pool, spec); err != nil || n != 1 {
+			t.Fatalf("immediate=%v: count = %d, %v", immediate, n, err)
+		}
+	}
+}

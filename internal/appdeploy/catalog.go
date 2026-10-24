@@ -55,7 +55,7 @@ func NewCatalog(pool *pgxpool.Pool, clk clock.Clock, fleet *fleet.Service, image
 }
 
 const (
-	appCols     = "id, slug, name, summary, description, category, icon, sort, status, created_at, updated_at"
+	appCols     = "id, slug, name, summary, description, category, icon, sort, status, internal, created_at, updated_at"
 	versionCols = "id, app_id, version, status, image_ids, spec, script, spec_hash, changelog, published_at, created_at, updated_at"
 )
 
@@ -66,7 +66,7 @@ func qualify(cols, alias string) string {
 
 func scanApp(row pgx.Row, extra ...any) (App, error) {
 	var a App
-	dest := append([]any{&a.ID, &a.Slug, &a.Name, &a.Summary, &a.Description, &a.Category, &a.Icon, &a.Sort, &a.Status, &a.CreatedAt, &a.UpdatedAt}, extra...)
+	dest := append([]any{&a.ID, &a.Slug, &a.Name, &a.Summary, &a.Description, &a.Category, &a.Icon, &a.Sort, &a.Status, &a.Internal, &a.CreatedAt, &a.UpdatedAt}, extra...)
 	err := row.Scan(dest...)
 	if db.IsNoRows(err) {
 		return App{}, apperr.ErrNotFound
@@ -93,10 +93,12 @@ func scanVersion(row pgx.Row, extra ...any) (Version, error) {
 
 // ---- 应用 ----
 
+// AppInput 建 / 改应用的输入。Internal 只在建应用时生效（导入 app.json 的 "internal"），更新时与 Slug 一样被忽略。
 type AppInput struct {
 	Slug, Name, Summary, Description, Category, Icon string
 	Sort                                             int
 	Status                                           string
+	Internal                                         bool
 }
 
 // normalizeApp 校验并补默认值；checkSlug 为 false 时（更新）忽略 Slug。
@@ -143,9 +145,9 @@ func (c *Catalog) CreateApp(ctx context.Context, actor audit.Actor, in AppInput)
 	var out App
 	err = db.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
 		now := c.clock.Now()
-		a, err := scanApp(tx.QueryRow(ctx, `INSERT INTO apps (slug, name, summary, description, category, icon, sort, status, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9) RETURNING `+appCols,
-			in.Slug, in.Name, in.Summary, in.Description, in.Category, in.Icon, in.Sort, in.Status, now))
+		a, err := scanApp(tx.QueryRow(ctx, `INSERT INTO apps (slug, name, summary, description, category, icon, sort, status, internal, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $10, $9, $9) RETURNING `+appCols,
+			in.Slug, in.Name, in.Summary, in.Description, in.Category, in.Icon, in.Sort, in.Status, now, in.Internal))
 		if db.IsUniqueViolation(err) {
 			return errSlugExists
 		}
@@ -158,7 +160,7 @@ func (c *Catalog) CreateApp(ctx context.Context, actor audit.Actor, in AppInput)
 	return out, err
 }
 
-// UpdateApp 修改应用的展示信息与状态；slug 创建后不可改（in.Slug 被忽略）。
+// UpdateApp 修改应用的展示信息与状态；slug 与 internal 创建后不可改（in.Slug / in.Internal 被忽略）。
 func (c *Catalog) UpdateApp(ctx context.Context, actor audit.Actor, id int64, in AppInput) (App, error) {
 	in, err := normalizeApp(in, false)
 	if err != nil {
@@ -662,11 +664,11 @@ type CatalogItem struct {
 	Images  []ImageBrief `json:"images"`
 }
 
-// ListPublished 返回已上架（apps.status = published 且有已发布版本）的应用及其最新已发布版本，按 sort, id 排序。
+// ListPublished 返回已上架（apps.status = published 且有已发布版本）的非内部应用及其最新已发布版本，按 sort, id 排序。
 func (c *Catalog) ListPublished(ctx context.Context) ([]CatalogItem, error) {
 	rows, err := c.pool.Query(ctx, `SELECT DISTINCT ON (a.id) `+qualify(appCols, "a")+`, `+qualify(versionCols, "v")+`
 		FROM apps a JOIN app_versions v ON v.app_id = a.id AND v.status = 'published'
-		WHERE a.status = 'published' ORDER BY a.id, v.published_at DESC, v.id DESC`)
+		WHERE a.status = 'published' AND NOT a.internal ORDER BY a.id, v.published_at DESC, v.id DESC`)
 	if err != nil {
 		return nil, err
 	}

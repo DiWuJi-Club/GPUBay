@@ -48,6 +48,27 @@ func TestGroupAPI(t *testing.T) {
 		t.Fatalf("list = %d %v", code, out)
 	}
 	row := items[0].(map[string]any)
+	poolRow := items[1].(map[string]any)
+	if row["purpose"] != "rental" || poolRow["purpose"] != "llm" || poolRow["visible"] != false {
+		t.Fatalf("purpose: %v / %v", row, poolRow)
+	}
+	poolID := itoa(int64(poolRow["id"].(float64)))
+	// 计划 9：池机组不能对用户可见、不能改用途、不能删除；不能经接口再建一个池
+	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": true}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("pool visible = %d %v", code, out)
+	}
+	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": false, "purpose": "rental"}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("pool purpose = %d %v", code, out)
+	}
+	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": false, "sort": 1000, "description": "推理节点"}); code != 200 || out["purpose"] != "llm" {
+		t.Fatalf("pool edit = %d %v", code, out)
+	}
+	if code, out := ops.do("DELETE", "/groups/"+poolID, map[string]any{}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("pool delete = %d %v", code, out)
+	}
+	if code, out := ops.do("POST", "/groups", map[string]any{"name": "第二池", "purpose": "llm"}); code != 400 || codeOf(out) != "bad_request" {
+		t.Fatalf("create llm group = %d %v", code, out)
+	}
 	if row["machine_count"].(float64) != 2 || row["idle_now"].(float64) != 2 || row["reserved_upcoming"].(float64) != 0 {
 		t.Fatalf("row = %v", row)
 	}

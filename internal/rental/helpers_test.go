@@ -69,6 +69,7 @@ type env struct {
 	notifier  *fakeNotifier
 	keys      *fakeKeys
 	userID    int64
+	systemID  int64 // 计划 9：迁移插入的系统账号（system:llm）
 	productID int64
 	imageID   int64
 	machines  []int64
@@ -87,12 +88,16 @@ func newEnv(t *testing.T, machines int) *env {
 	f := fleet.NewService(pool, clk)
 	n := &fakeNotifier{}
 	keys := &fakeKeys{}
+	var systemID int64
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM users WHERE system AND phone = 'system:llm'`).Scan(&systemID); err != nil {
+		t.Fatalf("system user: %v", err)
+	}
 	svc := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: w,
-		Catalog: catalog.NewService(pool), Fleet: f, Notifier: n, Keys: keys,
+		Catalog: catalog.NewService(pool), Fleet: f, Notifier: n, Keys: keys, SystemUserID: systemID,
 	})
 	e := &env{t: t, ctx: context.Background(), pool: pool, clock: clk, svc: svc, wallet: w, fleet: f, notifier: n, keys: keys,
-		productID: dbtest.ProductID(t, pool), imageID: dbtest.ImageID(t, pool)}
+		systemID: systemID, productID: dbtest.ProductID(t, pool), imageID: dbtest.ImageID(t, pool)}
 	e.userID = e.newUser("13600000001", startFunds)
 	for i := 0; i < machines; i++ {
 		e.machines = append(e.machines, dbtest.CreateMachine(t, pool, fmt.Sprintf("SN%03d", i)))

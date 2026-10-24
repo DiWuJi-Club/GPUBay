@@ -66,7 +66,7 @@ func (s *Service) Cancel(ctx context.Context, userID int64, id, ip string) (Inst
 		if inst.UserID != userID {
 			return apperr.ErrNotFound
 		}
-		if inst.State != StateReserved || !inst.Booked() {
+		if inst.System || inst.State != StateReserved || !inst.Booked() {
 			return apperr.ErrInvalidState
 		}
 		if !now.Before(inst.ScheduledStartAt.Add(-PrepLead)) {
@@ -101,7 +101,7 @@ func (s *Service) AdminCancelBooking(ctx context.Context, actor audit.Actor, id,
 		if err != nil {
 			return err
 		}
-		if inst.State != StateReserved || !inst.Booked() {
+		if inst.System || inst.State != StateReserved || !inst.Booked() {
 			return apperr.ErrInvalidState
 		}
 		userID = inst.UserID
@@ -123,6 +123,9 @@ func (s *Service) AdminCancelBooking(ctx context.Context, actor audit.Actor, id,
 // cancelInstance 把 reserved（或改派失败后的 creating）实例取消：lease 与实例置 cancelled、清主机私钥、按比例退款、写事件。
 // 调用方已持实例锁。返回实际退款金额。
 func (s *Service) cancelInstance(ctx context.Context, tx pgx.Tx, inst Instance, percent int, operatorID int64, reason, remark string, now time.Time) (int64, error) {
+	if inst.System { // 防御：系统实例从不是预订，调用方的状态校验本已挡住
+		return 0, apperr.ErrInvalidState
+	}
 	if _, err := tx.Exec(ctx, `UPDATE machine_leases SET status = 'cancelled', updated_at = $2
 		WHERE instance_id = $1 AND status IN ('reserved', 'active')`, inst.ID, now); err != nil {
 		return 0, err

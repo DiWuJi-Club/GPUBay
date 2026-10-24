@@ -120,7 +120,7 @@ func (s *Service) AdminReassign(ctx context.Context, actor audit.Actor, id strin
 			if err != nil {
 				return err
 			}
-			if inst.State != StateReserved || !inst.Booked() {
+			if inst.System || inst.State != StateReserved || !inst.Booked() {
 				return apperr.ErrInvalidState
 			}
 			lease, err := lockLease(ctx, tx, inst.ID)
@@ -152,6 +152,7 @@ func (s *Service) AdminReassign(ctx context.Context, actor audit.Actor, id strin
 
 // reassignTo 改派到指定机器：机器存在、同商品、idle / allocated、与 lease 时段无冲突（排他约束兜底）。
 // 与自动挑选不对称（有意）：不要求 agent_online（提前改派，开通时再看），也允许 visible=false 机组的机器（运维留池）；后台页面的说明文字同此。
+// 例外（计划 9）：Token 服务池（purpose='llm'）的机器不接受改派——池机器只给平台节点用。
 // 目标机器行锁 FOR NO KEY UPDATE（等待而非 SKIP LOCKED：运维点名的机器不该因并发分配被悄悄跳过）；
 // 实例的 group_id 改为目标机器的机组（与 AdminMigrate 一致），之后的自动改派与展示都以新机组为准。
 func (s *Service) reassignTo(ctx context.Context, tx pgx.Tx, inst *Instance, lease *leaseRow, target int64, reason string, now time.Time) error {
@@ -160,6 +161,7 @@ func (s *Service) reassignTo(ctx context.Context, tx pgx.Tx, inst *Instance, lea
 	}
 	var groupID *int64
 	err := tx.QueryRow(ctx, `SELECT m.group_id FROM machines m WHERE m.id = $1 AND m.product_id = $2 AND m.state IN ('idle', 'allocated')
+			AND NOT EXISTS (SELECT 1 FROM machine_groups g WHERE g.id = m.group_id AND g.purpose = 'llm')
 			AND NOT EXISTS (SELECT 1 FROM machine_leases l WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active')
 			                AND l.period && tstzrange($3::timestamptz, $4::timestamptz))
 			FOR NO KEY UPDATE OF m`,

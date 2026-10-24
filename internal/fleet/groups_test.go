@@ -187,3 +187,89 @@ func TestMarkAllocatedRequiresIdleAndOnline(t *testing.T) {
 }
 
 func itoa(n int64) string { return fmt.Sprintf("%d", n) }
+
+// 计划 9：迁移 00022 建好唯一的 Token 服务池（purpose='llm'、不可见）。
+func TestLLMPoolGroupID(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	id, err := svc.LLMPoolGroupID(ctx, pool)
+	if err != nil || id <= 0 {
+		t.Fatalf("LLMPoolGroupID = %d, %v", id, err)
+	}
+	g, err := svc.GetGroup(ctx, pool, id)
+	if err != nil || g.Purpose != fleet.GroupPurposeLLM || g.Visible || g.Name != "Token 服务池" {
+		t.Fatalf("pool group = %+v, %v", g, err)
+	}
+	rows, err := svc.ListGroups(ctx, false, nil)
+	if err != nil || len(rows) != 1 || rows[0].Purpose != fleet.GroupPurposeLLM {
+		t.Fatalf("list = %+v, %v", rows, err)
+	}
+	if vis, err := svc.ListGroups(ctx, true, nil); err != nil || len(vis) != 0 {
+		t.Fatalf("visible list must not contain pool: %+v, %v", vis, err)
+	}
+	other, err := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "A 区", Visible: true})
+	if err != nil || other.Purpose != fleet.GroupPurposeRental {
+		t.Fatalf("create = %+v, %v", other, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE machine_groups SET purpose = 'rental' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.LLMPoolGroupID(ctx, pool); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("missing pool = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPoolGroupCannotBeVisibleOrDeleted(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	id, err := svc.LLMPoolGroupID(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 可以改名、描述、排序（保持不可见）
+	g, err := svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "推理池", Description: "d", Sort: 5, Visible: false})
+	if err != nil || g.Name != "推理池" || g.Visible || g.Purpose != fleet.GroupPurposeLLM {
+		t.Fatalf("update = %+v, %v", g, err)
+	}
+	_, err = svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "推理池", Visible: true})
+	if ae := apperr.As(err); ae == nil || ae.Code != "invalid_state" || ae.Message != "Token 服务池不能对用户可见" {
+		t.Fatalf("visible = %v", err)
+	}
+	_, err = svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "推理池", Purpose: fleet.GroupPurposeRental})
+	if ae := apperr.As(err); ae == nil || ae.Code != "invalid_state" {
+		t.Fatalf("purpose change = %v", err)
+	}
+	if err := svc.DeleteGroupIn(ctx, pool, id); !errors.Is(err, apperr.ErrInvalidState) && (apperr.As(err) == nil || apperr.As(err).Code != "invalid_state") {
+		t.Fatalf("delete pool = %v", err)
+	}
+	if g, err := svc.GetGroup(ctx, pool, id); err != nil || g.Visible || g.Purpose != fleet.GroupPurposeLLM {
+		t.Fatalf("pool after rejected ops = %+v, %v", g, err)
+	}
+	// 普通机组不能改成池
+	r, err := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "A 区", Visible: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.UpdateGroup(ctx, opsActor, r.ID, fleet.GroupInput{Name: "A 区", Purpose: fleet.GroupPurposeLLM}); apperr.As(err) == nil {
+		t.Fatalf("rental -> llm = %v", err)
+	}
+	if g, err := svc.UpdateGroup(ctx, opsActor, r.ID, fleet.GroupInput{Name: "A 区", Purpose: fleet.GroupPurposeRental, Visible: false}); err != nil || g.Purpose != fleet.GroupPurposeRental || g.Visible {
+		t.Fatalf("rental update = %+v, %v", g, err)
+	}
+}
+
+func TestCreateGroupRejectsLLMPurpose(t *testing.T) {
+	svc, _, _ := newEnv(t)
+	ctx := context.Background()
+	_, err := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "第二个池", Purpose: fleet.GroupPurposeLLM})
+	if ae := apperr.As(err); ae == nil || ae.Code != "bad_request" || ae.Message != "不能创建 Token 服务池机组" {
+		t.Fatalf("create llm = %v", err)
+	}
+	if _, err := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "x", Purpose: "weird"}); apperr.As(err) == nil || apperr.As(err).Code != "bad_request" {
+		t.Fatalf("create weird purpose = %v", err)
+	}
+	g, err := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "A 区", Purpose: fleet.GroupPurposeRental, Visible: true})
+	if err != nil || g.Purpose != fleet.GroupPurposeRental {
+		t.Fatalf("create rental = %+v, %v", g, err)
+	}
+}
