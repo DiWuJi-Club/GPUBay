@@ -79,9 +79,6 @@ func NewRegistry(d Deps) *Registry {
 	return r
 }
 
-// writeTools 是 8 个写工具；Task 6 在 write.go 里实现并删除这里的占位。
-func writeTools(Deps) []Tool { return nil }
-
 func (r *Registry) register(t Tool) {
 	if _, dup := r.tools[t.Name]; dup {
 		panic("butler tools: duplicate tool " + t.Name)
@@ -126,8 +123,8 @@ func (r *Registry) Get(name string) (Tool, bool) {
 // Names 返回全部工具名（排序）。
 func (r *Registry) Names() []string { return append([]string(nil), r.names...) }
 
-// Validate 按工具 schema 校验并规范化参数（去 null、填默认）。未知工具 → *ValidationError「未知工具 <name>」；
-// 校验失败 → *ValidationError，文案「参数 <path>：<原因>」。
+// Validate 按工具 schema 校验并规范化参数（去 null、填默认）。未知工具 → 「未知工具 <name>」错误（IsUnknownTool 为 true，
+// 不是 *ValidationError）；校验失败 → *ValidationError，文案「参数 <path>：<原因>」。
 func (r *Registry) Validate(name string, args json.RawMessage) (json.RawMessage, error) {
 	s, ok := r.schemas[name]
 	if !ok {

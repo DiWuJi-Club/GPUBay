@@ -83,8 +83,7 @@ func arr(t *testing.T, v any, key string) []map[string]any {
 func TestRegistryDefs(t *testing.T) {
 	r := NewRegistry(newFakes().deps)
 	defs := r.Defs()
-	// Task 6 加入 8 个写工具后改为 ReadToolNames + WriteToolNames（23 个）。
-	want := append([]string(nil), ReadToolNames...)
+	want := append(append([]string(nil), ReadToolNames...), WriteToolNames...) // 15 读 + 8 写
 	sort.Strings(want)
 	var got []string
 	for _, d := range defs {
@@ -109,6 +108,14 @@ func TestRegistryDefs(t *testing.T) {
 		if tool.Kind != Read || tool.Danger || tool.Summary != nil {
 			t.Errorf("%s: read tool must be Kind=Read, no Danger, no Summary", n)
 		}
+	}
+	for _, n := range WriteToolNames {
+		if tool, _ := r.Get(n); tool.Kind != Write || tool.Summary == nil {
+			t.Errorf("%s: write tool must be Kind=Write with Summary", n)
+		}
+	}
+	if len(got) != 23 {
+		t.Fatalf("len(Defs) = %d, want 23", len(got))
 	}
 	if fmt.Sprint(r.Names()) != fmt.Sprint(got) {
 		t.Fatal("Names != Defs order")
