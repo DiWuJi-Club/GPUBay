@@ -52,8 +52,9 @@ func collectDeployments(rows pgx.Rows, err error) ([]Deployment, error) {
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Deployment, error) { return scanDeployment(r) })
 }
 
-// lockDeployment 锁部署行（FOR UPDATE）。用户操作与 rental 钩子须先持有实例行锁（规格 §14 加锁顺序）。
-func lockDeployment(ctx context.Context, q db.Querier, id string) (Deployment, error) {
+// LockDeployment 锁部署行（FOR UPDATE）；不存在 → apperr.ErrNotFound。用户操作与 rental 钩子须先持有实例行锁（规格 §14 加锁顺序）；
+// 计划 11 的 comfywf 在 rental.LockOwned 之后调用它。
+func LockDeployment(ctx context.Context, q db.Querier, id string) (Deployment, error) {
 	return scanDeployment(q.QueryRow(ctx, `SELECT `+depCols+` FROM app_deployments WHERE id = $1 FOR UPDATE`, id))
 }
 
@@ -188,7 +189,8 @@ func appName(ctx context.Context, q db.Querier, appID int64) (string, error) {
 
 // markFailed 把部署置为 failed（Runner / 钩子用；调用方持部署行锁）：next_poll_at 推后 24 小时（failed 不在 Runner 候选里，只为索引整洁）。
 // msg 在这里按该部署的全部 secret 值脱敏（先脱敏再截断，避免截断留下 secret 前缀）；解密失败时丢弃 msg（宁缺勿漏）。
-func (s *Service) markFailed(ctx context.Context, q db.Querier, cur Deployment, code, msg string, now time.Time) error {
+// 所有写 failed 的路径都经这里：Deps.OnTransition(failed) 在此于同一事务里调用一次。
+func (s *Service) markFailed(ctx context.Context, q pgx.Tx, cur Deployment, code, msg string, now time.Time) error {
 	secrets, err := openSecrets(s.d.Box, cur.SecretEnvEnc)
 	if err != nil {
 		s.d.Log.Warn("app deploy markFailed: cannot open secrets, dropping message", "deployment", cur.ID, "err", err)
@@ -199,6 +201,9 @@ func (s *Service) markFailed(ctx context.Context, q db.Querier, cur Deployment, 
 		next_poll_at = $5, updated_at = $4, row_version = row_version + 1 WHERE id = $1`, cur.ID, code, msg, now, now.Add(24*time.Hour)); err != nil {
 		return err
 	}
+	if err := s.onTransition(ctx, q, cur, StateFailed, now); err != nil {
+		return err
+	}
 	detail := ErrorText[code]
 	if detail == "" {
 		detail = code
@@ -207,6 +212,17 @@ func (s *Service) markFailed(ctx context.Context, q db.Querier, cur Deployment, 
 		detail += "：" + msg
 	}
 	return addEvent(ctx, q, cur.ID, cur.State, StateFailed, detail, now)
+}
+
+// onTransition 调 Deps.OnTransition（nil 安全）。
+func (s *Service) onTransition(ctx context.Context, tx pgx.Tx, cur Deployment, to string, now time.Time) error {
+	if s.d.OnTransition == nil {
+		return nil
+	}
+	if err := s.d.OnTransition(ctx, tx, cur, to, now); err != nil {
+		return fmt.Errorf("appdeploy: OnTransition(%s → %s): %w", cur.ID, to, err)
+	}
+	return nil
 }
 
 // markRemoved 把部署置为 removed（不再需要清理容器目录：实例已消失，或 Runner 已执行 remove），删除它登记的端口（以部署主人审计）并记事件。
@@ -251,7 +267,8 @@ func (s *Service) appAndVersion(ctx context.Context, d Deployment) (App, Version
 	return app, ver, nil
 }
 
-// bundleFor 生成部署的部署包（run.sh + app.sh + spec.json + env，imageEnv 非 nil 时加 image.env）。
+// bundleFor 生成部署的部署包（run.sh + app.sh + spec.json + env，imageEnv 非 nil 时加 image.env；
+// 版本支持工作流且接了 Deps.BundleExtra 时追加它给出的文件，其错误同样是 bundleError）。
 // healthAddr 非 nil 时覆盖 run.sh 的健康检查地址（测试）。
 func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, healthAddr func(port int) string, imageEnv []EnvKV) ([]byte, App, error) {
 	app, ver, err := s.appAndVersion(ctx, d)
@@ -263,7 +280,12 @@ func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, h
 		return nil, app, &bundleError{err}
 	}
 	in := BundleInput{Slug: app.Slug, InstanceID: d.InstanceID, AppRoot: appRoot, SpecHash: d.SpecHash, Spec: ver.Spec, Script: ver.Script,
-		Env: d.Env, Secret: secret, HFEndpoint: s.d.HFEndpoint, PipIndexURL: s.d.PipIndexURL, ImageEnv: imageEnv}
+		Env: d.Env, Secret: secret, HFEndpoint: s.d.HFEndpoint, PipIndexURL: s.d.PipIndexURL, GitMirror: s.d.GitMirror, ImageEnv: imageEnv}
+	if ver.Spec.SupportsWorkflows && s.d.BundleExtra != nil {
+		if in.Extra, err = s.d.BundleExtra(ctx, d, ver); err != nil {
+			return nil, app, &bundleError{err}
+		}
+	}
 	if healthAddr != nil && len(ver.Spec.Ports) > 0 {
 		in.HealthAddr = healthAddr(ver.Spec.Ports[0].Port)
 	}

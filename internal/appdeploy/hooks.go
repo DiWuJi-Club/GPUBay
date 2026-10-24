@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/rental"
@@ -70,7 +71,7 @@ func (s *Service) OnInstanceGone(ctx context.Context, tx pgx.Tx, instanceID, rea
 }
 
 // OnInstanceMigrated（规格 §6.4）：旧实例非终态部署 → lost（事件「实例已更换机器」），旧端口行不再指向它们（deployment_id 置 NULL，裁定 P7）。
-// state ≠ failed 且 desired ≠ removed 的复制到新实例（attempt 0，同版本 / 变量 / 密文 / 端口 / spec_hash）：
+// state ≠ failed 且 desired ≠ removed 的复制到新实例（attempt 0，同版本 / 变量 / 密文 / 端口 / spec_hash，连同工作流集合，置 pending）：
 //   - desired = running → queued，新实例 running 后部署；
 //   - desired = stopped → stopped / stopped（用户停的不自动启动；「启动」走 Start → queued 的完整部署）。
 //
@@ -118,6 +119,11 @@ func (s *Service) OnInstanceMigrated(ctx context.Context, tx pgx.Tx, oldID, newI
 		if err := addEvent(ctx, tx, nd.ID, "", state, detail, now); err != nil {
 			return err
 		}
+		// 计划 11 D14：工作流集合随部署复制，全部回到 pending（新容器里要重新装）
+		if _, err := tx.Exec(ctx, `INSERT INTO deployment_workflows (deployment_id, workflow_id, workflow_version_id, state, added_at)
+			SELECT $1, workflow_id, workflow_version_id, 'pending', $3 FROM deployment_workflows WHERE deployment_id = $2`, nd.ID, d.ID, now); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -151,15 +157,17 @@ func (s *Service) dropCopiedPorts(ctx context.Context, tx pgx.Tx, d Deployment, 
 
 // installPlan 是 PrepareInstall 校验通过的预装计划（变量已补默认值并拆成普通 / 敏感）。
 type installPlan struct {
-	app    App
-	ver    Version
-	plain  map[string]string
-	secret map[string]string
+	app       App
+	ver       Version
+	plain     map[string]string
+	secret    map[string]string
+	Workflows []WorkflowRef // 计划 11：预装的工作流集合（ResolveWorkflows 的结果）
 }
 
-// PrepareInstall 下单预装校验：published 应用的最新 published 版本、镜像兼容、变量。错误都是 4xx 的 apperr
-// （app_not_found / app_unavailable / app_image_mismatch / app_env_*），rental 在扣款前整单失败。
-func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, imageID int64, env map[string]string) (rental.InstallPlan, error) {
+// PrepareInstall 下单预装校验：published 应用的最新 published 版本、镜像兼容、变量；workflowIDs 非空时（计划 11）
+// 版本须支持工作流且接了 Deps.ResolveWorkflows（否则 workflow_app_unsupported），由它解析出集合。错误都是 4xx 的 apperr
+// （app_not_found / app_unavailable / app_image_mismatch / app_env_* / workflow_*），rental 在扣款前整单失败。
+func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, imageID int64, env map[string]string, workflowIDs []int64) (rental.InstallPlan, error) {
 	app, ver, err := s.resolveVersion(ctx, q, appID, nil)
 	if err != nil {
 		return nil, err
@@ -171,10 +179,20 @@ func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, image
 	if err != nil {
 		return nil, err
 	}
-	return &installPlan{app: app, ver: ver, plain: plain, secret: secret}, nil
+	plan := &installPlan{app: app, ver: ver, plain: plain, secret: secret}
+	if len(workflowIDs) > 0 {
+		if !ver.Spec.SupportsWorkflows || s.d.ResolveWorkflows == nil {
+			return nil, apperr.ErrWorkflowAppUnsupported
+		}
+		if plan.Workflows, err = s.d.ResolveWorkflows(ctx, q, workflowIDs); err != nil {
+			return nil, err
+		}
+	}
+	return plan, nil
 }
 
-// QueueInstall 为刚插入的实例写一条 queued 部署（实例 running 后 Runner 执行），以实例主人审计 instance.app_deploy。
+// QueueInstall 为刚插入的实例写一条 queued 部署（实例 running 后 Runner 执行），以实例主人审计 instance.app_deploy；
+// 计划带工作流时写入 deployment_workflows（pending）并记事件「预装工作流 N 个」。
 func (s *Service) QueueInstall(ctx context.Context, tx pgx.Tx, inst rental.Instance, plan rental.InstallPlan, now time.Time) error {
 	p, ok := plan.(*installPlan)
 	if !ok || p == nil {
@@ -187,6 +205,24 @@ func (s *Service) QueueInstall(ctx context.Context, tx pgx.Tx, inst rental.Insta
 	if err := addEvent(ctx, tx, d.ID, "", StateQueued, "预装："+p.app.Name+" "+p.ver.Version+"，实例开通后自动部署", now); err != nil {
 		return err
 	}
-	return audit.Record(ctx, tx, now, audit.Actor{UserID: inst.UserID}.Entry("instance.app_deploy", "instance", inst.ID,
-		map[string]any{"deployment": d.ID, "app": p.app.Slug, "version_id": p.ver.ID, "preinstall": true}))
+	if len(p.Workflows) > 0 {
+		for _, w := range p.Workflows {
+			if _, err := tx.Exec(ctx, `INSERT INTO deployment_workflows (deployment_id, workflow_id, workflow_version_id, state, added_at)
+				VALUES ($1, $2, $3, 'pending', $4)`, d.ID, w.WorkflowID, w.VersionID, now); err != nil {
+				return err
+			}
+		}
+		if err := addEvent(ctx, tx, d.ID, StateQueued, StateQueued, fmt.Sprintf("预装工作流 %d 个", len(p.Workflows)), now); err != nil {
+			return err
+		}
+	}
+	detail := map[string]any{"deployment": d.ID, "app": p.app.Slug, "version_id": p.ver.ID, "preinstall": true}
+	if len(p.Workflows) > 0 {
+		ids := make([]int64, len(p.Workflows))
+		for i, w := range p.Workflows {
+			ids[i] = w.WorkflowID
+		}
+		detail["workflow_ids"] = ids
+	}
+	return audit.Record(ctx, tx, now, audit.Actor{UserID: inst.UserID}.Entry("instance.app_deploy", "instance", inst.ID, detail))
 }

@@ -12,7 +12,7 @@ const (
 	DefaultTimeoutMinutes = 60
 	MaxTimeoutMinutes     = 180
 	MaxLogTail            = 65536
-	MaxBundleBytes        = 262144
+	MaxBundleBytes        = 4 << 20 // 计划 11 D2：8 个工作流 × 256KB + 脚本
 	MaxScriptBytes        = 65536
 	MaxStatusBytes        = 16384
 	MaxExecPerRound       = 16

@@ -2,7 +2,7 @@
 //
 // 加锁顺序（规格 §14，所有路径一律）：instances 行 → app_deployments 行 → instance_ports。
 //   - rental 钩子：在已持 instances 行锁（FOR UPDATE）的事务里锁 app_deployments 行。
-//   - 用户操作：rental.LockOwned（instances FOR UPDATE）→ lockDeployment；后台强制卸载同序（instances FOR UPDATE → 部署）。
+//   - 用户操作：rental.LockOwned（instances FOR UPDATE）→ LockDeployment；后台强制卸载同序（instances FOR UPDATE → 部署）。
 //   - Runner 回写：先取 instances 行 FOR KEY SHARE，再锁部署行。不能只锁部署行：
 //     插入 instance_ports 的外键检查会对 instances 行取 KEY SHARE，与持实例 FOR UPDATE、等部署行锁的用户操作成环（死锁）。
 //   - instance_ports 的插入 / 认领 / 删除都在持部署行锁之后（registerPorts 的前置条件）。
@@ -13,6 +13,7 @@ package appdeploy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -49,6 +50,18 @@ type Deps struct {
 	// AppRootFor 按实例给出应用根目录（测试 / e2e 多实例共用一个假容器时各用各的目录）；nil → AppRoot。
 	AppRootFor              func(instanceID string) string
 	HFEndpoint, PipIndexURL string
+	GitMirror               string // 注入 SPARK_GIT_MIRROR（计划 11，配置 SPARK_APP_GIT_MIRROR；空 = 直连）
+
+	// 计划 11 扩展点（comfywf 实现、app.go 接线；appdeploy 不 import comfywf）。都可为 nil。
+
+	// BundleExtra 给支持工作流的版本（Spec.SupportsWorkflows）追加部署包文件；错误按部署包生成失败处理（upload_failed）。
+	BundleExtra func(ctx context.Context, d Deployment, ver Version) ([]BundleFile, error)
+	// OnTransition 在 Runner 把部署写成 running（stepPoll）或 failed（markFailed）的同一回写事务里调用；d 是更新前的行，to 为目标状态。
+	OnTransition func(ctx context.Context, tx pgx.Tx, d Deployment, to string, now time.Time) error
+	// WorkflowViews 批量给出部署视图的 workflows 字段（按部署 ID）；只对 comfyui / 支持工作流的部署调用。
+	WorkflowViews func(ctx context.Context, depIDs []string) (map[string][]json.RawMessage, error)
+	// ResolveWorkflows 下单预装工作流时把工作流 ID 解析成 {工作流, 版本}（校验上架、去重、数量）；nil = 不支持预装工作流。
+	ResolveWorkflows func(ctx context.Context, q db.Querier, ids []int64) ([]WorkflowRef, error)
 }
 
 type Service struct {
@@ -198,7 +211,7 @@ func (s *Service) userOp(ctx context.Context, userID int64, instanceID, depID st
 		if err != nil {
 			return err
 		}
-		d, err := lockDeployment(ctx, tx, depID)
+		d, err := LockDeployment(ctx, tx, depID)
 		if err != nil {
 			return err
 		}
@@ -281,70 +294,77 @@ func portNumbers(ps []PortSpec) []int {
 // 已是 queued → 只更新变量（EnvSet）并返回当前行，连点两次等价于一次。
 func (s *Service) Redeploy(ctx context.Context, req RedeployRequest) (Deployment, error) {
 	return s.userOp(ctx, req.UserID, req.InstanceID, req.DeploymentID, func(tx pgx.Tx, inst rental.Instance, d Deployment, now time.Time) (Deployment, error) {
-		actor := audit.Actor{UserID: req.UserID, IP: req.IP}
-		oldSecret, err := openSecrets(s.d.Box, d.SecretEnvEnc)
+		return s.RedeployInTx(ctx, tx, inst, d, req, now)
+	})
+}
+
+// RedeployInTx 是 Redeploy 的事务内部分（计划 11：comfywf 改工作流集合后在同一事务里重新部署）。
+// 调用方须已按加锁顺序持实例行锁（rental.LockOwned）与部署行锁（LockDeployment），且 d 在 inst 上；
+// 审计操作人由 req.UserID / req.IP 构造。行为与 Redeploy 相同。
+func (s *Service) RedeployInTx(ctx context.Context, tx pgx.Tx, inst rental.Instance, d Deployment, req RedeployRequest, now time.Time) (Deployment, error) {
+	actor := audit.Actor{UserID: req.UserID, IP: req.IP}
+	oldSecret, err := openSecrets(s.d.Box, d.SecretEnvEnc)
+	if err != nil {
+		return Deployment{}, err
+	}
+	cur, err := scanVersion(tx.QueryRow(ctx, `SELECT `+versionCols+` FROM app_versions WHERE id = $1`, d.AppVersionID))
+	if err != nil {
+		return Deployment{}, err
+	}
+	switch d.State {
+	case StateQueued:
+		if !req.EnvSet {
+			return d, nil
+		}
+		plain, secret, err := ValidateEnv(cur.Spec, mergeEnv(cur.Spec, d.Env, oldSecret, req.Env, true))
 		if err != nil {
 			return Deployment{}, err
 		}
-		cur, err := scanVersion(tx.QueryRow(ctx, `SELECT `+versionCols+` FROM app_versions WHERE id = $1`, d.AppVersionID))
+		out, err := scanDeployment(tx.QueryRow(ctx, `UPDATE app_deployments SET env = $2, secret_env_enc = $3, updated_at = $4, row_version = row_version + 1
+			WHERE id = $1 RETURNING `+depCols, d.ID, mustJSON(plain), sealSecrets(s.d.Box, secret), now))
 		if err != nil {
-			return Deployment{}, err
-		}
-		switch d.State {
-		case StateQueued:
-			if !req.EnvSet {
-				return d, nil
-			}
-			plain, secret, err := ValidateEnv(cur.Spec, mergeEnv(cur.Spec, d.Env, oldSecret, req.Env, true))
-			if err != nil {
-				return Deployment{}, err
-			}
-			out, err := scanDeployment(tx.QueryRow(ctx, `UPDATE app_deployments SET env = $2, secret_env_enc = $3, updated_at = $4, row_version = row_version + 1
-				WHERE id = $1 RETURNING `+depCols, d.ID, mustJSON(plain), sealSecrets(s.d.Box, secret), now))
-			if err != nil {
-				return Deployment{}, err
-			}
-			return out, auditOp(ctx, tx, now, actor, "instance.app_redeploy", out)
-		case StateRunning, StateStopped, StateFailed:
-		default:
-			return Deployment{}, apperr.ErrAppInvalidState
-		}
-		ver, err := s.pickVersion(ctx, tx, d.AppID, req.VersionID)
-		if err != nil {
-			return Deployment{}, err
-		}
-		if err := s.checkImage(ctx, tx, ver, inst.ImageID); err != nil {
-			return Deployment{}, err
-		}
-		if !slices.Equal(portNumbers(cur.Spec.Ports), portNumbers(ver.Spec.Ports)) {
-			if err := s.checkPorts(ctx, tx, inst.ID, ver.Spec.Ports, d.ID); err != nil {
-				return Deployment{}, err
-			}
-			name, err := appName(ctx, tx, d.AppID)
-			if err != nil {
-				return Deployment{}, err
-			}
-			// 新版本端口变了：旧端口行删除，新版本 running 时重新登记
-			if err := deletePortsBecause(ctx, tx, d, "重新部署应用 "+name+"（端口变更）", now, actor); err != nil {
-				return Deployment{}, err
-			}
-		}
-		plain, secret, err := ValidateEnv(ver.Spec, mergeEnv(ver.Spec, d.Env, oldSecret, req.Env, req.EnvSet))
-		if err != nil {
-			return Deployment{}, err
-		}
-		out, err := scanDeployment(tx.QueryRow(ctx, `UPDATE app_deployments SET state = 'queued', desired = 'running', app_version_id = $2, spec_hash = $3, port = $4,
-			env = $5, secret_env_enc = $6, phase = '', progress = 0, message = '', health = 'unknown', error_code = '', crash_count = 0, unreachable_count = 0,
-			next_poll_at = $7, finished_at = NULL, updated_at = $7, row_version = row_version + 1 WHERE id = $1 RETURNING `+depCols,
-			d.ID, ver.ID, ver.SpecHash, ver.Spec.Ports[0].Port, mustJSON(plain), sealSecrets(s.d.Box, secret), now))
-		if err != nil {
-			return Deployment{}, err
-		}
-		if err := addEvent(ctx, tx, d.ID, d.State, StateQueued, "重新部署 v"+ver.Version, now); err != nil {
 			return Deployment{}, err
 		}
 		return out, auditOp(ctx, tx, now, actor, "instance.app_redeploy", out)
-	})
+	case StateRunning, StateStopped, StateFailed:
+	default:
+		return Deployment{}, apperr.ErrAppInvalidState
+	}
+	ver, err := s.pickVersion(ctx, tx, d.AppID, req.VersionID)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if err := s.checkImage(ctx, tx, ver, inst.ImageID); err != nil {
+		return Deployment{}, err
+	}
+	if !slices.Equal(portNumbers(cur.Spec.Ports), portNumbers(ver.Spec.Ports)) {
+		if err := s.checkPorts(ctx, tx, inst.ID, ver.Spec.Ports, d.ID); err != nil {
+			return Deployment{}, err
+		}
+		name, err := appName(ctx, tx, d.AppID)
+		if err != nil {
+			return Deployment{}, err
+		}
+		// 新版本端口变了：旧端口行删除，新版本 running 时重新登记
+		if err := deletePortsBecause(ctx, tx, d, "重新部署应用 "+name+"（端口变更）", now, actor); err != nil {
+			return Deployment{}, err
+		}
+	}
+	plain, secret, err := ValidateEnv(ver.Spec, mergeEnv(ver.Spec, d.Env, oldSecret, req.Env, req.EnvSet))
+	if err != nil {
+		return Deployment{}, err
+	}
+	out, err := scanDeployment(tx.QueryRow(ctx, `UPDATE app_deployments SET state = 'queued', desired = 'running', app_version_id = $2, spec_hash = $3, port = $4,
+		env = $5, secret_env_enc = $6, phase = '', progress = 0, message = '', health = 'unknown', error_code = '', crash_count = 0, unreachable_count = 0,
+		next_poll_at = $7, finished_at = NULL, updated_at = $7, row_version = row_version + 1 WHERE id = $1 RETURNING `+depCols,
+		d.ID, ver.ID, ver.SpecHash, ver.Spec.Ports[0].Port, mustJSON(plain), sealSecrets(s.d.Box, secret), now))
+	if err != nil {
+		return Deployment{}, err
+	}
+	if err := addEvent(ctx, tx, d.ID, d.State, StateQueued, "重新部署 v"+ver.Version, now); err != nil {
+		return Deployment{}, err
+	}
+	return out, auditOp(ctx, tx, now, actor, "instance.app_redeploy", out)
 }
 
 // Stop 停止（installing / running）：desired = stopped，由 Runner 执行 run.sh stop。
@@ -423,7 +443,7 @@ func (s *Service) remove(ctx context.Context, tx pgx.Tx, instState string, d Dep
 		if err := s.setRemoved(ctx, tx, d, "", detail, cleanup, now, actor); err != nil {
 			return Deployment{}, err
 		}
-		return lockDeployment(ctx, tx, d.ID)
+		return LockDeployment(ctx, tx, d.ID)
 	}
 	if detail == "" {
 		detail = "卸载中"
@@ -457,7 +477,7 @@ func (s *Service) AdminForceRemove(ctx context.Context, actor audit.Actor, depID
 		if err := tx.QueryRow(ctx, `SELECT state FROM instances WHERE id = $1 FOR UPDATE`, instanceID).Scan(&instState); err != nil {
 			return err
 		}
-		d, err := lockDeployment(ctx, tx, depID)
+		d, err := LockDeployment(ctx, tx, depID)
 		if err != nil {
 			return err
 		}
