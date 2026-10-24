@@ -82,7 +82,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_SSH_ADDR` | SSH 网关监听地址（compose 把公网 22 映射到它） | :2222 |
 | `SPARK_SSH_PUBLIC_PORT` | 写进用户 SSH 命令的公网端口；非 22 时命令带 `-p` | 22 |
 | `SPARK_SSH_MAX_SESSIONS_PER_INSTANCE` / `SPARK_SSH_DRAIN_TIMEOUT` | 每实例并发 SSH 会话上限 / 停机时等待会话结束的时间 | 16 / 30s |
-| `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的端口（Create 指令的 `ssh_port` 与网关上游拨号共用） | 2222 |
+| `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的**基准**端口：平台按实例计算端口（`rental.Instance.SSHPort`，目前恒等于基准），写进 Create 指令的 `ssh_port`，SSH 网关与 Web 入口按同一值拨上游 | 2222 |
 | `SPARK_INGRESS_DOMAIN` | 租户 Web 子域的父域（`ins-<id>-<port>.<此域>`）；生产推荐用与 `SPARK_DOMAIN` **不同的注册域（eTLD+1）**，子域不算；「不是 SPARK_DOMAIN 子域」的启动校验只防误配 | = SPARK_DOMAIN |
 | `SPARK_PUBLIC_BASE_URL` | 对外地址，支付回调为 `<地址>/api/v1/pay/notify/{wechat,alipay}`（real 支付必填，须 https）；域名必须等于 `SPARK_DOMAIN`；prod 必填且 https；dev 默认 `http://spark.local:8080`。本地测 ingress 需在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或改用 sslip.io 域 | 见左 |
 | `SPARK_ADMIN_PUBLIC_BASE_URL` | 后台对外地址（经反向代理或 `ssh -L` 隧道访问时填浏览器地址栏里的后台地址），用于后台写请求的 Origin 校验。为空时只认 `Sec-Fetch-Site`：带 `Origin` 而不带 `Sec-Fetch-Site` 的客户端（旧版 Safari、部分内嵌 WebView）后台写请求一律 403；staging / prod 为空时启动日志会打 WARN | 空 |
@@ -139,6 +139,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
   `SELECT l.id, l.status, i.state FROM machine_leases l JOIN instances i ON i.id = l.instance_id WHERE isempty(l.period) AND (l.status <> 'ended' OR i.state NOT IN ('released','failed'));`
 - 计划 8（邀请返利）发布：迁移 `00021`（设计文档写作 `00020`，计划 7 先占用了该编号）在存在 `referral_rebate / referral_clawback` 流水时拒绝回滚；多副本滚动期间旧副本的登录接口不认 `invite_code`，窗口内注册的用户不会绑定（窗口很短，可接受；一次性重启全部副本可消除）；发布后执行 `platform referral backfill-fingerprints`；`SPARK_PUBLIC_BASE_URL` 必须是用户可访问的控制台地址（邀请链接据此生成）。
 - 计划 8 必须在计划 7 合入 `main` 之后发布（goose 不接受乱序迁移：`00021` 先于 `00020` 落库后，`00020` 再也不会执行）。迁移 `00021` 扩展 `wallet_ledger.kind` 的 CHECK 约束，会对 `wallet_ledger` 持有 ACCESS EXCLUSIVE 锁并全表校验，随后在同一事务里建 `wallet_ledger_order_scan_idx`（非 CONCURRENTLY）：迁移期间所有充值 / 扣款 / 退款都会等待。先 `SELECT count(*) FROM wallet_ledger` 估算耗时，选低峰窗口发布。
+- 计划 10（共享机）真机 PoC 结论为 no-go，**共享机商品搁置**（记录见 `docs/superpowers/acceptance-plan10.md`），本次只发布 Agent 多容器与按实例端口的基础设施。没有迁移：`00023` 编号保留未用；goose 不接受乱序迁移，以后的共享机迁移要用发布时最大编号之后的新号。Agent 协议新增 `Hello.features`、`CreateInstance.share_slots`、`Heartbeat.instances`，新旧两侧互相忽略未知字段；照例先升级 Agent 再发布 platform。新 platform 在 Create 指令里显式写 `ssh_port`（= `SPARK_UPSTREAM_SSH_PORT`）与 `share_slots = 1`，Agent 发布到该端口；机器详情的 `last_metrics.instances` 带每实例的 cgroup 内存 / CPU / 数据盘用量（旧 Agent 为空数组）。新 Agent 在同一端口已被本机另一个**仍存在**的容器占用时拒绝开通（「SSH 端口冲突」）；`selfcheck` 新增 cgroup v2 与 cpu / memory / pids 控制器检查（硬性），核数 < 4 只告警。
 - 邀请返利的「同 IP」标记与邀请码查询限流（每 IP 每分钟 60 次）都按客户端 IP：platform 在反向代理之后时必须设 `SPARK_TRUST_PROXY=true`（及 `SPARK_TRUSTED_PROXY_HOPS`），否则所有绑定都带「同IP」、所有用户共用一个查码额度。即便设对了，同一 NAT 出口（公司 / 校园网）的邀请也会带「同IP」——该标记只提示、不搁置。
 
 ### 应用一键部署（计划 7）
