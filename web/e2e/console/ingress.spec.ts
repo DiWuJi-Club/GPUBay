@@ -111,7 +111,7 @@ test('C-ING-07 应用端口默认私有：未登录 302 到登录，登录后回
   ownInstance(api, id)
   const d = await deployViaApi(api, id, apps.vllm.id)
   const done = await tickUntil(api, id, d.id, 'running')
-  expect(done.url).toBe(`${portUrl(id, 8000)}/`)
+  expect(done.url).toBe(`${portUrl(id, 8000)}/docs`) // 「打开」= 主端口 URL + ports[0].path（vLLM 是 /docs，A-4）
   const ports = ((await (await api.get(`/api/v1/instances/${id}/ports`)).json()) as { items: { port: number; visibility: string }[] }).items
   expect(ports.map((p) => [p.port, p.visibility])).toEqual([[8000, 'private']])
   await hooks.advance(61) // runningInstance 刚为该手机号发过验证码
