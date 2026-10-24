@@ -88,6 +88,12 @@ func TestProberThresholds(t *testing.T) {
 	if got := ne.node(n.ID); got.State != llm.NodeReady || got.ProbeFailCount != 1 {
 		t.Fatalf("deployment health unhealthy: %+v", got)
 	}
+	// ready 节点探测成功：清掉上次的错误
+	ne.setDeployment(*n.DeploymentID, appdeploy.StateRunning, appdeploy.HealthOK, "")
+	ne.probeTick()
+	if got := ne.node(n.ID); got.Error != "" || got.ProbeFailCount != 0 {
+		t.Fatalf("error not cleared: %+v", got)
+	}
 	if ne.alertCount(llm.AlertNodeUnhealthy) != 1 {
 		t.Fatal("alert raised again while the first is unresolved")
 	}

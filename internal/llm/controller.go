@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/fleet"
@@ -70,15 +71,16 @@ func (c *Controller) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer conn.Release()
 	var locked bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, controllerLockName).Scan(&locked); err != nil {
+		destroyConn(conn) // 不知道锁拿没拿到：不能把可能持锁的连接还回池里
 		return false, err
 	}
 	if !locked {
+		conn.Release()
 		return false, nil
 	}
-	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtext($1))`, controllerLockName) //nolint:errcheck
+	defer c.unlock(conn)
 	rep, err := c.Tick(ctx, c.s.d.Clock.Now())
 	if !rep.zero() {
 		c.s.d.Log.Info("llm controller tick", "provisioned", rep.Provisioned, "drained", rep.Drained, "failed", rep.Failed,
@@ -86,6 +88,27 @@ func (c *Controller) RunOnce(ctx context.Context) (bool, error) {
 	}
 	perr := c.probe.Tick(ctx, c.s.d.Clock.Now())
 	return true, errors.Join(err, perr)
+}
+
+// unlock 释放会话级咨询锁后把连接还回池；解锁失败或返回 false（锁不在本连接上）→ 销毁连接（会话结束锁随之释放），
+// 否则带锁的连接回到池里，别的副本永远拿不到锁。
+func (c *Controller) unlock(conn *pgxpool.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var ok bool
+	if err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, controllerLockName).Scan(&ok); err != nil || !ok {
+		c.s.d.Log.Error("llm controller: advisory unlock failed; closing connection", "ok", ok, "err", err)
+		destroyConn(conn)
+		return
+	}
+	conn.Release()
+}
+
+// destroyConn 把连接从池里摘下并关闭。
+func destroyConn(conn *pgxpool.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = conn.Hijack().Close(ctx)
 }
 
 // ctlNode 一个非终态节点 + 模型 slug + 本轮 provisioning 的起点（最近一次进入 provisioning 的事件时刻；重建后重新计时）。
@@ -148,6 +171,18 @@ func (c *Controller) Tick(ctx context.Context, now time.Time) (TickReport, error
 	if nodes, err = c.liveNodes(ctx); err != nil {
 		return rep, errors.Join(append(errs, err)...)
 	}
+	// 排空检查之前先刷新一次路由表：draining 节点从表里拿掉之后，在途计数才可能只减不增
+	routerFresh := false
+	for _, n := range nodes {
+		if n.State == NodeDraining {
+			if err := c.s.router.Refresh(ctx); err != nil {
+				note("router refresh", err) // 刷新失败：本轮只走排空超时
+			} else {
+				routerFresh = true
+			}
+			break
+		}
+	}
 	for _, n := range nodes {
 		m := modelByID[n.ModelID]
 		switch n.State {
@@ -156,7 +191,7 @@ func (c *Controller) Tick(ctx context.Context, now time.Time) (TickReport, error
 		case NodeUnhealthy:
 			note("unhealthy "+n.ID, c.handleUnhealthy(ctx, now, n, m, &rep))
 		case NodeDraining:
-			note("drain "+n.ID, c.handleDraining(ctx, now, n))
+			note("drain "+n.ID, c.handleDraining(ctx, now, n, routerFresh))
 		case NodeRemoving:
 			note("remove "+n.ID, c.handleRemoving(ctx, n, &rep))
 		}
@@ -272,7 +307,7 @@ models:
 			for ci < len(cands) {
 				mid := cands[ci]
 				ci++
-				_, err := c.s.createNode(ctx, d.m, mid, poolID, fmt.Sprintf("补副本：模型 %s", d.m.Slug))
+				_, err := c.s.createNode(ctx, d.m, mid, poolID, fmt.Sprintf("补副本：模型 %s", d.m.Slug), nil)
 				if errors.Is(err, apperr.ErrMachineUnavailable) {
 					continue
 				}
@@ -309,6 +344,9 @@ func (c *Controller) failNode(ctx context.Context, n Node, expectState, detail s
 		}
 		x.State, x.Error = NodeFailed, detail
 		if alert != nil {
+			if alert.Level == "warning" { // warning 类（首次建节点失败）同类未处理前只一条；critical 每次都报
+				return detail, c.s.d.Fleet.RaiseAlertOnce(ctx, tx, *alert)
+			}
 			return detail, c.s.d.Fleet.RaiseAlert(ctx, tx, *alert)
 		}
 		return detail, nil
@@ -318,6 +356,26 @@ func (c *Controller) failNode(ctx context.Context, n Node, expectState, detail s
 	}
 	rep.Failed++
 	return c.s.releaseInstance(ctx, n.InstanceID)
+}
+
+// firstFailAlert 首次建节点失败的告警（文案稳定；同类未处理前只一条）。
+var firstFailAlert = fleet.Alert{Level: "warning", Kind: AlertNodeFailed, Message: "节点部署失败，详情见后台节点页"}
+
+// failProvisioning provisioning 节点建不起来：已在重建循环里（rebuild_count > 0）的部署失败 / 超时 → 回 unhealthy
+// （unhealthy_since = now），由第 3 步继续重建直到 MaxRebuilds；否则 → failed + 告警（一次）+ 释放实例。
+func (c *Controller) failProvisioning(ctx context.Context, n Node, detail string, rebuildable bool, rep *TickReport) error {
+	if rebuildable && n.RebuildCount > 0 {
+		_, _, err := c.s.mutateNode(ctx, n.ID, func(_ pgx.Tx, x *Node, now time.Time) (string, error) {
+			if err := expect(x, NodeProvisioning); err != nil {
+				return "", err
+			}
+			x.State, x.UnhealthySince, x.Error = NodeUnhealthy, &now, detail
+			return "重建后仍未就绪：" + detail, nil
+		})
+		return err
+	}
+	a := firstFailAlert
+	return c.failNode(ctx, n, NodeProvisioning, detail, &a, rep)
 }
 
 // instanceGoneText 实例结束的可展示原因。
@@ -338,17 +396,17 @@ func instanceGoneText(state string) string {
 func (c *Controller) advance(ctx context.Context, now time.Time, cn ctlNode, m Model, rep *TickReport) error {
 	n := cn.Node
 	if n.InstanceID == nil {
-		return c.failNode(ctx, n, NodeProvisioning, "节点没有实例", nil, rep)
+		return c.failProvisioning(ctx, n, "节点没有实例", false, rep)
 	}
 	inst, err := c.s.d.Rental.Get(ctx, *n.InstanceID)
 	if errors.Is(err, apperr.ErrNotFound) {
-		return c.failNode(ctx, n, NodeProvisioning, "实例不存在", nil, rep)
+		return c.failProvisioning(ctx, n, "实例不存在", false, rep)
 	}
 	if err != nil {
 		return err
 	}
 	if instanceGone(inst.State) {
-		return c.failNode(ctx, n, NodeProvisioning, instanceGoneText(inst.State), nil, rep)
+		return c.failProvisioning(ctx, n, instanceGoneText(inst.State), false, rep)
 	}
 	var dep *appdeploy.Deployment
 	if n.DeploymentID != nil {
@@ -357,18 +415,21 @@ func (c *Controller) advance(ctx context.Context, now time.Time, cn ctlNode, m M
 			return err
 		}
 		dep = &d
-		if d.State == appdeploy.StateFailed || d.State == appdeploy.StateRemoved || d.State == appdeploy.StateLost {
-			return c.failNode(ctx, n, NodeProvisioning, deploymentError(d), nil, rep)
+		switch d.State {
+		case appdeploy.StateFailed:
+			return c.failProvisioning(ctx, n, deploymentError(d), true, rep)
+		case appdeploy.StateRemoving, appdeploy.StateRemoved, appdeploy.StateLost: // 部署没了，重建不了
+			return c.failProvisioning(ctx, n, deploymentError(d), false, rep)
 		}
 	}
 	if now.Sub(cn.since) > ProvisionTimeout {
-		return c.failNode(ctx, n, NodeProvisioning, provisionTimeoutMsg, nil, rep)
+		return c.failProvisioning(ctx, n, provisionTimeoutMsg, true, rep)
 	}
 	if inst.State != rental.StateRunning {
 		return nil // creating：等 Agent 建好容器
 	}
 	if dep == nil {
-		return c.createDeployment(ctx, n, m)
+		return c.createDeployment(ctx, n, m, rep)
 	}
 	if dep.State == appdeploy.StateRunning && dep.Health == appdeploy.HealthOK {
 		_, err := c.probe.tryPromote(ctx, n, cn.slug)
@@ -379,7 +440,7 @@ func (c *Controller) advance(ctx context.Context, now time.Time, cn ctlNode, m M
 
 // createDeployment 实例 running 且还没有部署 → appdeploy.Create(vllm-node, 系统账号, NodeEnv)。vllm-node 未标记 internal
 // → 告警（一次）且不建部署（它会出现在用户应用市场，配置有误）。
-func (c *Controller) createDeployment(ctx context.Context, n Node, m Model) error {
+func (c *Controller) createDeployment(ctx context.Context, n Node, m Model, rep *TickReport) error {
 	app, err := c.s.d.AppCat.AppBySlug(ctx, NodeAppSlug)
 	if err != nil {
 		return err
@@ -393,6 +454,23 @@ func (c *Controller) createDeployment(ctx context.Context, n Node, m Model) erro
 	}
 	dep, err := c.s.d.Apps.Create(ctx, appdeploy.CreateRequest{UserID: c.s.d.SystemUserID, InstanceID: *n.InstanceID, AppID: app.ID,
 		VersionID: m.AppVersionID, Env: NodeEnv(m, string(key)), IP: ""})
+	if errors.Is(err, apperr.ErrAppExists) {
+		// 上一轮 Create 成功但回写 deployment_id 失败：认领实例上现有的 vllm-node 部署
+		live, lerr := c.s.d.Apps.ListLive(ctx, *n.InstanceID)
+		if lerr != nil {
+			return lerr
+		}
+		found := false
+		for _, d := range live {
+			if d.AppID == app.ID {
+				dep, err, found = d, nil, true
+				break
+			}
+		}
+		if !found {
+			return c.failProvisioning(ctx, n, "实例上已有 "+NodeAppSlug+" 部署但无法认领", false, rep)
+		}
+	}
 	if err != nil {
 		msg := "创建部署失败"
 		if ae := apperr.As(err); ae != nil {
@@ -431,7 +509,8 @@ func (c *Controller) handleUnhealthy(ctx context.Context, now time.Time, cn ctlN
 	if err != nil {
 		return err
 	}
-	if instanceGone(inst.State) {
+	// 实例非 running（已结束、stopped、creating）→ 直接 failed；running 但暂停（机器失联）照常走重建计时
+	if inst.State != rental.StateRunning {
 		return c.failNode(ctx, n, NodeUnhealthy, instanceGoneText(inst.State), nil, rep)
 	}
 	if mach, err := c.s.d.Fleet.Get(ctx, c.s.d.Pool, n.MachineID); err != nil {
@@ -439,25 +518,36 @@ func (c *Controller) handleUnhealthy(ctx context.Context, now time.Time, cn ctlN
 	} else if mach.State == fleet.StateFaulty {
 		return c.failNode(ctx, n, NodeUnhealthy, "机器故障", nil, rep)
 	}
-	if n.UnhealthySince == nil || now.Before(n.UnhealthySince.Add(UnhealthyRebuildAfter)) {
-		return nil
-	}
 	if n.DeploymentID == nil {
 		return c.failNode(ctx, n, NodeUnhealthy, "节点没有部署，无法重建", nil, rep)
-	}
-	if n.RebuildCount >= MaxRebuilds {
-		return c.failNode(ctx, n, NodeUnhealthy, "多次重建仍不健康", &fleet.Alert{Level: "critical", Kind: AlertNodeFailed,
-			MachineID: n.MachineID, InstanceID: *n.InstanceID, Message: "节点 " + n.ID + "（" + cn.slug + "）多次重建失败"}, rep)
 	}
 	dep, err := c.s.d.Apps.Get(ctx, *n.DeploymentID)
 	if err != nil {
 		return err
 	}
+	switch dep.State {
+	case appdeploy.StateRemoving, appdeploy.StateRemoved, appdeploy.StateLost:
+		return c.failNode(ctx, n, NodeUnhealthy, "部署已被移除（"+dep.State+"）", nil, rep)
+	}
+	if n.UnhealthySince == nil || now.Before(n.UnhealthySince.Add(UnhealthyRebuildAfter)) {
+		return nil
+	}
+	critical := func(detail, what string) error {
+		return c.failNode(ctx, n, NodeUnhealthy, detail, &fleet.Alert{Level: "critical", Kind: AlertNodeFailed,
+			MachineID: n.MachineID, InstanceID: *n.InstanceID, Message: "节点 " + n.ID + "（" + cn.slug + "）" + what}, rep)
+	}
+	if n.RebuildCount >= MaxRebuilds {
+		return critical("多次重建仍不健康", "多次重建失败")
+	}
 	if dep.State == appdeploy.StateQueued || dep.State == appdeploy.StateInstalling {
-		// 部署已在重新安装（如机器恢复后 OnInstanceRunning 置回 queued）：不再 Redeploy、不计重建次数，按 provisioning 等待（超时兜底）
+		// 部署已在（重新）安装：不再 Redeploy，按 provisioning 等待（超时兜底）。首次（如机器恢复后 OnInstanceRunning 置回 queued）
+		// 不计重建次数；已在重建循环里（rebuild_count > 0，上次重建的部署一直没跑起来）计一次，保证循环在 MaxRebuilds 内结束。
 		_, _, err := c.s.mutateNode(ctx, n.ID, func(_ pgx.Tx, x *Node, _ time.Time) (string, error) {
 			if err := expect(x, NodeUnhealthy); err != nil {
 				return "", err
+			}
+			if x.RebuildCount > 0 {
+				x.RebuildCount++
 			}
 			x.State, x.ProbeFailCount, x.UnhealthySince = NodeProvisioning, 0, nil
 			return "部署正在重新安装，等待就绪", nil
@@ -466,7 +556,10 @@ func (c *Controller) handleUnhealthy(ctx context.Context, now time.Time, cn ctlN
 	}
 	if _, err := c.s.d.Apps.Redeploy(ctx, appdeploy.RedeployRequest{UserID: c.s.d.SystemUserID, InstanceID: *n.InstanceID,
 		DeploymentID: *n.DeploymentID, VersionID: m.AppVersionID, EnvSet: false}); err != nil {
-		return fmt.Errorf("redeploy: %w", err) // 没有真正执行：rebuild_count 不变，下一轮再试
+		if ae := apperr.As(err); ae != nil { // 业务拒绝（版本 / 镜像 / 端口 / 状态）：重试也不会好
+			return critical(clipRunes("重建失败："+ae.Message, maxNodeError), "重建失败")
+		}
+		return fmt.Errorf("redeploy: %w", err) // 暂时性错误：没有真正执行，rebuild_count 不变，下一轮再试
 	}
 	_, _, err = c.s.mutateNode(ctx, n.ID, func(_ pgx.Tx, x *Node, _ time.Time) (string, error) {
 		if err := expect(x, NodeUnhealthy); err != nil {
@@ -482,11 +575,14 @@ func (c *Controller) handleUnhealthy(ctx context.Context, now time.Time, cn ctlN
 // ---- 第 4、5 步：排空与移除 ----
 
 // handleDraining 在途归零或 drain_since + DrainTimeout ≤ now → ReleaseSystem → removing。
-func (c *Controller) handleDraining(ctx context.Context, now time.Time, cn ctlNode) error {
+// 「在途归零」只在本轮已刷新路由表（routerFresh）且 drain_since + 2 × RouterRefresh ≤ now 时才可信：
+// 否则网关的路由表（或一次在排空提交之前开始的后台刷新）可能仍含该节点，刚选中它的请求还没计入在途。
+func (c *Controller) handleDraining(ctx context.Context, now time.Time, cn ctlNode, routerFresh bool) error {
 	n := cn.Node
 	inflight := c.s.router.Inflight(n.ID)
 	timedOut := n.DrainSince == nil || !now.Before(n.DrainSince.Add(DrainTimeout))
-	if inflight > 0 && !timedOut {
+	settled := routerFresh && n.DrainSince != nil && !now.Before(n.DrainSince.Add(2*RouterRefresh))
+	if !timedOut && (inflight > 0 || !settled) {
 		return nil
 	}
 	if err := c.s.releaseInstance(ctx, n.InstanceID); err != nil {

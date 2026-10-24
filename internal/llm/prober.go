@@ -270,7 +270,7 @@ func (p *Prober) checkLive(ctx context.Context, n0 Node, slug string) error {
 		}
 		n.LastProbeAt = &now
 		if obs.v == vOK {
-			n.ProbeFailCount = 0
+			n.ProbeFailCount, n.Error = 0, ""
 			if n.State == NodeUnhealthy {
 				n.State, n.UnhealthySince, n.LastReadyAt, n.Error = NodeReady, nil, &now, ""
 				return "健康检查恢复", nil

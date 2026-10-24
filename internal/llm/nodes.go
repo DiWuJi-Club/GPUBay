@@ -140,7 +140,9 @@ func expect(n *Node, states ...string) error {
 // createNode 在机器上建节点（规格 §5.2 第 1 步，事务外调用）：生成节点 ID 与密钥 → rental.PlaceSystem（它锁机器并复核）
 // → 插 llm_nodes(provisioning, instance_id) 与事件。插入失败（含唯一索引撞车）→ 释放刚建的系统实例。
 // PlaceSystem 的 ErrMachineUnavailable 原样返回（调用方跳过该机器）。
-func (s *Service) createNode(ctx context.Context, m Model, machineID, poolID int64, detail string) (Node, error) {
+// extra（可为 nil）在插入节点行的同一事务里执行（复核 / 审计）；它返回错误则整个事务回滚、实例释放。
+func (s *Service) createNode(ctx context.Context, m Model, machineID, poolID int64, detail string,
+	extra func(tx pgx.Tx, n Node, now time.Time) error) (Node, error) {
 	id := newNodeID()
 	_, enc, err := s.newNodeKey()
 	if err != nil {
@@ -160,7 +162,13 @@ func (s *Service) createNode(ctx context.Context, m Model, machineID, poolID int
 			return err
 		}
 		out = n
-		return insertNodeEvent(ctx, tx, id, "", NodeProvisioning, detail, now)
+		if err := insertNodeEvent(ctx, tx, id, "", NodeProvisioning, detail, now); err != nil {
+			return err
+		}
+		if extra != nil {
+			return extra(tx, n, now)
+		}
+		return nil
 	})
 	if err != nil {
 		if rerr := s.d.Rental.ReleaseSystem(ctx, inst.ID); rerr != nil {
@@ -267,24 +275,58 @@ func (s *Service) adminRecreate(ctx context.Context, actor audit.Actor, cur Node
 	if err != nil {
 		return Node{}, err
 	}
-	if m.Status != ModelOnline {
-		return Node{}, apperr.ErrLLMNodeInvalidState
+	// 预检（不调 rental）：模型在线、仍有缺额、旧节点未被替换过
+	if err := s.checkRecreate(ctx, s.d.Pool, m, cur, ""); err != nil {
+		return Node{}, err
 	}
 	poolID, err := s.d.Fleet.LLMPoolGroupID(ctx, s.d.Pool)
 	if err != nil {
 		return Node{}, err
 	}
-	n, err := s.createNode(ctx, m, cur.MachineID, poolID, "后台重建（替换节点 "+cur.ID+"）")
+	n, err := s.createNode(ctx, m, cur.MachineID, poolID, "后台重建（替换节点 "+cur.ID+"）", func(tx pgx.Tx, n Node, now time.Time) error {
+		// 锁旧节点行复核（并发的两次重建只有一次成功），替换关系记进旧节点的事件，审计与新节点同一事务
+		old, err := scanNode(tx.QueryRow(ctx, `SELECT `+nodeCols+` FROM llm_nodes WHERE id = $1 FOR UPDATE`, cur.ID))
+		if err != nil {
+			return err
+		}
+		if old.State != NodeFailed {
+			return apperr.ErrLLMNodeInvalidState
+		}
+		if err := s.checkRecreate(ctx, tx, m, old, n.ID); err != nil {
+			return err
+		}
+		if err := insertNodeEvent(ctx, tx, old.ID, NodeFailed, NodeFailed, "已由节点 "+n.ID+" 替换", now); err != nil {
+			return err
+		}
+		return nodeAudit(ctx, tx, now, actor, "llm.node.rebuild", n, NodeFailed, map[string]any{"replaces": old.ID})
+	})
 	if errors.Is(err, apperr.ErrMachineUnavailable) {
 		return Node{}, apperr.ErrLLMNodeInvalidState
 	}
 	if err != nil {
 		return Node{}, err
 	}
-	err = db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		return nodeAudit(ctx, tx, s.d.Clock.Now(), actor, "llm.node.rebuild", n, NodeFailed, map[string]any{"replaces": cur.ID})
-	})
-	return n, err
+	return n, nil
+}
+
+// checkRecreate failed 节点能否在原机器上重建：模型 online；计入副本的节点数（不含刚插入的 newID）< replicas；
+// 该机器上没有比旧节点更新的其它节点（旧节点已被替换过，或机器已被别的节点用过）。不满足 → llm_node_invalid_state。
+func (s *Service) checkRecreate(ctx context.Context, q db.Querier, m Model, old Node, newID string) error {
+	if m.Status != ModelOnline {
+		return apperr.ErrLLMNodeInvalidState
+	}
+	var active int
+	var replaced bool
+	if err := q.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM llm_nodes WHERE model_id = $1 AND state = ANY($2) AND id <> $3),
+		EXISTS (SELECT 1 FROM llm_nodes WHERE machine_id = $4 AND id NOT IN ($5, $3) AND created_at >= $6)`,
+		m.ID, nodeActiveStates, newID, old.MachineID, old.ID, old.CreatedAt).Scan(&active, &replaced); err != nil {
+		return err
+	}
+	if active >= m.Replicas || replaced {
+		return apperr.ErrLLMNodeInvalidState
+	}
+	return nil
 }
 
 // AdminRemoveNode 移除（规格 §10.2）：provisioning / ready / unhealthy / draining → removing 并立即 ReleaseSystem（不等在途）；

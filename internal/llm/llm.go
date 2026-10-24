@@ -63,7 +63,8 @@ type AppOps interface {
 	Create(ctx context.Context, req appdeploy.CreateRequest) (appdeploy.Deployment, error)
 	Redeploy(ctx context.Context, req appdeploy.RedeployRequest) (appdeploy.Deployment, error)
 	Get(ctx context.Context, depID string) (appdeploy.Deployment, error)
-	Events(ctx context.Context, depID string, limit int) ([]appdeploy.Event, error) // 节点详情的部署事件
+	Events(ctx context.Context, depID string, limit int) ([]appdeploy.Event, error)  // 节点详情的部署事件
+	ListLive(ctx context.Context, instanceID string) ([]appdeploy.Deployment, error) // Create 撞 app_exists 时认领现有部署
 }
 
 // AppCatalog 由 *appdeploy.Catalog 满足。
