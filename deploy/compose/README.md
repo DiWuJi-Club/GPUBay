@@ -28,8 +28,9 @@ platform 镜像以 distroless nonroot（uid/gid 65532）运行，没有 shell。
 9. 首次：`docker compose exec platform /platform admin create --username admin`；`docker compose exec platform /platform admin ssh-host-key` 把指纹填进帮助页（`web/shared/src/brand.ts` 的 `sshHostKeyFingerprint`）。
 10. 后台：只发布在宿主机 `127.0.0.1:8081`。运维 `ssh -p 2200 -L 8081:127.0.0.1:8081 <宿主机>` 后用浏览器打开 `http://localhost:8081/admin/`（用 `localhost` 而不是 `127.0.0.1`：staging / prod 的 `__Host-` Cookie 需要安全上下文）。
 11. 发布顺序：**先升级全部 Agent，再更新 platform 镜像**（旧 Agent 不认识 `host_key_pem`）。platform 重启会断开 SSH 会话（最多等 `SPARK_SSH_DRAIN_TIMEOUT`，默认 30s；compose 的 `stop_grace_period` 为 60s；如果自己写 systemd unit 来管理 platform，设 `TimeoutStopSec=60`）。
-12. 监控：探 HTTPS，例如 `https://<domain>/` 或 `https://ins-monitor0-80.<ingress_domain>/.spark/healthz`（返回 `ok`，不查库）。**不要对 22 端口做 TCP 探测**：未认证的连接计入按 IP 的暴力破解限额，探针会把监控机自己的 IP 封掉。
-13. 冒烟：`ssh -p 22 ins-xxxxxxxx@ssh.<domain>` 看到 Banner；`docker compose logs platform | grep 'ssh auth failed'` 里的 `ip` 必须是真实客户端地址而不是 172.x（Docker 的 iptables DNAT 保留源地址；若看到网桥地址，检查 dockerd 是否关闭了 iptables 或启用了 userland-proxy，或客户端是否走了 IPv6）。
+12. 升级到带 AI 管家（计划 12）的版本：prod 下 `SPARK_BUTLER` 缺省为 `on`，openai 模式没配 `SPARK_LLM_BASE_URL`、或缺 `SPARK_LLM_API_KEY` 时 **platform 拒绝启动**。旧的 `.env` 先加一行 `SPARK_BUTLER=off`（`.env.example` 已带），模型端点就绪后再按 `.env.example` 的注释块配置并改为 `on`、`docker compose up -d` 重建容器。迁移 `00025` 只新增表，可直接滚动。停机时运行中的管家对话会被中断（用户看到「服务正在重启，本轮已中断，请重试」），已确认的写操作会执行完再退出。
+13. 监控：探 HTTPS，例如 `https://<domain>/` 或 `https://ins-monitor0-80.<ingress_domain>/.spark/healthz`（返回 `ok`，不查库）。**不要对 22 端口做 TCP 探测**：未认证的连接计入按 IP 的暴力破解限额，探针会把监控机自己的 IP 封掉。
+14. 冒烟：`ssh -p 22 ins-xxxxxxxx@ssh.<domain>` 看到 Banner；`docker compose logs platform | grep 'ssh auth failed'` 里的 `ip` 必须是真实客户端地址而不是 172.x（Docker 的 iptables DNAT 保留源地址；若看到网桥地址，检查 dockerd 是否关闭了 iptables 或启用了 userland-proxy，或客户端是否走了 IPv6）。
 
 防火墙：Docker 发布的端口直接写 iptables 的 DOCKER 链，**不受 ufw 控制**；9443 靠绑定内网地址（`AGENT_BIND_IP`）、后台靠绑定 `127.0.0.1` 限制来源，不要指望 ufw 规则。
 

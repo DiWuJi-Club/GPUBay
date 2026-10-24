@@ -248,3 +248,12 @@ func TestBuildButlerRejectsMockLLMInProd(t *testing.T) {
 		t.Fatalf("butler off: err = %v, want mock LLM rejection", err)
 	}
 }
+
+// 生产环境开启管家而没有 SPARK_LLM_API_KEY（配置字面量绕过 config.Load）→ 报错。
+func TestBuildButlerRequiresAPIKeyInProd(t *testing.T) {
+	cfg := prodConfig(t)
+	cfg.LLM.APIKey = ""
+	if _, err := app.Build(cfg, nil, discardLog(), app.Options{}); err == nil || !strings.Contains(err.Error(), "SPARK_LLM_API_KEY") {
+		t.Fatalf("err = %v, want missing API key", err)
+	}
+}

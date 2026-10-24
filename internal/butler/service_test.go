@@ -11,6 +11,7 @@ import (
 	"spark-cloud/internal/butler/butlertest"
 	"spark-cloud/internal/butler/llm"
 	"spark-cloud/internal/butler/llm/mock"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/randx"
 )
 
@@ -337,5 +338,74 @@ func TestDetailApprovedRunning(t *testing.T) {
 	b, _ := json.Marshal(v[0])
 	if !strings.Contains(string(b), `"type":"tool"`) {
 		t.Fatal(string(b))
+	}
+}
+
+// Shutdown：运行中的轮次按整轮超时同一路径收尾（落 TextShutdown、idle、不计模型失败），Shutdown 等它结束才返回；之后不接新轮次。
+func TestShutdownInterruptsRunsAndRejectsNew(t *testing.T) {
+	e := newEnv(t)
+	e.mock.Enqueue(mock.Reply{Text: strings.Repeat("很长的回答", 40), ChunkDelay: 20 * time.Millisecond})
+	sink := &sliceSink{}
+	type res struct {
+		c   Conversation
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		c, err := e.svc.Send(context.Background(), SendRequest{UserID: e.owner, IP: "1.2.3.4", ConversationID: "new", Text: "慢慢说"}, sink)
+		done <- res{c, err}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(sink.find(EvDelta)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no delta before shutdown")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := e.svc.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	var r res
+	select {
+	case r = <-done: // Shutdown 返回时轮次必须已经结束
+	default:
+		t.Fatal("Shutdown returned before the run finished")
+	}
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if !strings.HasSuffix(sink.text(), TextShutdown) || len(sink.find(EvDone)) != 1 {
+		t.Fatalf("events = %v text = %q", sink.names(), sink.text())
+	}
+	msgs := e.msgs(r.c.ID)
+	if got := msgs[len(msgs)-1].Content[0].Text; !strings.HasSuffix(got, TextShutdown) || r.c.Status != ConvIdle {
+		t.Fatalf("stored = %q status = %s", got, r.c.Status)
+	}
+	if u, _ := e.svc.UsageToday(context.Background(), e.owner); u.Failures != 0 || e.svc.failStreak != 0 {
+		t.Fatalf("停机不算模型失败: %+v streak %d", u, e.svc.failStreak)
+	}
+	// 停机后不接新轮次；再次 Shutdown 立即返回
+	_, err := e.svc.Send(context.Background(), SendRequest{UserID: e.owner, ConversationID: "new", Text: "还在吗"}, NopSink{})
+	if ae := apperr.As(err); ae == nil || ae.Code != apperr.ErrButlerBusy.Code {
+		t.Fatalf("send after shutdown = %v, want butler_busy", err)
+	}
+	if err := e.svc.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Shutdown 的 ctx 到期而轮次还没收尾（例如卡在不响应 ctx 的调用里）→ 返回 ctx.Err()，不无限等待。
+func TestShutdownHonorsContext(t *testing.T) {
+	e := newEnv(t)
+	if err := e.svc.acquire(e.owner); err != nil { // 模拟一个永远不结束的轮次
+		t.Fatal(err)
+	}
+	defer e.svc.release(e.owner)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := e.svc.Shutdown(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("Shutdown = %v, want DeadlineExceeded", err)
 	}
 }

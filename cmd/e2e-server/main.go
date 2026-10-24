@@ -199,11 +199,19 @@ func run() error {
 	defer cancel()
 	ingressDone := make(chan struct{})
 	go func() { defer close(ingressDone); a.Ingress.Shutdown(shutdownCtx, time.Second) }() // 先撤销租户长连接，HTTP Shutdown 才不被拖住
+	butlerDone := make(chan struct{})
+	go func() { // 与 cmd/platform 相同：先让运行中的管家轮次收尾，SSE handler 才不拖住 Shutdown
+		defer close(butlerDone)
+		if a.Butler != nil {
+			_ = a.Butler.Shutdown(shutdownCtx)
+		}
+	}()
 	for _, s := range servers {
 		if err := s.Shutdown(shutdownCtx); err != nil && runErr == nil {
 			runErr = err
 		}
 	}
+	<-butlerDone
 	<-ingressDone
 	return runErr
 }

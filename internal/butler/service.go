@@ -56,6 +56,12 @@ type Service struct {
 
 	runTimeout time.Duration // 整轮超时（RunTimeout；测试可缩短）
 
+	// 优雅停机（Shutdown）：base 是所有轮次 ctx 的上级取消源；closing 后不再接新轮次（在 mu 下读写）；runs 计数已占名额的轮次。
+	base     context.Context
+	stopBase context.CancelFunc
+	closing  bool
+	runs     sync.WaitGroup
+
 	failMu     sync.Mutex
 	failStreak int // 连续 LLM 失败次数（进程内）；成功一次清零
 }
@@ -70,8 +76,11 @@ func NewService(d Deps) *Service {
 	if d.MaxOutputTokens <= 0 {
 		d.MaxOutputTokens = DefaultMaxOutputTokens
 	}
+	base, stop := context.WithCancel(context.Background())
 	return &Service{
-		Store:   NewStore(d.Pool, d.Clock),
+		base:     base,
+		stopBase: stop,
+		Store:    NewStore(d.Pool, d.Clock),
 		d:       d,
 		log:     d.Log,
 		running: map[int64]struct{}{},
@@ -85,6 +94,9 @@ func NewService(d Deps) *Service {
 func (s *Service) acquire(userID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closing { // 停机中：不接新轮次（多副本下负载均衡会把重试分到别的副本）
+		return errGlobalBusy
+	}
 	if _, ok := s.running[userID]; ok {
 		return apperr.ErrButlerBusy
 	}
@@ -94,6 +106,7 @@ func (s *Service) acquire(userID int64) error {
 		return errGlobalBusy
 	}
 	s.running[userID] = struct{}{}
+	s.runs.Add(1)
 	return nil
 }
 
@@ -103,6 +116,41 @@ func (s *Service) release(userID int64) {
 	if _, ok := s.running[userID]; ok {
 		delete(s.running, userID)
 		<-s.sem
+		s.runs.Done()
+	}
+}
+
+// runContext 返回一轮的 ctx：脱离请求 ctx（客户端断开不中断），RunTimeout 后或 Shutdown 时取消。
+func (s *Service) runContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.runTimeout)
+	stop := context.AfterFunc(s.base, cancel)
+	return c, func() { stop(); cancel() }
+}
+
+// stopText 是轮次 ctx 被取消时落库并推送的固定文案：停机 → TextShutdown，否则整轮超时 → TextRunTimeout。
+func (s *Service) stopText() string {
+	if s.base.Err() != nil {
+		return TextShutdown
+	}
+	return TextRunTimeout
+}
+
+// Shutdown 优雅停机（cmd/platform 在关闭 HTTP 服务之前调用）：不再接新轮次，取消所有运行中轮次的 ctx——
+// 它们按整轮超时的同一路径收尾（落「服务正在重启，本轮已中断，请重试」、对话回 idle、不计模型失败；
+// 已批准的写工具不被打断，执行完照常记录结果），然后等这些轮次全部结束或 ctx 到期（返回 ctx.Err()）。
+// 来不及收尾的轮次由其它副本的清扫器在 StaleRunAfter 后接管。可重复调用。
+func (s *Service) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	s.closing = true
+	s.mu.Unlock()
+	s.stopBase()
+	done := make(chan struct{})
+	go func() { s.runs.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

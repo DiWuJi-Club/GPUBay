@@ -2,10 +2,13 @@ package e2ehooks_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"spark-cloud/internal/butler"
 	"spark-cloud/internal/butler/llm"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/tz"
@@ -55,6 +58,7 @@ func TestButlerReplyHook(t *testing.T) {
 		"negative usage":   map[string]any{"text": "a", "usage": map[string]int{"input_tokens": -1}},
 		"negative delay":   map[string]any{"text": "a", "chunk_delay_ms": -1},
 		"huge delay":       map[string]any{"text": "a", "chunk_delay_ms": 60000},
+		"total delay":      map[string]any{"text": strings.Repeat("长", 8*31), "chunk_delay_ms": 1000}, // 31 段 × 1 秒 > 30 秒
 		"unknown field":    map[string]any{"txt": "typo"},
 		"unknown in tc":    map[string]any{"tool_calls": []map[string]any{{"name": "get_wallet", "arguments": map[string]any{}}}},
 	} {
@@ -187,8 +191,44 @@ func TestButlerSettingsHook(t *testing.T) {
 	}
 }
 
-// /hooks/sweep 在管家开启时也跑 Butler.Sweep（过期 pending 等），与 cmd/platform 的清扫器一致。
+// /hooks/sweep 在管家开启时也跑 Butler.Sweep，与 cmd/platform 的清扫器一致：假时钟越过 ConfirmTTL 后 pending → expired、对话回 idle。
 func TestSweepHookRunsButlerSweep(t *testing.T) {
 	e := newButlerEnv(t)
+	ctx := context.Background()
+	pool := e.a.Fleet.Pool()
+	uid := int64(e.must("POST", "/hooks/users", map[string]any{"phone": "13900000078"})["id"].(float64))
+	now := e.clk.Now()
+	content, _ := json.Marshal([]llm.Block{{Type: llm.BlockToolUse, ToolCallID: "tc-sweep0000001", ProviderCallID: "mock-1",
+		Name: "release_instance", Args: json.RawMessage(`{"instance_id":"ins-gone"}`)}})
+	var msgID int64
+	if _, err := pool.Exec(ctx, `INSERT INTO butler_conversations (id, user_id, title, status, provider, model, created_at, updated_at)
+		VALUES ('cv-sweep0000001', $1, '释放', 'awaiting_confirm', 'mock', 'mock', $2, $2)`, uid, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO butler_messages (conversation_id, seq, role, content, created_at)
+		VALUES ('cv-sweep0000001', 1, 'assistant', $1, $2) RETURNING id`, content, now).Scan(&msgID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO butler_tool_calls (id, conversation_id, message_id, user_id, provider_call_id, tool, kind, args, summary, status, expires_at, created_at)
+		VALUES ('tc-sweep0000001', 'cv-sweep0000001', $1, $2, 'mock-1', 'release_instance', 'write', '{"instance_id":"ins-gone"}', '释放实例', 'pending', $3, $4)`,
+		msgID, uid, now.Add(butler.ConfirmTTL), now); err != nil {
+		t.Fatal(err)
+	}
+	state := func() (call, conv string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT t.status, c.status FROM butler_tool_calls t JOIN butler_conversations c ON c.id = t.conversation_id
+			WHERE t.id = 'tc-sweep0000001'`).Scan(&call, &conv); err != nil {
+			t.Fatal(err)
+		}
+		return call, conv
+	}
 	e.must("POST", "/hooks/sweep", map[string]any{"heartbeat": false})
+	if call, conv := state(); call != "pending" || conv != "awaiting_confirm" {
+		t.Fatalf("before TTL: %s / %s", call, conv)
+	}
+	e.must("POST", "/hooks/clock/advance", map[string]int{"seconds": int(butler.ConfirmTTL/time.Second) + 60})
+	e.must("POST", "/hooks/sweep", map[string]any{"heartbeat": false})
+	if call, conv := state(); call != "expired" || conv != "idle" {
+		t.Fatalf("after TTL: %s / %s, want expired / idle", call, conv)
+	}
 }

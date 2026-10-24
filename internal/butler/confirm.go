@@ -112,7 +112,7 @@ func (s *Service) Confirm(ctx context.Context, userID int64, ip, convID, tcID st
 	sink.Emit(EvStart, StartEvent{ConversationID: conv.ID})
 
 	// 续跑不检查每日预算（预算只在 Send 开始时判断，一轮内允许超出）。
-	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.runTimeout)
+	runCtx, cancel := s.runContext(ctx)
 	defer cancel()
 	r := &run{userID: userID, convID: conv.ID, instanceID: conv.Context.InstanceID, token: token, ip: ip, sink: sink,
 		used: used, limit: st.DailyTokenLimit, secrets: map[string]string{}}
@@ -152,7 +152,8 @@ func (s *Service) executeCall(ctx context.Context, r *run, tc ToolCall) (cont bo
 		for _, v := range secrets {
 			r.addSecret(v)
 		}
-		wctx, cancel := context.WithTimeout(ctx, WriteToolTimeout)
+		// 已批准的写操作不随整轮超时 / 停机中途取消（半途取消只会留下「执行结果未知」）：只受 WriteToolTimeout 限制
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), WriteToolTimeout)
 		res, execErr = t.Exec(wctx, tools.Caller{UserID: r.userID, IP: r.ip, IdemKey: "butler:" + tc.ID, Now: now, QuotedCents: tc.QuoteAmount}, args)
 		cancel()
 		if execErr != nil {

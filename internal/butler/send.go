@@ -29,6 +29,7 @@ const (
 	TextRefusal        = "抱歉，这个问题我无法回答。"
 	TextInterrupted    = "本轮处理中断，请重试"
 	TextRunTimeout     = "这次处理时间太长，已停止，请重试"
+	TextShutdown       = "服务正在重启，本轮已中断，请重试"
 )
 
 // 写工具未执行时回填模型的结果文案（code：rejected / expired；mock 规则按 code 收尾）。
@@ -158,7 +159,7 @@ func (s *Service) Send(ctx context.Context, req SendRequest, sink Sink) (Convers
 	s.log.Info("butler: send", "conversation", conv.ID, "user", req.UserID, "chars", utf8.RuneCountInString(text))
 	sink.Emit(EvStart, StartEvent{ConversationID: conv.ID, MessageID: userMsg.ID})
 
-	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.runTimeout)
+	runCtx, cancel := s.runContext(ctx)
 	defer cancel()
 	s.runLoop(runCtx, &run{userID: req.UserID, convID: conv.ID, instanceID: req.Context.InstanceID, token: token, ip: req.IP,
 		sink: sink, used: used, limit: st.DailyTokenLimit, secrets: map[string]string{}})
@@ -216,7 +217,7 @@ type chatOut struct {
 }
 
 // runLoop 是工具循环（规格 §5.2 第 4 步）：至多 MaxIterations 次模型请求；每次回写都比对 run_token，不匹配即放弃本轮。
-// 整轮超时（RunTimeout）→ 固定文案「这次处理时间太长，已停止，请重试」结束（不计 LLM 失败）；panic → 内部错误结束。
+// 整轮超时（RunTimeout）→ 固定文案「这次处理时间太长，已停止，请重试」结束（不计 LLM 失败；Shutdown 取消时文案为 TextShutdown）；panic → 内部错误结束。
 // 续跑（Confirm 之后）不再检查每日预算：预算只在轮开始（Send）时判断，一轮内允许超出。
 func (s *Service) runLoop(ctx context.Context, r *run) {
 	defer func() {
@@ -226,7 +227,7 @@ func (s *Service) runLoop(ctx context.Context, r *run) {
 	}()
 	for iter := 0; iter < MaxIterations; iter++ {
 		if ctx.Err() != nil {
-			s.finishText(ctx, r, "", TextRunTimeout, 0, 0, DoneEndTurn)
+			s.finishText(ctx, r, "", s.stopText(), 0, 0, DoneEndTurn)
 			return
 		}
 		hist, err := s.loadHistory(ctx, r.convID, r.secrets)
@@ -245,8 +246,8 @@ func (s *Service) runLoop(ctx context.Context, r *run) {
 		}
 		out, err := s.chat(ctx, r, req)
 		if err != nil {
-			if ctx.Err() != nil { // 整轮超时（不是模型单次请求超时）：不算模型失败
-				s.finishText(ctx, r, out.text, TextRunTimeout, 0, 0, DoneEndTurn)
+			if ctx.Err() != nil { // 整轮超时或停机（不是模型单次请求超时）：不算模型失败
+				s.finishText(ctx, r, out.text, s.stopText(), 0, 0, DoneEndTurn)
 				return
 			}
 			s.llmFailed(ctx, r, err)

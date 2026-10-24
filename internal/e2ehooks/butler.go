@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/butler"
@@ -27,8 +28,13 @@ import (
 //
 // 请求体按字段严格解析：未知字段（拼错的键）→ 400，免得用例静默地没生效。
 
-// maxChunkDelayMS 是 reply.chunk_delay_ms 的上限：mock 每 8 个字符停一次，整轮仍要在 RunTimeout（120 秒）内结束。
-const maxChunkDelayMS = 5000
+// maxChunkDelayMS 是 reply.chunk_delay_ms 的上限；mock 每 8 个字符（rune）一段、每段后停一次，
+// 所以还限制整条回复的总停顿 ≤ maxTotalDelay（远小于单次模型请求超时 LLMTimeout 60 秒，否则这一轮会按模型超时失败）。
+const (
+	maxChunkDelayMS = 5000
+	maxTotalDelay   = 30 * time.Second
+	mockChunkRunes  = 8 // 与 mock.Chat 的分段一致
+)
 
 // decodeStrict 与 decode 相同，但拒绝未知字段与多余内容。
 func decodeStrict[T any](body json.RawMessage) (T, error) {
@@ -101,6 +107,9 @@ func (s *Server) butlerReply(_ context.Context, body json.RawMessage) (any, erro
 	}
 	if req.Text == "" && len(req.ToolCalls) == 0 {
 		return nil, badRequest("text 与 tool_calls 至少要有一个（或 error: true）")
+	}
+	if chunks := (utf8.RuneCountInString(req.Text) + mockChunkRunes - 1) / mockChunkRunes; time.Duration(chunks)*r.ChunkDelay > maxTotalDelay {
+		return nil, badRequest(fmt.Sprintf("chunk_delay_ms × 分段数（每 %d 字一段）不能超过 %d 秒", mockChunkRunes, int(maxTotalDelay/time.Second)))
 	}
 	r.Text = req.Text
 	for i, tc := range req.ToolCalls {

@@ -76,8 +76,9 @@ type Options struct {
 	// 集成测试与 e2e-server 的所有实例共用一个假容器 sshd，用 AppRootFor 让每个实例各用 <Root>/<实例 ID>/root/data；生产环境设置时 Build 直接报错。
 	AppRoot    string
 	AppRootFor func(instanceID string) string
-	// LLM 是测试 / e2e 注入的 AI 管家模型提供方（通常是 *mock.Mock，钩子往它的队列里塞回复）；nil = 按 cfg.LLM.Provider 构造。
-	// 生产环境设置时 Build 直接报错（与 DisableRateLimits 同款保护）。cfg.Butler 为 false 时忽略。
+	// LLM 是测试 / e2e 注入的 AI 管家模型提供方（通常是 *mock.Mock，钩子往它的队列里塞回复）：非 nil 时取代按 cfg.LLM 构造的提供方
+	// （cfg.LLM.Provider / BaseURL / Model 不再起作用，对话记录的 provider / model 取它的 Name / Model）；nil = 按 cfg.LLM.Provider 构造。
+	// 只有 cfg.Butler 为 true 时才会用到；但生产环境只要设置了就报错（不论管家开没开，与 DisableRateLimits 同款保护）。
 	LLM llm.Provider
 }
 
@@ -139,6 +140,9 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	if cfg.LLM.Provider == config.LLMMock && cfg.Env == "prod" { // config.Load 已拦；这里防配置字面量绕过
 		return nil, errors.New("生产环境禁止使用 mock LLM 提供方")
+	}
+	if cfg.Env == "prod" && cfg.Butler && cfg.LLM.APIKey == "" { // 同上：与 config.Load 的校验一致
+		return nil, errors.New("生产环境开启 AI 管家需要设置 SPARK_LLM_API_KEY")
 	}
 	ipHourLimit, loginLimit := 0, 0
 	if opt.DisableRateLimits {

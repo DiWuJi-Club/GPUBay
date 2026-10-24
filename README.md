@@ -180,7 +180,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 
 ### AI 管家（计划 12）
 
-- **模型端点**：默认 `SPARK_LLM_PROVIDER=openai`，接 OpenAI 兼容的 Chat Completions 流式接口（需支持 `tools` 与 `stream_options.include_usage`）。计划 9（Token 商城）合入后默认指向它的内网端点（如 `http://token-mall.spark.internal/v1`）；在那之前可接任意 OpenAI 兼容端点（如 vLLM：Qwen3 需 `--enable-auto-tool-choice --tool-call-parser hermes`）。`SPARK_LLM_BASE_URL` **写到 `/v1` 为止**，平台请求 `<base>/chat/completions`，`SPARK_LLM_API_KEY` 以 `Authorization: Bearer` 发送；URL 里不能带用户名密码。端点放在机房内网，platform 到端点的出站要放行。
+- **模型端点**：默认 `SPARK_LLM_PROVIDER=openai`，接 OpenAI 兼容的 Chat Completions 流式接口（需支持 `tools` 与 `stream_options.include_usage`）。计划 9（Token 商城）合入后应设为它的内网端点（如 `http://token-mall.spark.internal/v1`；平台没有内置默认地址）；在那之前可接任意 OpenAI 兼容端点（如 vLLM：Qwen3 需 `--enable-auto-tool-choice --tool-call-parser hermes`）。`SPARK_LLM_BASE_URL` **写到 `/v1` 为止**，平台请求 `<base>/chat/completions`，`SPARK_LLM_API_KEY` 以 `Authorization: Bearer` 发送；URL 里不能带用户名密码。端点放在机房内网，platform 到端点的出站要放行。
 - **Claude 模式**：`SPARK_LLM_PROVIDER=anthropic` + `SPARK_LLM_API_KEY`（Anthropic API 密钥），模型默认 `claude-opus-5-5`，`SPARK_LLM_BASE_URL` 可空（官方地址）或填兼容网关。按 token 计费，**每日 token 预算就是钱**：把 `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` 设成实际单价（分 / 百万 token），后台用量页才有费用估算；按需在后台调低每用户每日 token 限额（默认 30 万）。密钥只从环境变量读，不写日志、不入库。
 - **生产校验**：prod 开启管家且提供方不是 mock 时必须有 `SPARK_LLM_API_KEY`；`openai` 必须有 `SPARK_LLM_BASE_URL`，否则启动失败（不想开放就设 `SPARK_BUTLER=off`）。**`mock` 提供方在 prod 直接拒绝启动**（配置校验与 `app.Build` 两道），测试注入的提供方同样被拒。
 - **开发环境**：未设 `SPARK_LLM_BASE_URL` 且没显式 `SPARK_BUTLER=on` 时管家自动关闭（启动日志「AI 管家未开启」说明原因），控制台不显示入口；`SPARK_LLM_PROVIDER=mock make run` 用确定性 mock 模型体验全部流程（规则见 `internal/butler/llm/mock/rules.go`）。显式 `SPARK_BUTLER=on` 而没配端点则启动报错。

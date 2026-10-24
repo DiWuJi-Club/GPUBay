@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -101,8 +102,15 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if a.LLM != nil { // 只记提供方与模型名，不记端点密钥
-		log.Info("AI 管家已开启", "provider", a.LLM.Name(), "model", a.LLM.Model(), "tools", cfg.LLM.Tools)
+	switch {
+	case a.LLM != nil: // 只记提供方、模型名与端点主机，绝不记密钥（BaseURL 已校验不含用户名密码，这里也只取 host）
+		endpoint := "（SDK 默认）"
+		if u, err := url.Parse(cfg.LLM.BaseURL); err == nil && u.Host != "" {
+			endpoint = u.Host
+		}
+		log.Info("AI 管家已开启", "provider", a.LLM.Name(), "model", a.LLM.Model(), "endpoint", endpoint, "tools", cfg.LLM.Tools)
+	case cfg.ButlerOffReason == "":
+		log.Info("AI 管家已关闭（SPARK_BUTLER=off）")
 	}
 	sshLis, err := net.Listen("tcp", cfg.SSHAddr) // 先于启动任何服务：端口占用时干净退出
 	if err != nil {
@@ -200,14 +208,33 @@ func run(log *slog.Logger) error {
 		defer close(ingressDone)
 		a.Ingress.Shutdown(shutdownCtx, ingressShutdownGrace)
 	}()
+	// AI 管家：先取消运行中的轮次（落「服务正在重启」、回 idle），它们的 SSE handler 随即返回，http.Server.Shutdown 不被拖到超时；
+	// 与 HTTP 关闭并发，最多等 shutdownCtx。来不及收尾的轮次由其它副本的清扫器在 StaleRunAfter 后接管。
+	butlerDone := make(chan struct{})
+	go func() {
+		defer close(butlerDone)
+		if a.Butler != nil {
+			if err := a.Butler.Shutdown(shutdownCtx); err != nil {
+				log.Warn("AI 管家停机时仍有未结束的轮次", "err", err)
+			}
+		}
+	}()
 	for _, s := range []*http.Server{srv, adminSrv, redirect} {
 		if s == nil {
 			continue
 		}
-		if err := s.Shutdown(shutdownCtx); err != nil && runErr == nil {
-			runErr = err
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) { // 宽限期内没关完的连接直接断开：停机本身不算失败
+				log.Warn("http server shutdown timed out, closing remaining connections", "addr", s.Addr)
+				_ = s.Close()
+				continue
+			}
+			if runErr == nil {
+				runErr = err
+			}
 		}
 	}
+	<-butlerDone // 轮次回写用数据库连接池：先等它们收尾再关池（defer）
 	<-ingressDone
 	<-sweeperDone
 	<-runnerDone // Runner 的 exec 走上游连接池：先等它退出再关池
