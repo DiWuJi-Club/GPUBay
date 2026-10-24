@@ -26,6 +26,8 @@ export const router = createRouter({
     { path: '/kyc', component: () => import('./views/KycView.vue'), meta: { title: '实名认证', auth: true } },
     { path: '/account', component: () => import('./views/AccountView.vue'), meta: { title: '我的', auth: true } },
     { path: '/account/ssh-keys', component: () => import('./views/SshKeysView.vue'), meta: { title: 'SSH 公钥', auth: true } },
+    // 不要求登录：未登录可看模型与价格、快速开始，其余 Tab 显示登录引导（与 /market 一致）
+    { path: '/tokens', component: () => import('./views/TokensView.vue'), meta: { title: 'Token 商城' } },
     { path: '/help', component: () => import('./views/HelpView.vue'), meta: { title: '使用帮助' } },
     { path: '/:pathMatch(.*)*', component: () => import('./views/NotFoundView.vue'), meta: { title: '页面不存在' } },
   ],

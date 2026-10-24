@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ChatDotRound, Monitor, Shop, User, Wallet } from '@element-plus/icons-vue'
 import { brand, useMobile } from '@spark/shared'
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
@@ -8,10 +9,11 @@ import { session } from '../store/session'
 const mobile = useMobile()
 const route = useRoute()
 const tabs = [
-  { key: 'market', path: '/market', label: '算力市场' },
-  { key: 'instances', path: '/instances', label: '我的实例' },
-  { key: 'wallet', path: '/wallet', label: '钱包' },
-  { key: 'account', path: '/account', label: '我的' },
+  { key: 'market', path: '/market', label: '算力市场', icon: Shop },
+  { key: 'instances', path: '/instances', label: '我的实例', icon: Monitor },
+  { key: 'wallet', path: '/wallet', label: '钱包', icon: Wallet },
+  { key: 'account', path: '/account', label: '我的', icon: User },
+  { key: 'tokens', path: '/tokens', label: 'Token 商城', icon: ChatDotRound },
 ] as const
 const active = computed(() => tabs.find((t) => route.path === t.path || route.path.startsWith(t.path + '/'))?.key ?? '')
 const logo = import.meta.env.BASE_URL + brand.logoUrl
@@ -23,7 +25,7 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
       <div class="logo"><img :src="logo" alt="" width="28" height="28" /><span>{{ brand.name }}</span></div>
       <nav>
         <router-link v-for="t in tabs" :key="t.key" :to="t.path" class="menu-item" :class="{ active: active === t.key }" :data-testid="`menu-${t.key}`">
-          {{ t.label }}
+          <el-icon><component :is="t.icon" /></el-icon>{{ t.label }}
         </router-link>
       </nav>
     </aside>
@@ -40,7 +42,7 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
     </div>
     <nav v-if="mobile" class="tabbar" data-testid="layout-tabbar">
       <router-link v-for="t in tabs" :key="t.key" :to="t.path" :class="{ active: active === t.key }" :data-testid="`tabbar-${t.key}`">
-        {{ t.label }}
+        <el-icon :size="20"><component :is="t.icon" /></el-icon><span>{{ t.label }}</span>
       </router-link>
     </nav>
   </div>
@@ -50,7 +52,7 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
 .shell { display: flex; min-height: 100vh; }
 .side { width: 200px; background: #fff; border-right: 1px solid #ebeef5; flex-shrink: 0; }
 .logo { display: flex; align-items: center; gap: 8px; padding: 16px; font-weight: 600; }
-.menu-item { display: block; padding: 12px 16px; color: #303133; text-decoration: none; }
+.menu-item { display: flex; align-items: center; gap: 8px; padding: 12px 16px; color: #303133; text-decoration: none; }
 .menu-item.active { color: var(--el-color-primary); background: #ecf5ff; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar { height: 56px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; background: #fff; border-bottom: 1px solid #ebeef5; }
@@ -62,6 +64,9 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
   position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: #fff; border-top: 1px solid #ebeef5;
   height: calc(var(--sc-tabbar-height) + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom); box-sizing: border-box;
 }
-.tabbar a { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 44px; color: #606266; text-decoration: none; font-size: 13px; }
+.tabbar a {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-height: 44px;
+  color: #606266; text-decoration: none; font-size: 12px; white-space: nowrap;
+}
 .tabbar a.active { color: var(--el-color-primary); }
 </style>

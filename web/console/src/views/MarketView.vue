@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { durationLabel, fmtYuan, labelOf, messageOf, type AppCatalogItem, type Duration, type Image, type Listed, type Product } from '@spark/shared'
+import {
+  durationLabel, fmtYuan, formatPricePerM, labelOf, messageOf, type AppCatalogItem, type Duration, type Image, type Listed, type LLMModelsResponse, type Product,
+} from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -11,6 +13,7 @@ import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
 import { compatibleImages } from '../logic/apps'
 import { notifyError } from '../logic/notify'
+import { lowestInputPrice } from '../logic/tokens'
 import { refreshBalance, session } from '../store/session'
 
 const route = useRoute()
@@ -32,6 +35,16 @@ async function loadApps() {
     apps.value = (await api.get<{ items: AppCatalogItem[] }>('/apps')).items
   } catch {
     // 静默：商品卡片照常可租
+  }
+}
+
+// Token 商城横幅：最低输入价（分 / 百万 token）；失败或没有在线模型时不显示
+const tokensFrom = ref<number | null>(null)
+async function loadTokensBanner() {
+  try {
+    tokensFrom.value = lowestInputPrice((await api.get<LLMModelsResponse>('/llm/models')).items)
+  } catch {
+    // 静默：横幅只是入口，不影响商品列表
   }
 }
 
@@ -62,7 +75,10 @@ async function retry() {
   loadError.value = ''
   await load()
 }
-onMounted(load)
+onMounted(() => {
+  void loadTokensBanner()
+  void load()
+})
 usePolling(load, 30_000) // 30 秒刷新一次空闲台数（页面可见时）
 
 const specItems = (p: Product) => [
@@ -119,6 +135,11 @@ async function onPlaced(r: PlacedResult) {
 
 <template>
   <div class="market">
+    <router-link v-if="tokensFrom != null" to="/tokens" class="tokens-banner" data-testid="market-tokens-banner">
+      <span class="tokens-banner-title">Token 商城</span>
+      <span>按量调用大模型 API，<b data-testid="market-tokens-banner-price">{{ formatPricePerM(tokensFrom) }}</b> 起 / 百万 token</span>
+      <span class="tokens-banner-go">去看看 ›</span>
+    </router-link>
     <el-alert v-if="loadError" type="error" :title="loadError" show-icon :closable="false" data-testid="market-error">
       <el-button size="small" data-testid="market-retry" @click="retry">重试</el-button>
     </el-alert>
@@ -167,6 +188,12 @@ async function onPlaced(r: PlacedResult) {
 </template>
 
 <style scoped>
+.tokens-banner {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 16px; padding: 14px 16px; border-radius: 8px;
+  background: linear-gradient(90deg, #ecf5ff, #f4f0ff); border: 1px solid #d9ecff; color: #303133; text-decoration: none;
+}
+.tokens-banner-title { font-weight: 600; color: var(--el-color-primary); }
+.tokens-banner-go { margin-left: auto; color: var(--el-color-primary); font-size: 14px; }
 .cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
 .head { display: flex; justify-content: space-between; align-items: center; }
 .name { font-weight: 600; }
