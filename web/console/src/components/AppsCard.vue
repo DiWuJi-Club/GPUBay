@@ -6,6 +6,7 @@ import {
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
+import { useAskButler } from '../composables/useAskButler'
 import { usePolling } from '../composables/usePolling'
 import {
   MAX_APPS, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, instanceAppHint,
@@ -46,6 +47,10 @@ onMounted(load)
 watch(() => props.instance.state, () => void load())
 // Runner 每 5 秒推进一次：实例运行中且有排队 / 部署中 / 卸载中 / 停止中的部署时同频刷新（页面不可见时暂停）
 usePolling(load, 5_000, { enabled: () => props.instance.state === 'running' && items.value.some(deploymentBusy) })
+
+// 「问问管家」：带上本实例的上下文；failed 行预填排障问题
+const askButler = useAskButler()
+const FAILED_QUESTION = '这个实例上的应用为什么失败了？'
 
 const blockReason = computed(() => appOpBlockReason(props.instance.state))
 const hint = computed(() => instanceAppHint(props.instance.state))
@@ -128,7 +133,13 @@ function onCommand(d: Deployment, cmd: string) {
 </script>
 
 <template>
-  <el-card header="应用" data-testid="detail-apps-card">
+  <el-card data-testid="detail-apps-card">
+    <template #header>
+      <div class="card-head">
+        <span>应用</span>
+        <el-button link type="primary" size="small" data-testid="detail-ask-butler" @click="askButler({ instanceId: instance.id })">问问管家</el-button>
+      </div>
+    </template>
     <p class="muted">一键部署常用 AI 应用到这台实例（在实例里以进程运行，不另收费）；部署完成后点「打开」访问，默认只有您登录控制台后能打开。</p>
     <el-alert v-if="loadError" type="error" :title="`应用列表加载失败：${loadError}`" show-icon :closable="false" data-testid="detail-apps-error" />
     <p v-else-if="loaded && !items.length" class="muted" data-testid="detail-apps-empty">还没有部署应用</p>
@@ -154,6 +165,7 @@ function onCommand(d: Deployment, cmd: string) {
       <p v-if="d.state === 'failed'" class="danger small" data-testid="detail-app-error">
         {{ deploymentErrorText(d.error_code, d.message, '部署失败') }}
         <el-button link type="primary" size="small" data-testid="detail-app-error-log" @click="openLog(d)">查看日志</el-button>
+        <el-button link type="primary" size="small" data-testid="detail-app-ask-butler" @click="askButler({ instanceId: instance.id, draft: FAILED_QUESTION })">问问管家</el-button>
       </p>
       <p v-if="hint" class="muted small" data-testid="detail-app-instance-hint">{{ hint }}</p>
       <p v-if="d.state === 'running' && !d.url" class="warn small" data-testid="detail-app-port-deleted">端口已删除，重新部署可恢复</p>
@@ -216,6 +228,7 @@ function onCommand(d: Deployment, cmd: string) {
 </template>
 
 <style scoped>
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .app-row { padding: 8px 0; border-bottom: 1px solid var(--el-border-color-lighter); }
 .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; flex-wrap: wrap; }
 .icon { flex: none; width: 24px; height: 24px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; font-weight: 600; font-size: 13px; color: #fff; background: var(--el-color-primary); }

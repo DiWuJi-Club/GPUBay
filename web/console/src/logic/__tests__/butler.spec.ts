@@ -5,6 +5,14 @@ import {
   appendError,
   appendUser,
   applyEvent,
+  bannerOfStatus,
+  cardDeadline,
+  clearErrors,
+  confirmResult,
+  formatCountdown,
+  rollbackUser,
+  sendErrorKind,
+  stepText,
   confirmAmountText,
   confirmSummaryLines,
   confirmTitle,
@@ -316,4 +324,77 @@ describe('secondsLeft', () => {
 
 it('SUGGESTIONS 4 条', () => {
   expect(SUGGESTIONS).toHaveLength(4)
+})
+
+describe('Task 13：页面辅助', () => {
+  it('确认执行失败：tool 事件的 message 挂到卡片上；成功不带 message', () => {
+    const base = run(appendUser(emptyState(), '续费'), [ev('start', { conversation_id: 'cv-1', message_id: 1 }), ev('confirm', { tool_call: card })])
+    const failed = applyEvent(markConfirm(base, card.id, 'approved'), ev('tool', { id: card.id, name: 'renew_instance', label: '续费实例', status: 'error', message: '余额不足' }))
+    expect(failed.items[failed.items.length - 1]).toMatchObject({ kind: 'confirm', state: 'failed', message: '余额不足' })
+    const ok = applyEvent(markConfirm(base, card.id, 'approved'), ev('tool', { id: card.id, name: 'renew_instance', label: '续费实例', status: 'ok' }))
+    const last = ok.items[ok.items.length - 1]
+    expect(last).toMatchObject({ kind: 'confirm', state: 'executed' })
+    expect('message' in last && last.message).toBeFalsy()
+  })
+
+  it('sendErrorKind：额度 / 关闭 / 轮数 → 横幅；401 → 登录；取消忽略；其它 → 错误行', () => {
+    expect(sendErrorKind(429, 'butler_quota_exceeded')).toBe('banner')
+    expect(sendErrorKind(503, 'butler_disabled')).toBe('banner')
+    expect(sendErrorKind(409, 'butler_turn_limit')).toBe('banner')
+    expect(sendErrorKind(401, 'unauthorized')).toBe('auth')
+    expect(sendErrorKind(0, 'cancelled')).toBe('ignore')
+    expect(sendErrorKind(409, 'butler_busy')).toBe('row')
+    expect(sendErrorKind(503, 'butler_llm_unavailable')).toBe('row')
+    expect(sendErrorKind(0, 'network')).toBe('row')
+  })
+
+  it('rollbackUser 撤回末尾未被服务端接收的用户气泡；clearErrors 去掉错误行', () => {
+    const s = appendUser(run(emptyState(), [ev('delta', { text: '你好' }), ev('done', { reason: 'end_turn' })]), '再问一句')
+    const r = rollbackUser(s)
+    expect(r.items.map((it) => it.kind)).toEqual(['assistant'])
+    expect(r.status).toBe('idle')
+    // 末尾不是用户气泡（已开始回答）时不撤回
+    const answered = applyEvent(s, ev('delta', { text: '好' }))
+    expect(rollbackUser(answered).items).toHaveLength(answered.items.length)
+    const withErr = appendError(r, 'butler_busy', '上一条消息还在处理中，请稍候', '再问一句')
+    expect(clearErrors(withErr).items.map((it) => it.kind)).toEqual(['assistant'])
+    expect(clearErrors(r)).toBe(r)
+  })
+
+  it('cardDeadline：优先服务器剩余秒 expires_in，缺省退回 expires_at', () => {
+    const now = Date.parse('2026-10-25T10:00:00Z')
+    expect(cardDeadline({ ...card, expires_in: 300 }, now)).toBe(now + 300_000)
+    expect(cardDeadline({ ...card, expires_in: 0 }, now)).toBe(now)
+    expect(cardDeadline({ ...card, expires_in: undefined }, now)).toBe(Date.parse(card.expires_at))
+    expect(cardDeadline({ ...card, expires_in: undefined, expires_at: 'bad' }, now)).toBe(now)
+  })
+
+  it('formatCountdown：mm:ss', () => {
+    expect(formatCountdown(600)).toBe('10:00')
+    expect(formatCountdown(65)).toBe('01:05')
+    expect(formatCountdown(0)).toBe('00:00')
+    expect(formatCountdown(-3)).toBe('00:00')
+  })
+
+  it('confirmResult：各结果态的文案与颜色；pending 无结果', () => {
+    expect(confirmResult('pending')).toBeNull()
+    expect(confirmResult('approved')).toEqual({ text: '执行中…', type: 'info' })
+    expect(confirmResult('executed')).toEqual({ text: '已执行', type: 'success' })
+    expect(confirmResult('failed', '余额不足')).toEqual({ text: '执行失败：余额不足', type: 'danger' })
+    expect(confirmResult('failed')).toEqual({ text: '执行失败', type: 'danger' })
+    expect(confirmResult('rejected')).toEqual({ text: '已取消', type: 'muted' })
+    expect(confirmResult('expired')).toEqual({ text: '已失效', type: 'muted' })
+  })
+
+  it('bannerOfStatus：关闭时「AI 管家暂未开放：<notice>」，开启时为空', () => {
+    expect(bannerOfStatus({ enabled: false, notice: '系统维护中' })).toBe('AI 管家暂未开放：系统维护中')
+    expect(bannerOfStatus({ enabled: false, notice: '' })).toBe('AI 管家暂未开放')
+    expect(bannerOfStatus({ enabled: true, notice: '任意' })).toBe('')
+  })
+})
+
+it('stepText：✓ 成功 / ✗ 失败 / … 进行中', () => {
+  expect(stepText({ label: '查询套餐', status: 'ok' })).toBe('✓ 查询套餐')
+  expect(stepText({ label: '读取部署日志', status: 'error' })).toBe('✗ 读取部署日志失败')
+  expect(stepText({ label: '查询钱包', status: 'running' })).toBe('… 查询钱包')
 })

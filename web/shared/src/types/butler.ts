@@ -50,6 +50,8 @@ export interface PendingToolCall {
   quote_amount: number | null
   args: Record<string, unknown>
   expires_at: string
+  /** 服务器时钟下剩余整秒（倒计时以它为准；浏览器时钟与服务器不一致时 expires_at 不可靠）；缺省退回 expires_at */
+  expires_in?: number
   /** release_instance / remove_app / cancel_booking：红色 + 需勾选「我已了解」 */
   danger: boolean
 }
@@ -71,7 +73,8 @@ export type ButlerDoneReason = 'end_turn' | 'awaiting_confirm' | 'max_tokens' | 
 /** 各 SSE 事件的 data 载荷 */
 export interface ButlerStartEvent { conversation_id: string; message_id: number }
 export interface ButlerDeltaEvent { text: string }
-export interface ButlerToolEvent { id: string; name: string; label: string; status: 'ok' | 'error' }
+/** message：确认执行失败时的业务错误文案（「执行失败：<message>」） */
+export interface ButlerToolEvent { id: string; name: string; label: string; status: 'ok' | 'error'; message?: string }
 export interface ButlerConfirmEvent { tool_call: PendingToolCall }
 export interface ButlerUsageEvent { input_tokens: number; output_tokens: number; day_used: number; day_limit: number }
 export interface ButlerDoneEvent { reason: ButlerDoneReason }

@@ -27,6 +27,7 @@ export const router = createRouter({
     { path: '/account', component: () => import('./views/AccountView.vue'), meta: { title: '我的', auth: true } },
     { path: '/account/ssh-keys', component: () => import('./views/SshKeysView.vue'), meta: { title: 'SSH 公钥', auth: true } },
     { path: '/invite', component: () => import('./views/InviteView.vue'), meta: { title: '邀请返利', auth: true } },
+    { path: '/butler', component: () => import('./views/ButlerView.vue'), meta: { title: 'AI 管家', auth: true } },
     { path: '/help', component: () => import('./views/HelpView.vue'), meta: { title: '使用帮助' } },
     { path: '/:pathMatch(.*)*', component: () => import('./views/NotFoundView.vue'), meta: { title: '页面不存在' } },
   ],

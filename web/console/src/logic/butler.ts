@@ -22,7 +22,7 @@ export type ChatItem =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string; streaming: boolean; truncated?: boolean }
   | { kind: 'tool'; id: string; name: string; label: string; status: 'ok' | 'error' | 'running'; summary?: string }
-  | { kind: 'confirm'; card: PendingToolCall; state: ConfirmState }
+  | { kind: 'confirm'; card: PendingToolCall; state: ConfirmState; message?: string }
   | { kind: 'error'; code: string; message: string; retryText?: string }
 
 export interface ChatState {
@@ -106,7 +106,7 @@ export function applyEvent(s: ChatState, e: SSEEvent): ChatState {
         const card = items[ci] as Extract<ChatItem, { kind: 'confirm' }>
         // 只有待确认 / 已批准的卡片才会有执行结果；已拒绝 / 已失效的卡片不被改写
         if (card.state !== 'pending' && card.state !== 'approved') return s
-        items[ci] = { ...card, state: status === 'ok' ? 'executed' : 'failed' }
+        items[ci] = status === 'ok' ? { ...card, state: 'executed' } : { ...card, state: 'failed', message: typeof d.message === 'string' ? d.message : '' }
         return { ...s, items }
       }
       const ti = s.items.findIndex((it) => it.kind === 'tool' && it.id === d.id)
@@ -274,3 +274,70 @@ export function secondsLeft(expiresAt: string, now: Date): number {
 
 /** 空状态的 4 个建议 chip（规格 §11.2）。 */
 export const SUGGESTIONS: readonly string[] = ['帮我选一台机器', '在我的实例上部署 vLLM', '我的应用为什么失败了', '我的余额还能用多久']
+
+// ---- Task 13：页面辅助 ----
+
+/** 发送 / 确认请求在建立流之前失败时的处理方式：横幅（额度 / 关闭 / 轮数上限）、跳登录、忽略（主动取消）、错误行（可重试）。 */
+export function sendErrorKind(status: number, code: string): 'banner' | 'auth' | 'ignore' | 'row' {
+  if (status === 401) return 'auth'
+  if (code === 'cancelled') return 'ignore'
+  if (code === 'butler_quota_exceeded' || code === 'butler_disabled' || code === 'butler_turn_limit') return 'banner'
+  return 'row'
+}
+
+/** 撤回末尾的本地用户气泡（请求在服务端收下消息之前就失败了：没收到 start）；回到 idle。 */
+export function rollbackUser(s: ChatState): ChatState {
+  const last = s.items[s.items.length - 1]
+  if (last?.kind !== 'user') return { ...s, status: 'idle' }
+  return { ...s, items: s.items.slice(0, -1), status: 'idle' }
+}
+
+/** 去掉错误行（重试 / 发新消息时旧的错误提示不再有意义）；没有错误行原样返回。 */
+export function clearErrors(s: ChatState): ChatState {
+  if (!s.items.some((it) => it.kind === 'error')) return s
+  return { ...s, items: s.items.filter((it) => it.kind !== 'error') }
+}
+
+/** 确认卡到期的本地时间戳（毫秒）：有 expires_in（服务器时钟下剩余秒）时按收到卡片的时刻 nowMs 推算，否则用 expires_at；无法解析视为已到期。 */
+export function cardDeadline(card: PendingToolCall, nowMs: number): number {
+  if (typeof card.expires_in === 'number' && Number.isFinite(card.expires_in)) return nowMs + Math.max(0, card.expires_in) * 1000
+  const t = Date.parse(card.expires_at)
+  return Number.isNaN(t) ? nowMs : t
+}
+
+/** 倒计时 mm:ss（负数按 0）。 */
+export function formatCountdown(sec: number): string {
+  const v = Math.max(0, Math.floor(sec))
+  return `${String(Math.floor(v / 60)).padStart(2, '0')}:${String(v % 60).padStart(2, '0')}`
+}
+
+/** 确认卡结果态的文案与颜色；pending 没有结果（显示按钮）。 */
+export function confirmResult(state: ConfirmState, message?: string): { text: string; type: 'success' | 'danger' | 'muted' | 'info' } | null {
+  switch (state) {
+    case 'approved':
+      return { text: '执行中…', type: 'info' }
+    case 'executed':
+      return { text: '已执行', type: 'success' }
+    case 'failed':
+      return { text: message ? `执行失败：${message}` : '执行失败', type: 'danger' }
+    case 'rejected':
+      return { text: '已取消', type: 'muted' }
+    case 'expired':
+      return { text: '已失效', type: 'muted' }
+    default:
+      return null
+  }
+}
+
+/** GET /butler/status 关闭时的横幅文案（与服务端 butler_disabled 的消息同格式）；开启时为空。 */
+export function bannerOfStatus(st: { enabled: boolean; notice: string }): string {
+  if (st.enabled) return ''
+  return st.notice ? `AI 管家暂未开放：${st.notice}` : 'AI 管家暂未开放'
+}
+
+/** 工具步骤行文案：「✓ 查询套餐」/「✗ 读取部署日志失败」/「… 查询钱包」。 */
+export function stepText(it: { label: string; status: 'ok' | 'error' | 'running' }): string {
+  if (it.status === 'error') return `✗ ${it.label}失败`
+  if (it.status === 'running') return `… ${it.label}`
+  return `✓ ${it.label}`
+}

@@ -7,6 +7,7 @@ import { api } from '../api'
 import AppPicker from '../components/AppPicker.vue'
 import GuideDialog from '../components/GuideDialog.vue'
 import RentDialog, { type PlacedResult } from '../components/RentDialog.vue'
+import { useAskButler } from '../composables/useAskButler'
 import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
 import { compatibleImages } from '../logic/apps'
@@ -105,6 +106,7 @@ function appBlocked(p: Product, a: AppCatalogItem): string | null {
   return null
 }
 const book = (p: Product) => open(p, 'booking')
+const askButler = useAskButler()
 
 async function onPlaced(r: PlacedResult) {
   if (r.batchId && r.instances.length > 1) {
@@ -119,6 +121,9 @@ async function onPlaced(r: PlacedResult) {
 
 <template>
   <div class="market">
+    <p class="ask">
+      不知道选哪个？<el-button link type="primary" data-testid="market-ask-butler" @click="askButler({ draft: '帮我选一台机器' })">问 AI 管家</el-button>
+    </p>
     <el-alert v-if="loadError" type="error" :title="loadError" show-icon :closable="false" data-testid="market-error">
       <el-button size="small" data-testid="market-retry" @click="retry">重试</el-button>
     </el-alert>
@@ -178,6 +183,7 @@ async function onPlaced(r: PlacedResult) {
 .rent + .rent { margin: 8px 0 0; }
 .warn { color: var(--el-color-warning); }
 .muted { color: #909399; font-size: 13px; margin: 0 0 8px; }
+.ask { margin: 0 0 12px; font-size: 14px; color: #606266; display: flex; align-items: center; }
 .one-click { margin-top: 16px; padding-top: 12px; border-top: 1px solid #ebeef5; }
 .one-click-title { font-weight: 600; margin-bottom: 8px; }
 </style>

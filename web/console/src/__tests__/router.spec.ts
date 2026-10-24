@@ -57,3 +57,17 @@ describe('邀请返利路由 (计划 8)', () => {
     expect(router.resolve('/invite').meta).toEqual({ title: '邀请返利', auth: true })
   })
 })
+
+describe('AI 管家路由 (计划 12)', () => {
+  afterEach(() => {
+    session.status = 'unknown'
+  })
+
+  it('/butler 需要登录，标题「AI 管家」', async () => {
+    session.status = 'anon'
+    await router.push('/butler')
+    expect(router.currentRoute.value.path).toBe('/login')
+    expect(router.currentRoute.value.query.redirect).toBe('/butler')
+    expect(router.resolve('/butler').meta).toEqual({ title: 'AI 管家', auth: true })
+  })
+})

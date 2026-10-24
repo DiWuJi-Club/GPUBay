@@ -2,17 +2,23 @@
 import { brand, useMobile } from '@spark/shared'
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
+import ButlerDrawer from '../components/ButlerDrawer.vue'
+import ButlerLauncher from '../components/ButlerLauncher.vue'
 import { maskPhone } from '../logic/login'
 import { session } from '../store/session'
 
 const mobile = useMobile()
 const route = useRoute()
-const tabs = [
+/** short：手机底部标签的短名（缺省同 label） */
+const tabs: readonly { key: string; path: string; label: string; short?: string }[] = [
   { key: 'market', path: '/market', label: '算力市场' },
   { key: 'instances', path: '/instances', label: '我的实例' },
+  { key: 'butler', path: '/butler', label: 'AI 管家', short: '管家' },
   { key: 'wallet', path: '/wallet', label: '钱包' },
   { key: 'account', path: '/account', label: '我的' },
-] as const
+]
+/** AI 管家浮动按钮与抽屉只在桌面端、且不在 /butler 全页时出现（D13） */
+const showButler = computed(() => !mobile.value && route.path !== '/butler')
 const active = computed(() => tabs.find((t) => route.path === t.path || route.path.startsWith(t.path + '/'))?.key ?? '')
 const logo = import.meta.env.BASE_URL + brand.logoUrl
 </script>
@@ -36,13 +42,17 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
           <router-link v-else-if="!mobile" to="/login" data-testid="layout-login">登录</router-link>
         </span>
       </header>
-      <main class="content"><slot /></main>
+      <main class="content" :class="{ 'with-launcher': showButler }"><slot /></main>
     </div>
     <nav v-if="mobile" class="tabbar" data-testid="layout-tabbar">
       <router-link v-for="t in tabs" :key="t.key" :to="t.path" :class="{ active: active === t.key }" :data-testid="`tabbar-${t.key}`">
-        {{ t.label }}
+        {{ t.short ?? t.label }}
       </router-link>
     </nav>
+    <template v-if="showButler">
+      <ButlerLauncher />
+      <ButlerDrawer v-if="session.status === 'authed'" />
+    </template>
   </div>
 </template>
 
@@ -57,6 +67,8 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
 .title { font-weight: 600; }
 .right { display: flex; gap: 16px; align-items: center; }
 .content { flex: 1; padding: 16px; }
+/* 浮动按钮占右下角：内容区底部留白，页面最底部的按钮不被挡住 */
+.content.with-launcher { padding-bottom: 80px; }
 .shell.mobile .content { padding: 12px 16px calc(var(--sc-tabbar-height) + 16px + env(safe-area-inset-bottom)); }
 .tabbar {
   position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: #fff; border-top: 1px solid #ebeef5;
