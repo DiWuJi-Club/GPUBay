@@ -12,7 +12,11 @@ const LimitWindow = time.Minute
 const CodeRateLimitExceeded = "rate_limit_exceeded"
 
 // Limits 是一个用户的限额。字段 ≤ 0 视为未配置，取默认值（DefaultRPM / DefaultTPM / DefaultConcurrency）。
-type Limits struct{ RPM, TPM, Concurrency int }
+type Limits struct {
+	RPM         int `json:"rpm"`
+	TPM         int `json:"tpm"`
+	Concurrency int `json:"concurrency"`
+}
 
 func (l Limits) withDefaults() Limits {
 	if l.RPM <= 0 {
