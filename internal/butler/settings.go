@@ -47,7 +47,7 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	s.setMu.Lock()
 	if s.setOK {
 		if age := now.Sub(s.setAt); age >= 0 && age < SettingsCacheTTL {
-			v := s.setVal
+			v := cloneSettings(s.setVal)
 			s.setMu.Unlock()
 			return v, nil
 		}
@@ -62,10 +62,19 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	s.setMu.Lock()
 	// 读库期间若有失效 / 更新，不用这次读到的（可能更旧的）值覆盖缓存
 	if s.setGen == gen {
-		s.setVal, s.setAt, s.setOK = v, now, true
+		s.setVal, s.setAt, s.setOK = cloneSettings(v), now, true
 	}
 	s.setMu.Unlock()
 	return v, nil
+}
+
+// cloneSettings 复制 UpdatedBy 指向的值，调用方修改返回值不会影响缓存。
+func cloneSettings(v Settings) Settings {
+	if v.UpdatedBy != nil {
+		by := *v.UpdatedBy
+		v.UpdatedBy = &by
+	}
+	return v
 }
 
 // InvalidateSettings 清空本副本的设置缓存，下次 Settings 直接读库。
@@ -86,14 +95,20 @@ func validateSettings(in Settings) (Settings, error) {
 		return in, apperr.BadRequest(fmt.Sprintf("每对话消息数上限需在 %d～%d 之间", MinMaxTurns, MaxMaxTurns))
 	case utf8.RuneCountInString(in.Notice) > MaxNoticeRunes:
 		return in, apperr.BadRequest(fmt.Sprintf("关闭说明不能超过 %d 字", MaxNoticeRunes))
-	case !utf8.ValidString(in.Notice) || strings.ContainsRune(in.Notice, 0):
+	case !utf8.ValidString(in.Notice) || strings.ContainsFunc(in.Notice, badNoticeRune):
 		return in, apperr.BadRequest("关闭说明含非法字符")
 	}
 	return in, nil
 }
 
+// badNoticeRune：notice 里除 \n 外不允许控制字符（C0 / DEL / C1）。
+func badNoticeRune(r rune) bool {
+	return (r < 0x20 && r != '\n') || r == 0x7f || (r >= 0x80 && r < 0xa0)
+}
+
 // UpdateSettings 校验并保存后台设置（enabled / daily_token_limit / max_turns / notice），
-// 同一事务写审计 butler.settings（diff {old, new}）；成功后直接刷新本副本缓存。
+// 同一事务写审计 butler.settings（diff {old, new}）；提交后让本副本缓存失效（下次 Settings 读库），
+// 不把本次结果写进缓存——并发的两次更新提交顺序与返回顺序可能不同，写缓存可能留下旧值。
 func (s *Store) UpdateSettings(ctx context.Context, actor audit.Actor, in Settings) (Settings, error) {
 	in, err := validateSettings(in)
 	if err != nil {
@@ -126,9 +141,6 @@ func (s *Store) UpdateSettings(ctx context.Context, actor audit.Actor, in Settin
 	if err != nil {
 		return Settings{}, err
 	}
-	s.setMu.Lock()
-	s.setVal, s.setAt, s.setOK = v, now, true
-	s.setGen++
-	s.setMu.Unlock()
+	s.InvalidateSettings()
 	return v, nil
 }

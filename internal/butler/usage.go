@@ -33,11 +33,11 @@ type UserUsage struct {
 	Failures     int
 }
 
-// UserStats 是后台用户详情里的管家统计。
+// UserStats 是后台用户详情里的管家统计（时间窗见 UserButlerStats）。
 type UserStats struct {
 	Conversations int   // 现存对话数（不限时间；超过保留期的已被清扫）
-	Tokens30d     int64 // since 所在自然日起的 input + output token
-	WriteCalls30d int   // since 起用户确认执行过的写操作数（approved / executed / failed）
+	Tokens30d     int64 // since 所在东八区自然日（含）起的 input + output token
+	WriteCalls30d int   // created_at ≥ since（精确时刻）的写调用中用户已确认的数量（approved / executed / failed）
 }
 
 // DayOf 返回 t 所在东八区自然日的 00:00（UTC 表示），与 tz.DayStart 相同。
@@ -144,7 +144,12 @@ func (s *Store) UsageByUser(ctx context.Context, day time.Time, p paging.Page) (
 	return out, total, nil
 }
 
-// UserButlerStats 返回用户的管家统计：现存对话数；since 所在自然日起的 token；since 起确认执行过的写操作数。
+// UserButlerStats 返回用户的管家统计。两个时间窗口径不同：
+//   - token 来自按日汇总的 butler_usage，从 since 所在东八区自然日的 00:00 算起（含当天整天）；
+//   - 写操作按 butler_tool_calls.created_at ≥ since 的精确时刻计，只计用户确认过的
+//     （approved 执行中 / executed / failed），pending / rejected / expired 不计。
+//
+// 对话数不受 since 限制。
 func (s *Store) UserButlerStats(ctx context.Context, userID int64, since time.Time) (UserStats, error) {
 	var st UserStats
 	err := s.pool.QueryRow(ctx, `SELECT

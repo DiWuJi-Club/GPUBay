@@ -106,7 +106,8 @@ func TestDayBoundaryCST(t *testing.T) {
 	}
 }
 
-func TestOverBudget(t *testing.T) {
+// TestDailyBudget 即计划 Task 4 的 TestOverBudget（Review Focus 4：当日用量 ≥ 限额即超额，失败不计）。
+func TestDailyBudget(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 	uid := dbtest.CreateUser(t, s.pool, "13800000001", true)
