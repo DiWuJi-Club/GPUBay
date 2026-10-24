@@ -69,8 +69,9 @@ async function confirmAction() {
   busy.value = true
   try {
     if (t.kind === 'update') {
-      // 更新：指定确认框里展示的新版本；重试：不带 version_id（= 最新已发布，即当前版本；后端对失败的同版本当作重试）
-      await updateDeploymentWorkflow(props.instance.id, props.deployment.id, t.w.workflow_id, t.w.update_available ? t.w.latest_version_id : null)
+      // 更新：指定确认框里展示的新版本；重试：明确带当前已装版本（后端对失败的同版本当作重试，绝不换版本——不带 version_id
+      // 会取最新已发布版本，已装的是更新的已下线版本时会被换成旧版本）
+      await updateDeploymentWorkflow(props.instance.id, props.deployment.id, t.w.workflow_id, t.w.update_available ? t.w.latest_version_id : t.w.version_id)
       ElMessage.success(t.w.update_available ? `正在更新 ${t.w.name}` : `正在重新安装 ${t.w.name}`)
     } else {
       await removeDeploymentWorkflow(props.instance.id, props.deployment.id, t.w.workflow_id)
