@@ -38,6 +38,8 @@ export const routes: RouteRecordRaw[] = [
   { path: '/apps/:id/versions/:vid', component: () => import('./views/AppVersionView.vue'), meta: { title: '应用版本', roles: ALL_ROLES } },
   // ?state=&app_id=&user_id=&instance_id= 预填筛选，?dep= 打开详情抽屉；写操作（强制卸载）按角色显示
   { path: '/deployments', component: () => import('./views/DeploymentsView.vue'), meta: { title: '应用部署', roles: ALL_ROLES } },
+  // Token 商城（计划 9）：?tab=overview|models|nodes|accounts|usage；Tab 与写操作按角色显示，接口层仍按角色 403
+  { path: '/llm', component: () => import('./views/LlmView.vue'), meta: { title: 'Token 商城', roles: ALL_ROLES } },
   { path: '/catalog', component: () => import('./views/CatalogView.vue'), meta: { title: '价格与镜像', roles: SUPER_ONLY } },
   { path: '/admins', component: () => import('./views/AdminsView.vue'), meta: { title: '管理员', roles: SUPER_ONLY } },
   { path: '/audit', component: () => import('./views/AuditView.vue'), meta: { title: '审计日志', roles: ALL_ROLES } },
