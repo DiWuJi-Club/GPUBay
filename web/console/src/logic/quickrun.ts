@@ -48,12 +48,15 @@ export function defaultValues(inputs: WorkflowInput[]): QuickValues {
 const hasDefault = (i: WorkflowInput) => i.default !== undefined && i.default !== null
 const isEmpty = (v: unknown) => v === undefined || v === null || v === ''
 
+/** 区间（清单校验保证 int / float 两端都有；文案同后端 coerceValue）。 */
 function rangeReason(i: WorkflowInput, n: number): string | null {
-  const low = i.min != null && n < i.min
-  const high = i.max != null && n > i.max
-  if (!low && !high) return null
-  if (i.min != null && i.max != null) return `应在 ${i.min}～${i.max}`
-  return low ? `不能小于 ${i.min}` : `不能大于 ${i.max}`
+  if ((i.min != null && n < i.min) || (i.max != null && n > i.max)) return `应在 ${i.min ?? ''}～${i.max ?? ''}`
+  return null
+}
+
+/** 表单项是否标必填星号：无默认值的数字 / 枚举 / 图片（文本可为空串、bool 总有值、seed 空 = 随机）。 */
+export function inputRequired(i: WorkflowInput): boolean {
+  return !hasDefault(i) && i.type !== 'seed' && i.type !== 'bool' && i.type !== 'text' && i.type !== 'textarea'
 }
 
 function seedReason(v: unknown): string | null {
@@ -70,11 +73,12 @@ function seedReason(v: unknown): string | null {
 }
 
 /**
- * 单项预校验，返回中文原因（null = 通过）。空值：seed 为随机；有默认值时由服务器补默认；否则「必填」。
- * 文案与后端 coerceValue 一致（区间只给出一端时说「不能小于 / 大于」）。
+ * 单项预校验，返回中文原因（null = 通过），文案与后端 coerceValue 一致。空值：seed 为随机；文本的空串是合法值（后端接受 ""）；
+ * 其余有默认值时由服务器补默认，否则「必填」。
  */
 export function validateValue(i: WorkflowInput, v: unknown): string | null {
   if (i.type === 'seed') return seedReason(v)
+  if (v === '' && (i.type === 'text' || i.type === 'textarea')) return null
   if (isEmpty(v)) return hasDefault(i) ? null : '必填'
   switch (i.type) {
     case 'text':
@@ -178,4 +182,9 @@ export function fileKind(f: Partial<Pick<QuickRunFile, 'kind'>> & Pick<QuickRunF
 export function quickRunErrorText(e: unknown): string {
   if (isApiError(e) && e.code === 'workflow_busy') return labelOf(workflowErrorLabel, e.code)
   return messageOf(e)
+}
+
+/** 输出文件地址只接受本站的运行文件代理（同源相对路径）；否则返回空串不渲染（后端拼的地址，防御性检查）。 */
+export function safeFileURL(url: string): string {
+  return url.startsWith('/api/v1/instances/') ? url : ''
 }

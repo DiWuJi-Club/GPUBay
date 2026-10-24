@@ -1,7 +1,7 @@
 import type { Deployment, InstalledWorkflow, WorkflowCatalogItem } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  MAX_WORKFLOWS, addWorkflowReason, canChangeWorkflows, deploymentWorkflows, isWorkflowHost, workflowAddConfirmText, workflowPanelNotice,
+  MAX_WORKFLOWS, addWorkflowReason, canChangeWorkflows, deploymentWorkflows, isWorkflowHost, workflowAddConfirmText, workflowChangeBlockReason, workflowPanelNotice,
   workflowRemoveConfirmText, workflowRowActions, workflowUpdateConfirmText,
 } from '../apps'
 
@@ -36,6 +36,13 @@ describe('部署视图里的 workflows（计划 11）', () => {
     for (const s of ['queued', 'running', 'stopped', 'failed'] as const) expect(canChangeWorkflows(dep({ state: s }))).toBe(true)
     for (const s of ['installing', 'removing', 'removed', 'lost'] as const) expect(canChangeWorkflows(dep({ state: s }))).toBe(false)
   })
+  it('增删改的不可用原因：部署进行中；实例非运行（排队中的部署除外，开通后随部署安装）', () => {
+    expect(workflowChangeBlockReason(dep(), 'running')).toBeNull()
+    expect(workflowChangeBlockReason(dep({ state: 'installing' }), 'running')).toBe('部署进行中，完成后可操作')
+    expect(workflowChangeBlockReason(dep({ state: 'stopped' }), 'stopped')).toBe('实例已停机，续费后可操作')
+    expect(workflowChangeBlockReason(dep({ state: 'failed' }), 'creating')).toBe('实例开通后可操作')
+    expect(workflowChangeBlockReason(dep({ state: 'queued' }), 'reserved')).toBeNull()
+  })
   it('部署中时子区块提示「正在安装工作流…」（有工作流时）', () => {
     expect(workflowPanelNotice(dep({ state: 'installing', workflows: [wf({ state: 'pending' })] }))).toBe('正在安装工作流…（随应用进度）')
     expect(workflowPanelNotice(dep({ state: 'installing', workflows: [] }))).toBeNull()
@@ -45,7 +52,7 @@ describe('部署视图里的 workflows（计划 11）', () => {
 
 describe('workflowRowActions', () => {
   it('运行中且已安装、支持快速出图：打开 + 快速出图 + 移除', () => {
-    expect(workflowRowActions(wf(), dep(), 'running')).toEqual({ open: true, quickRun: true, quickRunDisabled: false, update: null, remove: true })
+    expect(workflowRowActions(wf(), dep(), 'running')).toEqual({ open: true, quickRun: true, quickRunDisabled: false, update: null, remove: true, blocked: null })
   })
   it('快速出图需要 quick_run、行已安装、部署运行中；实例非运行时置灰', () => {
     expect(workflowRowActions(wf({ quick_run: false }), dep(), 'running').quickRun).toBe(false)
@@ -62,6 +69,14 @@ describe('workflowRowActions', () => {
     expect(workflowRowActions(wf({ update_available: true, latest_version_id: 51, latest_version: '1.1.0' }), dep(), 'running').update).toBe('update')
     expect(workflowRowActions(wf({ state: 'failed' }), dep(), 'running').update).toBe('retry')
     expect(workflowRowActions(wf({ state: 'failed', update_available: true }), dep(), 'running').update).toBe('update')
+  })
+  it('没有已发布版本（latest_version_id 为 null）：不提供更新 / 重试（PUT 会 workflow_unavailable）', () => {
+    expect(workflowRowActions(wf({ state: 'failed', latest_version_id: null }), dep(), 'running').update).toBeNull()
+    expect(workflowRowActions(wf({ update_available: true, latest_version_id: null }), dep(), 'running').update).toBeNull()
+  })
+  it('实例停机：菜单项保留但带不可用原因', () => {
+    expect(workflowRowActions(wf({ update_available: true, latest_version_id: 51 }), dep({ state: 'stopped' }), 'stopped'))
+      .toMatchObject({ update: 'update', remove: true, blocked: '实例已停机，续费后可操作' })
   })
   it('部署中：不能更新 / 移除', () => {
     expect(workflowRowActions(wf({ update_available: true }), dep({ state: 'installing' }), 'running')).toMatchObject({ update: null, remove: false })

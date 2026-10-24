@@ -2,9 +2,10 @@
 import { formatGB, labelOf, messageOf, workflowCategoryLabel, type InstalledWorkflow, type WorkflowCatalogItem } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, ref, watch } from 'vue'
-import { addDeploymentWorkflow, panelWorkflowCatalog } from '../api'
+import { fetchWorkflows, installWorkflow } from '../api'
 import { addWorkflowReason, workflowAddConfirmText } from '../logic/apps'
 import { notifyError } from '../logic/notify'
+import { sortWorkflows } from '../logic/workflows'
 import AppDialog from './AppDialog.vue'
 
 /**
@@ -23,7 +24,7 @@ const selected = ref<number | null>(null)
 const submitting = ref(false)
 let seq = 0
 
-const sorted = computed(() => [...items.value].sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name, 'zh-CN')))
+const sorted = computed(() => sortWorkflows(items.value))
 const chosen = computed(() => items.value.find((i) => i.id === selected.value) ?? null)
 const reason = (i: WorkflowCatalogItem) => addWorkflowReason(i, props.installed)
 
@@ -32,9 +33,9 @@ async function load() {
   loading.value = true
   loadError.value = ''
   try {
-    const res = await panelWorkflowCatalog()
+    const res = await fetchWorkflows()
     if (mine !== seq) return
-    items.value = res.items
+    items.value = res
   } catch (e) {
     if (mine === seq) loadError.value = messageOf(e)
   } finally {
@@ -55,7 +56,7 @@ async function confirm() {
   if (!item || submitting.value) return
   submitting.value = true
   try {
-    await addDeploymentWorkflow(props.instanceId, props.deploymentId, item.id)
+    await installWorkflow(props.instanceId, props.deploymentId, item.id)
     ElMessage.success(`正在安装 ${item.name}`)
     visible.value = false
   } catch (e) {
@@ -72,7 +73,7 @@ async function confirm() {
     <el-skeleton v-if="loading" :rows="4" animated />
     <el-alert v-else-if="loadError" type="error" :title="`工作流列表加载失败：${loadError}`" show-icon :closable="false" />
     <p v-else-if="!items.length" class="muted" data-testid="wf-add-empty">工作流市场暂时没有可安装的工作流</p>
-    <div v-else class="list">
+    <div v-else class="list" role="radiogroup" aria-label="选择要安装的工作流">
       <div
         v-for="i in sorted" :key="i.id" class="item" :class="{ disabled: !!reason(i), active: selected === i.id }" role="radio"
         :aria-checked="selected === i.id" :aria-disabled="!!reason(i)" :tabindex="reason(i) ? -1 : 0"
