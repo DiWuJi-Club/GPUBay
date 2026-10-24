@@ -104,3 +104,26 @@
 - 当时连着的是计划 11 的验收 platform（旧协议，库 `spark_p11`）。机器 1 的记录：`agent_version = fe81c48`，`agent_online = true`，`last_seen_at` 持续刷新。`last_metrics` 的机器级字段照常（`data_disk_used = 72518127616`：实例数据盘是挂载点，判定正确，计入了合计）。没有新告警，也没有新的 Agent 指令（最后一条仍是 01:40 的 `create_instance`）。实例 `ins-o3xpibdh` 一直 `running`。
 - 也就是说，新 Agent 向旧 platform 上报的新字段（`Hello.features`、`Heartbeat.instances`）被安全忽略。
 - 验证完成后换回原来的 `9f0e8f0`（`active`），保持其他计划的验收环境不变。
+
+### V3 本分支 platform + 本分支 Agent 整机全流程（04:08～04:12）
+
+- 环境：
+  - platform 在开发 Mac 上，用本分支 `fe81c48` 构建（先 `make web`），使用标准端口 :8080 / :9443 / :2222 和开发库 `spark` 的副本 `spark_p10`（`CREATE DATABASE … TEMPLATE spark`，同一个 CA，迁移从 20 升到 21）。计划 9 和 11 的验收已经停止并释放了机器。
+  - Agent `fe81c48`。连接后机器 1：`agent_online = true`，`agent_version = fe81c48`，`last_metrics.instances = []`（此时没有实例）。
+- 控制台用户 13800000221（mock 验证码）添加 SSH 公钥，下单整机 1 天，镜像为 Spark CUDA SSH，扣款 ¥69。
+  - 约 25 秒后状态为 `running`。
+  - Create 指令 payload 是 `{"ssh_port": 2222, "image_ref": "spark/cuda-ssh:13.0.1", "share_slots": 1}`。
+  - `docker inspect`：`122071040000 122071040000 0 32768 65330487296 [CAP_IPC_LOCK CAP_SYS_NICE CAP_SYS_PTRACE] map[22/tcp:[{192.168.1.221 2222}]]`，与原来的整机参数一致。
+- 经平台 SSH 网关登录：`ssh -p 2222 ins-ka0vxzz5@<网关>`。
+  - `nvidia-smi` 输出 `NVIDIA GB10`。
+  - 容器内 `memory.max 122071040000`、`cpu.max max 100000`、`pids.max 32768`。
+  - `/root/data` 是 `/dev/loop10 196G`（验收环境 `SPARK_AGENT_DATA_SIZE_GIB=200`）。
+- 每实例指标。在容器里写入 512 MiB 文件、跑一个空转循环、读 3 GB 管道后，`machines.last_metrics.instances` 为 `[{cpu_percent: 99.99, data_disk_used: 536903680, instance_id: ins-ka0vxzz5, mem_current: 1124401152, mem_max: 122071040000}]`。同一时刻宿主机读该容器的 `memory.current` 为 `1123889152`，两者一致。机器级 `data_disk_used = 536903680`。
+- 释放：`wipe_instance` 为 done，实例变为 `released`，机器回到 `idle`，`last_metrics.instances = []`。宿主机上没有残留的容器、数据盘镜像或 loop 设备。
+- 期间唯一的告警是 04:08:10 机器 1 的 `machine_offline`：platform 启动时，库副本里机器的 `last_seen_at` 已经过期，Agent 连上之前触发了一次。属于库副本带来的现象，不是缺陷。
+- 复原：
+  - 停止验收 platform，删除库 `spark_p10`。
+  - 换回 Agent `9f0e8f0`（`active`）。
+  - 机器上没有容器、没有 MPS 进程，计算模式为 `Default`。
+
+**验收结论**：V1～V3 全部通过。搁置后保留的范围（多容器 Agent、按实例端口、每实例指标、新旧兼容）在真机上验证完毕，没有发现缺陷。
