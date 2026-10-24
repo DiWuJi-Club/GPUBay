@@ -22,6 +22,7 @@ import (
 
 	diskfake "spark-cloud/internal/agent/disk/fake"
 	"spark-cloud/internal/agent/executor"
+	"spark-cloud/internal/agent/metrics"
 	netfake "spark-cloud/internal/agent/netfilter/fake"
 	"spark-cloud/internal/agent/runtime"
 	rtfake "spark-cloud/internal/agent/runtime/fake"
@@ -51,7 +52,8 @@ func newEnv(t *testing.T) *env {
 	}
 	e := &env{t: t, rt: rtfake.New(), disk: diskfake.New(4000 << 30), net: netfake.New(), st: st, dir: dir}
 	e.ex = executor.New(executor.Deps{Log: quiet, Runtime: e.rt, Disk: e.disk, Net: e.net, State: st, StateDir: dir, Bridge: "spark0",
-		LocalIPs: func() []string { return []string{"127.0.0.1", "192.168.1.221"} }, MemTotal: func() uint64 { return 128 << 30 }}, true)
+		LocalIPs: func() []string { return []string{"127.0.0.1", "192.168.1.221"} }, MemTotal: func() uint64 { return 128 << 30 },
+		NumCPU: func() int { return 20 }, CgroupRoot: filepath.Join(dir, "cgroup")}, true)
 	e.ex.SetConfig(executor.Config{LanIP: "192.168.1.221", DNS: []string{"223.5.5.5"}, AllowCIDRs: []string{"10.0.9.0/24"}, BandwidthMbps: 200, DataSizeGiB: 2048})
 	return e
 }
@@ -123,8 +125,13 @@ func TestCreateHappyPath(t *testing.T) {
 	if !ok || inst.Desired != "running" || inst.BandwidthMbps != 50 {
 		t.Fatalf("state = %+v", inst)
 	}
-	if e.phases()["ins-aaaaaaaa"] != "running" || e.ex.DataMount() != e.disk.MountDir("ins-aaaaaaaa") {
-		t.Fatalf("phases = %v mount = %s", e.phases(), e.ex.DataMount())
+	if e.phases()["ins-aaaaaaaa"] != "running" {
+		t.Fatalf("phases = %v", e.phases())
+	}
+	wantMount := metrics.InstanceMount{ID: "ins-aaaaaaaa", DataDir: e.disk.MountDir("ins-aaaaaaaa"),
+		CgroupDir: filepath.Join(e.dir, "cgroup", "system.slice", "docker-"+c.FullID+".scope")}
+	if m := e.ex.Mounts(); len(m) != 1 || m[0] != wantMount || len(c.FullID) != 64 {
+		t.Fatalf("mounts = %+v want %+v", m, wantMount)
 	}
 }
 
@@ -258,7 +265,7 @@ func TestStopWipeAndVerification(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.dir, "ssh", "ins-aaaaaaaa")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("ssh dir remains")
 	}
-	if _, ok := e.st.Instance("ins-aaaaaaaa"); ok || len(e.phases()) != 0 || e.ex.DataMount() != "" {
+	if _, ok := e.st.Instance("ins-aaaaaaaa"); ok || len(e.phases()) != 0 || len(e.ex.Mounts()) != 0 {
 		t.Fatal("state remains")
 	}
 }
@@ -1217,5 +1224,139 @@ func TestSnapshotSharesReportDeadline(t *testing.T) {
 	}
 	if got := e.ex.Images(ctx); !slices.Equal(got, []string{"a:1"}) {
 		t.Fatalf("images = %v", got)
+	}
+}
+
+func createShared(id string, port, slots int) executor.Command {
+	c := create(id)
+	c.SSHPort, c.ShareSlots = port, slots
+	return c
+}
+
+// 份数等分：内存 (128 − 8) GiB / N、shm 为其一半（N = 1 时 min(MemTotal/2, 内存上限)）、CPU 20 / N、pids 32768 / N、数据盘 2048 / N。
+func TestCreateSpecSplitsByShareSlots(t *testing.T) {
+	cases := []struct {
+		slots         int
+		mem, shm      int64
+		cpus          float64
+		pids, diskGiB int
+		dropNice      bool
+	}{
+		{0, 120 << 30, 64 << 30, 0, 32768, 2048, false},
+		{1, 120 << 30, 64 << 30, 0, 32768, 2048, false},
+		{2, 60 << 30, 30 << 30, 10, 16384, 1024, true},
+		{4, 30 << 30, 15 << 30, 5, 8192, 512, true},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprint(tc.slots), func(t *testing.T) {
+			e := newEnv(t)
+			res := e.run(createShared("ins-aaaaaaaa", 2223, tc.slots))
+			if len(res) != 1 || !res[0].OK {
+				t.Fatalf("result = %+v", res)
+			}
+			sp, ok := e.rt.Spec("ins-aaaaaaaa")
+			if !ok || sp.MemoryBytes != tc.mem || sp.ShmBytes != tc.shm || sp.CPUs != tc.cpus || sp.PidsLimit != tc.pids || sp.DropNice != tc.dropNice || sp.SSHPort != 2223 {
+				t.Fatalf("spec = %+v", sp)
+			}
+			if got := e.disk.SizeGiB("ins-aaaaaaaa"); got != tc.diskGiB {
+				t.Fatalf("data disk = %d GiB, want %d", got, tc.diskGiB)
+			}
+			inst, _ := e.st.Instance("ins-aaaaaaaa")
+			if inst.DataSizeGiB != tc.diskGiB || inst.ShareSlots != tc.slots || inst.SSHPort != 2223 {
+				t.Fatalf("state = %+v", inst)
+			}
+		})
+	}
+}
+
+// 余量检查用等分后的数据盘：剩 700 GiB 时 1/4（512 + 100）可建、整机（2048 + 100）不可建。
+func TestCreateFreeSpaceCheckUsesSplitSize(t *testing.T) {
+	e := newEnv(t)
+	e.disk.SetFree(700 << 30)
+	if res := e.run(createShared("ins-aaaaaaaa", 2223, 4)); !res[0].OK {
+		t.Fatalf("shared create = %+v", res[0])
+	}
+	e2 := newEnv(t)
+	e2.disk.SetFree(700 << 30)
+	if res := e2.run(create("ins-aaaaaaaa")); res[0].OK || !strings.HasPrefix(res[0].Message, "磁盘空间不足") {
+		t.Fatalf("whole create = %+v", res[0])
+	}
+	e3 := newEnv(t)
+	c := createShared("ins-aaaaaaaa", 2223, 4)
+	c.DataSizeGiB = 3
+	if res := e3.run(c); res[0].OK || !strings.Contains(res[0].Message, "不足以分成 4 份") {
+		t.Fatalf("tiny disk = %+v", res[0])
+	}
+}
+
+// 本机已有实例占用同一 SSH 端口：拒绝创建（平台分配槽位出错的兜底）；同一实例重放、不同端口不受影响。
+func TestCreateRejectsSSHPortConflict(t *testing.T) {
+	e := newEnv(t)
+	if res := e.run(createShared("ins-aaaaaaaa", 2223, 4)); !res[0].OK {
+		t.Fatalf("first = %+v", res[0])
+	}
+	res := e.run(createShared("ins-bbbbbbbb", 2223, 4))
+	if res[0].OK || res[0].Message != "SSH 端口冲突：2223 已被实例 ins-aaaaaaaa 使用" {
+		t.Fatalf("conflict = %+v", res[0])
+	}
+	if _, ok := e.rt.Containers()["ins-bbbbbbbb"]; ok {
+		t.Fatal("container created despite port conflict")
+	}
+	if created, _ := e.disk.State("ins-bbbbbbbb"); created {
+		t.Fatal("data disk created despite port conflict")
+	}
+	again := createShared("ins-aaaaaaaa", 2223, 4)
+	again.ID = "cmd-again"
+	if res := e.run(again); !res[0].OK {
+		t.Fatalf("same instance re-create = %+v", res[0])
+	}
+	other := createShared("ins-bbbbbbbb", 2224, 4)
+	other.ID = "cmd-other-port"
+	if res := e.run(other); !res[0].OK {
+		t.Fatalf("other port = %+v", res[0])
+	}
+}
+
+// 多实例：每个实例一条采集位置；cgroup 目录由容器完整 ID 拼出，cgroupfs 驱动时退到 docker/<id>；洗机后移除。
+func TestMountsPerInstance(t *testing.T) {
+	e := newEnv(t)
+	e.run(createShared("ins-aaaaaaaa", 2223, 2), createShared("ins-bbbbbbbb", 2224, 2))
+	a, b := e.rt.Containers()["ins-aaaaaaaa"], e.rt.Containers()["ins-bbbbbbbb"]
+	if a.FullID == "" || a.FullID == b.FullID {
+		t.Fatalf("full ids = %q %q", a.FullID, b.FullID)
+	}
+	root := filepath.Join(e.dir, "cgroup")
+	fsDir := filepath.Join(root, "docker", b.FullID)
+	if err := os.MkdirAll(fsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := []metrics.InstanceMount{
+		{ID: "ins-aaaaaaaa", DataDir: e.disk.MountDir("ins-aaaaaaaa"), CgroupDir: filepath.Join(root, "system.slice", "docker-"+a.FullID+".scope")},
+		{ID: "ins-bbbbbbbb", DataDir: e.disk.MountDir("ins-bbbbbbbb"), CgroupDir: fsDir},
+	}
+	if got := e.ex.Mounts(); !slices.Equal(got, want) {
+		t.Fatalf("mounts = %+v\nwant %+v", got, want)
+	}
+	e.run(executor.Command{ID: "wipe-a", InstanceID: "ins-aaaaaaaa", Type: "wipe_instance"})
+	if got := e.ex.Mounts(); len(got) != 1 || got[0].ID != "ins-bbbbbbbb" {
+		t.Fatalf("after wipe = %+v", got)
+	}
+}
+
+// 重启后的新执行器还没 Inspect 过容器：CgroupDir 为空；Recover 启动后补上。
+func TestMountsCgroupUnknownUntilInspected(t *testing.T) {
+	e := newEnv(t)
+	e.run(create("ins-aaaaaaaa"))
+	ex2 := executor.New(executor.Deps{Log: quiet, Runtime: e.rt, Disk: e.disk, Net: e.net, State: e.st, StateDir: e.dir, Bridge: "spark0",
+		LocalIPs: func() []string { return []string{"192.168.1.221"} }, MemTotal: func() uint64 { return 128 << 30 }, CgroupRoot: filepath.Join(e.dir, "cgroup")}, true)
+	if m := ex2.Mounts(); len(m) != 1 || m[0].CgroupDir != "" || m[0].DataDir != e.disk.MountDir("ins-aaaaaaaa") {
+		t.Fatalf("before inspect = %+v", m)
+	}
+	ex2.SetConfig(executor.Config{LanIP: "192.168.1.221", BandwidthMbps: 200})
+	if err := ex2.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m := ex2.Mounts(); len(m) != 1 || !strings.HasSuffix(m[0].CgroupDir, "docker-"+e.rt.Containers()["ins-aaaaaaaa"].FullID+".scope") {
+		t.Fatalf("after recover = %+v", m)
 	}
 }

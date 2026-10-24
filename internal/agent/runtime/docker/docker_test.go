@@ -40,7 +40,7 @@ func TestCreateCommandSnapshot(t *testing.T) {
 	rt, r := newRT()
 	spec := runtime.Spec{InstanceID: "ins-abcdefgh", ImageRef: "nvcr.io/nvidia/cuda:13.0.1-base", LanIP: "192.168.1.221", SSHPort: 2222,
 		DNS: []string{"223.5.5.5", "119.29.29.29"}, SSHDir: "/var/lib/spark-agent/ssh/ins-abcdefgh", DataDir: "/var/lib/spark-agent/mnt/ins-abcdefgh",
-		MemoryBytes: 128849018880, ShmBytes: 64424509440}
+		MemoryBytes: 128849018880, ShmBytes: 64424509440, PidsLimit: 32768}
 	if err := rt.Create(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +49,27 @@ func TestCreateCommandSnapshot(t *testing.T) {
 		"--cap-add IPC_LOCK --cap-add SYS_NICE --cap-add SYS_PTRACE --ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 " +
 		"--network spark0 --dns 223.5.5.5 --dns 119.29.29.29 --dns-search . --restart no " +
 		"-p 192.168.1.221:2222:22/tcp " +
+		"-v /var/lib/spark-agent/ssh/ins-abcdefgh:/.spark:ro -v /var/lib/spark-agent/mnt/ins-abcdefgh:/root/data " +
+		"--entrypoint /.spark/init.sh nvcr.io/nvidia/cuda:13.0.1-base"
+	if r.Lines() != want {
+		t.Fatalf("create:\n got %s\nwant %s", r.Lines(), want)
+	}
+}
+
+// 共享机 1/4：--cpus 按份、--pids-limit 等分、不加 SYS_NICE、内存与 shm 由调用方算好。
+func TestCreateCommandSnapshotShared(t *testing.T) {
+	rt, r := newRT()
+	spec := runtime.Spec{InstanceID: "ins-abcdefgh", ImageRef: "nvcr.io/nvidia/cuda:13.0.1-base", LanIP: "192.168.1.221", SSHPort: 2224,
+		DNS: []string{"223.5.5.5"}, SSHDir: "/var/lib/spark-agent/ssh/ins-abcdefgh", DataDir: "/var/lib/spark-agent/mnt/ins-abcdefgh",
+		MemoryBytes: 32212254720, ShmBytes: 16106127360, CPUs: 5, PidsLimit: 8192, DropNice: true}
+	if err := rt.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	want := "docker create --name ins-abcdefgh --label spark.instance=ins-abcdefgh --gpus all " +
+		"--shm-size 16106127360 --memory 32212254720 --memory-swap 32212254720 --cpus 5.00 --pids-limit 8192 --oom-score-adj 500 " +
+		"--cap-add IPC_LOCK --cap-add SYS_PTRACE --ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 " +
+		"--network spark0 --dns 223.5.5.5 --dns-search . --restart no " +
+		"-p 192.168.1.221:2224:22/tcp " +
 		"-v /var/lib/spark-agent/ssh/ins-abcdefgh:/.spark:ro -v /var/lib/spark-agent/mnt/ins-abcdefgh:/root/data " +
 		"--entrypoint /.spark/init.sh nvcr.io/nvidia/cuda:13.0.1-base"
 	if r.Lines() != want {
@@ -87,9 +108,10 @@ func TestInspectListAndVeth(t *testing.T) {
 		t.Fatalf("missing = %+v %v", c, err)
 	}
 	r.Stub("docker inspect --type container --format {{json .}} ins-a",
-		`{"State":{"Running":true,"Pid":4242},"Config":{"Image":"nvcr.io/x:1","Labels":{"spark.instance":"ins-a"}},"Mounts":[{"Destination":"/root/data","Source":"/var/lib/spark-agent/mnt/ins-a"},{"Destination":"/.spark","Source":"/x"}]}`, nil)
+		`{"Id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","State":{"Running":true,"Pid":4242},"Config":{"Image":"nvcr.io/x:1","Labels":{"spark.instance":"ins-a"}},"Mounts":[{"Destination":"/root/data","Source":"/var/lib/spark-agent/mnt/ins-a"},{"Destination":"/.spark","Source":"/x"}]}`, nil)
 	c, err = rt.Inspect(ctx, "ins-a")
-	if err != nil || !c.Exists || !c.Running || c.Image != "nvcr.io/x:1" || c.Label != "ins-a" || !c.DataMounted || c.DataSource != "/var/lib/spark-agent/mnt/ins-a" || c.Pid != 4242 {
+	if err != nil || !c.Exists || !c.Running || c.Image != "nvcr.io/x:1" || c.Label != "ins-a" || !c.DataMounted || c.DataSource != "/var/lib/spark-agent/mnt/ins-a" || c.Pid != 4242 ||
+		c.FullID != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
 		t.Fatalf("inspect = %+v %v", c, err)
 	}
 	r.Stub("docker inspect --type container --format {{json .}} ins-b", `{"State":{"Running":false},"Config":{"Image":"img","Labels":{}},"Mounts":[]}`, nil)
@@ -144,12 +166,13 @@ func TestNotFoundLegacyWording(t *testing.T) {
 }
 
 func TestCreateRejectsInvalidSpec(t *testing.T) {
-	good := runtime.Spec{InstanceID: "ins-a", ImageRef: "img", LanIP: "192.168.1.221", SSHPort: 2222, SSHDir: "/s", DataDir: "/d", MemoryBytes: 1, ShmBytes: 1}
+	good := runtime.Spec{InstanceID: "ins-a", ImageRef: "img", LanIP: "192.168.1.221", SSHPort: 2222, SSHDir: "/s", DataDir: "/d", MemoryBytes: 1, ShmBytes: 1, PidsLimit: 1}
 	muts := map[string]func(*runtime.Spec){
 		"lanip": func(s *runtime.Spec) { s.LanIP = "" }, "port": func(s *runtime.Spec) { s.SSHPort = 0 },
 		"image": func(s *runtime.Spec) { s.ImageRef = "" }, "sshdir": func(s *runtime.Spec) { s.SSHDir = "" },
 		"datadir": func(s *runtime.Spec) { s.DataDir = "" }, "mem": func(s *runtime.Spec) { s.MemoryBytes = 0 },
 		"shm": func(s *runtime.Spec) { s.ShmBytes = 0 }, "id": func(s *runtime.Spec) { s.InstanceID = "" },
+		"pids": func(s *runtime.Spec) { s.PidsLimit = 0 }, "cpus": func(s *runtime.Spec) { s.CPUs = -1 },
 	}
 	for name, m := range muts {
 		rt, r := newRT()

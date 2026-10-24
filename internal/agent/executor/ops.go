@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"spark-cloud/internal/agent/metrics"
 	"spark-cloud/internal/agent/runtime"
 	"spark-cloud/internal/agent/state"
 )
@@ -30,16 +31,37 @@ func checkID(id string) error {
 
 func (e *Executor) sshDir(id string) string { return filepath.Join(e.d.StateDir, "ssh", id) }
 
+// slots 是指令的份数：0 / 1（及非法的负数）都按整机。
+func slots(c Command) int { return max(1, c.ShareSlots) }
+
+// spec 按份数 N 等分配额（规格 §6.2）：内存 (MemTotal − 8GiB) / N、shm 为内存上限的一半、CPU nproc / N、
+// pids 32768 / N，共享机去掉 SYS_NICE。N = 1 时与整机完全一致（不传 --cpus，shm = min(MemTotal/2, 内存上限)）。
 func (e *Executor) spec(c Command, cfg Config) (runtime.Spec, error) {
 	mem := e.d.MemTotal()
 	if mem <= HostReserveBytes {
 		return runtime.Spec{}, fmt.Errorf("无法确定机器内存（读到 %d 字节）", mem)
 	}
-	memLimit := mem - HostReserveBytes
+	n := slots(c)
+	memLimit := (mem - HostReserveBytes) / uint64(n)
 	shm := min(mem/2, memLimit) // /dev/shm 计入容器内存，不能超过内存上限
+	var cpus float64
+	if n > 1 {
+		shm = memLimit / 2
+		cpus = float64(e.d.NumCPU()) / float64(n)
+	}
 	return runtime.Spec{InstanceID: c.InstanceID, ImageRef: c.ImageRef, LanIP: cfg.LanIP, SSHPort: c.SSHPort, DNS: cfg.DNS,
 		SSHDir: e.sshDir(c.InstanceID), DataDir: e.d.Disk.MountDir(c.InstanceID),
-		MemoryBytes: int64(memLimit), ShmBytes: int64(shm)}, nil
+		MemoryBytes: int64(memLimit), ShmBytes: int64(shm), CPUs: cpus, PidsLimit: MaxPids / n, DropNice: n > 1}, nil
+}
+
+// portConflict：本机状态文件里别的实例已占用该 SSH 端口（平台分配槽位出错时的兜底）。
+func (e *Executor) portConflict(c Command) error {
+	for _, inst := range e.d.State.Instances() {
+		if inst.ID != c.InstanceID && inst.SSHPort == c.SSHPort {
+			return fmt.Errorf("SSH 端口冲突：%d 已被实例 %s 使用", c.SSHPort, inst.ID)
+		}
+	}
+	return nil
 }
 
 // create 的每一步都先自检：Agent 在任意一步重启后整条重跑也不会出错。
@@ -57,6 +79,16 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 	if c.SSHPort <= 0 {
 		c.SSHPort = 2222
 	}
+	if err := e.portConflict(c); err != nil {
+		return err
+	}
+	// 数据盘按份等分（向下取整到 GiB）；之后的余量检查、建盘与本地记录都用等分后的大小。
+	n := slots(c)
+	size := c.DataSizeGiB / n
+	if size < 1 {
+		return fmt.Errorf("数据盘 %d GiB 不足以分成 %d 份", c.DataSizeGiB, n)
+	}
+	c.DataSizeGiB = size
 	if strings.TrimSpace(c.UpstreamPubKey) == "" {
 		return errors.New("缺少上游 SSH 公钥")
 	}
@@ -109,7 +141,8 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 			return err
 		}
 	}
-	inst := state.Instance{ID: c.InstanceID, Desired: "stopped", ImageRef: c.ImageRef, LanIP: cfg.LanIP, SSHPort: c.SSHPort, BandwidthMbps: c.BandwidthMbps, DataSizeGiB: c.DataSizeGiB}
+	inst := state.Instance{ID: c.InstanceID, Desired: "stopped", ImageRef: c.ImageRef, LanIP: cfg.LanIP, SSHPort: c.SSHPort, BandwidthMbps: c.BandwidthMbps,
+		DataSizeGiB: c.DataSizeGiB, ShareSlots: c.ShareSlots}
 	if err := e.d.State.PutInstance(inst); err != nil {
 		return err
 	}
@@ -130,6 +163,7 @@ func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error 
 	if err != nil {
 		return err
 	}
+	e.noteContainer(inst.ID, c)
 	if !c.Exists {
 		return fmt.Errorf("容器 %s 不存在", inst.ID)
 	}
@@ -229,6 +263,7 @@ func (e *Executor) wipe(ctx context.Context, id string) error {
 	if err := e.d.Runtime.Remove(ctx, id); err != nil {
 		return err
 	}
+	e.noteContainer(id, runtime.Container{})
 	if err := e.d.Disk.Destroy(ctx, id); err != nil {
 		return err
 	}
@@ -340,13 +375,52 @@ func (e *Executor) report(ctx context.Context) []InstanceState {
 	return out
 }
 
-// DataMount 返回当前实例的数据盘挂载目录（指标采集用）；没有实例时为空。
-func (e *Executor) DataMount() string {
+// noteContainer 记下 Inspect 得到的容器完整 ID（容器不存在时清除），供 Mounts 拼 cgroup 路径。
+func (e *Executor) noteContainer(id string, c runtime.Container) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if c.Exists && c.FullID != "" {
+		e.fullIDs[id] = c.FullID
+	} else {
+		delete(e.fullIDs, id)
+	}
+}
+
+// Mounts 返回本地记录里每个实例的指标采集位置（心跳用，不调用 docker）：数据盘挂载目录与容器 cgroup 目录。
+// 容器完整 ID 来自最近一次 Inspect（启动、恢复、60 秒一轮的限速巡检都会刷新）；还不知道时 CgroupDir 为空。
+func (e *Executor) Mounts() []metrics.InstanceMount {
 	insts := e.d.State.Instances()
-	if len(insts) == 0 {
+	e.mu.Lock()
+	ids := make(map[string]string, len(e.fullIDs))
+	for k, v := range e.fullIDs {
+		ids[k] = v
+	}
+	e.mu.Unlock()
+	out := make([]metrics.InstanceMount, 0, len(insts))
+	for _, inst := range insts {
+		out = append(out, metrics.InstanceMount{ID: inst.ID, DataDir: e.d.Disk.MountDir(inst.ID), CgroupDir: e.cgroupDir(ids[inst.ID])})
+	}
+	return out
+}
+
+// cgroupDir 由容器完整 ID 拼 cgroup v2 目录：优先 systemd 驱动的 system.slice/docker-<id>.scope（DGX Spark 的 Docker 29 默认），
+// 不存在而 cgroupfs 驱动的 docker/<id> 存在时用后者；都不存在（容器未运行）时仍给 systemd 路径，采集读不到即为 0。
+func (e *Executor) cgroupDir(fullID string) string {
+	if fullID == "" || strings.ContainsAny(fullID, "/.") {
 		return ""
 	}
-	return e.d.Disk.MountDir(insts[0].ID)
+	sd := filepath.Join(e.d.CgroupRoot, "system.slice", "docker-"+fullID+".scope")
+	if _, err := os.Stat(sd); err != nil {
+		if fs := filepath.Join(e.d.CgroupRoot, "docker", fullID); dirExists(fs) {
+			return fs
+		}
+	}
+	return sd
+}
+
+func dirExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
 }
 
 // Recover 宿主机重启后：网桥与规则 → 挂载本地记录里全部实例的数据盘（期望 stopped 的也挂，否则会被误报 missing_data）

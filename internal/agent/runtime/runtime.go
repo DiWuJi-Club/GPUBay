@@ -9,14 +9,19 @@ type Spec struct {
 	LanIP       string // 容器 22 端口发布到 LanIP:SSHPort
 	SSHPort     int
 	DNS         []string
-	SSHDir      string // 只读挂到 /.spark
-	DataDir     string // 挂到 /root/data
-	MemoryBytes int64  // --memory / --memory-swap
-	ShmBytes    int64  // --shm-size
+	SSHDir      string  // 只读挂到 /.spark
+	DataDir     string  // 挂到 /root/data
+	MemoryBytes int64   // --memory / --memory-swap
+	ShmBytes    int64   // --shm-size
+	CPUs        float64 // --cpus；0 = 不传（整机不限）
+	PidsLimit   int     // --pids-limit，必须为正
+	DropNice    bool    // 不加 SYS_NICE（共享机：租户不能抬高自己的调度优先级压制邻居）
 }
 
 type Container struct {
-	Exists      bool
+	Exists bool
+	// FullID：容器完整 ID（64 位十六进制，docker inspect 的 .Id），用来拼 cgroup 路径；List 不填。
+	FullID      string
 	Running     bool
 	Image       string
 	Label       string // spark.instance 标签值

@@ -31,7 +31,10 @@ type Instance struct {
 	LanIP         string `json:"lan_ip"`
 	SSHPort       int    `json:"ssh_port"`
 	BandwidthMbps int    `json:"bandwidth_mbps"`
-	DataSizeGiB   int    `json:"data_size_gib"`
+	DataSizeGiB   int    `json:"data_size_gib"` // 实际数据盘大小（共享机为等分后的值）
+	// ShareSlots：建容器时的份数（0 / 1 = 整机）。计划 10 新增，旧状态文件没有该字段（读出为 0）；
+	// Recover 不需要它（配额已固化在容器参数里）。
+	ShareSlots int `json:"share_slots,omitempty"`
 }
 
 type file struct {

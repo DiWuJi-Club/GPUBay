@@ -67,11 +67,17 @@ func (r *Runtime) Create(ctx context.Context, s runtime.Spec) error {
 		return err
 	}
 	args := []string{"create", "--name", s.InstanceID, "--label", runtime.Label + "=" + s.InstanceID, "--gpus", "all",
-		"--shm-size", strconv.FormatInt(s.ShmBytes, 10), "--memory", strconv.FormatInt(s.MemoryBytes, 10), "--memory-swap", strconv.FormatInt(s.MemoryBytes, 10),
-		"--pids-limit", "32768", "--oom-score-adj", "500",
-		"--cap-add", "IPC_LOCK", "--cap-add", "SYS_NICE", "--cap-add", "SYS_PTRACE",
+		"--shm-size", strconv.FormatInt(s.ShmBytes, 10), "--memory", strconv.FormatInt(s.MemoryBytes, 10), "--memory-swap", strconv.FormatInt(s.MemoryBytes, 10)}
+	if s.CPUs > 0 { // 共享机按份限 CPU；整机不传，命令行与计划 2 一致
+		args = append(args, "--cpus", strconv.FormatFloat(s.CPUs, 'f', 2, 64))
+	}
+	args = append(args, "--pids-limit", strconv.Itoa(s.PidsLimit), "--oom-score-adj", "500", "--cap-add", "IPC_LOCK")
+	if !s.DropNice {
+		args = append(args, "--cap-add", "SYS_NICE")
+	}
+	args = append(args, "--cap-add", "SYS_PTRACE",
 		"--ulimit", "memlock=-1:-1", "--ulimit", "stack=67108864:67108864",
-		"--network", r.Bridge}
+		"--network", r.Bridge)
 	for _, d := range s.DNS {
 		args = append(args, "--dns", d)
 	}
@@ -105,6 +111,7 @@ func (r *Runtime) Remove(ctx context.Context, id string) error {
 }
 
 type inspectDoc struct {
+	ID    string `json:"Id"`
 	State struct {
 		Running bool `json:"Running"`
 		Pid     int  `json:"Pid"`
@@ -139,7 +146,7 @@ func (r *Runtime) Inspect(ctx context.Context, id string) (runtime.Container, er
 	if err := json.Unmarshal(out, &d); err != nil {
 		return runtime.Container{}, fmt.Errorf("parse docker inspect: %w", err)
 	}
-	c := runtime.Container{Exists: true, Running: d.State.Running, Image: d.Config.Image, Label: d.Config.Labels[runtime.Label], Pid: d.State.Pid}
+	c := runtime.Container{Exists: true, FullID: d.ID, Running: d.State.Running, Image: d.Config.Image, Label: d.Config.Labels[runtime.Label], Pid: d.State.Pid}
 	for _, m := range d.Mounts {
 		if m.Destination == "/root/data" {
 			c.DataMounted = true
@@ -238,7 +245,7 @@ func (r *Runtime) VethOf(ctx context.Context, id string) (string, error) {
 // peerIndexRe 取 `16: eth0@if17: <...>` 里的对端索引 17。
 var peerIndexRe = regexp.MustCompile(`^\d+: eth0@if(\d+):`)
 
-// validateSpec 拒绝会让 docker 静默放宽限制的空值（空 LanIP 会绑定 0.0.0.0，--memory 0 表示不限）。
+// validateSpec 拒绝会让 docker 静默放宽限制的空值（空 LanIP 会绑定 0.0.0.0，--memory 0、--pids-limit 0 表示不限）。
 func validateSpec(s runtime.Spec) error {
 	switch {
 	case s.InstanceID == "":
@@ -253,6 +260,10 @@ func validateSpec(s runtime.Spec) error {
 		return errors.New("runtime: empty SSHDir or DataDir")
 	case s.MemoryBytes <= 0 || s.ShmBytes <= 0:
 		return errors.New("runtime: MemoryBytes and ShmBytes must be positive")
+	case s.PidsLimit <= 0: // --pids-limit 0 / -1 表示不限
+		return errors.New("runtime: PidsLimit must be positive")
+	case s.CPUs < 0:
+		return errors.New("runtime: negative CPUs")
 	}
 	return nil
 }

@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -48,7 +49,9 @@ type Options struct {
 	Metrics           metrics.Metrics
 	HeartbeatInterval time.Duration // 自动模式心跳间隔，零值 100ms（测试里推进假时钟后很快就能同步）
 	Images            []string      // StateReport.images（本机已缓存镜像）；nil 时不上报，同旧 Agent
-	Log               *slog.Logger
+	// Features 是 Hello.features；nil → features.SharedSlots。new(uint32)（即 0）模拟不支持共享机的旧 Agent。
+	Features *uint32
+	Log      *slog.Logger
 }
 
 type Agent struct {
@@ -63,6 +66,48 @@ type Agent struct {
 	cancel  context.CancelFunc
 	done    chan struct{}  // Client.Run 已返回
 	wg      sync.WaitGroup // Client.Run 与（自动模式下）Executor.Run
+
+	mu       sync.Mutex
+	instMets map[string]metrics.InstanceMetrics // SetInstanceMetrics 注入的每实例指标
+}
+
+// SetInstanceMetrics 设置之后心跳里该实例的用量（InstanceID 以 id 为准）。心跳的 instances 为本地记录里的全部实例
+// （未注入的各项为 0）加上注入了但本地没有记录的实例，按 ID 排序。
+func (a *Agent) SetInstanceMetrics(id string, m metrics.InstanceMetrics) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	m.InstanceID = id
+	a.instMets[id] = m
+}
+
+// ClearInstanceMetrics 撤销 SetInstanceMetrics 的注入。
+func (a *Agent) ClearInstanceMetrics(id string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.instMets, id)
+}
+
+// instanceMetrics 组装心跳的每实例指标（见 SetInstanceMetrics）。
+func (a *Agent) instanceMetrics() []metrics.InstanceMetrics {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	seen := map[string]bool{}
+	var out []metrics.InstanceMetrics
+	for _, mt := range a.Exec.Mounts() {
+		seen[mt.ID] = true
+		m, ok := a.instMets[mt.ID]
+		if !ok {
+			m = metrics.InstanceMetrics{InstanceID: mt.ID}
+		}
+		out = append(out, m)
+	}
+	for id, m := range a.instMets {
+		if !seen[id] {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].InstanceID < out[j].InstanceID })
+	return out
 }
 
 func (a *Agent) Creds() *Creds { return a.creds }
@@ -135,16 +180,18 @@ func start(ctx context.Context, o Options, dir string) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &Agent{Runtime: rtfake.New(), Disk: diskfake.New(o.FreeBytes), Net: netfake.New(), Dir: dir, creds: creds, done: make(chan struct{})}
+	a := &Agent{Runtime: rtfake.New(), Disk: diskfake.New(o.FreeBytes), Net: netfake.New(), Dir: dir, creds: creds, done: make(chan struct{}),
+		instMets: map[string]metrics.InstanceMetrics{}}
 	a.Runtime.SetImages(o.Images)
 	ips := o.IPs
 	a.Exec = executor.New(executor.Deps{Runtime: a.Runtime, Disk: a.Disk, Net: a.Net, State: st, StateDir: dir, Bridge: "spark0",
-		LocalIPs: func() []string { return ips }, MemTotal: func() uint64 { return 128 << 30 }, Log: o.Log}, o.Stepped)
+		LocalIPs: func() []string { return ips }, MemTotal: func() uint64 { return 128 << 30 }, NumCPU: func() int { return 20 }, // DGX Spark：128 GiB、20 核
+		CgroupRoot: filepath.Join(dir, "cgroup"), Log: o.Log}, o.Stepped)
 	m := o.Metrics
 	a.Client = client.New(client.Config{Addr: o.Addr, TLS: tc, Version: o.Version, Hostname: "fake", LocalIPs: func() []string { return ips },
-		Stepped: o.Stepped, NoReconnect: o.NoReconnect, HeartbeatInterval: o.HeartbeatInterval,
+		Stepped: o.Stepped, NoReconnect: o.NoReconnect, HeartbeatInterval: o.HeartbeatInterval, Features: o.Features,
 		Backoff: client.Backoff{Min: 50 * time.Millisecond, Max: time.Second}},
-		a.Exec, func(context.Context) metrics.Metrics { return m }, o.Log)
+		a.Exec, func(context.Context) (metrics.Metrics, []metrics.InstanceMetrics) { return m, a.instanceMetrics() }, o.Log)
 	runCtx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
 	var runErr error

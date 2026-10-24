@@ -28,6 +28,7 @@ func TestSelfcheckReportsEachItem(t *testing.T) {
 	r := &cmdrun.Recorder{}
 	r.Stub("docker version", "29.6.2\n", nil)
 	r.Stub("docker info", `{"nvidia":{"path":"nvidia-container-runtime"}}`, nil)
+	stubShared(r)
 	r.Stub("iptables -w -S DOCKER-USER", "-N DOCKER-USER\n-A DOCKER-USER -j RETURN\n", nil)
 	r.Stub("tc -V", "tc utility\n", nil)
 	r.Stub("losetup -V", "losetup from util-linux\n", nil)
@@ -37,7 +38,8 @@ func TestSelfcheckReportsEachItem(t *testing.T) {
 	if err := selfcheck(context.Background(), r, "/var/lib/spark-agent", &out); err != nil {
 		t.Fatalf("selfcheck: %v\n%s", err, out.String())
 	}
-	for _, want := range []string{"ok: docker 29.6.2", "ok: nvidia runtime", "ok: iptables DOCKER-USER", "ok: tc", "ok: losetup", "ok: ufw", "ok: disk free"} {
+	for _, want := range []string{"ok: docker 29.6.2", "ok: nvidia runtime", "ok: iptables DOCKER-USER", "ok: tc", "ok: losetup", "ok: ufw", "ok: disk free",
+		"ok: nproc 20", "ok: cgroup v2 cpu memory pids"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("missing %q in:\n%s", want, out.String())
 		}
@@ -66,6 +68,7 @@ func TestSelfcheckGPUViaRuntimeOrCDI(t *testing.T) {
 		r := &cmdrun.Recorder{}
 		r.Stub("df", "Avail\n2000000000000\n", nil)
 		r.Stub("ufw status", "", errors.New("not installed"))
+		stubShared(r)
 		return r
 	}
 	cases := []struct {
@@ -106,6 +109,52 @@ func TestSelfcheckGPUViaRuntimeOrCDI(t *testing.T) {
 			}
 			if !strings.Contains(out.String(), "ok: command nvidia-smi") {
 				t.Fatalf("nvidia-smi item missing:\n%s", out.String())
+			}
+		})
+	}
+}
+
+// stubShared 给共享机相关的自检项（nproc、cgroup v2）打上 DGX Spark 的正常输出。
+func stubShared(r *cmdrun.Recorder) {
+	r.Stub("nproc", "20\n", nil)
+	r.Stub("docker info --format {{.CgroupVersion}}", "2\n", nil)
+	r.Stub("cat /sys/fs/cgroup/cgroup.controllers", "cpuset cpu io memory hugetlb pids rdma misc\n", nil)
+}
+
+func TestSelfcheckSharedMachineItems(t *testing.T) {
+	cases := []struct {
+		name string
+		stub func(r *cmdrun.Recorder)
+		want string
+	}{
+		{"ok", func(*cmdrun.Recorder) {}, ""},
+		{"few cpus", func(r *cmdrun.Recorder) { r.Stub("nproc", "2\n", nil) }, "FAIL: nproc: 只有 2 个 CPU，少于 4"},
+		{"cgroup v1", func(r *cmdrun.Recorder) { r.Stub("docker info --format {{.CgroupVersion}}", "1\n", nil) }, "FAIL: cgroup v2: docker 的 Cgroup Version 为 \"1\"，需要 2"},
+		{"no pids controller", func(r *cmdrun.Recorder) {
+			r.Stub("cat /sys/fs/cgroup/cgroup.controllers", "cpuset cpu io memory\n", nil)
+		}, "FAIL: cgroup v2: cgroup 缺少控制器 pids"},
+		{"no controllers file", func(r *cmdrun.Recorder) {
+			r.Stub("cat /sys/fs/cgroup/cgroup.controllers", "", &cmdrun.CmdError{Cmd: "cat", ExitCode: 1, Stderr: "No such file"})
+		}, "FAIL: cgroup v2: 读取 /sys/fs/cgroup/cgroup.controllers 失败"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &cmdrun.Recorder{}
+			r.Stub("docker info", `{"nvidia":{"path":"nvidia-container-runtime"}}`, nil)
+			r.Stub("ufw status", "", errors.New("not installed"))
+			r.Stub("df", "Avail\n2000000000000\n", nil)
+			stubShared(r)
+			c.stub(r)
+			var out bytes.Buffer
+			err := selfcheck(context.Background(), r, "/var/lib/spark-agent", &out)
+			if c.want == "" {
+				if err != nil || !strings.Contains(out.String(), "ok: nproc 20") || !strings.Contains(out.String(), "ok: cgroup v2") {
+					t.Fatalf("err=%v:\n%s", err, out.String())
+				}
+				return
+			}
+			if err == nil || !strings.Contains(out.String(), c.want) {
+				t.Fatalf("err=%v, want %q in:\n%s", err, c.want, out.String())
 			}
 		})
 	}
