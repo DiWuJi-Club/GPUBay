@@ -4,7 +4,8 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { fetchWorkflow } from '../api'
 import WorkflowInstallFlow from '../components/WorkflowInstallFlow.vue'
-import { coverOrPlaceholder, markdownBlocks, modelSource, shortCommit } from '../logic/workflows'
+import WorkflowCover from '../components/WorkflowCover.vue'
+import { markdownBlocks, modelSource, safeGitUrl, shortCommit } from '../logic/workflows'
 import { session } from '../store/session'
 
 const route = useRoute()
@@ -26,7 +27,7 @@ async function load() {
     const d = await fetchWorkflow(slug.value)
     if (mine !== seq) return
     wf.value = d
-    document.title = `${d.name} - ${brand.name}`
+    setTitle()
     resumeInstall()
   } catch (e) {
     if (mine !== seq) return
@@ -39,14 +40,18 @@ async function load() {
 }
 watch(slug, () => void load(), { immediate: true })
 
-/** 登录回来（?install=<slug>）：自动打开安装弹窗，并去掉查询参数。 */
+/** 标题用工作流名称（路由 afterEach 设的是通用的「工作流详情」，每次导航后都要再设）。 */
+function setTitle() {
+  if (wf.value) document.title = `${wf.value.name} - ${brand.name}`
+}
+
+/** 登录回来（?install=<slug>）：自动打开安装弹窗，并去掉查询参数（replace 后路由会重设标题：再设一次）。 */
 function resumeInstall() {
   if (typeof route.query.install !== 'string') return
-  void router.replace({ path: route.path })
+  void router.replace({ path: route.path }).then(setTitle)
   if (wf.value && session.status === 'authed') void flow.value?.open(wf.value)
 }
 
-const cover = computed(() => (wf.value ? coverOrPlaceholder(wf.value) : null))
 const manifest = computed(() => wf.value?.version.manifest ?? null)
 const description = computed(() => markdownBlocks(wf.value?.description ?? ''))
 
@@ -76,10 +81,7 @@ function inputHint(i: WorkflowInput): string {
     <template v-else-if="wf && manifest">
       <el-card>
         <div class="head">
-          <div class="cover">
-            <img v-if="cover?.kind === 'image'" :src="cover.url" alt="" />
-            <span v-else-if="cover" class="placeholder" :class="`cat-${cover.category}`">{{ cover.label }}</span>
-          </div>
+          <div class="cover"><WorkflowCover :item="wf" /></div>
           <div class="info">
             <h2 class="name" data-testid="wf-detail-name">{{ wf.name }}</h2>
             <p class="summary">{{ wf.summary }}</p>
@@ -124,7 +126,7 @@ function inputHint(i: WorkflowInput): string {
       <el-card header="自定义节点">
         <el-table :data="manifest.nodes" empty-text="只用 ComfyUI 内置节点" data-testid="wf-detail-nodes">
           <el-table-column prop="name" label="名称" min-width="180" />
-          <el-table-column label="Git" min-width="260"><template #default="{ row }"><a :href="row.git" target="_blank" rel="noopener noreferrer">{{ row.git }}</a></template></el-table-column>
+          <el-table-column label="Git" min-width="260"><template #default="{ row }"><a v-if="safeGitUrl(row.git)" :href="safeGitUrl(row.git)!" target="_blank" rel="noopener noreferrer">{{ row.git }}</a><span v-else>{{ row.git }}</span></template></el-table-column>
           <el-table-column label="commit" width="110"><template #default="{ row }"><code :title="row.commit">{{ shortCommit(row.commit) }}</code></template></el-table-column>
         </el-table>
       </el-card>
@@ -152,14 +154,7 @@ function inputHint(i: WorkflowInput): string {
 .wf-detail { display: flex; flex-direction: column; gap: 16px; }
 .back { color: #606266; text-decoration: none; font-size: 13px; }
 .head { display: flex; gap: 20px; flex-wrap: wrap; }
-.cover { width: 320px; max-width: 100%; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: #f5f7fa; flex: none; }
-.cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 22px; font-weight: 600; background: #909399; }
-.cat-txt2img { background: linear-gradient(135deg, #409eff, #79bbff); }
-.cat-img2img { background: linear-gradient(135deg, #e6a23c, #f3d19e); }
-.cat-video { background: linear-gradient(135deg, #f56c6c, #fab6b6); }
-.cat-upscale { background: linear-gradient(135deg, #67c23a, #b3e19d); }
-.cat-other { background: linear-gradient(135deg, #909399, #c8c9cc); }
+.cover { width: 320px; max-width: 100%; border-radius: 6px; overflow: hidden; flex: none; }
 .info { flex: 1; min-width: 240px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 .name { margin: 0; font-size: 20px; }
 .summary { margin: 0; color: #606266; }

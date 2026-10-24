@@ -1,21 +1,18 @@
 <script setup lang="ts">
 import { formatGB, type WorkflowCatalogItem } from '@spark/shared'
 import { computed } from 'vue'
-import { coverOrPlaceholder } from '../logic/workflows'
+import WorkflowCover from './WorkflowCover.vue'
 
 /** 工作流市场的卡片：封面（无则分类占位）、名称、简介、标签、下载量、节点数、快速出图标记、「一键安装」。 */
 const props = defineProps<{ item: WorkflowCatalogItem }>()
 const emit = defineEmits<{ install: [item: WorkflowCatalogItem] }>()
-const cover = computed(() => coverOrPlaceholder(props.item))
-const to = computed(() => `/workflows/${props.item.slug}`)
+const to = computed(() => `/workflows/${encodeURIComponent(props.item.slug)}`)
 </script>
 
 <template>
   <el-card class="wf-card" :body-style="{ padding: '0' }" :data-testid="`wf-card-${item.slug}`">
-    <router-link :to="to" class="cover" :aria-label="item.name">
-      <img v-if="cover.kind === 'image'" :src="cover.url" alt="" loading="lazy" />
-      <span v-else class="placeholder" :class="`cat-${cover.category}`" data-testid="wf-cover-placeholder">{{ cover.label }}</span>
-    </router-link>
+    <!-- 封面链接与名称链接同目标：封面不进 Tab 顺序、读屏跳过 -->
+    <router-link :to="to" class="cover" tabindex="-1" aria-hidden="true"><WorkflowCover :item="item" /></router-link>
     <div class="body">
       <router-link :to="to" class="name" data-testid="wf-card-name">{{ item.name }}</router-link>
       <p class="summary">{{ item.summary }}</p>
@@ -34,14 +31,7 @@ const to = computed(() => `/workflows/${props.item.slug}`)
 
 <style scoped>
 .wf-card { display: flex; flex-direction: column; }
-.cover { display: block; aspect-ratio: 16 / 9; background: #f5f7fa; overflow: hidden; }
-.cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 20px; font-weight: 600; background: #909399; }
-.cat-txt2img { background: linear-gradient(135deg, #409eff, #79bbff); }
-.cat-img2img { background: linear-gradient(135deg, #e6a23c, #f3d19e); }
-.cat-video { background: linear-gradient(135deg, #f56c6c, #fab6b6); }
-.cat-upscale { background: linear-gradient(135deg, #67c23a, #b3e19d); }
-.cat-other { background: linear-gradient(135deg, #909399, #c8c9cc); }
+.cover { display: block; }
 .body { padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 8px; }
 .name { font-weight: 600; color: #303133; text-decoration: none; }
 .name:hover { color: var(--el-color-primary); }

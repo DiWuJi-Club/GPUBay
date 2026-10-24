@@ -1,7 +1,8 @@
 import type { AppCatalogItem, Deployment, Instance, Product, WorkflowCatalogItem, WorkflowModel } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
+import { workflowAddConfirmText } from '../apps'
 import {
-  canInstallTo, coverOrPlaceholder, filterWorkflows, installCandidates, installConfirmText, installTargets, isWorkflowApp,
+  canInstallTo, mapLimit, safeGitUrl, targetHint, coverOrPlaceholder, filterWorkflows, installCandidates, installConfirmText, installTargets, isWorkflowApp,
   markdownBlocks, MAX_WORKFLOWS, modelSource, presetEnvFor, rentChoice, shortCommit, sortWorkflows, toggleWorkflow, totalDownloadGB,
   type InstallTarget,
 } from '../workflows'
@@ -84,8 +85,11 @@ describe('installCandidates / installTargets / canInstallTo', () => {
       inst({ id: 'a' }), inst({ id: 'b', state: 'released' }), inst({ id: 'c', apps_summary: [] }), inst({ id: 'd', state: 'stopped' }),
       inst({ id: 'e', apps_summary: undefined }), inst({ id: 'f', state: 'reserved' }),
     ]
-    expect(installCandidates(list).map((i) => i.id)).toEqual(['a', 'd', 'e', 'f'])
-    expect(installCandidates(Array.from({ length: 30 }, (_, i) => inst({ id: `x${i}` })))).toHaveLength(20)
+    expect(installCandidates(list)).toEqual({ instances: list.filter((i) => ['a', 'd', 'e', 'f'].includes(i.id)), truncated: false })
+    const many = installCandidates(Array.from({ length: 30 }, (_, i) => inst({ id: `x${i}` })))
+    expect(many.instances).toHaveLength(20)
+    expect(many.truncated).toBe(true)
+    expect(installCandidates(Array.from({ length: 20 }, (_, i) => inst({ id: `y${i}` }))).truncated).toBe(false)
   })
   it('目标：只挑 comfyui 部署，带已装数与是否已装', () => {
     const t = installTargets([
@@ -107,12 +111,18 @@ describe('installCandidates / installTargets / canInstallTo', () => {
     expect(canInstallTo(target({ installedCount: 7 })).ok).toBe(true)
     expect(canInstallTo(target({ installed: true }))).toEqual({ ok: false, reason: '已安装' })
   })
+  it('targetHint：排队 / 失败的部署给出说明', () => {
+    expect(targetHint('queued')).toBe('排队中：随 ComfyUI 部署一起安装')
+    expect(targetHint('failed')).toBe('ComfyUI 部署失败：安装时会重新部署')
+    expect(targetHint('running')).toBe('')
+  })
 })
 
 describe('installConfirmText / coverOrPlaceholder / 小工具', () => {
   it('确认文案含「重启 ComfyUI」与下载量', () => {
     const t = installConfirmText(wf({ gb: 17.24 }))
-    expect(t).toContain('重启 ComfyUI')
+    expect(t).toBe(workflowAddConfirmText(wf({ gb: 17.24 }))) // 与实例详情「添加工作流」同一文案
+    expect(t).toContain('重启实例上的 ComfyUI')
     expect(t).toContain('需下载约 17.2 GB')
     expect(installConfirmText(wf({ gb: 0 }))).not.toContain('下载')
   })
@@ -161,5 +171,29 @@ describe('markdownBlocks（描述的 Markdown 子集）', () => {
   it('空文本：没有块；未闭合的标记按原文', () => {
     expect(markdownBlocks('')).toEqual([])
     expect(markdownBlocks('a **b')).toEqual([{ type: 'p', inlines: [{ kind: 'text', text: 'a **b' }] }])
+  })
+})
+
+describe('mapLimit / safeGitUrl', () => {
+  it('并发上限内执行，结果按输入顺序、失败不影响其它', async () => {
+    let running = 0
+    let peak = 0
+    const out = await mapLimit([1, 2, 3, 4, 5, 6, 7], 3, async (n) => {
+      running++
+      peak = Math.max(peak, running)
+      await new Promise((r) => setTimeout(r, 5))
+      running--
+      if (n === 4) throw new Error('boom')
+      return n * 10
+    })
+    expect(peak).toBe(3)
+    expect(out.map((r) => (r.status === 'fulfilled' ? r.value : 'x'))).toEqual([10, 20, 30, 'x', 50, 60, 70])
+    expect(await mapLimit([], 3, async () => 1)).toEqual([])
+  })
+  it('只把 https 地址当链接', () => {
+    expect(safeGitUrl('https://github.com/a/b.git')).toBe('https://github.com/a/b.git')
+    expect(safeGitUrl('javascript:alert(1)')).toBeNull()
+    expect(safeGitUrl('http://github.com/a/b')).toBeNull()
+    expect(safeGitUrl('HTTPS://x')).toBeNull()
   })
 })

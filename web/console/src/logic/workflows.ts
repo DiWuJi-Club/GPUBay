@@ -1,19 +1,18 @@
 import {
-  formatGB, labelOf, workflowCategoryLabel,
+  labelOf, workflowCategoryLabel,
   type AppCatalogItem, type Deployment, type DeploymentState, type Duration, type Instance, type Product, type WorkflowCatalogItem, type WorkflowCategory, type WorkflowModel,
 } from '@spark/shared'
 
-import { MAX_WORKFLOWS } from './apps'
+import { addWorkflowReason, canChangeWorkflows, deploymentWorkflows, isWorkflowHost, MAX_WORKFLOWS, WORKFLOW_APP_SLUG, workflowAddConfirmText } from './apps'
 
-/** 每个 ComfyUI 部署最多装的工作流数（定义在 logic/apps.ts）；开通时预装同样上限。 */
-export { MAX_WORKFLOWS }
+/** 每个 ComfyUI 部署最多装的工作流数与应用 slug（定义在 logic/apps.ts）；开通时预装同样上限。 */
+export { MAX_WORKFLOWS, WORKFLOW_APP_SLUG }
 /** 安装弹窗最多查询的实例数（每台一个 GET /instances/{id}/apps）。 */
 export const INSTALL_SCAN_LIMIT = 20
 /** 市场页分类标签顺序（规格 §4）。 */
 export const WORKFLOW_CATEGORIES: WorkflowCategory[] = ['txt2img', 'img2img', 'video', 'upscale', 'other']
 export type CategoryFilter = WorkflowCategory | 'all'
-/** 「新开一台实例」时预选的应用与变量（D15：工作流自带模型，不再下预置模型）。 */
-export const WORKFLOW_APP_SLUG = 'comfyui'
+/** 「新开一台实例」时预选的变量（D15：工作流自带模型，不再下预置模型）。 */
 export const WORKFLOW_RENT_ENV: Record<string, string> = { MODEL_ID: 'none' }
 
 /** 前端过滤：分类 + 名称 / 标签搜索（忽略大小写与首尾空白）。 */
@@ -28,7 +27,7 @@ export function filterWorkflows<T extends Pick<WorkflowCatalogItem, 'name' | 'ta
 
 /** sort 升序，再按名称；返回新数组。 */
 export function sortWorkflows<T extends Pick<WorkflowCatalogItem, 'sort' | 'name'>>(items: T[]): T[] {
-  return [...items].sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name, 'zh'))
+  return [...items].sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name, 'zh-CN'))
 }
 
 /** 选中工作流的合计下载量（GB，两位小数）。 */
@@ -47,9 +46,33 @@ export function toggleWorkflow(selected: number[], id: number, max = MAX_WORKFLO
 // ---- 一键安装 ----
 
 const CANDIDATE_STATES = new Set(['reserved', 'creating', 'running', 'stopped']) // 同实例详情「应用」卡片的可见状态
-/** 可能有 ComfyUI 部署的实例：可管理应用的状态，且 apps_summary 非空（旧数据没有该字段时也查）；最多 INSTALL_SCAN_LIMIT 台。 */
-export function installCandidates(instances: Instance[]): Instance[] {
-  return instances.filter((i) => CANDIDATE_STATES.has(i.state) && (i.apps_summary == null || i.apps_summary.length > 0)).slice(0, INSTALL_SCAN_LIMIT)
+/**
+ * 可能有 ComfyUI 部署的实例：可管理应用的状态，且 apps_summary 非空（旧数据没有该字段时也查）；最多 INSTALL_SCAN_LIMIT 台
+ * （GET /instances 按创建时间倒序，即最近的），truncated = 有更多没查。
+ */
+export function installCandidates(instances: Instance[]): { instances: Instance[]; truncated: boolean } {
+  const all = instances.filter((i) => CANDIDATE_STATES.has(i.state) && (i.apps_summary == null || i.apps_summary.length > 0))
+  return { instances: all.slice(0, INSTALL_SCAN_LIMIT), truncated: all.length > INSTALL_SCAN_LIMIT }
+}
+/** 安装弹窗查询各实例部署列表的并发上限。 */
+export const INSTALL_SCAN_CONCURRENCY = 6
+
+/** 按并发上限依次执行，结果与输入同序（同 Promise.allSettled）。 */
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+  const out: PromiseSettledResult<R>[] = new Array(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++
+      try {
+        out[i] = { status: 'fulfilled', value: await fn(items[i]) }
+      } catch (reason) {
+        out[i] = { status: 'rejected', reason }
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return out
 }
 
 export interface InstallTarget {
@@ -63,33 +86,39 @@ export interface InstallTarget {
 }
 
 const LIVE_DEPLOYMENT = new Set<DeploymentState>(['queued', 'installing', 'running', 'stopped', 'failed'])
-/** 从每台实例的部署列表里挑 comfyui（按 app_slug）且未在移除的部署。 */
+/** 从每台实例的部署列表里挑 comfyui（isWorkflowHost）且未在移除的部署；已装数含待安装 / 安装失败的（都占上限）。 */
 export function installTargets(entries: { instance: Instance; deployments: Deployment[] }[], workflowId: number): InstallTarget[] {
   return entries.flatMap(({ instance, deployments }) =>
-    deployments.filter((d) => d.app_slug === WORKFLOW_APP_SLUG && LIVE_DEPLOYMENT.has(d.state)).map((d) => ({
-      instanceId: instance.id,
-      instanceName: `${instance.product_name} · ${instance.id}`,
-      deploymentId: d.id,
-      state: d.state,
-      installedCount: d.workflows?.length ?? 0,
-      installed: d.workflows?.some((w) => w.workflow_id === workflowId) ?? false,
-    })),
+    deployments.filter((d) => isWorkflowHost(d) && LIVE_DEPLOYMENT.has(d.state)).map((d) => {
+      const ws = deploymentWorkflows(d)
+      return {
+        instanceId: instance.id,
+        instanceName: `${instance.product_name} · ${instance.id}`,
+        deploymentId: d.id,
+        state: d.state,
+        installedCount: ws.length,
+        installed: addWorkflowReason({ id: workflowId }, ws) != null,
+      }
+    }),
   )
 }
 
-const INSTALLABLE = new Set<DeploymentState>(['queued', 'running', 'stopped', 'failed'])
 /** 能否装到该部署（与后端 app_invalid_state / workflow_limit / workflow_exists 同口径，后端为准）。 */
 export function canInstallTo(t: InstallTarget): { ok: boolean; reason: string } {
   if (t.installed) return { ok: false, reason: '已安装' }
-  if (!INSTALLABLE.has(t.state)) return { ok: false, reason: t.state === 'installing' ? 'ComfyUI 正在部署，请稍后再装' : '当前状态不能安装' }
+  if (!canChangeWorkflows(t)) return { ok: false, reason: t.state === 'installing' ? 'ComfyUI 正在部署，请稍后再装' : '当前状态不能安装' }
   if (t.installedCount >= MAX_WORKFLOWS) return { ok: false, reason: `已装满 ${MAX_WORKFLOWS} 个工作流` }
   return { ok: true, reason: '' }
 }
 
-/** 安装确认文案（规格 §4）。 */
-export function installConfirmText(w: Pick<WorkflowCatalogItem, 'version'>): string {
-  const gb = Number(w.version.download_gb) || 0
-  return `安装会重启 ComfyUI，实例上正在生成的任务会中断${gb > 0 ? `；需下载约 ${formatGB(gb)} 模型` : ''}。`
+/** 安装确认文案（规格 §4）：与实例详情「添加工作流」同一函数（logic/apps.ts，基于 RESTART_NOTE）。 */
+export const installConfirmText = workflowAddConfirmText
+
+/** 目标部署状态的补充说明：排队中只改集合随部署安装；失败的部署安装时会重新部署。 */
+export function targetHint(state: DeploymentState): string {
+  if (state === 'queued') return '排队中：随 ComfyUI 部署一起安装'
+  if (state === 'failed') return 'ComfyUI 部署失败：安装时会重新部署'
+  return ''
 }
 
 export type Cover = { kind: 'image'; url: string } | { kind: 'placeholder'; category: WorkflowCategory; label: string }
@@ -100,6 +129,8 @@ export function coverOrPlaceholder(w: Pick<WorkflowCatalogItem, 'cover_url' | 'c
 }
 
 export const shortCommit = (c: string) => c.slice(0, 8)
+/** 节点 Git 地址只在是 https:// 时渲染成链接（后端白名单已校验，这里再兜一层，不渲染 javascript: 等）。 */
+export const safeGitUrl = (u: string): string | null => (u.startsWith('https://') ? u : null)
 
 /** 模型来源：ModelScope 优先（容器内先试 ModelScope 再试 hf-mirror）。 */
 export function modelSource(m: WorkflowModel): string {
