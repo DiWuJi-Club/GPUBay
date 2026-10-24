@@ -7,6 +7,7 @@ import { bookViaApi, privateGroup, startAfter } from '../helpers/booking'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
+import { cleanupLLM, createPoolMachineAndNode, seedLLMModel } from '../helpers/llm'
 import { yuan } from '../helpers/money'
 import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
 import { cstTime, duration } from '../helpers/time'
@@ -36,6 +37,8 @@ const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestI
 
 // A-INS-14 部署了应用：afterEach 卸载（其余用例没有部署，清理是空操作）
 test.afterEach(cleanupApps)
+// A-INS-15 造了 Token 商城模型与平台节点：afterEach 下线模型、释放节点、机器移出池
+test.afterEach(cleanupLLM)
 const rowOf = (page: Page, id: string) => rows(page).filter({ has: page.getByTestId('ainst-id').getByText(id, { exact: true }) })
 
 test('A-INS-01 实例列表：状态 / 用户 / 机器筛选作为查询参数、地址栏预填、重置、超过一页翻页、首次加载失败可重试', async ({ page }) => {
@@ -995,4 +998,27 @@ test('A-INS-14 实例详情「应用」卡片：部署状态、进度 / 错误�
   await page.goto(`/admin/instances/${id}`)
   await expect(app(vllm.id).getByTestId('admin-instance-app-force-remove')).toBeVisible()
   await expect(app(webui.id).getByTestId('admin-instance-app-force-remove')).toBeVisible()
+})
+
+test('A-INS-15 平台节点（系统实例）：列表「平台节点」标签与「不计时」，详情没有退款 / 延长 / 换机 / 改派', async ({ page }) => {
+  const m = await seedLLMModel()
+  const { machineId, instanceId } = await createPoolMachineAndNode(m)
+  await loginAdmin(page, await createAdmin('super')) // 超级管理员：普通实例上这些按钮都有（A-INS-09）
+  await page.goto(`/admin/instances?machine_id=${machineId}`)
+  const row = page.getByRole('row').filter({ has: page.getByTestId('ainst-id').getByText(instanceId, { exact: true }) })
+  await expect(row.getByTestId('ainst-system')).toHaveText('平台节点')
+  await expect(row).toContainText('不计时')
+  await row.getByTestId('ainst-id').getByText(instanceId, { exact: true }).click()
+  await expectAdminUrl(page, `/instances/${instanceId}`)
+  await expect(page.getByTestId('adetail-system')).toHaveText('平台节点')
+  await expect(page.getByTestId('adetail-remaining')).toHaveText('不计时')
+  await expect(page.getByTestId('adetail-expires')).toHaveText('不计时')
+  await expect(page.getByTestId('admin-instance-apps-system-hint')).toBeVisible()
+  for (const b of ['extend', 'migrate', 'refund', 'reassign', 'cancel-booking']) await expect(page.getByTestId(`adetail-${b}-btn`)).toHaveCount(0)
+  // 接口层同样拒绝
+  const admin = await createAdmin('super')
+  const ctx = await adminApi(admin)
+  const r = await ctx.post(`/admin/api/v1/instances/${instanceId}/extend`, { data: { seconds: 3600, reason: 'e2e' } })
+  expect(r.status()).toBe(409)
+  expect(((await r.json()) as { code: string }).code).toBe('invalid_state')
 })

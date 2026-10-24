@@ -3,6 +3,7 @@ import { adminApi, adminPost, createAdmin } from '../helpers/admin'
 import { loginConsole, nav, placeOrder, seedUser, settle, toast, toastLocator, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { yuan } from '../helpers/money'
+import { callChat, cleanupLLM, createKey, createPoolMachineAndNode, seedLLMModel, waitGatewayModel } from '../helpers/llm'
 import { inviteeOf, inviterWithCode, restoreRate } from '../helpers/referral'
 import { cstTime } from '../helpers/time'
 
@@ -256,5 +257,27 @@ test('C-WAL-05 流水显示邀请返利 / 返利扣回标签与颜色', async ({
     await expect(page.getByTestId('wallet-balance')).toHaveText(yuan(90))
   } finally {
     await restoreRate()
+  }
+})
+
+test('C-WAL-06 流水显示「Token 消费」标签（扣款类橙色）与结算扣款金额', async ({ page }, info) => {
+  try {
+    // ¥1.00 一次（达到结算阈值），清扫一轮即结算为一条 llm_pay 流水
+    const m = await seedLLMModel({ input_price: 500_000, output_price: 1_000_000 })
+    await createPoolMachineAndNode(m)
+    const u = await seedUser({ balance: 100_000 })
+    const k = await createKey(await userApi(u.phone))
+    await waitGatewayModel(k.key, m.slug)
+    expect((await callChat(k.key, m.slug)).status).toBe(200)
+    await hooks.sweep()
+    await loginConsole(page, u.phone)
+    await nav(page, info, 'wallet')
+    await expect(page.getByTestId('ledger-kind').first()).toHaveText('Token 消费')
+    await expect(page.locator('.el-tag').filter({ has: page.getByTestId('ledger-kind') }).first()).toHaveClass(/el-tag--warning/)
+    await expect(page.getByTestId('ledger-amount').first()).toHaveText(`-${yuan(100)}`)
+    await expect(page.getByTestId('ledger-after').first()).toHaveText(yuan(99_900))
+    await expect(page.getByTestId('wallet-balance')).toHaveText(yuan(99_900))
+  } finally {
+    await cleanupLLM()
   }
 })

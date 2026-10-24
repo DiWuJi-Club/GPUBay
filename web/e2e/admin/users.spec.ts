@@ -5,6 +5,7 @@ import {
 import { seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
+import { callChat, cleanupLLM, createKey, createPoolMachineAndNode, seedLLMModel, waitGatewayModel } from '../helpers/llm'
 import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
 import { cstTime } from '../helpers/time'
 
@@ -714,4 +715,47 @@ test('A-USR-07 用户详情显示 SSH 公钥（名称按文本显示）', async 
   await expect(page.getByTestId('udetail-key-fp').first()).toHaveText(/^SHA256:/)
   await expect(page.locator('[data-testid="udetail-key-row"] img')).toHaveCount(0)
   expect(await xssFired(page)).toBe(false)
+})
+
+test('A-USR-08 用户详情「Token 商城」区块（Key 数、本月 / 未结算 / 欠费、状态）链到账户 Tab；用户列表默认不含系统账号', async ({ page }) => {
+  try {
+    const m = await seedLLMModel({ input_price: 500_000, output_price: 1_000_000 }) // ¥1.00 一次
+    await createPoolMachineAndNode(m)
+    const u = await seedUser()
+    const k = await createKey(await userApi(u.phone))
+    await waitGatewayModel(k.key, m.slug)
+    expect((await callChat(k.key, m.slug)).status).toBe(200)
+    const ops = await createAdmin('ops')
+    const ctx = await adminApi(ops)
+
+    // 系统账号（system:llm，迁移写入，最早注册 → 列表最后一位）：默认不列出，include_system=true 才列出
+    type List = { items: User[]; total: number }
+    const plain = await getJSON<List>(ctx, '/admin/api/v1/users?page_size=100')
+    const all = await getJSON<List>(ctx, '/admin/api/v1/users?include_system=true&page_size=100')
+    expect(all.total).toBe(plain.total + 1)
+    const last = await getJSON<List>(ctx, `/admin/api/v1/users?include_system=true&page_size=100&page=${Math.ceil(all.total / 100)}`)
+    expect(last.items.at(-1)?.phone).toBe('system:llm')
+    const plainLast = await getJSON<List>(ctx, `/admin/api/v1/users?page_size=100&page=${Math.max(1, Math.ceil(plain.total / 100))}`)
+    expect(plainLast.items.some((x) => x.phone === 'system:llm')).toBe(false)
+
+    await loginAdmin(page, ops)
+    await page.goto('/admin/users')
+    await expect(page.getByTestId('users-total')).toHaveText(`共 ${plain.total} 人`)
+    await page.getByTestId('users-include-system').click()
+    await expect(page.getByTestId('users-total')).toHaveText(`共 ${plain.total + 1} 人`)
+
+    await page.goto(`/admin/users/${u.id}`)
+    await expect(page.getByTestId('udetail-llm')).toBeVisible()
+    await expect(page.getByTestId('udetail-llm-keys')).toHaveText('1')
+    await expect(page.getByTestId('udetail-llm-month')).toHaveText('¥1.00')
+    await expect(page.getByTestId('udetail-llm-unsettled')).toHaveText('¥1.00')
+    await expect(page.getByTestId('udetail-llm-debt')).toHaveText('¥0.00')
+    await expect(page.getByTestId('udetail-llm-blocked')).toHaveText('正常')
+    await page.getByTestId('udetail-llm-link').click()
+    await expectAdminUrl(page, '/llm', { tab: 'accounts', user_id: String(u.id) })
+    await expect(page.getByTestId('llm-acc-user-tag')).toHaveText(`用户 ID ${u.id}`)
+    await expect(page.locator(`[data-testid="llm-acc-row"][data-user="${u.id}"]`)).toHaveText(u.phone)
+  } finally {
+    await cleanupLLM()
+  }
 })
