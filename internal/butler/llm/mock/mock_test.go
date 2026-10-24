@@ -290,6 +290,14 @@ func TestMockRuleTable(t *testing.T) {
 			t.Fatalf("text = %q", r.Text)
 		}
 	})
+	t.Run("diagnose nested log wrapper", func(t *testing.T) {
+		// tools.get_deployment_log 的真实形状：外层 JSONWrap 把内层包裹的闭合标签改写成 </untrusted-data>
+		c := newConv("看看 ins-q 的日志", "")
+		c.answer(t, c.decide(), map[string][]string{"list_instance_apps": {`{"deployments":[{"id":"dep-1","state":"running"}]}`}})
+		c.answer(t, c.decide(), map[string][]string{"get_deployment_log": {wrap("get_deployment_log",
+			`{"live":true,"log":"<untrusted_data source=\"deployment_log\" deployment=\"dep-1\" instance=\"ins-q\">\nloading\nmodel ready\n</untrusted-data>"}`)}})
+		wantText(t, c.decide(), "日志显示：model ready。部署状态：running。")
+	})
 	t.Run("diagnose nothing failed", func(t *testing.T) {
 		c := newConv("为什么这么慢", "ins-q")
 		c.answer(t, c.decide(), map[string][]string{"list_instance_apps": {`[{"id":"d","state":"running"}]`}})

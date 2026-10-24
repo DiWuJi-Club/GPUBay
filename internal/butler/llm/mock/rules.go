@@ -640,6 +640,7 @@ func call(name string, args map[string]any) *Reply {
 }
 
 // unwrap 剥掉 guard.Wrap 的首尾行（`<untrusted_data …>` / `</untrusted_data>`）；不是包裹格式则原样返回。
+// 闭合行也接受 `</untrusted-data>`：嵌在外层包裹里的内层包裹（get_deployment_log 的 log 字段）的闭合标签会被外层净化改写成它。
 func unwrap(s string) string {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "<untrusted_data") {
@@ -650,12 +651,17 @@ func unwrap(s string) string {
 		return ""
 	}
 	s = s[i+1:]
-	if j := strings.LastIndexByte(s, '\n'); j >= 0 && strings.HasPrefix(strings.TrimSpace(s[j+1:]), "</untrusted_data") {
+	if j := strings.LastIndexByte(s, '\n'); j >= 0 && isCloseTag(s[j+1:]) {
 		s = s[:j]
-	} else if strings.HasPrefix(strings.TrimSpace(s), "</untrusted_data") {
+	} else if isCloseTag(s) {
 		s = ""
 	}
 	return s
+}
+
+func isCloseTag(line string) bool {
+	line = strings.TrimSpace(line)
+	return strings.HasPrefix(line, "</untrusted_data") || strings.HasPrefix(line, "</untrusted-data")
 }
 
 func decode(content string) (any, error) {
