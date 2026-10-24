@@ -82,6 +82,61 @@ type Server struct {
 	models   modelCache
 	balances balanceCache
 	recorded recordedCache
+
+	// 停机（见 Shutdown）：closing 之后新请求一律 503；active 计在途请求（含记账），stop 取消仍在转发的请求。
+	shutMu  sync.Mutex
+	closing bool
+	active  sync.WaitGroup
+	stopCtx context.Context
+	stop    context.CancelCauseFunc
+}
+
+// errShutdown 是停机取消在途转发时的 cause（区分总超时与客户端断开：记 upstream_error、不收费）。
+var errShutdown = errors.New("llmgw: platform shutting down")
+
+// shutdownWait：取消在途转发之后等它们写完错误、记完账的上限（记账本身最多 recordTimeout）。
+const shutdownWait = recordTimeout + 5*time.Second
+
+// shutDown 报告 ctx 是否因停机被取消。
+func shutDown(ctx context.Context) bool { return errors.Is(context.Cause(ctx), errShutdown) }
+
+// begin 登记一个在途请求；Shutdown 之后返回 false。closing 置位后不再 Add，Wait 与 Add 不会并发（WaitGroup 的要求）。
+func (g *Server) begin() bool {
+	g.shutMu.Lock()
+	defer g.shutMu.Unlock()
+	if g.closing {
+		return false
+	}
+	g.active.Add(1)
+	return true
+}
+
+// Shutdown 优雅停止网关，与公网 http.Server.Shutdown 并发调用（http.Server.Shutdown 只等不取消，长时间的流式生成会把它拖到超时）：
+// 之后的新请求返回 503；在途请求最多再给 grace（或到 ctx 结束）自然完成，期满仍在转发的被取消——流式写一个 error 事件、
+// 非流式回 503，用量记 upstream_error、不收费（平台的原因）；再最多等 shutdownWait 让它们记完账后返回。
+// 调用方在它返回之后再关上游连接池与数据库连接池。
+func (g *Server) Shutdown(ctx context.Context, grace time.Duration) {
+	g.shutMu.Lock()
+	g.closing = true
+	g.shutMu.Unlock()
+	done := make(chan struct{})
+	go func() { g.active.Wait(); close(done) }()
+	t := time.NewTimer(grace)
+	defer t.Stop()
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+	case <-t.C:
+	}
+	g.stop(errShutdown)
+	w := time.NewTimer(shutdownWait)
+	defer w.Stop()
+	select {
+	case <-done:
+	case <-w.C:
+		g.log.Warn("llmgw: in-flight requests did not finish after shutdown cancel")
+	}
 }
 
 func New(svc *llm.Service, cfg Config, clk clock.Clock, log *slog.Logger) *Server {
@@ -92,7 +147,9 @@ func New(svc *llm.Service, cfg Config, clk clock.Clock, log *slog.Logger) *Serve
 		clk = clock.Real{}
 	}
 	cfg = cfg.withDefaults()
-	return &Server{svc: svc, cfg: cfg, log: log, clk: clk, authLim: &ipLimiter{limit: cfg.AuthFailLimit}, lastGC: time.Now()}
+	g := &Server{svc: svc, cfg: cfg, log: log, clk: clk, authLim: &ipLimiter{limit: cfg.AuthFailLimit}, lastGC: time.Now()}
+	g.stopCtx, g.stop = context.WithCancelCause(context.Background())
+	return g
 }
 
 // Router 返回网关的 chi 路由（路径相对 /v1）：GET /models、POST /chat/completions、/completions、/embeddings；
@@ -183,6 +240,12 @@ func (g *Server) entry(next http.Handler) http.Handler {
 			return
 		}
 		h.Set("Access-Control-Allow-Headers", defaultAllowHeaders)
+		if !g.begin() {
+			setRetryAfter(w, 2*time.Second)
+			writeErr(w, http.StatusServiceUnavailable, codeServerOverloaded, "服务正在重启，请稍后重试")
+			return
+		}
+		defer g.active.Done()
 		deadline := time.Now().Add(g.cfg.TotalTimeout)
 		g.setDeadlines(w, deadline)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), deadlineKey{}, deadline)))

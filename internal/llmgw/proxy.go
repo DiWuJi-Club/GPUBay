@@ -190,6 +190,10 @@ func (c *call) run() {
 	// 与入口的写期限同一截止时刻（写期限另加 WriteGrace）：总超时先到，还来得及写错误并记 upstream_timeout
 	ctx, cancel := context.WithDeadline(c.r.Context(), g.requestDeadline(c.r))
 	defer cancel()
+	// 停机宽限期满时取消转发（cause = errShutdown，见 Server.Shutdown）
+	ctx, cancelShutdown := context.WithCancelCause(ctx)
+	defer cancelShutdown(nil)
+	defer context.AfterFunc(g.stopCtx, func() { cancelShutdown(errShutdown) })()
 	router := g.svc.Router()
 	exclude := map[string]bool{}
 	var failed *llm.RouteNode
@@ -370,11 +374,14 @@ func (c *call) respond(ctx context.Context, node llm.RouteNode, up upstreamResp,
 	c.nonStream(ctx, &n, up)
 }
 
-// transportError 没拿到上游响应：客户端断开 → client_abort；超时 → 504 upstream_timeout；其它 → 502 upstream_error。
+// transportError 没拿到上游响应：客户端断开 → client_abort；停机取消 → 503（upstream_error，不收费）；超时 → 504 upstream_timeout；其它 → 502 upstream_error。
 func (c *call) transportError(ctx context.Context, node *llm.RouteNode, up upstreamResp, err error) {
 	switch {
 	case c.r.Context().Err() != nil:
 		c.record(c.abortOutcome(node, statusClientClosed, 0, nil))
+	case shutDown(ctx):
+		setRetryAfter(c.w, 2*time.Second)
+		c.fail(outcome{node: node, status: llm.UsageUpstreamError}, http.StatusServiceUnavailable, codeServerOverloaded, "服务正在重启，本次请求不收费，请重试")
 	case up.ttftHit != nil && up.ttftHit.Load(), isTimeout(err), ctx.Err() != nil:
 		c.fail(outcome{node: node, status: llm.UsageUpstreamTimeout}, http.StatusGatewayTimeout, codeUpstreamTimeout, "上游节点响应超时，请稍后再试")
 	default:

@@ -25,6 +25,7 @@ type RecordedRequest struct {
 }
 
 // FakeVLLM 是一个假 vLLM 节点（http.Handler）：
+//   - GET /health：200（不鉴权；appdeploy Runner 的 HTTP 健康检查打它）；
 //   - GET /v1/models：返回 Served 名单；
 //   - POST /v1/chat/completions、/v1/completions：非流式返回一个完整响应（content = Chunks 拼接）与 usage；
 //     流式先发角色块，再按 Chunks 逐块发 data:，然后是 finish 块，请求带 stream_options.include_usage=true 时发 usage 块，最后 [DONE]；
@@ -115,6 +116,10 @@ func (f *FakeVLLM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	idx := f.record(r, body)
 	sw := &sentWriter{f: f, idx: idx, w: w}
+	if r.Method == http.MethodGet && r.URL.Path == "/health" { // 与 vLLM 相同：健康检查不鉴权、空响应体
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if f.RequireKey != "" && r.Header.Get("Authorization") != "Bearer "+f.RequireKey {
 		sw.writeJSON(http.StatusUnauthorized, map[string]any{"error": "Unauthorized"})
 		return

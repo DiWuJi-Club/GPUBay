@@ -3,9 +3,13 @@ package llm_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/llm"
 	"spark-cloud/internal/platform/dbtest"
@@ -132,4 +136,41 @@ func TestCheckInvariants(t *testing.T) {
 	if err := llm.CheckInvariants(ctx, pool); err != nil {
 		t.Fatalf("after cancelling lease: %v", err)
 	}
+}
+
+// TestInvariantsAgainstDevDB 对真实（开发 / 验收）库核对七条不变量：只在设置了 SPARK_DATABASE_URL 时运行（计划 9 Task 16 真机检查点）。
+// 连接级 default_transaction_read_only=on，CheckInvariants 本身也在只读 REPEATABLE READ 事务里：不会写库。
+//
+//	SPARK_DATABASE_URL=postgres://… go test ./internal/llm/ -run TestInvariantsAgainstDevDB -count=1 -v
+func TestInvariantsAgainstDevDB(t *testing.T) {
+	dsn := os.Getenv("SPARK_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SPARK_DATABASE_URL 未设置")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var ro string
+	if err := pool.QueryRow(ctx, `SHOW default_transaction_read_only`).Scan(&ro); err != nil || ro != "on" {
+		t.Fatalf("connection not read-only: %q, %v", ro, err)
+	}
+	if err := llm.CheckInvariants(ctx, pool); err != nil {
+		t.Fatalf("invariants: %v", err)
+	}
+	var nodes, usage, settlements int64
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM llm_nodes), (SELECT count(*) FROM llm_usage), (SELECT count(*) FROM llm_settlements)`).
+		Scan(&nodes, &usage, &settlements); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("invariants hold: %d nodes, %d usage rows, %d settlements", nodes, usage, settlements)
 }

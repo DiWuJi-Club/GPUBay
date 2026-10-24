@@ -56,9 +56,10 @@ type Server struct {
 	HealthAddr string
 
 	sweepMu       sync.Mutex // 进程内串行化 /hooks/sweep（再加清扫咨询锁防跨进程交叠）；见 sweep
+	llmMu         sync.Mutex // 进程内串行化 /hooks/llm/tick（Playwright 超时重发时不让两轮 Controller 交叠）
 	mu            sync.Mutex
 	agents        map[int64]*fakeagent.Agent
-	upstreamStops map[int]func() // ingress-upstream 起的回显服务，按端口
+	upstreamStops map[int]func() // ingress-upstream 起的回显服务 / llm/upstream 起的 FakeVLLM，按端口
 }
 
 // Close 停掉全部 fake Agent。
@@ -93,6 +94,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/ingress-upstream", s.handle(s.ingressUpstream))
 	mux.HandleFunc("POST /hooks/apps/seed", s.handle(s.appsSeed))
 	mux.HandleFunc("POST /hooks/apps/tick", s.handle(s.appsTick))
+	mux.HandleFunc("POST /hooks/llm/upstream", s.handle(s.llmUpstream))
+	mux.HandleFunc("POST /hooks/llm/node", s.handle(s.llmNode))
+	mux.HandleFunc("POST /hooks/llm/tick", s.handle(s.llmTick))
 	return loopbackOnly(mux)
 }
 
@@ -269,7 +273,8 @@ func (s *Server) heartbeatAll(ctx context.Context) error {
 	return nil
 }
 
-// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep + Referral.Settle。
+// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep + Referral.Settle + LLM.Settle
+// （与 cmd/platform 的 RunSweeper 附加任务顺序一致）。
 // Rental.Sweep 先做离线检测与暂停、再做到期停机，而到期停机只处理未暂停的实例：推进 24 小时后不心跳直接清扫，
 // 机器会被判失联、实例被暂停而永远不会停机。
 //
@@ -307,6 +312,9 @@ func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 	}
 	if err := s.App.Referral.Settle(ctx); err != nil {
 		return nil, fmt.Errorf("referral settle: %w", err)
+	}
+	if err := s.App.LLM.Settle(ctx); err != nil {
+		return nil, fmt.Errorf("llm settle: %w", err)
 	}
 	return map[string]bool{"ok": true}, nil
 }

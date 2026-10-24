@@ -121,6 +121,7 @@ func run() error {
 		AgentDNSServers: []string{"223.5.5.5", "119.29.29.29"}, UpstreamSSHKeyFile: keyFile,
 		IngressDomain: "spark.test", PublicBaseURL: "http://spark.test:18080", SSHAddr: sshAddr, SSHPublicPort: 22, UpstreamSSHPort: upstream.Port(),
 		SSHDrainTimeout: time.Second, // 停机时不为残留会话等 30 秒（Playwright 的 gracefulShutdown 只给 20 秒）
+		LLMGateway:      true,        // 挂 /v1；Token 节点 Controller 不启动（LLMController 不适用于此进程），由 /hooks/llm/tick 驱动
 	}
 	clk := clock.NewFake(time.Now())
 	kycSwitch := &e2ehooks.SwitchableKYC{}
