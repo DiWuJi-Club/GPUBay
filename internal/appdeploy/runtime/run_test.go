@@ -369,8 +369,8 @@ func TestRunShImageEnvLoadedBeforeEnv(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "pwned")
 	b := newBox(t, "app_env.sh", nil)
 	imgPath := "/opt/img/bin:" + os.Getenv("PATH")
-	kvs := []appdeploy.EnvKV{{"CUDA_HOME", "/usr/local/cuda"}, {"PATH", imgPath}, {"MODEL_ID", "from-image"}, {"SPARK_PORT", "1"},
-		{"HF_ENDPOINT", "https://image.example"}, {"TRITON_X", "$(touch " + marker + ")'`x`"}}
+	kvs := []appdeploy.EnvKV{{Name: "CUDA_HOME", Value: "/usr/local/cuda"}, {Name: "PATH", Value: imgPath}, {Name: "MODEL_ID", Value: "from-image"},
+		{Name: "SPARK_PORT", Value: "1"}, {Name: "HF_ENDPOINT", Value: "https://image.example"}, {Name: "TRITON_X", Value: "$(touch " + marker + ")'`x`"}}
 	if err := os.WriteFile(filepath.Join(b.dir, "image.env"), appdeploy.RenderImageEnv(kvs), 0o600); err != nil {
 		t.Fatal(err)
 	}
