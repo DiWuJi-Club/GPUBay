@@ -178,6 +178,17 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
   - 只回退 platform 版本（不执行 Down）：新表留着不用，已部署的应用进程继续在容器里运行，但不再有人推进部署、登记端口或在实例重启后恢复；控制台和后台没有应用入口。
   - 执行 `00020` 的 Down：删除 `apps`、`app_versions`、`app_deployments`、`app_deploy_events` 与 `machines.cached_images(_at)`，**部署记录、事件和加密保存的应用变量全部丢失且不可恢复**；`instance_ports` 删除 `deployment_id` 列，应用登记的端口行保留下来变成普通端口（用户可自行删除）；数据盘 `/root/data/models` 里的模型与 `.spark-apps` 目录不受影响。
 
+### AI 管家（计划 12）
+
+- **模型端点**：默认 `SPARK_LLM_PROVIDER=openai`，接 OpenAI 兼容的 Chat Completions 流式接口（需支持 `tools` 与 `stream_options.include_usage`）。计划 9（Token 商城）合入后默认指向它的内网端点（如 `http://token-mall.spark.internal/v1`）；在那之前可接任意 OpenAI 兼容端点（如 vLLM：Qwen3 需 `--enable-auto-tool-choice --tool-call-parser hermes`）。`SPARK_LLM_BASE_URL` **写到 `/v1` 为止**，平台请求 `<base>/chat/completions`，`SPARK_LLM_API_KEY` 以 `Authorization: Bearer` 发送；URL 里不能带用户名密码。端点放在机房内网，platform 到端点的出站要放行。
+- **Claude 模式**：`SPARK_LLM_PROVIDER=anthropic` + `SPARK_LLM_API_KEY`（Anthropic API 密钥），模型默认 `claude-opus-5-5`，`SPARK_LLM_BASE_URL` 可空（官方地址）或填兼容网关。按 token 计费，**每日 token 预算就是钱**：把 `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` 设成实际单价（分 / 百万 token），后台用量页才有费用估算；按需在后台调低每用户每日 token 限额（默认 30 万）。密钥只从环境变量读，不写日志、不入库。
+- **生产校验**：prod 开启管家且提供方不是 mock 时必须有 `SPARK_LLM_API_KEY`；`openai` 必须有 `SPARK_LLM_BASE_URL`，否则启动失败（不想开放就设 `SPARK_BUTLER=off`）。**`mock` 提供方在 prod 直接拒绝启动**（配置校验与 `app.Build` 两道），测试注入的提供方同样被拒。
+- **开发环境**：未设 `SPARK_LLM_BASE_URL` 且没显式 `SPARK_BUTLER=on` 时管家自动关闭（启动日志「AI 管家未开启」说明原因），控制台不显示入口；`SPARK_LLM_PROVIDER=mock make run` 用确定性 mock 模型体验全部流程（规则见 `internal/butler/llm/mock/rules.go`）。显式 `SPARK_BUTLER=on` 而没配端点则启动报错。
+- **开关**：后台「AI 管家 → 设置」的总开关（super，不重启，本副本立即生效、其它副本最多 10 秒）用于临时关闭并给用户显示说明；`SPARK_BUTLER=off` 是部署级开关（不注册路由、不显示入口，需重启）。端点不支持工具调用时设 `SPARK_LLM_TOOLS=off` 应急：管家只回答问题、不能查询或操作（重启生效）。
+- **故障**：连续 5 次模型调用失败会产生告警「AI 管家模型不可用」；失败的轮次不计入用户预算。
+- **存储与保留**：对话（消息、工具调用、确认卡）存 PostgreSQL，**保留 90 天**（按最后更新时间，清扫器每轮删除），用量按日汇总保留 400 天；用户可随时删除自己的对话，后台 ops / super 可查看任意对话（帮助页已向用户说明）。写操作一律经用户在确认卡上确认后执行，并写审计 `butler.tool_execute`；部署变量里的 secret 值加密暂存，执行 / 拒绝 / 过期后清除。
+- **发布与回滚**：迁移 `00025_butler.sql` 只新增表，不改 Agent、不改既有表，可滚动发布。回滚只回退 platform 时表留着不用；执行 Down 删除全部对话与用量记录（审计日志保留）。
+
 ## API 约定
 
 - `POST /api/v1/orders`、`POST /api/v1/bookings` 与 `POST /api/v1/instances/{id}/renew` 支持可选请求头 `Idempotency-Key`（最长 64 字符）。

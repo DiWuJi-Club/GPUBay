@@ -26,6 +26,12 @@ import (
 	"spark-cloud/internal/api"
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
+	"spark-cloud/internal/butler"
+	"spark-cloud/internal/butler/llm"
+	"spark-cloud/internal/butler/llm/anthropic"
+	"spark-cloud/internal/butler/llm/mock"
+	"spark-cloud/internal/butler/llm/openai"
+	"spark-cloud/internal/butler/tools"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
@@ -70,6 +76,9 @@ type Options struct {
 	// 集成测试与 e2e-server 的所有实例共用一个假容器 sshd，用 AppRootFor 让每个实例各用 <Root>/<实例 ID>/root/data；生产环境设置时 Build 直接报错。
 	AppRoot    string
 	AppRootFor func(instanceID string) string
+	// LLM 是测试 / e2e 注入的 AI 管家模型提供方（通常是 *mock.Mock，钩子往它的队列里塞回复）；nil = 按 cfg.LLM.Provider 构造。
+	// 生产环境设置时 Build 直接报错（与 DisableRateLimits 同款保护）。cfg.Butler 为 false 时忽略。
+	LLM llm.Provider
 }
 
 const noRateLimit = 1_000_000
@@ -104,6 +113,11 @@ type App struct {
 	Apps       *appdeploy.Service // 应用一键部署（计划 7）
 	AppCatalog *appdeploy.Catalog
 	AppRunner  *appdeploy.Runner // 部署后台执行者；由 cmd/platform 按 SPARK_APP_RUNNER 启动
+
+	// 计划 12：AI 管家；cfg.Butler 为 false（SPARK_BUTLER=off，或开发环境未配端点被自动关闭）时两者都是 nil、路由不注册。
+	// cmd/platform 把 Butler.Sweep 挂进清扫器。
+	Butler *butler.Service
+	LLM    llm.Provider
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
@@ -119,6 +133,12 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	if (opt.AppRoot != "" || opt.AppRootFor != nil) && cfg.Env == "prod" {
 		return nil, errors.New("生产环境禁止注入应用根目录")
+	}
+	if opt.LLM != nil && cfg.Env == "prod" {
+		return nil, errors.New("生产环境禁止注入 LLM 提供方")
+	}
+	if cfg.LLM.Provider == config.LLMMock && cfg.Env == "prod" { // config.Load 已拦；这里防配置字面量绕过
+		return nil, errors.New("生产环境禁止使用 mock LLM 提供方")
 	}
 	ipHourLimit, loginLimit := 0, 0
 	if opt.DisableRateLimits {
@@ -305,6 +325,29 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	appRunner := appdeploy.NewRunner(apps, upstreamPool, appdeploy.RunnerConfig{HealthAddr: opt.AppHealthAddr, AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor})
 	srv.Apps, srv.AppsLimit = apps, authorizeLimit // 零值取默认（每用户每小时 60 次写）；DisableRateLimits 时为 noRateLimit
 	adminSrv.Apps, adminSrv.AppCatalog = apps, appCat
+	var bt *butler.Service
+	var provider llm.Provider
+	if cfg.Butler {
+		if provider, err = llmProvider(cfg.LLM, opt.LLM); err != nil {
+			return nil, err
+		}
+		// 工具的数据来源与控制台完全相同：machine_label 用 api 实例视图的同一 fleet 查询、ssh_command 用同一 SSH 主机 / 端口、
+		// 端口地址用同一入口 PortURL；所有调用都走 *ForUser 路径（规格 §1.1 第 1 条）。
+		reg := tools.NewRegistry(tools.Deps{Rental: r, Apps: apps, Catalog: c, Wallet: w, Users: ids, Pool: pool,
+			MachineLabel: func(ctx context.Context, machineID int64) (string, error) {
+				m, err := f.Get(ctx, f.Pool(), machineID)
+				if err != nil {
+					return "", err
+				}
+				return m.Label(), nil
+			},
+			PortURL: ingressAuth.PortURL, SSHHost: srv.SSHHost, SSHPort: srv.SSHPort, Clock: clk, IngressDomain: ingressAuth.IngressDomain, Box: box})
+		bt = butler.NewService(butler.Deps{Pool: pool, Clock: clk, Log: log, Provider: provider, Tools: reg, ToolsEnabled: cfg.LLM.Tools,
+			Users: ids, Wallet: w, Rental: r, Fleet: f, Box: box, MaxOutputTokens: cfg.LLM.MaxOutputTokens})
+		// 零值取默认（每用户每分钟 20 次发消息 + 确认）；DisableRateLimits 时为 noRateLimit（e2e 假时钟下窗口永不滑过）
+		srv.Butler, srv.ButlerLimit = bt, authorizeLimit
+		adminSrv.Butler, adminSrv.LLMPriceInCentsPerM, adminSrv.LLMPriceOutCentsPerM = bt, cfg.LLM.PriceInCentsPerM, cfg.LLM.PriceOutCentsPerM
+	}
 	routes := ingress.NewTable(r, log)
 	ingSrv := ingress.NewServer(ingressAuth, routes, ids, upstreamPool, r, clk, log)
 	proxyHops := 0 // 不信任代理：入口不看任何转发头
@@ -314,7 +357,32 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	handler := ingress.Front(cfg.IngressDomain, proxyHops, ingSrv, srv.Router())
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
-		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner}, nil
+		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner,
+		Butler: bt, LLM: provider}, nil
+}
+
+// llmProvider 返回 AI 管家的模型提供方：注入的优先（测试 / e2e），否则按 cfg.Provider 构造。
+// 模型名为空（配置字面量）时取 provider 默认；openai 必须有端点（config.Load 已校验，这里防配置字面量绕过）。
+func llmProvider(cfg config.LLMConfig, injected llm.Provider) (llm.Provider, error) {
+	if injected != nil {
+		return injected, nil
+	}
+	model := cfg.Model
+	if model == "" {
+		model = config.DefaultLLMModel(cfg.Provider)
+	}
+	switch cfg.Provider {
+	case config.LLMOpenAI:
+		if cfg.BaseURL == "" {
+			return nil, errors.New("SPARK_LLM_PROVIDER=openai 需要设置 SPARK_LLM_BASE_URL")
+		}
+		return openai.New(openai.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens}), nil
+	case config.LLMAnthropic:
+		return anthropic.New(anthropic.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens}), nil
+	case config.LLMMock:
+		return mock.New(), nil
+	}
+	return nil, fmt.Errorf("未知的 LLM 提供方 %q", cfg.Provider)
 }
 
 // upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。

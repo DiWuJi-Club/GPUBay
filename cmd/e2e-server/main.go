@@ -25,6 +25,7 @@ import (
 
 	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/app"
+	"spark-cloud/internal/butler/llm/mock"
 	"spark-cloud/internal/e2ehooks"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
@@ -121,14 +122,18 @@ func run() error {
 		AgentDNSServers: []string{"223.5.5.5", "119.29.29.29"}, UpstreamSSHKeyFile: keyFile,
 		IngressDomain: "spark.test", PublicBaseURL: "http://spark.test:18080", SSHAddr: sshAddr, SSHPublicPort: 22, UpstreamSSHPort: upstream.Port(),
 		SSHDrainTimeout: time.Second, // 停机时不为残留会话等 30 秒（Playwright 的 gracefulShutdown 只给 20 秒）
+		// AI 管家用进程内确定性 mock（规格 §16.3）：规则表 + /hooks/butler/reply 入队的脚本化回复
+		Butler: true, LLM: config.LLMConfig{Provider: config.LLMMock, Model: "mock", MaxOutputTokens: config.DefaultLLMMaxOutputTokens, Tools: true},
 	}
+	mockLLM := mock.New()
 	clk := clock.NewFake(time.Now())
 	kycSwitch := &e2ehooks.SwitchableKYC{}
 	// 不启动应用部署 Runner（SPARK_APP_RUNNER 不适用于此进程）：由 /hooks/apps/tick 按假时钟逐轮驱动
 	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: kycSwitch, DisableRateLimits: true, AgentTick: 50 * time.Millisecond,
 		HostKeyGen:    func() (string, []byte, error) { return hostPub, hostPEM, nil },
 		AppHealthAddr: func(int) string { return healthAddr },
-		AppRootFor:    func(id string) string { return filepath.Join(appRoot, id, "root", "data") }})
+		AppRootFor:    func(id string) string { return filepath.Join(appRoot, id, "root", "data") },
+		LLM:           mockLLM})
 	if err != nil {
 		return err
 	}
@@ -154,7 +159,7 @@ func run() error {
 	// 在 fake Agent 停掉之后（defer 逆序）先取消 gwCtx，再等 Agent 网关、SSH 网关与接入层循环全部退出
 	defer func() { stopGW(); <-gwErr; <-sshErr; <-loopsDone; a.Upstream.Close() }()
 	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr, SSHAddr: sshAddr, Upstream: upstream,
-		HealthAddr: healthAddr}
+		HealthAddr: healthAddr, LLM: mockLLM}
 	defer hooksSrv.Close()
 
 	public, adminSrv := a.Servers(cfg) // 与 cmd/platform 完全相同的监听与路由；不启动定时清扫器，清扫由钩子触发

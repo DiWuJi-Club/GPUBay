@@ -29,6 +29,7 @@ import (
 	"spark-cloud/internal/agent/state"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/butler/llm/mock"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/clock"
@@ -54,6 +55,8 @@ type Server struct {
 	Upstream  *sshtest.Server // 假「容器 sshd」（所有 e2e 机器的 lan_ip 都是 127.0.0.1）；/hooks/ingress-upstream 在它上面登记端口
 	// HealthAddr 是 fake 应用的健康检查 / Web 服务地址（host:port）：/hooks/apps/seed 把每个应用端口的 direct-tcpip 转到它
 	HealthAddr string
+	// LLM 是 app.Options.LLM 注入的同一个 mock 提供方：/hooks/butler/reply 往它的队列里塞下一轮回复；nil 时管家钩子报 400
+	LLM *mock.Mock
 
 	sweepMu       sync.Mutex // 进程内串行化 /hooks/sweep（再加清扫咨询锁防跨进程交叠）；见 sweep
 	mu            sync.Mutex
@@ -93,6 +96,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/ingress-upstream", s.handle(s.ingressUpstream))
 	mux.HandleFunc("POST /hooks/apps/seed", s.handle(s.appsSeed))
 	mux.HandleFunc("POST /hooks/apps/tick", s.handle(s.appsTick))
+	mux.HandleFunc("POST /hooks/butler/reply", s.handle(s.butlerReply))
+	mux.HandleFunc("POST /hooks/butler/reset", s.handle(s.butlerReset))
+	mux.HandleFunc("POST /hooks/butler/usage", s.handle(s.butlerUsage))
+	mux.HandleFunc("POST /hooks/butler/settings", s.handle(s.butlerSettings))
 	return loopbackOnly(mux)
 }
 
@@ -269,7 +276,7 @@ func (s *Server) heartbeatAll(ctx context.Context) error {
 	return nil
 }
 
-// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep + Referral.Settle。
+// sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep + Referral.Settle（+ 管家开启时 Butler.Sweep）。
 // Rental.Sweep 先做离线检测与暂停、再做到期停机，而到期停机只处理未暂停的实例：推进 24 小时后不心跳直接清扫，
 // 机器会被判失联、实例被暂停而永远不会停机。
 //
@@ -307,6 +314,11 @@ func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 	}
 	if err := s.App.Referral.Settle(ctx); err != nil {
 		return nil, fmt.Errorf("referral settle: %w", err)
+	}
+	if s.App.Butler != nil { // 与 cmd/platform 的清扫器附加任务相同：确认过期、崩溃轮次、对话保留
+		if err := s.App.Butler.Sweep(ctx); err != nil {
+			return nil, fmt.Errorf("butler sweep: %w", err)
+		}
 	}
 	return map[string]bool{"ok": true}, nil
 }

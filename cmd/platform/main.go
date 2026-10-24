@@ -101,6 +101,9 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if a.LLM != nil { // 只记提供方与模型名，不记端点密钥
+		log.Info("AI 管家已开启", "provider", a.LLM.Name(), "model", a.LLM.Model(), "tools", cfg.LLM.Tools)
+	}
 	sshLis, err := net.Listen("tcp", cfg.SSHAddr) // 先于启动任何服务：端口占用时干净退出
 	if err != nil {
 		return fmt.Errorf("ssh gateway listen: %w", err)
@@ -108,7 +111,11 @@ func run(log *slog.Logger) error {
 	sweeperDone := make(chan struct{})
 	go func() {
 		defer close(sweeperDone)
-		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep, a.Referral.Settle)
+		extra := []func(context.Context) error{a.Billing.Sweep, a.Referral.Settle}
+		if a.Butler != nil { // AI 管家：确认过期、崩溃轮次接管、90 天对话保留、用量保留（规格 §8）
+			extra = append(extra, a.Butler.Sweep)
+		}
+		a.Rental.RunSweeper(ctx, cfg.SweepInterval, extra...)
 	}()
 	runnerDone := make(chan struct{})
 	if cfg.AppRunner { // 多副本都开也安全：每轮先拿会话级咨询锁，同一时刻只有一个副本在推进部署
