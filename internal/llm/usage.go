@@ -25,6 +25,11 @@ const (
 // ErrDuplicateUsage RecordUsage 遇到已存在的 request_id：整个事务回滚、不重复计费（规格 §14 幂等）。
 var ErrDuplicateUsage = errors.New("llm: duplicate usage request_id")
 
+// usageDaySQL 用量行所属的北京时间自然日（llm_usage_daily.day 的口径）。DailyUsage、结算写 llm_usage_daily、
+// 不变量 5 必须用同一表达式；查询里 created_at 须无歧义（只出现 llm_usage 一张表或无同名列）。
+// 按时间区间过滤时用 [tz.DayStart, +24h) 的瞬时值即可（北京时间无夏令时，两者等价且能走索引）。
+const usageDaySQL = "(created_at AT TIME ZONE 'Asia/Shanghai')::date"
+
 var usageStatuses = []string{UsageOK, UsageClientAbort, UsageUpstreamError, UsageUpstreamTimeout, UsageNoNode}
 
 // Cost 单次请求费用（微分）= prompt × input_price + completion × output_price；embedding 只算输入（规格 §1.1 #4）。
@@ -243,7 +248,7 @@ func (s *Service) ListUsage(ctx context.Context, f UsageFilter, p paging.Page) (
 	return list, total, err
 }
 
-// ExportUsage 后台 CSV：按 id 正序逐行回调；超过 csvx.MaxRows 时在回调前返回 csvx.ErrTooLarge（规格 T18）。
+// ExportUsage 后台 CSV：按时间正序（created_at, id）逐行回调；超过 csvx.MaxRows 时在回调前返回 csvx.ErrTooLarge（规格 T18）。
 func (s *Service) ExportUsage(ctx context.Context, f UsageFilter, fn func(UsageRow) error) error {
 	w, err := f.where()
 	if err != nil {
@@ -256,7 +261,7 @@ func (s *Service) ExportUsage(ctx context.Context, f UsageFilter, fn func(UsageR
 	if total > csvx.MaxRows {
 		return csvx.ErrTooLarge
 	}
-	rows, err := s.d.Pool.Query(ctx, `SELECT `+usageRowCols+usageRowFrom+` WHERE `+w.SQL()+` ORDER BY g.id`, w.Args...)
+	rows, err := s.d.Pool.Query(ctx, `SELECT `+usageRowCols+usageRowFrom+` WHERE `+w.SQL()+` ORDER BY g.created_at, g.id`, w.Args...)
 	if err != nil {
 		return err
 	}
@@ -291,7 +296,7 @@ func (s *Service) DailyUsage(ctx context.Context, userID int64, from, to time.Ti
 			FROM llm_usage_daily
 			WHERE day BETWEEN $1::date AND $2::date AND ($3::bigint = 0 OR user_id = $3)
 			UNION ALL
-			SELECT (created_at AT TIME ZONE 'Asia/Shanghai')::date, user_id, model_id, 1, prompt_tokens, completion_tokens, cost_micro
+			SELECT `+usageDaySQL+`, user_id, model_id, 1, prompt_tokens, completion_tokens, cost_micro
 			FROM llm_usage
 			WHERE settlement_id IS NULL AND created_at >= $4 AND created_at < $5 AND ($3::bigint = 0 OR user_id = $3))
 		SELECT x.day, x.user_id, x.model_id, m.slug, sum(x.requests)::bigint, sum(x.prompt_tokens)::bigint,

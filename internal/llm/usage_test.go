@@ -521,15 +521,15 @@ func TestListUsageFiltersAndExport(t *testing.T) {
 		t.Fatalf("bad status err = %v", err)
 	}
 
-	// 导出：时间正序（id 正序）逐行回调
-	var got []string
+	// 导出：按 created_at 正序（不是 id 序：今天第一秒的未结算行晚于今天 01:00 的已结算行插入）
+	var got []time.Time
 	if err := e.svc.ExportUsage(e.ctx, llm.UsageFilter{UserID: f.u, From: &from}, func(r llm.UsageRow) error {
-		got = append(got, r.RequestID)
+		got = append(got, r.CreatedAt)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 || got[0] > got[1] || got[1] > got[2] {
+	if len(got) != 3 || !got[0].Equal(f.todayCST) || !got[1].Equal(f.todayCST.Add(time.Hour)) || !got[2].Equal(f.now) {
 		t.Fatalf("export = %v", got)
 	}
 	stop := errors.New("stop")
@@ -731,6 +731,39 @@ func TestAdminUpdateAccountLimits(t *testing.T) {
 	}
 	if st, _ := e.authCode(e.svc, plain); st != 0 {
 		t.Fatalf("authorize after unblock = %d", st)
+	}
+
+	// 未停用的账户：单独给原因（或 blocked=false 带原因）→ llm_account_invalid；空白原因视为没给
+	for _, in := range []llm.AccountUpdate{{BlockedReason: &reason}, {Blocked: &no, BlockedReason: &reason}} {
+		if _, err := e.svc.AdminUpdateAccount(e.ctx, e.admin(), u, in); errCode(err) != "llm_account_invalid" ||
+			!strings.Contains(err.Error(), "blocked_reason") {
+			t.Fatalf("reason without blocking err = %v", err)
+		}
+	}
+
+	// 无变化：不写、不审计
+	audits := e.auditCount("llm.account.update", target)
+	var updatedAt time.Time
+	if err := e.pool.QueryRow(e.ctx, `SELECT updated_at FROM llm_accounts WHERE user_id = $1`, u).Scan(&updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(time.Minute)
+	for _, in := range []llm.AccountUpdate{{}, {TPMLimit: set(9000), RPMLimit: llm.OptInt{Set: true}, Blocked: &no, BlockedReason: &blank}} {
+		a, err := e.svc.AdminUpdateAccount(e.ctx, e.admin(), u, in)
+		if err != nil || a.Blocked || *a.TPMLimit != 9000 || !a.UpdatedAt.Equal(updatedAt) {
+			t.Fatalf("no-op update = %+v %v", a, err)
+		}
+	}
+	if n := e.auditCount("llm.account.update", target); n != audits {
+		t.Fatalf("no-op audited: %d → %d", audits, n)
+	}
+	// 没有账户行的用户 + 空更新：插入默认行，不审计
+	u3 := e.verifiedUser()
+	if a, err := e.svc.AdminUpdateAccount(e.ctx, e.admin(), u3, llm.AccountUpdate{}); err != nil || a.UserID != u3 || a.Blocked {
+		t.Fatalf("empty update on new account = %+v %v", a, err)
+	}
+	if e.queryInt(`SELECT count(*) FROM llm_accounts WHERE user_id = $1`, u3) != 1 || e.auditCount("llm.account.update", fmt.Sprint(u3)) != 0 {
+		t.Fatal("empty update on new account: want row, no audit")
 	}
 
 	// 用户不存在

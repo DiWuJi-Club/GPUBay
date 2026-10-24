@@ -127,7 +127,8 @@ func (o *OptInt) UnmarshalJSON(b []byte) error {
 }
 
 // AccountUpdate 后台 PUT /llm/accounts/{user_id}：没给的字段不改；限额给 null 恢复默认。
-// Blocked=true 时停用原因必填（trim 后 1～200 字；已停用时可只改原因）；Blocked=false 解除停用并清空原因。
+// Blocked=true 时停用原因必填（trim 后 1～200 字；已停用时可只改原因）；Blocked=false 解除停用并清空原因；
+// 账户未停用且本次也不停用时给非空原因 → llm_account_invalid。
 type AccountUpdate struct {
 	RPMLimit         OptInt  `json:"rpm_limit"`
 	TPMLimit         OptInt  `json:"tpm_limit"`
@@ -151,9 +152,13 @@ func applyLimit(cur *int, o OptInt, field string, max int) (*int, error) {
 }
 
 // AdminUpdateAccount 后台改用户的限额 / 停用（账户行不存在则创建）；审计 llm.account.update{before, after}。
+// 结果与现状相同 → 不写、不审计，返回当前账户。
 // 事务提交后本进程内该用户全部 Key 的鉴权缓存立即失效（InvalidateUser，见 authorize.go），其它进程最多 KeyCacheTTL 后生效。
 func (s *Service) AdminUpdateAccount(ctx context.Context, actor audit.Actor, userID int64, in AccountUpdate) (Account, error) {
-	var out Account
+	var (
+		out     Account
+		changed bool
+	)
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
 		before, err := s.EnsureAccount(ctx, tx, userID)
 		if err != nil {
@@ -182,8 +187,19 @@ func (s *Service) AdminUpdateAccount(ctx context.Context, actor audit.Actor, use
 				return apperr.LLMAccountInvalid("blocked_reason", "停用须填写原因（最多 200 个字符）")
 			}
 		} else {
+			// 未停用的账户不接受停用原因（防止误以为已停用）；解除停用时一并给的原因忽略并清空。
+			if !before.Blocked && in.BlockedReason != nil && strings.TrimSpace(*in.BlockedReason) != "" {
+				return apperr.LLMAccountInvalid("blocked_reason", "账户未停用，不能单独设置停用原因")
+			}
 			next.BlockedReason = ""
 		}
+		if equalIntPtr(next.RPMLimit, before.RPMLimit) && equalIntPtr(next.TPMLimit, before.TPMLimit) &&
+			equalIntPtr(next.ConcurrencyLimit, before.ConcurrencyLimit) && next.Blocked == before.Blocked &&
+			next.BlockedReason == before.BlockedReason {
+			out, changed = before, false // 无变化：不写、不审计（缺失的账户行仍由 EnsureAccount 插入）
+			return nil
+		}
+		changed = true
 		now := s.d.Clock.Now()
 		a, err := scanAccount(tx.QueryRow(ctx, `UPDATE llm_accounts SET rpm_limit = $2, tpm_limit = $3, concurrency_limit = $4,
 				blocked = $5, blocked_reason = $6, updated_at = $7
@@ -199,8 +215,17 @@ func (s *Service) AdminUpdateAccount(ctx context.Context, actor audit.Actor, use
 	if err != nil {
 		return Account{}, err
 	}
-	s.InvalidateUser(userID)
+	if changed {
+		s.InvalidateUser(userID)
+	}
 	return out, nil
+}
+
+func equalIntPtr(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // AccountFilter 后台账户列表筛选：Q 为数字（用户 ID 精确或手机号子串）；Blocked 非 nil 按停用状态；Debt 只看欠费 > 0。
