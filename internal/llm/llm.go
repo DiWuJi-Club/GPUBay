@@ -34,6 +34,7 @@ import (
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/secretbox"
+	"spark-cloud/internal/rental"
 	"spark-cloud/internal/wallet"
 )
 
@@ -48,15 +49,21 @@ type UserLookup interface {
 	CanRent(ctx context.Context, userID int64) error
 }
 
-// RentalOps 由 *rental.Service 满足：PlaceSystem / ReleaseSystem / Get / UpstreamTarget。
-// 占位：rental.SystemPlaceRequest 与 UpstreamTarget 在 Task 2 才有，届时替换为真实方法集。
-type RentalOps interface{}
+// RentalOps 由 *rental.Service 满足：系统实例的开通 / 释放 / 查询与拨号目标（节点 Controller / Prober 用）。
+type RentalOps interface {
+	PlaceSystem(ctx context.Context, req rental.SystemPlaceRequest) (rental.Instance, error)
+	ReleaseSystem(ctx context.Context, instanceID string) error
+	Get(ctx context.Context, id string) (rental.Instance, error)
+	UpstreamTarget(ctx context.Context, instanceID string) (upstream.Target, error)
+	ListLiveSystemInstances(ctx context.Context) ([]rental.Instance, error)
+}
 
 // AppOps 由 *appdeploy.Service 满足。
 type AppOps interface {
 	Create(ctx context.Context, req appdeploy.CreateRequest) (appdeploy.Deployment, error)
 	Redeploy(ctx context.Context, req appdeploy.RedeployRequest) (appdeploy.Deployment, error)
 	Get(ctx context.Context, depID string) (appdeploy.Deployment, error)
+	Events(ctx context.Context, depID string, limit int) ([]appdeploy.Event, error) // 节点详情的部署事件
 }
 
 // AppCatalog 由 *appdeploy.Catalog 满足。
@@ -71,7 +78,7 @@ type ImageLookup interface {
 	GetImage(ctx context.Context, q db.Querier, id int64) (catalog.Image, error)
 }
 
-// FleetOps 由 *fleet.Service 满足（LLMPoolGroupID 在 Task 3 新增）。
+// FleetOps 由 *fleet.Service 满足。
 type FleetOps interface {
 	LLMPoolGroupID(ctx context.Context, q db.Querier) (int64, error)
 	Get(ctx context.Context, q db.Querier, id int64) (fleet.Machine, error)
