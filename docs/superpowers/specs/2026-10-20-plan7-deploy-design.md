@@ -204,7 +204,7 @@ ALTER TABLE machines ADD COLUMN cached_images TEXT[] NOT NULL DEFAULT '{}', ADD 
 ```json
 {
   "ports": [
-    {"port": 8000, "label": "OpenAI 兼容接口", "path": "/v1", "health_path": "/health"}
+    {"port": 8000, "label": "OpenAI 兼容接口", "path": "/docs", "health_path": "/health"}
   ],
   "timeout_minutes": 60,
   "min_data_free_gib": 40,
@@ -222,7 +222,7 @@ ALTER TABLE machines ADD COLUMN cached_images TEXT[] NOT NULL DEFAULT '{}', ADD 
 ```
 
 字段约束（`appdeploy.ValidateSpec`）：
-- `ports`：1～2 项；`port ∈ [1024, 65535]`，≠ 22、≠ 2222，互不相同；`label` ≤ 32 字符；`path` 以 `/` 开头 ≤ 128 字符；`health_path` 只在第一项上有意义（可空 = 只做 TCP 连通检查）。
+- `ports`：1～2 项；`port ∈ [1024, 65535]`，≠ 22、≠ 2222，互不相同；`label` ≤ 32 字符；`path` 以 `/` 开头 ≤ 128 字符（主端口的 `path` 是「打开」按钮在端口 URL 后拼的路径，根路径不是页面的应用用，如 vLLM 的 `/docs`；验收缺陷 A-4）；`health_path` 只在第一项上有意义（可空 = 只做 TCP 连通检查）。
 - `timeout_minutes`：1～180，默认 60（D6）。`min_data_free_gib`：0～2048，默认 0；部署前 `df /root/data` 剩余不足 → `failed(disk)`（在 `run.sh deploy` 的 prepare 阶段检查，消息带实际剩余）。
 - `env`：≤ 16 项；`name ~ ^[A-Z][A-Z0-9_]{0,63}$`，不得以 `SPARK_` 开头（平台保留），不得是 `PATH / LD_PRELOAD / LD_LIBRARY_PATH / HOME / SHELL / IFS / ENV / BASH_ENV`；`type ∈ string | int | bool | enum | secret`；`string / secret` 可带 `pattern`（Go RE2，≤ 256 字符）与 `max_len`（默认 256，上限 1024）；`int` 带 `min / max`；`enum` 的 `options` 1～32 项、每项 ≤ 128 字符；`default` 必须自身通过校验；`required` 的变量没有 `default` 时用户必填；`label` ≤ 32、`help` ≤ 200。
 - `links`：≤ 4 项，`path` 规则同上；控制台把它们拼到主端口 URL 后面显示。
@@ -348,7 +348,7 @@ queued ──(Runner 上传+启动)──▶ installing ──(status: running, 
   └──(实例恢复 running：running / stopped → queued)                       └──(卸载 / 实例消失)──▶ removed（终态）
                                                                  换机：旧实例 → lost（终态），新实例复制为 queued
 ```
-- 用户可见字段：`state`、`phase`、`progress`、`message`、`health`、`error_code`（映射中文）、`url`（主端口 URL，端口存在时）、`links[]`、`update_available`、`version`、`attempt`、时间戳。
+- 用户可见字段：`state`、`phase`、`progress`、`message`、`health`、`error_code`（映射中文）、`url`（「打开」的地址 = 主端口 URL + `ports[0].path`，端口存在时）、`links[]`、`update_available`、`version`、`attempt`、时间戳。
 
 ### 6.2 用户操作与允许状态
 
@@ -387,7 +387,7 @@ queued ──(Runner 上传+启动)──▶ installing ──(status: running, 
 
 ## 7. 暴露与链接
 - 部署进入 `running` 时（Runner 回写事务内）对 `spec.ports` 每项：若 `(instance_id, port)` 已存在且 `deployment_id IS NULL` → 认领并把 `note` 改为应用名；已存在且属于别的部署 → 不可能（创建时已查冲突）；不存在 → `INSERT (visibility='private', note=<app.name>, deployment_id)`。端口数超过 5 → 不可能（创建时已算入），兜底 `failed(port_limit)`。
-- 控制台 URL = 现有 `rental.PortURL`（`https://ins-<id>-<port>.<ingress_domain>/`），`links[]` = URL + `path`。
+- 控制台 URL = 现有 `rental.PortURL`（`https://ins-<id>-<port>.<ingress_domain>/`），`links[]` = URL + `path`；部署的 `url`（「打开」、实例列表摘要）= URL + `ports[0].path`。
 - 卸载：`DELETE FROM instance_ports WHERE deployment_id = $1`；审计 `instance.port_delete` 以 user actor 记录，detail「卸载应用 <name>」。
 - 后台「强制私有」/「删端口」对应用端口照常生效；删除后部署的 `url` 为空，提示同上。
 - `rental.ListIngressRoutes` 与 ingress 不需要改：应用端口只是普通端口。

@@ -43,7 +43,7 @@ type View struct {
 	SecretEnv       map[string]bool   `json:"secret_env"`
 	Spec            Spec              `json:"spec"`
 	Port            int               `json:"port"`
-	URL             *string           `json:"url"`
+	URL             *string           `json:"url"` // 「打开」的地址（openURL）；端口不在时为 null
 	Links           []LinkView        `json:"links"`
 	Attempt         int               `json:"attempt"`
 	CleanupPending  bool              `json:"cleanup_pending"`
@@ -200,7 +200,8 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 		}
 		if s.d.PortURL != nil && ports[depPort{d.ID, d.Port}] {
 			u := s.d.PortURL(d.InstanceID, d.Port)
-			v.URL = &u
+			open := openURL(u, ver.spec)
+			v.URL = &open
 			for _, l := range ver.spec.Links {
 				v.Links = append(v.Links, LinkView{Label: l.Label, URL: strings.TrimSuffix(u, "/") + l.Path})
 			}
@@ -208,6 +209,15 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+// openURL 是「打开」的地址：主端口 URL + ports[0].path（应用根路径不是页面时用，如 vLLM 的 /docs；验收缺陷 A-4）；
+// path 为空时就是主端口 URL。links 仍拼在主端口 URL 后面。
+func openURL(portURL string, sp Spec) string {
+	if len(sp.Ports) == 0 || sp.Ports[0].Path == "" {
+		return portURL
+	}
+	return strings.TrimSuffix(portURL, "/") + sp.Ports[0].Path
 }
 
 // normalizeSpec 把视图里 spec 的 nil 切片换成空切片（前端按数组处理）。返回副本，不改调用方的 spec。

@@ -64,7 +64,7 @@ func fakeApps() []fakeApp {
 	return []fakeApp{
 		{in: appdeploy.AppInput{Slug: "vllm", Name: "vLLM 推理服务", Summary: "OpenAI 兼容的大模型推理接口（Qwen3 等）", Category: "llm", Icon: "llm", Sort: 10},
 			spec: appdeploy.Spec{
-				Ports:          []appdeploy.PortSpec{{Port: 8000, Label: "OpenAI 兼容接口", Path: "/v1", HealthPath: "/health"}},
+				Ports:          []appdeploy.PortSpec{{Port: 8000, Label: "OpenAI 兼容接口", Path: "/docs", HealthPath: "/health"}},
 				TimeoutMinutes: 90,
 				Env: []appdeploy.EnvSpec{
 					{Name: "MODEL_ID", Label: "模型", Type: "enum", Required: true, Options: []string{"Qwen/Qwen3-8B", "Qwen/Qwen3-4B", "Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen3-14B"},

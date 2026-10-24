@@ -192,13 +192,15 @@ func TestInstanceAppsFlow(t *testing.T) {
 
 	// Runner 登记端口后 url / links 出现
 	e.exec(`INSERT INTO instance_ports (instance_id, port, note, deployment_id, created_at, updated_at) VALUES ($1, 8000, 'vllm', $2, now(), now())`, id, depID)
-	wantURL := e.ingress.PortURL(id, 8000)
+	// url 是「打开」的地址 = 主端口 URL + ports[0].path（A-4）；links 拼在主端口 URL 后面
+	portURL := e.ingress.PortURL(id, 8000)
+	wantURL := strings.TrimSuffix(portURL, "/") + "/v1"
 	code, one := c.do("GET", "/instances/"+id+"/apps/"+depID, nil)
 	if code != 200 || one["url"] != wantURL || !strings.HasPrefix(wantURL, "http") || !strings.Contains(wantURL, id+"-8000.spark.test") {
 		t.Fatalf("get with port = %d %v (want url %s)", code, one, wantURL)
 	}
 	links := one["links"].([]any)
-	if len(links) != 1 || links[0].(map[string]any)["label"] != "文档" || links[0].(map[string]any)["url"] != strings.TrimSuffix(wantURL, "/")+"/docs" {
+	if len(links) != 1 || links[0].(map[string]any)["label"] != "文档" || links[0].(map[string]any)["url"] != strings.TrimSuffix(portURL, "/")+"/docs" {
 		t.Fatalf("links = %v", links)
 	}
 	if _, inst := c.do("GET", "/instances/"+id, nil); inst["apps_summary"].([]any)[0].(map[string]any)["url"] != wantURL {
