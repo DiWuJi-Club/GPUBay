@@ -171,7 +171,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 
 ### ComfyUI 工作流市场（计划 11）
 
-- **发布顺序**：只发 platform（迁移 `00024_comfy_workflows.sql`，四张新表），不改 Agent。发布后依次：
+- **发布顺序**：只发 platform（迁移 `00024_comfy_workflows.sql`：四张新表，并修改 `uploads`——`purpose` 允许 `workflow_cover`、`user_id` 可空、加约束「封面 ⇔ `user_id` 为空」），不改 Agent。发布后依次：
   1. 导入 comfyui 应用 **1.1.0**（`supports_workflows`、`MODEL_ID` 默认 `none`、模型 / 自定义节点 / 用户目录放到数据盘 `/root/data/comfyui`）。**只导入 comfyui 一个目录**：`app import` 按目录名顺序导入、遇到第一个失败的目录（例如已导入过的 vllm 1.0.0，同版本号重复导入报错）就停止，整个 `deploy/apps` 再导一遍会报错退出。用一次性容器只读挂载 `deploy/apps/comfyui`（在 `deploy/compose/` 下执行）：
 
      ```bash
@@ -190,8 +190,8 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
   3. 后台「工作流」逐个检查版本（模型 / 节点 / 快速出图参数）并发布（super + TOTP，发布后不可变），再把工作流状态改为「上架」，控制台 `/workflows` 才能看到。
 - **国内网络**：模型从 ModelScope（或 `SPARK_APP_HF_ENDPOINT` 的 hf-mirror）下载；自定义节点从 GitHub 经 `SPARK_APP_GIT_MIRROR` 前缀 clone，镜像失效时改这个变量（或设 `off` 直连）后用户重新部署即可。若指向内网镜像站，网段要加进 `SPARK_AGENT_ALLOW_CIDRS`。
 - **安全**：自定义节点是第三方代码，在用户容器里以 root 安装运行；只有 super 能发布工作流版本，Git 主机限 github.com / gitee.com / gitcode.com 且钉死 commit，导入前须评审节点仓库。
-- **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。
-- **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），容器内文件不受影响。
+- **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。这些限制与每用户同时上传数、每小时运行尝试数用的是进程内锁与计数（「计数 → `/prompt` → 入库」靠进程内锁串行化），**假设 platform 只有一个副本**；多副本部署时它们只是每个副本各自的软上限（落在不同副本上的并发请求可以同时通过检查）。
+- **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），并删除 `uploads` 里的封面登记（`workflow_cover` 行）、把 `uploads` 的约束还原（`purpose` 只允许 `license`、`user_id` 非空）；`SPARK_UPLOAD_DIR` 里的封面文件留在磁盘上（可手工清理），容器内文件不受影响。
 
 ## API 约定
 
