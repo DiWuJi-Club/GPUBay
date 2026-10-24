@@ -122,6 +122,19 @@ func TestMigration00024RoundTrip(t *testing.T) {
 		t.Fatalf("indexes = %d", n)
 	}
 
+	// uploads：workflow_cover 用途、所有者为 NULL；license 仍必须有所有者。
+	exec(`INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at) VALUES ('2026/01/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png', 1, 1, 'image/png', 'license', now())`)
+	exec(`INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at) VALUES ('2026/01/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.webp', NULL, 1, 'image/webp', 'workflow_cover', now())`)
+	for _, bad := range []string{
+		`INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at) VALUES ('2026/01/cccccccccccccccccccccccccccccccc.png', NULL, 1, 'image/png', 'license', now())`,
+		`INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at) VALUES ('2026/01/dddddddddddddddddddddddddddddddd.png', 1, 1, 'image/png', 'workflow_cover', now())`,
+		`INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at) VALUES ('2026/01/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.png', 1, 1, 'image/png', 'avatar', now())`,
+	} {
+		if _, err := sqlDB.ExecContext(ctx, bad); !isCheck(err) {
+			t.Fatalf("%s: err = %v, want check violation", bad, err)
+		}
+	}
+
 	if _, err := p.Down(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -133,6 +146,13 @@ func TestMigration00024RoundTrip(t *testing.T) {
 	}
 	if n := count(`SELECT count(*) FROM apps`); n != 1 {
 		t.Fatalf("apps after down = %d", n)
+	}
+	if n := count(`SELECT count(*) FROM uploads`); n != 1 {
+		t.Fatalf("uploads after down = %d, want only the license row", n)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at)
+		VALUES ('2026/01/ffffffffffffffffffffffffffffffff.png', 1, 1, 'image/png', 'workflow_cover', now())`); !isCheck(err) {
+		t.Fatalf("workflow_cover after down: err = %v, want check violation", err)
 	}
 
 	if _, err := p.UpByOne(ctx); err != nil {

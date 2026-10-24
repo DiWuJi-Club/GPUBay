@@ -2,7 +2,14 @@
 -- 计划 11：ComfyUI 工作流市场。工作流目录（comfy_workflows / comfy_workflow_versions）、
 -- 某个 ComfyUI 部署上「应装」的工作流集合（deployment_workflows）、快速出图运行记录（comfy_workflow_runs）。
 -- 00021～00023 留给其它计划。
--- Down 只删这四张表；容器内已装的工作流文件、自定义节点与模型（/root/data/comfyui、/root/data/models）不受影响。
+-- 另外放开 uploads：新用途 workflow_cover（工作流封面，D13），所有者是平台（user_id 为 NULL，只允许该用途）。
+-- Down 删这四张表并删除封面登记、恢复 uploads 约束；容器内已装的工作流文件、自定义节点与模型（/root/data/comfyui、/root/data/models）
+-- 不受影响；封面文件本身留在上传目录（孤儿文件，无害）。
+
+ALTER TABLE uploads DROP CONSTRAINT uploads_purpose_check;
+ALTER TABLE uploads ADD CONSTRAINT uploads_purpose_check CHECK (purpose IN ('license', 'workflow_cover'));
+ALTER TABLE uploads ALTER COLUMN user_id DROP NOT NULL;
+ALTER TABLE uploads ADD CONSTRAINT uploads_owner_check CHECK ((user_id IS NULL) = (purpose = 'workflow_cover'));
 
 CREATE TABLE comfy_workflows (
     id          BIGSERIAL PRIMARY KEY,
@@ -69,3 +76,8 @@ DROP TABLE comfy_workflow_runs;
 DROP TABLE deployment_workflows;
 DROP TABLE comfy_workflow_versions;
 DROP TABLE comfy_workflows;
+DELETE FROM uploads WHERE purpose = 'workflow_cover';
+ALTER TABLE uploads DROP CONSTRAINT uploads_owner_check;
+ALTER TABLE uploads ALTER COLUMN user_id SET NOT NULL;
+ALTER TABLE uploads DROP CONSTRAINT uploads_purpose_check;
+ALTER TABLE uploads ADD CONSTRAINT uploads_purpose_check CHECK (purpose IN ('license'));
