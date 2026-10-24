@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { isApiError, messageOf, useMobile, type Deployment, type InstalledWorkflow, type QuickRun, type WorkflowInput } from '@spark/shared'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { fetchWorkflow, getQuickRun, startQuickRun, uploadQuickRunImage } from '../api'
+import { getInstalledWorkflow, getQuickRun, startQuickRun, uploadQuickRunImage } from '../api'
 import {
   buildRunInputs, defaultValues, fileKind, pollDelayMs, pollExpired, quickRunErrorText, runFinished, runStatusText, safeFileURL, type QuickValues,
 } from '../logic/quickrun'
@@ -12,8 +12,7 @@ import QuickRunForm from './QuickRunForm.vue'
  * 「运行」→ POST …/runs → 每 2 秒 GET …/runs/{id}，结束（完成 / 失败）或满 30 分钟停止（D10）。
  * 输出文件的 url 是同源代理地址（Cookie 鉴权），直接作 <img> / <video> 的 src 与下载链接。
  *
- * 参数表单取自 GET /workflows/{slug}（市场详情，只有最新已发布版本的 manifest）；控制台没有按已装版本取 inputs 的接口，
- * 已装版本落后时提示先更新；工作流已下线（详情 404）时按默认参数运行（服务器按已装版本校验）；其它加载失败不允许运行。
+ * 参数表单取自 GET …/workflows/{wid}（已装版本的 inputs，与服务器校验所用的一致）；加载失败或该版本不支持快速出图时不允许运行。
  */
 const props = defineProps<{ instanceId: string; deployment: Pick<Deployment, 'id' | 'url' | 'app_name'>; workflow: InstalledWorkflow | null }>()
 const visible = defineModel<boolean>({ required: true })
@@ -23,9 +22,8 @@ const inputs = ref<WorkflowInput[]>([])
 const values = ref<QuickValues>({})
 const loading = ref(false)
 const loadError = ref('')
-/** 参数表单加载失败且不是「已下线」：不允许运行（表单缺项会被服务器拒绝或按默认值误跑） */
+/** 参数表单加载失败 / 版本不支持快速出图：不允许运行 */
 const loadBlocking = ref(false)
-const versionNote = ref('')
 const form = ref<InstanceType<typeof QuickRunForm> | null>(null)
 
 const run = ref<QuickRun | null>(null)
@@ -58,7 +56,6 @@ function reset() {
   values.value = {}
   loadError.value = ''
   loadBlocking.value = false
-  versionNote.value = ''
   run.value = null
   runError.value = ''
   pollNote.value = ''
@@ -71,16 +68,18 @@ async function load() {
   const mine = seq
   loading.value = true
   try {
-    const d = await fetchWorkflow(w.slug)
+    const d = await getInstalledWorkflow(props.instanceId, props.deployment.id, w.workflow_id)
     if (mine !== seq) return
-    inputs.value = d.version.manifest?.inputs ?? []
+    inputs.value = d.inputs ?? []
     values.value = defaultValues(inputs.value)
-    if (d.version.id !== w.version_id) versionNote.value = `参数表单按最新版本 v${d.version.version} 显示（已装 v${w.version}）；如运行报参数错误，请先更新工作流`
+    if (!d.quick_run) {
+      loadError.value = `已装版本 v${d.workflow.version} 不支持快速出图，请在 ComfyUI 里使用`
+      loadBlocking.value = true
+    }
   } catch (e) {
     if (mine !== seq) return
-    const offline = isApiError(e) && e.code === 'workflow_not_found'
-    loadError.value = offline ? '该工作流已下线，无法加载参数表单；将按工作流的默认参数运行' : `参数表单加载失败：${messageOf(e)}`
-    loadBlocking.value = !offline
+    loadError.value = `参数表单加载失败：${messageOf(e)}`
+    loadBlocking.value = true
   } finally {
     if (mine === seq) loading.value = false
   }
@@ -173,7 +172,6 @@ function openComfy() {
         <el-skeleton v-if="loading" :rows="5" animated />
         <template v-else>
           <el-alert v-if="loadError" type="warning" :title="loadError" show-icon :closable="false" class="mb" data-testid="qr-load-error" />
-          <el-alert v-if="versionNote" type="info" :title="versionNote" show-icon :closable="false" class="mb" data-testid="qr-version-note" />
           <QuickRunForm ref="form" v-model="values" :inputs="inputs" :upload="upload" :disabled="inFlight" />
           <el-button type="primary" :loading="inFlight" :disabled="loadBlocking" data-testid="qr-run" @click="start">
             {{ inFlight ? '运行中…' : '运行' }}

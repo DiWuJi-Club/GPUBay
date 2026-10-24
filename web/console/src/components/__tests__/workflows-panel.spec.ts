@@ -10,6 +10,7 @@ Object.defineProperty(window, 'matchMedia', { value: (q: string) => ({ matches: 
 const m = vi.hoisted(() => ({
   fetchWorkflows: vi.fn(),
   fetchWorkflow: vi.fn(),
+  getInstalledWorkflow: vi.fn(),
   installWorkflow: vi.fn(),
   updateDeploymentWorkflow: vi.fn(),
   removeDeploymentWorkflow: vi.fn(),
@@ -32,6 +33,8 @@ const detail = (versionId = 50) => ({ version: { id: versionId, version: version
   { key: 'seed', label: '种子', type: 'seed', node: '3', input: 'seed' },
   { key: 'image', label: '参考图', type: 'image', node: '10', input: 'image' },
 ] } } })
+/** 已装版本的快速出图参数（GET …/workflows/{wid}）。 */
+const installed = (quickRun = true) => ({ workflow: wf({ update_available: false, latest_version_id: 50 }), inputs: detail().version.manifest.inputs, outputs: [], quick_run: quickRun })
 const IMG = 'spark-quickrun/abcdef012345.png'
 const runView = (over: Partial<QuickRun> = {}): QuickRun => ({
   id: 'r1', prompt_id: 'p', seed: 77, state: 'queued', files: [], message: '', created_at: '2026-10-24T10:00:00Z', finished_at: null, ...over,
@@ -80,6 +83,7 @@ beforeEach(() => {
   vi.resetAllMocks()
   m.fetchWorkflows.mockResolvedValue([catalogItem(5, 'sdxl', 6.9), catalogItem(6, 'flux', 17)])
   m.fetchWorkflow.mockResolvedValue(detail())
+  m.getInstalledWorkflow.mockResolvedValue(installed())
   m.installWorkflow.mockResolvedValue({})
   m.updateDeploymentWorkflow.mockResolvedValue({})
   m.removeDeploymentWorkflow.mockResolvedValue({})
@@ -340,19 +344,29 @@ describe('QuickRunDrawer', () => {
     expect(URL.createObjectURL).not.toHaveBeenCalled()
   })
 
-  it('参数加载失败：已下线（404）按默认参数可运行；其它错误不可运行', async () => {
-    m.fetchWorkflow.mockRejectedValueOnce(new ApiError(404, 'workflow_not_found', '工作流不存在或未上架'))
+  it('表单按已装版本的 inputs 渲染（GET …/workflows/{wid}）', async () => {
+    mountDrawer()
+    await flushPromises()
+    expect(m.getInstalledWorkflow).toHaveBeenCalledWith('ins-1', 'dep-1', 5)
+    expect(m.fetchWorkflow).not.toHaveBeenCalled()
+    expect(q('qr-input-width')).toBeTruthy()
+    expect(q('qr-load-error')).toBeNull()
+    expect(q('qr-run')!.hasAttribute('disabled')).toBe(false)
+  })
+
+  it('参数加载失败（含 404 workflow_not_found）或版本不支持快速出图：不可运行', async () => {
+    m.getInstalledWorkflow.mockRejectedValueOnce(new ApiError(404, 'workflow_not_found', '工作流不存在或未上架'))
     const w = mountDrawer()
     await flushPromises()
-    expect(q('qr-load-error')!.textContent).toContain('已下线')
-    expect(q('qr-run')!.hasAttribute('disabled')).toBe(false)
+    expect(q('qr-load-error')!.textContent).toContain('参数表单加载失败：工作流不存在或未上架')
+    expect(q('qr-run')!.hasAttribute('disabled')).toBe(true)
     w.unmount()
     wrappers = []
     document.body.innerHTML = ''
-    m.fetchWorkflow.mockRejectedValueOnce(new ApiError(500, 'internal', '服务器错误'))
+    m.getInstalledWorkflow.mockResolvedValueOnce(installed(false))
     mountDrawer()
     await flushPromises()
-    expect(q('qr-load-error')!.textContent).toContain('参数表单加载失败')
+    expect(q('qr-load-error')!.textContent).toContain('不支持快速出图')
     expect(q('qr-run')!.hasAttribute('disabled')).toBe(true)
   })
 })

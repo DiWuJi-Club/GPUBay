@@ -1,5 +1,6 @@
 import {
   createHttp, type Deployment, type HttpOptions, type InstalledWorkflow, type Listed, type QuickRun, type WorkflowCatalogItem, type WorkflowDetail,
+  type WorkflowInput, type WorkflowOutput,
 } from '@spark/shared'
 
 const handlers = { unauthorized: () => {} }
@@ -16,7 +17,14 @@ export function onUnauthorized(fn: () => void) {
 /** 安装 / 更新 / 移除的响应：部署视图（同 GET /instances/{id}/apps 的条目）与该部署的已装工作流。 */
 export interface InstalledWorkflowsResult { deployment: Deployment; workflows: InstalledWorkflow[] }
 
+/** GET …/workflows/{wid}：已装的一项与**已装版本**的快速出图参数（inputs / outputs 恒为数组）。 */
+export interface InstalledWorkflowDetail { workflow: InstalledWorkflow; inputs: WorkflowInput[]; outputs: WorkflowOutput[]; quick_run: boolean }
+
 const wfBase = (instanceId: string, depId: string) => `/instances/${instanceId}/apps/${depId}/workflows`
+
+/** 已装工作流详情（快速出图表单按它渲染）；不在该部署的集合里 → workflow_not_found。 */
+export const getInstalledWorkflow = (instanceId: string, depId: string, workflowId: number) =>
+  api.get<InstalledWorkflowDetail>(`${wfBase(instanceId, depId)}/${workflowId}`)
 
 export const updateDeploymentWorkflow = (instanceId: string, depId: string, workflowId: number, versionId?: number | null) =>
   api.put<InstalledWorkflowsResult>(`${wfBase(instanceId, depId)}/${workflowId}`, versionId ? { version_id: versionId } : {})
