@@ -13,6 +13,7 @@ import (
 
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
+	"spark-cloud/internal/butler"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
@@ -54,11 +55,16 @@ type Server struct {
 	// 计划 7：应用部署；nil 时不注册 /apps* 与 /instances/{id}/apps*，实例视图的 apps_summary 恒为空数组
 	Apps      *appdeploy.Service
 	AppsLimit int // 应用部署类写操作每用户每小时上限；零值 appdeploy.UserOpsPerHour（60）
+	// 计划 12：AI 管家；nil 时不注册 /butler/*（前端按「未开放」处理）
+	Butler      *butler.Service
+	ButlerLimit int           // 发消息 + 确认每用户每分钟上限；零值 butler.SendRatePerMinute（20）
+	ButlerPing  time.Duration // SSE 保活注释间隔；零值 15 秒（测试调小）
 
 	authorizeLim *userLimiter
 	calendarLim  *ipLimiter
 	referralLim  *ipLimiter
 	appsLim      *userLimiter
+	butlerLim    *userLimiter
 }
 
 const sessionCookie = "sc_session"
@@ -94,6 +100,11 @@ func (s *Server) Router() http.Handler {
 		alimit = appdeploy.UserOpsPerHour
 	}
 	s.appsLim = &userLimiter{limit: alimit, window: time.Hour}
+	blimit := s.ButlerLimit
+	if blimit <= 0 {
+		blimit = butler.SendRatePerMinute
+	}
+	s.butlerLim = &userLimiter{limit: blimit, window: time.Minute}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -189,6 +200,14 @@ func (s *Server) Router() http.Handler {
 				r.Get("/referral/me", s.handleReferralMe)
 				r.Get("/referral/invitees", s.handleReferralInvitees)
 				r.Get("/referral/rewards", s.handleReferralRewards)
+			}
+			if s.Butler != nil {
+				r.Get("/butler/status", s.handleButlerStatus)
+				r.Get("/butler/conversations", s.handleButlerConversations)
+				r.Get("/butler/conversations/{id}", s.handleButlerConversation)
+				r.Delete("/butler/conversations/{id}", s.handleButlerDelete)
+				r.Post("/butler/conversations/{id}/messages", s.handleButlerSend)                   // SSE；id 可为 new
+				r.Post("/butler/conversations/{id}/tool-calls/{tc}/confirm", s.handleButlerConfirm) // SSE
 			}
 			if s.DevPay {
 				r.Post("/dev/recharges/{id}/pay", s.handleDevPay)

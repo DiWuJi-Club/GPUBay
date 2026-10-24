@@ -96,6 +96,16 @@ func newAppsTestEnv(t *testing.T, tweak func(*api.Server)) *testEnv {
 
 func buildTestEnv(t *testing.T, withApps bool, tweak func(*api.Server)) *testEnv {
 	t.Helper()
+	var setup func(*api.Server, *pgxpool.Pool)
+	if tweak != nil {
+		setup = func(srv *api.Server, _ *pgxpool.Pool) { tweak(srv) }
+	}
+	return buildTestEnvPool(t, withApps, setup)
+}
+
+// buildTestEnvPool 同 buildTestEnv，调整函数额外拿到连接池（组装需要直连数据库的服务，例如 AI 管家）。
+func buildTestEnvPool(t *testing.T, withApps bool, tweak func(*api.Server, *pgxpool.Pool)) *testEnv {
+	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
 	box, _ := secretbox.New(dbtest.Key)
@@ -136,7 +146,7 @@ func buildTestEnv(t *testing.T, withApps bool, tweak func(*api.Server)) *testEnv
 		srv.Apps = apps
 	}
 	if tweak != nil {
-		tweak(srv)
+		tweak(srv, pool)
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
