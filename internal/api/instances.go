@@ -223,6 +223,8 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		ImageID   int64             `json:"image_id"`
 		AppID     *int64            `json:"app_id"`  // 计划 7：开通后自动部署的应用（可选）
 		AppEnv    map[string]string `json:"app_env"` // 该应用的变量值；校验失败整单不下、不扣款
+		// 计划 11：随应用一并预装的 ComfyUI 工作流（须同时给 app_id；最多 8 个，校验在 PrepareInstall）
+		AppWorkflowIDs []int64 `json:"app_workflow_ids"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		s.writeError(w, r, err)
@@ -230,7 +232,7 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	ord, inst, err := s.Rental.Place(r.Context(), rental.PlaceRequest{
 		UserID: currentUser(r).ID, ProductID: req.ProductID, ImageID: req.ImageID, Duration: catalog.Duration(req.Duration),
-		IdempotencyKey: r.Header.Get(idempotencyHeader), AppID: req.AppID, AppEnv: req.AppEnv,
+		IdempotencyKey: r.Header.Get(idempotencyHeader), AppID: req.AppID, AppEnv: req.AppEnv, AppWorkflowIDs: req.AppWorkflowIDs,
 	})
 	if err != nil {
 		s.writeError(w, r, err)
