@@ -110,6 +110,7 @@ type App struct {
 
 	LLM           *llm.Service    // Token 商城（计划 9）；Settle 挂在清扫器上，Router 由 RunAccessLoops 刷新
 	LLMController *llm.Controller // 节点生命周期；由 cmd/platform 按 SPARK_LLM_CONTROLLER 启动（e2e-server 不启动，用钩子驱动）
+	LLMGateway    *llmgw.Server   // /v1 网关；SPARK_LLM_GATEWAY=off 时 nil。cmd/platform 停机时与公网 http.Server.Shutdown 并发调用它的 Shutdown
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
@@ -325,8 +326,11 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Images: c, Fleet: f, Upstream: upstreamPool, SystemUserID: systemUserID})
 	llmCtl := llm.NewController(llmSvc)
 	srv.LLM, adminSrv.LLM = llmSvc, llmSvc
+	var llmGW *llmgw.Server
 	if cfg.LLMGateway {
-		srv.LLMGateway = llmgw.New(llmSvc, llmgw.Config{}, clk, log).Router()
+		// 401 的按 IP 限流：零值取默认（每 IP 每分钟 60 次）；DisableRateLimits 时为 noRateLimit（同其它按 IP 限流）
+		llmGW = llmgw.New(llmSvc, llmgw.Config{AuthFailLimit: authorizeLimit}, clk, log)
+		srv.LLMGateway = llmGW.Router()
 	}
 	routes := ingress.NewTable(r, log)
 	ingSrv := ingress.NewServer(ingressAuth, routes, ids, upstreamPool, r, clk, log)
@@ -338,7 +342,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
 		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner,
-		LLM: llmSvc, LLMController: llmCtl}, nil
+		LLM: llmSvc, LLMController: llmCtl, LLMGateway: llmGW}, nil
 }
 
 // upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。

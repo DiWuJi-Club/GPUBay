@@ -117,15 +117,22 @@ func run(log *slog.Logger) error {
 		close(runnerDone)
 		log.Warn("SPARK_APP_RUNNER=off：应用部署不会推进")
 	}
+	// Token 节点 Controller 只能跑在提供 /v1 的副本里：排空节点时看的是进程内的在途请求数（llm.Router），
+	// 没有网关的副本看到的永远是 0，会在仍有请求时释放节点。多个网关副本都开时咨询锁保证只有一个在工作，
+	// 但它只看得到自己进程的在途请求——建议网关与 Controller 同在一个副本（见 README「Token 商城」）。
 	controllerDone := make(chan struct{})
-	if cfg.LLMController { // 多副本都开也安全：每轮先拿会话级咨询锁，同一时刻只有一个副本在建 / 探测 / 排空节点
+	switch {
+	case cfg.LLMController && cfg.LLMGateway:
 		go func() {
 			defer close(controllerDone)
 			a.LLMController.Run(ctx)
 		}()
-	} else {
+	case cfg.LLMController:
 		close(controllerDone)
-		log.Warn("SPARK_LLM_CONTROLLER=off：Token 商城节点不会创建、探测或排空")
+		log.Warn("SPARK_LLM_CONTROLLER=on 但 SPARK_LLM_GATEWAY=off：Controller 只在提供 /v1 的副本上运行（排空要看本进程的在途请求），本副本不启动")
+	default:
+		close(controllerDone)
+		log.Warn("SPARK_LLM_CONTROLLER=off：本副本不创建、探测或排空 Token 商城节点")
 	}
 	if !cfg.LLMGateway {
 		log.Warn("SPARK_LLM_GATEWAY=off：本副本不提供 /v1（OpenAI 兼容网关）")
@@ -192,7 +199,8 @@ func run(log *slog.Logger) error {
 		}
 	}
 	// 停机顺序：1) 停止 accept（ctx → SSH 网关 / Agent 网关；Shutdown → 各 HTTP 监听器）；2) SSH drain（最长 SPARK_SSH_DRAIN_TIMEOUT，
-	// 与 HTTP 关闭同时进行）；3) HTTP 与 ingress 并发关闭：ingress 立即撤销 WebSocket / SSE，普通请求给 5 秒宽限后撤销剩下的，
+	// 与 HTTP 关闭同时进行）；3) HTTP、ingress 与 /v1 网关并发关闭：ingress 立即撤销 WebSocket / SSE，普通请求给 5 秒宽限后撤销剩下的；
+	// /v1 网关给在途请求 5 秒宽限，期满取消仍在转发的（记 upstream_error、不收费）并等它们记完账；
 	// http.Server.Shutdown 因而不被长连接拖住；4) 关上游连接池；5) 关数据库（defer）。
 	// 总耗时约 max(SSH drain 30s, HTTP 10s) + 几秒，compose / systemd 的停止超时应 ≥ 45s。
 	stop() // 确保清扫器、网关、访问层循环退出，SSH 网关停止 accept 并开始 drain
@@ -203,6 +211,13 @@ func run(log *slog.Logger) error {
 		defer close(ingressDone)
 		a.Ingress.Shutdown(shutdownCtx, ingressShutdownGrace)
 	}()
+	llmGWDone := make(chan struct{})
+	go func() {
+		defer close(llmGWDone)
+		if a.LLMGateway != nil {
+			a.LLMGateway.Shutdown(shutdownCtx, llmShutdownGrace)
+		}
+	}()
 	for _, s := range []*http.Server{srv, adminSrv, redirect} {
 		if s == nil {
 			continue
@@ -212,6 +227,7 @@ func run(log *slog.Logger) error {
 		}
 	}
 	<-ingressDone
+	<-llmGWDone // 被取消的 /v1 请求记完账（走数据库、上游连接池）之后才往下关
 	<-sweeperDone
 	<-runnerDone     // Runner 的 exec 走上游连接池：先等它退出再关池
 	<-controllerDone // Controller 的探测同样走上游连接池
@@ -229,6 +245,9 @@ func run(log *slog.Logger) error {
 
 // ingressShutdownGrace：停机时给进行中的普通租户请求的宽限。
 const ingressShutdownGrace = 5 * time.Second
+
+// llmShutdownGrace：停机时给进行中的 /v1 请求（含流式生成）的宽限；比 HTTP 关闭的 10 秒短，期满取消的请求还来得及写完错误。
+const llmShutdownGrace = 5 * time.Second
 
 // listensOnAllInterfaces 报告监听地址是否绑定了所有网卡（:8081、0.0.0.0:8081、[::]:8081）。
 func listensOnAllInterfaces(addr string) bool {

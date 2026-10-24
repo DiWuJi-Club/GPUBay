@@ -193,7 +193,7 @@ func streamErrorEvent(code, msg string) []byte {
 }
 
 // stream 规格 §6.1 第 10 步（流式）：逐 SSE 事件透传并 Flush；统计内容块、取末尾 usage；[DONE] 结束。
-// 客户端断开 → 取消上游、client_abort 按块数估算计费；上游首字节后断开 / 超时 → 写一个 error 事件后结束，不计费。
+// 客户端断开 → 取消上游、client_abort 按块数估算计费；停机取消 → error 事件、upstream_error 不收费；上游首字节后断开 / 超时 → 写一个 error 事件后结束，不计费。
 func (c *call) stream(ctx context.Context, node *llm.RouteNode, up upstreamResp) {
 	resp := up.resp
 	defer resp.Body.Close()
@@ -273,6 +273,10 @@ func (c *call) stream(ctx context.Context, node *llm.RouteNode, up upstreamResp)
 			o.prompt, o.completed, o.estimated = usage.PromptTokens, usage.CompletionTokens, false
 		}
 		c.record(o)
+	case shutDown(ctx):
+		c.g.log.Warn("llmgw: stream cancelled by shutdown", "node_id", node.ID, "request_id", c.reqID)
+		c.writeStreamError(codeUpstreamError, "服务正在重启，本次请求不收费，请重试")
+		c.record(outcome{node: node, status: llm.UsageUpstreamError, httpStatus: http.StatusOK, ttft: ttft})
 	case ctx.Err() != nil || isTimeout(sc.Err()):
 		c.g.log.Warn("llmgw: upstream stream timed out", "node_id", node.ID, "request_id", c.reqID)
 		c.writeStreamError(codeUpstreamTimeout, "上游节点响应超时，本次请求不收费")
