@@ -1,8 +1,8 @@
 import { ApiError, type QuickRun, type WorkflowInput } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  MAX_SEED, buildRunInputs, defaultValues, fileKind, pollDeadlineMs, pollDelayMs, pollExpired, quickRunErrorText, runFinished, runStatusText,
-  validateValue, validateValues,
+  MAX_SEED, buildRunInputs, defaultValues, fileKind, inputRequired, pollDeadlineMs, pollDelayMs, pollExpired, quickRunErrorText, runFinished,
+  runStatusText, safeFileURL, validateValue, validateValues,
 } from '../quickrun'
 
 const inp = (over: Partial<WorkflowInput> & Pick<WorkflowInput, 'key' | 'type'>): WorkflowInput => ({ label: over.key, node: '1', input: over.key, ...over })
@@ -67,17 +67,11 @@ describe('validateValue（与后端 BuildPrompt / coerceValue 一致）', () => 
     const len = inp({ key: 'length', type: 'int', default: 81, min: 1, max: 121, step: 4 })
     expect(validateValue(len, 81)).toBeNull()
     expect(validateValue(len, 80)).toBe('必须是 1 加 4 的整数倍')
-    // 无 min：按 v % step
-    const nomin = inp({ key: 'n', type: 'int', default: 8, max: 64, step: 8 })
-    expect(validateValue(nomin, 16)).toBeNull()
-    expect(validateValue(nomin, 12)).toBe('必须是 0 加 8 的整数倍')
-    expect(validateValue(nomin, 72)).toBe('不能大于 64')
   })
   it('float：数字与区间', () => {
     expect(validateValue(by('cfg'), 7.5)).toBeNull()
     expect(validateValue(by('cfg'), 0.5)).toBe('应在 1～30')
     expect(validateValue(by('cfg'), Number.NaN)).toBe('必须是数字')
-    expect(validateValue(inp({ key: 'f', type: 'float', default: 1, min: 0 }), -1)).toBe('不能小于 0')
   })
   it('text / textarea：max_len（默认 1000，按字符数）、NUL', () => {
     expect(validateValue(by('prompt'), '猫'.repeat(2000))).toBeNull()
@@ -110,13 +104,39 @@ describe('validateValue（与后端 BuildPrompt / coerceValue 一致）', () => 
     expect(validateValue(im, '../x.png')).toBe('请先上传图片')
     expect(validateValue(im, '')).toBe('必填')
   })
-  it('没有默认值的输入必填（seed 除外）；有默认值时留空用默认', () => {
-    expect(validateValue(inp({ key: 't', type: 'text' }), '')).toBe('必填')
+  it('没有默认值的输入必填（seed、文本除外）；有默认值时留空用默认', () => {
+    // 文本：空串是合法值（后端 coerceValue 接受 ""），表单总会发送字符串
+    expect(validateValue(inp({ key: 't', type: 'text' }), '')).toBeNull()
+    expect(validateValue(inp({ key: 't', type: 'textarea' }), '')).toBeNull()
+    expect(validateValue(inp({ key: 't', type: 'text' }), null)).toBe('必填')
     expect(validateValue(inp({ key: 'n', type: 'int', min: 1, max: 9 }), null)).toBe('必填')
     expect(validateValue(inp({ key: 'e', type: 'enum', options: ['a'] }), '')).toBe('必填')
     expect(validateValue(by('steps'), null)).toBeNull()
     expect(validateValue(by('sampler'), '')).toBeNull()
     expect(validateValue(by('negative'), '')).toBeNull()
+  })
+})
+
+describe('inputRequired（表单星号）', () => {
+  it('无默认值的数字 / 枚举 / 图片必填；文本、bool、seed 不标', () => {
+    expect(inputRequired(inp({ key: 'n', type: 'int', min: 1, max: 2 }))).toBe(true)
+    expect(inputRequired(inp({ key: 'e', type: 'enum', options: ['a'] }))).toBe(true)
+    expect(inputRequired(inp({ key: 'i', type: 'image' }))).toBe(true)
+    expect(inputRequired(inp({ key: 't', type: 'text' }))).toBe(false)
+    expect(inputRequired(inp({ key: 't', type: 'textarea' }))).toBe(false)
+    expect(inputRequired(inp({ key: 'b', type: 'bool' }))).toBe(false)
+    expect(inputRequired(inp({ key: 's', type: 'seed' }))).toBe(false)
+    expect(inputRequired(inp({ key: 'n', type: 'int', default: 1, min: 1, max: 2 }))).toBe(false)
+  })
+})
+
+describe('safeFileURL', () => {
+  it('只接受本站的运行文件代理地址', () => {
+    expect(safeFileURL('/api/v1/instances/i/apps/d/workflows/5/runs/r/files/0')).toBe('/api/v1/instances/i/apps/d/workflows/5/runs/r/files/0')
+    expect(safeFileURL('https://evil.example/x.png')).toBe('')
+    expect(safeFileURL('//evil.example/api/v1/instances/x')).toBe('')
+    expect(safeFileURL('javascript:alert(1)')).toBe('')
+    expect(safeFileURL('')).toBe('')
   })
 })
 

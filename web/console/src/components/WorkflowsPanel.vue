@@ -2,9 +2,10 @@
 import { labelOf, workflowStateLabel, workflowStateType, type Deployment, type InstalledWorkflow, type Instance } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, ref } from 'vue'
-import { panelWorkflowDetail, removeDeploymentWorkflow, updateDeploymentWorkflow } from '../api'
+import { fetchWorkflow, removeDeploymentWorkflow, updateDeploymentWorkflow } from '../api'
 import {
-  MAX_WORKFLOWS, canChangeWorkflows, deploymentWorkflows, workflowPanelNotice, workflowRemoveConfirmText, workflowRowActions, workflowUpdateConfirmText,
+  MAX_WORKFLOWS, canChangeWorkflows, deploymentWorkflows, workflowChangeBlockReason, workflowPanelNotice, workflowRemoveConfirmText, workflowRowActions,
+  workflowUpdateConfirmText,
 } from '../logic/apps'
 import { notifyError } from '../logic/notify'
 import AppDialog from './AppDialog.vue'
@@ -23,6 +24,8 @@ const list = computed(() => deploymentWorkflows(props.deployment))
 const notice = computed(() => workflowPanelNotice(props.deployment))
 const canChange = computed(() => canChangeWorkflows(props.deployment))
 const atLimit = computed(() => list.value.length >= MAX_WORKFLOWS)
+/** 添加 / 更新 / 移除都会重新部署：实例非运行时（排队中的部署除外）置灰并说明原因，同应用卡片的「重新部署」 */
+const blockReason = computed(() => workflowChangeBlockReason(props.deployment, props.instance.state))
 const actions = (w: InstalledWorkflow) => workflowRowActions(w, props.deployment, props.instance.state)
 
 function openComfy() {
@@ -53,7 +56,7 @@ async function ask(kind: 'update' | 'remove', w: InstalledWorkflow) {
   if (kind !== 'update' || !w.update_available) return
   // 新版本的更新说明：市场详情里的最新已发布版本正是要更新到的版本时才显示（拿不到不影响更新）
   try {
-    const d = await panelWorkflowDetail(w.slug)
+    const d = await fetchWorkflow(w.slug)
     if (mine === seq && d.version.id === w.latest_version_id) changelog.value = d.version.changelog
   } catch {
     // 忽略：确认文案已含新版本号
@@ -62,7 +65,7 @@ async function ask(kind: 'update' | 'remove', w: InstalledWorkflow) {
 
 async function confirmAction() {
   const t = confirmTarget.value
-  if (!t || busy.value) return
+  if (!t || busy.value || blockReason.value) return
   busy.value = true
   try {
     if (t.kind === 'update') {
@@ -83,6 +86,7 @@ async function confirmAction() {
 }
 
 function onCommand(w: InstalledWorkflow, cmd: string) {
+  if (blockReason.value) return
   if (cmd === 'update' || cmd === 'remove') void ask(cmd, w)
 }
 </script>
@@ -111,10 +115,12 @@ function onCommand(w: InstalledWorkflow, cmd: string) {
           <el-button size="small" :data-testid="`wf-more-${w.slug}`">更多 ▾</el-button>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item v-if="actions(w).update" command="update" :data-testid="`wf-update-${w.slug}`">
-                {{ actions(w).update === 'update' ? `更新到 v${w.latest_version}` : '重试安装' }}
+              <el-dropdown-item v-if="actions(w).update" command="update" :disabled="!!actions(w).blocked" :data-testid="`wf-update-${w.slug}`">
+                {{ actions(w).update === 'update' ? `更新到 v${w.latest_version}` : '重试安装' }}<span v-if="actions(w).blocked" class="reason">（{{ actions(w).blocked }}）</span>
               </el-dropdown-item>
-              <el-dropdown-item v-if="actions(w).remove" command="remove" divided :data-testid="`wf-remove-${w.slug}`">移除</el-dropdown-item>
+              <el-dropdown-item v-if="actions(w).remove" command="remove" divided :disabled="!!actions(w).blocked" :data-testid="`wf-remove-${w.slug}`">
+                移除<span v-if="actions(w).blocked" class="reason">（{{ actions(w).blocked }}）</span>
+              </el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
@@ -123,7 +129,10 @@ function onCommand(w: InstalledWorkflow, cmd: string) {
     </div>
 
     <template v-if="canChange">
-      <el-button v-if="!atLimit" size="small" data-testid="wf-add" @click="addVisible = true">添加工作流</el-button>
+      <div v-if="!atLimit" class="add">
+        <el-button size="small" :disabled="!!blockReason" data-testid="wf-add" @click="addVisible = true">添加工作流</el-button>
+        <span v-if="blockReason" class="muted small" data-testid="wf-add-blocked">{{ blockReason }}</span>
+      </div>
       <p v-else class="muted small" data-testid="wf-limit">每个 ComfyUI 最多安装 {{ MAX_WORKFLOWS }} 个工作流</p>
     </template>
 
@@ -160,6 +169,8 @@ function onCommand(w: InstalledWorkflow, cmd: string) {
 .muted { color: #909399; }
 .small { font-size: 12px; margin: 4px 0; }
 .danger { color: var(--el-color-danger); }
+.add { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.reason { color: #c0c4cc; font-size: 12px; }
 .changelog { margin-top: 8px; padding: 8px; background: var(--el-fill-color-light); border-radius: 4px; }
 .changelog p { margin: 4px 0 0; white-space: pre-wrap; }
 @media (max-width: 768px) { .wf-panel { margin-left: 0; } }

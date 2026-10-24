@@ -3,8 +3,10 @@ import {
   type AppCatalogItem, type Deployment, type DeploymentState, type Duration, type Instance, type Product, type WorkflowCatalogItem, type WorkflowCategory, type WorkflowModel,
 } from '@spark/shared'
 
-/** 每个 ComfyUI 部署最多装的工作流数（与 comfywf.MaxWorkflowsPerDeployment 一致）；开通时预装同样上限。 */
-export const MAX_WORKFLOWS = 8
+import { MAX_WORKFLOWS } from './apps'
+
+/** 每个 ComfyUI 部署最多装的工作流数（定义在 logic/apps.ts）；开通时预装同样上限。 */
+export { MAX_WORKFLOWS }
 /** 安装弹窗最多查询的实例数（每台一个 GET /instances/{id}/apps）。 */
 export const INSTALL_SCAN_LIMIT = 20
 /** 市场页分类标签顺序（规格 §4）。 */

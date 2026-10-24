@@ -2,7 +2,7 @@
 import type { WorkflowInput } from '@spark/shared'
 import type { UploadRequestOptions, UploadRawFile } from 'element-plus'
 import { onBeforeUnmount, reactive } from 'vue'
-import { validateValue, validateValues, quickRunErrorText, type QuickValue, type QuickValues } from '../logic/quickrun'
+import { inputRequired, quickRunErrorText, validateValue, validateValues, type QuickValue, type QuickValues } from '../logic/quickrun'
 
 /**
  * 快速出图表单：按工作流版本的 inputs 渲染（规格 §4）。textarea / text → el-input，int / float → el-input-number，bool → switch，
@@ -23,7 +23,7 @@ const val = (i: WorkflowInput) => model.value[i.key]
 const numVal = (i: WorkflowInput) => (typeof val(i) === 'number' ? (val(i) as number) : undefined)
 const strVal = (i: WorkflowInput) => (typeof val(i) === 'string' ? (val(i) as string) : '')
 const hasDefault = (i: WorkflowInput) => i.default !== undefined && i.default !== null
-const required = (i: WorkflowInput) => i.type !== 'seed' && !hasDefault(i)
+let disposed = false // 上传返回前表单已卸载（抽屉关闭）：丢弃结果，不再创建缩略图 URL
 
 function set(key: string, v: QuickValue) {
   model.value = { ...model.value, [key]: v }
@@ -70,16 +70,18 @@ async function doUpload(i: WorkflowInput, opt: UploadRequestOptions) {
   delete errors[i.key]
   try {
     const name = await props.upload(opt.file)
+    if (disposed) return
     if (previews[i.key]) URL.revokeObjectURL(previews[i.key])
     previews[i.key] = URL.createObjectURL(opt.file)
     set(i.key, name)
   } catch (e) {
-    errors[i.key] = `上传失败：${quickRunErrorText(e)}`
+    if (!disposed) errors[i.key] = `上传失败：${quickRunErrorText(e)}`
   } finally {
-    uploading[i.key] = false
+    if (!disposed) uploading[i.key] = false
   }
 }
 onBeforeUnmount(() => {
+  disposed = true
   for (const u of Object.values(previews)) URL.revokeObjectURL(u)
 })
 
@@ -98,7 +100,7 @@ defineExpose({ validate })
 <template>
   <el-form label-position="top" class="qr-form" data-testid="qr-form" @submit.prevent>
     <p v-if="!inputs.length" class="help">这个工作流没有可调参数，将按默认设置运行。</p>
-    <el-form-item v-for="i in inputs" :key="i.key" :label="i.label || i.key" :required="required(i)" :class="{ 'is-error': !!errors[i.key] }">
+    <el-form-item v-for="i in inputs" :key="i.key" :label="i.label || i.key" :required="inputRequired(i)" :class="{ 'is-error': !!errors[i.key] }">
       <el-input
         v-if="i.type === 'textarea'" type="textarea" :autosize="{ minRows: 3, maxRows: 10 }" :model-value="strVal(i)" :placeholder="placeholder(i)"
         :disabled="disabled" :data-testid="`qr-input-${i.key}`" @update:model-value="(v: string) => set(i.key, v)" @blur="check(i)"

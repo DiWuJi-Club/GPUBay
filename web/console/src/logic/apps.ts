@@ -248,7 +248,7 @@ export function mergeTimeline(inst: UserEvent[], apps: { name: string; events: D
 
 // ---- 计划 11：ComfyUI 部署上的工作流（实例详情「应用」卡片的工作流子区块） ----
 
-/** 每个 ComfyUI 部署最多安装的工作流数（与 comfywf.MaxWorkflowsPerDeployment 一致）。 */
+/** 每个 ComfyUI 部署最多安装的工作流数（与 comfywf.MaxWorkflowsPerDeployment 一致；logic/workflows.ts 转出同一常量）。 */
 export const MAX_WORKFLOWS = 8
 
 /** 显示工作流子区块的部署：应用 slug 为 comfyui（与后端 Installer 按 slug 判断一致）。 */
@@ -263,6 +263,16 @@ export function deploymentWorkflows(d: Pick<Deployment, 'workflows'>): Installed
 export const canChangeWorkflows = (d: Pick<Deployment, 'state'>) =>
   d.state === 'queued' || d.state === 'running' || d.state === 'stopped' || d.state === 'failed'
 
+/**
+ * 增删改工作流的不可用原因（null = 可用）：部署进行中；或实例不在运行（会重新部署，同「重新部署」的限制）。
+ * 排队中的部署（实例开通前 / 恢复前）只改集合、随部署安装，不受实例状态限制。
+ */
+export function workflowChangeBlockReason(d: Pick<Deployment, 'state'>, instanceState: InstanceState): string | null {
+  if (!canChangeWorkflows(d)) return '部署进行中，完成后可操作'
+  if (d.state === 'queued') return null
+  return appOpBlockReason(instanceState)
+}
+
 /** 部署中时子区块顶部的提示（有工作流时；进度条沿用应用行的渲染）。 */
 export function workflowPanelNotice(d: Pick<Deployment, 'state' | 'workflows'>): string | null {
   return d.state === 'installing' && deploymentWorkflows(d).length ? '正在安装工作流…（随应用进度）' : null
@@ -275,9 +285,11 @@ export interface WorkflowRowActions {
   quickRun: boolean
   /** 实例不在运行（停机等）时快速出图置灰 */
   quickRunDisabled: boolean
-  /** 更多菜单：有新版本 → 更新；安装失败且无新版本 → 重试安装（PUT 同版本 = 重试）；部署中不可 */
+  /** 更多菜单：有新版本 → 更新；安装失败且无新版本 → 重试安装（PUT 同版本 = 重试）；部署中、没有已发布版本时不提供 */
   update: 'update' | 'retry' | null
   remove: boolean
+  /** 更新 / 移除暂不可用的原因（实例非运行等）：菜单项置灰并显示原因 */
+  blocked: string | null
 }
 
 export function workflowRowActions(w: InstalledWorkflow, d: Pick<Deployment, 'state' | 'url'>, instanceState: InstanceState): WorkflowRowActions {
@@ -286,8 +298,9 @@ export function workflowRowActions(w: InstalledWorkflow, d: Pick<Deployment, 'st
     open: d.state === 'running' && !!d.url,
     quickRun: w.quick_run && w.state === 'installed' && d.state === 'running',
     quickRunDisabled: instanceState !== 'running',
-    update: !change ? null : w.update_available ? 'update' : w.state === 'failed' ? 'retry' : null,
+    update: !change || w.latest_version_id == null ? null : w.update_available ? 'update' : w.state === 'failed' ? 'retry' : null,
     remove: change,
+    blocked: change ? workflowChangeBlockReason(d, instanceState) : null,
   }
 }
 
