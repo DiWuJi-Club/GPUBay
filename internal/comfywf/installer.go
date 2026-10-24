@@ -86,7 +86,8 @@ func (h *Hooks) BundleExtra(ctx context.Context, d appdeploy.Deployment, ver app
 // OnTransition 实现 appdeploy.Deps.OnTransition（每个部署的 running / failed 回写都会调，非 comfyui 部署没有行，是一条空 UPDATE）：
 //   - running，部署版本支持工作流：pending / failed → installed（installed_at = now）。failed 的也算：重新部署成功 = 集合里的
 //     全部工作流都装好了（规格 §2）。
-//   - running，部署版本不支持工作流（包里没有 workflows/，什么也没装）：pending → failed（规格 §14：running 的部署上没有 pending 行）。
+//   - running，部署版本不支持工作流（包里没有 workflows/，什么也没装，例如换回了旧版本）：pending / installed → failed（规格 §14：
+//     running 的部署上没有 pending 行；之前装的也不再由平台维护，快速出图随之停用）。
 //   - failed：pending → failed。
 //
 // d 是更新前的行（AppVersionID 即本次部署的版本）。
@@ -97,7 +98,7 @@ func (h *Hooks) OnTransition(ctx context.Context, tx pgx.Tx, d appdeploy.Deploym
 		_, err = tx.Exec(ctx, `WITH v AS (SELECT COALESCE((spec->>'supports_workflows')::boolean, false) AS ok FROM app_versions WHERE id = $3)
 			UPDATE deployment_workflows dw SET state = CASE WHEN v.ok THEN 'installed' ELSE 'failed' END,
 				installed_at = CASE WHEN v.ok THEN $2 ELSE dw.installed_at END
-			FROM v WHERE dw.deployment_id = $1 AND (dw.state = 'pending' OR (v.ok AND dw.state = 'failed'))`,
+			FROM v WHERE dw.deployment_id = $1 AND (dw.state = 'pending' OR dw.state = CASE WHEN v.ok THEN 'failed' ELSE 'installed' END)`,
 			d.ID, now, d.AppVersionID)
 	case appdeploy.StateFailed:
 		_, err = tx.Exec(ctx, `UPDATE deployment_workflows SET state = 'failed' WHERE deployment_id = $1 AND state = 'pending'`, d.ID)

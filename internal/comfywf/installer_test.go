@@ -529,13 +529,15 @@ func TestOnTransition(t *testing.T) {
 		t.Fatalf("installed_at: %v %v %v", r[0].InstalledAt, r[1].InstalledAt, r[2].InstalledAt)
 	}
 
-	// 部署版本不支持工作流（包里没有 workflows/，什么也没装）：running 时 pending → failed（running 的部署上不留 pending），failed 不变
+	// 部署版本不支持工作流（包里没有 workflows/，什么也没装；例如换回了旧版本）：running 时 pending / installed → failed
+	// （running 的部署上不留 pending；之前装的工作流文件不再由平台维护，快速出图要停用），failed 不变
 	odep, _ := e.dep(e.comfy, e.comfyOld, appdeploy.StateInstalling)
 	e.attach(odep, v1, WFStatePending)
 	e.attach(odep, v2, WFStateFailed)
+	e.attach(odep, v3, WFStateInstalled)
 	od := e.get(odep)
 	tx(func(q pgx.Tx) error { return e.hooks.OnTransition(e.ctx, q, od, appdeploy.StateRunning, now) })
-	if r := e.rows(odep); r[0].State != WFStateFailed || r[0].InstalledAt != nil || r[1].State != WFStateFailed {
+	if r := e.rows(odep); r[0].State != WFStateFailed || r[0].InstalledAt != nil || r[1].State != WFStateFailed || r[2].State != WFStateFailed {
 		t.Fatalf("unsupported running: %+v", r)
 	}
 	// 非 comfyui 部署、没有行：无操作
