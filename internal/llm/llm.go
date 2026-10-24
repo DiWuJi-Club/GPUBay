@@ -22,6 +22,7 @@ package llm
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -96,7 +97,9 @@ type Deps struct {
 
 type Service struct {
 	d Deps
-	// Task 6 / 9 增加：Key 缓存、余额缓存、Limiter、Router
+	// keyCache：key_hash → keyCacheEntry（Authorize 的 KeyCacheTTL 缓存，见 authorize.go）。
+	keyCache sync.Map
+	// Task 9 增加：余额缓存、Limiter、Router
 }
 
 func NewService(d Deps) *Service {
