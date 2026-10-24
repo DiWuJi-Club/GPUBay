@@ -58,6 +58,21 @@ func LockDeployment(ctx context.Context, q db.Querier, id string) (Deployment, e
 	return scanDeployment(q.QueryRow(ctx, `SELECT `+depCols+` FROM app_deployments WHERE id = $1 FOR UPDATE`, id))
 }
 
+// TouchDeployment 只把部署行 row_version + 1、updated_at = now（不改状态）；不存在 → apperr.ErrNotFound。
+// 用途（计划 11）：改了部署包的输入却不改行本身的调用方（comfywf 对 queued 部署只改工作流集合）必须调用它——
+// Runner 在事务外打包并 exec，回写时按 row_version 丢弃期间被改过的行，下一轮按新输入重新打包；
+// 否则旧包装进容器，OnTransition(running) 还会把没进包的 pending 集合标成 installed。调用方应已持部署行锁。
+func TouchDeployment(ctx context.Context, q db.Querier, id string, now time.Time) error {
+	tag, err := q.Exec(ctx, `UPDATE app_deployments SET row_version = row_version + 1, updated_at = $2 WHERE id = $1`, id, now)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return apperr.ErrNotFound
+	}
+	return nil
+}
+
 // addEvent 记一条部署事件（detail 须已脱敏、不含变量值）。
 func addEvent(ctx context.Context, q db.Querier, depID, from, to, detail string, at time.Time) error {
 	_, err := q.Exec(ctx, `INSERT INTO app_deploy_events (deployment_id, at, from_state, to_state, detail) VALUES ($1, $2, $3, $4, $5)`,
@@ -220,6 +235,8 @@ func (s *Service) onTransition(ctx context.Context, tx pgx.Tx, cur Deployment, t
 		return nil
 	}
 	if err := s.d.OnTransition(ctx, tx, cur, to, now); err != nil {
+		// 回写随之回滚、下一轮重试；一直失败时部署卡在原状态，必须让人看见
+		s.d.Log.Error("appdeploy: OnTransition failed, writeback rolled back", "deployment", cur.ID, "to", to, "err", err)
 		return fmt.Errorf("appdeploy: OnTransition(%s → %s): %w", cur.ID, to, err)
 	}
 	return nil

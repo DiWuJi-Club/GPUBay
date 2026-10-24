@@ -1,6 +1,7 @@
 package runtime_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -24,6 +25,7 @@ type box struct {
 	root   string // 充当容器 /root/data
 	dir    string // <root>/.spark-apps/testapp
 	health *httptest.Server
+	in     appdeploy.BundleInput // newBox 渲染 env 用的输入（不含 extra）
 }
 
 func newBox(t *testing.T, app string, extra map[string]string) *box {
@@ -55,7 +57,7 @@ func newBox(t *testing.T, app string, extra map[string]string) *box {
 		env = append(env, []byte("export "+k+"="+appdeploy.ShellQuote(v)+"\n")...)
 	}
 	os.WriteFile(filepath.Join(dir, "env"), env, 0o600)
-	b := &box{t: t, root: root, dir: dir, health: hs}
+	b := &box{t: t, root: root, dir: dir, health: hs, in: in}
 	t.Cleanup(func() {
 		if _, err := os.Stat(b.dir); err == nil { // remove 之后目录已不在
 			b.run("stop")
@@ -813,13 +815,25 @@ func TestRunShInstallKeyFollowsWorkflowManifest(t *testing.T) {
 // 升级兼容：计划 7 写下的两段式 .installed（「spec_hash env_cksum」）在没有 manifest 时仍算匹配，存量部署恢复时不重跑 install。
 func TestRunShLegacyInstalledKeyStillMatches(t *testing.T) {
 	b := newBox(t, "app_ok.sh", nil)
-	cmd := exec.Command("/bin/sh", "-c", `cksum < env | awk '{print $1 "-" $2}'`)
-	cmd.Dir = b.dir
+	user := []appdeploy.EnvKV{{Name: "MODEL_ID", Value: b.in.Env["MODEL_ID"]}}
+	in := b.in
+	in.GitMirror = "https://gh-proxy.com/" // 升级后的平台总带着镜像配置
+	// 升级前：计划 7 的规则渲染的 env，及据它算出的两段式 .installed
+	oldEnv := appdeploy.RenderEnv(plan7Reserved(in), user)
+	cmd := exec.Command("/bin/sh", "-c", `cksum | awk '{print $1 "-" $2}'`)
+	cmd.Stdin = bytes.NewReader(oldEnv)
 	ck, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(b.dir, ".installed"), []byte("hash-1 "+strings.TrimSpace(string(ck))+"\n"), 0o644)
+	legacy := []byte("hash-1 " + strings.TrimSpace(string(ck)) + "\n")
+	// 升级后：平台按现在的规则重新渲染 env（不支持工作流的版本）并上传，覆盖旧文件
+	newEnv := appdeploy.RenderEnv(appdeploy.ReservedEnv(in), user)
+	if !bytes.Equal(newEnv, oldEnv) {
+		t.Fatalf("non-workflow env changed after upgrade:\n%s\nplan 7:\n%s", newEnv, oldEnv)
+	}
+	os.WriteFile(filepath.Join(b.dir, "env"), newEnv, 0o600)
+	os.WriteFile(filepath.Join(b.dir, ".installed"), legacy, 0o644)
 	b.run("deploy")
 	b.waitState("running")
 	if _, err := os.Stat(filepath.Join(b.dir, "installed.marker")); err == nil {
@@ -829,7 +843,7 @@ func TestRunShLegacyInstalledKeyStillMatches(t *testing.T) {
 		t.Fatalf("log:\n%s", b.log())
 	}
 	// 但旧键 + 新出现的 manifest → 重跑
-	os.WriteFile(filepath.Join(b.dir, ".installed"), []byte("hash-1 "+strings.TrimSpace(string(ck))+"\n"), 0o644)
+	os.WriteFile(filepath.Join(b.dir, ".installed"), legacy, 0o644)
 	os.MkdirAll(filepath.Join(b.dir, "workflows"), 0o700)
 	os.WriteFile(filepath.Join(b.dir, "workflows", "manifest.json"), []byte(`{}`), 0o644)
 	b.run("deploy")
@@ -840,6 +854,23 @@ func TestRunShLegacyInstalledKeyStillMatches(t *testing.T) {
 	}
 }
 
+// plan7Reserved 是计划 7 的保留变量表（逐项写死，不经 ReservedEnv）：升级兼容测试的「旧规则」。
+func plan7Reserved(in appdeploy.BundleInput) []appdeploy.EnvKV {
+	models := in.AppRoot + "/models"
+	health := in.HealthAddr
+	if health == "" {
+		health = "127.0.0.1:" + strconv.Itoa(in.Spec.Ports[0].Port)
+	}
+	return []appdeploy.EnvKV{
+		{Name: "SPARK_APP", Value: in.Slug}, {Name: "SPARK_APP_DIR", Value: appdeploy.AppDir(in.AppRoot, in.Slug)}, {Name: "SPARK_DATA_DIR", Value: in.AppRoot},
+		{Name: "SPARK_PORT", Value: strconv.Itoa(in.Spec.Ports[0].Port)}, {Name: "SPARK_PORT_2", Value: ""}, {Name: "SPARK_INSTANCE_ID", Value: in.InstanceID},
+		{Name: "SPARK_MODELS_DIR", Value: models}, {Name: "SPARK_SPEC_HASH", Value: in.SpecHash}, {Name: "SPARK_TIMEOUT_S", Value: strconv.Itoa(in.Spec.TimeoutMinutes * 60)},
+		{Name: "SPARK_HEALTH_PATH", Value: in.Spec.Ports[0].HealthPath}, {Name: "SPARK_MIN_FREE_GIB", Value: strconv.Itoa(in.Spec.MinDataFreeGiB)}, {Name: "SPARK_HEALTH_ADDR", Value: health},
+		{Name: "HF_ENDPOINT", Value: in.HFEndpoint}, {Name: "MODELSCOPE_CACHE", Value: models + "/modelscope"}, {Name: "HF_HOME", Value: models + "/hf"},
+		{Name: "PIP_INDEX_URL", Value: in.PipIndexURL},
+	}
+}
+
 // 计划 11 D7：install 失败前最后一次汇报的消息以 disk: 开头 → failed 状态沿用它（平台映射为错误码 disk）。
 func TestRunShInstallDiskMessageKept(t *testing.T) {
 	b := newBox(t, "app_disk.sh", nil)
@@ -847,5 +878,24 @@ func TestRunShInstallDiskMessageKept(t *testing.T) {
 	st := b.waitState("failed")
 	if !strings.HasPrefix(st.Message, "disk:") || st.Message != "disk: 剩余 1GiB，需要 12GiB" || st.Phase != "download" || st.ExitCode != 2 {
 		t.Fatalf("failed status = %+v", st)
+	}
+}
+
+// disk: 消息里的双引号、反斜杠、中文原样保留（status.json 里是转义过的，取出时要还原，否则再次写入会被双重转义或截断）。
+func TestRunShInstallDiskMessageWithQuotes(t *testing.T) {
+	for _, msg := range []string{
+		`disk: 剩余 "1GiB"，需要 12GiB`,
+		`disk: path C:\data\models 不够`,
+		`disk: a"b \ "c" 结尾\`,
+		`disk: x","pid":1,"y":"z`, // 伪造 status.json 字段
+	} {
+		t.Run(msg, func(t *testing.T) {
+			b := newBox(t, "app_disk.sh", map[string]string{"DISK_MSG": msg})
+			b.run("deploy")
+			st := b.waitState("failed")
+			if st.Message != msg || st.Phase != "download" || st.ExitCode != 2 {
+				t.Fatalf("failed status = %+v, want message %q", st, msg)
+			}
+		})
 	}
 }

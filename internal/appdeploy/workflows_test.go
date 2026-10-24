@@ -249,6 +249,22 @@ func TestRedeployInTxMatchesRedeploy(t *testing.T) {
 	if !errors.Is(err, apperr.ErrAppInvalidState) {
 		t.Fatalf("installing = %v", err)
 	}
+	// 部署不在给定实例上 → not_found（不改行）
+	err = db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+		inst, err := rental.LockOwned(e.ctx, tx, e.userID, instA.ID)
+		if err != nil {
+			return err
+		}
+		d, err := appdeploy.LockDeployment(e.ctx, tx, b.ID)
+		if err != nil {
+			return err
+		}
+		_, err = e.svc.RedeployInTx(e.ctx, tx, inst, d, appdeploy.RedeployRequest{UserID: e.userID}, e.clk.Now())
+		return err
+	})
+	if !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("deployment on another instance = %v", err)
+	}
 	if _, err := appdeploy.LockDeployment(e.ctx, e.pool, "dep-nope"); !errors.Is(err, apperr.ErrNotFound) {
 		t.Fatalf("LockDeployment missing = %v", err)
 	}
@@ -324,5 +340,48 @@ func TestCatalogViewSupportsWorkflows(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("%s version = %s", it.Slug, b)
 		}
+	}
+}
+
+// ResolveWorkflows 约定返回不重复的工作流；QueueInstall 仍按 workflow_id 去重（保留第一个），重复不会让开通事务撞主键失败。
+func TestQueueInstallDedupesWorkflows(t *testing.T) {
+	e := newEnv(t, 1)
+	comfy, _ := e.publishedApp("comfyui", workflowSpec(8188), goodScript, []int64{e.imageID})
+	w1, v1 := e.comfyWorkflow("sdxl-txt2img")
+	svc := e.serviceWith(func(d *appdeploy.Deps) {
+		d.ResolveWorkflows = func(context.Context, db.Querier, []int64) ([]appdeploy.WorkflowRef, error) {
+			return []appdeploy.WorkflowRef{{WorkflowID: w1, VersionID: v1}, {WorkflowID: w1, VersionID: v1 + 1000}}, nil
+		}
+	})
+	plan, err := svc.PrepareInstall(e.ctx, e.pool, comfy.ID, e.imageID, model4B, []int64{w1, w1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := e.reservedInstance()
+	e.hookTx(inst.ID, func(tx pgx.Tx) error { return svc.QueueInstall(e.ctx, tx, inst, plan, e.clk.Now()) })
+	live, _ := svc.ListLive(e.ctx, inst.ID)
+	if got := e.depWorkflows(live[0].ID); len(got) != 1 || got[0].VersionID != v1 {
+		t.Fatalf("rows = %+v", got)
+	}
+	if ev := e.lastEvent(live[0].ID); ev.Detail != "预装工作流 1 个" {
+		t.Fatalf("event = %+v", ev)
+	}
+}
+
+// TouchDeployment 只把 row_version + 1、updated_at = now（Runner 据此丢弃 exec 期间打出的旧部署包）；不存在 → not_found。
+func TestTouchDeployment(t *testing.T) {
+	e := newEnv(t, 1)
+	a, _ := e.publishedApp("comfyui", workflowSpec(8188), goodScript, []int64{e.imageID})
+	d := e.create(e.runningInstance(), a.ID, model4B)
+	e.clk.Advance(time.Minute)
+	if err := appdeploy.TouchDeployment(e.ctx, e.pool, d.ID, e.clk.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got := e.dep(d.ID)
+	if got.RowVersion != d.RowVersion+1 || !got.UpdatedAt.Equal(e.clk.Now()) || got.State != d.State || !got.NextPollAt.Equal(d.NextPollAt) {
+		t.Fatalf("touched = %+v (was %+v)", got, d)
+	}
+	if err := appdeploy.TouchDeployment(e.ctx, e.pool, "dep-nope", e.clk.Now()); !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("missing = %v", err)
 	}
 }

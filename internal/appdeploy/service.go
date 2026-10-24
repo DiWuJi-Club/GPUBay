@@ -61,6 +61,7 @@ type Deps struct {
 	// WorkflowViews 批量给出部署视图的 workflows 字段（按部署 ID）；只对 comfyui / 支持工作流的部署调用。
 	WorkflowViews func(ctx context.Context, depIDs []string) (map[string][]json.RawMessage, error)
 	// ResolveWorkflows 下单预装工作流时把工作流 ID 解析成 {工作流, 版本}（校验上架、去重、数量）；nil = 不支持预装工作流。
+	// 约定：返回的 WorkflowID 互不相同（QueueInstall 仍防御性去重，保留第一个）。
 	ResolveWorkflows func(ctx context.Context, q db.Querier, ids []int64) ([]WorkflowRef, error)
 }
 
@@ -299,9 +300,16 @@ func (s *Service) Redeploy(ctx context.Context, req RedeployRequest) (Deployment
 }
 
 // RedeployInTx 是 Redeploy 的事务内部分（计划 11：comfywf 改工作流集合后在同一事务里重新部署）。
-// 调用方须已按加锁顺序持实例行锁（rental.LockOwned）与部署行锁（LockDeployment），且 d 在 inst 上；
+// 调用方须已按加锁顺序持实例行锁（rental.LockOwned）与部署行锁（LockDeployment）；d 不在 inst 上 → not_found。
 // 审计操作人由 req.UserID / req.IP 构造。行为与 Redeploy 相同。
+//
+// 注意：d 为 queued 且 !req.EnvSet 时什么都不做，**不** bump row_version（Runner 可能正拿着旧输入在打包 / exec）。
+// 调用方若改了部署包的其它输入（如工作流集合），须另调 TouchDeployment，Runner 才会丢弃本轮、按新输入重新打包。
+// VersionID 为 nil 表示「最新已发布版本」而不是「不换」；要保持当前版本须传 &d.AppVersionID（该版本须仍是 published）。
 func (s *Service) RedeployInTx(ctx context.Context, tx pgx.Tx, inst rental.Instance, d Deployment, req RedeployRequest, now time.Time) (Deployment, error) {
+	if d.InstanceID != inst.ID {
+		return Deployment{}, apperr.ErrNotFound
+	}
 	actor := audit.Actor{UserID: req.UserID, IP: req.IP}
 	oldSecret, err := openSecrets(s.d.Box, d.SecretEnvEnc)
 	if err != nil {

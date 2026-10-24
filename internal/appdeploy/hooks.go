@@ -164,6 +164,19 @@ type installPlan struct {
 	Workflows []WorkflowRef // 计划 11：预装的工作流集合（ResolveWorkflows 的结果）
 }
 
+// dedupeRefs 按 WorkflowID 去重（保留第一个）。ResolveWorkflows 约定已去重；这里防御，免得重复让开通事务撞主键整单失败。
+func dedupeRefs(refs []WorkflowRef) []WorkflowRef {
+	seen := map[int64]bool{}
+	out := make([]WorkflowRef, 0, len(refs))
+	for _, r := range refs {
+		if !seen[r.WorkflowID] {
+			seen[r.WorkflowID] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // PrepareInstall 下单预装校验：published 应用的最新 published 版本、镜像兼容、变量；workflowIDs 非空时（计划 11）
 // 版本须支持工作流且接了 Deps.ResolveWorkflows（否则 workflow_app_unsupported），由它解析出集合。错误都是 4xx 的 apperr
 // （app_not_found / app_unavailable / app_image_mismatch / app_env_* / workflow_*），rental 在扣款前整单失败。
@@ -184,9 +197,11 @@ func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, image
 		if !ver.Spec.SupportsWorkflows || s.d.ResolveWorkflows == nil {
 			return nil, apperr.ErrWorkflowAppUnsupported
 		}
-		if plan.Workflows, err = s.d.ResolveWorkflows(ctx, q, workflowIDs); err != nil {
+		refs, err := s.d.ResolveWorkflows(ctx, q, workflowIDs)
+		if err != nil {
 			return nil, err
 		}
+		plan.Workflows = dedupeRefs(refs)
 	}
 	return plan, nil
 }
