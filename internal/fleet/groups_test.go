@@ -273,3 +273,78 @@ func TestCreateGroupRejectsLLMPurpose(t *testing.T) {
 		t.Fatalf("create rental = %+v, %v", g, err)
 	}
 }
+
+// 计划 9 规格 §3.3：池里有未结束系统实例或非终态节点的机器不能离开池（移出、改组、加入别的机组），检查在机组事务里、机器行锁之后。
+func TestPoolMachineWithLiveNodeCannotLeave(t *testing.T) {
+	svc, pool, _ := newEnv(t)
+	ctx := context.Background()
+	poolID, err := svc.LLMPoolGroupID(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := svc.CreateGroup(ctx, opsActor, fleet.GroupInput{Name: "A 区", Visible: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	withNode := dbtest.CreateMachine(t, pool, "SN-NODE")
+	withInst := dbtest.CreateMachine(t, pool, "SN-INST")
+	free := dbtest.CreateMachine(t, pool, "SN-FREE")
+	if err := svc.AssignMachines(ctx, opsActor, poolID, []int64{withNode, withInst, free}); err != nil {
+		t.Fatal(err)
+	}
+	var modelID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO llm_models (slug, name, kind, source_id, image_id, context_len, input_price, output_price, created_at, updated_at)
+		VALUES ('qwen3-4b', 'Qwen3 4B', 'chat', 'Qwen/Qwen3-4B', $1, 32768, 100, 400, $2, $2) RETURNING id`, dbtest.ImageID(t, pool), dbtest.T0).Scan(&modelID); err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO llm_nodes (id, model_id, machine_id, state, api_key_enc, created_at, updated_at)
+		VALUES ('node-a', $1, $2, 'removing', '\x00', $3, $3)`, modelID, withNode, dbtest.T0)
+	exec(`INSERT INTO instances (id, user_id, machine_id, product_id, image_id, state, ssh_password_enc, password_auth, system, created_at, updated_at)
+		SELECT 'ins-sys', u.id, m.id, m.product_id, $2, 'wiping', '\x00', false, true, $3, $3 FROM machines m, users u
+		WHERE m.id = $1 AND u.system`, withInst, dbtest.ImageID(t, pool), dbtest.T0)
+
+	for _, id := range []int64{withNode, withInst} {
+		if err := svc.UnassignMachines(ctx, opsActor, poolID, []int64{id, free}); !errors.Is(err, apperr.ErrLLMPoolMachineBusy) {
+			t.Fatalf("unassign %d = %v", id, err)
+		}
+		if _, err := svc.UpdateMachine(ctx, opsActor, id, fleet.MachineUpdate{SetGroup: true}); !errors.Is(err, apperr.ErrLLMPoolMachineBusy) {
+			t.Fatalf("ungroup %d = %v", id, err)
+		}
+		if _, err := svc.UpdateMachine(ctx, opsActor, id, fleet.MachineUpdate{SetGroup: true, GroupID: &other.ID}); !errors.Is(err, apperr.ErrLLMPoolMachineBusy) {
+			t.Fatalf("regroup %d = %v", id, err)
+		}
+		if err := svc.AssignMachines(ctx, opsActor, other.ID, []int64{id}); !errors.Is(err, apperr.ErrLLMPoolMachineBusy) {
+			t.Fatalf("assign elsewhere %d = %v", id, err)
+		}
+		// 留在池里的操作照常
+		if _, err := svc.UpdateMachine(ctx, opsActor, id, fleet.MachineUpdate{SetGroup: true, GroupID: &poolID}); err != nil {
+			t.Fatalf("keep in pool %d = %v", id, err)
+		}
+		if err := svc.AssignMachines(ctx, opsActor, poolID, []int64{id}); err != nil {
+			t.Fatalf("reassign to pool %d = %v", id, err)
+		}
+	}
+	// 被拒的批量操作整体回滚：空闲机器仍在池里
+	if m, _ := svc.Get(ctx, pool, free); m.GroupID == nil || *m.GroupID != poolID {
+		t.Fatalf("free machine group = %v", m.GroupID)
+	}
+	// 从别的机组移出时不看池（池机器不受影响）
+	if err := svc.UnassignMachines(ctx, opsActor, other.ID, []int64{withNode}); err != nil {
+		t.Fatalf("unassign from other group = %v", err)
+	}
+	// 终态节点 / 已结束实例不再阻止
+	exec(`UPDATE llm_nodes SET state = 'removed' WHERE id = 'node-a'`)
+	exec(`UPDATE instances SET state = 'released' WHERE id = 'ins-sys'`)
+	if err := svc.UnassignMachines(ctx, opsActor, poolID, []int64{withNode, withInst, free}); err != nil {
+		t.Fatalf("unassign after node removed = %v", err)
+	}
+	if err := svc.AssignMachines(ctx, opsActor, other.ID, []int64{withNode}); err != nil {
+		t.Fatalf("assign after = %v", err)
+	}
+}
