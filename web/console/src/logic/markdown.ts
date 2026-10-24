@@ -24,14 +24,19 @@ const SAFE_URL = new RegExp(`^[${URL_CHARS}]+$`)
 
 type LinkKind = 'site' | 'instance'
 
+/** 接口 / 后台 / 测试钩子路径不给链接（纵深防御：防诱导点击触发 GET 接口或跳到后台）。 */
+const BLOCKED_SITE = /^\/(?:api|admin|hooks)(?:[/?#]|$)/i
+/** . / .. 路径段（含 %2e 写法）会被浏览器归一化，可绕过上面的前缀检查，一律不给链接。 */
+const DOT_SEGMENT = /\/(?:\.|%2e){1,2}(?:[/?#]|$)/i
+
 /**
  * 链接白名单（D9）：
- * - 站内路径：以 / 开头且不含 //（防 //evil.example 这类协议相对地址）；
+ * - 站内路径：以 / 开头且不含 //（防 //evil.example 这类协议相对地址），且不是 /api、/admin、/hooks 开头；
  * - 实例端口地址：https://ins-<id>-<port>.<ingressDomain> 后接结尾或 / ? #（防 .<domain>.evil.example、@evil.example）。
  */
 export function linkKind(url: string, ingressDomain: string): LinkKind | null {
   if (!SAFE_URL.test(url)) return null
-  if (url.startsWith('/')) return url.includes('//') ? null : 'site'
+  if (url.startsWith('/')) return url.includes('//') || BLOCKED_SITE.test(url) || DOT_SEGMENT.test(url) ? null : 'site'
   const domain = ingressDomain.trim().toLowerCase()
   if (!domain || !/^[a-z0-9.-]+$/.test(domain)) return null
   const re = new RegExp(`^https://ins-[a-z0-9]+-[0-9]+\\.${escapeRegExp(domain)}(?:[/?#][${URL_CHARS}]*)?$`)
@@ -54,8 +59,8 @@ function splitTrailing(url: string): [string, string] {
   return m ? [url.slice(0, m.index), m[0]] : [url, '']
 }
 
-// 行内记号：`代码`、[文本](url)、裸 http(s) URL
-const INLINE = new RegExp(`\`([^\`\\n]+)\`|\\[([^\\]\\n]*)\\]\\(([^()\\s]*)\\)|(https?://[${URL_CHARS}]+)`, 'g')
+// 行内记号：`代码`、[文本](url)、裸 http(s) URL。文本与 url 的字符类都排除 [ ]，未闭合的记号只扫到下一个 [ 为止（避免平方级回溯）
+const INLINE = new RegExp(`\`([^\`\\n]+)\`|\\[([^\\[\\]\\n]*)\\]\\(([^()\\[\\]\\s]*)\\)|(https?://[${URL_CHARS}]+)`, 'g')
 
 function inline(src: string, opt: MarkdownOptions): string {
   let out = ''

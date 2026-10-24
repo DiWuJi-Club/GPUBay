@@ -154,6 +154,50 @@ describe('streamPost', () => {
     await expect(p).rejects.toMatchObject({ status: 0, code: 'cancelled' })
   })
 
+  it('signal 取消而流本身不响应 abort：主动 cancel 读取 → cancelled', async () => {
+    const ac = new AbortController()
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('event: delta\ndata: {"text":"a"}\n\n'))
+      }, // 之后永远不再吐数据、也不关闭
+    })
+    const { fn } = fakeFetch(new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }))
+    const got: SSEEvent[] = []
+    const p = streamPost('', '/x', {}, (e) => got.push(e), { fetch: fn, signal: ac.signal })
+    setTimeout(() => ac.abort(), 20)
+    await expect(p).rejects.toMatchObject({ status: 0, code: 'cancelled' })
+    expect(got).toHaveLength(1)
+  })
+
+  it('空闲看门狗：超过 idleTimeoutMs 没有任何数据 → network；每个分块（含 ping）都会重置计时', async () => {
+    const enc = new TextEncoder()
+    let pings = 0
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(enc.encode('event: delta\ndata: {"text":"a"}\n\n'))
+        const t = setInterval(() => {
+          if (pings++ < 4) c.enqueue(enc.encode(': ping\n\n')) // 每 20ms 一次 ping，4 次后沉默
+          else clearInterval(t)
+        }, 20)
+      },
+    })
+    const { fn } = fakeFetch(new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }))
+    const got: SSEEvent[] = []
+    const t0 = Date.now()
+    const err = await streamPost('', '/x', {}, (e) => got.push(e), { fetch: fn, idleTimeoutMs: 50 }).catch((e) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect(err).toMatchObject({ status: 0, code: 'network' })
+    expect(got).toEqual([{ event: 'delta', data: '{"text":"a"}' }])
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(80 + 50 - 10) // ping 期间没有误触发
+  })
+
+  it('流正常关闭但没收到 done → 正常 resolve（由调用方判断是否完整）', async () => {
+    const { fn } = fakeFetch(sseResponse(['event: delta\ndata: {"text":"a"}\n\n']))
+    const got: SSEEvent[] = []
+    await expect(streamPost('', '/x', {}, (e) => got.push(e), { fetch: fn })).resolves.toBeUndefined()
+    expect(got.map((e) => e.event)).toEqual(['delta'])
+  })
+
   it('请求前已取消（fetch 抛 AbortError）→ cancelled', async () => {
     const ac = new AbortController()
     ac.abort()

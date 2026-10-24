@@ -46,10 +46,16 @@ function parseFrame(frame: string): SSEEvent | null {
 const networkError = (status = 0) => new ApiError(status, 'network', '网络异常，请稍后重试', '')
 const cancelledError = () => new ApiError(0, 'cancelled', '已取消', '')
 
+/** 空闲看门狗：服务端每 15 秒发一次 : ping，超过这么久一个字节都没收到就当连接已死。 */
+export const SSE_IDLE_TIMEOUT_MS = 45_000
+
 /**
  * POST JSON 并按 SSE 读取响应，每个完整帧回调一次 onEvent。
- * 非 2xx 或非 text/event-stream 响应 → 按 errorOf 抛 ApiError（服务端在建立流之前以 JSON 返回限额 / busy / 校验错误）；
- * 网络中断 → ApiError(0, 'network')；signal 取消 → ApiError(0, 'cancelled')。onEvent 自身抛出的异常原样上抛。
+ * - 非 2xx 或非 text/event-stream 响应 → 按 errorOf 抛 ApiError（服务端在建立流之前以 JSON 返回限额 / busy / 校验错误）；
+ *   不处理 401（不调用 onUnauthorized），调用方自行处理；
+ * - 网络中断，或 idleTimeoutMs（缺省 45 秒）内没收到任何数据 → ApiError(0, 'network')；
+ * - signal 取消 → ApiError(0, 'cancelled')；onEvent 自身抛出的异常原样上抛；
+ * - 流正常关闭即 resolve，即使没收到 done / error 事件——是否完整结束由调用方按收到的事件判断。
  * 不设整体超时：一轮最长约 120 秒，由服务端控制。
  */
 export async function streamPost(
@@ -57,10 +63,11 @@ export async function streamPost(
   path: string,
   body: unknown,
   onEvent: (e: SSEEvent) => void,
-  opt: { signal?: AbortSignal; fetch?: typeof fetch } = {},
+  opt: { signal?: AbortSignal; fetch?: typeof fetch; idleTimeoutMs?: number } = {},
 ): Promise<void> {
   const doFetch: typeof fetch = opt.fetch ?? ((input, init) => fetch(input, init))
-  const failed = () => (opt.signal?.aborted ? cancelledError() : networkError())
+  const signal = opt.signal
+  const failed = () => (signal?.aborted ? cancelledError() : networkError())
   let resp: Response
   try {
     resp = await doFetch(base + path, {
@@ -68,7 +75,7 @@ export async function streamPost(
       headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json', 'X-Device-Id': defaultDeviceId() },
       body: JSON.stringify(body ?? {}),
       credentials: 'same-origin',
-      signal: opt.signal,
+      signal,
     })
   } catch {
     throw failed()
@@ -79,16 +86,38 @@ export async function streamPost(
 
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
+  const idleMs = opt.idleTimeoutMs ?? SSE_IDLE_TIMEOUT_MS
+  let idle = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const cancel = () => {
+    reader.cancel().catch(() => {})
+  }
+  const arm = () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      idle = true
+      cancel()
+    }, idleMs)
+  }
+  // 取消时主动 cancel 读取：fetch 的 signal 不一定能中断已建立的流（测试注入的 fetch、部分实现）
+  const onAbort = () => cancel()
+  signal?.addEventListener('abort', onAbort)
   let buf = ''
   try {
+    if (signal?.aborted) throw cancelledError()
+    arm()
     for (;;) {
       let chunk: ReadableStreamReadResult<Uint8Array>
       try {
         chunk = await reader.read()
       } catch {
-        throw failed()
+        throw idle ? networkError() : failed()
       }
+      // reader.cancel() 让挂起的 read 以 done 结束：区分看门狗 / 取消与服务端正常关闭
+      if (signal?.aborted) throw cancelledError()
+      if (idle) throw networkError()
       if (chunk.done) break
+      arm()
       buf += decoder.decode(chunk.value, { stream: true })
       const { events, rest } = parseSSE(buf)
       buf = rest
@@ -96,6 +125,8 @@ export async function streamPost(
     }
     // 流结束时未以空行收尾的残帧按 SSE 规范丢弃（服务端每帧都以 \n\n 结束）
   } finally {
-    reader.cancel().catch(() => {})
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+    cancel()
   }
 }

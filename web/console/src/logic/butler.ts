@@ -48,6 +48,11 @@ function endStreaming(items: ChatItem[]): ChatItem[] {
   return items.map((it) => (it.kind === 'assistant' && it.streaming ? { ...it, streaming: false } : it))
 }
 
+/** 步骤的中文名：没有工具名时显示「工具」。 */
+function toolLabel(name: string): string {
+  return name ? labelOf(butlerToolLabel, name) : '工具'
+}
+
 function lastUserText(items: ChatItem[]): string | undefined {
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i]
@@ -72,7 +77,7 @@ function parseData<T>(data: string): T | null {
  * - tool：同 id 的确认卡 → executed / failed（确认执行的结果）；同 id 的步骤 → 更新；否则追加步骤；
  * - confirm：追加确认卡（同 id 则替换），status = awaiting_confirm；
  * - usage：更新今日额度；
- * - done：结束流式，max_tokens → 最后一个助手气泡 truncated；awaiting_confirm 保持待确认，其余回到 idle；
+ * - done：结束流式，max_tokens → 本轮最后一个助手气泡 truncated；awaiting_confirm 保持待确认，其余回到 idle；
  * - error：追加错误项（retryText = 最近一条用户消息，供「重试」），回到 idle。
  */
 export function applyEvent(s: ChatState, e: SSEEvent): ChatState {
@@ -99,11 +104,14 @@ export function applyEvent(s: ChatState, e: SSEEvent): ChatState {
       if (ci >= 0) {
         const items = endStreaming(s.items)
         const card = items[ci] as Extract<ChatItem, { kind: 'confirm' }>
+        // 只有待确认 / 已批准的卡片才会有执行结果；已拒绝 / 已失效的卡片不被改写
+        if (card.state !== 'pending' && card.state !== 'approved') return s
         items[ci] = { ...card, state: status === 'ok' ? 'executed' : 'failed' }
         return { ...s, items }
       }
       const ti = s.items.findIndex((it) => it.kind === 'tool' && it.id === d.id)
-      const step: ChatItem = { kind: 'tool', id: d.id, name: d.name, label: d.label || labelOf(butlerToolLabel, d.name), status }
+      const name = typeof d.name === 'string' ? d.name : ''
+      const step: ChatItem = { kind: 'tool', id: d.id, name, label: d.label || toolLabel(name), status }
       if (ti >= 0) {
         const items = [...s.items]
         items[ti] = { ...(items[ti] as Extract<ChatItem, { kind: 'tool' }>), ...step }
@@ -128,7 +136,8 @@ export function applyEvent(s: ChatState, e: SSEEvent): ChatState {
       if (!d) return s
       const items = endStreaming(s.items)
       if (d.reason === 'max_tokens') {
-        for (let i = items.length - 1; i >= 0; i--) {
+        // 只标记本轮（最近一条用户消息之后）的助手气泡，不回头改上一轮的
+        for (let i = items.length - 1; i >= 0 && items[i].kind !== 'user'; i--) {
           const it = items[i]
           if (it.kind === 'assistant') {
             items[i] = { ...it, truncated: true }
@@ -175,7 +184,7 @@ export function markConfirm(s: ChatState, id: string, state: ConfirmState): Chat
 }
 
 /**
- * 历史详情 → 聊天状态。user 的 text 块 → 用户气泡；assistant 的 text 块 → 助手气泡；tool 块 → 步骤（同 id 去重）；
+ * 历史详情 → 聊天状态。user 的 text 块 → 用户气泡；assistant 的 text 块 → 助手气泡（相邻的用空行连接）；tool 块 → 步骤（同 id 去重）；
  * tool_result → 挂到同 id 步骤的 summary；tool 角色的文本（「用户拒绝了该操作」等给模型看的回填）不展示。
  * pending_tool_call → 末尾的待确认卡（同 id 的步骤去掉，避免重复）。额度不在详情里，沿用 prev。
  */
@@ -190,11 +199,12 @@ export function fromDetail(d: ConversationDetail, prev?: Pick<ChatState, 'dayUse
         if (m.role === 'user') userText += b.text
         else if (m.role === 'assistant' && b.text) {
           const last = items[items.length - 1]
-          if (last?.kind === 'assistant') items[items.length - 1] = { ...last, text: last.text + b.text }
+          if (last?.kind === 'assistant') items[items.length - 1] = { ...last, text: `${last.text}\n\n${b.text}` }
           else items.push({ kind: 'assistant', text: b.text, streaming: false })
         }
       } else if (b.type === 'tool') {
-        const step: ChatItem = { kind: 'tool', id: b.id, name: b.name, label: b.label || labelOf(butlerToolLabel, b.name), status: b.status === 'error' ? 'error' : 'ok' }
+        const name = typeof b.name === 'string' ? b.name : ''
+        const step: ChatItem = { kind: 'tool', id: b.id, name, label: b.label || toolLabel(name), status: b.status === 'error' ? 'error' : 'ok' }
         if (b.summary) step.summary = b.summary
         const at = stepIndex.get(b.id)
         if (at !== undefined) items[at] = { ...(items[at] as Extract<ChatItem, { kind: 'tool' }>), ...step }
@@ -227,10 +237,11 @@ export function fromDetail(d: ConversationDetail, prev?: Pick<ChatState, 'dayUse
   }
 }
 
-/** 额度提示「今日已用 12%」：≥ 90% warn（橙），≥ 100% exhausted；限额 ≤ 0 视为已用完（服务端按「已用 ≥ 限额」拒绝）。 */
+/** 额度提示「今日已用 12%」：≥ 90% warn（橙），≥ 100% exhausted；限额 ≤ 0 表示还没拿到额度，返回空文案。 */
 export function formatQuota(used: number, limit: number): { text: string; level: 'ok' | 'warn' | 'exhausted' } {
+  if (!(limit > 0)) return { text: '', level: 'ok' } // 额度未加载（0）：不显示
   const u = Math.max(0, used || 0)
-  if (!(limit > 0) || u >= limit) return { text: '今日已用 100%', level: 'exhausted' }
+  if (u >= limit) return { text: '今日已用 100%', level: 'exhausted' }
   const pct = Math.floor((u * 100) / limit)
   return { text: `今日已用 ${pct}%`, level: u * 10 >= limit * 9 ? 'warn' : 'ok' }
 }

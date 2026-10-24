@@ -123,6 +123,26 @@ describe('renderMarkdown XSS（Review Focus 5）', () => {
     assertInert(q)
   })
 
+  it('/api、/admin、/hooks 与 . / .. 路径段不给链接（纵深防御）', () => {
+    for (const u of ['/api/v1/butler/conversations/cv-1', '/api', '/admin/', '/ADMIN/users', '/hooks/butler/reply', '/api?x=1',
+      '/x/../api/v1/me', '/./admin', '/x/%2e%2e/hooks/a', '/x/%2E/', '/x/..']) {
+      expect(linkKind(u, 'spark.test')).toBeNull()
+      expect(md(`[x](${u})`)).not.toContain('<a')
+    }
+    // 仅前缀相同的普通路径不受影响
+    expect(linkKind('/apis', 'spark.test')).toBe('site')
+    expect(linkKind('/admins/x', 'spark.test')).toBe('site')
+    expect(linkKind('/help#api', 'spark.test')).toBe('site')
+    expect(linkKind('/apps/vllm.v1', 'spark.test')).toBe('site')
+  })
+
+  it('大量未闭合的 [ 不会退化成平方级耗时', () => {
+    const t0 = performance.now()
+    md('['.repeat(20000) + 'x')
+    md('[a](b'.repeat(20000))
+    expect(performance.now() - t0).toBeLessThan(500)
+  })
+
   it('ingressDomain 为空时不放行实例链接；站内路径仍可用', () => {
     expect(renderMarkdown('https://ins-abc-8000.spark.test/', { ingressDomain: '' })).not.toContain('<a')
     expect(renderMarkdown('[实例](/instances/ins-abc)', { ingressDomain: '' })).toContain('<a href="/instances/ins-abc"')

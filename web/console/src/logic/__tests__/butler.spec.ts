@@ -102,15 +102,38 @@ describe('applyEvent', () => {
     expect(s.items.filter((i) => i.kind === 'confirm')).toEqual([{ kind: 'confirm', card: { ...card, summary: '新' }, state: 'pending' }])
   })
 
-  it('tool 事件缺 label 时用中文名表', () => {
+  it('tool 事件缺 label 时用中文名表；缺 name 时显示「工具」', () => {
     const s = applyEvent(emptyState(), ev('tool', { id: 'tc-1', name: 'get_wallet', status: 'ok' }))
     expect(s.items[0]).toMatchObject({ label: '查询钱包' })
+    const n = applyEvent(emptyState(), ev('tool', { id: 'tc-2', status: 'ok' }))
+    expect(n.items[0]).toEqual({ kind: 'tool', id: 'tc-2', name: '', label: '工具', status: 'ok' })
+  })
+
+  it('tool 结果只改写待确认 / 已批准的卡片，已拒绝 / 已失效的不变', () => {
+    const base = run(emptyState(), [ev('confirm', { tool_call: card }), ev('done', { reason: 'awaiting_confirm' })])
+    const result = ev('tool', { id: card.id, name: 'renew_instance', label: '续费实例', status: 'ok' })
+    expect(applyEvent(base, result).items[0]).toMatchObject({ state: 'executed' })
+    expect(applyEvent(markConfirm(base, card.id, 'approved'), result).items[0]).toMatchObject({ state: 'executed' })
+    for (const st of ['rejected', 'expired'] as const) {
+      const s = markConfirm(base, card.id, st)
+      expect(applyEvent(s, result)).toBe(s)
+    }
   })
 
   it('done max_tokens → 最后一个助手气泡 truncated', () => {
     const s = run(emptyState(), [ev('delta', { text: '很长的回答' }), ev('done', { reason: 'max_tokens' })])
     expect(s.items).toEqual([{ kind: 'assistant', text: '很长的回答', streaming: false, truncated: true }])
     expect(s.status).toBe('idle')
+  })
+
+  it('done max_tokens 只标记本轮：本轮没有助手文本时不回头标记上一轮', () => {
+    let s = run(appendUser(emptyState(), '一'), [ev('delta', { text: '上一轮' }), ev('done', { reason: 'end_turn' })])
+    s = run(appendUser(s, '二'), [ev('start', { conversation_id: 'cv-1', message_id: 2 }), ev('done', { reason: 'max_tokens' })])
+    expect(s.items).toEqual([
+      { kind: 'user', text: '一' },
+      { kind: 'assistant', text: '上一轮', streaming: false },
+      { kind: 'user', text: '二' },
+    ])
   })
 
   it('error 事件：追加错误项并带上最近的用户消息作为重试文本', () => {
@@ -220,6 +243,18 @@ describe('fromDetail', () => {
     expect(s).toEqual({ conversationId: 'cv-9', status: 'idle', items: [], dayUsed: 0, dayLimit: 0 })
   })
 
+  it('相邻的助手文本块（跨消息）用空行连接', () => {
+    const s = fromDetail({
+      ...detail,
+      pending_tool_call: null,
+      messages: [
+        { id: 1, seq: 1, role: 'assistant', content: [{ type: 'text', text: '第一段' }, { type: 'text', text: '第二段' }] },
+        { id: 2, seq: 2, role: 'assistant', content: [{ type: 'text', text: '第三段' }] },
+      ],
+    })
+    expect(s.items).toEqual([{ kind: 'assistant', text: '第一段\n\n第二段\n\n第三段', streaming: false }])
+  })
+
   it('error 状态的步骤保留 error', () => {
     const s = fromDetail({
       ...detail,
@@ -239,9 +274,10 @@ describe('formatQuota', () => {
     expect(formatQuota(300000, 300000)).toEqual({ text: '今日已用 100%', level: 'exhausted' })
     expect(formatQuota(450000, 300000)).toEqual({ text: '今日已用 100%', level: 'exhausted' })
   })
-  it('零用量与零限额', () => {
+  it('零用量；限额未加载时不显示', () => {
     expect(formatQuota(0, 300000)).toEqual({ text: '今日已用 0%', level: 'ok' })
-    expect(formatQuota(0, 0).level).toBe('exhausted')
+    expect(formatQuota(0, 0)).toEqual({ text: '', level: 'ok' }) // 0 = 额度尚未加载
+    expect(formatQuota(500, -1)).toEqual({ text: '', level: 'ok' })
   })
 })
 
