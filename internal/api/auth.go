@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"spark-cloud/internal/identity"
 )
 
 func (s *Server) setSession(w http.ResponseWriter, token string, maxAge int) {
@@ -57,8 +59,24 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	ok(w)
 }
 
+// meView /me：用户 + Token 商城本月消费（分；0 或未启用 Token 商城时省略）。
+type meView struct {
+	identity.User
+	LLMMonthCost int64 `json:"llm_month_cost,omitempty"`
+}
+
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, currentUser(r))
+	u := currentUser(r)
+	v := meView{User: u}
+	if s.LLM != nil {
+		// 读不到只记日志：/me 是登录态入口，不能因为 Token 商城出错而失败
+		if a, err := s.LLM.Account(r.Context(), u.ID); err != nil {
+			s.Log.Warn("me: llm account failed", "user_id", u.ID, "err", err)
+		} else {
+			v.LLMMonthCost = a.MonthCost
+		}
+	}
+	writeJSON(w, http.StatusOK, v)
 }
 
 func (s *Server) handleKYCPersonal(w http.ResponseWriter, r *http.Request) {

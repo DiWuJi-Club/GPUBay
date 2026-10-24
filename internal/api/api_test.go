@@ -95,6 +95,16 @@ func newAppsTestEnv(t *testing.T, tweak func(*api.Server)) *testEnv {
 
 func buildTestEnv(t *testing.T, withApps bool, tweak func(*api.Server)) *testEnv {
 	t.Helper()
+	var tw func(*api.Server, *pgxpool.Pool)
+	if tweak != nil {
+		tw = func(s *api.Server, _ *pgxpool.Pool) { tweak(s) }
+	}
+	return buildTestEnvPool(t, withApps, tw)
+}
+
+// buildTestEnvPool 同 buildTestEnv，但 tweak 还能拿到连接池（组装依赖数据库的可选服务，如 Token 商城）。
+func buildTestEnvPool(t *testing.T, withApps bool, tweak func(*api.Server, *pgxpool.Pool)) *testEnv {
+	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
 	box, _ := secretbox.New(dbtest.Key)
@@ -133,7 +143,7 @@ func buildTestEnv(t *testing.T, withApps bool, tweak func(*api.Server)) *testEnv
 		srv.Apps = apps
 	}
 	if tweak != nil {
-		tweak(srv)
+		tweak(srv, pool)
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
