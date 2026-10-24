@@ -437,7 +437,8 @@ func TestAdminWorkflowCover(t *testing.T) {
 	resp, _ = ops.send("GET", path, nil)
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 || !bytes.Equal(body, png) || resp.Header.Get("Content-Type") != "image/png" ||
-		resp.Header.Get("X-Content-Type-Options") != "nosniff" || resp.Header.Get("Cache-Control") != "private, max-age=86400" {
+		resp.Header.Get("X-Content-Type-Options") != "nosniff" || resp.Header.Get("Cache-Control") != "private, max-age=86400" ||
+		resp.Header.Get("Content-Security-Policy") != "default-src 'none'; sandbox" {
 		t.Fatalf("get cover = %d %v %d bytes", resp.StatusCode, resp.Header, len(body))
 	}
 	// 列表带 cover_url；换封面后地址改变、旧文件删除

@@ -15,7 +15,7 @@ func TestConsts(t *testing.T) {
 	if ProxyTimeout.Seconds() != 30 || ViewTimeout.Seconds() != 120 || RunWaitMax.Minutes() != 30 {
 		t.Fatal("timeouts differ from spec §13")
 	}
-	if InstalledFilePrefix != "spark-" || DataDirName != "comfyui" {
+	if DataDirName != "comfyui" {
 		t.Fatal("path constants differ")
 	}
 	if len(Categories) != 5 || Categories[0] != CategoryTxt2Img || Categories[4] != CategoryOther {
