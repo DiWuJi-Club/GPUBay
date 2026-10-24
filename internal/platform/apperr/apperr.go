@@ -67,6 +67,14 @@ var (
 	ErrAppExists        = New("app_exists", "该应用已在此实例上部署", 409)
 	ErrAppInvalidState  = New("app_invalid_state", "当前状态不允许该操作", 409)
 	ErrAppVersionFrozen = New("app_version_frozen", "已发布的版本不能修改", 409)
+	// 计划 12：AI 管家。ErrButlerDisabled 由 handler 把后台设置的 notice 拼到消息后（「AI 管家暂未开放：<notice>」）
+	ErrButlerDisabled       = New("butler_disabled", "AI 管家暂未开放", 503)
+	ErrButlerBusy           = New("butler_busy", "上一条消息还在处理中，请稍候", 409)
+	ErrButlerTurnLimit      = New("butler_turn_limit", "这个对话太长了，请新建对话", 409)
+	ErrButlerQuota          = New("butler_quota_exceeded", "今日 AI 管家额度已用完，明天再来", 429)
+	ErrButlerLLM            = New("butler_llm_unavailable", "AI 管家暂时不可用，请稍后再试", 503)
+	ErrButlerConfirmInvalid = New("butler_confirm_invalid", "该操作已失效，请重新发起", 409)
+	ErrButlerMessageInvalid = New("butler_message_invalid", "消息不能为空且不超过 2000 字", 400)
 )
 
 // As 取出错误链中的 *Error；不是业务错误时返回 nil。

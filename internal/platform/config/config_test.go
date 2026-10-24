@@ -86,6 +86,7 @@ func prodEnv() map[string]string {
 		"SPARK_ALIPAY_APP_ID": "2021000000000001", "SPARK_ALIPAY_PRIVATE_KEY_PATH": "/etc/spark/ali.pem",
 		"SPARK_ALIPAY_PUBLIC_KEY_PATH": "/etc/spark/alipub.pem", "SPARK_ALIPAY_SANDBOX": "false",
 		"SPARK_AGENT_HOSTS": "agent.example", "SPARK_UPSTREAM_SSH_KEY_FILE": "/etc/spark/up.key",
+		"SPARK_LLM_BASE_URL": "http://token-mall.spark.internal/v1", "SPARK_LLM_API_KEY": "test-key",
 	}
 }
 
@@ -419,5 +420,107 @@ func TestLoadAppDefaultsAndValues(t *testing.T) {
 	}
 	if got := (config.Config{AppHFEndpoint: "http://x"}).FillAppDefaults().AppHFEndpoint; got != "http://x" {
 		t.Fatalf("FillAppDefaults overwrote %q", got)
+	}
+}
+
+// 计划 12：AI 管家的 LLM 配置。
+func TestLoadLLMDefaults(t *testing.T) {
+	base := func(kv ...string) map[string]string {
+		m := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	// 默认 provider openai；配了 BaseURL 时管家开启、模型 qwen3-32b、输出 2048、价格 0、工具开
+	c, err := config.Load(env(base("SPARK_LLM_BASE_URL", "http://token-mall.spark.internal/v1/")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := c.LLM
+	if !c.Butler || c.ButlerOffReason != "" || l.Provider != "openai" || l.BaseURL != "http://token-mall.spark.internal/v1" || l.Model != "qwen3-32b" ||
+		l.MaxOutputTokens != 2048 || l.PriceInCentsPerM != 0 || l.PriceOutCentsPerM != 0 || !l.Tools || l.APIKey != "" {
+		t.Fatalf("llm defaults = %+v butler=%v reason=%q", l, c.Butler, c.ButlerOffReason)
+	}
+	// 模型默认值按 provider
+	for provider, model := range map[string]string{"anthropic": "claude-opus-5-5", "mock": "mock"} {
+		c, err := config.Load(env(base("SPARK_LLM_PROVIDER", provider)))
+		if err != nil || !c.Butler || c.LLM.Model != model {
+			t.Fatalf("%s: model = %q butler=%v err=%v", provider, c.LLM.Model, c.Butler, err)
+		}
+	}
+	// 显式值
+	c, err = config.Load(env(base("SPARK_LLM_PROVIDER", "anthropic", "SPARK_LLM_MODEL", "claude-x", "SPARK_LLM_API_KEY", "test-key",
+		"SPARK_LLM_MAX_OUTPUT_TOKENS", "4096", "SPARK_LLM_PRICE_INPUT_CENTS_PER_M", "3600", "SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M", "18000",
+		"SPARK_LLM_TOOLS", "off", "SPARK_BUTLER", "on")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l := c.LLM; l.Model != "claude-x" || l.APIKey != "test-key" || l.MaxOutputTokens != 4096 || l.PriceInCentsPerM != 3600 ||
+		l.PriceOutCentsPerM != 18000 || l.Tools || l.BaseURL != "" || !c.Butler {
+		t.Fatalf("llm values = %+v", l)
+	}
+	// SPARK_BUTLER=off：不校验 BaseURL
+	c, err = config.Load(env(base("SPARK_BUTLER", "off")))
+	if err != nil || c.Butler || c.ButlerOffReason != "" {
+		t.Fatalf("SPARK_BUTLER=off: butler=%v reason=%q err=%v", c.Butler, c.ButlerOffReason, err)
+	}
+	// 开发环境未显式开启管家、openai 又没配 BaseURL：不报错，管家按配置关闭并给出原因（make run / 后台 CLI 开箱可用）
+	c, err = config.Load(env(base()))
+	if err != nil || c.Butler || !strings.Contains(c.ButlerOffReason, "SPARK_LLM_BASE_URL") {
+		t.Fatalf("dev without base url: butler=%v reason=%q err=%v", c.Butler, c.ButlerOffReason, err)
+	}
+	// 生产环境配齐：BaseURL + APIKey
+	c, err = config.Load(env(prodEnv()))
+	if err != nil || !c.Butler || c.LLM.APIKey != "test-key" {
+		t.Fatalf("prod: butler=%v err=%v", c.Butler, err)
+	}
+}
+
+func TestLoadLLMErrors(t *testing.T) {
+	base := func(kv ...string) map[string]string {
+		m := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	prod := func(kv ...string) map[string]string {
+		m := prodEnv()
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"bad provider", base("SPARK_LLM_PROVIDER", "gemini"), "SPARK_LLM_PROVIDER"},
+		{"prod mock", prod("SPARK_LLM_PROVIDER", "mock"), "生产环境禁止使用 mock LLM 提供方"},
+		{"prod mock butler off", prod("SPARK_LLM_PROVIDER", "mock", "SPARK_BUTLER", "off"), "生产环境禁止使用 mock LLM 提供方"},
+		{"dev openai explicit on without base url", base("SPARK_BUTLER", "on"), "SPARK_LLM_BASE_URL"},
+		{"staging openai without base url", base("SPARK_ENV", "staging"), "SPARK_LLM_BASE_URL"},
+		{"prod openai without base url", prod("SPARK_LLM_BASE_URL", ""), "SPARK_LLM_BASE_URL"},
+		{"prod without api key", prod("SPARK_LLM_API_KEY", ""), "SPARK_LLM_API_KEY"},
+		{"prod anthropic without api key", prod("SPARK_LLM_PROVIDER", "anthropic", "SPARK_LLM_API_KEY", ""), "SPARK_LLM_API_KEY"},
+		{"base url not http", base("SPARK_LLM_BASE_URL", "token-mall:8000/v1"), "SPARK_LLM_BASE_URL"},
+		{"base url ftp", base("SPARK_LLM_PROVIDER", "anthropic", "SPARK_LLM_BASE_URL", "ftp://x/v1"), "SPARK_LLM_BASE_URL"},
+		{"bad butler", base("SPARK_BUTLER", "true"), "SPARK_BUTLER"},
+		{"bad tools", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_TOOLS", "yes"), "SPARK_LLM_TOOLS"},
+		{"bad max tokens", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_MAX_OUTPUT_TOKENS", "0"), "SPARK_LLM_MAX_OUTPUT_TOKENS"},
+		{"bad price", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_PRICE_INPUT_CENTS_PER_M", "-1"), "SPARK_LLM_PRICE_INPUT_CENTS_PER_M"},
+		{"bad out price", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M", "x"), "SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M"},
+	}
+	for _, tc := range cases {
+		_, err := config.Load(env(tc.env))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want contains %q", tc.name, err, tc.want)
+		}
+	}
+	// prod 关闭管家时不要求 BaseURL / APIKey
+	if c, err := config.Load(env(prod("SPARK_BUTLER", "off", "SPARK_LLM_BASE_URL", "", "SPARK_LLM_API_KEY", ""))); err != nil || c.Butler {
+		t.Fatalf("prod butler off: butler=%v err=%v", c.Butler, err)
 	}
 }

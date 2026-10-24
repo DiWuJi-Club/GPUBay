@@ -18,6 +18,8 @@ make check        # test + e2e
 
 开发环境短信为 mock，验证码固定为 `000000`；实名核验 mock 全部通过。
 
+AI 管家（计划 12）在开发环境默认需要 OpenAI 兼容端点：未设 `SPARK_LLM_BASE_URL` 且未显式 `SPARK_BUTLER=on` 时自动关闭（启动日志说明原因）；本地体验用 `SPARK_LLM_PROVIDER=mock make run`（确定性 mock 模型）。
+
 开发环境支付为 mock：充值后调用 `POST /api/v1/dev/recharges/{id}/pay` 模拟支付成功（生产环境不注册该接口）。PDU 为 mock，断电重启只记录调用。
 
 ### 管理后台
@@ -91,6 +93,14 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_APP_HF_ENDPOINT` | 注入应用容器的 `HF_ENDPOINT`（模型下载的 HuggingFace 镜像站） | https://hf-mirror.com |
 | `SPARK_APP_PIP_INDEX_URL` | 注入应用容器的 `PIP_INDEX_URL`（应用脚本若需装小包） | https://pypi.tuna.tsinghua.edu.cn/simple |
 | `SPARK_APP_RUNNER` | on / off：是否在本副本启动应用部署 Runner（多副本都 on，咨询锁保证只有一个在工作；e2e 用 off） | on |
+| `SPARK_BUTLER` | on / off：AI 管家部署级开关（off 时不注册路由、不显示入口；与后台「AI 管家」设置的总开关不同） | on |
+| `SPARK_LLM_PROVIDER` | openai / anthropic / mock（prod 禁 mock） | openai |
+| `SPARK_LLM_BASE_URL` | OpenAI 兼容端点（如 `http://token-mall.spark.internal/v1`）；openai 必填（仅开发环境未显式开启管家时缺省为自动关闭），anthropic 可空 | |
+| `SPARK_LLM_API_KEY` | 模型端点密钥；prod 开启管家且非 mock 时必填 | |
+| `SPARK_LLM_MODEL` | 模型名 | openai `qwen3-32b` / anthropic `claude-opus-5-5` / mock `mock` |
+| `SPARK_LLM_MAX_OUTPUT_TOKENS` | 单次输出 token 上限 | 2048 |
+| `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` | 用量页估算费用：输入 / 输出每百万 token 的价格（分） | 0 / 0 |
+| `SPARK_LLM_TOOLS` | on / off：off 时不给模型工具（端点不支持工具调用时的应急开关，管家只答不做） | on |
 
 ## 节点 Agent
 

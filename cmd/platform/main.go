@@ -82,6 +82,9 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if cfg.ButlerOffReason != "" {
+		log.Warn("AI 管家未开启", "reason", cfg.ButlerOffReason)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
