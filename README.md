@@ -53,7 +53,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_SECRET_KEY` | 32 字节密钥的 base64，加密身份证号、实例密码、内置 CA 私钥、SSH 网关主机密钥与实例主机私钥（轮换的后果见「部署注意」） | 必填 |
 | `SPARK_DOMAIN` | 控制台域名（须等于 `SPARK_PUBLIC_BASE_URL` 的域名）；用户 SSH 命令连 `ssh.<此域>`；未设 `SPARK_INGRESS_DOMAIN` 时也是租户 Web 子域的父域 | spark.local |
 | `SPARK_ADMIN_ADDR` | 后台 API 监听地址（只应绑定内网地址） | 127.0.0.1:8081 |
-| `SPARK_UPLOAD_DIR` | 上传文件（营业执照）保存目录，需定期备份 | ./.devdata/uploads |
+| `SPARK_UPLOAD_DIR` | 上传文件（营业执照、工作流封面）保存目录，需定期备份；`platform admin workflow import` 须用同一目录 | ./.devdata/uploads |
 | `SPARK_SMS_DRIVER` / `SPARK_KYC_DRIVER` | mock / aliyun（生产禁止 mock） | mock |
 | `SPARK_PAY_DRIVER` | mock / real（生产禁止 mock；real 时启用已配置的微信和 / 或支付宝） | mock |
 | `SPARK_PDU_DRIVER` | mock / snmp（生产禁止 mock；snmp 时按每台 PDU 的配置） | mock |
@@ -87,6 +87,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_APP_HF_ENDPOINT` | 注入应用容器的 `HF_ENDPOINT`（模型下载的 HuggingFace 镜像站） | https://hf-mirror.com |
 | `SPARK_APP_PIP_INDEX_URL` | 注入应用容器的 `PIP_INDEX_URL`（应用脚本若需装小包） | https://pypi.tuna.tsinghua.edu.cn/simple |
 | `SPARK_APP_RUNNER` | on / off：是否在本副本启动应用部署 Runner（多副本都 on，咨询锁保证只有一个在工作；e2e 用 off） | on |
+| `SPARK_APP_GIT_MIRROR` | 注入应用容器的 `SPARK_GIT_MIRROR`：ComfyUI 安装工作流的自定义节点时 `git clone <前缀>https://github.com/...`（失败再直连）。须以 `https://` 开头、以 `/` 结尾；`off` = 直连 | https://gh-proxy.com/ |
 
 ## 节点 Agent
 
@@ -160,6 +161,24 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - **回滚**：
   - 只回退 platform 版本（不执行 Down）：新表留着不用，已部署的应用进程继续在容器里运行，但不再有人推进部署、登记端口或在实例重启后恢复；控制台和后台没有应用入口。
   - 执行 `00020` 的 Down：删除 `apps`、`app_versions`、`app_deployments`、`app_deploy_events` 与 `machines.cached_images(_at)`，**部署记录、事件和加密保存的应用变量全部丢失且不可恢复**；`instance_ports` 删除 `deployment_id` 列，应用登记的端口行保留下来变成普通端口（用户可自行删除）；数据盘 `/root/data/models` 里的模型与 `.spark-apps` 目录不受影响。
+
+### ComfyUI 工作流市场（计划 11）
+
+- **发布顺序**：只发 platform（迁移 `00024_comfy_workflows.sql`，四张新表），不改 Agent。发布后依次：
+  1. 导入 comfyui 应用 **1.1.0**（`supports_workflows`、`MODEL_ID` 默认 `none`、模型 / 自定义节点 / 用户目录放到数据盘 `/root/data/comfyui`）：与计划 7 相同的 `platform admin app import /apps`（`deploy/apps` 里 comfyui 已是 1.1.0，其它应用同版本号重复导入会报错、可忽略），再在后台「应用」发布 comfyui 1.1.0（super + TOTP）。1.0.0 的部署照常运行，用户第一次给它装工作流时自动换到 1.1.0。
+  2. 导入工作流为草稿：`platform admin workflow import <目录>`，目录形如 `deploy/workflows`（每个 `<slug>/` 下 `workflow.json`、`graph.json`、`manifest.json`，可选 `api.json`、`cover.png|jpg|webp`；格式见 `deploy/workflows/README.md`）。同计划 7，命令读的是 platform 容器内的目录：
+
+     ```bash
+     docker compose cp ../workflows/. platform:/workflows
+     docker compose exec platform /platform admin workflow import /workflows
+     ```
+
+     每个工作流输出 `<slug> <版本> created|version-added`，失败的输出 `<slug> error: 原因`（其它照常导入，最后非零退出）。**封面写进 `SPARK_UPLOAD_DIR`**：在 platform 容器内执行（`exec`）天然是同一目录；用一次性容器（`run --rm`）或在宿主机上直接跑 `platform admin` 时，必须让它的 `SPARK_UPLOAD_DIR` 指向与服务**同一个**目录（同一个卷），否则数据库里有封面记录而服务读不到文件。
+  3. 后台「工作流」逐个检查版本（模型 / 节点 / 快速出图参数）并发布（super + TOTP，发布后不可变），再把工作流状态改为「上架」，控制台 `/workflows` 才能看到。
+- **国内网络**：模型从 ModelScope（或 `SPARK_APP_HF_ENDPOINT` 的 hf-mirror）下载；自定义节点从 GitHub 经 `SPARK_APP_GIT_MIRROR` 前缀 clone，镜像失效时改这个变量（或设 `off` 直连）后用户重新部署即可。若指向内网镜像站，网段要加进 `SPARK_AGENT_ALLOW_CIDRS`。
+- **安全**：自定义节点是第三方代码，在用户容器里以 root 安装运行；只有 super 能发布工作流版本，Git 主机限 github.com / gitee.com / gitcode.com 且钉死 commit，导入前须评审节点仓库。
+- **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。
+- **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），容器内文件不受影响。
 
 ## API 约定
 
