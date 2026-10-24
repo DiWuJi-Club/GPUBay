@@ -3,7 +3,6 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
@@ -12,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib" // 注册 database/sql 驱动 "pgx"，供 goose 使用
+	"github.com/jackc/pgx/v5/stdlib" // database/sql 适配，供 goose 使用
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
 
@@ -39,10 +38,13 @@ func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 }
 
 func Migrate(ctx context.Context, url string) error {
-	sqlDB, err := sql.Open("pgx", url)
+	// 按连接池的规则解析：pool_max_conns 等 pool_* 参数只对 pgxpool 有意义，
+	// 直接交给 database/sql 驱动会被当成服务器参数发给 PostgreSQL 而连接失败。
+	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
-		return fmt.Errorf("open migrate conn: %w", err)
+		return fmt.Errorf("parse database url: %w", err)
 	}
+	sqlDB := stdlib.OpenDB(*cfg.ConnConfig)
 	defer sqlDB.Close()
 	// 会话级咨询锁：多个副本同时启动时串行执行迁移。
 	locker, err := lock.NewPostgresSessionLocker()
