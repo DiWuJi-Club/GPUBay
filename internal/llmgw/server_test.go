@@ -392,6 +392,27 @@ func TestGatewayFailoverBeforeFirstByte(t *testing.T) {
 		if nodeIDOf(row) != bID || row.Status != llm.UsageOK || row.CostMicro != 3*100+2*400 {
 			t.Fatalf("usage row %+v", row)
 		}
+		if a, b := e.svc.Router().Inflight(aID), e.svc.Router().Inflight(bID); a != 0 || b != 0 {
+			t.Fatalf("router in-flight leaked: A %d B %d", a, b)
+		}
+	})
+	t.Run("dial timeout then other node", func(t *testing.T) {
+		m := e.model("fo-t", llm.KindChat)
+		tID, _ := e.node(m, &llmtest.FakeVLLM{}, "node-ttttttttttt1")
+		e.setNodeAddr(tID, dialTimeoutAddr)
+		live := &llmtest.FakeVLLM{}
+		uID, _ := e.node(m, live, "node-uuuuuuuuuuu1")
+		_, key := e.userKey()
+		resp, b := e.post("/v1/chat/completions", key, chatBody("fo-t"))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d %s", resp.StatusCode, b)
+		}
+		if n := e.queryInt(`SELECT probe_fail_count FROM llm_nodes WHERE id = $1`, tID); n != 1 {
+			t.Fatalf("timed-out node probe_fail_count = %d", n)
+		}
+		if row := e.usageRow(resp.Header.Get("X-Request-Id")); nodeIDOf(row) != uID {
+			t.Fatalf("usage node %q", nodeIDOf(row))
+		}
 	})
 	t.Run("connection refused then other node", func(t *testing.T) {
 		m := e.model("fo-c", llm.KindChat)
@@ -527,6 +548,26 @@ func TestGatewayModelsAndCORS(t *testing.T) {
 		resp.Header.Get("Access-Control-Allow-Credentials") != "" {
 		t.Fatalf("preflight: %d %v", resp.StatusCode, resp.Header)
 	}
+	preflight := func(reqHeaders string) string {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodOptions, e.srv.URL+"/v1/chat/completions", nil)
+		req.Header.Set("Origin", "https://example.com")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		req.Header.Set("Access-Control-Request-Headers", reqHeaders)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.Header.Get("Access-Control-Allow-Headers")
+	}
+	if got := preflight("authorization,x-stainless-os"); got != "authorization, x-stainless-os" {
+		t.Fatalf("echoed allow headers = %q", got)
+	}
+	if got := preflight("authorization, bad header(), x"); got != defaultAllowHeaders || !strings.Contains(got, "X-Stainless-OS") ||
+		!strings.Contains(got, "OpenAI-Organization") {
+		t.Fatalf("fallback allow headers = %q", got)
+	}
 
 	// 未知路径：404 OpenAI 格式，也带 CORS 与 X-Request-Id
 	r, b := e.get("/v1/no/such/path", all)
@@ -581,10 +622,100 @@ func TestGatewayDeadlinesExtended(t *testing.T) {
 	}
 	dw.mu.Lock()
 	defer dw.mu.Unlock()
-	if len(dw.write) == 0 || dw.write[0].Before(before.Add(9*time.Minute)) {
-		t.Fatalf("write deadlines %v, want ≥ now + 9m", dw.write)
+	if len(dw.write) == 0 || dw.write[0].Before(before.Add(llm.TotalTimeout+WriteGrace)) {
+		t.Fatalf("write deadlines %v, want ≥ now + TotalTimeout + WriteGrace", dw.write)
 	}
 	if len(dw.read) < 2 || dw.read[0].Before(before.Add(50*time.Second)) || !dw.read[len(dw.read)-1].IsZero() {
 		t.Fatalf("read deadlines %v, want now + 60s then cleared after body read", dw.read)
+	}
+}
+
+func TestGatewayTimeouts(t *testing.T) {
+	e := newGEnv(t, func(c *Config) { c.TTFTTimeout = 150 * time.Millisecond; c.TotalTimeout = 1500 * time.Millisecond })
+	m := e.model("to-chat", llm.KindChat)
+	slowHeaders := &llmtest.FakeVLLM{HeaderDelay: 400 * time.Millisecond, PromptTokens: 1, CompletionTokens: 1, Chunks: []string{"x"}}
+	e.node(m, slowHeaders, "")
+	_, key := e.userKey()
+
+	// 非流式不受首字节超时约束（vLLM 生成完才发响应头），只受总超时
+	if r, b := e.post("/v1/chat/completions", key, chatBody("to-chat")); r.StatusCode != http.StatusOK {
+		t.Fatalf("non-stream with slow headers: %d %s", r.StatusCode, b)
+	}
+	// 流式：首字节超时 → 504 upstream_timeout、不收费
+	r, b := e.post("/v1/chat/completions", key, chatBody("to-chat", `"stream":true`))
+	expectErr(t, r, b, http.StatusGatewayTimeout, codeUpstreamTimeout)
+	if row := e.usageRow(r.Header.Get("X-Request-Id")); row.Status != llm.UsageUpstreamTimeout || row.CostMicro != 0 || row.HTTPStatus != 504 {
+		t.Fatalf("ttft usage row %+v", row)
+	}
+
+	// 流式进行中总超时：写期限多留 WriteGrace，error 事件仍写得出去；upstream_timeout 不收费
+	long := e.model("to-long", llm.KindChat)
+	chunks := make([]string, 50)
+	for i := range chunks {
+		chunks[i] = "z"
+	}
+	e.node(long, &llmtest.FakeVLLM{Chunks: chunks, Delay: 100 * time.Millisecond}, "")
+	r, got := e.post("/v1/chat/completions", key, chatBody("to-long", `"stream":true`))
+	if r.StatusCode != http.StatusOK || !strings.Contains(string(got), `"code":"upstream_timeout"`) {
+		t.Fatalf("total timeout stream: %d tail %q", r.StatusCode, got[max(0, len(got)-200):])
+	}
+	if row := e.usageRow(r.Header.Get("X-Request-Id")); row.Status != llm.UsageUpstreamTimeout || row.CostMicro != 0 {
+		t.Fatalf("total timeout usage row %+v", row)
+	}
+}
+
+func TestGatewayBudgetCountsRecentUsage(t *testing.T) {
+	e := newGEnv(t)
+	// 每个输出 token 1 分；请求 max_tokens 1 → 预估 1 分；上游实际 5 个输出 token → 5 分
+	m := e.model("bud-recent", llm.KindChat, func(f map[string]any) { f["input_price"] = 0; f["output_price"] = 1_000_000 })
+	e.node(m, &llmtest.FakeVLLM{CompletionTokens: 5, Chunks: []string{"x"}}, "")
+	u := e.user(5)
+	key, _ := e.key(u)
+	body := chatBody("bud-recent", `"max_tokens":1`)
+	r, b := e.post("/v1/chat/completions", key, body)
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("first: %d %s", r.StatusCode, b)
+	}
+	if row := e.usageRow(r.Header.Get("X-Request-Id")); row.CostMicro != 5_000_000 {
+		t.Fatalf("first cost %d", row.CostMicro)
+	}
+	// Key 缓存里的 unsettled 仍是 0；本进程刚记的 5 分要扣掉 → 可用 0 < 1
+	r, b = e.post("/v1/chat/completions", key, body)
+	d := expectErr(t, r, b, http.StatusPaymentRequired, codeInsufficientQuota)
+	if !strings.Contains(d.Message, "可用 ¥0.00") {
+		t.Fatalf("message %q", d.Message)
+	}
+	// 缓存重新装载后（unsettled 已含这 5 分）不重复扣减
+	e.svc.InvalidateUser(u)
+	e.exec(`UPDATE llm_accounts SET unsettled_micro = 0 WHERE user_id = $1`, u) // 模拟已结算：余额另行扣过
+	r, b = e.post("/v1/chat/completions", key, body)
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("after reload: %d %s", r.StatusCode, b)
+	}
+}
+
+func TestGatewayNodeKeyRejected(t *testing.T) {
+	e := newGEnv(t)
+	m := e.model("nk-chat", llm.KindChat)
+	fake := &llmtest.FakeVLLM{}
+	id, _ := e.node(m, fake, "")
+	var good []byte
+	if err := e.pool.QueryRow(e.ctx, `SELECT api_key_enc FROM llm_nodes WHERE id = $1`, id).Scan(&good); err != nil {
+		t.Fatal(err)
+	}
+	e.exec(`UPDATE llm_nodes SET api_key_enc = $2 WHERE id = $1`, id, e.box.Seal([]byte("wrong-node-key")))
+	_, key := e.userKey()
+	r, b := e.post("/v1/chat/completions", key, chatBody("nk-chat"))
+	expectErr(t, r, b, http.StatusBadGateway, codeUpstreamError)
+	if row := e.usageRow(r.Header.Get("X-Request-Id")); row.Status != llm.UsageUpstreamError || row.CostMicro != 0 {
+		t.Fatalf("usage row %+v", row)
+	}
+	if _, ok := e.gw.nodeKeys.Load(id); ok {
+		t.Fatal("rejected node key still cached")
+	}
+	// 密钥修正后下一次请求重新解密、成功
+	e.exec(`UPDATE llm_nodes SET api_key_enc = $2 WHERE id = $1`, id, good)
+	if r, b := e.post("/v1/chat/completions", key, chatBody("nk-chat")); r.StatusCode != http.StatusOK {
+		t.Fatalf("after fix: %d %s", r.StatusCode, b)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,9 @@ import (
 
 // ReadTimeout 入口给请求体上传的读期限（覆盖公网 http.Server 的 30 秒 ReadTimeout）；读完请求体后清除，见 setDeadlines。
 const ReadTimeout = 60 * time.Second
+
+// WriteGrace 写期限比请求总超时多留的时间：总超时先到 → 记 upstream_timeout（不收费），并且还能把错误 / error 事件写给客户端。
+const WriteGrace = 30 * time.Second
 
 // modelCacheTTL / transportGCEvery：在线模型表的进程内缓存时长、回收已下线节点 Transport 的间隔。
 const (
@@ -70,13 +74,14 @@ type Server struct {
 	clk     clock.Clock
 	authLim *ipLimiter
 
-	transports sync.Map // nodeID → http.RoundTripper
-	nodeKeys   sync.Map // nodeID → string（节点密钥不变，解密一次）
+	transports sync.Map // nodeID → *nodeTransports
+	nodeKeys   sync.Map // nodeID → string（节点密钥不变，解密一次；节点回 401 或掉出路由表时删除）
 	gcMu       sync.Mutex
 	lastGC     time.Time
 
 	models   modelCache
 	balances balanceCache
+	recorded recordedCache
 }
 
 func New(svc *llm.Service, cfg Config, clk clock.Clock, log *slog.Logger) *Server {
@@ -92,6 +97,7 @@ func New(svc *llm.Service, cfg Config, clk clock.Clock, log *slog.Logger) *Serve
 
 // Router 返回网关的 chi 路由（路径相对 /v1）：GET /models、POST /chat/completions、/completions、/embeddings；
 // OPTIONS 任意路径 → 200（CORS 预检，在入口中间件里处理）；其它 → OpenAI 格式 404 / 405。
+// 已知路径配错方法回 405 method_not_allowed（规格只写了 404，405 对 SDK 更明确，保留）。
 func (g *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(g.entry)
@@ -111,34 +117,86 @@ func (g *Server) Router() http.Handler {
 // newRequestID 'req-' + 16 位 [a-z0-9]（llm_usage.request_id、X-Request-Id）。
 func newRequestID() string { return randx.ID("req-", 16) }
 
+// defaultAllowHeaders 预检没带（或带了不合法的）Access-Control-Request-Headers 时允许的请求头：
+// OpenAI 官方 SDK 在浏览器里会带 X-Stainless-* 与 OpenAI-Organization / OpenAI-Project。
+const defaultAllowHeaders = "Authorization, Content-Type, Accept, X-Request-Id, OpenAI-Organization, OpenAI-Project, " +
+	"X-Stainless-Arch, X-Stainless-Lang, X-Stainless-OS, X-Stainless-Package-Version, X-Stainless-Retry-Count, " +
+	"X-Stainless-Runtime, X-Stainless-Runtime-Version, X-Stainless-Timeout, X-Stainless-Helper-Method"
+
+// allowHeaders 回显预检请求的 Access-Control-Request-Headers：须是逗号分隔的 HTTP token 列表（≤ 64 项、≤ 4 KiB），
+// 否则用 defaultAllowHeaders。网关只认 Authorization / Content-Type，其它头放行无害（不转发给节点）。
+func allowHeaders(req string) string {
+	req = strings.TrimSpace(req)
+	if req == "" || len(req) > 4096 {
+		return defaultAllowHeaders
+	}
+	parts := strings.Split(req, ",")
+	if len(parts) > 64 {
+		return defaultAllowHeaders
+	}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || !isToken(p) {
+			return defaultAllowHeaders
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, ", ")
+}
+
+// isToken RFC 9110 token。
+func isToken(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// deadlineKey 请求 ctx 里放本请求的总截止时刻（入口算一次，写期限与转发 ctx 同源）。
+type deadlineKey struct{}
+
+// requestDeadline 取入口算好的截止时刻（没有经过入口中间件时现算）。
+func (g *Server) requestDeadline(r *http.Request) time.Time {
+	if d, ok := r.Context().Value(deadlineKey{}).(time.Time); ok {
+		return d
+	}
+	return time.Now().Add(g.cfg.TotalTimeout)
+}
+
 // entry 是入口中间件：X-Request-Id、CORS（每个 /v1 响应都带；无凭据）、连接期限；OPTIONS 直接 200。
 func (g *Server) entry(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Request-Id", newRequestID())
 		h.Set("Access-Control-Allow-Origin", "*")
-		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		h.Set("Access-Control-Expose-Headers", "X-Request-Id, Retry-After")
 		if r.Method == http.MethodOptions {
+			h.Set("Access-Control-Allow-Headers", allowHeaders(r.Header.Get("Access-Control-Request-Headers")))
+			h.Add("Vary", "Access-Control-Request-Headers")
 			h.Set("Access-Control-Max-Age", "600")
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		g.setDeadlines(w)
-		next.ServeHTTP(w, r)
+		h.Set("Access-Control-Allow-Headers", defaultAllowHeaders)
+		deadline := time.Now().Add(g.cfg.TotalTimeout)
+		g.setDeadlines(w, deadline)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), deadlineKey{}, deadline)))
 	})
 }
 
-// setDeadlines 把本连接的写期限延到 now + TotalTimeout（公网 http.Server 的 60 秒 WriteTimeout 对流式不够），
-// 读期限延到 now + ReadTimeout（请求体上传）。失败（如 ResponseRecorder 不支持）只记日志。
-func (g *Server) setDeadlines(w http.ResponseWriter) {
+// setDeadlines 写期限 = 请求截止时刻 + WriteGrace（公网 http.Server 的 60 秒 WriteTimeout 对流式不够；转发 ctx 用同一截止时刻），
+// 读期限 now + ReadTimeout（请求体上传）。失败（如 ResponseRecorder 不支持）只记日志。
+func (g *Server) setDeadlines(w http.ResponseWriter, deadline time.Time) {
 	rc := http.NewResponseController(w)
-	now := time.Now()
-	if err := rc.SetWriteDeadline(now.Add(g.cfg.TotalTimeout)); err != nil {
+	if err := rc.SetWriteDeadline(deadline.Add(WriteGrace)); err != nil {
 		g.logDeadline(err)
 	}
-	if err := rc.SetReadDeadline(now.Add(ReadTimeout)); err != nil {
+	if err := rc.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
 		g.logDeadline(err)
 	}
 }
@@ -200,6 +258,66 @@ func (g *Server) flushCaches() {
 	g.balances.m.Clear()
 }
 
+// ---- 本进程新记的用量（补 Authorize 缓存里 unsettled_micro 的滞后） ----
+
+// recordedTTL 记录保留时长：比 KeyCacheTTL 长，任何还在用的 Authorize 缓存条目都是这段时间内装载的。
+const recordedTTL = 2 * llm.KeyCacheTTL
+
+// recordedCache 每用户一份「记账成功的 cost_micro + 记账后的装载序号」。预算预检只扣减序号 ≥ AuthContext.LoadSeq 的那些
+// （它们不在那份缓存的 unsettled_micro 里）；进程内、尽力而为，并发打穿仍由结算的欠费兜底。
+type recordedCache struct {
+	mu    sync.Mutex
+	users map[int64][]recordedCost
+}
+
+type recordedCost struct {
+	seq   uint64
+	micro int64
+	at    time.Time // 单调时钟，只用于清理
+}
+
+func (c *recordedCache) add(userID int64, seq uint64, micro int64) {
+	if micro <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.users == nil {
+		c.users = map[int64][]recordedCost{}
+	}
+	c.users[userID] = append(c.users[userID], recordedCost{seq: seq, micro: micro, at: time.Now()})
+}
+
+// since 用户在装载序号 seq 之后（含）记的 cost_micro 合计。
+func (c *recordedCache) since(userID int64, seq uint64) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var sum int64
+	for _, r := range c.users[userID] {
+		if r.seq >= seq {
+			sum += r.micro
+		}
+	}
+	return sum
+}
+
+// prune 删掉超过 recordedTTL 的记录（随 Transport 回收一起，每 transportGCEvery 一次）。
+func (c *recordedCache) prune(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for u, list := range c.users {
+		i := 0
+		for i < len(list) && now.Sub(list[i].at) > recordedTTL {
+			i++
+		}
+		if i == len(list) {
+			delete(c.users, u)
+		} else {
+			c.users[u] = list[i:]
+		}
+	}
+}
+
 // ---- 余额缓存（每用户 BalanceCacheTTL） ----
 
 type balanceCache struct{ m sync.Map } // userID → balanceEntry
@@ -243,34 +361,50 @@ type dialFailure struct{ err error }
 func (e *dialFailure) Error() string { return "llmgw: dial upstream: " + e.err.Error() }
 func (e *dialFailure) Unwrap() error { return e.err }
 
+// nodeTransports 一个节点的两个 RoundTripper：流式带 ResponseHeaderTimeout = TTFTTimeout，非流式不带（只受总超时约束）。
+// 见 call.send 关于首字节超时只用于流式的说明。注入的 Config.Transport 两者共用一个。
+type nodeTransports struct {
+	stream, plain http.RoundTripper
+}
+
 // transport 取（或建）节点的 RoundTripper；顺带按 transportGCEvery 回收已不在路由表里的节点。
-func (g *Server) transport(node llm.RouteNode) http.RoundTripper {
+func (g *Server) transport(node llm.RouteNode, stream bool) http.RoundTripper {
 	g.maybeGCTransports()
-	if v, ok := g.transports.Load(node.ID); ok {
-		return v.(http.RoundTripper)
-	}
-	var rt http.RoundTripper
-	if g.cfg.Transport != nil {
-		rt = g.cfg.Transport(node)
-	} else {
-		target, pool := node.Target, g.svc.Upstream()
-		rt = &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				c, err := pool.Dial(ctx, target, llm.NodePort)
-				if err != nil {
-					return nil, &dialFailure{err: err}
-				}
-				return c, nil
-			},
-			MaxIdleConns:          256,
-			MaxIdleConnsPerHost:   64,
-			IdleConnTimeout:       90 * time.Second,
-			ResponseHeaderTimeout: g.cfg.TTFTTimeout,
-			DisableCompression:    true,
+	v, ok := g.transports.Load(node.ID)
+	if !ok {
+		var nt *nodeTransports
+		if g.cfg.Transport != nil {
+			rt := g.cfg.Transport(node)
+			nt = &nodeTransports{stream: rt, plain: rt}
+		} else {
+			nt = &nodeTransports{stream: g.newTransport(node, g.cfg.TTFTTimeout), plain: g.newTransport(node, 0)}
 		}
+		v, _ = g.transports.LoadOrStore(node.ID, nt)
 	}
-	v, _ := g.transports.LoadOrStore(node.ID, rt)
-	return v.(http.RoundTripper)
+	nt := v.(*nodeTransports)
+	if stream {
+		return nt.stream
+	}
+	return nt.plain
+}
+
+// newTransport 生产 Transport：DialContext 忽略地址、经上游 SSH 连接池拨容器内 127.0.0.1:NodePort。
+func (g *Server) newTransport(node llm.RouteNode, headerTimeout time.Duration) *http.Transport {
+	target, pool := node.Target, g.svc.Upstream()
+	return &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			c, err := pool.Dial(ctx, target, llm.NodePort)
+			if err != nil {
+				return nil, &dialFailure{err: err}
+			}
+			return c, nil
+		},
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: headerTimeout,
+		DisableCompression:    true, // SSE 原样透传
+	}
 }
 
 // maybeGCTransports 节点掉出路由表（removed / failed / draining / unhealthy）后关闭其空闲连接并删除 Transport；
@@ -286,13 +420,23 @@ func (g *Server) maybeGCTransports() {
 	router := g.svc.Router()
 	g.transports.Range(func(k, v any) bool {
 		if id := k.(string); !router.HasNode(id) {
-			if ci, ok := v.(interface{ CloseIdleConnections() }); ok {
-				ci.CloseIdleConnections()
+			nt := v.(*nodeTransports)
+			for _, rt := range []http.RoundTripper{nt.stream, nt.plain} {
+				if ci, ok := rt.(interface{ CloseIdleConnections() }); ok {
+					ci.CloseIdleConnections()
+				}
 			}
 			g.transports.Delete(id)
 		}
 		return true
 	})
+	g.nodeKeys.Range(func(k, _ any) bool {
+		if id := k.(string); !router.HasNode(id) {
+			g.nodeKeys.Delete(id)
+		}
+		return true
+	})
+	g.recorded.prune(time.Now())
 }
 
 // ---- 401 的按 IP 限流 ----

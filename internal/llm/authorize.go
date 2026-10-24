@@ -22,6 +22,9 @@ type AuthContext struct {
 	Account               Account // 用户还没有 llm_accounts 行时为全零值（UserID 已填）
 	UserStatus, KYCStatus string
 	Limits                Limits // 解析后的 RPM / TPM / Concurrency（默认或账户覆盖）
+	// LoadSeq 是这份数据查库时的装载序号（查库之前取号，见 AuthLoadSeq）：网关据此只扣减「装载之后本进程新记的用量」，
+	// 补上缓存里 unsettled_micro 落后的部分（预算预检）。
+	LoadSeq uint64
 }
 
 // AuthError 鉴权 / 门槛失败；网关直接转成 OpenAI 错误体 {"error":{"message","type","code"}}。
@@ -51,7 +54,8 @@ type keyCacheEntry struct {
 type keyCache struct {
 	m         sync.Map
 	gen       atomic.Uint64
-	afterLoad func() // 仅测试：查库之后、写缓存之前调用
+	loads     atomic.Uint64 // 装载序号（每次查库 +1）
+	afterLoad func()        // 仅测试：查库之后、写缓存之前调用
 }
 
 // Authorize 按 Key 哈希鉴权（规格 §6.1 步骤 2～3）：Key（active、未过期）→ 用户（未封禁、已实名）→ 账户（未停用、无欠费）。
@@ -66,6 +70,7 @@ func (s *Service) Authorize(ctx context.Context, keyHash string, now time.Time) 
 		return ac, checkAuth(ac, now)
 	}
 	gen := c.gen.Load()
+	seq := c.loads.Add(1) // 查库之前取号：之后提交的用量一定 ≥ 这个号（之前提交的可能被重复扣减一次，偏保守）
 	found, err := s.loadAuth(ctx, keyHash)
 	if err != nil {
 		return AuthContext{}, err
@@ -77,6 +82,7 @@ func (s *Service) Authorize(ctx context.Context, keyHash string, now time.Time) 
 		c.m.Delete(keyHash)
 		return AuthContext{}, errInvalidKey()
 	}
+	found.LoadSeq = seq
 	e := &keyCacheEntry{ac: *found, expires: now.Add(KeyCacheTTL)}
 	c.m.Store(keyHash, e)
 	if c.gen.Load() != gen {
@@ -141,6 +147,10 @@ func (s *Service) loadAuth(ctx context.Context, keyHash string) (*AuthContext, e
 	ac.Limits = a.Limits()
 	return &ac, nil
 }
+
+// AuthLoadSeq 返回当前装载序号。网关在记账成功后取它标记该笔用量：序号 ≥ AuthContext.LoadSeq 的用量
+// 不在那份缓存的 unsettled_micro 里（或恰在边界上，被保守地多扣一次）。
+func (s *Service) AuthLoadSeq() uint64 { return s.keyCache.loads.Load() }
 
 // InvalidateKey 本进程内立即失效该哈希的缓存（控制台修改 / 撤销、后台停用时在事务提交后调用）；其它进程最多 KeyCacheTTL 后生效。
 func (s *Service) InvalidateKey(hash string) {

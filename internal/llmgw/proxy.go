@@ -76,6 +76,7 @@ func (g *Server) handleCompletion(endpoint string) http.HandlerFunc {
 		if !ok {
 			return
 		}
+		// Content-Type 在鉴权之后检查（规格 §6.1 把它写在第 1 步）：未鉴权的请求一律先回 401，保留这个顺序。
 		if !isJSONContentType(r.Header.Get("Content-Type")) {
 			writeErr(w, http.StatusBadRequest, codeInvalidRequest, "Content-Type 必须是 application/json")
 			return
@@ -158,7 +159,9 @@ func (g *Server) handleCompletion(endpoint string) http.HandlerFunc {
 			return
 		}
 		need := max(llm.EstimateFen(m, len(body), p.maxTokens), 1)
-		budget := bal - (ac.Account.UnsettledMicro+llm.MicroPerFen-1)/llm.MicroPerFen - ac.Account.Debt
+		// 缓存的 unsettled_micro 最多落后 KeyCacheTTL：补上装载之后本进程新记的用量
+		unsettled := ac.Account.UnsettledMicro + g.recorded.since(ac.UserID, ac.LoadSeq)
+		budget := bal - (unsettled+llm.MicroPerFen-1)/llm.MicroPerFen - ac.Account.Debt
 		releaseEst, avail, ok := lim.TryReserveEstimate(ac.UserID, need, budget)
 		if !ok {
 			writeErr(w, http.StatusPaymentRequired, codeInsufficientQuota,
@@ -184,34 +187,39 @@ func yuan(fen int64) string { return fmt.Sprintf("%d.%02d", fen/100, fen%100) }
 // run 选节点、转发（首字节前失败转移一次）、响应与记账。
 func (c *call) run() {
 	g := c.g
-	ctx, cancel := context.WithTimeout(c.r.Context(), g.cfg.TotalTimeout)
+	// 与入口的写期限同一截止时刻（写期限另加 WriteGrace）：总超时先到，还来得及写错误并记 upstream_timeout
+	ctx, cancel := context.WithDeadline(c.r.Context(), g.requestDeadline(c.r))
 	defer cancel()
 	router := g.svc.Router()
 	exclude := map[string]bool{}
 	var failed *llm.RouteNode
-	for attempt := 0; attempt < 2; attempt++ {
+	// attempt 一次选节点 + 转发；返回 true 表示请求已处理完。节点在途名额用 defer 归还（panic 也不泄漏）。
+	attempt := func() bool {
 		node, release, err := router.PickAcquire(c.model.ID, c.ac.Key.ID, exclude)
 		if err != nil {
 			if failed != nil {
 				// 失败转移时没有别的可用节点
 				c.fail(outcome{node: failed, status: llm.UsageUpstreamError}, http.StatusBadGateway, codeUpstreamError, "上游节点出错，请稍后再试")
-				return
+			} else {
+				c.noNode(err)
 			}
-			c.noNode(err)
-			return
+			return true
 		}
+		defer release()
 		up, err := c.send(ctx, node)
-		if c.failover(up, err) {
-			release()
+		if c.failover(ctx, up, err) {
 			g.noteFailure(node.ID, up, err, c.reqID)
 			exclude[node.ID] = true
-			n := node
-			failed = &n
-			continue
+			failed = &node
+			return false
 		}
 		c.respond(ctx, node, up, err)
-		release()
-		return
+		return true
+	}
+	for i := 0; i < 2; i++ {
+		if attempt() {
+			return
+		}
 	}
 	c.fail(outcome{node: failed, status: llm.UsageUpstreamError}, http.StatusBadGateway, codeUpstreamError, "上游节点出错，请稍后再试")
 }
@@ -242,7 +250,10 @@ type upstreamResp struct {
 }
 
 // send 把请求转发给节点：方法 / 路径不变，头只带 Content-Type、Accept、Authorization（节点密钥）、X-Request-Id。
-// 首字节（响应头）超时 TTFTTimeout：生产 Transport 有 ResponseHeaderTimeout，这里再用计时器兜底（注入的 Transport 也生效）。
+//
+// 首字节超时 TTFTTimeout 只用于流式请求（生产流式 Transport 的 ResponseHeaderTimeout + 这里的计时器兜底，注入的 Transport 也生效）。
+// 与规格 §6.1 第 8 步不同：vLLM 的非流式响应要等整段生成完才发响应头，对它套 120 秒首字节超时会把长生成误杀；
+// 非流式只受总超时（TotalTimeout）约束。
 func (c *call) send(ctx context.Context, node llm.RouteNode) (upstreamResp, error) {
 	g := c.g
 	key, err := g.nodeKey(ctx, node.ID)
@@ -262,12 +273,15 @@ func (c *call) send(ctx context.Context, node llm.RouteNode) (upstreamResp, erro
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("X-Request-Id", c.reqID)
 	hit := &atomic.Bool{}
-	timer := time.AfterFunc(g.cfg.TTFTTimeout, func() {
-		hit.Store(true)
-		upCancel()
-	})
-	resp, err := g.transport(node).RoundTrip(req)
-	if !timer.Stop() && err == nil {
+	var timer *time.Timer
+	if c.p.stream {
+		timer = time.AfterFunc(g.cfg.TTFTTimeout, func() {
+			hit.Store(true)
+			upCancel()
+		})
+	}
+	resp, err := g.transport(node, c.p.stream).RoundTrip(req)
+	if timer != nil && !timer.Stop() && err == nil {
 		// 计时器恰在响应头到达时触发：上游 ctx 已取消，按首字节超时处理
 		resp.Body.Close()
 		resp, err = nil, context.DeadlineExceeded
@@ -279,19 +293,20 @@ func (c *call) send(ctx context.Context, node llm.RouteNode) (upstreamResp, erro
 	return upstreamResp{resp: resp, cancel: upCancel, ttftHit: hit}, nil
 }
 
-// failover 规格 §6.1 第 9 步：尚未向客户端写任何字节，且是连接层错误（建连失败 / 连接被拒 / 复用的连接被对端关闭）
-// 或上游 502 / 503 → 换节点。客户端已断开、超时、网关内部错误不换。
-func (c *call) failover(up upstreamResp, err error) bool {
-	if c.r.Context().Err() != nil || up.internal {
+// failover 规格 §6.1 第 9 步：尚未向客户端写任何字节，且是连接层错误（建连失败——包括拨号超时 / 连接被拒 / 复用的连接被对端关闭）
+// 或上游 502 / 503 → 换节点。客户端已断开、总超时已到、首字节超时、网关内部错误不换。
+func (c *call) failover(ctx context.Context, up upstreamResp, err error) bool {
+	if c.r.Context().Err() != nil || ctx.Err() != nil || up.internal {
 		return false
 	}
 	if err == nil {
 		s := up.resp.StatusCode
 		return s == http.StatusBadGateway || s == http.StatusServiceUnavailable
 	}
-	if up.ttftHit != nil && up.ttftHit.Load() || isTimeout(err) {
+	if up.ttftHit != nil && up.ttftHit.Load() {
 		return false
 	}
+	// 建连失败（含 SSH 拨号超时）先判：它也是 net.Error Timeout，但节点不可达就该换节点
 	var df *dialFailure
 	var de *upstream.DialError
 	var oe *net.OpError
@@ -300,6 +315,8 @@ func (c *call) failover(up upstreamResp, err error) bool {
 		return true
 	case errors.As(err, &oe) && oe.Op == "dial":
 		return true
+	case isTimeout(err):
+		return false
 	case errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, syscall.ECONNRESET),
 		errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		return true
@@ -403,6 +420,11 @@ func (c *call) nonStream(ctx context.Context, node *llm.RouteNode, up upstreamRe
 	}
 	s := resp.StatusCode
 	switch {
+	case s == http.StatusUnauthorized:
+		// 节点拒绝了节点密钥：平台故障（密钥不一致），不是用户的错——丢掉缓存的密钥、502，不透传
+		c.g.nodeKeys.Delete(node.ID)
+		c.g.log.Error("llmgw: node rejected node key", "node_id", node.ID, "request_id", c.reqID)
+		c.fail(outcome{node: node, status: llm.UsageUpstreamError}, http.StatusBadGateway, codeUpstreamError, "上游节点出错，请稍后再试")
 	case s >= 200 && s < 300:
 		o := outcome{node: node, status: llm.UsageOK, httpStatus: s, charge: true}
 		var parsed struct {
@@ -465,10 +487,16 @@ func (c *call) record(o outcome) {
 			g.log.Error("llm: record usage failed", "err", err, "request_id", c.reqID, "user_id", u.UserID, "key_id", u.KeyID,
 				"model_id", u.ModelID, "status", u.Status, "prompt_tokens", u.PromptTokens, "completion_tokens", u.CompletionTokens,
 				"cost_micro", u.CostMicro)
-			if e := g.svc.AlertUsageRecordFailed(ctx); e != nil {
+			// 告警用自己的短超时 ctx：记账可能正是因为超时失败的
+			actx, acancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if e := g.svc.AlertUsageRecordFailed(actx); e != nil {
 				g.log.Error("llmgw: raise usage record alert failed", "err", e)
 			}
+			acancel()
 		}
+	} else if u.Status == llm.UsageOK || u.Status == llm.UsageClientAbort {
+		// 记账后取装载序号：序号 ≥ 它的缓存条目装载时这笔还没提交（或在边界上），预检要另扣
+		g.recorded.add(u.UserID, g.svc.AuthLoadSeq(), u.CostMicro)
 	}
 	g.svc.Limiter().AddTokens(c.ac.UserID, o.prompt+o.completed, g.clk.Now())
 }

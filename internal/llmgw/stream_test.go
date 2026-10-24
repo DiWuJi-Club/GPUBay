@@ -49,6 +49,56 @@ func TestSSEScanner(t *testing.T) {
 	if all.String() != in {
 		t.Fatal("concatenated events differ from input")
 	}
+	// 其它空行形态：LF + CRLF、CR CR、CRLF 被拆在两次读之间（OneByteReader）
+	in2 := "data: a\n\r\ndata: b\r\rdata: c\r\n\r\n"
+	sc = newSSEScanner(iotest.OneByteReader(strings.NewReader(in2)))
+	var got2 []string
+	for {
+		e, d, ok := sc.Next()
+		if !ok {
+			break
+		}
+		got2 = append(got2, string(e)+"|"+string(d))
+	}
+	if want := []string{"data: a\n\r\n|a", "data: b\r\r|b", "data: c\r\n\r\n|c"}; !reflect.DeepEqual(got2, want) {
+		t.Fatalf("blank-line variants:\n got %q\nwant %q", got2, want)
+	}
+	// 大事件：> 32 KiB（跨多次读）与 > 1 MiB 都完整解析
+	for _, size := range []int{40 << 10, 1<<20 + 123} {
+		payload := `{"choices":[{"delta":{"content":"` + strings.Repeat("y", size) + `"}}]}`
+		raw := "data: " + payload + "\n\n" + "data: [DONE]\n\n"
+		sc := newSSEScanner(strings.NewReader(raw))
+		ev, d, ok := sc.Next()
+		if !ok || string(ev) != "data: "+payload+"\n\n" || string(d) != payload {
+			t.Fatalf("size %d: event len %d data len %d", size, len(ev), len(d))
+		}
+		if c, _ := countChunk(d); !c {
+			t.Fatalf("size %d: content not counted", size)
+		}
+		if _, d, ok := sc.Next(); !ok || string(d) != "[DONE]" {
+			t.Fatalf("size %d: [DONE] lost", size)
+		}
+	}
+	// 超过上限仍没有空行：原样转发、不解析
+	over := "data: " + strings.Repeat("q", 100) + "\n\n"
+	sc = newSSEScanner(iotest.OneByteReader(strings.NewReader(over)))
+	sc.max = 50
+	var relayed []byte
+	first, d, ok := sc.Next()
+	if !ok || d != nil || len(first) != 51 {
+		t.Fatalf("over-limit event: ok %v len %d data %q", ok, len(first), d)
+	}
+	relayed = append(relayed, first...)
+	for {
+		part, _, ok := sc.Next()
+		if !ok {
+			break
+		}
+		relayed = append(relayed, part...)
+	}
+	if string(relayed) != over {
+		t.Fatal("over-limit bytes not relayed intact")
+	}
 	sc = newSSEScanner(iotest.TimeoutReader(strings.NewReader("data: x\n\n")))
 	if _, _, ok := sc.Next(); !ok {
 		t.Fatal("first event lost")
@@ -71,6 +121,8 @@ func TestCountChunk(t *testing.T) {
 		{`{"choices":[{"text":"x"}]}`, true, nil},
 		{`{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}`, false, &usageJSON{3, 4}},
 		{`{"choices":[{"delta":{}}],"usage":null}`, false, nil},
+		{`{"choices":{"bad":true},"usage":{"prompt_tokens":1,"completion_tokens":2}}`, false, &usageJSON{1, 2}},
+		{`{"choices":[{"delta":{"content":"x"}}],"usage":"bad"}`, true, nil},
 		{`not json`, false, nil},
 	} {
 		content, u := countChunk([]byte(c.data))
@@ -181,6 +233,10 @@ func TestGatewayStreamPassthroughAndUsage(t *testing.T) {
 	}
 	if !bytes.Equal(got2, fake.Recorded()[1].Sent) {
 		t.Fatal("second stream bytes differ")
+	}
+	// [DONE] 之后读完上游剩余字节：两次流式请求复用同一条上游连接
+	if n := e.nodeConns(nodeID); n != 1 {
+		t.Fatalf("upstream connections = %d, want 1 (connection reused after [DONE])", n)
 	}
 
 	// 流式请求遇上游 4xx：按非流式透传
