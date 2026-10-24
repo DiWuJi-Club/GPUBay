@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"strconv"
+	"strings"
 
 	"spark-cloud/internal/platform/apperr"
 )
@@ -74,9 +76,20 @@ func BuildPrompt(apiPrompt json.RawMessage, inputs []InputSpec, values map[strin
 	return out, seed, nil
 }
 
-// seedValue D11：nil / "" / -1 → 随机；否则须是 0～2^53-1 的整数。
+// seedValue D11：nil / "" / -1 → 随机；否则须是 0～2^53-1 的整数（也接受十进制数字字符串，如 "123"、"-1"）。
 func seedValue(v any, rnd func() int64) (int64, string) {
-	if v == nil || v == "" {
+	if s, ok := v.(string); ok {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return randomSeed(rnd), ""
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, "种子应为 -1（随机）或 0～9007199254740991 的整数"
+		}
+		v = n
+	}
+	if v == nil {
 		return randomSeed(rnd), ""
 	}
 	n, ok := toInt(v)

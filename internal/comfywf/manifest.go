@@ -29,10 +29,13 @@ var (
 	nodeTypeRe   = regexp.MustCompile(`^[A-Za-z0-9_.: -]{1,64}$`)
 	inputKeyRe   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 	quickImageRe = regexp.MustCompile(`^spark-quickrun/[a-z0-9]{12}\.(png|jpg|webp)$`)
+	// subgraphIDRe 前端子图定义的 id 是 UUID；只有这种形状的 type 才当作子图实例。
+	subgraphIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 )
 
 const (
 	maxModelFile  = 256
+	maxRepoLen    = 128
 	maxLabelRunes = 32
 	defaultMaxLen = 1000
 	maxMaxLen     = 4000
@@ -63,6 +66,38 @@ var modelLoaderInputs = map[string][]string{
 	"DualCLIPLoader": {"clip_name1", "clip_name2"}, "TripleCLIPLoader": {"clip_name1", "clip_name2", "clip_name3"},
 	"LoraLoader": {"lora_name"}, "LoraLoaderModelOnly": {"lora_name"}, "UpscaleModelLoader": {"model_name"},
 	"ControlNetLoader": {"control_net_name"}, "CLIPVisionLoader": {"clip_name"},
+}
+
+// modelLoaderDirs 各模型加载节点读取的 models/<dir>（manifest.models[].dir 须与之相符，否则装好了 ComfyUI 也找不到）。
+var modelLoaderDirs = map[string][]string{
+	"CheckpointLoaderSimple": {"checkpoints"}, "UNETLoader": {"diffusion_models", "unet"}, "VAELoader": {"vae"},
+	"CLIPLoader": {"text_encoders", "clip"}, "DualCLIPLoader": {"text_encoders", "clip"}, "TripleCLIPLoader": {"text_encoders", "clip"},
+	"LoraLoader": {"loras"}, "LoraLoaderModelOnly": {"loras"}, "UpscaleModelLoader": {"upscale_models"},
+	"ControlNetLoader": {"controlnet"}, "CLIPVisionLoader": {"clip_vision"},
+}
+
+// modelSet 已声明的模型（文件名 → 下标）。
+type modelSet struct {
+	idx   map[string]int
+	specs []ModelSpec
+}
+
+// ref 校验 loader 节点引用的模型文件 name：须已声明（错误指向 path），目录须与 loader 相符（错误指向该模型的 dir）。
+func (ms modelSet) ref(path, who, loader, name string) error {
+	i, ok := ms.idx[name]
+	if !ok {
+		return invalid(path, who+" 引用的模型 "+name+" 不在 manifest.models 里")
+	}
+	if dirs := modelLoaderDirs[loader]; len(dirs) > 0 && !slices.Contains(dirs, ms.specs[i].Dir) {
+		return invalid(fmt.Sprintf("manifest.models[%d].dir", i),
+			fmt.Sprintf("模型 %s 的目录应为 %s（%s 的 %s 引用了它）", name, strings.Join(dirs, " 或 "), path, loader))
+	}
+	return nil
+}
+
+// isLoaderInput api_prompt 里 class_type 的 input 是不是模型文件名入参。
+func isLoaderInput(classType, input string) bool {
+	return slices.Contains(modelLoaderInputs[classType], input)
 }
 
 // outputClassTypes manifest.outputs[].node 允许的 class_type（规格 §3.2）。
@@ -111,7 +146,7 @@ func ValidateManifest(m *Manifest, graph, apiPrompt json.RawMessage) error {
 		}
 		return nil
 	}
-	if err := validateInputs(m.Inputs, api); err != nil {
+	if err := validateInputs(m.Inputs, api, models); err != nil {
 		return err
 	}
 	return validateOutputs(m.Outputs, api)
@@ -146,6 +181,12 @@ func normalize(m *Manifest) {
 		for j := range in.Options {
 			in.Options[j] = strings.TrimSpace(in.Options[j])
 		}
+		// UseNumber 解出的 json.Number 统一成 float64（与 encoding/json 默认一致；manifest_hash 不随解码方式变）。
+		if n, ok := in.Default.(json.Number); ok {
+			if f, err := n.Float64(); err == nil {
+				in.Default = f
+			}
+		}
 		if (in.Type == InputText || in.Type == InputTextarea) && in.MaxLen == 0 {
 			in.MaxLen = defaultMaxLen
 		}
@@ -157,21 +198,26 @@ func normalize(m *Manifest) {
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
-// validateModels 返回声明的模型文件名集合。
-func validateModels(models []ModelSpec) (map[string]bool, error) {
+// validateModels 返回声明的模型集合。
+func validateModels(models []ModelSpec) (modelSet, error) {
+	ms, err := validateModelList(models)
+	return modelSet{idx: ms, specs: models}, err
+}
+
+func validateModelList(models []ModelSpec) (map[string]int, error) {
 	if len(models) > MaxModelsPerVersion {
 		return nil, invalid("manifest.models", fmt.Sprintf("最多 %d 个模型", MaxModelsPerVersion))
 	}
-	names := map[string]bool{}
+	names := map[string]int{}
 	for i, md := range models {
 		p := fmt.Sprintf("manifest.models[%d]", i)
 		if !modelNameRe.MatchString(md.Name) {
 			return nil, invalid(p+".name", "文件名只能含字母、数字、. _ -，不含 /，≤ 128 字符")
 		}
-		if names[md.Name] {
+		if _, dup := names[md.Name]; dup {
 			return nil, invalid(p+".name", "模型 "+md.Name+" 重复")
 		}
-		names[md.Name] = true
+		names[md.Name] = i
 		if !ValidModelDir(md.Dir) {
 			return nil, invalid(p+".dir", "目录只能是 "+strings.Join(ModelDirs, " / "))
 		}
@@ -188,8 +234,8 @@ func validateModels(models []ModelSpec) (map[string]bool, error) {
 			if src.rf == nil {
 				continue
 			}
-			if !repoRe.MatchString(src.rf.Repo) {
-				return nil, invalid(p+"."+src.key+".repo", "仓库应形如 owner/name")
+			if len(src.rf.Repo) > maxRepoLen || !repoRe.MatchString(src.rf.Repo) {
+				return nil, invalid(p+"."+src.key+".repo", fmt.Sprintf("仓库应形如 owner/name，≤ %d 字符", maxRepoLen))
 			}
 			if !validRepoFile(src.rf.File) {
 				return nil, invalid(p+"."+src.key+".file", "应为仓库内相对路径（每段以字母或数字开头，不含 ..，≤ 256 字符）")
@@ -250,7 +296,7 @@ func validateNodes(nodes []NodeSpec) (map[string]bool, error) {
 
 func checkGitURL(s string) string {
 	u, err := url.Parse(s)
-	if err != nil || u.Scheme != "https" || u.Opaque != "" {
+	if err != nil || !strings.HasPrefix(s, "https://") || u.Scheme != "https" || u.Opaque != "" {
 		return "必须是 https:// 地址"
 	}
 	if u.User != nil || u.Port() != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(s, "#") {
@@ -261,6 +307,11 @@ func checkGitURL(s string) string {
 	}
 	if u.RawPath != "" || !gitPathRe.MatchString(u.Path) {
 		return "路径应形如 /owner/repo(.git)"
+	}
+	for _, seg := range strings.Split(strings.TrimPrefix(u.Path, "/"), "/") {
+		if strings.HasPrefix(seg, ".") {
+			return "路径的每一段不能以 . 开头"
+		}
 	}
 	return ""
 }
@@ -302,15 +353,17 @@ func parseAPIPrompt(raw json.RawMessage) (map[string]apiNode, error) {
 }
 
 // checkAPIRefs D16 在 api_prompt 上的同构校验：模型加载入参须已声明、非内置 class_type 须在 node_types 里。
-func checkAPIRefs(api map[string]apiNode, models, customTypes map[string]bool) error {
+func checkAPIRefs(api map[string]apiNode, models modelSet, customTypes map[string]bool) error {
 	for _, id := range sortedKeys(api) {
 		n := api[id]
 		if !builtinNodeTypes[n.ClassType] && !customTypes[n.ClassType] {
 			return invalid("api_prompt."+id+".class_type", "节点类型 "+n.ClassType+" 不是内置节点，须在 manifest.nodes[].node_types 里声明")
 		}
 		for _, in := range modelLoaderInputs[n.ClassType] {
-			if s, ok := n.Inputs[in].(string); ok && s != "" && !models[s] {
-				return invalid("api_prompt."+id+".inputs."+in, "引用的模型 "+s+" 不在 manifest.models 里")
+			if s, ok := n.Inputs[in].(string); ok && s != "" {
+				if err := models.ref("api_prompt."+id+".inputs."+in, n.ClassType, n.ClassType, s); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -318,7 +371,7 @@ func checkAPIRefs(api map[string]apiNode, models, customTypes map[string]bool) e
 }
 
 // validateGraph 校验 UI 格式 graph 的形状与 D16 交叉校验（含 definitions.subgraphs 里的子图节点）。
-func validateGraph(raw json.RawMessage, models, customTypes map[string]bool) error {
+func validateGraph(raw json.RawMessage, models modelSet, customTypes map[string]bool) error {
 	if len(raw) > MaxGraphBytes {
 		return invalid("graph", fmt.Sprintf("不能超过 %d KB", MaxGraphBytes/1024))
 	}
@@ -345,7 +398,7 @@ func validateGraph(raw json.RawMessage, models, customTypes map[string]bool) err
 	subgraphs := map[string]bool{}
 	if g.Definitions != nil {
 		for _, sg := range g.Definitions.Subgraphs {
-			if sg.ID != "" {
+			if subgraphIDRe.MatchString(sg.ID) {
 				subgraphs[sg.ID] = true
 			}
 		}
@@ -367,7 +420,7 @@ func validateGraph(raw json.RawMessage, models, customTypes map[string]bool) err
 	return nil
 }
 
-func checkGraphNodes(path string, raw json.RawMessage, models, customTypes, subgraphs map[string]bool) error {
+func checkGraphNodes(path string, raw json.RawMessage, models modelSet, customTypes, subgraphs map[string]bool) error {
 	var nodes []json.RawMessage
 	if err := json.Unmarshal(raw, &nodes); err != nil {
 		return invalid(path, "nodes 应为数组")
@@ -392,19 +445,44 @@ func checkGraphNodes(path string, raw json.RawMessage, models, customTypes, subg
 		if isCustomGraphNode(n.Type, n.Properties, subgraphs) && !customTypes[n.Type] {
 			return invalid(p, label+" 不是内置节点，须在 manifest.nodes[].node_types 里声明")
 		}
-		if idx := modelLoaderWidgets[n.Type]; len(idx) > 0 && isJSONArray(n.Widgets) {
-			var wv []any
-			_ = json.Unmarshal(n.Widgets, &wv)
-			for _, k := range idx {
-				if k < len(wv) {
-					if s, ok := wv[k].(string); ok && s != "" && !models[s] {
-						return invalid(p, label+" 引用的模型 "+s+" 不在 manifest.models 里")
-					}
-				}
+		for _, s := range loaderWidgetModels(n.Type, n.Widgets) {
+			if err := models.ref(p, label, n.Type, s); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
+}
+
+// loaderWidgetModels 模型加载节点 widgets_values 里的模型文件名：数组按位置（modelLoaderWidgets）；对象（部分前端 /
+// 节点包的写法）按入参名（modelLoaderInputs）；其它形状、非字符串、空串跳过。
+func loaderWidgetModels(typ string, raw json.RawMessage) []string {
+	var out []string
+	t := bytes.TrimSpace(raw)
+	switch {
+	case len(t) == 0:
+	case t[0] == '[':
+		var wv []any
+		if json.Unmarshal(t, &wv) == nil {
+			for _, k := range modelLoaderWidgets[typ] {
+				if k < len(wv) {
+					if s, ok := wv[k].(string); ok && s != "" {
+						out = append(out, s)
+					}
+				}
+			}
+		}
+	case t[0] == '{':
+		var wv map[string]any
+		if json.Unmarshal(t, &wv) == nil {
+			for _, name := range modelLoaderInputs[typ] {
+				if s, ok := wv[name].(string); ok && s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // isCustomGraphNode D16：properties.cnr_id 存在且 ≠ comfy-core、或 properties.aux_id 存在、或 type 不是内置节点（也不是子图实例）。
@@ -418,7 +496,7 @@ func isCustomGraphNode(typ string, props map[string]any, subgraphs map[string]bo
 	return !builtinNodeTypes[typ] && !subgraphs[typ]
 }
 
-func validateInputs(inputs []InputSpec, api map[string]apiNode) error {
+func validateInputs(inputs []InputSpec, api map[string]apiNode, models modelSet) error {
 	if len(inputs) > MaxInputs {
 		return invalid("manifest.inputs", fmt.Sprintf("最多 %d 个参数", MaxInputs))
 	}
@@ -456,6 +534,17 @@ func validateInputs(inputs []InputSpec, api map[string]apiNode) error {
 		targets[t] = true
 		if !currentValueMatches(in.Type, cur) {
 			return invalid(p+".input", "节点 "+in.Node+" 的 "+in.Input+" 现值类型与参数类型 "+in.Type+" 不符")
+		}
+		// 模型文件名入参只能做成 enum，选项都必须是声明的模型（否则快速出图能让 ComfyUI 去读清单外的文件）。
+		if isLoaderInput(node.ClassType, in.Input) {
+			if in.Type != InputEnum {
+				return invalid(p+".type", node.ClassType+" 的 "+in.Input+" 是模型文件名，只能用 enum 类型")
+			}
+			for j, o := range in.Options {
+				if err := models.ref(fmt.Sprintf("%s.options[%d]", p, j), "选项", node.ClassType, o); err != nil {
+					return err
+				}
+			}
 		}
 		if in.Type == InputImage {
 			if images++; images > maxImageInput {
@@ -741,12 +830,15 @@ func sortedKeys[V any](m map[string]V) []string {
 // compareNodeID 节点 id 排序：都是十进制数字时按数值（"9" < "10"），否则按字典序。
 func compareNodeID(a, b string) int {
 	if isDigits(a) && isDigits(b) {
-		a, b = strings.TrimLeft(a, "0"), strings.TrimLeft(b, "0")
-		if len(a) != len(b) {
-			return len(a) - len(b)
+		ta, tb := strings.TrimLeft(a, "0"), strings.TrimLeft(b, "0")
+		if len(ta) != len(tb) {
+			return len(ta) - len(tb)
+		}
+		if c := strings.Compare(ta, tb); c != 0 {
+			return c
 		}
 	}
-	return strings.Compare(a, b)
+	return strings.Compare(a, b) // 数值相同（"010" 与 "10"）按原文定序，结果稳定
 }
 
 func isDigits(s string) bool {

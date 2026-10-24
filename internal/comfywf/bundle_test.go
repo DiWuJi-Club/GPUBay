@@ -37,6 +37,46 @@ func TestManifestHash(t *testing.T) {
 	}
 }
 
+// JSONB 往返会改写数字原文（1e-7 → 0.0000001、1E3 → 1000、1.0 → 1）；哈希必须不变。
+func TestManifestHashJSONBInvariant(t *testing.T) {
+	m := okManifest()
+	pairs := [][2]string{
+		{`{"nodes":[{"v":1e-7}],"links":[]}`, `{"links":[],"nodes":[{"v":0.0000001}]}`},
+		{`{"nodes":[{"v":1E3}],"links":[]}`, `{"nodes":[{"v":1000}],"links":[]}`},
+		{`{"nodes":[{"v":1.0}],"links":[]}`, `{"nodes":[{"v":1}],"links":[]}`},
+		{`{"nodes":[{"v":-0.5e1}],"links":[]}`, `{"nodes":[{"v":-5}],"links":[]}`},
+		{`{"nodes":[{"v":2.50}],"links":[]}`, `{"nodes":[{"v":2.5}],"links":[]}`},
+		{`{"nodes":[{"v":18446744073709551615}],"links":[]}`, `{"nodes":[{"v":1.8446744073709551615e19}],"links":[]}`},
+		{`{"nodes":[{"v":1e20}],"links":[]}`, `{"nodes":[{"v":100000000000000000000}],"links":[]}`},
+	}
+	for _, p := range pairs {
+		if ManifestHash(json.RawMessage(p[0]), nil, m) != ManifestHash(json.RawMessage(p[1]), nil, m) {
+			t.Errorf("graph %s vs %s", p[0], p[1])
+		}
+		if ManifestHash(nil, json.RawMessage(p[0]), m) != ManifestHash(nil, json.RawMessage(p[1]), m) {
+			t.Errorf("api %s vs %s", p[0], p[1])
+		}
+	}
+	if ManifestHash(json.RawMessage(`{"v":18446744073709551615}`), nil, m) == ManifestHash(json.RawMessage(`{"v":18446744073709551614}`), nil, m) {
+		t.Error("big integers collapsed")
+	}
+	if ManifestHash(json.RawMessage(`{"v":0.1}`), nil, m) == ManifestHash(json.RawMessage(`{"v":0.2}`), nil, m) {
+		t.Error("floats collapsed")
+	}
+	// 清单的 Default：json.Number（UseNumber 解出）与 float64 等价（normalize 统一成 float64）。
+	m1, m2 := okManifest(), okManifest()
+	m1.Inputs[2].Default = json.Number("1024")
+	m1.Inputs[5].Default = json.Number("7.0")
+	normalize(&m1)
+	normalize(&m2)
+	if m1.Inputs[2].Default != 1024.0 || m1.Inputs[5].Default != 7.0 {
+		t.Fatalf("defaults = %#v %#v", m1.Inputs[2].Default, m1.Inputs[5].Default)
+	}
+	if ManifestHash(nil, nil, m1) != ManifestHash(nil, nil, m2) {
+		t.Error("Default json.Number vs float64")
+	}
+}
+
 func TestDownloadGB(t *testing.T) {
 	m := Manifest{Models: []ModelSpec{{SizeGB: 6.94}, {SizeGB: 0.07}, {SizeGB: 9.79}}}
 	if got := DownloadGB(m); got != 16.8 {
@@ -134,6 +174,16 @@ func TestBundleFilesNodes(t *testing.T) {
 
 func TestBundleFilesInvalid(t *testing.T) {
 	bad := []func(w *BundleWorkflow){
+		// 纵深防御：app.sh 按空格分隔的行读清单，字段必须仍满足清单正则。
+		func(w *BundleWorkflow) { w.Manifest.Models[0].Name = "a b.safetensors" },
+		func(w *BundleWorkflow) { w.Manifest.Models[0].Dir = "../x" },
+		func(w *BundleWorkflow) { w.Manifest.Models[0].HF.File = "a b" },
+		func(w *BundleWorkflow) { w.Manifest.Models[0].SHA256 = "x y" },
+		func(w *BundleWorkflow) {
+			w.Manifest.Nodes = []NodeSpec{usduNode()}
+			w.Manifest.Nodes[0].Git = "https://github.com/a/b c"
+		},
+		func(w *BundleWorkflow) { w.Manifest.Nodes = []NodeSpec{usduNode()}; w.Manifest.Nodes[0].Commit = "x" },
 		func(w *BundleWorkflow) { w.Slug = "../etc" },
 		func(w *BundleWorkflow) { w.Version = "" },
 		func(w *BundleWorkflow) { w.Graph = nil },
