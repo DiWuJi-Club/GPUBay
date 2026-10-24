@@ -128,11 +128,15 @@ func runeLen(s string) int { return utf8.RuneCountInString(s) }
 
 // ---- 工作流 ----
 
+// WorkflowInput 是建 / 改工作流的输入。改（UpdateWorkflow）是整体替换：Name / Summary / Description / Category / Tags / Sort
+// 都按给出的值写入（空串 / nil 即清空），只有两处例外：
+//   - Slug：创建后不可改，为空或等于原值，否则 bad_request；
+//   - Status：建时空 = draft；改时空 = 保持当前状态（在行锁内取，漏传不会把已上架的工作流打回草稿）。
 type WorkflowInput struct {
 	Slug, Name, Summary, Description, Category string
 	Tags                                       []string
 	Sort                                       int
-	Status                                     string // 空 = draft
+	Status                                     string
 }
 
 // hasControl 报告 s 是否含控制字符（含 NUL）或不是合法 UTF-8；allowNewline 时放行 \n 与 \t（说明是多行 Markdown）。
@@ -149,7 +153,8 @@ func hasControl(s string, allowNewline bool) bool {
 }
 
 // normalizeWorkflow 按规格 §2 的列注释校验并规范化（去空白、说明的 \r\n → \n、标签去空去重）；名称 / 简介 / 标签不能含控制字符，
-// 说明只允许换行与制表符。checkSlug 为 false 时（更新）不校验 Slug（UpdateWorkflow 另外要求它为空或等于原值）。
+// 说明只允许换行与制表符。checkSlug 为 false 时（更新）不校验 Slug（UpdateWorkflow 另外要求它为空或等于原值），
+// 且空 Status 原样保留（= 保持当前状态，由 UpdateWorkflow 在行锁内补上）；创建时空 Status = draft。
 func normalizeWorkflow(in WorkflowInput, checkSlug bool) (WorkflowInput, error) {
 	in.Slug = strings.TrimSpace(in.Slug)
 	in.Name = strings.TrimSpace(in.Name)
@@ -164,7 +169,7 @@ func normalizeWorkflow(in WorkflowInput, checkSlug bool) (WorkflowInput, error) 
 	case hasControl(in.Description, true):
 		return in, apperr.BadRequest("说明不能包含换行以外的控制字符")
 	}
-	if in.Status == "" {
+	if in.Status == "" && checkSlug {
 		in.Status = StatusDraft
 	}
 	tags := make([]string, 0, len(in.Tags))
@@ -197,7 +202,7 @@ func normalizeWorkflow(in WorkflowInput, checkSlug bool) (WorkflowInput, error) 
 		return in, apperr.BadRequest(fmt.Sprintf("标签最多 %d 个", maxTags))
 	case in.Sort < -maxSort || in.Sort > maxSort:
 		return in, apperr.BadRequest("排序值需在 -10000～10000 之间")
-	case !slices.Contains(wfStatuses, in.Status):
+	case !slices.Contains(wfStatuses, in.Status) && !(in.Status == "" && !checkSlug):
 		return in, apperr.BadRequest("状态只能是 draft、published 或 retired")
 	}
 	return in, nil
@@ -237,7 +242,8 @@ func (c *Catalog) insertWorkflow(ctx context.Context, tx pgx.Tx, actor audit.Act
 	return w, audit.Record(ctx, tx, now, actor.Entry("workflow.create", "workflow", target(w.ID), w))
 }
 
-// UpdateWorkflow 修改展示信息、排序与状态；slug 创建后不可改：in.Slug 为空或等于原值，否则 bad_request。
+// UpdateWorkflow 整体修改展示信息、排序与状态（字段语义见 WorkflowInput）：slug 为空或等于原值，否则 bad_request；
+// 空 Status = 保持当前状态（行锁内取）。
 func (c *Catalog) UpdateWorkflow(ctx context.Context, actor audit.Actor, id int64, in WorkflowInput) (Workflow, error) {
 	in, err := normalizeWorkflow(in, false)
 	if err != nil {
@@ -251,6 +257,9 @@ func (c *Catalog) UpdateWorkflow(ctx context.Context, actor audit.Actor, id int6
 		}
 		if in.Slug != "" && in.Slug != before.Slug {
 			return errSlugImmutable
+		}
+		if in.Status == "" {
+			in.Status = before.Status
 		}
 		now := c.clock.Now()
 		w, err := scanWorkflow(tx.QueryRow(ctx, `UPDATE comfy_workflows SET name = $2, summary = $3, description = $4, category = $5, tags = $6,
@@ -879,6 +888,22 @@ func (c *Catalog) ValidateVersionUpdate(ctx context.Context, wfID, vid int64, in
 	default:
 		return ValidateResult{}, apperr.ErrWorkflowVersionFrozen
 	}
+}
+
+// CheckPublishable 不加锁地预检草稿能否发布（后台在校验动态码之前调用：明显发布不了的请求不消耗动态码）：
+// 版本须属于该工作流（否则 not_found）且是草稿（否则 invalid_state），库里的内容须通过完整校验（否则 workflow_version_invalid）。
+// 只读；PublishVersion 仍在行锁内重新校验。
+func (c *Catalog) CheckPublishable(ctx context.Context, wfID, vid int64) error {
+	cur, err := c.version(ctx, c.pool, wfID, vid, false)
+	if err != nil {
+		return err
+	}
+	if cur.Status != StatusDraft {
+		return apperr.ErrInvalidState
+	}
+	in := VersionInput{Version: cur.Version, Graph: cur.Graph, APIPrompt: cur.APIPrompt, Manifest: cur.Manifest, Changelog: &cur.Changelog}
+	_, err = validateVersionInput(&in, cur.Changelog)
+	return err
 }
 
 // PublishVersion 在行锁内按锁住的内容重新完整校验草稿（规则可能已更新），然后发布：status = published、published_at、

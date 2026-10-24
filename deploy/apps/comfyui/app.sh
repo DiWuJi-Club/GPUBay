@@ -4,7 +4,7 @@
 #             补齐工作流需要的模型、自定义节点，把工作流文件放进用户目录；全部幂等，已有的秒过
 #   start   = 生成 extra_model_paths.yaml，main.py 放后台并写 service.pid
 # 模型软链、自定义节点、用户目录（含保存的工作流）、输入目录都在数据盘 $SPARK_DATA_DIR/comfyui 下，容器重建、卸载应用都不丢；
-# 模型文件本身缓存在 $SPARK_MODELS_DIR（modelscope/<仓库>、hf/<仓库>）。
+# 模型文件本身缓存在 ${SPARK_MODELS_DIR}（modelscope/<仓库>、hf/<仓库>）。
 # 由平台 run.sh 以 `sh app.sh install|start` 调用，env 里的变量已导出，spark_status 在 PATH 上。
 # 注意：变量后面紧跟中文时加花括号写成 ${_x} 形式（有的 sh 会把多字节字符当成变量名的一部分）。
 set -eu
@@ -13,6 +13,8 @@ set -eu
 [ -n "${HF_ENDPOINT:-}" ] || unset HF_ENDPOINT
 # 下载工具的进度条（\r 刷屏）不进日志，进度由 spark_status 汇报
 export TQDM_DISABLE=1 HF_HUB_DISABLE_PROGRESS_BARS=1
+# 不走 Xet 存储协议（hf-mirror 是否支持 Xet 不确定），统一用普通 HTTP 下载
+export HF_HUB_DISABLE_XET=1
 
 # 镜像里的 ComfyUI 程序目录（SPARK_TEST_COMFY_DIR 只给平台单测用）
 COMFY=${SPARK_TEST_COMFY_DIR:-/opt/ComfyUI}
@@ -23,6 +25,9 @@ MANIFEST=$SPARK_APP_DIR/workflows/manifest.json
 # 模型子目录（与平台 comfywf.ModelDirs 一致）
 MODEL_DIRS="checkpoints diffusion_models unet text_encoders clip vae loras upscale_models controlnet clip_vision embeddings style_models vae_approx"
 MODEL=${MODEL_ID:-none}
+# 进度分段：预置模型 5～PRESET_HI，工作流模型 WF_LO～70，节点 70～78，工作流文件 79（两者都有时预置模型只占 5～35，进度不回退）
+PRESET_HI=75
+WF_LO=5
 
 log() { printf '%s\n' "$*"; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -79,14 +84,14 @@ model_size_gb() {
   esac
 }
 
-# 后台每 10 秒按 du 汇报下载百分比（5～75）；参数是本模型涉及的仓库目录（下载中的 .incomplete 文件也在里面）
+# 后台每 10 秒按 du 汇报下载百分比（5～PRESET_HI）；参数是本模型涉及的仓库目录（下载中的 .incomplete 文件也在里面）
 progress_loop() {
   _total_kb=$(( $(model_size_gb) * 1024 * 1024 ))
   while :; do
     sleep 10
     _kb=$(du -skc "$@" 2>/dev/null | tail -n 1 | awk '{print $1}')
-    _pct=$(( 5 + ${_kb:-0} * 70 / _total_kb ))
-    [ "$_pct" -gt 75 ] && _pct=75
+    _pct=$(( 5 + ${_kb:-0} * (PRESET_HI - 5) / _total_kb ))
+    [ "$_pct" -gt "$PRESET_HI" ] && _pct=$PRESET_HI
     spark_status download "$_pct" "下载模型 ${MODEL}：$(( ${_kb:-0} / 1024 / 1024 ))GB / $(model_size_gb)GB"
   done
 }
@@ -132,7 +137,11 @@ download() {
   kill "$_pl" 2>/dev/null || true
   trap - EXIT
   link_models
-  spark_status install 78 "模型就绪"
+  if [ "$PRESET_HI" -lt 75 ]; then
+    spark_status download "$PRESET_HI" "预置模型就绪，接着安装工作流"
+  else
+    spark_status install 78 "模型就绪"
+  fi
 }
 
 # ---------- 工作流（部署包 workflows/manifest.json，计划 11） ----------
@@ -168,20 +177,26 @@ try:
         doc = json.load(f)
 except (OSError, ValueError) as e:
     fail("读取失败：%s" % e)
-if not isinstance(doc, dict) or not isinstance(doc.get("workflows") or [], list):
-    fail("格式不对")
+def items(v, what):
+    # 列表且每项都是对象；null / 缺省 = 空
+    if v is None:
+        return []
+    if not isinstance(v, list) or not all(isinstance(x, dict) for x in v):
+        fail(what + " 格式不对（应是对象数组）")
+    return v
+
+if not isinstance(doc, dict):
+    fail("格式不对（应是对象）")
 
 models, nodes, out_m, out_n, out_w = set(), {}, [], [], []
-for w in doc.get("workflows") or []:
-    if not isinstance(w, dict):
-        fail("格式不对")
+for w in items(doc.get("workflows"), "workflows"):
     slug, file = text(w.get("slug")), text(w.get("file"))
     if not SLUG.match(slug):
         fail("工作流标识 %r 不合法" % slug)
     if file != slug + ".json":
         fail("工作流 %s 的文件名 %r 不合法" % (slug, file))
     out_w.append("wf %s %s" % (slug, file))
-    for m in w.get("models") or []:
+    for m in items(w.get("models"), "工作流 %s 的 models" % slug):
         name, d = text(m.get("name")), text(m.get("dir"))
         if not NAME.match(name) or d not in DIRS:
             fail("工作流 %s 的模型 %r（目录 %r）不合法" % (slug, name, d))
@@ -196,7 +211,11 @@ for w in doc.get("workflows") or []:
             fail("模型 %s 的 sha256 不合法" % name)
         src = []
         for k in ("modelscope", "hf"):
-            s = m.get(k) or {}
+            s = m.get(k)
+            if s is None:
+                s = {}
+            if not isinstance(s, dict):
+                fail("模型 %s 的 %s 来源格式不对" % (name, k))
             repo, fl = text(s.get("repo")), text(s.get("file"))
             if not repo and not fl:
                 src += ["-", "-"]
@@ -207,7 +226,7 @@ for w in doc.get("workflows") or []:
         if src[0] == "-" and src[2] == "-":
             fail("模型 %s 没有下载来源" % name)
         out_m.append("model %s %s %s %s %s" % (name, d, "%g" % size, sha or "-", " ".join(src)))
-    for n in w.get("nodes") or []:
+    for n in items(w.get("nodes"), "工作流 %s 的 nodes" % slug):
         name, git, commit = text(n.get("name")), text(n.get("git")), text(n.get("commit"))
         if not NODE.match(name) or not GIT.match(git) or not HEX40.match(commit):
             fail("工作流 %s 的节点 %r 不合法" % (slug, name))
@@ -253,8 +272,25 @@ wf_progress() {
   done
 }
 
-# 模型：目标 comfyui/models/<dir>/<name> 已存在（有效软链或普通文件）→ 跳过；否则按 MODEL_SOURCE 选源（没有该源就用另一个），
-# 预检磁盘，下载到 $SPARK_MODELS_DIR/<modelscope|hf>/<仓库>，可选 sha256 校验，软链到目标。进度 5～70。
+# wf_fetch <modelscope|hf> <仓库> <仓库内路径> <起> <止> <模型名> <序号> <总数> <大小 GB>：后台汇报进度 + 下载，返回下载工具的退出码。
+# 只在 if 里调用（set -e 不生效，下载失败时由调用方决定换源还是失败）
+wf_fetch() {
+  _fb=$SPARK_MODELS_DIR/$1/$2
+  mkdir -p "$_fb" || return 1
+  wf_progress "$_fb" "$9" "$4" "$5" "$6" "$7" "$8" &
+  _pl=$!
+  trap 'kill "$_pl" 2>/dev/null || true' EXIT
+  log "下载模型 ${6}：$1 $2 $3"
+  fetch_from "$1" "$2" "$3" "$_fb"
+  _rc=$?
+  kill "$_pl" 2>/dev/null || true
+  trap - EXIT
+  return "$_rc"
+}
+
+# 模型：目标 comfyui/models/<dir>/<name> 已存在（有效软链或普通文件；失效的软链不算）→ 跳过；否则按 MODEL_SOURCE 选源（没有该源就用
+# 另一个；所选来源下载失败而另一个来源存在时换它再试），预检磁盘，下载到 $SPARK_MODELS_DIR/<modelscope|hf>/<仓库>，可选 sha256 校验，
+# 软链到目标。进度 WF_LO～70。
 wf_models() {
   _n=$(grep -c '^model ' "$1" || true)
   _i=0
@@ -270,23 +306,23 @@ wf_models() {
       hf-mirror) if [ "$_hfr" != - ]; then _src=hf; else _src=modelscope; fi ;;
       *) if [ "$_msr" != - ]; then _src=modelscope; else _src=hf; fi ;;
     esac
-    if [ "$_src" = hf ]; then _repo=$_hfr; _file=$_hff; else _repo=$_msr; _file=$_msf; fi
-    _base=$SPARK_MODELS_DIR/$_src/$_repo
-    _got=$_base/$_file
-    _lo=$(( 5 + (_i - 1) * 65 / _n )); _hi=$(( 5 + _i * 65 / _n ))
+    _lo=$(( WF_LO + (_i - 1) * (70 - WF_LO) / _n )); _hi=$(( WF_LO + _i * (70 - WF_LO) / _n ))
     spark_status download "$_lo" "下载模型 ${_name}（${_i}/${_n}，约 ${_size}GB）"
-    # 缓存里已有这个文件（别的部署 / 预置模型下过）就不预检，下载工具会跳过完整的文件
-    [ -f "$_got" ] || disk_check "$_name" "$_size" "$_lo"
-    mkdir -p "$_base"
-    wf_progress "$_base" "$_size" "$_lo" "$_hi" "$_name" "$_i" "$_n" &
-    _pl=$!
-    trap 'kill "$_pl" 2>/dev/null || true' EXIT
-    log "下载模型 ${_name}：$_src $_repo $_file"
-    fetch_from "$_src" "$_repo" "$_file" "$_base"
-    kill "$_pl" 2>/dev/null || true
-    trap - EXIT
+    _tries=0
+    while :; do
+      _tries=$((_tries + 1))
+      if [ "$_src" = hf ]; then _repo=$_hfr; _file=$_hff; _alt=$_msr; else _repo=$_msr; _file=$_msf; _alt=$_hfr; fi
+      _got=$SPARK_MODELS_DIR/$_src/$_repo/$_file
+      # 缓存里已有这个文件（别的部署 / 预置模型下过）就不预检，下载工具会跳过完整的文件
+      [ -f "$_got" ] || disk_check "$_name" "$_size" "$_lo"
+      if wf_fetch "$_src" "$_repo" "$_file" "$_lo" "$_hi" "$_name" "$_i" "$_n" "$_size"; then break; fi
+      if [ "$_alt" = - ] || [ "$_tries" -ge 2 ]; then die "模型 $_name 下载失败（来源 ${_src}：$_repo ${_file}）"; fi
+      if [ "$_src" = hf ]; then _src=modelscope; else _src=hf; fi
+      log "模型 $_name 下载失败，改用另一个来源 $_src 再试"
+    done
     [ -f "$_got" ] || die "模型 $_name 下载后找不到文件 $_got"
     if [ "$_sha" != - ]; then
+      spark_status download "$_hi" "校验 sha256：${_name}"
       _sum=$(sha256sum "$_got" | awk '{print $1}')
       if [ "$_sum" != "$_sha" ]; then
         rm -f "$_got"
@@ -298,40 +334,67 @@ wf_models() {
   done 3<"$1"
 }
 
-# node_fetch <git> <临时目录> <commit>：clone（GitHub 地址先经 SPARK_GIT_MIRROR，失败再直连）→ checkout → 子模块 → pip。
-# 失败返回非零（调用方在 if / || 里，set -e 不生效，每一步自己判断）
-node_fetch() {
-  _url=$1
-  case "$1" in https://github.com/*) _url=${SPARK_GIT_MIRROR:-}$1 ;; esac
-  if ! git clone --quiet --filter=blob:none "$_url" "$2" </dev/null; then
-    [ "$_url" != "$1" ] || return 1
-    log "经镜像 clone 失败，改为直连 $1"
-    rm -rf "$2"
-    git clone --quiet --filter=blob:none "$1" "$2" </dev/null || return 1
-  fi
+# node_fetch_from <地址> <临时目录> <commit> <mirror|direct>：clone → checkout → 子模块（mirror 时子模块的 GitHub 地址也经镜像）。
+# 失败返回非零（调用方在 if 里，set -e 不生效，每一步自己判断）
+node_fetch_from() {
+  git clone --quiet --no-checkout "$1" "$2" </dev/null || return 1
   git -C "$2" checkout --quiet "$3" </dev/null || return 1
-  # 有的节点带子模块（如 ComfyUI_UltimateSDUpscale 的 repositories/ultimate_sd_upscale）：GitHub 子模块同样先经镜像
+  # 有的节点带子模块（如 ComfyUI_UltimateSDUpscale 的 repositories/ultimate_sd_upscale）；子模块的地址与 commit 由节点仓库的
+  # gitlink 固定（不做主机白名单检查，见 deploy/apps/README.md）
   if [ -f "$2/.gitmodules" ]; then
-    if [ -n "${SPARK_GIT_MIRROR:-}" ] &&
-      git -C "$2" -c "url.${SPARK_GIT_MIRROR:-}https://github.com/.insteadOf=https://github.com/" submodule update --init --recursive </dev/null; then
-      :
+    if [ "$4" = mirror ]; then
+      git -C "$2" -c "url.${SPARK_GIT_MIRROR:-}https://github.com/.insteadOf=https://github.com/" submodule update --init --recursive </dev/null || return 1
     else
       git -C "$2" submodule update --init --recursive </dev/null || return 1
     fi
   fi
-  if [ -f "$2/requirements.txt" ]; then
-    pip install -r "$2/requirements.txt" </dev/null || return 1
-  fi
   return 0
 }
 
-# 节点：custom_nodes/<name>/.spark-commit = commit → 跳过；否则装到临时目录，成功后替换旧目录并写 .spark-commit。进度 70～78。
-# 清单里不再有的节点不删（D8）。
+# node_fetch <git> <临时目录> <commit>：GitHub 地址且配置了 SPARK_GIT_MIRROR 时先整套经镜像取（clone + checkout + 子模块），
+# 任一步失败就清掉临时目录、整套直连重来
+node_fetch() {
+  case "$1" in
+    https://github.com/*)
+      if [ -n "${SPARK_GIT_MIRROR:-}" ]; then
+        node_fetch_from "${SPARK_GIT_MIRROR:-}$1" "$2" "$3" mirror && return 0
+        log "经镜像获取 $1 失败，改为直连"
+        rm -rf "$2"
+      fi ;;
+  esac
+  node_fetch_from "$1" "$2" "$3" direct
+}
+
+# pip 约束：镜像自带的 PIP_CONSTRAINT（NVIDIA 镜像用它钉住自家编译的 torch 等）+ 当前已装的 torch / CUDA 相关包的版本，
+# 节点的 requirements.txt 不能把它们换掉（换成 PyPI 的通用版会让 GPU 不可用）
+pip_constraints() { # pip_constraints <输出文件>
+  : > "$1"
+  for _pc in ${PIP_CONSTRAINT:-}; do
+    if [ -f "$_pc" ]; then cat "$_pc" >> "$1"; printf '\n' >> "$1"; fi
+  done
+  python3 -m pip list --format=freeze 2>/dev/null |
+    grep -iE '^(torch|torchvision|torchaudio|torchsde|triton|numpy|transformers|safetensors|xformers|flash[-_]attn|cuda-python|nvidia-[a-z0-9-]+)==' >> "$1" || true
+}
+
+node_pip() { # node_pip <节点目录>：有 requirements.txt 才装；失败返回非零
+  [ -f "$1/requirements.txt" ] || return 0
+  _c=$SPARK_APP_DIR/.pip-constraints.txt
+  pip_constraints "$_c"
+  python3 -m pip install -c "$_c" -r "$1/requirements.txt" </dev/null
+}
+
+# 节点：custom_nodes/<name>/.spark-commit = commit → 跳过；否则取到 comfyui/.tmp-nodes/<name>（不在 custom_nodes 里，ComfyUI 不会
+# 把半成品当节点加载）、装依赖，成功后替换旧目录并写 .spark-commit。进度 70～78。清单里不再有的节点不删（D8）。
 wf_nodes() {
   # git 不等终端输入密码（私有 / 不存在的仓库直接失败）；传输 60 秒低于 1KB/s 视为卡死，失败后走直连
   export GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60
   _m=$(grep -c '^node ' "$1" || true)
   _j=0
+  # 上次中断留下的临时目录（含旧版放在 custom_nodes/.tmp-* 的）
+  rm -rf "$CDATA/.tmp-nodes"
+  for _old in "$CDATA"/custom_nodes/.tmp-*; do
+    if [ -e "$_old" ]; then rm -rf "$_old"; fi
+  done
   while read -r _kind _name _git _commit <&3; do
     [ "$_kind" = node ] || continue
     _j=$((_j + 1))
@@ -341,16 +404,22 @@ wf_nodes() {
       continue
     fi
     spark_status install "$(( 70 + (_j - 1) * 8 / _m ))" "安装节点 ${_name}（${_j}/${_m}）"
-    _tmp=$CDATA/custom_nodes/.tmp-$_name
+    _tmp=$CDATA/.tmp-nodes/$_name
     rm -rf "$_tmp"
+    mkdir -p "$CDATA/.tmp-nodes"
     if ! node_fetch "$_git" "$_tmp" "$_commit"; then
       rm -rf "$_tmp"
-      die "节点 $_name 安装失败（$_git @ ${_commit}），见上面的输出"
+      die "节点 $_name 获取失败（$_git @ ${_commit}），见上面的输出"
+    fi
+    if ! node_pip "$_tmp"; then
+      rm -rf "$_tmp"
+      die "节点 $_name 的依赖（requirements.txt）安装失败，见上面的输出"
     fi
     rm -rf "$_ndir"
     mv "$_tmp" "$_ndir"
     printf '%s\n' "$_commit" > "$_ndir/.spark-commit"
   done 3<"$1"
+  rm -rf "$CDATA/.tmp-nodes"
 }
 
 # 工作流文件：每个 wf 复制为 user/default/workflows/spark-<slug>.json；目录里不在清单中的 spark-*.json 删除（用户自己的文件不动）。
@@ -417,7 +486,11 @@ write_yaml() {
 case "${1:-}" in
   install)
     ensure_dirs
-    if [ "$MODEL" != none ]; then download; fi
+    if [ -f "$MANIFEST" ]; then PRESET_HI=35; fi
+    if [ "$MODEL" != none ]; then
+      download
+      WF_LO=$PRESET_HI
+    fi
     wf_install
     ;;
   start)
@@ -430,7 +503,7 @@ case "${1:-}" in
     fi
     # 1.0.0 的用户目录在镜像层（/opt/ComfyUI/user，容器重建会丢）：第一次换到数据盘用户目录时拷过来一次，之后不再拷
     if [ ! -e "$CDATA/.spark-user-migrated" ]; then
-      if [ -d "$COMFY/user" ]; then cp -R "$COMFY/user/." "$CDATA/user/" 2>/dev/null || true; fi
+      if [ -d "$COMFY/user" ]; then cp -Rn "$COMFY/user/." "$CDATA/user/" 2>/dev/null || true; fi
       : > "$CDATA/.spark-user-migrated"
     fi
     # 每次启动换新的 comfyui.log（上一次的留一份 comfyui.log.1）

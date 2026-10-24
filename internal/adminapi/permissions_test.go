@@ -117,7 +117,14 @@ func TestPermissionMatrix(t *testing.T) {
 			if r.method != "GET" {
 				body = map[string]any{}
 			}
-			code, out := c.do(r.method, path, body)
+			var code int
+			var out map[string]any
+			if r.method == "POST" && r.path == "/workflows/{id}/cover" { // 封面上传只收 multipart（字段名不对 → 有权角色 400）
+				resp, o := c.upload(path, "x", "x.png", []byte("x"))
+				code, out = resp.StatusCode, o
+			} else {
+				code, out = c.do(r.method, path, body)
+			}
 			allowed := slices.Contains(r.roles, role)
 			name := fmt.Sprintf("%s %s as %s", r.method, path, role)
 			switch {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -288,10 +289,16 @@ func TestInstallerAddErrors(t *testing.T) {
 func TestInstallerAppVersionSelection(t *testing.T) {
 	e := newInstEnv(t)
 	w, _ := e.pubWF("sdxl-txt2img")
-	// 更新的但不支持工作流的版本不会被选中
+	// 更新的但不支持工作流的版本、更新的支持但不兼容实例镜像的版本，都不会被选中
 	e.appVersion(e.comfy, "1.0.1", false, StatusPublished, dbtest.T0.Add(90*time.Minute))
+	var other int64
+	if err := e.pool.QueryRow(e.ctx, `SELECT id FROM images WHERE enabled AND id <> $1 ORDER BY sort, id LIMIT 1`, e.imageID).Scan(&other); err != nil {
+		t.Fatal(err)
+	}
+	foreign := e.appVersion(e.comfy, "1.3.0", true, StatusPublished, dbtest.T0.Add(110*time.Minute))
+	e.exec(`UPDATE app_versions SET image_ids = ARRAY[$2::bigint] WHERE id = $1`, foreign, other)
 
-	// 1.0.0 部署：升到最新的支持版本，spec_hash 随之变
+	// 1.0.0 部署：升到最新的、兼容镜像的支持版本，spec_hash 随之变
 	dep, ins := e.dep(e.comfy, e.comfyOld, appdeploy.StateRunning)
 	before := e.get(dep)
 	res, err := e.add(dep, ins, w.ID, nil)
@@ -302,22 +309,21 @@ func TestInstallerAppVersionSelection(t *testing.T) {
 		t.Fatalf("upgrade: %+v", res.Deployment)
 	}
 
-	// 支持工作流的当前版本已下线：改用最新的已发布支持版本
+	// 支持工作流的当前版本不换：仍发布（即使有更新的支持版本），或已下线（原样重新部署）
 	newer := e.appVersion(e.comfy, "1.2.0", true, StatusPublished, dbtest.T0.Add(100*time.Minute))
-	e.exec(`UPDATE app_versions SET status = 'retired' WHERE id = $1`, e.comfyNew)
-	dep2, ins2 := e.dep(e.comfy, e.comfyNew, appdeploy.StateStopped)
-	res, err = e.add(dep2, ins2, w.ID, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Deployment.AppVersionID != newer {
-		t.Fatalf("retired current: version %d, want %d", res.Deployment.AppVersionID, newer)
-	}
-	// 支持且仍发布的当前版本不换（即使有更新的支持版本）
-	e.exec(`UPDATE app_versions SET status = 'published' WHERE id = $1`, e.comfyNew)
-	dep3, ins3 := e.dep(e.comfy, e.comfyNew, appdeploy.StateRunning)
-	if res, err = e.add(dep3, ins3, w.ID, nil); err != nil || res.Deployment.AppVersionID != e.comfyNew {
+	dep2, ins2 := e.dep(e.comfy, e.comfyNew, appdeploy.StateRunning)
+	if res, err = e.add(dep2, ins2, w.ID, nil); err != nil || res.Deployment.AppVersionID != e.comfyNew || res.Deployment.State != appdeploy.StateQueued {
 		t.Fatalf("keep current: %+v, %v", res.Deployment, err)
+	}
+	e.exec(`UPDATE app_versions SET status = 'retired' WHERE id = $1`, e.comfyNew)
+	dep3, ins3 := e.dep(e.comfy, e.comfyNew, appdeploy.StateStopped)
+	if res, err = e.add(dep3, ins3, w.ID, nil); err != nil || res.Deployment.AppVersionID != e.comfyNew || res.Deployment.State != appdeploy.StateQueued {
+		t.Fatalf("keep retired current: %+v, %v", res.Deployment, err)
+	}
+	// 当前版本不支持：comfyNew 已下线 → 1.2.0
+	dep4, ins4 := e.dep(e.comfy, e.comfyOld, appdeploy.StateFailed)
+	if res, err = e.add(dep4, ins4, w.ID, nil); err != nil || res.Deployment.AppVersionID != newer {
+		t.Fatalf("upgrade past retired: %+v, %v", res.Deployment, err)
 	}
 
 	// queued 的 1.0.0 部署（不重新部署，版本换不了）→ workflow_app_unsupported
@@ -325,10 +331,10 @@ func TestInstallerAppVersionSelection(t *testing.T) {
 	_, err = e.add(qdep, qins, w.ID, nil)
 	wantCode(t, err, "workflow_app_unsupported")
 
-	// 没有任何已发布的支持版本 → workflow_app_unsupported
-	e.exec(`UPDATE app_versions SET status = 'retired' WHERE app_id = $1 AND (spec->>'supports_workflows')::boolean`, e.comfy)
-	dep4, ins4 := e.dep(e.comfy, e.comfyOld, appdeploy.StateRunning)
-	_, err = e.add(dep4, ins4, w.ID, nil)
+	// 没有任何已发布且兼容镜像的支持版本 → workflow_app_unsupported
+	e.exec(`UPDATE app_versions SET status = 'retired' WHERE id = $1`, newer)
+	dep5, ins5 := e.dep(e.comfy, e.comfyOld, appdeploy.StateRunning)
+	_, err = e.add(dep5, ins5, w.ID, nil)
 	wantCode(t, err, "workflow_app_unsupported")
 }
 
@@ -378,8 +384,11 @@ func TestInstallerUpdate(t *testing.T) {
 		t.Fatalf("downgrade: %+v, %v", res, err)
 	}
 
+	// 指定别的工作流的版本 → workflow_not_found
+	other, ov := e.pubWF("other-wf")
+	_, err = upd(&ov.ID)
+	wantCode(t, err, "workflow_not_found")
 	// 没装的工作流 → workflow_not_found
-	other, _ := e.pubWF("other-wf")
 	_, err = e.in.Update(e.ctx, UpdateRequest{UserID: e.uid, InstanceID: ins, DeploymentID: dep, WorkflowID: other.ID})
 	wantCode(t, err, "workflow_not_found")
 	// 工作流下线后更新 → workflow_unavailable
@@ -433,8 +442,17 @@ func TestInstallerRemove(t *testing.T) {
 	e.attach(odep, v1, WFStatePending)
 	before = e.get(odep)
 	res, err = rm(odep, oins, w1.ID)
-	if err != nil || len(res.Workflows) != 0 || res.Deployment.State != appdeploy.StateRunning || res.Deployment.RowVersion != before.RowVersion+1 {
+	if err != nil || len(res.Workflows) != 0 || res.Deployment.State != appdeploy.StateRunning || res.Deployment.RowVersion != before.RowVersion {
 		t.Fatalf("unsupported remove: %+v, %v", res, err)
+	}
+	// queued 且版本不支持：删行 + row_version + 1；失败的行不回 pending（下一次部署不带集合）
+	qdep, qins := e.dep(e.comfy, e.comfyOld, appdeploy.StateQueued)
+	e.attach(qdep, v1, WFStatePending)
+	e.attach(qdep, v2, WFStateFailed)
+	before = e.get(qdep)
+	res, err = rm(qdep, qins, w1.ID)
+	if err != nil || res.Deployment.RowVersion != before.RowVersion+1 || len(res.Workflows) != 1 || res.Workflows[0].State != WFStateFailed {
+		t.Fatalf("queued unsupported remove: %+v, %v", res, err)
 	}
 }
 
@@ -511,12 +529,13 @@ func TestOnTransition(t *testing.T) {
 		t.Fatalf("installed_at: %v %v %v", r[0].InstalledAt, r[1].InstalledAt, r[2].InstalledAt)
 	}
 
-	// 部署版本不支持工作流（包里没有 workflows/）：running 不把 pending 标成 installed
+	// 部署版本不支持工作流（包里没有 workflows/，什么也没装）：running 时 pending → failed（running 的部署上不留 pending），failed 不变
 	odep, _ := e.dep(e.comfy, e.comfyOld, appdeploy.StateInstalling)
 	e.attach(odep, v1, WFStatePending)
+	e.attach(odep, v2, WFStateFailed)
 	od := e.get(odep)
 	tx(func(q pgx.Tx) error { return e.hooks.OnTransition(e.ctx, q, od, appdeploy.StateRunning, now) })
-	if r := e.rows(odep); r[0].State != WFStatePending {
+	if r := e.rows(odep); r[0].State != WFStateFailed || r[0].InstalledAt != nil || r[1].State != WFStateFailed {
 		t.Fatalf("unsupported running: %+v", r)
 	}
 	// 非 comfyui 部署、没有行：无操作
@@ -681,5 +700,50 @@ func TestInstalledViews(t *testing.T) {
 	b, _ := json.Marshal(vs)
 	if !strings.Contains(string(b), `"slug":"sdxl-txt2img"`) || !strings.Contains(string(b), `"workflows":[]`) || strings.Contains(string(b), "api_prompt") {
 		t.Fatalf("deployment views = %s", b)
+	}
+}
+
+// 并发：同一部署上的集合修改按实例行锁串行（LockOwned → LockDeployment），上限与重复都不会被并发绕过。
+func TestInstallerConcurrentAdd(t *testing.T) {
+	e := newInstEnv(t)
+	dep, ins := e.dep(e.comfy, e.comfyNew, appdeploy.StateQueued)
+	for i := 0; i < MaxWorkflowsPerDeployment-1; i++ {
+		_, v := e.pubWF(fmt.Sprintf("wf-%d", i))
+		e.attach(dep, v, WFStateInstalled)
+	}
+	a, _ := e.pubWF("wf-a")
+	b, _ := e.pubWF("wf-b")
+	race := func(ids ...int64) []string {
+		t.Helper()
+		var wg sync.WaitGroup
+		codes := make([]string, len(ids))
+		for k, id := range ids {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := e.add(dep, ins, id, nil)
+				codes[k] = errCode(err)
+			}()
+		}
+		wg.Wait()
+		slices.Sort(codes)
+		return codes
+	}
+	// 7 个已装，并发加两个不同的 → 恰好一个成功、一个 workflow_limit
+	if codes := race(a.ID, b.ID); !slices.Equal(codes, []string{"", "workflow_limit"}) {
+		t.Fatalf("limit race = %q", codes)
+	}
+	if n := len(e.rows(dep)); n != MaxWorkflowsPerDeployment {
+		t.Fatalf("rows = %d", n)
+	}
+
+	// 并发加同一个 → 恰好一个成功、一个 workflow_exists
+	dep2, ins2 := e.dep(e.comfy, e.comfyNew, appdeploy.StateRunning)
+	dep, ins = dep2, ins2
+	if codes := race(a.ID, a.ID); !slices.Equal(codes, []string{"", "workflow_exists"}) {
+		t.Fatalf("exists race = %q", codes)
+	}
+	if n := len(e.rows(dep2)); n != 1 {
+		t.Fatalf("rows = %d", n)
 	}
 }

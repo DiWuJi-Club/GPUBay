@@ -18,6 +18,14 @@ import (
 	"spark-cloud/internal/rental"
 )
 
+// 安装服务的取舍（规格 §5.3 / §14 之外、评审确认的决定）：
+//   - 目标应用版本：当前版本支持工作流 → 原样重新部署（即使已下线）；否则升到 published、支持工作流、兼容实例镜像的最新版本。
+//     Remove 同样如此：在不支持工作流的版本上移除工作流会顺带升级应用；没有可升的版本时只删行、不重新部署。
+//   - queued 部署不重新部署、换不了版本：其当前版本不支持工作流时 Add / Update → workflow_app_unsupported（Remove 照删）。
+//     queued 部署的集合每次改动都 row_version + 1（Runner 可能正在事务外按旧集合打包，回写时据此丢弃）。
+//   - 集合里 failed 的行只在下一次部署确实会带上集合时（重新部署，或 queued 且版本支持）回到 pending。
+//   - 加入 / 换版本后整组须能生成部署包（同名节点冲突 → workflow_version_invalid），预装（ResolveWorkflows）同。
+
 // comfyUISlug 是 ComfyUI 应用的 slug：只有它的部署能装工作流（与 appdeploy 视图的判断一致）。
 const comfyUISlug = "comfyui"
 
@@ -76,8 +84,9 @@ func (h *Hooks) BundleExtra(ctx context.Context, d appdeploy.Deployment, ver app
 }
 
 // OnTransition 实现 appdeploy.Deps.OnTransition（每个部署的 running / failed 回写都会调，非 comfyui 部署没有行，是一条空 UPDATE）：
-//   - running：pending / failed → installed（installed_at = now）。只在部署版本支持工作流时（否则包里没有 workflows/，什么也没装）。
-//     failed 的也算：重新部署成功 = 集合里的全部工作流都装好了（规格 §2）。
+//   - running，部署版本支持工作流：pending / failed → installed（installed_at = now）。failed 的也算：重新部署成功 = 集合里的
+//     全部工作流都装好了（规格 §2）。
+//   - running，部署版本不支持工作流（包里没有 workflows/，什么也没装）：pending → failed（规格 §14：running 的部署上没有 pending 行）。
 //   - failed：pending → failed。
 //
 // d 是更新前的行（AppVersionID 即本次部署的版本）。
@@ -85,9 +94,10 @@ func (h *Hooks) OnTransition(ctx context.Context, tx pgx.Tx, d appdeploy.Deploym
 	var err error
 	switch to {
 	case appdeploy.StateRunning:
-		_, err = tx.Exec(ctx, `UPDATE deployment_workflows SET state = 'installed', installed_at = $2
-			WHERE deployment_id = $1 AND state IN ('pending', 'failed')
-			AND EXISTS (SELECT 1 FROM app_versions WHERE id = $3 AND COALESCE((spec->>'supports_workflows')::boolean, false))`,
+		_, err = tx.Exec(ctx, `WITH v AS (SELECT COALESCE((spec->>'supports_workflows')::boolean, false) AS ok FROM app_versions WHERE id = $3)
+			UPDATE deployment_workflows dw SET state = CASE WHEN v.ok THEN 'installed' ELSE 'failed' END,
+				installed_at = CASE WHEN v.ok THEN $2 ELSE dw.installed_at END
+			FROM v WHERE dw.deployment_id = $1 AND (dw.state = 'pending' OR (v.ok AND dw.state = 'failed'))`,
 			d.ID, now, d.AppVersionID)
 	case appdeploy.StateFailed:
 		_, err = tx.Exec(ctx, `UPDATE deployment_workflows SET state = 'failed' WHERE deployment_id = $1 AND state = 'pending'`, d.ID)
@@ -248,29 +258,39 @@ func (i *Installer) mutate(ctx context.Context, userID int64, instanceID, depID,
 		default:
 			return apperr.ErrAppInvalidState
 		}
-		redeploy := d.State != appdeploy.StateQueued
+		queued := d.State == appdeploy.StateQueued
+		redeploy := !queued
 		var target int64
+		var carries bool // 下一次部署的包会带上集合（版本支持工作流）
 		if redeploy {
-			target, err = i.targetVersion(ctx, d)
+			target, err = i.targetVersion(ctx, d, inst.ImageID)
 			if errors.Is(err, apperr.ErrWorkflowAppUnsupported) && !needSupport {
 				redeploy, err = false, nil
 			}
-		} else if needSupport {
-			err = i.requireSupport(ctx, d.AppVersionID)
+			carries = redeploy
+		} else {
+			carries, err = i.supports(ctx, d.AppVersionID)
+			if err == nil && needSupport && !carries {
+				err = apperr.ErrWorkflowAppUnsupported
+			}
 		}
 		if err != nil {
 			return err
 		}
 		changed, err := fn(tx, inst, d, now)
+		out = d
 		if err != nil || !changed {
-			out = d
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE deployment_workflows SET state = 'pending' WHERE deployment_id = $1 AND state = 'failed'`, d.ID); err != nil {
-			return err
+		if carries { // 失败的工作流随这次部署重装
+			if _, err := tx.Exec(ctx, `UPDATE deployment_workflows SET state = 'pending' WHERE deployment_id = $1 AND state = 'failed'`, d.ID); err != nil {
+				return err
+			}
 		}
 		if !redeploy {
-			out, err = touchDeployment(ctx, tx, d.ID, now)
+			if queued { // Runner 可能正按旧集合打包：作废这一轮
+				out, err = touchDeployment(ctx, tx, d.ID, now)
+			}
 			return err
 		}
 		out, err = i.apps.RedeployInTx(ctx, tx, inst, d, appdeploy.RedeployRequest{UserID: userID, InstanceID: instanceID, DeploymentID: depID,
@@ -296,27 +316,24 @@ func touchDeployment(ctx context.Context, tx pgx.Tx, id string, now time.Time) (
 	return appdeploy.LockDeployment(ctx, tx, id)
 }
 
-// requireSupport：版本 spec.supports_workflows 为假 → workflow_app_unsupported。
-func (i *Installer) requireSupport(ctx context.Context, versionID int64) error {
+// supports：应用版本 spec.supports_workflows。
+func (i *Installer) supports(ctx context.Context, versionID int64) (bool, error) {
 	v, err := i.appsCat.GetVersion(ctx, versionID)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if !v.Spec.SupportsWorkflows {
-		return apperr.ErrWorkflowAppUnsupported
-	}
-	return nil
+	return v.Spec.SupportsWorkflows, nil
 }
 
-// targetVersion 定重新部署用的应用版本（规格 §3.4 / §5.3 第 3 步）：当前版本支持工作流且仍是已发布 → 不换（显式传当前版本 ID：
-// RedeployRequest.VersionID 为 nil 意味着「最新已发布」）；否则（不支持，或支持但已下线）取 published 且支持工作流的版本里
-// published_at 最新的；没有 → workflow_app_unsupported。
-func (i *Installer) targetVersion(ctx context.Context, d appdeploy.Deployment) (int64, error) {
+// targetVersion 定重新部署用的应用版本（规格 §3.4 / §5.3 第 3 步），候选都须兼容实例镜像：
+// 当前版本支持工作流 → 不换（即使已下线：RedeployInTx 接受显式指定的当前版本；RedeployRequest.VersionID 为 nil 意味着
+// 「最新已发布」，所以显式传当前版本 ID）；否则取 published 且支持工作流的版本里 published_at 最新的；没有 → workflow_app_unsupported。
+func (i *Installer) targetVersion(ctx context.Context, d appdeploy.Deployment, imageID int64) (int64, error) {
 	cur, err := i.appsCat.GetVersion(ctx, d.AppVersionID)
 	if err != nil {
 		return 0, err
 	}
-	if cur.Spec.SupportsWorkflows && cur.Status == StatusPublished {
+	if cur.Spec.SupportsWorkflows && slices.Contains(cur.ImageIDs, imageID) {
 		return cur.ID, nil
 	}
 	vers, err := i.appsCat.ListVersions(ctx, d.AppID)
@@ -326,7 +343,7 @@ func (i *Installer) targetVersion(ctx context.Context, d appdeploy.Deployment) (
 	var best *appdeploy.Version
 	for k := range vers {
 		v := &vers[k]
-		if v.Status != StatusPublished || !v.Spec.SupportsWorkflows || v.PublishedAt == nil {
+		if v.Status != StatusPublished || !v.Spec.SupportsWorkflows || v.PublishedAt == nil || !slices.Contains(v.ImageIDs, imageID) {
 			continue
 		}
 		if best == nil || v.PublishedAt.After(*best.PublishedAt) || (v.PublishedAt.Equal(*best.PublishedAt) && v.ID > best.ID) {
@@ -397,18 +414,23 @@ func (i *Installer) Add(ctx context.Context, req AddRequest) (Result, error) {
 		})
 }
 
+// setRow 是集合里的一行及其工作流 slug / 名称与版本号。
+type setRow struct {
+	DeploymentWorkflow
+	Slug, Name, Version string
+}
+
 // installedRow 读集合里的一行（FOR UPDATE；部署行已锁，这里只为语义清楚）；不在集合里 → workflow_not_found。
-func installedRow(ctx context.Context, tx pgx.Tx, depID string, wfID int64) (DeploymentWorkflow, string, string, error) {
-	var r DeploymentWorkflow
-	var name, version string
-	err := tx.QueryRow(ctx, `SELECT dw.deployment_id, dw.workflow_id, dw.workflow_version_id, dw.state, dw.added_at, dw.installed_at, w.name, v.version
+func installedRow(ctx context.Context, tx pgx.Tx, depID string, wfID int64) (setRow, error) {
+	var r setRow
+	err := tx.QueryRow(ctx, `SELECT dw.deployment_id, dw.workflow_id, dw.workflow_version_id, dw.state, dw.added_at, dw.installed_at, w.slug, w.name, v.version
 		FROM deployment_workflows dw JOIN comfy_workflows w ON w.id = dw.workflow_id JOIN comfy_workflow_versions v ON v.id = dw.workflow_version_id
 		WHERE dw.deployment_id = $1 AND dw.workflow_id = $2 FOR UPDATE OF dw`, depID, wfID).
-		Scan(&r.DeploymentID, &r.WorkflowID, &r.VersionID, &r.State, &r.AddedAt, &r.InstalledAt, &name, &version)
+		Scan(&r.DeploymentID, &r.WorkflowID, &r.VersionID, &r.State, &r.AddedAt, &r.InstalledAt, &r.Slug, &r.Name, &r.Version)
 	if db.IsNoRows(err) {
-		return r, "", "", apperr.ErrWorkflowNotFound
+		return r, apperr.ErrWorkflowNotFound
 	}
-	return r, name, version, err
+	return r, err
 }
 
 // Update 把集合里的工作流换到指定 / 最新已发布版本（pending）并重新部署。工作流已下线 → workflow_unavailable；
@@ -416,7 +438,7 @@ func installedRow(ctx context.Context, tx pgx.Tx, depID string, wfID int64) (Dep
 func (i *Installer) Update(ctx context.Context, req UpdateRequest) (Result, error) {
 	return i.mutate(ctx, req.UserID, req.InstanceID, req.DeploymentID, req.IP, true,
 		func(tx pgx.Tx, inst rental.Instance, d appdeploy.Deployment, now time.Time) (bool, error) {
-			cur, _, curVer, err := installedRow(ctx, tx, d.ID, req.WorkflowID)
+			cur, err := installedRow(ctx, tx, d.ID, req.WorkflowID)
 			if err != nil {
 				return false, err
 			}
@@ -434,7 +456,7 @@ func (i *Installer) Update(ctx context.Context, req UpdateRequest) (Result, erro
 			if err := checkSet(ctx, tx, d.ID); err != nil {
 				return false, err
 			}
-			detail := "更新工作流 " + w.Name + " v" + curVer + " → v" + v.Version
+			detail := "更新工作流 " + w.Name + " v" + cur.Version + " → v" + v.Version
 			if v.ID == cur.VersionID {
 				detail = "重新安装工作流 " + w.Name + " v" + v.Version
 			}
@@ -443,28 +465,27 @@ func (i *Installer) Update(ctx context.Context, req UpdateRequest) (Result, erro
 			}
 			return true, i.audit(ctx, tx, req.UserID, req.IP, "instance.workflow_update", inst, now, map[string]any{
 				"deployment": d.ID, "workflow_id": w.ID, "slug": w.Slug, "version_id": v.ID, "version": v.Version,
-				"from_version_id": cur.VersionID, "from_version": curVer})
+				"from_version_id": cur.VersionID, "from_version": cur.Version})
 		})
 }
 
-// Remove 把工作流移出集合并重新部署（容器内删 spark-<slug>.json，模型与节点保留，D8）；queued 只删行。
-// 不在集合里 → workflow_not_found。部署版本不支持工作流且没有可换的支持版本时只删行（不重新部署）。
+// Remove 把工作流移出集合并重新部署（容器内删 spark-<slug>.json，模型与节点保留，D8）；queued 只删行（row_version + 1）。
+// 不在集合里 → workflow_not_found。部署版本不支持工作流时与 Add 一样换到支持的版本重新部署；没有可换的支持版本时只删行
+// （不重新部署，也不动部署行：包里本来就没有工作流）。
 func (i *Installer) Remove(ctx context.Context, req RemoveRequest) (Result, error) {
 	return i.mutate(ctx, req.UserID, req.InstanceID, req.DeploymentID, req.IP, false,
 		func(tx pgx.Tx, inst rental.Instance, d appdeploy.Deployment, now time.Time) (bool, error) {
-			cur, name, curVer, err := installedRow(ctx, tx, d.ID, req.WorkflowID)
+			cur, err := installedRow(ctx, tx, d.ID, req.WorkflowID)
 			if err != nil {
 				return false, err
 			}
-			var slug string
-			if err := tx.QueryRow(ctx, `DELETE FROM deployment_workflows dw USING comfy_workflows w
-				WHERE dw.deployment_id = $1 AND dw.workflow_id = $2 AND w.id = dw.workflow_id RETURNING w.slug`, d.ID, req.WorkflowID).Scan(&slug); err != nil {
+			if _, err := tx.Exec(ctx, `DELETE FROM deployment_workflows WHERE deployment_id = $1 AND workflow_id = $2`, d.ID, req.WorkflowID); err != nil {
 				return false, err
 			}
-			if err := addEvent(ctx, tx, d, "移除工作流 "+name, now); err != nil {
+			if err := addEvent(ctx, tx, d, "移除工作流 "+cur.Name, now); err != nil {
 				return false, err
 			}
 			return true, i.audit(ctx, tx, req.UserID, req.IP, "instance.workflow_remove", inst, now, map[string]any{
-				"deployment": d.ID, "workflow_id": req.WorkflowID, "slug": slug, "version_id": cur.VersionID, "version": curVer})
+				"deployment": d.ID, "workflow_id": req.WorkflowID, "slug": cur.Slug, "version_id": cur.VersionID, "version": cur.Version})
 		})
 }

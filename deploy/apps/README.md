@@ -82,7 +82,7 @@ ComfyUI 不下仓库里的 diffusers 分片格式（ComfyUI 读不了，体积�
 |---|---|
 | `/root/data/comfyui/models/<dir>/<name>` | 模型软链（指向 `/root/data/models/{modelscope,hf}/<仓库>/<文件>`）；`<dir>` ∈ `checkpoints diffusion_models unet text_encoders clip vae loras upscale_models controlnet clip_vision embeddings style_models vae_approx` |
 | `/root/data/comfyui/custom_nodes/<name>` | 自定义节点（`.spark-commit` 记录装的 commit） |
-| `/root/data/comfyui/user` | ComfyUI 用户目录（`--user-directory`）；平台放的工作流是 `user/default/workflows/spark-<slug>.json`；从 1.0.0 升级后第一次启动把镜像层的 `/opt/ComfyUI/user` 拷过来一次 |
+| `/root/data/comfyui/user` | ComfyUI 用户目录（`--user-directory`）；平台放的工作流是 `user/default/workflows/spark-<slug>.json`；从 1.0.0 升级后第一次启动把镜像层的 `/opt/ComfyUI/user` 拷过来一次（`cp -Rn`，不覆盖已有文件） |
 | `/root/data/comfyui/input` | 输入图片（`--input-directory`，首次启动拷入镜像自带的 `example.png`） |
 | `/root/data/comfyui-output` | 生成结果（`--output-directory`） |
 
@@ -108,14 +108,22 @@ wf <slug> <file>
 
 然后（全部幂等）：
 
-1. 模型：目标已存在（有效软链或普通文件）→ 跳过；否则按 `MODEL_SOURCE` 选来源（清单里没有该来源就用另一个），下载前 `df` 预检
-   （剩余 < 模型大小 + 5GiB → `spark_status download <pct> "disk: …"` 后退出 2，`run.sh` 沿用该消息，平台记错误码 `disk`），
-   `modelscope download` / `hf download` 到 `/root/data/models/{modelscope,hf}/<仓库>`，`sha256` 非空时校验（不符删文件、失败），再 `ln -sfn`。进度 5～70。
-2. 节点：`.spark-commit` 与清单 commit 相同 → 跳过；否则 `git clone --filter=blob:none` 到 `custom_nodes/.tmp-<name>`（GitHub 地址先经
-   `SPARK_GIT_MIRROR`，失败再直连）→ `checkout <commit>` → 有 `.gitmodules` 时 `submodule update --init --recursive`（有镜像时先带
-   `url.<镜像>https://github.com/.insteadOf=https://github.com/`，失败再直连）→ 有 `requirements.txt` 时 `pip install -r` → 替换旧目录、写 `.spark-commit`。
-   任一步失败 → install 失败。清单里不再有的节点不删。进度 70～78。
+1. 模型：目标已存在（有效软链或普通文件；失效的软链不算）→ 跳过；否则按 `MODEL_SOURCE` 选来源（清单里没有该来源就用另一个；
+   所选来源下载失败而另一个来源存在时换它再试一次），下载前 `df` 预检（剩余 < 模型大小 + 5GiB → `spark_status download <pct> "disk: …"`
+   后退出 2，`run.sh` 沿用该消息，平台记错误码 `disk`），`modelscope download <仓库> <文件> --local-dir …` / `hf download … --local-dir …`
+   到 `/root/data/models/{modelscope,hf}/<仓库>`，`sha256` 非空时校验（不符删文件、失败），再 `ln -sfn`。进度 5～70；同时选了预置模型
+   （`MODEL_ID` ≠ `none`）时预置模型占 5～35、工作流模型占 35～70，进度不回退。
+2. 节点：`.spark-commit` 与清单 commit 相同 → 跳过；否则取到 `/root/data/comfyui/.tmp-nodes/<name>`（不在 `custom_nodes` 里，ComfyUI
+   不会加载半成品；上次中断留下的临时目录先清掉）：`git clone --no-checkout` → `checkout <commit>` → 有 `.gitmodules` 时
+   `submodule update --init --recursive`。GitHub 地址且配置了 `SPARK_GIT_MIRROR` 时这一整套先经镜像（子模块带
+   `url.<镜像>https://github.com/.insteadOf=https://github.com/`），任一步失败就清掉临时目录、整套直连重来。
+   之后有 `requirements.txt` 时 `python3 -m pip install -c $SPARK_APP_DIR/.pip-constraints.txt -r …`：约束文件 = 镜像 `PIP_CONSTRAINT`
+   指向的文件 + 当前已装的 `torch / torchvision / torchaudio / torchsde / triton / numpy / transformers / safetensors / xformers /
+   flash-attn / cuda-python / nvidia-*` 版本，节点依赖不能把镜像里为 GPU 编译的包换掉（冲突时 pip 报错，install 失败）。
+   最后替换旧目录、写 `.spark-commit`。任一步失败 → install 失败。清单里不再有的节点不删。进度 70～78。
+   **子模块不做主机白名单检查**：清单只校验节点仓库本身的 Git 主机（D5）；子模块的地址与 commit 由节点仓库在该 commit 上的
+   `.gitmodules` + gitlink 固定，发布工作流版本时（super + TOTP）审核的就是这个 commit。
 3. 工作流文件：复制为 `user/default/workflows/spark-<slug>.json`，目录里不在清单中的 `spark-*.json` 删除（用户自己存的文件不动）；
    包里没有 manifest 时同样清理。最后 `spark_status install 79 "工作流就绪：N 个"`。
 
-`go test ./internal/appdeploy/ -run TestComfyApp` 用假的 `modelscope / hf / git / pip / python3` 真跑 comfyui 的 `install` / `start`。
+`go test ./internal/appdeploy/ -run TestComfyApp` 用假的 `modelscope / hf / git / python3`（含 `python3 -m pip`）真跑 comfyui 的 `install` / `start`。

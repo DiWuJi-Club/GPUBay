@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"spark-cloud/internal/admin"
+	"spark-cloud/internal/adminapi"
 )
 
 // wfFixture 读 deploy/workflows/sdxl-txt2img 下的文件（真实的首批工作流，校验必过）。
@@ -255,10 +256,28 @@ func TestAdminWorkflowVersions(t *testing.T) {
 	if code, out := root.do("POST", base+"/999999/publish", map[string]any{"totp": "000000"}); code != 404 {
 		t.Fatalf("publish missing = %d %v", code, out)
 	}
-	if code, out := root.do("POST", vpath+"/publish", map[string]any{"totp": "000000"}); code < 400 || codeOf(out) == "forbidden" {
+	// 错误的动态码 → invalid_totp，窗口不打开（随后不带码 → totp_required）
+	if code, out := root.do("POST", vpath+"/publish", map[string]any{"totp": "000000"}); code != 400 || codeOf(out) != "invalid_totp" {
 		t.Fatalf("publish wrong totp = %d %v", code, out)
 	}
-	code, out = root.do("POST", vpath+"/publish", map[string]any{"totp": root.totp()})
+	if code, out := root.do("POST", vpath+"/publish", map[string]any{}); code != 403 || codeOf(out) != "totp_required" {
+		t.Fatalf("publish after wrong totp = %d %v", code, out)
+	}
+	// 库里内容通不过校验：动态码校验之前就拒绝（workflow_version_invalid），同一个动态码之后还能用
+	var manifest string
+	if err := e.pool.QueryRow(e.ctx, `SELECT manifest::text FROM comfy_workflow_versions WHERE id = $1`, vid).Scan(&manifest); err != nil {
+		t.Fatal(err)
+	}
+	e.exec(`UPDATE comfy_workflow_versions SET manifest = jsonb_set(manifest, '{models}', '[]') WHERE id = $1`, vid)
+	totp := root.totp()
+	if code, out := root.do("POST", vpath+"/publish", map[string]any{"totp": totp}); code != 400 || codeOf(out) != "workflow_version_invalid" {
+		t.Fatalf("publish invalid stored content = %d %v", code, out)
+	}
+	if code, out := root.do("POST", vpath+"/publish", map[string]any{}); code != 400 || codeOf(out) != "workflow_version_invalid" {
+		t.Fatalf("publish invalid without totp = %d %v", code, out)
+	}
+	e.exec(`UPDATE comfy_workflow_versions SET manifest = $2::jsonb WHERE id = $1`, vid, manifest)
+	code, out = root.do("POST", vpath+"/publish", map[string]any{"totp": totp})
 	if code != 200 || out["status"] != "published" || out["published_at"] == nil || out["manifest_hash"] != hash {
 		t.Fatalf("publish = %d %v", code, out)
 	}
@@ -297,6 +316,10 @@ func TestAdminWorkflowVersions(t *testing.T) {
 	if code, out := root.do("POST", base, map[string]any{"version": "1.2", "copy_from": 999999}); code != 404 {
 		t.Fatalf("copy missing = %d %v", code, out)
 	}
+	// 上次发布打开了二次验证窗口：窗口内再发布不用动态码
+	if code, out := root.do("POST", fmt.Sprintf("%s/%d/publish", base, int64(out["id"].(float64))), map[string]any{}); code != 200 || out["status"] != "published" {
+		t.Fatalf("publish within step-up window = %d %v", code, out)
+	}
 
 	if code, out := root.do("PUT", vpath, map[string]any{"status": "retired"}); code != 200 || out["status"] != "retired" || out["changelog"] != "修正说明" {
 		t.Fatalf("retire = %d %v", code, out)
@@ -323,8 +346,14 @@ func m0(t *testing.T) any {
 	return m["models"]
 }
 
-// upload 以 multipart/form-data 上传 field 字段。
+// upload 以 multipart/form-data 上传 field 字段（带浏览器同源请求的 Sec-Fetch-Site: same-origin）。
 func (c *client) upload(path, field, filename string, data []byte) (*http.Response, map[string]any) {
+	c.e.t.Helper()
+	return c.uploadWith(path, field, filename, data, map[string]string{"Sec-Fetch-Site": "same-origin"})
+}
+
+// uploadWith 同 upload，但只带 headers 里给的头（不自动加 Sec-Fetch-Site）。
+func (c *client) uploadWith(path, field, filename string, data []byte, headers map[string]string) (*http.Response, map[string]any) {
 	c.e.t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -333,6 +362,9 @@ func (c *client) upload(path, field, filename string, data []byte) (*http.Respon
 	_ = mw.Close()
 	req, _ := http.NewRequest("POST", c.base+path, &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.e.t.Fatal(err)
@@ -364,6 +396,21 @@ func TestAdminWorkflowCover(t *testing.T) {
 	if code, out := root.do("POST", path, map[string]any{}); code != 400 {
 		t.Fatalf("json upload = %d %v", code, out)
 	}
+	// 跨站防护：两个头都没有 / 跨站 Sec-Fetch-Site / 外站 Origin → 403
+	for name, h := range map[string]map[string]string{
+		"no origin headers": {},
+		"cross-site":        {"Sec-Fetch-Site": "cross-site"},
+		"same-site sibling": {"Sec-Fetch-Site": "same-site"},
+		"foreign origin":    {"Origin": "https://evil.example"},
+	} {
+		if resp, out := root.uploadWith(path, "file", "c.png", png, h); resp.StatusCode != 403 || codeOf(out) != "forbidden" {
+			t.Fatalf("%s upload = %d %v", name, resp.StatusCode, out)
+		}
+	}
+	// multipart 只对封面接口放行：其它写接口仍要求 JSON
+	if resp, out := root.upload(fmt.Sprintf("/workflows/%d/versions", id), "file", "c.png", png); resp.StatusCode != 400 || codeOf(out) != "bad_request" {
+		t.Fatalf("multipart to versions = %d %v", resp.StatusCode, out)
+	}
 	if resp, out := root.upload(path, "other", "c.png", png); resp.StatusCode != 400 {
 		t.Fatalf("missing field = %d %v", resp.StatusCode, out)
 	}
@@ -390,7 +437,7 @@ func TestAdminWorkflowCover(t *testing.T) {
 	resp, _ = ops.send("GET", path, nil)
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 || !bytes.Equal(body, png) || resp.Header.Get("Content-Type") != "image/png" ||
-		resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		resp.Header.Get("X-Content-Type-Options") != "nosniff" || resp.Header.Get("Cache-Control") != "private, max-age=86400" {
 		t.Fatalf("get cover = %d %v %d bytes", resp.StatusCode, resp.Header, len(body))
 	}
 	// 列表带 cover_url；换封面后地址改变、旧文件删除
@@ -487,5 +534,23 @@ func TestAdminWorkflowInstallsDeploymentDashboard(t *testing.T) {
 	e.exec(`UPDATE app_deployments SET state = 'removed' WHERE id = $1`, dep.ID)
 	if _, out := fin.do("GET", "/dashboard", nil); out["workflow_installs"].(float64) != 0 {
 		t.Fatalf("dashboard after removal = %v", out)
+	}
+}
+
+// 没接工作流目录（Workflows 为 nil）：工作流路由不注册（404），仪表盘照常、工作流数字为 0。
+func TestAdminWorkflowsNotConfigured(t *testing.T) {
+	e := newEnvWith(t, func(s *adminapi.Server) { s.Workflows, s.Installer = nil, nil })
+	fin := e.loginAs("fin", admin.RoleFinance)
+	if code, out := fin.do("GET", "/workflows", nil); code != 404 || codeOf(out) != "not_found" {
+		t.Fatalf("workflows = %d %v", code, out)
+	}
+	for _, r := range e.srv.Routes() {
+		if strings.Contains(r.Pattern, "/workflows") {
+			t.Fatalf("route registered: %s %s", r.Method, r.Pattern)
+		}
+	}
+	code, out := fin.do("GET", "/dashboard", nil)
+	if code != 200 || out["workflow_installs"].(float64) != 0 || out["workflow_runs_24h"].(float64) != 0 {
+		t.Fatalf("dashboard = %d %v", code, out)
 	}
 }

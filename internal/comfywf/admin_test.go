@@ -76,3 +76,43 @@ func TestAdminCounts(t *testing.T) {
 		t.Fatalf("counts = %d %d %v", installs, runs, err)
 	}
 }
+
+func TestUpdateWorkflowEmptyStatusKeeps(t *testing.T) {
+	e := newCatEnv(t)
+	w := e.workflow("sdxl", StatusPublished)
+	u, err := e.cat.UpdateWorkflow(e.ctx, e.actor(), w.ID, WorkflowInput{Name: "新名字", Category: CategoryTxt2Img})
+	if err != nil || u.Status != StatusPublished || u.Name != "新名字" {
+		t.Fatalf("update without status = %+v %v", u, err)
+	}
+	u, err = e.cat.UpdateWorkflow(e.ctx, e.actor(), w.ID, WorkflowInput{Name: "x", Category: CategoryTxt2Img, Status: StatusRetired})
+	if err != nil || u.Status != StatusRetired {
+		t.Fatalf("update to retired = %+v %v", u, err)
+	}
+	if _, err := e.cat.UpdateWorkflow(e.ctx, e.actor(), w.ID, WorkflowInput{Name: "x", Category: CategoryTxt2Img, Status: "hidden"}); errCode(err) != "bad_request" {
+		t.Fatalf("bad status = %v", err)
+	}
+	// 新建时空状态仍是 draft
+	if d := e.workflow("other", ""); d.Status != StatusDraft {
+		t.Fatalf("create without status = %+v", d)
+	}
+}
+
+func TestCheckPublishable(t *testing.T) {
+	e := newCatEnv(t)
+	w := e.workflow("sdxl", StatusPublished)
+	v := e.version(w.ID, "1.0")
+	if err := e.cat.CheckPublishable(e.ctx, w.ID, v.ID); err != nil {
+		t.Fatalf("good draft: %v", err)
+	}
+	// 库里的内容不再能通过校验（例如规则变严 / 手工改库）→ workflow_version_invalid，不改任何东西
+	e.exec(`UPDATE comfy_workflow_versions SET manifest = jsonb_set(manifest, '{models}', '[]') WHERE id = $1`, v.ID)
+	wantCode(t, e.cat.CheckPublishable(e.ctx, w.ID, v.ID), "workflow_version_invalid")
+	if n := e.count(`SELECT count(*) FROM comfy_workflow_versions WHERE id = $1 AND status = 'draft'`, v.ID); n != 1 {
+		t.Fatal("CheckPublishable changed the version")
+	}
+	p := e.published(w.ID, "1.1")
+	wantCode(t, e.cat.CheckPublishable(e.ctx, w.ID, p.ID), "invalid_state")
+	wantCode(t, e.cat.CheckPublishable(e.ctx, w.ID, 999999), "not_found")
+	other := e.workflow("other", "")
+	wantCode(t, e.cat.CheckPublishable(e.ctx, other.ID, p.ID), "not_found")
+}

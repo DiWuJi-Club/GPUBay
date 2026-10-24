@@ -5,10 +5,10 @@ import { runningInstance } from '../helpers/instances'
 /** Element Plus 打开对话框时外层包装有 dialog-fade-in 动画（translateY -20px），几何断言前等页面上所有动画结束（被取消的动画也算结束）。 */
 const settled = (l: Locator) => l.evaluate(() => Promise.allSettled(document.getAnimations().map((a) => a.finished)).then(() => undefined))
 
-test('C-NAV-01 响应式布局：电脑侧边菜单、手机底部四个标签', async ({ page }, info) => {
+test('C-NAV-01 响应式布局：电脑侧边菜单、手机底部五个标签', async ({ page }, info) => {
   const u = await seedUser()
   await loginConsole(page, u.phone)
-  const tabs = ['market', 'instances', 'wallet', 'account']
+  const tabs = ['market', 'workflows', 'instances', 'wallet', 'account']
   if (isMobile(info)) {
     await expect(page.getByTestId('layout-tabbar')).toBeVisible()
     for (const t of tabs) await expect(page.getByTestId(`tabbar-${t}`)).toBeVisible()

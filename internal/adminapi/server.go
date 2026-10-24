@@ -124,7 +124,9 @@ func (s *Server) Router() http.Handler {
 			s.financeRoutes(g)
 			s.catalogRoutes(g)
 			s.appRoutes(g)
-			s.workflowRoutes(g)
+			if s.Workflows != nil { // 计划 11：没接工作流目录时不注册这些路由（404），仪表盘的工作流数字为 0
+				s.workflowRoutes(g)
+			}
 		})
 	})
 	static := s.Static
@@ -154,10 +156,24 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // requireJSONForWrites 要求写请求使用 application/json；配合 SameSite=Strict Cookie 防止跨站请求。
-// 例外：工作流封面上传（multipart/form-data，由处理器自己校验类型；同站防护 SameSiteGuard 照常生效）。
+// 例外：工作流封面上传要求 multipart/form-data。浏览器跨站表单可以发 multipart，所以这条路由还要求请求带 Origin 或
+// Sec-Fetch-Site（浏览器的 fetch / XHR 一定带其一），两个都没有 → 403；带了的由随后的 SameSiteGuard 比对。
 func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && !isCoverUpload(r) &&
+		if isCoverUpload(r) {
+			if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+				s.writeError(w, r, apperr.BadRequest("请使用 multipart/form-data 上传文件"))
+				return
+			}
+			if r.Header.Get("Origin") == "" && r.Header.Get("Sec-Fetch-Site") == "" {
+				s.Log.Warn("cover upload without Origin / Sec-Fetch-Site rejected", "path", r.URL.Path)
+				s.writeError(w, r, apperr.ErrForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions &&
 			!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 			s.writeError(w, r, apperr.BadRequest("请求格式必须为 JSON"))
 			return
