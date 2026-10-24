@@ -260,6 +260,33 @@ func (e *Executor) wipe(ctx context.Context, id string) error {
 	return e.d.State.DeleteInstance(id)
 }
 
+// Snapshot 采集一份 StateReport 的内容：实例状态与已缓存镜像共用一个 reportTimeout，
+// dockerd 卡死时整份报告最多等 reportTimeout（实例状态先采；超时后不再列镜像，该次报告不带 images）。
+func (e *Executor) Snapshot(ctx context.Context) ([]InstanceState, []string) {
+	ctx, cancel := context.WithTimeout(ctx, e.reportTimeout)
+	defer cancel()
+	return e.report(ctx), e.images(ctx)
+}
+
+// Images 本机已缓存镜像（StateReport.images），受 reportTimeout 约束；出错或超时返回 nil（该次报告不带 images，平台保留旧记录）。
+func (e *Executor) Images(ctx context.Context) []string {
+	ctx, cancel := context.WithTimeout(ctx, e.reportTimeout)
+	defer cancel()
+	return e.images(ctx)
+}
+
+func (e *Executor) images(ctx context.Context) []string {
+	if ctx.Err() != nil { // Report 已用完时限：不再调用 docker
+		return nil
+	}
+	imgs, err := e.d.Runtime.Images(ctx)
+	if err != nil {
+		e.d.Log.Warn("list images", "err", err)
+		return nil
+	}
+	return imgs
+}
+
 // Report 上报本机实例状态：以 docker 列表为准，本地记录里有但容器不存在的不上报（平台视为 missing）。
 // docker 出错时按本地记录报 unknown；挂载检查出错的实例也报 unknown（平台对 unknown 不做对账动作）。
 // 整个采集受 reportTimeout 约束：dockerd 卡死（超时）与 docker 出错同样处理。
@@ -267,6 +294,10 @@ func (e *Executor) wipe(ctx context.Context, id string) error {
 func (e *Executor) Report(ctx context.Context) []InstanceState {
 	ctx, cancel := context.WithTimeout(ctx, e.reportTimeout)
 	defer cancel()
+	return e.report(ctx)
+}
+
+func (e *Executor) report(ctx context.Context) []InstanceState {
 	e.mu.Lock()
 	recovering := map[string]bool{}
 	for id, since := range e.recoverPending {

@@ -6,7 +6,7 @@ DEV_DB  := postgres://postgres:postgres@localhost:5433/spark?sslmode=disable
 # 仅本地开发使用的固定密钥，生产环境必须用 openssl rand -base64 32 生成
 DEV_KEY := MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
 
-.PHONY: test devdb run build web-install web web-test e2e check proto agent platform-image
+.PHONY: test devdb run build web-install web web-test e2e check proto agent platform-image app-images
 
 # 协议代码已入库，日常构建不需要 protoc。重新生成：protoc 36.2 + protoc-gen-go v1.36.12 + protoc-gen-go-grpc v1.6.2（都在 ~/.local/bin）
 proto:
@@ -56,5 +56,17 @@ platform-image:
 	docker build -f deploy/platform/Dockerfile --build-arg VERSION=$(VERSION) \
 		$(if $(GOPROXY),--build-arg GOPROXY=$(GOPROXY)) $(if $(NPM_REGISTRY),--build-arg NPM_REGISTRY=$(NPM_REGISTRY)) $(if $(DISTROLESS),--build-arg DISTROLESS=$(DISTROLESS)) \
 		-t spark-cloud/platform:$(VERSION) -t spark-cloud/platform:latest .
+
+# 应用镜像（计划 7）：在一台 arm64 机器上构建；大陆网络传 PIP_INDEX_URL / COMFYUI_SRC，见 deploy/image/apps/README.md
+APP_IMAGE_TAG ?= 25.09
+PIP_INDEX_URL ?=
+COMFYUI_SRC ?=
+app-images:
+	docker build -f deploy/image/apps/llm-serving/Dockerfile --build-arg BASE=nvcr.io/nvidia/vllm:$(APP_IMAGE_TAG)-py3 \
+		$(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_URL)) -t spark/llm-serving:$(APP_IMAGE_TAG) deploy/image/apps/llm-serving
+	docker build -f deploy/image/apps/comfyui/Dockerfile --build-arg BASE=nvcr.io/nvidia/pytorch:$(APP_IMAGE_TAG)-py3 \
+		$(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_URL)) $(if $(COMFYUI_SRC),--build-arg COMFYUI_SRC=$(COMFYUI_SRC)) -t spark/comfyui:$(APP_IMAGE_TAG) deploy/image/apps/comfyui
+	docker build -f deploy/image/apps/pytorch/Dockerfile --build-arg BASE=nvcr.io/nvidia/pytorch:$(APP_IMAGE_TAG)-py3 \
+		$(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_URL)) -t spark/pytorch:$(APP_IMAGE_TAG) deploy/image/apps/pytorch
 
 check: test e2e

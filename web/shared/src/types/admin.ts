@@ -1,4 +1,5 @@
 import type { InstancePort, SshKey } from './access'
+import type { AppCategory, AppSpec, AppStatus, Deployment, DeploymentEvent } from './apps'
 import type { CalendarPeriod } from './booking'
 import type { Duration } from './catalog'
 import type { InstanceState, OrderKind, OrderStatus } from './instance'
@@ -58,6 +59,9 @@ export interface Machine {
   last_metrics: MachineMetrics | null
   group_id: number | null
   display_name: string
+  /** Agent 上报的本机镜像（repository:tag，≤ 200 项），只用于覆盖率展示 */
+  cached_images: string[]
+  cached_images_at: string | null
 }
 
 export interface MachineMetrics {
@@ -219,6 +223,8 @@ export interface AdminInstanceDetail {
   commands: CommandRow[]
   ports: InstancePort[]
   ssh_host_pubkey_fingerprint: string
+  /** 该实例的全部部署（含已卸载 / 已失效的历史，按创建时间） */
+  apps?: AdminDeployment[]
 }
 
 export interface RefundQuote {
@@ -340,6 +346,10 @@ export interface Dashboard {
   bookings_upcoming_7d: number
   /** 本月已发放返利净额（返利 − 扣回，分） */
   referral_month_settled: number
+  /** queued + installing */
+  apps_installing: number
+  apps_running: number
+  apps_failed_24h: number
 }
 
 // ---- 邀请返利（计划 8，金额单位：分）。手机号为原文，页面显示前须脱敏；后端从不返回实名指纹 / 证件号 ----
@@ -472,4 +482,61 @@ export interface RescanResult {
   failed: number
   released: number
   incomplete: boolean
+}
+
+/** 后台应用列表的一行（GET /admin/api/v1/apps）；POST / PUT 返回的应用不带 versions / deployments_live。 */
+export interface AdminApp {
+  id: number
+  slug: string
+  name: string
+  summary: string
+  description: string
+  category: AppCategory
+  icon: string
+  sort: number
+  status: AppStatus
+  created_at: string
+  updated_at: string
+  versions: number
+  /** 非终态（不是 removed / lost）的部署数 */
+  deployments_live: number
+}
+
+/** 兼容镜像在在线机器上的缓存情况（unknown：缓存上报超过 5 分钟或旧 Agent 未上报）。 */
+export interface AppCoverage {
+  image_id: number
+  image_name: string
+  cached: number
+  online: number
+  unknown: number
+}
+
+/** 后台版本（GET /apps/{id}/versions 的一项；脚本走 /script 单独取）。已退役版本的 coverage 为空。 */
+export interface AdminAppVersion {
+  id: number
+  app_id: number
+  version: string
+  status: AppStatus
+  image_ids: number[]
+  spec: AppSpec
+  spec_hash: string
+  changelog: string
+  published_at: string | null
+  created_at: string
+  updated_at: string
+  coverage: AppCoverage[]
+  /** 该版本的非终态部署数（后端尚未提供时缺省） */
+  deployments_live?: number
+}
+
+/** 后台部署视图：多 log_tail（已脱敏）与 user_id。 */
+export interface AdminDeployment extends Deployment {
+  log_tail: string
+  user_id: number
+}
+
+/** GET /deployments/{dep}：事件按时间倒序（最近 100 条）；log_tail 只在 deployment 里。 */
+export interface AdminDeploymentDetail {
+  deployment: AdminDeployment
+  events: DeploymentEvent[]
 }

@@ -47,6 +47,7 @@ type Options struct {
 	FreeBytes         uint64   // 0 → 4000 GiB
 	Metrics           metrics.Metrics
 	HeartbeatInterval time.Duration // 自动模式心跳间隔，零值 100ms（测试里推进假时钟后很快就能同步）
+	Images            []string      // StateReport.images（本机已缓存镜像）；nil 时不上报，同旧 Agent
 	Log               *slog.Logger
 }
 
@@ -65,6 +66,9 @@ type Agent struct {
 }
 
 func (a *Agent) Creds() *Creds { return a.creds }
+
+// SetImages 设置之后的 StateReport 上报的已缓存镜像；nil 时不带 images（同旧 Agent）。
+func (a *Agent) SetImages(imgs []string) { a.Runtime.SetImages(imgs) }
 
 // Start 接入（或复用凭据）并建流，直到收到 AgentConfig 才返回；10 秒内连不上则停掉并返回错误。
 func Start(ctx context.Context, o Options) (*Agent, error) {
@@ -132,6 +136,7 @@ func start(ctx context.Context, o Options, dir string) (*Agent, error) {
 		return nil, err
 	}
 	a := &Agent{Runtime: rtfake.New(), Disk: diskfake.New(o.FreeBytes), Net: netfake.New(), Dir: dir, creds: creds, done: make(chan struct{})}
+	a.Runtime.SetImages(o.Images)
 	ips := o.IPs
 	a.Exec = executor.New(executor.Deps{Runtime: a.Runtime, Disk: a.Disk, Net: a.Net, State: st, StateDir: dir, Bridge: "spark0",
 		LocalIPs: func() []string { return ips }, MemTotal: func() uint64 { return 128 << 30 }, Log: o.Log}, o.Stepped)

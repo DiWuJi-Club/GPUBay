@@ -14,10 +14,15 @@ import (
 )
 
 // initScript 是容器入口：写最小 sshd 配置并 exec sshd；镜像自身的 ENTRYPOINT / CMD 不会执行。
+// exec 之前把本进程的环境（镜像的 Docker ENV）原样拷到 /run/spark-image.environ（NAME=value\0…）：sshd 为每个会话重建环境，
+// 平台经 SSH 执行的应用部署（run.sh）拿不到 CUDA_HOME / LD_LIBRARY_PATH 等，部署前读这个文件生成 image.env
+// （appdeploy.DefaultImageEnviron，计划 7 验收缺陷 A-1）。不能事后读 /proc/1/environ：sshd 的 setproctitle 会覆盖那块内存。
+// 拷贝失败不影响启动（|| true）。
 // sftp 用 sshd 内置实现（镜像不需要 openssh-sftp-server）；X11、Unix socket 转发关闭；TCP 转发与 agent 转发放开（网关侧另有白名单）。
 const initScript = `#!/bin/sh
 set -e
 mkdir -p /run/sshd
+cat /proc/$$/environ > /run/spark-image.environ 2>/dev/null || true
 cat > /run/spark-sshd.conf <<'EOF'
 Port 22
 HostKey /.spark/hostkeys/ssh_host_ed25519_key

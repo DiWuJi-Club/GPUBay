@@ -2,17 +2,20 @@
 import {
   durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, isApiError, labelOf, messageOf, portVisibilityLabel,
   useCountdown, useIdempotencyKey,
-  type CancelQuote, type Duration, type Instance, type InstancePort, type Listed, type Order, type PortVisibility, type Product, type UserEvent,
+  type AppCatalogItem, type CancelQuote, type Deployment, type DeploymentEvent, type Duration, type Instance, type InstancePort, type Listed, type Order,
+  type PortVisibility, type Product, type UserEvent,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import AppDialog from '../components/AppDialog.vue'
+import AppsCard from '../components/AppsCard.vue'
 import GuideDialog from '../components/GuideDialog.vue'
 import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
 import { MAX_PORTS, validatePort } from '../logic/access'
+import { mergeTimeline } from '../logic/apps'
 import { describeDuration } from '../logic/booking'
 import { autoRenewFailureText, canCancel, canRelease, canRenew, canSetAutoRenew, releaseWarning, renewQuantityMax } from '../logic/instance'
 import { notifyError } from '../logic/notify'
@@ -69,6 +72,7 @@ onMounted(() => {
   // 商品价格依赖实例的 product_id：实例加载后再拉；失败不提示（续费对话框打开时会再拉一次并提示）
   void load().then(() => loadProduct().catch(() => (productError.value = true)))
   void loadEvents()
+  void loadCatalog()
 })
 const nowMs = ref(Date.now())
 const ticker = setInterval(() => (nowMs.value = Date.now()), 1000)
@@ -391,9 +395,46 @@ async function loadEvents() {
   }
 }
 
+// ---- 应用（卡片自己加载部署；这里只放应用目录，以及合并到「动态」的部署事件）----
+const catalog = ref<AppCatalogItem[]>([])
+/** 应用目录（添加 / 重新部署弹窗用）：失败不提示，弹窗里显示「暂无可部署的应用」。 */
+async function loadCatalog() {
+  try {
+    catalog.value = (await api.get<Listed<AppCatalogItem>>('/apps')).items
+  } catch {
+    catalog.value = []
+  }
+}
+const deployments = ref<Deployment[]>([])
+const appEvents = ref<{ name: string; events: DeploymentEvent[] }[]>([])
+let depSignature: string | null = null // null = 还没拿到过部署列表
+/** 部署列表刷新：部署或其状态变了才重拉部署事件与端口（运行时登记端口、卸载删端口；首次端口已由 load 拉过）。 */
+function onDeployments(items: Deployment[]) {
+  deployments.value = items
+  const sig = items.map((d) => `${d.id}:${d.state}:${d.desired}`).join(',')
+  if (sig === depSignature) return
+  const first = depSignature === null
+  depSignature = sig
+  if (items.length || !first) void loadAppEvents()
+  if (!first && inst.value && canManagePorts(inst.value.state)) void loadPorts()
+}
+async function loadAppEvents() {
+  const of = id.value
+  const deps = deployments.value
+  const results = await Promise.allSettled(
+    deps.map((d) => api.get<Listed<DeploymentEvent>>(`/instances/${of}/apps/${d.id}/events`).then((r) => ({ name: d.app_name, events: r.items }))),
+  )
+  if (of !== id.value || deps !== deployments.value) return // 换实例 / 列表又刷新过：丢弃
+  appEvents.value = results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []))
+}
+const timeline = computed(() => mergeTimeline(events.value, appEvents.value))
+
 watch(id, () => {
   password.value = ''
   events.value = []
+  deployments.value = []
+  appEvents.value = []
+  depSignature = null
   cancelVisible.value = false
   resetVisible.value = false
   ports.value = []
@@ -490,6 +531,8 @@ watch(id, () => {
         </template>
       </el-card>
 
+      <AppsCard v-if="canManagePorts(inst.state)" :key="inst.id" :instance="inst" :apps="catalog" @deployments="onDeployments" />
+
       <el-card v-if="canManagePorts(inst.state)" header="Web 访问" data-testid="detail-ports-card">
         <p class="muted">把容器里监听的端口（如 JupyterLab 8888）开放为网址；默认只有您登录控制台后能访问，可设为公开。应用需监听 127.0.0.1 或 0.0.0.0。</p>
         <p v-if="inst.state !== 'running'" class="muted" data-testid="detail-port-hint">实例运行中才可访问，现在可以先添加端口</p>
@@ -539,9 +582,9 @@ watch(id, () => {
       </el-card>
 
       <el-card header="动态" data-testid="detail-timeline">
-        <el-timeline v-if="events.length">
-          <el-timeline-item v-for="(ev, i) in events" :key="i" :timestamp="fmtTime(ev.at)" placement="top">
-            <span data-testid="detail-event" :data-kind="ev.reason_kind">{{ ev.detail }}</span>
+        <el-timeline v-if="timeline.length">
+          <el-timeline-item v-for="(ev, i) in timeline" :key="i" :timestamp="fmtTime(ev.at)" placement="top">
+            <span data-testid="detail-event" :data-kind="ev.kind">{{ ev.text }}</span>
           </el-timeline-item>
         </el-timeline>
         <p v-else class="muted">暂无记录</p>

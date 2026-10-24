@@ -6,6 +6,7 @@ package sshtest
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -14,9 +15,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -26,6 +31,10 @@ import (
 type Options struct {
 	AuthorizedKey ssh.PublicKey // 允许以 root 登录的公钥（平台上游公钥）
 	HostKey       ssh.Signer    // nil → 生成 ed25519
+	// Shell：exec 请求用本机 /bin/sh -c 真执行（工作目录 Root，HOME=Root）；false 时沿用回显模式（echo / exit / cat / …）。
+	Shell bool
+	// Root：Shell 模式的工作目录（充当容器的 /）；为空时自动建临时目录并在 Close 时删除。
+	Root string
 }
 
 type Server struct {
@@ -45,6 +54,12 @@ type Server struct {
 	opens       []string           // 收到的通道打开类型（按到达顺序）
 	closed      bool
 	wg          sync.WaitGroup
+
+	shell    bool
+	root     string
+	rootTemp bool            // root 是 New 建的临时目录，Close 时删除
+	ctx      context.Context // Shell 模式命令的生命周期；Close 时取消
+	cancel   context.CancelFunc
 }
 
 func New(o Options) (*Server, error) {
@@ -71,11 +86,30 @@ func New(o Options) (*Server, error) {
 		},
 	}
 	cfg.AddHostKey(signer)
+	ctx, cancel := context.WithCancel(context.Background())
+	root, rootTemp := o.Root, false
+	if o.Shell && root == "" {
+		var err error
+		if root, err = os.MkdirTemp("", "sshtest-root-"); err != nil {
+			cancel()
+			return nil, err
+		}
+		rootTemp = true
+		// 解开符号链接（macOS 的 /var → /private/var），让 Root() 与命令里的 pwd 一致
+		if real, err := filepath.EvalSymlinks(root); err == nil {
+			root = real
+		}
+	}
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		cancel()
+		if rootTemp {
+			os.RemoveAll(root)
+		}
 		return nil, err
 	}
-	s := &Server{lis: lis, signer: signer, cfg: cfg, targets: map[int]string{}, extras: map[io.Closer]bool{}, holds: map[int]*hold{}}
+	s := &Server{lis: lis, signer: signer, cfg: cfg, targets: map[int]string{}, extras: map[io.Closer]bool{}, holds: map[int]*hold{},
+		shell: o.Shell, root: root, rootTemp: rootTemp, ctx: ctx, cancel: cancel}
 	s.wg.Add(1)
 	go s.accept()
 	return s, nil
@@ -84,6 +118,9 @@ func New(o Options) (*Server, error) {
 func (s *Server) Addr() string       { return s.lis.Addr().String() }
 func (s *Server) Port() int          { return s.lis.Addr().(*net.TCPAddr).Port }
 func (s *Server) Signer() ssh.Signer { return s.signer }
+
+// Root 返回 Shell 模式的工作目录（非 Shell 模式为空）。
+func (s *Server) Root() string { return s.root }
 func (s *Server) HostPubLine() string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(s.signer.PublicKey())))
 }
@@ -128,7 +165,11 @@ func (s *Server) Close() {
 	s.mu.Unlock()
 	s.lis.Close()
 	s.DropAll()
+	s.cancel() // 杀掉 Shell 模式下仍在跑的命令（整个进程组）
 	s.wg.Wait()
+	if s.rootTemp {
+		os.RemoveAll(s.root)
+	}
 }
 
 // SetTarget 让到容器内 127.0.0.1:<port> 的 direct-tcpip 转到 addr。
@@ -605,7 +646,10 @@ func (x *session) finish(ch ssh.Channel, status uint32) {
 }
 
 func (x *session) exec(ch ssh.Channel, cmd string) uint32 {
-	switch {
+	if x.srv.shell {
+		return x.srv.runShell(ch, cmd)
+	}
+	switch { // 原回显模式不变
 	case strings.HasPrefix(cmd, "echo "):
 		fmt.Fprint(ch, strings.TrimPrefix(cmd, "echo ")+"\n")
 	case strings.HasPrefix(cmd, "exit "):
@@ -661,6 +705,42 @@ func (x *session) exec(ch ssh.Channel, cmd string) uint32 {
 		fmt.Fprintf(ch, "exec:%s\n", cmd)
 	}
 	return 0
+}
+
+// runShell 用 /bin/sh -c 真执行命令：stdin / stdout / stderr 与通道对接，返回退出码；服务器 Close 时命令被杀（ctx）。
+// 命令跑在独立进程组里，取消时整组 SIGKILL：只杀 /bin/sh 的话，fork 出来的子进程（Linux dash 下的 sleep、
+// 未重定向的后台进程）仍占着 stdout 管道，Wait 等不到 EOF，Close 就卡住。WaitDelay 兜底逃出进程组的孙进程。
+func (s *Server) runShell(ch ssh.Channel, cmd string) uint32 {
+	c := exec.CommandContext(s.ctx, "/bin/sh", "-c", cmd)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c.WaitDelay = 2 * time.Second
+	c.Dir = s.root
+	c.Env = append(os.Environ(), "HOME="+s.root, "SPARK_TEST_ROOT="+s.root)
+	c.Stdout, c.Stderr = ch, ch.Stderr()
+	stdin, err := c.StdinPipe()
+	if err != nil {
+		fmt.Fprintf(ch.Stderr(), "sshtest: %v\n", err)
+		return 255
+	}
+	if err := c.Start(); err != nil {
+		fmt.Fprintf(ch.Stderr(), "sshtest: %v\n", err)
+		return 127
+	}
+	go func() { io.Copy(stdin, ch); stdin.Close() }()
+	err = c.Wait()
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return 0
+	case errors.As(err, &ee):
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() { // 被信号杀：128+信号
+			return 128 + uint32(ws.Signal())
+		}
+		return uint32(ee.ExitCode())
+	default:
+		return 255
+	}
 }
 
 // writeN 写 n 个 'x'（64 KiB 一块），命令返回后 session 立即 exit：用来验证网关不截断尾部数据。

@@ -11,6 +11,7 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AppFormDialog: typeof import('./components/AppFormDialog.vue')['default']
     BatchLink: typeof import('./components/BatchLink.vue')['default']
     BookingOpsDialogs: typeof import('./components/BookingOpsDialogs.vue')['default']
     DateRange: typeof import('./components/DateRange.vue')['default']
@@ -45,6 +46,7 @@ declare module 'vue' {
     ElTimeline: typeof import('element-plus/es')['ElTimeline']
     ElTimelineItem: typeof import('element-plus/es')['ElTimelineItem']
     FinancePage: typeof import('./components/FinancePage.vue')['default']
+    ForceRemoveDialog: typeof import('./components/ForceRemoveDialog.vue')['default']
     IdLink: typeof import('./components/IdLink.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']

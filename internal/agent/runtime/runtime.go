@@ -42,6 +42,8 @@ type Runtime interface {
 	// ConnectNetwork 把容器重新挂接到指定网络（容器停止状态下也可执行）。
 	ConnectNetwork(ctx context.Context, id, network string) error
 	VethOf(ctx context.Context, id string) (string, error)
+	// Images 返回本机已缓存的镜像 repository:tag（imageref.Normalize：去重排序、≤ 200 项、每项 ≤ 256 字节、不含 <none>）。
+	Images(ctx context.Context) ([]string, error)
 }
 
 const Label = "spark.instance"

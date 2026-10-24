@@ -1,5 +1,6 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 import { adminApi, adminPost, createAdmin } from '../helpers/admin'
+import { cleanupApps, deployViaApi, ownInstance, seedApps, tickUntil } from '../helpers/apps'
 import { loginConsoleAt, seedUser } from '../helpers/console'
 import { CONSOLE_SITE_URL, hooks } from '../helpers/hooks'
 import { instanceOf, runningInstance } from '../helpers/instances'
@@ -8,6 +9,9 @@ import { instanceOf, runningInstance } from '../helpers/instances'
 // 经平台入口 → SSH 上游连接池 → 假容器 sshd 的 direct-tcpip → 回显服务。用例都「先经 API 加端口、再调 ingressUpstream」：
 // 该钩子在登记回显服务后立即刷新路由表，不必等 2 秒的定时刷新。
 const portUrl = (id: string, port: number) => `http://${id}-${port}.spark.test:18080`
+
+// C-ING-07 部署了应用：afterEach 卸载（其余用例没有部署，清理是空操作）
+test.afterEach(cleanupApps)
 
 test('C-ING-01 私有端口：未登录 → 登录页 → 回到目标页，内容来自容器端口；再次访问不再跳转', async ({ page }) => {
   const u = await seedUser()
@@ -98,4 +102,34 @@ test('C-ING-06 被后台强制私有后：详情页显示锁定、无切换按�
   const r = await api.put(`/api/v1/instances/${id}/ports/8888`, { data: { visibility: 'public' } })
   expect(r.status()).toBe(409)
   expect(((await r.json()) as { code: string }).code).toBe('port_forced_private')
+})
+
+test('C-ING-07 应用端口默认私有：未登录 302 到登录，登录后回到应用页面', async ({ page }) => {
+  const apps = await seedApps() // 8000 端口在假容器里转到 fake 应用服务（回 spark-app-ok|path=…）
+  const u = await seedUser()
+  const { api, id } = await runningInstance(u.phone)
+  ownInstance(api, id)
+  const d = await deployViaApi(api, id, apps.vllm.id)
+  const done = await tickUntil(api, id, d.id, 'running')
+  expect(done.url).toBe(`${portUrl(id, 8000)}/docs`) // 「打开」= 主端口 URL + ports[0].path（vLLM 是 /docs，A-4）
+  const ports = ((await (await api.get(`/api/v1/instances/${id}/ports`)).json()) as { items: { port: number; visibility: string }[] }).items
+  expect(ports.map((p) => [p.port, p.visibility])).toEqual([[8000, 'private']])
+  await hooks.advance(61) // runningInstance 刚为该手机号发过验证码
+  // 路由表每 2 秒刷新：端口登记后最多 2 秒才从「未开放」变成走 authorize 跳转
+  let resp = null as Awaited<ReturnType<Page['goto']>>
+  await expect.poll(async () => {
+    resp = await page.goto(`${portUrl(id, 8000)}/docs`)
+    return new URL(page.url()).host
+  }, { timeout: 10_000 }).toBe('spark.test:18080')
+  await expect(page).toHaveURL(/^http:\/\/spark\.test:18080\/login\?redirect=/)
+  let first = resp!.request()
+  while (first.redirectedFrom()) first = first.redirectedFrom()!
+  expect(first.url()).toBe(`${portUrl(id, 8000)}/docs`)
+  expect((await first.response())!.status()).toBe(302) // 实例域名上的第一跳就是 302
+  await page.getByTestId('login-phone').fill(u.phone)
+  await page.getByTestId('login-send').click()
+  await page.getByTestId('login-code').fill('000000')
+  await page.getByTestId('login-submit').click()
+  await expect(page).toHaveURL(`${portUrl(id, 8000)}/docs`)
+  await expect(page.locator('body')).toHaveText('spark-app-ok|path=/docs')
 })

@@ -90,10 +90,18 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	for _, d := range upcoming {
 		upcoming7 += d.Count
 	}
+	appsInstalling, appsRunning, appsFailed24h, err := s.Apps.Counts(ctx, now)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"machines": machines, "instances": instances,
 		"recharge_today": rechargeToday, "recharge_month": rechargeMonth, "order_today": orderToday, "order_month": orderMonth,
 		"utilization": util, "ssh_sessions_open": sshOpen, "bookings_upcoming_7d": upcoming7,
 		"referral_month_settled": refMonth,
+		"apps_installing":        appsInstalling,
+		"apps_running":           appsRunning,
+		"apps_failed_24h":        appsFailed24h,
 	})
 }

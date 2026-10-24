@@ -88,6 +88,9 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_ADMIN_PUBLIC_BASE_URL` | 后台对外地址（经反向代理或 `ssh -L` 隧道访问时填浏览器地址栏里的后台地址），用于后台写请求的 Origin 校验。为空时只认 `Sec-Fetch-Site`：带 `Origin` 而不带 `Sec-Fetch-Site` 的客户端（旧版 Safari、部分内嵌 WebView）后台写请求一律 403；staging / prod 为空时启动日志会打 WARN | 空 |
 | `SPARK_TLS_CERT_FILE` / `SPARK_TLS_KEY_FILE` | 证书与私钥（PEM，覆盖 `<domain>` 与 `*.<ingress_domain>`）；设置后公网监听器为 HTTPS 并每分钟检查文件变化热加载 | 空 |
 | `SPARK_HTTP_REDIRECT_ADDR` | 纯 HTTP 301 到 https 的监听地址（仅 TLS 开启时有效） | 空 |
+| `SPARK_APP_HF_ENDPOINT` | 注入应用容器的 `HF_ENDPOINT`（模型下载的 HuggingFace 镜像站） | https://hf-mirror.com |
+| `SPARK_APP_PIP_INDEX_URL` | 注入应用容器的 `PIP_INDEX_URL`（应用脚本若需装小包） | https://pypi.tuna.tsinghua.edu.cn/simple |
+| `SPARK_APP_RUNNER` | on / off：是否在本副本启动应用部署 Runner（多副本都 on，咨询锁保证只有一个在工作；e2e 用 off） | on |
 
 ## 节点 Agent
 
@@ -98,7 +101,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 3. 后台机器详情「生成接入命令」，在机器上以 root 执行。脚本依次：下载并校验二进制 -> 用下载的临时二进制执行 `selfcheck`（失败则中止）-> 原子替换 `/usr/local/bin/spark-agent` -> 建 `/etc/spark-agent`、`/var/lib/spark-agent`（强制 0700，可重复执行）-> `enroll` -> 安装并启用 systemd 服务 `spark-agent`（`Restart=always`）。自检失败时令牌未被消耗，可原样重跑；`enroll` 之后的任何失败都需要在后台重新生成接入命令。令牌不会被脚本打印，但 `ps` 里在 enroll 运行期间可见，也会留在 shell 历史和 `sudo` 的 `/var/log/auth.log` 里；一次性令牌用后即失效，过期未用的令牌请在后台作废。
 4. 9443 端口只对机房内网开放。
 5. 镜像规范与参考 Dockerfile 见 `docs/image-spec.md`、`deploy/image/Dockerfile`。
-6. 升级 Agent（**每次发布都先升级全部 Agent，再发布 platform**）：`make agent` 后更新文件服务器上的二进制与 `SPARK_AGENT_BINARY_SHA256`（平台重启生效），在后台重新生成接入命令并在机器上执行（会换新证书，运行中的实例不受影响）。
+6. 升级 Agent（**每次发布都先升级全部 Agent，再发布 platform**）：计划 7 起 Agent 在每 60 秒的 `StateReport.images` 里上报本机已缓存的镜像（`docker image ls`，最多 200 项），后台据此显示应用镜像的缓存覆盖率；旧 Agent 不上报也照常工作（覆盖率显示「未知」）。`make agent` 后更新文件服务器上的二进制与 `SPARK_AGENT_BINARY_SHA256`（平台重启生效），在后台重新生成接入命令并在机器上执行（会换新证书，运行中的实例不受影响）。
 7. 机器网络：Agent 在宿主机重启后先挂载数据盘再拉起应运行的容器；若容器端口要绑定的局域网地址还没就绪，Agent 推迟启动并每 60 秒重试。业务网卡建议用有线 + 固定地址，并启用 `NetworkManager-wait-online`。
 8. 本地无 Docker 时：`spark-agent run --fake --dir ./.devdata/agent --state-dir ./.devdata/agent/state`（`--fake` 仅用于开发，systemd unit 不使用）。
 9. 脚本测试：`sh deploy/agent/install_test.sh`（已并入 `make test`）。
@@ -137,6 +140,33 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - 计划 8（邀请返利）发布：迁移 `00021`（设计文档写作 `00020`，计划 7 先占用了该编号）在存在 `referral_rebate / referral_clawback` 流水时拒绝回滚；多副本滚动期间旧副本的登录接口不认 `invite_code`，窗口内注册的用户不会绑定（窗口很短，可接受；一次性重启全部副本可消除）；发布后执行 `platform referral backfill-fingerprints`；`SPARK_PUBLIC_BASE_URL` 必须是用户可访问的控制台地址（邀请链接据此生成）。
 - 计划 8 必须在计划 7 合入 `main` 之后发布（goose 不接受乱序迁移：`00021` 先于 `00020` 落库后，`00020` 再也不会执行）。迁移 `00021` 扩展 `wallet_ledger.kind` 的 CHECK 约束，会对 `wallet_ledger` 持有 ACCESS EXCLUSIVE 锁并全表校验，随后在同一事务里建 `wallet_ledger_order_scan_idx`（非 CONCURRENTLY）：迁移期间所有充值 / 扣款 / 退款都会等待。先 `SELECT count(*) FROM wallet_ledger` 估算耗时，选低峰窗口发布。
 - 邀请返利的「同 IP」标记与邀请码查询限流（每 IP 每分钟 60 次）都按客户端 IP：platform 在反向代理之后时必须设 `SPARK_TRUST_PROXY=true`（及 `SPARK_TRUSTED_PROXY_HOPS`），否则所有绑定都带「同IP」、所有用户共用一个查码额度。即便设对了，同一 NAT 出口（公司 / 校园网）的邀请也会带「同IP」——该标记只提示、不搁置。
+
+### 应用一键部署（计划 7）
+
+- **发布顺序**：先升级全部 Agent（新增 `StateReport.images`），再发布 platform（迁移 `00020_apps.sql`）。platform 先发也能工作，只是缓存覆盖率显示「未知」；本计划不改实例指令，旧 Agent 的实例操作不受影响。
+- **Runner**：部署由 platform 里的 Runner 推进（每 5 秒一轮，经上游 SSH 在用户容器里执行 `run.sh`）。多副本都保持 `SPARK_APP_RUNNER=on` 即可：每轮先拿 PostgreSQL 会话级咨询锁，同一时刻只有一个副本在工作，该副本挂掉后其它副本下一轮接手。设为 `off` 时启动日志打 WARN，所有副本都 off 则部署一直停在「等待部署」。
+- **镜像分发（内网 Harbor `registry.spark.internal`）**：
+  - Harbor 建两个项目：`proxy-nvcr`（Proxy Cache，代理 `nvcr.io`，机器与构建机拉 `registry.spark.internal/proxy-nvcr/nvidia/vllm:25.09-py3` 等价于拉 nvcr.io）与 `spark`（放我们构建的应用镜像）。机器只从 Harbor 拉镜像；拉镜像的是宿主机 dockerd，容器内的应用不访问 Harbor。`SPARK_AGENT_ALLOW_CIDRS` 按原有约定含 Harbor 地址；若 `SPARK_APP_HF_ENDPOINT` / `SPARK_APP_PIP_INDEX_URL` 指向内网镜像站，也要把它们的网段加进去（容器默认不能访问机房内网）。
+  - 构建：在一台 arm64 机器（可以是进维护的 Spark）上，仓库根目录 `make app-images`，按 `APP_IMAGE_TAG`（默认 `25.09`）构建 `spark/llm-serving`、`spark/comfyui`、`spark/pytorch` 三个镜像。大陆网络传镜像源构建参数：
+    `make app-images PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple COMFYUI_SRC=https://ghfast.top/https://github.com/comfyanonymous/ComfyUI.git`。
+    基础镜像想走 Harbor 代理时直接 `docker build --build-arg BASE=registry.spark.internal/proxy-nvcr/nvidia/vllm:25.09-py3 ...`（各参数与逐条命令见 `deploy/image/apps/README.md`）。
+  - 推送：`for app in llm-serving comfyui pytorch; do docker tag spark/$app:25.09 registry.spark.internal/spark/$app:25.09 && docker push registry.spark.internal/spark/$app:25.09; done`。
+- **登记与上架**（顺序不能乱）：
+  1. 后台「价格与镜像」登记三个镜像，名称必须是 `LLM Serving`、`ComfyUI`、`PyTorch`（导入按名称找镜像），地址填 `registry.spark.internal/spark/<app>:25.09`；已有的 PyTorch 占位条目改成新地址即可。
+  2. 导入应用为草稿。`platform admin app import` 读的是 **platform 容器内**的目录，而 distroless 镜像里没有 `deploy/apps`，先把目录放进容器再导入（在 `deploy/compose/` 下执行；`../apps/.` 带结尾的 `/.`，重复执行也是覆盖到 `/apps` 而不是套一层 `/apps/apps`）：
+
+     ```bash
+     docker compose cp ../apps/. platform:/apps
+     docker compose exec platform /platform admin app import /apps
+     ```
+
+     或不往运行中的容器里写文件，用一次性容器只读挂载：`docker compose run --rm --no-deps -v "$(cd ../apps && pwd):/apps:ro" platform admin app import /apps`。
+     每个应用输出 `<slug> <版本> created|version-added`；引用的镜像没登记时该应用导入失败（先登记再重跑；同一版本号重复导入会报错，改脚本请升版本）。
+  3. 后台「应用」逐个发布版本（super + TOTP）。发布时平台向全部在线机器广播预拉取，版本页显示每个兼容镜像「已缓存 X / 在线 Y」；llm-serving 约 29GB，首次预拉取耗时较长，发布不受覆盖率限制。
+- **安全**：`run.sh` 与应用脚本在用户容器里**以 root 执行**，发布一个应用版本的权限等同于发布一个镜像——只给 super，发布要 TOTP；导入的脚本须经代码评审（`deploy/apps/README.md` 的约定）。
+- **回滚**：
+  - 只回退 platform 版本（不执行 Down）：新表留着不用，已部署的应用进程继续在容器里运行，但不再有人推进部署、登记端口或在实例重启后恢复；控制台和后台没有应用入口。
+  - 执行 `00020` 的 Down：删除 `apps`、`app_versions`、`app_deployments`、`app_deploy_events` 与 `machines.cached_images(_at)`，**部署记录、事件和加密保存的应用变量全部丢失且不可恢复**；`instance_ports` 删除 `deployment_id` 列，应用登记的端口行保留下来变成普通端口（用户可自行删除）；数据盘 `/root/data/models` 里的模型与 `.spark-apps` 目录不受影响。
 
 ## API 约定
 

@@ -276,6 +276,9 @@ type bookingRequest struct {
 	StartAt           string `json:"start_at"`
 	AutoRenew         bool   `json:"auto_renew"`
 	AutoRenewDuration string `json:"auto_renew_duration"`
+	// 计划 7：每台实例开通后自动部署的应用（可选），见 POST /orders
+	AppID  *int64            `json:"app_id"`
+	AppEnv map[string]string `json:"app_env"`
 }
 
 func (s *Server) batchResult(ctx context.Context, res rental.BatchResult) (map[string]any, error) {
@@ -324,6 +327,7 @@ func (s *Server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		UserID: currentUser(r).ID, ProductID: req.ProductID, ImageID: req.ImageID, GroupID: req.GroupID, MachineID: req.MachineID,
 		Count: req.Count, Duration: catalog.Duration(req.Duration), Quantity: req.Quantity, StartAt: start,
 		AutoRenew: req.AutoRenew, AutoRenewDuration: catalog.Duration(req.AutoRenewDuration), IdempotencyKey: r.Header.Get(idempotencyHeader),
+		AppID: req.AppID, AppEnv: req.AppEnv,
 	})
 	if err != nil {
 		s.writeError(w, r, err)

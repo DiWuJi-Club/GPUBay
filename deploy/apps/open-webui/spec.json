@@ -1,0 +1,10 @@
+{
+  "ports": [{"port": 3000, "label": "对话界面", "health_path": "/health"}],
+  "timeout_minutes": 15,
+  "min_data_free_gib": 2,
+  "env": [
+    {"name": "OPENAI_API_BASE_URL", "label": "接口地址", "type": "string", "pattern": "^https?://[^\\s]{1,200}$", "default": "http://127.0.0.1:8000/v1", "help": "OpenAI 兼容接口地址，默认是本实例上的 vLLM"},
+    {"name": "OPENAI_API_KEY", "label": "接口密钥", "type": "secret", "required": false, "help": "vLLM 设置了接口密钥时填同一个；没有则留空"},
+    {"name": "WEBUI_SECRET_KEY", "label": "会话密钥", "type": "secret", "required": false, "help": "留空则首次启动自动生成"}
+  ]
+}

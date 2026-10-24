@@ -1,0 +1,11 @@
+{
+  "ports": [{"port": 8188, "label": "ComfyUI 界面", "health_path": "/system_stats"}],
+  "timeout_minutes": 90,
+  "min_data_free_gib": 50,
+  "env": [
+    {"name": "MODEL_ID", "label": "模型", "type": "enum", "required": true,
+     "options": ["AI-ModelScope/stable-diffusion-xl-base-1.0", "AI-ModelScope/FLUX.1-schnell", "Qwen/Qwen-Image"], "default": "AI-ModelScope/stable-diffusion-xl-base-1.0",
+     "help": "下载 ComfyUI 可直接加载的单文件权重：SDXL 约 7GB、FLUX.1-schnell 约 34GB（hf-mirror 为 17GB fp8 版）、Qwen-Image（fp8）约 30GB"},
+    {"name": "MODEL_SOURCE", "label": "下载源", "type": "enum", "options": ["modelscope", "hf-mirror"], "default": "modelscope"}
+  ]
+}

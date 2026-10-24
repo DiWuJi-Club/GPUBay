@@ -1,7 +1,11 @@
 // Package apperr 定义可以直接展示给用户的业务错误。
 package apperr
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
 
 type Error struct {
 	Code    string
@@ -56,6 +60,13 @@ var (
 	ErrInviteCodeInvalid    = New("invite_code_invalid", "邀请码无效", 400)
 	ErrReferralFrozen       = New("referral_frozen", "邀请功能已暂停", 409)
 	ErrReferralBindingState = New("referral_binding_state", "该绑定当前状态不允许此操作", 409)
+	// 计划 7
+	ErrAppNotFound      = New("app_not_found", "应用不存在或未上架", 404)
+	ErrAppUnavailable   = New("app_unavailable", "该应用当前没有可用版本", 409)
+	ErrAppLimit         = New("app_limit", "每个实例最多部署 3 个应用", 409)
+	ErrAppExists        = New("app_exists", "该应用已在此实例上部署", 409)
+	ErrAppInvalidState  = New("app_invalid_state", "当前状态不允许该操作", 409)
+	ErrAppVersionFrozen = New("app_version_frozen", "已发布的版本不能修改", 409)
 )
 
 // As 取出错误链中的 *Error；不是业务错误时返回 nil。
@@ -65,4 +76,23 @@ func As(err error) *Error {
 		return e
 	}
 	return nil
+}
+
+// AppImageMismatch 该应用需要 need 中某个镜像，实例当前镜像为 have。
+func AppImageMismatch(need []string, have string) *Error {
+	return New("app_image_mismatch", "该应用需要以下镜像之一："+strings.Join(need, "、")+"，当前实例镜像为 "+have, 409)
+}
+
+func AppPortConflict(port int) *Error {
+	return New("app_port_conflict", fmt.Sprintf("应用端口 %d 已被该实例的其它端口占用", port), 409)
+}
+
+func AppEnvInvalid(label, reason string) *Error {
+	return New("app_env_invalid", label+"："+reason, 400)
+}
+
+func AppEnvRequired(label string) *Error { return New("app_env_required", "请填写 "+label, 400) }
+
+func AppVersionInvalid(path, reason string) *Error {
+	return New("app_version_invalid", path+"："+reason, 400)
 }

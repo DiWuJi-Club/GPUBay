@@ -1,6 +1,7 @@
 package sshtest_test
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -9,7 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -375,5 +380,107 @@ func TestForwardAddrClearedOnDrop(t *testing.T) {
 	}
 	if srv.ForwardAddr() != "" {
 		t.Fatalf("forward addr not cleared after drop: %q", srv.ForwardAddr())
+	}
+}
+
+func TestShellModeExec(t *testing.T) {
+	up := newSigner(t)
+	srv, err := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey(), Shell: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	root := srv.Root()
+	if root == "" {
+		t.Fatal("no root")
+	}
+	c := dial(t, srv, up)
+	// 真执行：工作目录是 Root，HOME 也是
+	if out, err := output(t, c, `pwd; printf '%s\n' "$HOME"`); err != nil || out != root+"\n"+root+"\n" {
+		t.Fatalf("pwd = %q %v", out, err)
+	}
+	// 退出码透传
+	var exitErr *ssh.ExitError
+	if _, err := output(t, c, "exit 7"); !errors.As(err, &exitErr) || exitErr.ExitStatus() != 7 {
+		t.Fatalf("exit 7 = %v", err)
+	}
+	// stdin → 文件（部署包上传路径）
+	sess, _ := c.NewSession()
+	sess.Stdin = strings.NewReader("payload")
+	if err := sess.Run("mkdir -p sub && cat > sub/f"); err != nil {
+		t.Fatal(err)
+	}
+	sess.Close()
+	if b, _ := os.ReadFile(filepath.Join(root, "sub", "f")); string(b) != "payload" {
+		t.Fatalf("file = %q", b)
+	}
+	// stderr 分流
+	sess, _ = c.NewSession()
+	var stdout, stderr bytes.Buffer
+	sess.Stdout, sess.Stderr = &stdout, &stderr
+	if err := sess.Run("echo out; echo err >&2"); err != nil || stdout.String() != "out\n" || stderr.String() != "err\n" {
+		t.Fatalf("split = %q %q %v", stdout.String(), stderr.String(), err)
+	}
+	sess.Close()
+	// 关闭服务器杀掉仍在跑的命令（sleep 不会残留）
+	sess, _ = c.NewSession()
+	done := make(chan error, 1)
+	go func() { done <- sess.Run("sleep 30") }()
+	time.Sleep(100 * time.Millisecond)
+	srv.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("sleep finished normally")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("command survived Close")
+	}
+	if _, err := os.Stat(root); err == nil {
+		t.Fatal("temp root not removed on Close")
+	}
+}
+
+// 后台子进程继承 stdout 时，Close 必须杀掉整个进程组：只杀 /bin/sh 的话子进程一直占着 stdout 管道，
+// Wait 等不到 EOF，Close 卡住（Linux dash 下 fork 出来的 sleep 就是这样）。
+func TestShellModeCloseKillsBackgroundChild(t *testing.T) {
+	up := newSigner(t)
+	srv, err := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey(), Shell: true, Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	c := dial(t, srv, up)
+	sess, _ := c.NewSession()
+	out, _ := sess.StdoutPipe()
+	if err := sess.Start("sleep 30 & echo $!; wait"); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(out).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatalf("pid line = %q", line)
+	}
+	t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+	closed := make(chan struct{})
+	start := time.Now()
+	go func() { srv.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung on a background child holding stdout")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("Close took %v (waited for WaitDelay instead of killing the process group)", d)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for syscall.Kill(pid, 0) == nil && time.Now().Before(deadline) { // 被杀后由 init 收尸，短暂停留为僵尸
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatalf("background child %d survived Close", pid)
 	}
 }

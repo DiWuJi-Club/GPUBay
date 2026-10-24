@@ -14,6 +14,7 @@ import (
 
 	"spark-cloud/internal/agent/cmdrun"
 	"spark-cloud/internal/agent/runtime"
+	"spark-cloud/internal/platform/imageref"
 )
 
 type Runtime struct {
@@ -44,6 +45,15 @@ func (r *Runtime) EnsureNetwork(ctx context.Context) error {
 		"-o", "com.docker.network.bridge.name="+r.Bridge, "-o", "com.docker.network.bridge.enable_icc=false",
 		"-o", "com.docker.network.bridge.enable_ip_masquerade=true", r.Bridge)
 	return err
+}
+
+// Images 列出本机已缓存镜像（StateReport.images）；规范化规则与网关、覆盖率统计共用 imageref。
+func (r *Runtime) Images(ctx context.Context) ([]string, error) {
+	out, err := r.Run.Run(ctx, "docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "dangling=false")
+	if err != nil {
+		return nil, err
+	}
+	return imageref.Normalize(strings.Split(string(out), "\n")), nil
 }
 
 func (r *Runtime) Pull(ctx context.Context, ref string) error {

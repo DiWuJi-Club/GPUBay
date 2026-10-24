@@ -35,8 +35,9 @@ export const hooks = {
     await post('/hooks/sweep', opts)
   },
   /** 让步进式 fake Agent 执行该机器（缺省全部）当前队列里的指令并上报；指令经真实网关投递，返回时平台已处理完结果。
-   *  未接入的机器会先被接入。fail=true 时每条指令都按失败回报（result 为原因）。 */
-  agent(opts: { machine_id?: number; fail?: boolean; result?: string } = {}) {
+   *  未接入的机器会先被接入。fail=true 时每条指令都按失败回报（result 为原因）。
+   *  images 给出时先把该（些）Agent 的已缓存镜像设为这份清单（整体替换），本次及之后的状态上报都带上（覆盖率 / 机器详情）。 */
+  agent(opts: { machine_id?: number; fail?: boolean; result?: string; images?: string[] } = {}) {
     return post<{ completed: number }>('/hooks/agent', opts)
   },
   /** 造已接入并连上 fake Agent 的空闲机器；rack 缺省为 E2E；group_id 指定时登记后加入机组。 */
@@ -78,5 +79,14 @@ export const hooks = {
    *  先经 API 加端口、再调本钩子（路由表只收录已登记的端口）。所有实例共用同一个假容器：同一端口后登记的覆盖先登记的。 */
   async ingressUpstream(port: number, body: string): Promise<void> {
     await post('/hooks/ingress-upstream', { port, body })
+  },
+  /** 创建并发布四个 fake 应用（vllm / open-webui / comfyui / jupyterlab，幂等），并把各应用端口在假容器里转到 fake 应用服务
+   *  （回 `spark-app-ok|path=<path>`）。每次调用都重新登记端口：ingressUpstream 会覆盖同端口的目标。 */
+  appsSeed() {
+    return post<{ apps: { id: number; slug: string; version_id: number; port: number }[] }>('/hooks/apps/seed', {})
+  },
+  /** 让应用部署 Runner 执行 n 轮（1～200）：每轮先把假时钟推进 5 秒（PollInterval）、真实等 200ms，再 Tick。 */
+  appsTick(n = 1) {
+    return post<{ rounds: number; processed: number }>('/hooks/apps/tick', { n })
   },
 }

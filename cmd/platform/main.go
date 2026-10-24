@@ -15,6 +15,9 @@ import (
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/app"
+	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/db"
@@ -46,7 +49,7 @@ func main() {
 // adminMain 执行 `platform admin ...`：使用与服务相同的配置连接数据库（会先执行迁移）。
 func adminMain(args []string) error {
 	if len(args) > 0 && args[0] == "gen-upstream-key" { // 不需要数据库
-		return runAdmin(context.Background(), nil, args, os.Stdout, nil)
+		return runAdmin(context.Background(), nil, nil, args, os.Stdout, nil)
 	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -69,7 +72,9 @@ func adminMain(args []string) error {
 		return adminSSHHostKey(ctx, pool, box, os.Stdout)
 	}
 	svc := admin.NewService(admin.Deps{Pool: pool, Clock: clock.Real{}, Box: box})
-	return runAdmin(ctx, svc, args, os.Stdout, terminalPrompter(os.Stdin, os.Stdout))
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	cat := appdeploy.NewCatalog(pool, clock.Real{}, fleet.NewService(pool, clock.Real{}), catalog.NewService(pool), log)
+	return runAdmin(ctx, svc, cat, args, os.Stdout, terminalPrompter(os.Stdin, os.Stdout))
 }
 
 func run(log *slog.Logger) error {
@@ -102,6 +107,16 @@ func run(log *slog.Logger) error {
 		defer close(sweeperDone)
 		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep, a.Referral.Settle)
 	}()
+	runnerDone := make(chan struct{})
+	if cfg.AppRunner { // 多副本都开也安全：每轮先拿会话级咨询锁，同一时刻只有一个副本在推进部署
+		go func() {
+			defer close(runnerDone)
+			a.AppRunner.Run(ctx)
+		}()
+	} else {
+		close(runnerDone)
+		log.Warn("SPARK_APP_RUNNER=off：应用部署不会推进")
+	}
 
 	srv, adminSrv := a.Servers(cfg)
 	if cfg.TrustProxy && cfg.TLSEnabled() {
@@ -185,6 +200,7 @@ func run(log *slog.Logger) error {
 	}
 	<-ingressDone
 	<-sweeperDone
+	<-runnerDone // Runner 的 exec 走上游连接池：先等它退出再关池
 	<-accessDone
 	// SSH 网关已随 ctx 停止 accept 并在 drain；Serve 总是返回 nil，等它 drain 完（会话记录已落库）再关闭连接池与数据库连接池（defer）
 	<-sshErr

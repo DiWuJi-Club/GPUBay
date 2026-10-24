@@ -138,6 +138,9 @@ func (s *Service) beginWipe(ctx context.Context, tx pgx.Tx, inst Instance, reaso
 	if err := recordEvent(ctx, tx, inst.ID, inst.State, StateWiping, reason, now); err != nil {
 		return err
 	}
+	if err := s.apps().OnInstanceGone(ctx, tx, inst.ID, "实例已释放", now); err != nil {
+		return err
+	}
 	if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
 		return err
 	}

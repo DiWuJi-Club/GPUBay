@@ -9,8 +9,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -426,5 +429,396 @@ func TestHostKeyAlgorithms(t *testing.T) {
 		if got := upstream.HostKeyAlgorithms(line); fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Errorf("HostKeyAlgorithms(%q) = %v, want %v", line, got, want)
 		}
+	}
+}
+
+func shellServer(t *testing.T, up ssh.Signer) *sshtest.Server {
+	t.Helper()
+	srv, err := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey(), Shell: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestPoolExec(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0001", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	ctx := context.Background()
+	out, errb, exit, err := p.Exec(ctx, tg, "echo hi; echo oops >&2", nil, 1024)
+	if err != nil || exit != 0 || string(out) != "hi\n" || string(errb) != "oops\n" {
+		t.Fatalf("exec = %q %q %d %v", out, errb, exit, err)
+	}
+	if _, _, exit, err := p.Exec(ctx, tg, "exit 3", nil, 1024); err != nil || exit != 3 {
+		t.Fatalf("exit 3 = %d %v", exit, err)
+	}
+	// stdin 传递（部署包上传就是这条路径）
+	out, _, exit, err = p.Exec(ctx, tg, "cat > f && wc -c < f", []byte("12345"), 1024)
+	if err != nil || exit != 0 || strings.TrimSpace(string(out)) != "5" {
+		t.Fatalf("stdin = %q %d %v", out, exit, err)
+	}
+	// 截断
+	out, errb, exit, err = p.Exec(ctx, tg, "head -c 5000 /dev/zero | tr '\\0' x; head -c 3000 /dev/zero | tr '\\0' y >&2", nil, 100)
+	if err != nil || exit != 0 || len(out) != 100 || len(errb) != 100 {
+		t.Fatalf("truncate = %d %d %d %v", len(out), len(errb), exit, err)
+	}
+	if p.Len() != 1 || srv.ConnCount() != 1 {
+		t.Fatalf("pool=%d conns=%d, want one shared connection", p.Len(), srv.ConnCount())
+	}
+	// 不可达 → DialError
+	var de *upstream.DialError
+	if _, _, _, err := p.Exec(ctx, upstream.Target{InstanceID: "ins-exec0002", LanIP: "10.255.255.1", HostPubkey: "x"}, "true", nil, 10); !errors.As(err, &de) {
+		t.Fatalf("unreachable = %v", err)
+	}
+	p.Close()
+	if _, _, _, err := p.Exec(ctx, tg, "true", nil, 10); !errors.Is(err, upstream.ErrClosed) {
+		t.Fatalf("closed = %v", err)
+	}
+}
+
+func TestPoolExecTimeoutKeepsConnection(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0003", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	out, _, exit, err := p.Exec(ctx, tg, "echo partial; sleep 10; echo late", nil, 1024)
+	var de *upstream.DialError
+	if !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &de) || exit != -1 || string(out) != "partial\n" || time.Since(start) > 3*time.Second {
+		t.Fatalf("timeout = %q %d %v after %v", out, exit, err, time.Since(start))
+	}
+	// 共享连接仍可用
+	if out, _, exit, err := p.Exec(context.Background(), tg, "echo again", nil, 64); err != nil || exit != 0 || string(out) != "again\n" {
+		t.Fatalf("after timeout = %q %d %v", out, exit, err)
+	}
+	if p.Len() != 1 || srv.ConnCount() != 1 {
+		t.Fatalf("pool=%d conns=%d", p.Len(), srv.ConnCount())
+	}
+}
+
+// flakyProxy 是池与 sshtest 之间的 TCP 中继，可让现有连接「悄悄死掉」：
+// breakOnWrite 后客户端下一次写入即断开两侧（池里仍是旧 client，keepalive 尚未察觉）；
+// blackhole 后两个方向的数据都被吞掉（上游卡死，不回应任何报文）。之后新建的连接不受影响。
+type flakyProxy struct {
+	lis      net.Listener
+	target   string
+	mu       sync.Mutex
+	conns    []*proxyConn
+	accepted int
+}
+
+type proxyConn struct {
+	client, upstream net.Conn
+	mode             atomic.Int32 // 0 正常转发，1 客户端下次写入即断开，2 吞掉全部数据
+}
+
+func newFlakyProxy(t *testing.T, target string) *flakyProxy {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := &flakyProxy{lis: lis, target: target}
+	t.Cleanup(func() {
+		lis.Close()
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		for _, pc := range fp.conns {
+			pc.client.Close()
+			pc.upstream.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			u, err := net.Dial("tcp", target)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			pc := &proxyConn{client: c, upstream: u}
+			fp.mu.Lock()
+			fp.conns = append(fp.conns, pc)
+			fp.accepted++
+			fp.mu.Unlock()
+			go pc.pump(c, u, true)
+			go pc.pump(u, c, false)
+		}
+	}()
+	return fp
+}
+
+func (pc *proxyConn) pump(from, to net.Conn, fromClient bool) {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := from.Read(buf)
+		if err != nil {
+			pc.client.Close()
+			pc.upstream.Close()
+			return
+		}
+		switch pc.mode.Load() {
+		case 1:
+			if fromClient {
+				pc.client.Close()
+				pc.upstream.Close()
+				return
+			}
+		case 2:
+			continue
+		}
+		if _, err := to.Write(buf[:n]); err != nil {
+			pc.client.Close()
+			pc.upstream.Close()
+			return
+		}
+	}
+}
+
+func (fp *flakyProxy) Port() int { return fp.lis.Addr().(*net.TCPAddr).Port }
+
+func (fp *flakyProxy) Accepted() int {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	return fp.accepted
+}
+
+func (fp *flakyProxy) setMode(m int32) {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	for _, pc := range fp.conns {
+		pc.mode.Store(m)
+	}
+}
+
+// 池里的旧 client 已死但未被察觉：NewSession 失败（命令尚未发出）→ 丢弃并重建一次后成功。
+func TestPoolExecRetriesDeadClient(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	fp := newFlakyProxy(t, srv.Addr())
+	p := upstream.New(upstream.Config{Signer: up, Port: fp.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0004", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	for i := 0; i < 5; i++ {
+		if out, _, exit, err := p.Exec(context.Background(), tg, "echo ok >> runs; echo ok", nil, 64); err != nil || exit != 0 || string(out) != "ok\n" {
+			t.Fatalf("round %d = %q %d %v", i, out, exit, err)
+		}
+		if got := fp.Accepted(); got != i+1 {
+			t.Fatalf("round %d: proxy accepted %d connections, want %d", i, got, i+1)
+		}
+		fp.setMode(1) // 上游悄悄死掉：下一次 Exec 的 NewSession 才发现
+	}
+	if out, _, _, err := p.Exec(context.Background(), tg, "wc -l < runs", nil, 64); err != nil || strings.TrimSpace(string(out)) != "5" {
+		t.Fatalf("runs = %q %v, want each command executed exactly once", out, err)
+	}
+}
+
+// 命令执行中连接断开：exit = -1、非 DialError，且命令不重跑。
+func TestPoolExecConnectionDiesMidCommand(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0006", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(filepath.Join(srv.Root(), "runs")); err == nil {
+				srv.DropAll()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	start := time.Now()
+	_, _, exit, err := p.Exec(context.Background(), tg, "echo x >> runs; sleep 5", nil, 64)
+	var de *upstream.DialError
+	if err == nil || errors.As(err, &de) || exit != -1 || time.Since(start) > 3*time.Second {
+		t.Fatalf("mid-command drop = %d %v after %v", exit, err, time.Since(start))
+	}
+	if out, _, _, err := p.Exec(context.Background(), tg, "wc -l < runs", nil, 64); err != nil || strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("runs = %q %v, want the command executed once", out, err)
+	}
+}
+
+// ctx 到期而上游卡死、不回应 session 关闭：Exec 在宽限期后丢弃连接并及时返回。
+func TestPoolExecTimeoutHungUpstream(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	fp := newFlakyProxy(t, srv.Addr())
+	p := upstream.New(upstream.Config{Signer: up, Port: fp.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0007", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(filepath.Join(srv.Root(), "started")); err == nil {
+				fp.setMode(2)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, exit, err := p.Exec(ctx, tg, "touch started; sleep 10", nil, 64)
+	if !errors.Is(err, context.DeadlineExceeded) || exit != -1 || time.Since(start) > 4*time.Second {
+		t.Fatalf("hung upstream = %d %v after %v", exit, err, time.Since(start))
+	}
+	if p.Len() != 0 {
+		t.Fatalf("pool=%d, want the hung connection dropped", p.Len())
+	}
+}
+
+// rejectServer 是最小的「容器 sshd」：direct-tcpip 回显（充当入口隧道），session 按 mode 拒绝通道或拒绝 exec。
+type rejectServer struct {
+	lis     net.Listener
+	hostPub string
+	mode    atomic.Int32 // 1 拒绝 session 通道，2 接受 session 但拒绝 exec
+	conns   atomic.Int32
+}
+
+func newRejectServer(t *testing.T, up ssh.Signer) *rejectServer {
+	t.Helper()
+	host := signer(t)
+	cfg := &ssh.ServerConfig{PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		if c.User() == "root" && string(key.Marshal()) == string(up.PublicKey().Marshal()) {
+			return &ssh.Permissions{}, nil
+		}
+		return nil, errors.New("not authorized")
+	}}
+	cfg.AddHostKey(host)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := &rejectServer{lis: lis, hostPub: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(host.PublicKey())))}
+	var mu sync.Mutex
+	var open []net.Conn
+	t.Cleanup(func() {
+		lis.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range open {
+			c.Close()
+		}
+	})
+	go func() {
+		for {
+			nc, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			open = append(open, nc)
+			mu.Unlock()
+			go func() {
+				defer nc.Close()
+				_, chans, reqs, err := ssh.NewServerConn(nc, cfg)
+				if err != nil {
+					return
+				}
+				rs.conns.Add(1)
+				defer rs.conns.Add(-1)
+				go ssh.DiscardRequests(reqs)
+				for newCh := range chans {
+					switch {
+					case newCh.ChannelType() == "direct-tcpip":
+						ch, chReqs, err := newCh.Accept()
+						if err != nil {
+							continue
+						}
+						go ssh.DiscardRequests(chReqs)
+						go func() { io.Copy(ch, ch); ch.Close() }()
+					case newCh.ChannelType() == "session" && rs.mode.Load() == 2:
+						ch, chReqs, err := newCh.Accept()
+						if err != nil {
+							continue
+						}
+						go func() {
+							for req := range chReqs {
+								if req.WantReply {
+									req.Reply(false, nil)
+								}
+							}
+							ch.Close()
+						}()
+					default:
+						newCh.Reject(ssh.Prohibited, "sessions disabled")
+					}
+				}
+			}()
+		}
+	}()
+	return rs
+}
+
+// 健康上游干净地拒绝 session / exec：返回普通错误，共享连接（及其上的入口隧道）保留。
+func TestPoolExecRejectionKeepsClient(t *testing.T) {
+	up := signer(t)
+	rs := newRejectServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: rs.lis.Addr().(*net.TCPAddr).Port, DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0008", LanIP: "127.0.0.1", HostPubkey: rs.hostPub}
+	tunnel, err := p.Dial(context.Background(), tg, 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.Close()
+	echo := func(step string) {
+		t.Helper()
+		tunnel.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := tunnel.Write([]byte(step)); err != nil {
+			t.Fatalf("%s: tunnel write: %v", step, err)
+		}
+		buf := make([]byte, len(step))
+		if _, err := io.ReadFull(tunnel, buf); err != nil || string(buf) != step {
+			t.Fatalf("%s: tunnel read = %q %v", step, buf, err)
+		}
+		if p.Len() != 1 || rs.conns.Load() != 1 {
+			t.Fatalf("%s: pool=%d conns=%d, want the shared connection kept", step, p.Len(), rs.conns.Load())
+		}
+	}
+	echo("before")
+	var de *upstream.DialError
+	var oce *ssh.OpenChannelError
+	rs.mode.Store(1)
+	if _, _, exit, err := p.Exec(context.Background(), tg, "true", nil, 64); err == nil || exit != -1 || errors.As(err, &de) || !errors.As(err, &oce) {
+		t.Fatalf("session rejected = %d %v", exit, err)
+	}
+	echo("after-session-reject")
+	rs.mode.Store(2)
+	if _, _, exit, err := p.Exec(context.Background(), tg, "true", nil, 64); err == nil || exit != -1 || errors.As(err, &de) {
+		t.Fatalf("exec rejected = %d %v", exit, err)
+	}
+	echo("after-exec-reject")
+}
+
+// 命令不读 stdin 就以 0 退出：Wait 报 stdin 拷贝错误，但命令已执行过——不得当作连接错误重跑，也不得丢弃共享连接。
+func TestPoolExecUnreadStdinRunsOnce(t *testing.T) {
+	up := signer(t)
+	srv := shellServer(t, up)
+	p := upstream.New(upstream.Config{Signer: up, Port: srv.Port(), DialTimeout: time.Second}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-exec0005", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine()}
+	if out, errb, exit, err := p.Exec(context.Background(), tg, "echo run >> runs", make([]byte, 8<<20), 64); err != nil || exit != 0 {
+		t.Fatalf("exec = %q %q %d %v", out, errb, exit, err)
+	}
+	if out, _, exit, err := p.Exec(context.Background(), tg, "wc -l < runs", nil, 64); err != nil || exit != 0 || strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("runs = %q %d %v, want the command executed once", out, exit, err)
+	}
+	if p.Len() != 1 || srv.ConnCount() != 1 {
+		t.Fatalf("pool=%d conns=%d, want the shared connection kept", p.Len(), srv.ConnCount())
 	}
 }

@@ -52,6 +52,10 @@ type Machine struct {
 	AgentConnectedAt  *time.Time      `json:"agent_connected_at"`
 	StateReportedAt   *time.Time      `json:"state_reported_at"`
 	LastMetrics       json.RawMessage `json:"last_metrics"`
+
+	// 计划 7：Agent 上报的已缓存镜像（imageref 形态）；CachedImagesAt 为空表示从未上报（旧 Agent）。
+	CachedImages   []string   `json:"cached_images"`
+	CachedImagesAt *time.Time `json:"cached_images_at"`
 }
 
 type NewMachine struct {
@@ -75,7 +79,8 @@ func NewService(pool *pgxpool.Pool, clk clock.Clock) *Service {
 }
 
 const machineCols = `id, serial, rack, slot, lan_ip, product_id, state, agent_online, last_seen_at, pdu_id, pdu_outlet, created_at,
-	cert_fingerprint, agent_conn_id, agent_version, agent_connected_at, state_reported_at, last_metrics, group_id, display_name`
+	cert_fingerprint, agent_conn_id, agent_version, agent_connected_at, state_reported_at, last_metrics, group_id, display_name,
+	cached_images, cached_images_at`
 
 func scanMachine(row pgx.Row) (Machine, error) {
 	var m Machine
@@ -83,7 +88,7 @@ func scanMachine(row pgx.Row) (Machine, error) {
 	var metrics []byte
 	err := row.Scan(&m.ID, &m.Serial, &m.Rack, &m.Slot, &m.LanIP, &m.ProductID, &m.State, &m.AgentOnline, &m.LastSeenAt,
 		&m.PDUID, &m.PDUOutlet, &m.CreatedAt, &m.CertFingerprint, &connID, &m.AgentVersion, &m.AgentConnectedAt, &m.StateReportedAt, &metrics,
-		&m.GroupID, &m.DisplayName)
+		&m.GroupID, &m.DisplayName, &m.CachedImages, &m.CachedImagesAt)
 	if db.IsNoRows(err) {
 		return Machine{}, apperr.ErrNotFound
 	}
