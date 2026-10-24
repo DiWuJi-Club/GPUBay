@@ -52,6 +52,10 @@ type Machine struct {
 	AgentConnectedAt  *time.Time      `json:"agent_connected_at"`
 	StateReportedAt   *time.Time      `json:"state_reported_at"`
 	LastMetrics       json.RawMessage `json:"last_metrics"`
+
+	// 计划 7：Agent 上报的已缓存镜像（imageref 形态）；CachedImagesAt 为空表示从未上报（旧 Agent）。
+	CachedImages   []string   `json:"cached_images"`
+	CachedImagesAt *time.Time `json:"cached_images_at"`
 }
 
 type NewMachine struct {
@@ -75,7 +79,8 @@ func NewService(pool *pgxpool.Pool, clk clock.Clock) *Service {
 }
 
 const machineCols = `id, serial, rack, slot, lan_ip, product_id, state, agent_online, last_seen_at, pdu_id, pdu_outlet, created_at,
-	cert_fingerprint, agent_conn_id, agent_version, agent_connected_at, state_reported_at, last_metrics, group_id, display_name`
+	cert_fingerprint, agent_conn_id, agent_version, agent_connected_at, state_reported_at, last_metrics, group_id, display_name,
+	cached_images, cached_images_at`
 
 func scanMachine(row pgx.Row) (Machine, error) {
 	var m Machine
@@ -83,7 +88,7 @@ func scanMachine(row pgx.Row) (Machine, error) {
 	var metrics []byte
 	err := row.Scan(&m.ID, &m.Serial, &m.Rack, &m.Slot, &m.LanIP, &m.ProductID, &m.State, &m.AgentOnline, &m.LastSeenAt,
 		&m.PDUID, &m.PDUOutlet, &m.CreatedAt, &m.CertFingerprint, &connID, &m.AgentVersion, &m.AgentConnectedAt, &m.StateReportedAt, &metrics,
-		&m.GroupID, &m.DisplayName)
+		&m.GroupID, &m.DisplayName, &m.CachedImages, &m.CachedImagesAt)
 	if db.IsNoRows(err) {
 		return Machine{}, apperr.ErrNotFound
 	}
@@ -225,10 +230,14 @@ func (s *Service) Heartbeat(ctx context.Context, machineID int64) (bool, error) 
 
 // MarkOfflineStale 把超过 timeout 没有心跳的在线机器标记为离线，返回这些机器的 ID。
 // 同时清空 state_reported_at：流若撑过了离线期（未重连），清扫器不能拿离线前的报告恢复计时，须等新的 StateReport。
+// 候选行按 id 顺序加锁并跳过别的事务正锁着的行（SKIP LOCKED）：多行 UPDATE 不定序加锁，会与下单、指令回报等
+// 同样锁机器行的事务形成死锁环（并发用例里见过）；被跳过的机器正被别的事务处理，下一轮清扫再判定。
 func (s *Service) MarkOfflineStale(ctx context.Context, timeout time.Duration) ([]int64, error) {
 	now := s.clock.Now()
 	rows, err := s.pool.Query(ctx, `UPDATE machines SET agent_online = false, state_reported_at = NULL, updated_at = $1
-		WHERE agent_online AND (last_seen_at IS NULL OR last_seen_at < $2) RETURNING id`, now, now.Add(-timeout))
+		WHERE id IN (SELECT id FROM machines WHERE agent_online AND (last_seen_at IS NULL OR last_seen_at < $2)
+			ORDER BY id FOR UPDATE SKIP LOCKED)
+		RETURNING id`, now, now.Add(-timeout))
 	if err != nil {
 		return nil, err
 	}

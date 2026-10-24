@@ -21,6 +21,8 @@ const enroll = ref<EnrollCommand | null>(null)
 const revokeVisible = ref(false)
 const groups = ref<AdminGroup[]>([])
 const edit = reactive({ visible: false, groupId: '' as string, displayName: '', busy: false })
+/** Agent 上报的镜像（repository:tag），按文本显示 */
+const cachedImages = computed(() => data.value?.machine.cached_images ?? [])
 const inMaintenance = computed(() => data.value?.machine.state === 'maintenance' || data.value?.machine.state === 'faulty')
 
 let seq = 0
@@ -213,6 +215,23 @@ async function revokeEnrollment() {
         <p v-else class="muted" data-testid="mdetail-metrics-none">尚未收到指标</p>
       </el-card>
 
+      <el-card data-testid="machine-cached-images">
+        <template #header>
+          <div class="head">
+            <span>已缓存镜像<template v-if="data.machine.cached_images_at">（{{ cachedImages.length }}）</template></span>
+            <span class="muted small" data-testid="machine-cached-images-at">{{ data.machine.cached_images_at ? `上报于 ${fmtTime(data.machine.cached_images_at)}` : '' }}</span>
+          </div>
+        </template>
+        <p v-if="!data.machine.cached_images_at" class="muted" data-testid="machine-cached-images-none">未上报（Agent 版本过旧或尚未上报）</p>
+        <template v-else>
+          <ul v-if="cachedImages.length" class="images">
+            <li v-for="img in cachedImages" :key="img" class="mono" data-testid="machine-cached-image">{{ img }}</li>
+          </ul>
+          <p v-else class="muted" data-testid="machine-cached-images-empty">无</p>
+        </template>
+        <p class="muted small" data-testid="machine-cached-images-note">应用版本的缓存覆盖率只统计在线机器；上报时间早于 5 分钟或从未上报的机器计为「未知」。最多显示 200 项。</p>
+      </el-card>
+
       <el-card header="档期（未来 60 天）" data-testid="mdetail-leases">
         <table class="grid">
           <thead><tr><th>开始</th><th>结束</th><th>实例</th><th>用户</th></tr></thead>
@@ -288,6 +307,8 @@ async function revokeEnrollment() {
 .muted { color: #909399; }
 .actions { display: flex; gap: 12px; margin-top: 16px; }
 .agent { margin-top: 12px; }
+.small { font-size: 12px; }
+.images { margin: 0 0 8px; padding-left: 18px; display: grid; gap: 4px; font-size: 13px; word-break: break-all; }
 .warn { color: var(--el-color-warning); }
 .grid { width: 100%; border-collapse: collapse; font-size: 13px; }
 .grid th, .grid td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--el-border-color-lighter); }

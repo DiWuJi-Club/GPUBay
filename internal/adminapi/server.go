@@ -15,6 +15,7 @@ import (
 
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/agentgw"
+	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
@@ -24,6 +25,7 @@ import (
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/httpx"
 	"spark-cloud/internal/platform/paging"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
@@ -60,7 +62,10 @@ type Server struct {
 	Rental        *rental.Service
 	Billing       *billing.Service
 	Uploads       *storage.Service
-	Gateway       *agentgw.Server // 机器接入命令与撤销（计划 2）
+	Gateway       *agentgw.Server    // 机器接入命令与撤销（计划 2）
+	Referral      *referral.Service  // 计划 8：邀请返利（referralRoutes、用户详情 referral 区块、仪表盘本月返利净额）
+	Apps          *appdeploy.Service // 应用部署（计划 7）：部署列表 / 详情 / 强制卸载、实例详情与仪表盘
+	AppCatalog    *appdeploy.Catalog // 应用目录（计划 7）：应用、版本、发布、预拉取、覆盖率
 	Clock         clock.Clock
 	Log           *slog.Logger
 	SecureCookie  bool                                     // 生产环境为 true：Cookie 仅经 HTTPS 发送
@@ -116,7 +121,9 @@ func (s *Server) Router() http.Handler {
 			s.instanceRoutes(g)
 			s.userRoutes(g)
 			s.financeRoutes(g)
+			s.referralRoutes(g)
 			s.catalogRoutes(g)
+			s.appRoutes(g)
 		})
 	})
 	static := s.Static

@@ -49,9 +49,24 @@ var expectedRoutes = []struct {
 	{"GET", "/orders", finance}, {"GET", "/orders/export", finance}, {"GET", "/ledger", finance}, {"GET", "/ledger/export", finance},
 	{"GET", "/recharges", finance}, {"GET", "/recharges/export", finance},
 
+	{"GET", "/referral/summary", finance}, {"GET", "/referral/config", finance}, {"POST", "/referral/config", super},
+	{"GET", "/referral/inviters", finance}, {"GET", "/referral/inviters/{id}", finance},
+	{"POST", "/referral/inviters/{id}/freeze", finance}, {"POST", "/referral/inviters/{id}/unfreeze", finance},
+	{"GET", "/referral/bindings", finance}, {"GET", "/referral/bindings/export", finance},
+	{"POST", "/referral/bindings/{id}/approve", finance}, {"POST", "/referral/bindings/{id}/revoke", finance},
+	{"GET", "/referral/rewards", finance}, {"GET", "/referral/rewards/export", finance},
+	{"POST", "/referral/rescan", super},
+
 	{"GET", "/products", all}, {"PUT", "/products/{id}/prices/{duration}", super},
 	{"GET", "/images", all}, {"POST", "/images", super}, {"PUT", "/images/{id}", super},
 	{"GET", "/audit", all}, {"GET", "/dashboard", all},
+
+	// 计划 7 D8：super 维护目录（建 / 改 / 发布 / 下线）；ops 预拉取与强制卸载；finance 只读（含脚本原文——只在后台可见）
+	{"GET", "/apps", all}, {"POST", "/apps", super}, {"PUT", "/apps/{id}", super}, {"DELETE", "/apps/{id}", super},
+	{"GET", "/apps/{id}/versions", all}, {"POST", "/apps/{id}/versions", super}, {"PUT", "/apps/{id}/versions/{vid}", super},
+	{"POST", "/apps/{id}/versions/{vid}/publish", super}, {"POST", "/apps/{id}/versions/{vid}/prepull", ops},
+	{"GET", "/apps/{id}/versions/{vid}/script", all},
+	{"GET", "/deployments", all}, {"GET", "/deployments/{dep}", all}, {"POST", "/deployments/{dep}/force-remove", ops},
 }
 
 func roleKey(roles []admin.Role) string {

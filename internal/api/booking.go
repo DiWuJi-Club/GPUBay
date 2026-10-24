@@ -51,14 +51,17 @@ func (l *ipLimiter) allow(key string, now time.Time) bool {
 	return true
 }
 
-func (s *Server) calendarRateLimit(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.calendarLim.allow(clientIP(r), s.Clock.Now()) {
-			s.writeError(w, r, apperr.ErrRateLimited)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// ipRateLimit 匿名端点按客户端 IP 限流（机组 / 日历 / 可用性、邀请码查询各用一个 ipLimiter）。
+func (s *Server) ipRateLimit(l *ipLimiter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !l.allow(clientIP(r), s.Clock.Now()) {
+				s.writeError(w, r, apperr.ErrRateLimited)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // optionalUserID 匿名端点里尽力识别当前用户（机器日历的 mine 标记）；没有或无效会话返回 0。
@@ -273,6 +276,9 @@ type bookingRequest struct {
 	StartAt           string `json:"start_at"`
 	AutoRenew         bool   `json:"auto_renew"`
 	AutoRenewDuration string `json:"auto_renew_duration"`
+	// 计划 7：每台实例开通后自动部署的应用（可选），见 POST /orders
+	AppID  *int64            `json:"app_id"`
+	AppEnv map[string]string `json:"app_env"`
 }
 
 func (s *Server) batchResult(ctx context.Context, res rental.BatchResult) (map[string]any, error) {
@@ -321,6 +327,7 @@ func (s *Server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		UserID: currentUser(r).ID, ProductID: req.ProductID, ImageID: req.ImageID, GroupID: req.GroupID, MachineID: req.MachineID,
 		Count: req.Count, Duration: catalog.Duration(req.Duration), Quantity: req.Quantity, StartAt: start,
 		AutoRenew: req.AutoRenew, AutoRenewDuration: catalog.Duration(req.AutoRenewDuration), IdempotencyKey: r.Header.Get(idempotencyHeader),
+		AppID: req.AppID, AppEnv: req.AppEnv,
 	})
 	if err != nil {
 		s.writeError(w, r, err)

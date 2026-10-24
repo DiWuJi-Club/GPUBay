@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
@@ -18,6 +20,7 @@ import (
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/httpx"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/storage"
 	"spark-cloud/internal/wallet"
@@ -32,7 +35,8 @@ type Server struct {
 	Rental           *rental.Service
 	Uploads          *storage.Service
 	Billing          *billing.Service
-	DevPay           bool // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
+	Referral         *referral.Service // 计划 8：邀请返利；nil 时不注册 /referral 路由
+	DevPay           bool              // 仅开发环境（mock 支付）为 true：注册模拟支付成功接口
 	Clock            clock.Clock
 	Log              *slog.Logger
 	Domain           string        // 主域名，例如 spark.example.com
@@ -46,9 +50,15 @@ type Server struct {
 	Ingress          *ingress.Auth // Web 入口鉴权；nil 时不注册 authorize 端点
 	AuthorizeLimit   int           // authorize 每用户每分钟上限；零值 60
 	CalendarLimit    int           // 匿名机组 / 日历 / 可用性端点按 IP 每分钟上限；零值 120
+	ReferralLimit    int           // 匿名邀请码查询按 IP 每分钟上限；零值 60
+	// 计划 7：应用部署；nil 时不注册 /apps* 与 /instances/{id}/apps*，实例视图的 apps_summary 恒为空数组
+	Apps      *appdeploy.Service
+	AppsLimit int // 应用部署类写操作每用户每小时上限；零值 appdeploy.UserOpsPerHour（60）
 
-	authorizeLim *authorizeLimiter
+	authorizeLim *userLimiter
 	calendarLim  *ipLimiter
+	referralLim  *ipLimiter
+	appsLim      *userLimiter
 }
 
 const sessionCookie = "sc_session"
@@ -68,12 +78,22 @@ func (s *Server) Router() http.Handler {
 	if limit <= 0 {
 		limit = defaultAuthorizeLimit
 	}
-	s.authorizeLim = &authorizeLimiter{limit: limit}
+	s.authorizeLim = &userLimiter{limit: limit, window: time.Minute}
 	climit := s.CalendarLimit
 	if climit <= 0 {
 		climit = defaultCalendarLimit
 	}
 	s.calendarLim = &ipLimiter{limit: climit}
+	rlimit := s.ReferralLimit
+	if rlimit <= 0 {
+		rlimit = defaultReferralLimit
+	}
+	s.referralLim = &ipLimiter{limit: rlimit}
+	alimit := s.AppsLimit
+	if alimit <= 0 {
+		alimit = appdeploy.UserOpsPerHour
+	}
+	s.appsLim = &userLimiter{limit: alimit, window: time.Hour}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -100,16 +120,23 @@ func (s *Server) Router() http.Handler {
 		r.Get("/images", s.handleImages)
 		r.Get("/pay/channels", s.handlePayChannels)
 		r.Group(func(r chi.Router) {
-			r.Use(httpx.NoStore, s.calendarRateLimit)
+			r.Use(httpx.NoStore, s.ipRateLimit(s.calendarLim))
 			r.Get("/groups", s.handleGroups)
 			r.Get("/groups/{id}/machines", s.handleGroupMachines)
 			r.Get("/groups/{id}/calendar", s.handleGroupCalendar)
 			r.Get("/machines/{id}/calendar", s.handleMachineCalendar)
 			r.Get("/availability", s.handleAvailability)
+			if s.Apps != nil {
+				r.Get("/apps", s.handleAppCatalog)
+				r.Get("/apps/{slug}", s.handleAppCatalogItem)
+			}
 		})
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
 		if s.Ingress != nil {
 			r.With(httpx.NoStore).Get("/ingress/authorize", s.handleIngressAuthorize) // 组外：未登录要 302 到登录页而不是 JSON 401
+		}
+		if s.Referral != nil {
+			r.With(httpx.NoStore, s.ipRateLimit(s.referralLim)).Get("/referral/codes/{code}", s.handleReferralCode) // 匿名：登录页显示邀请人
 		}
 
 		r.Group(func(r chi.Router) {
@@ -144,9 +171,25 @@ func (s *Server) Router() http.Handler {
 			r.Put("/instances/{id}/ports/{port}", s.handleUpdatePort)
 			r.Delete("/instances/{id}/ports/{port}", s.handleDeletePort)
 			r.Get("/instances/{id}/ssh-sessions", s.handleSSHSessions)
+			if s.Apps != nil {
+				r.Get("/instances/{id}/apps", s.handleInstanceApps)
+				r.Post("/instances/{id}/apps", s.handleCreateApp)
+				r.Get("/instances/{id}/apps/{dep}", s.handleInstanceApp)
+				r.Post("/instances/{id}/apps/{dep}/redeploy", s.handleRedeployApp)
+				r.Post("/instances/{id}/apps/{dep}/stop", s.handleStopApp)
+				r.Post("/instances/{id}/apps/{dep}/start", s.handleStartApp)
+				r.Delete("/instances/{id}/apps/{dep}", s.handleRemoveApp)
+				r.Get("/instances/{id}/apps/{dep}/log", s.handleAppLog)
+				r.Get("/instances/{id}/apps/{dep}/events", s.handleAppEvents)
+			}
 			r.Get("/recharges", s.handleRecharges)
 			r.Post("/recharges", s.handleCreateRecharge)
 			r.Get("/recharges/{id}", s.handleRecharge)
+			if s.Referral != nil {
+				r.Get("/referral/me", s.handleReferralMe)
+				r.Get("/referral/invitees", s.handleReferralInvitees)
+				r.Get("/referral/rewards", s.handleReferralRewards)
+			}
 			if s.DevPay {
 				r.Post("/dev/recharges/{id}/pay", s.handleDevPay)
 			}

@@ -41,6 +41,8 @@ function goRecharge() {
 }
 
 // ---- 流水：游标分页 + 滚动到底自动加载 ----
+/** 邀请返利绿色、返利扣回橙色 */
+const kindClass = (kind: string) => ({ 'kind-rebate': kind === 'referral_rebate', 'kind-clawback': kind === 'referral_clawback' })
 const PAGE = 20
 const ledger = ref<LedgerRow[]>([])
 const ledgerHasMore = ref(true)
@@ -172,7 +174,7 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
           <template v-if="mobile">
             <div v-for="r in ledger" :key="r.id" class="row-card" data-testid="ledger-row">
               <div class="row-head">
-                <span data-testid="ledger-kind">{{ labelOf(ledgerKindLabel, r.kind) }}</span>
+                <span :class="kindClass(r.kind)" data-testid="ledger-kind">{{ labelOf(ledgerKindLabel, r.kind) }}</span>
                 <b :class="r.amount >= 0 ? 'money-plus' : 'money-minus'" data-testid="ledger-amount">{{ signed(r.amount) }}</b>
               </div>
               <div class="muted">余额 <span data-testid="ledger-after">{{ fmtYuan(r.balance_after) }}</span> · <span data-testid="ledger-time">{{ fmtTime(r.created_at) }}</span></div>
@@ -180,7 +182,7 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
             </div>
           </template>
           <el-table v-else :data="ledger" row-key="id">
-            <el-table-column label="类型" width="100"><template #default="{ row }"><span data-testid="ledger-kind">{{ labelOf(ledgerKindLabel, row.kind) }}</span></template></el-table-column>
+            <el-table-column label="类型" width="100"><template #default="{ row }"><span :class="kindClass(row.kind)" data-testid="ledger-kind">{{ labelOf(ledgerKindLabel, row.kind) }}</span></template></el-table-column>
             <el-table-column label="金额" width="140"><template #default="{ row }"><b :class="row.amount >= 0 ? 'money-plus' : 'money-minus'" data-testid="ledger-amount">{{ signed(row.amount) }}</b></template></el-table-column>
             <el-table-column label="变动后余额" width="140"><template #default="{ row }"><span data-testid="ledger-after">{{ fmtYuan(row.balance_after) }}</span></template></el-table-column>
             <el-table-column label="备注" min-width="160"><template #default="{ row }"><span data-testid="ledger-remark">{{ row.remark }}</span></template></el-table-column>
@@ -237,6 +239,8 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
 .row-card { padding: 12px 0; border-bottom: 1px solid #ebeef5; }
 .row-head { display: flex; justify-content: space-between; align-items: center; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.kind-rebate { color: var(--el-color-success); }
+.kind-clawback { color: var(--el-color-warning); }
 .sentinel { height: 24px; text-align: center; color: #909399; font-size: 12px; }
 .end { text-align: center; padding: 12px; }
 </style>

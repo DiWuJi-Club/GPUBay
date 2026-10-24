@@ -3,6 +3,8 @@ package wallet_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -206,5 +208,126 @@ func TestAdminAdjustRejectsIdenticalRepeat(t *testing.T) {
 	}
 	if bal, _ := svc.Balance(ctx, uid); bal != 13000 {
 		t.Fatalf("balance = %d, want 13000", bal)
+	}
+}
+
+func applyUpTo(ctx context.Context, pool *pgxpool.Pool, svc *wallet.Service, e wallet.Entry) (applied, after int64, err error) {
+	err = db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		var e2 error
+		applied, after, e2 = svc.ApplyUpTo(ctx, tx, e)
+		return e2
+	})
+	return
+}
+
+func TestApplyUpToTakesMinOfAmountAndBalance(t *testing.T) {
+	svc, pool := newEnv(t)
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13800000081", true)
+	dbtest.Fund(t, pool, uid, 300)
+	// 余额充足：全额扣
+	applied, after, err := applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -100, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "ord-1-c1"})
+	if err != nil || applied != 100 || after != 200 {
+		t.Fatalf("full = %d %d %v", applied, after, err)
+	}
+	// 余额不足：扣到 0
+	applied, after, err = applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -500, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "ord-1-c2"})
+	if err != nil || applied != 200 || after != 0 {
+		t.Fatalf("partial = %d %d %v", applied, after, err)
+	}
+	// 余额为 0：不记流水
+	applied, after, err = applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -50, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "ord-1-c3"})
+	if err != nil || applied != 0 || after != 0 {
+		t.Fatalf("zero = %d %d %v", applied, after, err)
+	}
+	rows, err := svc.ListLedger(ctx, uid, 0, 10)
+	if err != nil || len(rows) != 3 { // fund + c1 + c2
+		t.Fatalf("ledger = %d %v", len(rows), err)
+	}
+	if rows[0].Amount != -200 || rows[0].RefID != "ord-1-c2" || rows[1].Amount != -100 {
+		t.Fatalf("ledger rows = %+v", rows)
+	}
+	// 重复 ref → ErrDuplicate
+	dbtest.Fund(t, pool, uid, 100)
+	if _, _, err := applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -10, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "ord-1-c1"}); !errors.Is(err, apperr.ErrDuplicate) {
+		t.Fatalf("duplicate = %v", err)
+	}
+	// 正数、0 与缺 ref 都被拒绝
+	for _, e := range []wallet.Entry{
+		{UserID: uid, Amount: 10, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "x"},
+		{UserID: uid, Amount: 0, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "x"},
+		{UserID: uid, Amount: -10, Kind: wallet.KindReferralClawback},
+		{UserID: uid, Amount: math.MinInt64, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "x"}, // 取反溢出
+	} {
+		if _, _, err := applyUpTo(ctx, pool, svc, e); apperr.As(err) == nil || apperr.As(err).Code != "bad_request" {
+			t.Fatalf("entry %+v: want bad_request, got %v", e, err)
+		}
+	}
+	// 没有账户行的用户：applied 0、不报错、不建流水
+	uid2 := dbtest.CreateUser(t, pool, "13800000082", true)
+	if applied, after, err := applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid2, Amount: -10, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: "ord-2-c1"}); err != nil || applied != 0 || after != 0 {
+		t.Fatalf("no account = %d %d %v", applied, after, err)
+	}
+	var ledgerRows, accountRows int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM wallet_ledger WHERE user_id = $1), (SELECT count(*) FROM wallet_accounts WHERE user_id = $1)`, uid2).Scan(&ledgerRows, &accountRows); err != nil {
+		t.Fatal(err)
+	}
+	if ledgerRows != 0 || accountRows != 0 {
+		t.Fatalf("no account: ledger rows %d, account rows %d; want 0, 0", ledgerRows, accountRows)
+	}
+}
+
+// Review Focus 2：扣回与用户自己的扣款并发，余额永不为负，balance_after 链连续。
+func TestApplyUpToConcurrentWithDebitsNeverOverdraws(t *testing.T) {
+	svc, pool := newEnv(t)
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13800000083", true)
+	dbtest.Fund(t, pool, uid, 1000)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := apply(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -90, Kind: wallet.KindOrderPay, RefType: "order", RefID: fmt.Sprintf("ord-%d", i)}); err != nil && !errors.Is(err, apperr.ErrInsufficientBalance) {
+				t.Errorf("apply ord-%d: %v", i, err)
+			}
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			if _, _, err := applyUpTo(ctx, pool, svc, wallet.Entry{UserID: uid, Amount: -70, Kind: wallet.KindReferralClawback, RefType: "referral", RefID: fmt.Sprintf("ord-%d-c1", i)}); err != nil {
+				t.Errorf("applyUpTo ord-%d-c1: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+	var clawbacks int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM wallet_ledger WHERE user_id = $1 AND kind = 'referral_clawback'`, uid).Scan(&clawbacks); err != nil || clawbacks < 1 {
+		t.Fatalf("clawback rows = %d %v; want >= 1", clawbacks, err)
+	}
+	bal, err := svc.Balance(ctx, uid)
+	if err != nil || bal < 0 {
+		t.Fatalf("balance = %d %v", bal, err)
+	}
+	rows, err := pool.Query(ctx, `SELECT amount, balance_after FROM wallet_ledger WHERE user_id = $1 ORDER BY id`, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var prev int64
+	for rows.Next() {
+		var amount, after int64
+		if err := rows.Scan(&amount, &after); err != nil {
+			t.Fatal(err)
+		}
+		if after < 0 || prev+amount != after {
+			t.Fatalf("ledger chain broken: prev %d + %d != %d", prev, amount, after)
+		}
+		prev = after
+	}
+	if prev != bal {
+		t.Fatalf("last balance_after %d != balance %d", prev, bal)
 	}
 }

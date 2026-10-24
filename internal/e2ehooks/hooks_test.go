@@ -28,6 +28,7 @@ import (
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/dbtest"
 	"spark-cloud/internal/platform/paging"
+	"spark-cloud/internal/referral"
 	"spark-cloud/internal/rental"
 	"spark-cloud/internal/sshgw"
 )
@@ -42,7 +43,11 @@ type env struct {
 	up  *sshtest.Server
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { t.Helper(); return newEnvWith(t, false) }
+
+// newEnvWith(apps = true) 与 cmd/e2e-server 的应用部署配置相同：假容器 sshd 用 shell 模式、每实例一个应用根目录、
+// 健康检查 / 应用 Web 打到一个 httptest；结束时先停掉容器里 setsid 出去的 fake 服务进程。
+func newEnvWith(t *testing.T, apps bool) *env {
 	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
@@ -65,15 +70,30 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	up, err := sshtest.New(sshtest.Options{AuthorizedKey: upSigner.PublicKey(), HostKey: hostSigner})
+	upOpts := sshtest.Options{AuthorizedKey: upSigner.PublicKey(), HostKey: hostSigner}
+	if apps {
+		upOpts.Shell, upOpts.Root = true, t.TempDir()
+	}
+	up, err := sshtest.New(upOpts)
 	if err != nil {
 		t.Fatal(err)
+	}
+	opt := app.Options{Clock: clk, KYC: k, DisableRateLimits: true, AgentTick: 20 * time.Millisecond,
+		HostKeyGen: func() (string, []byte, error) { return hostPub, hostPEM, nil }}
+	healthAddr := ""
+	if apps {
+		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "spark-app-ok|path=%s", r.URL.Path) }))
+		t.Cleanup(health.Close)
+		healthAddr = strings.TrimPrefix(health.URL, "http://")
+		root := up.Root()
+		opt.AppHealthAddr = func(int) string { return healthAddr }
+		opt.AppRootFor = func(id string) string { return filepath.Join(root, id, "root", "data") }
+		t.Cleanup(func() { e2ehooks.StopFakeApps(root) })
 	}
 	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(),
 		AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200, AgentDNSServers: []string{"223.5.5.5"}, UpstreamSSHKeyFile: keyFile,
 		UpstreamSSHPort: up.Port()}
-	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: k, DisableRateLimits: true, AgentTick: 20 * time.Millisecond,
-		HostKeyGen: func() (string, []byte, error) { return hostPub, hostPEM, nil }})
+	a, err := app.Build(cfg, pool, log, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +110,8 @@ func newEnv(t *testing.T) *env {
 	go func() { defer close(done); _ = a.Gateway.Serve(ctx, lis) }()
 	sshDone := make(chan struct{})
 	go func() { defer close(sshDone); _ = a.SSH.Serve(ctx, sshLis) }()
-	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String(), SSHAddr: sshLis.Addr().String(), Upstream: up}
+	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String(), SSHAddr: sshLis.Addr().String(), Upstream: up,
+		HealthAddr: healthAddr}
 	ts := httptest.NewServer(hooks.Handler())
 	t.Cleanup(func() {
 		ts.Close()
@@ -302,6 +323,12 @@ func TestSweepHeartbeatGoesThroughAgent(t *testing.T) {
 	if !m.AgentOnline || !m.LastSeenAt.Equal(e.clk.Now()) || len(m.LastMetrics) == 0 {
 		t.Fatalf("after sweep = %+v", m)
 	}
+	// sweep 也跑 Referral.Settle：扫描水位离开迁移写入的初值 2000-01-01，推进到 now − ScanLag
+	var watermark time.Time
+	if err := e.a.Fleet.Pool().QueryRow(ctx, `SELECT watermark FROM referral_state WHERE id = 1`).Scan(&watermark); err != nil ||
+		!watermark.Equal(e.clk.Now().Add(-referral.ScanLag)) {
+		t.Fatalf("referral watermark = %v %v, want sweep to run Referral.Settle", watermark, err)
+	}
 	e.must("POST", "/hooks/clock/advance", map[string]int{"seconds": 360})
 	e.must("POST", "/hooks/sweep", map[string]any{"heartbeat": false})
 	if m, _ = e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), mid); m.AgentOnline {
@@ -470,5 +497,151 @@ func TestGroupsHookAndMachinesInGroup(t *testing.T) {
 	ids = e.must("POST", "/hooks/machines", map[string]any{"count": 1})["ids"].([]any)
 	if m, _ := e.a.Fleet.Get(ctx, e.a.Fleet.Pool(), int64(ids[0].(float64))); m.GroupID != nil {
 		t.Fatalf("machine without group_id = %v", *m.GroupID)
+	}
+}
+
+// /hooks/users 带 invite_code / device_id / ip 时走真实注册路径（SendLoginCode + LoginWith）：新用户被绑定、设备被记录，
+// 余额与实名照常写入；对已存在的手机号只是再登录一次（记设备），不重置实名、不重复入账（裁定 Q9）。
+func TestUsersHookRealRegistrationWithInvite(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	pool := e.a.Fleet.Pool()
+	inviter := e.must("POST", "/hooks/users", map[string]any{"phone": "13900000011", "verified": true, "balance": 1000})
+	inviterID := int64(inviter["id"].(float64))
+	acc, err := e.a.Referral.EnsureCode(ctx, inviterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"
+	out := e.must("POST", "/hooks/users", map[string]any{"phone": "13900000012", "verified": true, "balance": 5000, "ledger_rows": 2,
+		"invite_code": strings.ToLower(acc.Code), "device_id": dev, "ip": "10.1.2.3"})
+	inviteeID := int64(out["id"].(float64))
+	inv, _ := out["invite"].(map[string]any)
+	if inv == nil || inv["bound"] != true || inv["reason"] != "ok" || inv["inviter"] != "139****0011" || out["phone"] != "13900000012" {
+		t.Fatalf("users with invite_code = %v", out)
+	}
+	var n int
+	var gotInviter int64
+	var ip, status string
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(inviter_id), max(ip), max(status) FROM referral_bindings WHERE invitee_id = $1`, inviteeID).
+		Scan(&n, &gotInviter, &ip, &status); err != nil || n != 1 || gotInviter != inviterID || ip != "10.1.2.3" || status != "active" {
+		t.Fatalf("binding = %d %d %q %q %v", n, gotInviter, ip, status, err)
+	}
+	if user, err := e.a.Identity.GetUser(ctx, inviteeID); err != nil || user.KYCStatus != "verified" || user.Kind != "personal" {
+		t.Fatalf("invitee = %+v, %v", user, err)
+	}
+	if bal, _ := e.a.Wallet.Balance(ctx, inviteeID); bal != 5000 {
+		t.Fatalf("invitee balance = %d, want 5000", bal)
+	}
+	if rows, _ := e.a.Wallet.ListLedger(ctx, inviteeID, 0, 100); len(rows) != 3 {
+		t.Fatalf("invitee ledger rows = %d, want 3", len(rows))
+	}
+
+	// 已存在的手机号：只登录（记设备 D），不重置实名、不重复入账
+	again := e.must("POST", "/hooks/users", map[string]any{"phone": "13900000011", "device_id": dev})
+	if int64(again["id"].(float64)) != inviterID {
+		t.Fatalf("existing phone id = %v, want %d", again["id"], inviterID)
+	}
+	if user, _ := e.a.Identity.GetUser(ctx, inviterID); user.KYCStatus != "verified" {
+		t.Fatalf("existing user kyc reset to %q", user.KYCStatus)
+	}
+	if bal, _ := e.a.Wallet.Balance(ctx, inviterID); bal != 1000 {
+		t.Fatalf("existing user balance = %d, want 1000 (no re-seed)", bal)
+	}
+	var devices int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_devices WHERE user_id = $1 AND device_id = $2`, inviterID, dev).Scan(&devices); err != nil || devices != 1 {
+		t.Fatalf("inviter device = %d, %v", devices, err)
+	}
+	// 与邀请人同设备注册 → 绑定被搁置
+	held := e.must("POST", "/hooks/users", map[string]any{"phone": "13900000013", "invite_code": acc.Code, "device_id": dev})
+	if err := pool.QueryRow(ctx, `SELECT status FROM referral_bindings WHERE invitee_id = $1`, int64(held["id"].(float64))).Scan(&status); err != nil || status != "held" {
+		t.Fatalf("same-device binding = %q, %v", status, err)
+	}
+	// 老用户带码：不绑定
+	old := e.must("POST", "/hooks/users", map[string]any{"phone": "13900000012", "invite_code": acc.Code})
+	if inv, _ := old["invite"].(map[string]any); inv == nil || inv["bound"] != false || inv["reason"] != "existing_user" {
+		t.Fatalf("existing user with code = %v", old)
+	}
+	// 不带三者时仍是直接插入：没有 invite 字段
+	if plain := e.must("POST", "/hooks/users", map[string]any{}); plain["invite"] != nil {
+		t.Fatalf("plain users invite = %v", plain["invite"])
+	}
+}
+
+// /hooks/referral/config 插一版费率：未给的字段沿用当前版本，立即生效。
+func TestReferralConfigHook(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	before, err := e.a.Referral.CurrentConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := e.must("POST", "/hooks/referral/config", map[string]any{"hold_days": 0})
+	cur, err := e.a.Referral.CurrentConfig(ctx)
+	if err != nil || cur.HoldDays != 0 || cur.RateBP != before.RateBP || cur.MaxPerInvitee != before.MaxPerInvitee ||
+		cur.MaxPerInviter30d != before.MaxPerInviter30d || cur.PeriodDays != before.PeriodDays || int64(out["id"].(float64)) != cur.ID {
+		t.Fatalf("after hold_days 0: %+v (before %+v) %v, out %v", cur, before, err, out)
+	}
+	e.must("POST", "/hooks/referral/config", map[string]any{"rate_bp": 1500})
+	if cur, _ = e.a.Referral.CurrentConfig(ctx); cur.RateBP != 1500 || cur.HoldDays != 0 {
+		t.Fatalf("after rate 1500: %+v", cur)
+	}
+	if code, _ := e.call("POST", "/hooks/referral/config", map[string]any{"rate_bp": 9999}); code == 200 {
+		t.Fatal("invalid rate accepted")
+	}
+}
+
+// /hooks/sweep 与生产清扫器一样持有清扫咨询锁（rental.SweeperLockKey），并发的钩子清扫也逐个执行：
+// 两轮 Rental.Sweep 交叠会在 fleet.MarkOfflineStale 的多行 UPDATE 上互相死锁。
+func TestSweepHookTakesSweeperLock(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.must("POST", "/hooks/machines", map[string]any{"count": 3})
+	conn, err := e.a.Fleet.Pool().Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, rental.SweeperLockKey); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() {
+		code, _ := e.call("POST", "/hooks/sweep", map[string]any{})
+		done <- code
+	}()
+	select {
+	case code := <-done:
+		t.Fatalf("sweep finished (%d) while another sweeper held the lock", code)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, rental.SweeperLockKey); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-done:
+		if code != 200 {
+			t.Fatalf("sweep after unlock = %d", code)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("sweep still blocked after unlock")
+	}
+	// 并发调用全部成功（逐个执行，不死锁、不耗尽连接池）
+	e.must("POST", "/hooks/clock/advance", map[string]int{"seconds": 360})
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func() {
+			code, out := e.call("POST", "/hooks/sweep", map[string]any{"heartbeat": i%2 == 0})
+			if code != 200 {
+				errs <- fmt.Errorf("sweep = %d %v", code, out)
+				return
+			}
+			errs <- nil
+		}()
+	}
+	for i := 0; i < 8; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
 	}
 }

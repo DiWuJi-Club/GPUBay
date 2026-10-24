@@ -57,6 +57,11 @@ type Config struct {
 	TLSCertFile        string
 	TLSKeyFile         string
 	HTTPRedirectAddr   string // 纯 HTTP 301 到 https 的监听地址；仅 TLS 开启时有效
+
+	// 计划 7：应用一键部署
+	AppHFEndpoint  string // 注入应用容器的 HF_ENDPOINT（HuggingFace 镜像站）
+	AppPipIndexURL string // 注入应用容器的 PIP_INDEX_URL
+	AppRunner      bool   // 是否在本副本启动应用部署 Runner（多副本都开时由咨询锁保证只有一个在工作）
 }
 
 // AliyunConfig 阿里云短信与号码百科（三要素核验）共用一组 AccessKey。
@@ -186,6 +191,9 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if err := c.loadAccess(getenv, or); err != nil {
+		return Config{}, err
+	}
+	if err := c.loadApps(or); err != nil {
 		return Config{}, err
 	}
 	if err := c.checkPlugins(); err != nil {
@@ -468,6 +476,45 @@ func (c *Config) loadAccess(getenv func(string) string, or func(key, def string)
 		return errors.New("生产环境必须配置 TLS 证书或在反向代理后设置 SPARK_TRUST_PROXY=true")
 	}
 	return nil
+}
+
+// 应用一键部署的默认镜像站（国内可达）。
+const (
+	DefaultAppHFEndpoint  = "https://hf-mirror.com"
+	DefaultAppPipIndexURL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+)
+
+// loadApps 读取并校验应用一键部署（计划 7）配置。
+func (c *Config) loadApps(or func(key, def string) string) error {
+	c.AppHFEndpoint = strings.TrimSpace(or("SPARK_APP_HF_ENDPOINT", DefaultAppHFEndpoint))
+	c.AppPipIndexURL = strings.TrimSpace(or("SPARK_APP_PIP_INDEX_URL", DefaultAppPipIndexURL))
+	for _, v := range []struct{ name, value string }{{"SPARK_APP_HF_ENDPOINT", c.AppHFEndpoint}, {"SPARK_APP_PIP_INDEX_URL", c.AppPipIndexURL}} {
+		u, err := url.Parse(v.value)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%s 必须以 http:// 或 https:// 开头，当前为 %q", v.name, v.value)
+		}
+	}
+	switch v := or("SPARK_APP_RUNNER", "on"); v {
+	case "on":
+		c.AppRunner = true
+	case "off":
+		c.AppRunner = false
+	default:
+		return fmt.Errorf("SPARK_APP_RUNNER 只能是 on 或 off，当前为 %q", v)
+	}
+	return nil
+}
+
+// FillAppDefaults 给没有经过 Load 的 Config 字面量（测试、e2e-server）补上应用部署镜像站的默认值；Load 之后调用无副作用。
+// AppRunner 不在这里补：它只由 cmd/platform 读取（经 Load，默认 on）。
+func (c Config) FillAppDefaults() Config {
+	if c.AppHFEndpoint == "" {
+		c.AppHFEndpoint = DefaultAppHFEndpoint
+	}
+	if c.AppPipIndexURL == "" {
+		c.AppPipIndexURL = DefaultAppPipIndexURL
+	}
+	return c
 }
 
 // TLSEnabled 报告公网监听器是否由 platform 自己终止 TLS。

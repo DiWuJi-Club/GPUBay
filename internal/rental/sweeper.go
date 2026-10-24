@@ -16,7 +16,7 @@ import (
 
 const (
 	sweepBatch     = 200
-	sweeperLockKey = 7301001 // pg_try_advisory_lock 的键，保证多个 platform 副本只有一个在清扫
+	SweeperLockKey = 7301001 // pg_try_advisory_lock 的键，保证多个 platform 副本只有一个在清扫；e2e 的 /hooks/sweep 也持有它
 )
 
 // extraTaskTimeout 限制每个附加任务的执行时间，避免外部调用卡住后一直占着清扫咨询锁（测试可调小）。
@@ -136,6 +136,9 @@ func (s *Service) beginWipe(ctx context.Context, tx pgx.Tx, inst Instance, reaso
 		return err
 	}
 	if err := recordEvent(ctx, tx, inst.ID, inst.State, StateWiping, reason, now); err != nil {
+		return err
+	}
+	if err := s.apps().OnInstanceGone(ctx, tx, inst.ID, "实例已释放", now); err != nil {
 		return err
 	}
 	if err := s.refreshLease(ctx, tx, inst.ID, now); err != nil {
@@ -454,14 +457,14 @@ func (s *Service) sweepOnce(ctx context.Context, extra []func(context.Context) e
 	}
 	defer conn.Release()
 	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, sweeperLockKey).Scan(&locked); err != nil {
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, SweeperLockKey).Scan(&locked); err != nil {
 		s.d.Log.Error("sweeper advisory lock", "err", err)
 		return
 	}
 	if !locked {
 		return
 	}
-	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, sweeperLockKey) //nolint:errcheck
+	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, SweeperLockKey) //nolint:errcheck
 	if err := s.Sweep(ctx); err != nil {
 		s.d.Log.Error("sweep failed", "err", err)
 	}

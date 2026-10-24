@@ -77,6 +77,10 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			SELECT $2, port, visibility, forced_private, note, $3, $3 FROM instance_ports WHERE instance_id = $1 ORDER BY port`, old.ID, id, now); err != nil {
 			return err
 		}
+		// 端口已复制（deployment_id NULL），部署复制为新实例的 queued；必须在 beginWipe(old) 之前，否则旧部署会先被标 removed
+		if err := s.apps().OnInstanceMigrated(ctx, tx, old.ID, id, now); err != nil {
+			return err
+		}
 		if err := recordEvent(ctx, tx, id, "", StateCreating, "migrated from "+old.ID+": "+reason, now); err != nil {
 			return err
 		}

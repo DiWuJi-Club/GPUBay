@@ -1,10 +1,12 @@
 import type { InstancePort, SshKey } from './access'
+import type { AppCategory, AppSpec, AppStatus, Deployment, DeploymentEvent } from './apps'
 import type { CalendarPeriod } from './booking'
 import type { Duration } from './catalog'
 import type { InstanceState, OrderKind, OrderStatus } from './instance'
 import type { KycResult } from './kyc'
 import type { LedgerKind, LedgerRow } from './wallet'
 import type { RechargeChannel, RechargeStatus } from './recharge'
+import type { BindingStatus, RebateRule, ReferralAccountStatus, RewardStatus } from './referral'
 import type { User } from './user'
 
 export interface Paged<T> {
@@ -57,6 +59,9 @@ export interface Machine {
   last_metrics: MachineMetrics | null
   group_id: number | null
   display_name: string
+  /** Agent 上报的本机镜像（repository:tag，≤ 200 项），只用于覆盖率展示 */
+  cached_images: string[]
+  cached_images_at: string | null
 }
 
 export interface MachineMetrics {
@@ -218,6 +223,8 @@ export interface AdminInstanceDetail {
   commands: CommandRow[]
   ports: InstancePort[]
   ssh_host_pubkey_fingerprint: string
+  /** 该实例的全部部署（含已卸载 / 已失效的历史，按创建时间） */
+  apps?: AdminDeployment[]
 }
 
 export interface RefundQuote {
@@ -272,6 +279,11 @@ export interface UserDetail {
   ledger: LedgerRow[]
   kyc: AdminKYCRecord[]
   ssh_keys: SshKey[]
+  /** 邀请区块：作为被邀请人时的邀请人、作为邀请人时的统计；两者都没有时为空对象 */
+  referral: {
+    inviter?: { user_id: number; phone: string; binding_status: BindingStatus }
+    account?: { code: string; status: ReferralAccountStatus; invitees: number; settled_net: number; pending: number; debt: number }
+  }
 }
 
 export interface AdminPrice {
@@ -332,4 +344,199 @@ export interface Dashboard {
   utilization: { date: string; rate: number }[]
   ssh_sessions_open: number
   bookings_upcoming_7d: number
+  /** 本月已发放返利净额（返利 − 扣回，分） */
+  referral_month_settled: number
+  /** queued + installing */
+  apps_installing: number
+  apps_running: number
+  apps_failed_24h: number
+}
+
+// ---- 邀请返利（计划 8，金额单位：分）。手机号为原文，页面显示前须脱敏；后端从不返回实名指纹 / 证件号 ----
+
+export type RiskFlag = 'same_ip' | 'same_device' | 'burst' | 'same_identity'
+
+/** GET /referral/summary */
+export interface AdminReferralSummary {
+  pending: number
+  month_settled: number
+  settled_net: number
+  debt: number
+  held_count: number
+}
+
+/** 费率版本（GET /referral/config 的 current 与 versions[]） */
+export interface AdminRateVersion extends RebateRule {
+  id: number
+  effective_from: string
+  note: string
+  created_by: number | null
+  created_at: string
+}
+
+/** 邀请账户（referral_accounts） */
+export interface AdminReferralAccount {
+  user_id: number
+  code: string
+  status: ReferralAccountStatus
+  frozen_reason: string
+  debt: number
+  created_at: string
+}
+
+/** GET /referral/inviters 的一行 */
+export interface AdminInviterRow extends AdminReferralAccount {
+  phone: string
+  kyc_status: string
+  user_status: string
+  invitees: number
+  held_count: number
+  pending: number
+  settled_net: number
+  last_bound_at: string | null
+}
+
+/** 绑定（GET /referral/bindings；ip / device_id / user_agent 只用于导出核查，页面不展示） */
+export interface AdminBinding {
+  id: number
+  inviter_id: number
+  invitee_id: number
+  inviter_phone: string
+  invitee_phone: string
+  code: string
+  status: BindingStatus
+  risk_flags: RiskFlag[]
+  hold_reason: string
+  rate_version_id: number
+  bound_at: string
+  rebate_until: string
+  ip: string
+  device_id: string
+  user_agent: string
+  reviewed_by: number | null
+  reviewed_at: string | null
+  review_note: string
+  pending: number
+  contributed: number
+  /** 邀请人或被邀请人有未处理的实名同身份核查失败（晚于绑定 / 上次审核），通过前须人工核查 */
+  kyc_check_unresolved: boolean
+}
+
+/** GET /referral/rewards 的一行 */
+export interface AdminReferralReward {
+  order_id: string
+  binding_id: number
+  inviter_id: number
+  invitee_id: number
+  rate_version_id: number
+  rate_bp: number
+  order_amount: number
+  refunded_amount: number
+  reward_cap: number
+  reward: number
+  status: RewardStatus
+  settle_after: string
+  settled_amount: number
+  clawed_amount: number
+  settled_at: string | null
+  paid_at: string
+  created_at: string
+  updated_at: string
+  inviter_phone: string
+  invitee_phone: string
+}
+
+export interface AdminReferralEvent {
+  id: number
+  order_id: string
+  binding_id: number
+  kind: string
+  source_ledger_id: number | null
+  wallet_ledger_id: number | null
+  amount: number
+  detail: string
+  created_at: string
+}
+
+/** GET /referral/inviters/{id} */
+export interface AdminInviterDetail {
+  account: AdminReferralAccount
+  phone: string
+  /** 最近 100 个；全量个数见 bindings_total */
+  bindings: AdminBinding[]
+  bindings_total: number
+  /** 最近 100 条；全量条数见 rewards_total */
+  rewards: AdminReferralReward[]
+  rewards_total: number
+  /** 最近 50 条 */
+  events: AdminReferralEvent[]
+}
+
+/**
+ * POST /referral/rescan 的结果（200）。拨回水位后重扫已执行：failed 为处理失败的流水行数（之后每轮清扫重试），
+ * incomplete 表示发现或发放本身出错 / 超时（之后的清扫轮继续）。返回错误时什么都没发生。
+ */
+export interface RescanResult {
+  watermark: string
+  processed: number
+  failed: number
+  released: number
+  incomplete: boolean
+}
+
+/** 后台应用列表的一行（GET /admin/api/v1/apps）；POST / PUT 返回的应用不带 versions / deployments_live。 */
+export interface AdminApp {
+  id: number
+  slug: string
+  name: string
+  summary: string
+  description: string
+  category: AppCategory
+  icon: string
+  sort: number
+  status: AppStatus
+  created_at: string
+  updated_at: string
+  versions: number
+  /** 非终态（不是 removed / lost）的部署数 */
+  deployments_live: number
+}
+
+/** 兼容镜像在在线机器上的缓存情况（unknown：缓存上报超过 5 分钟或旧 Agent 未上报）。 */
+export interface AppCoverage {
+  image_id: number
+  image_name: string
+  cached: number
+  online: number
+  unknown: number
+}
+
+/** 后台版本（GET /apps/{id}/versions 的一项；脚本走 /script 单独取）。已退役版本的 coverage 为空。 */
+export interface AdminAppVersion {
+  id: number
+  app_id: number
+  version: string
+  status: AppStatus
+  image_ids: number[]
+  spec: AppSpec
+  spec_hash: string
+  changelog: string
+  published_at: string | null
+  created_at: string
+  updated_at: string
+  coverage: AppCoverage[]
+  /** 该版本的非终态部署数（后端尚未提供时缺省） */
+  deployments_live?: number
+}
+
+/** 后台部署视图：多 log_tail（已脱敏）与 user_id。 */
+export interface AdminDeployment extends Deployment {
+  log_tail: string
+  user_id: number
+}
+
+/** GET /deployments/{dep}：事件按时间倒序（最近 100 条）；log_tail 只在 deployment 里。 */
+export interface AdminDeploymentDetail {
+  deployment: AdminDeployment
+  events: DeploymentEvent[]
 }

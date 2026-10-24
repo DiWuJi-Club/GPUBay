@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -98,10 +99,18 @@ func TestCreateHappyPath(t *testing.T) {
 	}
 	init, _ := os.ReadFile(filepath.Join(ssh, "init.sh"))
 	for _, want := range []string{"#!/bin/sh", "HostKey /.spark/hostkeys/ssh_host_ed25519_key", "AuthorizedKeysFile /.spark/authorized_keys", "StrictModes no", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitRootLogin prohibit-password", "exec /usr/sbin/sshd -D -e",
-		"Subsystem sftp internal-sftp", "AllowTcpForwarding yes", "AllowStreamLocalForwarding no", "GatewayPorts no", "AllowAgentForwarding yes", "X11Forwarding no", "PermitTunnel no", "ClientAliveInterval 60", "ClientAliveCountMax 3", "MaxStartups 50:30:200", "MaxSessions 32"} {
+		"Subsystem sftp internal-sftp", "AllowTcpForwarding yes", "AllowStreamLocalForwarding no", "GatewayPorts no", "AllowAgentForwarding yes", "X11Forwarding no", "PermitTunnel no", "ClientAliveInterval 60", "ClientAliveCountMax 3", "MaxStartups 50:30:200", "MaxSessions 32",
+		// 镜像环境留给平台（appdeploy.DefaultImageEnviron，A-1），且在 exec sshd 之前（之后 PID 1 的 environ 被进程标题覆盖）
+		"cat /proc/$$/environ > /run/spark-image.environ 2>/dev/null || true\n"} {
 		if !strings.Contains(string(init), want) {
 			t.Fatalf("init.sh missing %q:\n%s", want, init)
 		}
+	}
+	if strings.Index(string(init), "/run/spark-image.environ") > strings.Index(string(init), "exec /usr/sbin/sshd") {
+		t.Fatalf("image environ must be saved before exec sshd:\n%s", init)
+	}
+	if out, err := exec.Command("/bin/sh", "-n", filepath.Join(ssh, "init.sh")).CombinedOutput(); err != nil {
+		t.Fatalf("init.sh syntax: %v %s", err, out)
 	}
 	if st, err := os.Stat(filepath.Join(ssh, "init.sh")); err != nil || st.Mode().Perm() != 0o755 {
 		t.Fatalf("init.sh perm = %v %v", st, err)
@@ -1160,4 +1169,53 @@ func rsaKeyPEM(t *testing.T) (*rsa.PrivateKey, string) {
 		t.Fatal(err)
 	}
 	return k, string(pem.EncodeToMemory(block))
+}
+
+func TestImagesReportedFromRuntime(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	if got := e.ex.Images(ctx); got != nil {
+		t.Fatalf("unset = %#v", got)
+	}
+	e.rt.SetImages([]string{"a:1"})
+	if got := e.ex.Images(ctx); !slices.Equal(got, []string{"a:1"}) {
+		t.Fatalf("images = %v", got)
+	}
+	e.rt.FailNext("images", errors.New("docker down"))
+	if got := e.ex.Images(ctx); got != nil {
+		t.Fatalf("on error = %v, want nil", got)
+	}
+	// dockerd 卡死：受 reportTimeout 约束，返回 nil
+	executor.SetReportTimeoutForTest(e.ex, 50*time.Millisecond)
+	e.rt.Block("images", true)
+	start := time.Now()
+	if got := e.ex.Images(ctx); got != nil || time.Since(start) > 2*time.Second {
+		t.Fatalf("blocked = %v after %v", got, time.Since(start))
+	}
+}
+
+// Snapshot：实例状态与镜像共用一个 reportTimeout；状态采集用完时限后不再调用 docker 列镜像。
+func TestSnapshotSharesReportDeadline(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.run(create("ins-aaaaaaaa"))
+	e.rt.SetImages([]string{"a:1"})
+	states, imgs := e.ex.Snapshot(ctx)
+	if len(states) != 1 || states[0].Phase != "running" || !slices.Equal(imgs, []string{"a:1"}) {
+		t.Fatalf("snapshot = %v %v", states, imgs)
+	}
+	executor.SetReportTimeoutForTest(e.ex, 50*time.Millisecond)
+	e.rt.Block("list", true)
+	e.rt.FailNext("images", errors.New("must not be consumed"))
+	states, imgs = e.ex.Snapshot(ctx)
+	if len(states) != 1 || states[0].Phase != "unknown" || imgs != nil {
+		t.Fatalf("stalled snapshot = %v %v", states, imgs)
+	}
+	// 镜像没被列过：预置的失败仍在队列里
+	if got := e.ex.Images(ctx); got != nil {
+		t.Fatalf("images was listed after report deadline: next call = %v", got)
+	}
+	if got := e.ex.Images(ctx); !slices.Equal(got, []string{"a:1"}) {
+		t.Fatalf("images = %v", got)
+	}
 }

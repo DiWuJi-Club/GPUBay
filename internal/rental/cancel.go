@@ -130,6 +130,9 @@ func (s *Service) cancelInstance(ctx context.Context, tx pgx.Tx, inst Instance, 
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'cancelled', cancelled_at = $2, ssh_host_key_enc = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 		return 0, err
 	}
+	if err := s.apps().OnInstanceGone(ctx, tx, inst.ID, "预订取消", now); err != nil {
+		return 0, err
+	}
 	// agent_commands 在 lease 之后、orders 之前锁：与 ExpireDue / beginWipe（instance → lease → agent_commands）
 	// 和 RefundRelease（instance → agent_commands → orders → wallet）同序，不与它们成环
 	if err := s.d.Fleet.CancelCommands(ctx, tx, inst.ID, "booking cancelled"); err != nil {
