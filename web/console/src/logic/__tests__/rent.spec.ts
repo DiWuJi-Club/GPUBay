@@ -4,7 +4,7 @@ import { bookingBody, orderBody, useRentKey, type RentForm } from '../rent'
 
 const form = (over: Partial<RentForm> = {}): RentForm => ({
   groupId: null, count: 1, immediate: true, day: '', hour: null, duration: '1d', quantity: 1, imageId: 3, machineId: null,
-  autoRenew: false, autoRenewDuration: '1d', appId: null, ...over,
+  autoRenew: false, autoRenewDuration: '1d', appId: null, appWorkflowIds: [], ...over,
 })
 
 describe('下单请求体（/orders、/bookings）', () => {
@@ -28,6 +28,14 @@ describe('下单请求体（/orders、/bookings）', () => {
       product_id: 1, image_id: 3, group_id: null, machine_id: null, count: 1, duration: '1d', quantity: 1, start_at: undefined,
       auto_renew: false, auto_renew_duration: '1d', app_id: 1, app_env: { MODEL_ID: 'Qwen/Qwen3-4B' },
     })
+  })
+  it('预装工作流：有应用时带 app_workflow_ids；空列表或不预装应用时不带', () => {
+    expect(orderBody(1, form({ appId: 3, appWorkflowIds: [7, 9] }), 3, { MODEL_ID: 'none' }))
+      .toStrictEqual({ product_id: 1, duration: '1d', image_id: 3, app_id: 3, app_env: { MODEL_ID: 'none' }, app_workflow_ids: [7, 9] })
+    expect(bookingBody(1, form({ appId: 3, appWorkflowIds: [7] }), null, 3, {})).toMatchObject({ app_id: 3, app_workflow_ids: [7] })
+    expect(orderBody(1, form({ appId: 3 }), 3, {})).not.toHaveProperty('app_workflow_ids')
+    expect(orderBody(1, form({ appWorkflowIds: [7] }), null, {})).toStrictEqual({ product_id: 1, duration: '1d', image_id: 3 })
+    expect(bookingBody(1, form({ appWorkflowIds: [7] }), null, null, {})).not.toHaveProperty('app_workflow_ids')
   })
 })
 
@@ -72,6 +80,21 @@ describe('幂等键（RentDialog 的派生参数）', () => {
     env.value = { ...env.value, OPTIONAL: '' }
     await nextTick()
     expect(key.current()).toBe(k1)
+    scope.stop()
+  })
+  it('改预装工作流（增、减、换）都换键', async () => {
+    const { f, key, scope } = setup()
+    const k1 = key.current()
+    f.appWorkflowIds = [7]
+    await nextTick()
+    const k2 = key.current()
+    expect(k2).not.toBe(k1)
+    f.appWorkflowIds = [7, 9]
+    await nextTick()
+    expect(key.current()).not.toBe(k2)
+    f.appWorkflowIds = [7]
+    await nextTick()
+    expect(key.current()).not.toBe(k2) // 派生参数又变了一次：再换（不回到旧键）
     scope.stop()
   })
 })

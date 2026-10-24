@@ -54,5 +54,9 @@ declare module 'vue' {
     RentDialog: typeof import('./components/RentDialog.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    WorkflowCard: typeof import('./components/WorkflowCard.vue')['default']
+    WorkflowInstallDialog: typeof import('./components/WorkflowInstallDialog.vue')['default']
+    WorkflowInstallFlow: typeof import('./components/WorkflowInstallFlow.vue')['default']
+    WorkflowPicker: typeof import('./components/WorkflowPicker.vue')['default']
   }
 }
