@@ -60,13 +60,15 @@ func (s *Service) Settle(ctx context.Context) error {
 // settleOutcome 一次单账户结算提交后的结果（事务外用于日志与缓存失效）。
 type settleOutcome struct {
 	settled          bool
+	healed           bool // unsettled_micro 按明细校正过（不一定有结算）
 	debtBefore, debt int64
 	settlementID     int64
 }
 
 // settleAccount 单账户结算（规格 §7 伪代码逐行实现）。加锁顺序（§14）：llm_accounts(user) FOR UPDATE → llm_usage（UPDATE 标记）
 // → llm_settlements → llm_usage_daily → wallet_accounts(user)（ApplyUpTo 里 FOR UPDATE）。
-// 返回是否写了一条结算。提交后失效该用户的 Authorize 缓存（欠费 / 未结算变化要尽快反映到网关预检与 402）。
+// 返回是否写了一条结算。提交后（有结算或校正过 unsettled_micro）失效该用户的 Authorize 缓存
+// （欠费 / 未结算变化要尽快反映到网关预检与 402）。
 func (s *Service) settleAccount(ctx context.Context, userID int64, now time.Time) (bool, error) {
 	var out settleOutcome
 	err := withRetry(func() error {
@@ -80,10 +82,12 @@ func (s *Service) settleAccount(ctx context.Context, userID int64, now time.Time
 	if err != nil {
 		return false, err
 	}
+	if out.settled || out.healed {
+		s.InvalidateUser(userID)
+	}
 	if !out.settled {
 		return false, nil
 	}
-	s.InvalidateUser(userID)
 	switch {
 	case out.debtBefore == 0 && out.debt > 0:
 		s.d.Log.Warn("llm: user in debt", "user_id", userID, "settlement_id", out.settlementID, "debt", out.debt)
@@ -117,6 +121,15 @@ func (s *Service) settleTx(ctx context.Context, tx pgx.Tx, userID int64, now tim
 		userID).Scan(&oldest, &maxID); err != nil {
 		return out, err
 	}
+	if maxID == nil && a.UnsettledMicro > 0 {
+		// 账上有未结算、明细里一行都没有：计数漂移，以明细为准归零（否则 ≥ ¥1 的漂移会让账户每轮都是候选）
+		s.d.Log.Error("llm: settle unsettled_micro drift", "user_id", userID, "unsettled_micro", a.UnsettledMicro, "actual", 0)
+		if _, err := tx.Exec(ctx, `UPDATE llm_accounts SET unsettled_micro = 0, updated_at = $2 WHERE user_id = $1`,
+			userID, now); err != nil {
+			return out, err
+		}
+		out.healed = true
+	}
 	dueUsage := maxID != nil && (a.UnsettledMicro >= SettleMinMicro || !oldest.After(now.Add(-SettleMaxAge)))
 	if !dueUsage {
 		if a.Debt == 0 {
@@ -133,8 +146,20 @@ func (s *Service) settleTx(ctx context.Context, tx pgx.Tx, userID int64, now tim
 		}
 	}
 
+	// 纯扣欠费在保存点里做：余额在上面的只读之后、ApplyUpTo 之前被扣光（applied = 0）时整段回滚，
+	// 不留一条全零的结算行（之前的计数校正保留）。
+	q := tx
+	if !dueUsage {
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return out, err
+		}
+		defer sp.Rollback(ctx) //nolint:errcheck // 释放后回滚是空操作
+		q = sp
+	}
+
 	var sid int64
-	if err := tx.QueryRow(ctx, `INSERT INTO llm_settlements (user_id, requests, prompt_tokens, completion_tokens, cost_micro,
+	if err := q.QueryRow(ctx, `INSERT INTO llm_settlements (user_id, requests, prompt_tokens, completion_tokens, cost_micro,
 			usage_amount, debt_amount, charged, created_at)
 		VALUES ($1, 0, 0, 0, 0, 0, 0, 0, $2) RETURNING id`, userID, now).Scan(&sid); err != nil {
 		return out, err
@@ -146,13 +171,16 @@ func (s *Service) settleTx(ctx context.Context, tx pgx.Tx, userID int64, now tim
 	var requests, promptTokens, completionTokens, sum int64
 	var periodFrom, periodTo *time.Time
 	unsettled, carry := a.UnsettledMicro, a.CarryMicro
+	if out.healed {
+		unsettled = 0
+	}
 	var usageAmount int64
 	if dueUsage {
-		// 自然日口径与不变量 5 / DailyUsage 相同。TODO: usage.go 的 usageDaySQL 常量合入后改为引用它（同一表达式）。
-		rows, err := tx.Query(ctx, `WITH m AS (
+		// 自然日口径 usageDaySQL：与不变量 5 / DailyUsage 相同
+		rows, err := q.Query(ctx, `WITH m AS (
 				UPDATE llm_usage SET settlement_id = $3
 				WHERE user_id = $1 AND settlement_id IS NULL AND id <= $2
-				RETURNING (created_at AT TIME ZONE 'Asia/Shanghai')::date AS day, model_id, prompt_tokens, completion_tokens,
+				RETURNING `+usageDaySQL+` AS day, model_id, prompt_tokens, completion_tokens,
 					cost_micro, created_at)
 			SELECT day, model_id, count(*), COALESCE(sum(prompt_tokens), 0)::bigint, COALESCE(sum(completion_tokens), 0)::bigint,
 				COALESCE(sum(cost_micro), 0)::bigint, min(created_at), max(created_at)
@@ -179,7 +207,7 @@ func (s *Service) settleTx(ctx context.Context, tx pgx.Tx, userID int64, now tim
 			if periodTo == nil || g.to.After(*periodTo) {
 				periodTo = &g.to
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO llm_usage_daily (day, user_id, model_id, requests, prompt_tokens, completion_tokens, cost_micro)
+			if _, err := q.Exec(ctx, `INSERT INTO llm_usage_daily (day, user_id, model_id, requests, prompt_tokens, completion_tokens, cost_micro)
 				VALUES ($1, $2, $3, $4, $5, $6, $7)
 				ON CONFLICT (day, user_id, model_id) DO UPDATE SET
 					requests = llm_usage_daily.requests + EXCLUDED.requests,
@@ -190,12 +218,15 @@ func (s *Service) settleTx(ctx context.Context, tx pgx.Tx, userID int64, now tim
 				return out, err
 			}
 		}
-		if sum != a.UnsettledMicro {
-			// 账户计数与明细不一致：以明细为准（只减掉本次纳入的部分，max_id 之后的行仍计在账上）
-			s.d.Log.Error("llm: settle unsettled_micro mismatch", "user_id", userID, "settlement_id", sid,
-				"unsettled_micro", a.UnsettledMicro, "sum", sum)
+		// 自愈：unsettled_micro 一律重算为剩余未结算明细之和（max_id 之后的行仍计在账上）；与预期不符记 Error
+		if err := q.QueryRow(ctx, `SELECT COALESCE(sum(cost_micro), 0)::bigint FROM llm_usage
+			WHERE user_id = $1 AND settlement_id IS NULL`, userID).Scan(&unsettled); err != nil {
+			return out, err
 		}
-		unsettled = max(a.UnsettledMicro-sum, 0)
+		if want := a.UnsettledMicro - sum; unsettled != want {
+			s.d.Log.Error("llm: settle unsettled_micro mismatch", "user_id", userID, "settlement_id", sid,
+				"unsettled_micro", a.UnsettledMicro, "marked", sum, "expected_remaining", want, "actual_remaining", unsettled)
+		}
 		total := sum + a.CarryMicro
 		usageAmount, carry = total/MicroPerFen, total%MicroPerFen
 	}
@@ -212,33 +243,41 @@ func (s *Service) settleTx(ctx context.Context, tx pgx.Tx, userID int64, now tim
 				remark += fmt.Sprintf("（含欠费 ¥%d.%02d）", debtAmount/100, debtAmount%100)
 			}
 		}
-		applied, _, err = s.d.Wallet.ApplyUpTo(ctx, tx, wallet.Entry{UserID: userID, Amount: -due, Kind: wallet.KindLLMPay,
+		applied, _, err = s.d.Wallet.ApplyUpTo(ctx, q, wallet.Entry{UserID: userID, Amount: -due, Kind: wallet.KindLLMPay,
 			RefType: LedgerRefTypeSettlement, RefID: strconv.FormatInt(sid, 10), Remark: remark})
 		if err != nil {
 			return out, fmt.Errorf("settlement %d: %w", sid, err)
 		}
 		if applied > 0 {
 			var id int64
-			if err := tx.QueryRow(ctx, `SELECT id FROM wallet_ledger WHERE kind = $1 AND ref_type = $2 AND ref_id = $3`,
+			if err := q.QueryRow(ctx, `SELECT id FROM wallet_ledger WHERE kind = $1 AND ref_type = $2 AND ref_id = $3`,
 				string(wallet.KindLLMPay), LedgerRefTypeSettlement, strconv.FormatInt(sid, 10)).Scan(&id); err != nil {
 				return out, err
 			}
 			ledgerID = &id
 		}
 	}
+	if !dueUsage && applied == 0 {
+		return out, nil // 纯扣欠费一分没扣到：回滚保存点（defer），不记结算
+	}
 	debt := due - applied
 
-	if _, err := tx.Exec(ctx, `UPDATE llm_settlements SET requests = $2, prompt_tokens = $3, completion_tokens = $4, cost_micro = $5,
+	if _, err := q.Exec(ctx, `UPDATE llm_settlements SET requests = $2, prompt_tokens = $3, completion_tokens = $4, cost_micro = $5,
 			usage_amount = $6, debt_amount = $7, charged = $8, wallet_ledger_id = $9, period_from = $10, period_to = $11
 		WHERE id = $1`,
 		sid, requests, promptTokens, completionTokens, sum, usageAmount, debtAmount, applied, ledgerID, periodFrom, periodTo); err != nil {
 		return out, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE llm_accounts SET unsettled_micro = $2, carry_micro = $3, debt = $4, updated_at = $5
+	if _, err := q.Exec(ctx, `UPDATE llm_accounts SET unsettled_micro = $2, carry_micro = $3, debt = $4, updated_at = $5
 		WHERE user_id = $1`, userID, unsettled, carry, debt, now); err != nil {
 		return out, err
 	}
-	return settleOutcome{settled: true, debtBefore: a.Debt, debt: debt, settlementID: sid}, nil
+	if q != tx {
+		if err := q.Commit(ctx); err != nil { // 释放保存点
+			return out, err
+		}
+	}
+	return settleOutcome{settled: true, healed: out.healed, debtBefore: a.Debt, debt: debt, settlementID: sid}, nil
 }
 
 // purge 删一批（≤ PurgeBatch）created_at 早于 now − UsageRetention 的已结算明细；llm_usage_daily 与 llm_settlements 保留。

@@ -2,6 +2,7 @@ package llm_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -11,10 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"spark-cloud/internal/llm"
-	"spark-cloud/internal/platform/dbtest"
+	"spark-cloud/internal/platform/apperr"
+	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/paging"
 	"spark-cloud/internal/platform/tz"
+	"spark-cloud/internal/wallet"
 )
 
 // lockedBuf 并发安全的日志缓冲（断言有 / 无 Error 日志）。
@@ -409,6 +414,7 @@ func TestSettleDebtRepaidOnRecharge(t *testing.T) {
 
 func TestSettleMaxIDBoundary(t *testing.T) {
 	e := newEnv(t)
+	logs := e.withLogBuf()
 	m := e.createModel("qwen3-4b")
 	u, k, _ := e.settleUser(1000)
 	e.spend(u, k, m.ID, 60_000_000)
@@ -435,11 +441,14 @@ func TestSettleMaxIDBoundary(t *testing.T) {
 	if len(ss) != 1 || ss[0].Requests != 2 || ss[0].CostMicro != 120_000_000 || ss[0].Charged != 120 {
 		t.Fatalf("settlements = %+v", ss)
 	}
-	if a := e.acct(u); a.unsettled != 0 {
+	// 计数自愈：unsettled_micro 重算为剩余未结算明细之和（这一行没走 RecordUsage，与预期 0 不符 → 记 Error）
+	if a := e.acct(u); a.unsettled != 30_000_000 {
 		t.Fatalf("account = %+v", a)
 	}
-	// 模拟该写入方随后补记账户（它要等结算事务释放账户锁），下一轮结算纳入
-	e.exec(`UPDATE llm_accounts SET unsettled_micro = unsettled_micro + 30000000 WHERE user_id = $1`, u)
+	if !strings.Contains(logs.String(), "unsettled_micro mismatch") {
+		t.Fatalf("mismatch not logged:\n%s", logs.String())
+	}
+	e.invariants()
 	e.clk.Advance(llm.SettleMaxAge)
 	e.settle()
 	if err := e.pool.QueryRow(e.ctx, `SELECT settlement_id FROM llm_usage WHERE id = $1`, lateID).Scan(&sid); err != nil {
@@ -450,6 +459,136 @@ func TestSettleMaxIDBoundary(t *testing.T) {
 		t.Fatalf("second settlement = %+v (late row sid %v)", ss, sid)
 	}
 	e.invariants()
+}
+
+func TestSettleUnsettledDriftHealed(t *testing.T) {
+	e := newEnv(t)
+	logs := e.withLogBuf()
+	u, _, _ := e.settleUser(1000)
+	// 账上 ¥1.5 未结算，但没有任何明细
+	e.exec(`UPDATE llm_accounts SET unsettled_micro = 150000000 WHERE user_id = $1`, u)
+	e.settle()
+	if a := e.acct(u); a != (acctState{}) {
+		t.Fatalf("account after heal = %+v", a)
+	}
+	if n := e.queryInt(`SELECT count(*) FROM llm_settlements`); n != 0 {
+		t.Fatalf("heal wrote %d settlements", n)
+	}
+	if n := strings.Count(logs.String(), "unsettled_micro drift"); n != 1 {
+		t.Fatalf("drift logged %d times:\n%s", n, logs.String())
+	}
+	// 校正后不再是候选：再跑一轮不再记 Error
+	e.clk.Advance(llm.SettleMaxAge)
+	e.settle()
+	if n := strings.Count(logs.String(), "level=ERROR"); n != 1 {
+		t.Fatalf("errors logged %d times:\n%s", n, logs.String())
+	}
+	if b := e.balance(u); b != 1000 {
+		t.Fatalf("balance = %d", b)
+	}
+	e.invariants()
+}
+
+func TestSettleDebtOnlyDrainedBalanceLeavesNoRow(t *testing.T) {
+	e := newEnv(t)
+	m := e.createModel("qwen3-4b")
+	u, k, _ := e.settleUser(3)
+	e.spend(u, k, m.ID, 10_000_000)
+	e.clk.Advance(llm.SettleMaxAge)
+	e.settle() // 欠 7
+	e.fund(u, 5)
+	// 结算读到余额 5 之后、ApplyUpTo 锁钱包之前，另一笔扣款把余额扣光
+	llm.SetSettleBeforeMarkHook(e.svc, func(userID int64) {
+		if userID == u {
+			if err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+				_, err := e.wallet.Apply(e.ctx, tx, wallet.Entry{UserID: u, Amount: -5, Kind: wallet.KindOrderPay,
+					RefType: "test", RefID: "drain"})
+				return err
+			}); err != nil {
+				t.Fatalf("drain: %v", err)
+			}
+		}
+	})
+	e.settle()
+	llm.SetSettleBeforeMarkHook(e.svc, nil)
+	if ss := e.settlementsOf(u); len(ss) != 1 {
+		t.Fatalf("drained debt-only settlement left rows: %+v", ss)
+	}
+	if a := e.acct(u); a.debt != 7 {
+		t.Fatalf("account = %+v", a)
+	}
+	e.invariants()
+	// 再充值后正常扣
+	e.fund(u, 10)
+	e.settle()
+	if ss := e.settlementsOf(u); len(ss) != 2 || ss[1].Charged != 7 || ss[1].DebtAmount != 7 {
+		t.Fatalf("settlements = %+v", ss)
+	}
+	e.invariants()
+}
+
+func TestAdminListSettlements(t *testing.T) {
+	e := newEnv(t)
+	m := e.createModel("qwen3-4b")
+	a, ka, _ := e.settleUser(10_000)
+	b, kb, _ := e.settleUser(10_000)
+	t0 := e.clk.Now()
+	at := func(d time.Duration) time.Time { return t0.Add(d) }
+	e.spend(a, ka, m.ID, 100_000_000)
+	e.settle() // a@t0
+	e.setClock(at(time.Hour))
+	e.spend(a, ka, m.ID, 100_000_000)
+	e.spend(b, kb, m.ID, 100_000_000)
+	e.settle() // a@1h, b@1h
+	e.setClock(at(2 * time.Hour))
+	e.spend(b, kb, m.ID, 100_000_000)
+	e.settle() // b@2h
+
+	list := func(f llm.SettlementFilter, p paging.Page) ([]llm.Settlement, int) {
+		t.Helper()
+		l, total, err := e.svc.AdminListSettlements(e.ctx, f, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l, total
+	}
+	desc := func(l []llm.Settlement) string {
+		var parts []string
+		for i, x := range l {
+			if i > 0 && x.ID > l[i-1].ID {
+				t.Fatalf("not newest first: %+v", l)
+			}
+			parts = append(parts, fmt.Sprintf("%d@%s", x.UserID, x.CreatedAt.Sub(t0)))
+		}
+		return strings.Join(parts, " ")
+	}
+	all, total := list(llm.SettlementFilter{}, paging.Page{Number: 1, Size: 20})
+	if total != 4 || len(all) != 4 {
+		t.Fatalf("all: total %d, %s", total, desc(all))
+	}
+	// [From, To)：1h 两条在内，2h 那条不在
+	from, to := at(time.Hour), at(2*time.Hour)
+	got, total := list(llm.SettlementFilter{From: &from, To: &to}, paging.Page{Number: 1, Size: 20})
+	if total != 2 || len(got) != 2 || got[0].CreatedAt.Sub(t0) != time.Hour || got[1].CreatedAt.Sub(t0) != time.Hour {
+		t.Fatalf("window: total %d, %s", total, desc(got))
+	}
+	got, total = list(llm.SettlementFilter{UserID: b, From: &from}, paging.Page{Number: 1, Size: 20})
+	if total != 2 || len(got) != 2 || got[0].UserID != b || got[0].CreatedAt.Sub(t0) != 2*time.Hour {
+		t.Fatalf("user b from 1h: total %d, %s", total, desc(got))
+	}
+	got, total = list(llm.SettlementFilter{UserID: a, To: &from}, paging.Page{Number: 1, Size: 20})
+	if total != 1 || len(got) != 1 || got[0].UserID != a || !got[0].CreatedAt.Equal(t0) {
+		t.Fatalf("user a before 1h: total %d, %s", total, desc(got))
+	}
+	// 分页：总数不受页大小影响，第 2 页是更早的
+	p1, total := list(llm.SettlementFilter{UserID: a}, paging.Page{Number: 1, Size: 1})
+	p2, _ := list(llm.SettlementFilter{UserID: a}, paging.Page{Number: 2, Size: 1})
+	if total != 2 || len(p1) != 1 || len(p2) != 1 || p1[0].ID <= p2[0].ID {
+		t.Fatalf("paging: total %d, %s / %s", total, desc(p1), desc(p2))
+	}
+	if l, total := list(llm.SettlementFilter{UserID: a, From: &to}, paging.Page{Number: 1, Size: 20}); total != 0 || l == nil || len(l) != 0 {
+		t.Fatalf("empty: total %d, %v", total, l)
+	}
 }
 
 func TestSettleReplayIsNoop(t *testing.T) {
@@ -673,8 +812,49 @@ func TestSettleManyAccountsAndInvariants(t *testing.T) {
 			}
 		}
 		// 记账与两个并发 Settle（多副本无咨询锁时的最坏情况）同时进行
+		type walletOp struct {
+			user   int64
+			amount int64
+		}
+		var wops []walletOp
+		for j := r.IntN(10); j > 0; j-- {
+			amt := int64(1 + r.IntN(200))
+			if r.IntN(3) == 0 {
+				amt = -int64(1 + r.IntN(50)) // 其它业务扣款（余额不足就算了）
+			}
+			wops = append(wops, walletOp{users[r.IntN(nUsers)].id, amt})
+		}
 		var wg sync.WaitGroup
 		errs := make(chan error, nUsers+8)
+		// 钱包写入方（充值 / 扣款，只锁 wallet_accounts）与清理和结算并发
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for _, op := range wops {
+				err := db.WithTx(e.ctx, e.pool, func(tx pgx.Tx) error {
+					kind := wallet.KindRecharge
+					if op.amount < 0 {
+						kind = wallet.KindOrderPay
+					}
+					_, err := e.wallet.Apply(e.ctx, tx, wallet.Entry{UserID: op.user, Amount: op.amount, Kind: kind,
+						RefType: "test", RefID: nextReqID()})
+					return err
+				})
+				if err != nil && !errors.Is(err, apperr.ErrInsufficientBalance) {
+					errs <- err
+					return
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 3 {
+				if _, err := llm.Purge(e.ctx, e.svc); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
 		for i := range plans {
 			wg.Add(1)
 			go func(us []llm.Usage) {
@@ -705,12 +885,6 @@ func TestSettleManyAccountsAndInvariants(t *testing.T) {
 			t.Fatal(err)
 		}
 		e.invariants()
-		// 随机充值、推进时间
-		for _, us := range users {
-			if r.IntN(4) == 0 {
-				dbtest.Fund(t, e.pool, us.id, int64(1+r.IntN(200)))
-			}
-		}
 		e.clk.Advance(time.Duration(r.IntN(12)) * time.Minute)
 	}
 	e.clk.Advance(llm.SettleMaxAge)
