@@ -11,6 +11,7 @@ vi.mock('element-plus', async (importOriginal) => {
   return { ...mod, ElMessageBox: { confirm } }
 })
 
+import { beijingToday } from '../../../logic/tokens'
 import { session } from '../../../store/session'
 import TokensView from '../../../views/TokensView.vue'
 
@@ -179,17 +180,72 @@ describe('创建 Key', () => {
     await flushPromises()
     expect(confirm).toHaveBeenCalledTimes(2)
     expect(byId('tokens-key-plain')).not.toBeNull()
-    expect(dialogOpen()).toBe(true)
 
     confirm.mockResolvedValueOnce('confirm')
     await click('tokens-key-done')
     expect(dialogOpen()).toBe(false)
-    expect(byId('tokens-key-plain')).toBeNull() // 明文已清空
+    // 离场动画期间仍是明文面板（不闪回创建表单），但明文已清空
+    expect(byId('tokens-key-plain')!.textContent).toBe('')
+    expect(byId('tokens-key-name')).toBeNull()
 
     // 再次打开是空表单，没有上一次的明文
     await click('tokens-key-create')
     expect((byId('tokens-key-name') as HTMLInputElement).value).toBe('')
     expect(byId('tokens-key-plain')).toBeNull()
+  })
+
+  it('明文面板显示时离开页面要确认：取消留在原页，确认才跳转；刷新 / 关标签页触发 beforeunload 拦截', async () => {
+    await mountKeys()
+    post.mockResolvedValue({ key: PLAIN, item: key(4) })
+    await click('tokens-key-create')
+    await type('tokens-key-name', 'ci')
+    await click('tokens-key-submit')
+    expect(byId('tokens-key-plain')!.textContent).toBe(PLAIN)
+
+    const unload = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(unload)
+    expect(unload.defaultPrevented).toBe(true)
+
+    confirm.mockRejectedValueOnce('cancel')
+    await router.push('/kyc')
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(router.currentRoute.value.path).toBe('/tokens')
+    expect(byId('tokens-key-plain')!.textContent).toBe(PLAIN)
+
+    confirm.mockResolvedValueOnce('confirm')
+    await router.push('/kyc')
+    await flushPromises()
+    expect(confirm).toHaveBeenCalledTimes(2)
+    expect(router.currentRoute.value.path).toBe('/kyc')
+
+    // 组件已卸载：监听已移除，不再拦截
+    const later = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(later)
+    expect(later.defaultPrevented).toBe(false)
+  })
+
+  it('没有明文面板时离开页面不打扰；表单阶段 beforeunload 不拦截', async () => {
+    await mountKeys()
+    await click('tokens-key-create')
+    const unload = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(unload)
+    expect(unload.defaultPrevented).toBe(false)
+    await router.push('/kyc')
+    expect(confirm).not.toHaveBeenCalled()
+    expect(router.currentRoute.value.path).toBe('/kyc')
+  })
+
+  it('到期日期：原生日期框，最早今天（北京时间），选了就带 expires_at', async () => {
+    await mountKeys()
+    post.mockResolvedValue({ key: PLAIN, item: key(4) })
+    await click('tokens-key-create')
+    const input = byId('tokens-key-expires') as HTMLInputElement
+    expect(input.type).toBe('date')
+    expect(input.min).toBe(beijingToday(new Date()))
+    await type('tokens-key-name', 'ci')
+    await type('tokens-key-expires', '2099-01-31')
+    await click('tokens-key-submit')
+    expect(post).toHaveBeenCalledWith('/llm/keys', { name: 'ci', model_slugs: [], expires_at: '2099-01-31T23:59:59+08:00' })
   })
 
   it('最小输入只带名称与空模型列表（= 全部模型）', async () => {

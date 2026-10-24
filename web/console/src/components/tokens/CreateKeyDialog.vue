@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { isApiError, messageOf, type LLMKey, type LLMKeyCreated, type LLMModelPublic } from '@spark/shared'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import 'element-plus/theme-chalk/el-message-box.css' // 显式引入的 ElMessageBox 不经自动引入插件，样式自己带上
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 import { api } from '../../api'
 import AppDialog from '../AppDialog.vue'
 import { copyText } from '../../logic/clipboard'
@@ -19,7 +19,11 @@ const errors = ref<KeyFormErrors>({})
 const serverError = ref('')
 const submitting = ref(false)
 const plain = ref('') // 明文 Key：只在本次对话框里保留，关闭即清空
-const phase = computed(() => (plain.value ? 'secret' : 'form'))
+// 面板阶段单独保存：关闭时明文立即清空，但阶段保持到下次打开才重置，离场动画期间不会闪回创建表单
+const phase = ref<'form' | 'secret'>('form')
+/** 明文面板正在显示（离开页面 / 关闭对话框前要二次确认）。 */
+const secretShown = computed(() => visible.value && phase.value === 'secret' && plain.value !== '')
+const today = ref(beijingToday(new Date()))
 const isEdit = computed(() => props.editing != null)
 const title = computed(() => (phase.value === 'secret' ? 'API Key 已创建' : isEdit.value ? '编辑 API Key' : '创建 API Key'))
 
@@ -41,13 +45,11 @@ watch(
     errors.value = {}
     serverError.value = ''
     plain.value = ''
+    phase.value = 'form'
+    today.value = beijingToday(new Date())
   },
   { immediate: true },
 )
-
-// 日期选择器给的是本地零点的 Date：按本地年月日与北京时间的今天比较
-const localYmd = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-const disabledDate = (d: Date) => localYmd(d) < beijingToday(new Date())
 
 async function submit() {
   if (submitting.value) return
@@ -68,6 +70,7 @@ async function submit() {
     } else {
       const created = await api.post<LLMKeyCreated>('/llm/keys', r.body)
       plain.value = created.key
+      phase.value = 'secret'
       emit('saved')
     }
   } catch (e) {
@@ -96,9 +99,19 @@ async function closeSecret() {
   if (await confirmCloseSecret()) visible.value = false
 }
 function beforeClose(done: () => void) {
-  if (phase.value !== 'secret') return done()
+  if (!secretShown.value) return done()
   void confirmCloseSecret().then((ok) => ok && done())
 }
+
+// 明文面板显示时离开页面（站内跳转 / 刷新 / 关标签页）同样要确认，否则 Key 就丢了
+onBeforeRouteLeave(async () => !secretShown.value || (await confirmCloseSecret()))
+function onBeforeUnload(e: BeforeUnloadEvent) {
+  if (!secretShown.value) return
+  e.preventDefault()
+  e.returnValue = '' // 旧浏览器需要
+}
+onMounted(() => window.addEventListener('beforeunload', onBeforeUnload))
+onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload))
 </script>
 
 <template>
@@ -126,12 +139,9 @@ function beforeClose(done: () => void) {
         </el-input>
       </el-form-item>
       <el-form-item v-if="!isEdit" label="到期日期" :error="errors.expiresOn">
-        <el-date-picker
-          v-model="form.expiresOn" type="date" value-format="YYYY-MM-DD" placeholder="留空 = 永不过期" :disabled-date="disabledDate" clearable
-          style="width: 100%" data-testid="tokens-key-expires"
-        />
+        <input v-model="form.expiresOn" type="date" :min="today" class="el-input__inner native-date" data-testid="tokens-key-expires" />
       </el-form-item>
-      <p v-if="!isEdit" class="muted">到期日当天 23:59（北京时间）后失效；到期日创建后不能修改。</p>
+      <p v-if="!isEdit" class="muted">留空 = 永不过期；到期日当天 23:59（北京时间）后失效，创建后不能修改。</p>
       <p v-if="serverError" class="danger" data-testid="tokens-key-error">{{ serverError }}</p>
     </el-form>
     <template #footer>
@@ -149,5 +159,6 @@ function beforeClose(done: () => void) {
 .secret code { flex: 1; min-width: 0; background: #f4f4f5; padding: 8px 10px; border-radius: 4px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; font-size: 13px; }
 .muted { color: #909399; font-size: 12px; margin: 4px 0 0; }
+.native-date { height: 32px; border: 1px solid #dcdfe6; border-radius: 4px; padding: 0 8px; font-size: 14px; background: #fff; }
 .danger { color: var(--el-color-danger); font-size: 13px; }
 </style>

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { fmtDate, fmtTime, fmtYuan, messageOf, useMobile, type LLMKey, type LLMModelPublic } from '@spark/shared'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import 'element-plus/theme-chalk/el-message-box.css' // 显式引入的 ElMessageBox 不经自动引入插件，样式自己带上
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../../api'
