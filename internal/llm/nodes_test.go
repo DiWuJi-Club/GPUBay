@@ -94,6 +94,25 @@ func TestAdminNodeOps(t *testing.T) {
 	if ne.node(a.ID).State != llm.NodeFailed {
 		t.Fatal("old failed node must stay failed (not revived)")
 	}
+	if ev := ne.eventStates(a.ID); ev[len(ev)-1] != "failed>failed" {
+		t.Fatalf("replacement not recorded on the old node: %v", ev)
+	}
+	// 已被替换过：再重建 → invalid_state（即使机器之后又空出来）
+	ne.exec(`UPDATE llm_nodes SET state = 'failed' WHERE id = $1`, fresh.ID)
+	ne.setInstance(*fresh.InstanceID, rental.StateReleased)
+	placed := ne.rental.placeCount()
+	if _, err := ne.svc.AdminRebuildNode(ne.ctx, actor, a.ID); !errors.Is(err, apperr.ErrLLMNodeInvalidState) {
+		t.Fatalf("rebuild of an already replaced node: %v", err)
+	}
+	// 没有缺额：→ invalid_state，且不碰 rental
+	ne.exec(`UPDATE llm_models SET replicas = 0 WHERE id = $1`, m.ID)
+	if _, err := ne.svc.AdminRebuildNode(ne.ctx, actor, fresh.ID); !errors.Is(err, apperr.ErrLLMNodeInvalidState) {
+		t.Fatalf("rebuild without deficit: %v", err)
+	}
+	if ne.rental.placeCount() != placed {
+		t.Fatal("PlaceSystem called for a rejected rebuild")
+	}
+	ne.exec(`UPDATE llm_models SET replicas = 2 WHERE id = $1`, m.ID)
 	// failed → remove → removed
 	got, err = ne.svc.AdminRemoveNode(ne.ctx, actor, a.ID, "清理")
 	if err != nil || got.State != llm.NodeRemoved {

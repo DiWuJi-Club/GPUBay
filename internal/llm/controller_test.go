@@ -366,8 +366,19 @@ func TestControllerOfflineModelScalesToZero(t *testing.T) {
 	if rep.Drained != 2 || rep.Provisioned != 0 {
 		t.Fatalf("report %+v", rep)
 	}
+	// 同一轮不释放：在途 0 要等 drain_since + 2 × RouterRefresh 之后才可信
+	if ne.countState(m.ID, llm.NodeDraining) != 2 || len(ne.rental.releasedIDs()) != 0 {
+		t.Fatalf("released in the drain tick: %v", ne.rental.releasedIDs())
+	}
+	ne.clk.Advance(2*llm.RouterRefresh - time.Second)
+	ne.tick()
+	if len(ne.rental.releasedIDs()) != 0 {
+		t.Fatal("released before 2 × RouterRefresh")
+	}
+	ne.clk.Advance(time.Second)
+	ne.tick()
 	for _, n := range nodes {
-		if got := ne.node(n.ID); got.State != llm.NodeRemoving { // 在途 0：同一轮排空即释放
+		if got := ne.node(n.ID); got.State != llm.NodeRemoving {
 			t.Fatalf("node %s state %s", n.ID, got.State)
 		}
 		ne.setInstance(*n.InstanceID, rental.StateReleased)
@@ -522,5 +533,162 @@ func TestControllerRunOnceTakesAdvisoryLock(t *testing.T) {
 	}
 	if ran, err := ne.ctl.RunOnce(context.Background()); !ran || err != nil || ne.rental.placeCount() != 1 {
 		t.Fatalf("ran %v err %v place %d", ran, err, ne.rental.placeCount())
+	}
+	// RunOnce 之后锁已释放：别的连接立即能拿到
+	var got bool
+	if err := conn.QueryRow(ne.ctx, `SELECT pg_try_advisory_lock(hashtext('llm-controller'))`).Scan(&got); err != nil || !got {
+		t.Fatalf("lock still held after RunOnce: %v %v", got, err)
+	}
+	if _, err := conn.Exec(ne.ctx, `SELECT pg_advisory_unlock(hashtext('llm-controller'))`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 排空前网关已选中节点（PickAcquire）：请求结束前不释放；路由表刷新后不再选它。
+func TestControllerDrainWaitsForRequestPickedBeforeDrain(t *testing.T) {
+	ne := newNodeEnv(t)
+	ne.poolMachine("W1")
+	m := ne.onlineModel("qwen3-4b", 1)
+	ne.tick()
+	n := ne.bringReady(m.ID)[0]
+	r := ne.svc.Router()
+	if err := r.Refresh(ne.ctx); err != nil {
+		t.Fatal(err)
+	}
+	picked, release, err := r.PickAcquire(m.ID, 1, nil)
+	if err != nil || picked.ID != n.ID {
+		t.Fatalf("PickAcquire %v %v", picked.ID, err)
+	}
+	ne.exec(`UPDATE llm_models SET replicas = 0 WHERE id = $1`, m.ID)
+	ne.tick()
+	if ne.node(n.ID).State != llm.NodeDraining {
+		t.Fatal("not draining")
+	}
+	if _, _, err := r.PickAcquire(m.ID, 2, nil); err == nil {
+		t.Fatal("router still routes to a draining node after the controller refreshed it")
+	}
+	ne.clk.Advance(10 * time.Second)
+	ne.tick()
+	if len(ne.rental.releasedIDs()) != 0 {
+		t.Fatal("released while the picked request is in flight")
+	}
+	release()
+	ne.tick()
+	if ne.node(n.ID).State != llm.NodeRemoving || len(ne.rental.releasedIDs()) != 1 {
+		t.Fatalf("after request ended: %s %v", ne.node(n.ID).State, ne.rental.releasedIDs())
+	}
+}
+
+// 重建循环里的 provisioning 失败（部署 failed / 超时）回到 unhealthy，继续重建直到 MaxRebuilds 后 failed + 严重告警。
+func TestControllerRebuildLoopThroughProvisioningFailures(t *testing.T) {
+	ne := newNodeEnv(t)
+	ne.poolMachine("RB1")
+	m := ne.onlineModel("qwen3-4b", 1)
+	ne.tick()
+	n := ne.bringReady(m.ID)[0]
+	dep := *n.DeploymentID
+	ne.exec(`UPDATE llm_nodes SET state = 'unhealthy', unhealthy_since = $2 WHERE id = $1`, n.ID, ne.clk.Now())
+	for round := 1; round <= llm.MaxRebuilds; round++ {
+		ne.clk.Advance(llm.UnhealthyRebuildAfter)
+		ne.tick()
+		got := ne.node(n.ID)
+		if got.State != llm.NodeProvisioning || got.RebuildCount != round {
+			t.Fatalf("round %d: %+v", round, got)
+		}
+		if round%2 == 1 { // 部署失败
+			ne.setDeployment(dep, appdeploy.StateFailed, appdeploy.HealthUnknown, appdeploy.ErrCodeScriptFailed)
+		} else { // 一直起不来：超时
+			ne.clk.Advance(llm.ProvisionTimeout + time.Minute)
+		}
+		ne.tick()
+		got = ne.node(n.ID)
+		if got.State != llm.NodeUnhealthy || got.UnhealthySince == nil || !got.UnhealthySince.Equal(ne.clk.Now()) {
+			t.Fatalf("round %d: provisioning failure should go back to unhealthy: %+v", round, got)
+		}
+		if round%2 == 0 {
+			ne.setDeployment(dep, appdeploy.StateFailed, appdeploy.HealthUnknown, appdeploy.ErrCodeTimeout)
+		}
+	}
+	ne.clk.Advance(llm.UnhealthyRebuildAfter)
+	ne.tick()
+	if got := ne.node(n.ID); got.State != llm.NodeFailed {
+		t.Fatalf("after %d rebuilds: %s", llm.MaxRebuilds, got.State)
+	}
+	if c := ne.queryInt(`SELECT count(*) FROM alerts WHERE kind = $1 AND level = 'critical' AND message = $2`,
+		llm.AlertNodeFailed, "节点 "+n.ID+"（qwen3-4b）多次重建失败"); c != 1 {
+		t.Fatalf("critical alerts %d", c)
+	}
+	if !slices.Contains(ne.rental.releasedIDs(), *n.InstanceID) {
+		t.Fatal("instance not released")
+	}
+	if len(ne.apps.redeployCalls()) != llm.MaxRebuilds {
+		t.Fatalf("redeploys %d", len(ne.apps.redeployCalls()))
+	}
+}
+
+// 首次建节点失败：failed + warning 告警（文案稳定，同类只一条）。
+func TestControllerFirstProvisionFailureAlertsOnce(t *testing.T) {
+	ne := newNodeEnv(t)
+	ne.poolMachine("F1")
+	ne.poolMachine("F2")
+	m := ne.onlineModel("qwen3-4b", 2)
+	ne.tick()
+	for _, n := range ne.nodesOf(m.ID) {
+		ne.setInstance(*n.InstanceID, rental.StateFailed)
+	}
+	if rep := ne.tick(); rep.Failed != 2 {
+		t.Fatalf("report %+v", rep)
+	}
+	if c := ne.queryInt(`SELECT count(*) FROM alerts WHERE kind = $1 AND level = 'warning' AND message = '节点部署失败，详情见后台节点页'`,
+		llm.AlertNodeFailed); c != 1 {
+		t.Fatalf("warning alerts %d", c)
+	}
+}
+
+func TestControllerUnhealthyFailsOnRemovedDeploymentStoppedInstanceOrRedeployRejected(t *testing.T) {
+	ne := newNodeEnv(t)
+	for _, s := range []string{"G1", "G2", "G3"} {
+		ne.poolMachine(s)
+	}
+	m := ne.onlineModel("qwen3-4b", 3)
+	ne.tick()
+	nodes := ne.bringReady(m.ID)
+	a, b, c := nodes[0], nodes[1], nodes[2]
+	ne.exec(`UPDATE llm_nodes SET state = 'unhealthy', unhealthy_since = $1`, ne.clk.Now())
+	ne.setDeployment(*a.DeploymentID, appdeploy.StateRemoved, appdeploy.HealthUnknown, "")
+	ne.setInstance(*b.InstanceID, rental.StateStopped)
+	ne.tick() // 不等 10 分钟
+	if ne.node(a.ID).State != llm.NodeFailed || ne.node(b.ID).State != llm.NodeFailed || ne.node(c.ID).State != llm.NodeUnhealthy {
+		t.Fatalf("a %s b %s c %s", ne.node(a.ID).State, ne.node(b.ID).State, ne.node(c.ID).State)
+	}
+	// c：Redeploy 被业务拒绝（apperr）→ failed + 严重告警，错误进 node.error
+	ne.apps.redeployErr = apperr.ErrAppUnavailable
+	ne.clk.Advance(llm.UnhealthyRebuildAfter)
+	ne.tick()
+	got := ne.node(c.ID)
+	if got.State != llm.NodeFailed || !strings.Contains(got.Error, apperr.ErrAppUnavailable.Message) || got.RebuildCount != 0 {
+		t.Fatalf("c %+v", got)
+	}
+	if n := ne.queryInt(`SELECT count(*) FROM alerts WHERE kind = $1 AND level = 'critical' AND message = $2`,
+		llm.AlertNodeFailed, "节点 "+c.ID+"（qwen3-4b）重建失败"); n != 1 {
+		t.Fatalf("critical alerts %d", n)
+	}
+}
+
+// Create 撞 app_exists（上次 Create 成功但没记下 deployment_id）：认领实例上现有的 vllm-node 部署。
+func TestControllerAdoptsExistingDeployment(t *testing.T) {
+	ne := newNodeEnv(t)
+	ne.poolMachine("AD1")
+	m := ne.onlineModel("qwen3-4b", 1)
+	ne.tick()
+	n := ne.nodesOf(m.ID)[0]
+	ne.setInstance(*n.InstanceID, rental.StateRunning)
+	prior, err := ne.apps.Create(ne.ctx, appdeploy.CreateRequest{UserID: ne.systemUserID, InstanceID: *n.InstanceID, AppID: ne.appID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ne.tick()
+	if got := ne.node(n.ID); got.DeploymentID == nil || *got.DeploymentID != prior.ID || got.State != llm.NodeProvisioning {
+		t.Fatalf("not adopted: %+v", got)
 	}
 }

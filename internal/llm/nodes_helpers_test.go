@@ -151,8 +151,9 @@ type fakeApps struct {
 	e  *env
 	mu sync.Mutex
 
-	creates   []appdeploy.CreateRequest
-	redeploys []appdeploy.RedeployRequest
+	creates     []appdeploy.CreateRequest
+	redeploys   []appdeploy.RedeployRequest
+	redeployErr error // 非 nil：Redeploy 直接返回它
 }
 
 func (f *fakeApps) Create(ctx context.Context, req appdeploy.CreateRequest) (appdeploy.Deployment, error) {
@@ -162,6 +163,14 @@ func (f *fakeApps) Create(ctx context.Context, req appdeploy.CreateRequest) (app
 	ver := f.e.versionID
 	if req.VersionID != nil {
 		ver = *req.VersionID
+	}
+	var exists bool
+	if err := f.e.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM app_deployments WHERE instance_id = $1 AND app_id = $2
+		AND state NOT IN ('removed', 'lost'))`, req.InstanceID, req.AppID).Scan(&exists); err != nil {
+		return appdeploy.Deployment{}, err
+	}
+	if exists {
+		return appdeploy.Deployment{}, apperr.ErrAppExists
 	}
 	env, _ := json.Marshal(req.Env)
 	id := randx.ID("dep-", 12)
@@ -177,7 +186,11 @@ func (f *fakeApps) Create(ctx context.Context, req appdeploy.CreateRequest) (app
 func (f *fakeApps) Redeploy(ctx context.Context, req appdeploy.RedeployRequest) (appdeploy.Deployment, error) {
 	f.mu.Lock()
 	f.redeploys = append(f.redeploys, req)
+	rerr := f.redeployErr
 	f.mu.Unlock()
+	if rerr != nil {
+		return appdeploy.Deployment{}, rerr
+	}
 	d, err := f.Get(ctx, req.DeploymentID)
 	if err != nil {
 		return d, err
@@ -206,6 +219,26 @@ func (f *fakeApps) Get(ctx context.Context, id string) (appdeploy.Deployment, er
 		err = json.Unmarshal(env, &d.Env)
 	}
 	return d, err
+}
+
+func (f *fakeApps) ListLive(ctx context.Context, instanceID string) ([]appdeploy.Deployment, error) {
+	rows, err := f.e.pool.Query(ctx, `SELECT id FROM app_deployments WHERE instance_id = $1 AND state NOT IN ('removed', 'lost') ORDER BY created_at, id`, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
+	}
+	var out []appdeploy.Deployment
+	for _, id := range ids {
+		d, err := f.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, nil
 }
 
 func (f *fakeApps) Events(ctx context.Context, id string, limit int) ([]appdeploy.Event, error) {
