@@ -26,6 +26,7 @@ const (
 	WriteToolTimeout = 30 * time.Second
 	ConfirmTTL       = 10 * time.Minute // 确认卡有效期
 	StaleRunAfter    = 3 * time.Minute  // running 超过该时长视为副本崩溃，清扫器接管
+	SettingsCacheTTL = 10 * time.Second // butler_settings 进程内缓存时长（其它副本最多这么久后看到后台修改）
 )
 
 // butler_settings 的默认值与取值范围（与迁移 00025 的 DEFAULT / CHECK 一致）。
