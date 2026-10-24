@@ -1,4 +1,4 @@
-import { centsToYuanInput, formatTokens, type LLMModelPublic } from '@spark/shared'
+import { centsToYuanInput, fmtDate, fmtYuan, formatTokens, labelOf, llmKeyStatusLabel, yuanToCents, type LLMKey, type LLMKeyInput, type LLMModelPublic } from '@spark/shared'
 
 // 计划 9：Token 商城（/tokens）的纯逻辑。价格单位「分 / 百万 token」，费用 cost_micro「微分」（1 分 = 10^6 微分）。
 
@@ -113,4 +113,77 @@ export const llmErrorHelp: Record<string, string> = {
   upstream_error: '模型节点出错，本次不收费，可直接重试',
   model_unavailable: '模型暂无可用节点，请稍后再试',
   server_overloaded: '模型节点繁忙，按响应头 Retry-After 稍后重试',
+}
+
+// ---- API Keys（Task 18）----
+
+/** Key 名称最多 32 个字符（按 Unicode 码点计，与后端 utf8.RuneCountInString 一致）。 */
+export const KEY_NAME_MAX = 32
+/** 月上限最大 100 万元（分）。 */
+export const MONTHLY_CAP_MAX_FEN = 100_000_000
+
+/** 创建 / 编辑 Key 对话框的表单。monthlyCap 是元字符串（空 = 不限）；expiresOn 是北京时间日期 YYYY-MM-DD（空 = 永不过期）。 */
+export interface KeyForm {
+  name: string
+  modelSlugs: string[]
+  monthlyCap: string
+  expiresOn: string
+}
+export type KeyFormErrors = Partial<Record<keyof KeyForm, string>>
+
+export const emptyKeyForm = (): KeyForm => ({ name: '', modelSlugs: [], monthlyCap: '', expiresOn: '' })
+
+/** 编辑表单回填：月上限分 → 元字符串（不做除法）。到期日不可编辑，留空。 */
+export function keyFormOf(k: LLMKey): KeyForm {
+  return { name: k.name, modelSlugs: [...k.model_slugs], monthlyCap: k.monthly_cap == null ? '' : centsToYuanInput(k.monthly_cap), expiresOn: '' }
+}
+
+/** 月上限（元字符串）→ 分：空 = 不限（null）；按十进制字符串换算（yuanToCents），不做浮点乘法。 */
+export function monthlyCapYuanToFen(input: string): { fen: number | null } | { error: string } {
+  if (input.trim() === '') return { fen: null }
+  const fen = yuanToCents(input)
+  if (fen == null || fen <= 0) return { error: '月上限须大于 0，最多两位小数' }
+  if (fen > MONTHLY_CAP_MAX_FEN) return { error: `月上限不能超过 ${fmtYuan(MONTHLY_CAP_MAX_FEN)}` }
+  return { fen }
+}
+
+const ymdRe = /^\d{4}-\d{2}-\d{2}$/
+
+/** 北京时间的「今天」YYYY-MM-DD（日期选择器禁用今天之前的日期、校验到期日用）。 */
+export const beijingToday = (now: Date): string => fmtDate(now)
+
+/**
+ * 校验 Key 表单并生成请求体。
+ * create：POST /llm/keys 的 LLMKeyInput——月上限、到期日为空时不带；到期日取北京时间当天 23:59:59（今天可选）。
+ * edit：PUT /llm/keys/{id} 的字段（名称 / 模型 / 月上限）；清空月上限发 monthly_cap: null；到期日不可改，不带。
+ */
+export function validateKeyInput(f: KeyForm, now: Date, mode: 'create' | 'edit' = 'create'): { body: LLMKeyInput } | { errors: KeyFormErrors } {
+  const errors: KeyFormErrors = {}
+  const name = f.name.trim()
+  if (name === '') errors.name = '请填写名称'
+  else if ([...name].length > KEY_NAME_MAX) errors.name = `名称最多 ${KEY_NAME_MAX} 个字符`
+  const cap = monthlyCapYuanToFen(f.monthlyCap)
+  if ('error' in cap) errors.monthlyCap = cap.error
+  const expiresOn = f.expiresOn.trim()
+  if (mode === 'create' && expiresOn !== '') {
+    if (!ymdRe.test(expiresOn)) errors.expiresOn = '日期格式不正确'
+    else if (expiresOn < beijingToday(now)) errors.expiresOn = '到期日期不能早于今天'
+  }
+  if (Object.keys(errors).length > 0 || 'error' in cap) return { errors }
+
+  const body: LLMKeyInput = { name, model_slugs: [...new Set(f.modelSlugs)] }
+  if (mode === 'edit') body.monthly_cap = cap.fen
+  else {
+    if (cap.fen != null) body.monthly_cap = cap.fen
+    if (expiresOn !== '') body.expires_at = `${expiresOn}T23:59:59+08:00`
+  }
+  return { body }
+}
+
+/** 表格「状态」列：撤销 / 停用按状态；启用但已过 expires_at 显示「已过期」。 */
+export function keyStatusTag(k: LLMKey, now: Date): { label: string; type: 'success' | 'warning' | 'info' | 'danger' } {
+  if (k.status === 'revoked') return { label: labelOf(llmKeyStatusLabel, 'revoked'), type: 'info' }
+  if (k.status === 'disabled') return { label: labelOf(llmKeyStatusLabel, 'disabled'), type: 'warning' }
+  if (k.expires_at && new Date(k.expires_at).getTime() <= now.getTime()) return { label: '已过期', type: 'danger' }
+  return { label: labelOf(llmKeyStatusLabel, k.status), type: 'success' }
 }

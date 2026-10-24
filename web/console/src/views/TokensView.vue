@@ -3,6 +3,7 @@ import { messageOf, type LLMModelPublic, type LLMModelsResponse } from '@spark/s
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
+import KeysTab from '../components/tokens/KeysTab.vue'
 import LoginPrompt from '../components/tokens/LoginPrompt.vue'
 import ModelsTab from '../components/tokens/ModelsTab.vue'
 import QuickStartTab from '../components/tokens/QuickStartTab.vue'
@@ -53,10 +54,10 @@ onMounted(loadModels)
         <ModelsTab v-else :models="models" />
       </el-tab-pane>
 
-      <el-tab-pane name="keys">
+      <!-- 已登录时 lazy：第一次打开该 Tab 才挂载 KeysTab、请求 /llm/keys -->
+      <el-tab-pane name="keys" :lazy="authed">
         <template #label><span data-testid="tokens-tab-keys">API Keys</span></template>
-        <!-- 已登录内容：计划 9 Task 18（KeysTab） -->
-        <el-empty v-if="authed" description="即将开放" data-testid="tokens-keys-pane" />
+        <KeysTab v-if="authed" :models="models" data-testid="tokens-keys-pane" />
         <LoginPrompt v-else />
       </el-tab-pane>
 
