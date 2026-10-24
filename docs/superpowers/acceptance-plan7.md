@@ -32,6 +32,7 @@
 - 清单第 10 步的「1.0.2」顺延为 **1.0.3**（新增 `NOTE` 变量）。
 - 1.0.2 和 1.0.3 是验收专用版本，验收结束后已下线（`retired`）。vLLM 当前最新的已发布版本是 1.0.1。
 - 1.0.0 仍处于发布状态，按原样部署会触发 A-1。Task 23 若要部署 vLLM，请选 1.0.1。
+- 2026-10-24 复测时导入并发布 **1.0.4**（A-1～A-4 修复后的版本），1.0.0、1.0.1 已下线。vLLM 当前唯一的已发布版本是 1.0.4。
 
 ### 1. 镜像登记与缓存上报（§16.4.1 后半）——通过
 
@@ -256,14 +257,14 @@
 
 | 编号 | 现象 | 复现 | 原因（初判） | 严重度 | 修复 |
 |---|---|---|---|---|---|
-| A-1 | 平台起的应用进程里没有镜像的 Docker `ENV`。vLLM 1.0.0 启动时 Triton JIT 报 `cuda.h: No such file or directory`，部署 `failed(health_failed)`「服务进程已退出」。 | 在 `spark/llm-serving:25.09` 实例上部署 vllm 1.0.0（任意模型）→ 下载完成后约 1 分钟失败。对照 `docker exec <ctr> cat /proc/$(cat /root/data/.spark-apps/jupyterlab/service.pid)/environ`：只有精简的 `PATH`，没有 `CUDA_HOME / LD_LIBRARY_PATH / TRITON_* / NVIDIA_*`；`docker inspect` 里这些变量都在。 | `run.sh` 由平台经实例 sshd（上游 SSH exec）执行，sshd 会话不继承容器 ENV，`/.spark/init.sh` 也没有导出。Task 15 在真机上的验证大概率走的是 `docker exec`（继承 ENV），所以没发现。JupyterLab 和用户 SSH 会话同样缺这些变量，可能影响 Triton / torch.compile 等。 | 高（推理应用默认版本不可用） | 已修（`32fdfa3`），待真机复测：Agent init.sh 在 exec sshd 前把入口环境拷到 `/run/spark-image.environ`（`/proc/1/environ` 会被 sshd 的进程标题覆盖，不能用）；Runner 部署前读取、过滤后随包下发 `image.env`（0600），`run.sh` 先加载它再加载 `env`。需要新 Agent，且实例容器要在升级后创建或重启过。vLLM 1.0.4 不再带临时 export。原建议：建议：Agent / `init.sh` 启动时把容器 ENV 落成文件（例如 `/.spark/env`，0644，只放镜像 ENV），`run.sh` 在 source `env` 之前先 source 它；或在 sshd 配置 `SetEnv` / `PermitUserEnvironment`。修好后 vLLM 1.0.0 里的临时 export（1.0.1）即可去掉。 |
-| A-2 | Open WebUI 默认设置下对话失败，页面显示 `"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`（vLLM 返回 400）。 | 同一实例部署 vllm（1.0.1）+ open-webui 1.0.0 → 注册 → 选 Qwen3-4B / 8B 发任意消息。 | `llm-serving` 镜像的 Open WebUI 没锁版本，实装 0.12.3，默认 `function_calling = native` 并带内置工具，请求里有 `tool_choice: auto`；vLLM 的 `app.sh` 没开 `--enable-auto-tool-choice --tool-call-parser hermes`。 | 高（§16.4 第 4 项的核心路径失败） | 已修（`5d07e8e`），待真机复测：vLLM 1.0.4 加 `--enable-auto-tool-choice --tool-call-parser hermes`，`llm-serving` Dockerfile 锁 `open-webui==0.12.3`。原建议：建议：vLLM `app.sh` 加 `--enable-auto-tool-choice --tool-call-parser hermes`（Qwen3 适用），同时在 Dockerfile 里锁定 Open WebUI 版本。验收中的规避：把用户设置 `function_calling` 设为 `legacy`，对话成功。 |
-| A-3 | 规格 §16.4 第 11 项「Agent 停 + `docker stop` → 10 轮后 `failed(unreachable)`、告警一条」无法发生：Agent 失联满 5 分钟后实例被暂停，Runner 跳过轮询（§6.3），计数停在 7～8；Agent 恢复后会立刻拉起容器，三个部署走 `alive=0` 变成 `failed(crashed)`，需要逐个重新部署。 | 按 brief 第 9 步顺序：先 `systemctl stop spark-agent`，约 2 分钟后 `docker stop`，等 10 分钟。 | 验收清单与 §6.3「机器失联跳过轮询」冲突（10 轮 × 30 秒 ≈ Agent 失联判定的 5 分钟）。Agent 在线时只停容器，unreachable 路径和告警都正确（做法 2）。 | 中（规格 / 清单不一致；产品行为符合 §6.3） | 已修（规格 §16.4 第 11、13 项与计划 Task 22 第 9 步改为两个场景分开验证），待复测。原建议：建议改清单：先只 `docker stop`（Agent 在线）验证 unreachable，再单独验证 Agent 停机期间轮询照常。暂停期间应用进程被 Agent 重启容器后需要手工重新部署，已在 Task 10 的遗留里登记，可考虑恢复时把 crashed 自动重新排队。 |
-| A-4 | vLLM 行主按钮「打开」打开的是端口根路径，vLLM 返回 `{"detail":"Not Found"}`。 | vLLM running → 实例详情点「打开」。 | 控制台把 `url`（主端口根）作为「打开」目标；spec 里端口的 `path: "/v1"` 没有用上，`links` 只放在「链接」下拉里。 | 低（「链接 → 接口文档」可用） | 已修（`4c6c998`、`5d07e8e`），待真机复测：部署视图的 `url`（「打开」、列表摘要）= 主端口 URL + `ports[0].path`，vLLM 的 `ports[0].path` 改为 `/docs`。原建议：建议：有 `ports[0].path` 时把它拼进 `url`，或在根路径 404 的应用上默认打开第一个 `links`（vLLM 填 `/docs`）。 |
+| A-1 | 平台起的应用进程里没有镜像的 Docker `ENV`。vLLM 1.0.0 启动时 Triton JIT 报 `cuda.h: No such file or directory`，部署 `failed(health_failed)`「服务进程已退出」。 | 在 `spark/llm-serving:25.09` 实例上部署 vllm 1.0.0（任意模型）→ 下载完成后约 1 分钟失败。对照 `docker exec <ctr> cat /proc/$(cat /root/data/.spark-apps/jupyterlab/service.pid)/environ`：只有精简的 `PATH`，没有 `CUDA_HOME / LD_LIBRARY_PATH / TRITON_* / NVIDIA_*`；`docker inspect` 里这些变量都在。 | `run.sh` 由平台经实例 sshd（上游 SSH exec）执行，sshd 会话不继承容器 ENV，`/.spark/init.sh` 也没有导出。Task 15 在真机上的验证大概率走的是 `docker exec`（继承 ENV），所以没发现。JupyterLab 和用户 SSH 会话同样缺这些变量，可能影响 Triton / torch.compile 等。 | 高（推理应用默认版本不可用） | 已修（`32fdfa3`），**2026-10-24 真机复测通过**（见「复测」第 1、2、5、6、10 项）：Agent init.sh 在 exec sshd 前把入口环境拷到 `/run/spark-image.environ`（`/proc/1/environ` 会被 sshd 的进程标题覆盖，不能用）；Runner 部署前读取、过滤后随包下发 `image.env`（0600），`run.sh` 先加载它再加载 `env`。需要新 Agent，且实例容器要在升级后创建或重启过。vLLM 1.0.4 不再带临时 export。原建议：建议：Agent / `init.sh` 启动时把容器 ENV 落成文件（例如 `/.spark/env`，0644，只放镜像 ENV），`run.sh` 在 source `env` 之前先 source 它；或在 sshd 配置 `SetEnv` / `PermitUserEnvironment`。修好后 vLLM 1.0.0 里的临时 export（1.0.1）即可去掉。 |
+| A-2 | Open WebUI 默认设置下对话失败，页面显示 `"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`（vLLM 返回 400）。 | 同一实例部署 vllm（1.0.1）+ open-webui 1.0.0 → 注册 → 选 Qwen3-4B / 8B 发任意消息。 | `llm-serving` 镜像的 Open WebUI 没锁版本，实装 0.12.3，默认 `function_calling = native` 并带内置工具，请求里有 `tool_choice: auto`；vLLM 的 `app.sh` 没开 `--enable-auto-tool-choice --tool-call-parser hermes`。 | 高（§16.4 第 4 项的核心路径失败） | 已修（`5d07e8e`），**真机复测通过**（复测第 4 项）：vLLM 1.0.4 加 `--enable-auto-tool-choice --tool-call-parser hermes`，`llm-serving` Dockerfile 锁 `open-webui==0.12.3`。原建议：建议：vLLM `app.sh` 加 `--enable-auto-tool-choice --tool-call-parser hermes`（Qwen3 适用），同时在 Dockerfile 里锁定 Open WebUI 版本。验收中的规避：把用户设置 `function_calling` 设为 `legacy`，对话成功。 |
+| A-3 | 规格 §16.4 第 11 项「Agent 停 + `docker stop` → 10 轮后 `failed(unreachable)`、告警一条」无法发生：Agent 失联满 5 分钟后实例被暂停，Runner 跳过轮询（§6.3），计数停在 7～8；Agent 恢复后会立刻拉起容器，三个部署走 `alive=0` 变成 `failed(crashed)`，需要逐个重新部署。 | 按 brief 第 9 步顺序：先 `systemctl stop spark-agent`，约 2 分钟后 `docker stop`，等 10 分钟。 | 验收清单与 §6.3「机器失联跳过轮询」冲突（10 轮 × 30 秒 ≈ Agent 失联判定的 5 分钟）。Agent 在线时只停容器，unreachable 路径和告警都正确（做法 2）。 | 中（规格 / 清单不一致；产品行为符合 §6.3） | 已修（规格 §16.4 第 11、13 项与计划 Task 22 第 9 步改为两个场景分开验证），**按新清单复测通过**（复测第 9 项）。原建议：建议改清单：先只 `docker stop`（Agent 在线）验证 unreachable，再单独验证 Agent 停机期间轮询照常。暂停期间应用进程被 Agent 重启容器后需要手工重新部署，已在 Task 10 的遗留里登记，可考虑恢复时把 crashed 自动重新排队。 |
+| A-4 | vLLM 行主按钮「打开」打开的是端口根路径，vLLM 返回 `{"detail":"Not Found"}`。 | vLLM running → 实例详情点「打开」。 | 控制台把 `url`（主端口根）作为「打开」目标；spec 里端口的 `path: "/v1"` 没有用上，`links` 只放在「链接」下拉里。 | 低（「链接 → 接口文档」可用） | 已修（`4c6c998`、`5d07e8e`），**真机复测通过**（复测第 3 项）：部署视图的 `url`（「打开」、列表摘要）= 主端口 URL + `ports[0].path`，vLLM 的 `ports[0].path` 改为 `/docs`。原建议：建议：有 `ports[0].path` 时把它拼进 `url`，或在根路径 404 的应用上默认打开第一个 `links`（vLLM 填 `/docs`）。 |
 
 ### 观察（列入遗留）
 
-O-3、O-4、O-5、O-7 已修（`5d07e8e`、`ee03e67`、`042bb40`），其余见 `followups-plan7.md`。
+O-3、O-4、O-5、O-7 已修（`5d07e8e`、`ee03e67`、`042bb40`），2026-10-24 真机复测通过（复测第 7、8、9 项）；其余见 `followups-plan7.md`。
 
 - **O-1**：本地 tag 镜像（`spark/*:25.09`）每次登记或发布版本都会广播 `pull_image`，Docker Hub 不可达导致每次都失败。本次共 11 条 failed 指令，后台机器详情的指令列表一片红。可考虑「机器已缓存该 ref 时不下发 pull」。
 - **O-2**：平台日志没有部署生命周期的 INFO 行（只有 unreachable 的 WARN）。排障依赖库里的事件表和后台页面。
@@ -276,3 +277,208 @@ O-3、O-4、O-5、O-7 已修（`5d07e8e`、`ee03e67`、`042bb40`），其余见 
 - **O-9**：验收中途开发 Mac 休眠 / 会话暂停（05:50～10:18）。醒来时平台出现 `upstream keepalive failed` 和 `appdeploy runner tick … context deadline exceeded`，以及一条 `machine_offline` 告警（id 14）。之后自愈，部署状态没有被误判。属于环境因素，仅记录。
 - **O-10**：释放实例会洗掉数据盘，模型缓存随之清空。Task 23 的 ComfyUI 和卸载重装需要在新实例上重新下载（在 Spark 上的实例容器里下载）。
 - **O-11**：清单写「添加按钮禁用」，实际是达到上限后按钮隐藏、显示上限文字；API 上 `app_limit` 先于 `app_exists`。两者都能达到提示目的。
+
+## 复测：A-1～A-4 与 O-3 / O-4 / O-5 / O-7 的修复（2026-10-24）
+
+- 日期：2026-10-24 21:23～22:25。
+- 机器：同验收 A（`spark-3479`，B-01，machine 1）。
+- Agent：从 `feat/plan7-deploy` HEAD `9f0e8f0` 用 `make agent` 构建。SHA-256 为 `13bc98a7dcda8be7f5511f77edf56585c32430991b9a0127d50ceb78c8ff1ef0`，与 Spark 上的 `/usr/local/bin/spark-agent` 和 `.devdata/dl` 一致；后台 `agent_version = 9f0e8f0`，`connected = true`。安装由负责人 sudo 执行（`install -m 755` + `systemctl restart spark-agent`）。
+- 平台：`.devdata/platform-p7` 用 `9f0e8f0` 重新构建（先 `make web`），环境变量同验收 A，`SPARK_AGENT_BINARY_SHA256` 改为上面的新值。开发库 :5433（`make devdb`），迁移版本 20。
+- 应用目录：只导入 vllm（`deploy/apps/vllm` 拷到临时目录再 `platform admin app import`），得到 draft **1.0.4**；后台接口发布（动态码），覆盖率 `prepull_machines 1`；1.0.0、1.0.1 改为 `retired`。
+- 控制台用户 13800000221。余额 ¥224.00，mock 充值 ¥500.00，本次四笔 ¥69（三次下单 + 一次续费）后为 ¥448.00。
+- 页面操作用 Playwright 驱动真实 Chrome（`--host-resolver-rules` 把 `*.sslip.io` 指到 Mac），控制台登录态来自真实 `/auth/login`。截图在本次会话 scratchpad 的 `shots/r*.png`、`shots/b*.png`（不入库）。
+- 实例：
+  - `ins-q9x06yz0`（PyTorch）：**在升级 Agent 之前**创建，用于第 10 项。
+  - `ins-y4b87drm`（LLM Serving，预装 vLLM 1.0.4）：第 1～9 项。
+- 所有模型都在 Spark 的实例容器里下载，Mac 上没有下载任何模型或镜像。
+- 结论：10 项**全部通过**。复测中发现 1 个新缺陷 **A-5**（Open WebUI 启动卡在下载向量模型，环境变化引起），已修复并在真机上复测通过。
+
+### 1. 新实例上 vLLM 1.0.4 不加规避直接 running（A-1）——通过
+
+- 21:27:12 下单（`image_id` = LLM Serving，`app_id` = vllm，`MODEL_ID = Qwen/Qwen3-4B`，生成的 `API_KEY`）。21:27:18 实例 running。
+- 下载 21:27:32～21:31:50（7.6GB，约 30MB/s），21:32:04 进入健康检查，**21:33:53 running**。从下单到可用约 6 分 40 秒，没有任何规避。
+- `docker exec` 读 `/proc/$(cat service.pid)/environ`（vLLM API server 进程）：
+  - 有 `CUDA_HOME=/usr/local/cuda`、`LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib:…`。
+  - 有全部 `TRITON_*`：`TRITON_PTXAS_PATH`、`TRITON_CUOBJDUMP_PATH`、`TRITON_NVDISASM_PATH`、`TRITON_CUDACRT_PATH`、`TRITON_CUDART_PATH`、`TRITON_CUPTI_PATH`。
+  - 有 `NVIDIA_*` 与 `PIP_*`；`PATH` 以应用目录开头，后接镜像的 `/usr/local/cuda/bin` 等。
+- 命令行为 `vllm serve /root/data/models/modelscope/Qwen/Qwen3-4B … --enable-auto-tool-choice --tool-call-parser hermes --api-key ***`。
+- 应用目录里 `image.env` 与 `env` 都是 `-rw-------`。
+
+### 2. 没有 `cannot read image environment` 告警（A-1）——通过
+
+- 平台重启后的日志里，这条 warn 只出现 1 次，就是第 10 项故意制造的旧实例（`dep-olrr0bgz6ple`）。
+- 新实例上的 vLLM、JupyterLab、Open WebUI、ComfyUI 部署都没有这条 warn。
+- 期间平台日志其他非 INFO 行只有 2 条 `same-site guard rejected request`（复测脚本第一次登录后台时带了 Origin 头，属于预期的防护）。
+
+### 3. 「打开」和实例列表的应用标签都落在 Swagger `/docs`（A-4）——通过
+
+- 实例详情 vLLM 行点「打开」：新标签页 `http://ins-y4b87drm-8000.<域>:8080/docs`，标题「FastAPI - Swagger UI」，页面有 `.swagger-ui`。截图：`shots/r3-open-docs.png`。
+- 「我的实例」列表中的应用标签「vLLM 推理服务 · 运行中」（绿色）：点击后打开同一个 `/docs`，显示 Swagger。截图：`shots/r3-list.png`、`r3-list-open.png`。
+
+### 4. Open WebUI 默认（native）工具调用：对话不再 400（A-2）——通过（期间发现 A-5）
+
+- **部署**：21:35:21 添加 Open WebUI 1.0.0（`OPENAI_API_KEY` = vLLM 的密钥）。部署一直停在「健康检查」，7 分钟后仍未就绪，见缺陷 **A-5**。
+  - 修复为 open-webui **1.0.1**（`10663d3`）：导入、发布，并下线 1.0.0。
+  - 21:50:36 重新部署到 1.0.1，31 秒 running。
+  - 为验证全新数据目录下的行为，又卸载后重新添加。21:53:42 提交，**21:54:07 running**（25 秒），启动日志没有向量模型错误。
+- **注册与对话**：
+  - 经登录跳转进入 Open WebUI，注册首个用户（`role = admin`）。
+  - 用户设置里没有改 `function_calling`，保持默认 native。`/api/models` 返回 `["Qwen/Qwen3-4B"]`。
+  - 发「用一句话介绍 DGX Spark」：思考 12 秒后正常回复（「DGX Spark是NVIDIA推出的一种高性能人工智能加速器……」），页面没有报错。截图：`shots/r4-webui-chat.png`。
+- **工具调用（经 Open WebUI）**：发「现在几点了？请调用工具查询当前时间后回答。」
+  - 页面显示「已分析 get_current_timestamp」，随后回复「当前时间是2026年10月24日13:56:51 UTC……北京时间为……21:56:51」。截图：`shots/r4-webui-tool.png`。
+  - 页面经 ingress 建立了 `ws://ins-y4b87drm-3000.<域>:8080/ws/socket.io/?EIO=4&transport=websocket`。
+- **工具调用（直接调 vLLM）**：`/v1/chat/completions` 带一个 `get_weather` 工具和 `tool_choice: auto`，返回 `finish_reason = tool_calls`，`arguments = {"city": "北京"}`。
+- vLLM 日志尾部这几次对话对应的 `POST /v1/chat/completions` 都是 200（含工具调用后的第二轮），页面没有出现 400 或 `"auto" tool choice requires …` 的报错。
+
+### 5. JupyterLab / Open WebUI 带着镜像 ENV 照常启动（A-1 的影响面）——通过
+
+- JupyterLab 1.0.0：21:35:21 提交，21:35:37 running（16 秒）。
+- 在 Jupyter 内核里执行代码（容器内经 Jupyter REST 建内核、websocket `execute_request`）：
+  - `os.environ` 有 `CUDA_HOME=/usr/local/cuda`、`LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib:…`、`TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`、`NVIDIA_PYTORCH_VERSION=25.09`、`PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple`。
+  - `torch.cuda.is_available() = True`，设备 `NVIDIA GB10`。
+- Open WebUI 1.0.1 带 `image.env` 正常启动（第 4 项）。
+  - 另做对照：Open WebUI 独立 venv 里的 torch `2.14.1+cu130` 在有、无 `image.env` 两种情况下都能加载向量模型（`encode` 得到 `(1, 384)`）。
+  - 镜像的 `LD_LIBRARY_PATH` 指向系统 torch，但没有干扰 venv。
+- ComfyUI（验收 B）同样带 `image.env` 运行，进程环境里有 `CUDA_HOME / LD_LIBRARY_PATH / NVIDIA_PYTORCH_VERSION`。
+
+### 6. `/proc/1/environ` 不可用，`/run/spark-image.environ` 可用（A-1 的实现前提）——通过
+
+- `docker exec ins-y4b87drm sh -c "tr '\0' '\n' < /proc/1/environ | head"` 输出 `.conf [listener] 0 of 50-200 startups` 和若干空行。
+  - PID 1 是 `sshd: /usr/sbin/sshd -D -e -f /run/spark-sshd.conf [listener] …`，OpenSSH 的 setproctitle 覆盖了环境区，里面没有可用的环境变量。
+- `/run/spark-image.environ` 存在（3199 字节，root 所有）。Runner 从中过滤出的 `image.env` 包含 `PATH`、`CUDA_*`、`LD_LIBRARY_PATH`、`TRITON_*`、`NVIDIA_*`、`PIP_*` 等。
+
+### 7. 重新部署的日志不带上一次运行（O-3）——通过
+
+- 21:57:50 经接口重新部署 vLLM，22:07:44 running。
+  - 请求体 `{"env":{}}` 按规则（`EnvSet = true`，普通变量以提交值为准、缺省取默认；secret 未出现则沿用）把 `MODEL_ID` 换成了默认的 `Qwen/Qwen3-8B`，所以重新下载了 16GB。控制台的重新部署对话框会带上当前值，不会出现这种情况。
+- 部署日志（控制台 `GET …/log`）共 219 行：
+  - 只有 `==== deploy #2 …` 一个头。
+  - vLLM 输出只在 14:05～14:07（UTC，本次运行），没有第 1 次运行（13:31～13:33）的行。
+  - 容器里有 `vllm.log.1`（上一次运行）。
+  - 日志里 `api_key` 是 `***`，原文 0 次。
+
+### 8. 到期停机后应用行是灰色「已停机」（O-4、O-7）——通过
+
+- 22:20:40 `UPDATE instances SET expires_at = now() + interval '1 minute'`，22:22:11 实例 stopped（「已到期停机」）。
+- 实例详情三行都是灰色 `el-tag--info`「已停机」，下面一行「实例已停机，续费后自动恢复」，不再是绿色「运行中」，也没有重复的失败文案。
+- 「我的实例」列表的三个应用标签也是灰色「vLLM 推理服务 · 已停机」等。
+- 截图：`shots/r8-detail.png`、`r8-list.png`。
+- 22:22:31 续费 1 天，22:24:54 三个应用都回到 running / ok。三个日志都是 `skip install: spec_hash … and env unchanged`。
+
+### 9. 修订后的第 11 项：(a) 容器挂掉、(b) Agent 停机；不可达首轮 health 即 unknown（A-3、O-5）——通过
+
+**(b) Agent 停机（不停容器）**
+
+- 22:08:10 `sudo systemctl stop spark-agent`，22:12:18 `start`（约 4 分钟，没有满 5 分钟）。
+- 期间三个部署每约 30 秒轮询一次（`last_polled_at` 22:10:55 → 22:11:25 → 22:12:00），`health ok`，`unreachable_count 0`。
+- 机器 `agent_online` 仍为 true（失联未满 5 分钟），实例没有暂停，也没有产生告警。
+
+**(a) 容器挂掉（Agent 在线）**
+
+- 22:12:35 `docker stop ins-y4b87drm`。
+
+  | 时间 | unreachable_count | state / health |
+  |---|---|---|
+  | 22:12:35 | 1 | running / **unknown**（O-5：首轮即 unknown） |
+  | 22:13:05～22:17:05 | 2～9 | running / unknown |
+  | 22:17:40 | 10 | **failed / unknown，`error_code = unreachable`** |
+
+  从停容器到 failed 共 5 分 05 秒。
+- 告警：
+  - 22:13:15 `container_down`（id 19，计划 3 既有告警）。
+  - 22:17:40 `app_deploy_unreachable`（id 20），**恰好一条**。
+- 22:18:15 `docker start`，三个应用逐个「重新部署」。JupyterLab、Open WebUI 22:18:32 running，vLLM 22:20:32 running，日志都是 `skip install`。
+
+### 10. 升级前创建的实例照常部署，并有 warn——通过
+
+- `ins-q9x06yz0`（PyTorch）在旧 Agent（`748dec2`）下 21:24:27 创建。容器里没有 `/run/spark-image.environ`。
+- 21:25 升级 Agent 并重启。重启 Agent 不会重建正在运行的容器，文件仍然不存在。
+- 21:26 添加 JupyterLab：
+  - 平台日志一条 WARN `appdeploy: cannot read image environment, deploying without image.env`，`deployment = dep-olrr0bgz6ple`，`path = /run/spark-image.environ`，`err = exit 1`。
+  - 21:26:38 running / ok。
+  - 应用目录里没有 `image.env`；进程环境只有平台变量与 sshd 的会话变量。这符合 followups 里「存量实例要重启一次容器」的说明。
+- 随后释放该实例。
+
+### 对账（§16.4 第 13 项）
+
+- 复测与验收 B 期间的新告警共 3 条，全部已处理：
+
+  | id | 类型 | 来源 |
+  |---|---|---|
+  | 18 | `machine_offline` | 21:23:11 平台启动时产生。平台此前从 10-22 停到 10-24，Agent 长时间连不上平台，属于环境因素，与本次操作无关。 |
+  | 19 | `container_down` | 第 9 项 (a)，预期 |
+  | 20 | `app_deploy_unreachable` | 第 9 项 (a)，预期 |
+
+- `ssh_sessions`：`ins-y4b87drm` 与 `ins-5g9by05o` 都是 0 行。期间平台 exec 有数百次（部署、轮询、日志），没有产生会话行。
+
+## 验收 B：ComfyUI、卸载与再部署（§16.4 第 9、10 项）
+
+- 日期：2026-10-24 22:25～22:35。环境同上面的「复测」：Agent `9f0e8f0`，platform-p7 `9f0e8f0`，应用目录包含 open-webui 1.0.1。
+- 镜像：`spark/comfyui:25.09`，Task 2 在 221 上构建，基础镜像为 `nvcr.io/nvidia/pytorch:25.09-py3`。
+- 实例 `ins-5g9by05o`（ComfyUI，1 天）。用完已释放。
+- 结论：**两项都通过**。
+
+### 1. ComfyUI（§16.4 第 9 项）——通过
+
+- **下单**：22:25:40 在市场页「一键部署」点「ComfyUI 图像生成」。
+  - 对话框里预装应用为「ComfyUI 图像生成 · AI-ModelScope/stable-diffusion-xl-base-1.0」，镜像锁定为 ComfyUI（「该应用需要此镜像」），模型默认 SDXL base，下载源为 modelscope。
+  - 确认页显示「预装应用：ComfyUI 图像生成（AI-ModelScope/stable-diffusion-xl-base-1.0）」，价格 ¥69.00 / 1 天。下单后跳到实例详情。
+  - 截图：`shots/b1-dialog.png`。
+- **部署**：
+  - 22:25:48 开始。进度从 10% 推到 60%，phase 为「下载模型 …：nGB / 7GB」。22:31:10 进入健康检查，**22:31:20 running**。
+  - 从下单到可用 **5 分 40 秒**（要求 ≤ 15 分钟）。
+  - `sd_xl_base_1.0.safetensors` 共 6.5GB，约 5.3 分钟下完，约 21MB/s。
+- **打开与生成**：
+  - 经登录跳转进入 ComfyUI（`ws://ins-5g9by05o-8188.<域>:8080/ws` 经 ingress）。首访是「从模板开始」，关掉后加载默认工作流。
+  - 「Checkpoint加载器（简易）」下拉为 `sd_xl_base_1.0.safetensors`（`/object_info` 里唯一的 checkpoint），「空Latent图像」为 512 × 512。
+  - 点「运行」，22:33:10 `history` 状态 `success`，输出 `ComfyUI_00001_.png`。
+  - 截图：`shots/b1-comfy-ui.png`、`b1-comfy-default.png`、`b1-comfy-image.png`（八个紫色星空玻璃瓶）。
+- **机器侧**：
+  - `/root/data/comfyui-output/ComfyUI_00001_.png`，320KB，PIL 读出尺寸 `(512, 512)`。
+  - `/opt/ComfyUI/models/checkpoints/sd_xl_base_1.0.safetensors` 软链到 `/root/data/models/modelscope/AI-ModelScope/stable-diffusion-xl-base-1.0/…`。
+  - `nvidia-smi` 有 `python3`，占用 7245MiB。
+
+### 2. 卸载与再部署（§16.4 第 10 项）——通过
+
+- **卸载**：22:33 在实例详情「操作 → 卸载」。
+  - 确认框文案「卸载后应用目录会删除，模型缓存保留在 /root/data/models」，截图：`shots/b2-remove-confirm.png`。
+  - 确认后 4.3 秒，应用卡片变为空状态。
+  - 刷新后「Web 访问」的端口从 `[8188]` 变为空列表，截图：`shots/b2-removed.png`。
+- **机器侧**：
+  - `ls -la /root/data/.spark-apps/` 为空目录（`comfyui` 已删除）。
+  - `/root/data/models/modelscope/AI-ModelScope/stable-diffusion-xl-base-1.0` 仍为 6.5G。
+  - `/root/data/comfyui-output/ComfyUI_00001_.png` 仍在。
+- **再部署**：22:33:48 在「添加应用」里选 ComfyUI（默认 SDXL base）提交，**22:34:06 running，用时 18 秒**（要求 ≤ 3 分钟）。
+  - 日志是新的 `deploy #1`：`.installed` 已随目录删除，所以重新执行了 install；`spark_status download 5% 开始下载 …`后，`modelscope download` 发现文件已存在，立即完成。
+  - 端口 8188（「ComfyUI 图像生成」）重新登记。
+- **释放**：22:34 释放实例。
+  - 部署全部 `removed`，实例 `released`。
+  - 机器 1 回到 `idle`，Agent `9f0e8f0` 在线，二进制 SHA 不变。
+  - 容器列表为空。
+
+### 缺陷（复测与验收 B）
+
+| 编号 | 现象 | 复现 | 原因 | 严重度 | 修复 |
+|---|---|---|---|---|---|
+| A-5 | Open WebUI 1.0.0 部署后一直停在「健康检查」：服务进程在，但 3000 端口没有就绪，到超时才会失败。验收 A（10-20）时 52 秒就绪。 | LLM Serving 实例上添加 open-webui 1.0.0（平台默认 `HF_ENDPOINT=https://hf-mirror.com`）。 | Open WebUI 启动时（lifespan）要从 HuggingFace 拉 RAG 向量模型 `sentence-transformers/all-MiniLM-L6-v2`。现在 hf-mirror 对 `model.safetensors` 返回 302，指向 HF 的 xet CDN（`cas-bridge.xethub.hf.co`），xet 客户端先报 401，重试的下载随后挂住。不开 xet、走普通 HTTP 同样在 120 秒内下不完。与 `image.env` 无关：不带镜像 ENV 的对照也失败。属于环境变化：hf-mirror 开始重定向到 xet。 | 高（§16.4 第 4 项的部署路径不可用） | `10663d3`：open-webui **1.0.1** 在 install 时从 ModelScope 下载同名模型（只取 safetensors 与配置，88MB，约 25 秒），下载失败只影响知识库，不阻塞部署；start 加 `OFFLINE_MODE=True`（不访问 HuggingFace，也不检查版本更新），并把 `RAG_EMBEDDING_MODEL` 指向本地目录。单测 `TestOpenWebUIOfflineEmbedding` 用假的 `modelscope` / `open-webui` 真跑脚本，覆盖下载成功和失败两种情况。真机：全新部署 25 秒 running，向量模型正常加载，第 4 项通过。 |
+
+### 观察（列入遗留）
+
+- **O-12**：hf-mirror 对 xet 存储的仓库会重定向到 HF 的 xet CDN，国内不可达（见 A-5）。vLLM 与 ComfyUI 的「下载源：hf-mirror」选项对这类仓库大概率同样不可用，这次没有实测，默认的 modelscope 不受影响。
+- **O-13**：Open WebUI 的 `RAG_EMBEDDING_MODEL` 是持久化配置，首次启动时写进它自己的数据库。由 1.0.0 升级到 1.0.1 的部署，数据库里仍是 HF 模型名，离线模式下只会记一条 `Error loading SentenceTransformer`。启动不受影响，对话可用，只有知识库不可用，需要在「管理员设置 → 文档」里改成本地路径，或卸载后重新添加。生产首次导入就是 1.0.1，不受影响。
+- **O-14**：重新部署接口的 `env` 是「整表」语义：带 `env` 时，没给的普通变量取默认值。复测第 7 项用 `{"env":{}}` 把 `MODEL_ID` 换回了默认的 8B。控制台对话框总会带上当前值，只有直接调接口的人需要注意；接口文档或帮助页可以写明「只改部分变量时不要带 `env` 以外的字段，或带上完整的当前值」。
+- **O-15**：`image.env` 里有 `NVIDIA_VISIBLE_DEVICES=void`。这是容器入口进程的环境，GPU 由 CDI 注入，对应用没有影响（vLLM、ComfyUI、Jupyter 都能用 GPU），仅记录。
+
+## 总结论
+
+- 计划 7 真机验收（§16.4 第 1～13 项）**全部通过**：
+  - 验收 A 覆盖第 1～8、11～13 项。
+  - 复测确认 A-1～A-4 与 O-3 / O-4 / O-5 / O-7 的修复，并按修订后的第 11 项清单通过。
+  - 验收 B 覆盖第 9、10 项。
+- 复测中新发现的 A-5 已修复，并在真机上通过。
+- 收尾状态：
+  - 测试实例全部释放，机器 1 `idle`，Agent `9f0e8f0`。
+  - platform-p7 以 `9f0e8f0` 运行（只改了 `deploy/apps` 与测试，平台二进制不变）。
+  - 应用目录已发布的版本：vllm 1.0.4、open-webui 1.0.1、jupyterlab 1.0.0、comfyui 1.0.0。
+- 写入前核对：本记录与提交里没有任何密码、sudo 口令、TOTP 密钥、API_KEY 或令牌的值。
