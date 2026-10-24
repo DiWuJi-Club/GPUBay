@@ -90,10 +90,18 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	var wfInstalls, wfRuns24h int
+	if s.Workflows != nil {
+		if wfInstalls, wfRuns24h, err = s.Workflows.AdminCounts(ctx, now); err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"machines": machines, "instances": instances,
 		"recharge_today": rechargeToday, "recharge_month": rechargeMonth, "order_today": orderToday, "order_month": orderMonth,
 		"utilization": util, "ssh_sessions_open": sshOpen, "bookings_upcoming_7d": upcoming7,
 		"apps_installing": appsInstalling, "apps_running": appsRunning, "apps_failed_24h": appsFailed24h,
+		"workflow_installs": wfInstalls, "workflow_runs_24h": wfRuns24h,
 	})
 }
