@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { useMobile } from '@spark/shared'
 
-const props = withDefaults(defineProps<{ kind?: 'confirm' | 'form'; title?: string; width?: number }>(), { kind: 'confirm', title: '', width: undefined })
+// beforeClose：点右上角关闭、按 Esc、点遮罩时先调用，由调用方决定是否 done()（例如明文 Key 面板关闭前二次确认）
+const props = withDefaults(defineProps<{ kind?: 'confirm' | 'form'; title?: string; width?: number; beforeClose?: (done: () => void) => void }>(), {
+  kind: 'confirm',
+  title: '',
+  width: undefined,
+  beforeClose: undefined,
+})
 const visible = defineModel<boolean>({ required: true })
 const mobile = useMobile()
 </script>
@@ -15,6 +21,7 @@ const mobile = useMobile()
     :class="{ sheet: mobile && props.kind === 'confirm' }"
     :width="props.width ?? (props.kind === 'confirm' ? 420 : 560)"
     :align-center="!mobile"
+    :before-close="props.beforeClose"
     append-to-body
     destroy-on-close
   >

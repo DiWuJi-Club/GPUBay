@@ -9,7 +9,7 @@ import { defineConfig } from 'vite'
 const epComponents = [
   'button', 'input', 'input-number', 'form', 'form-item', 'dialog', 'message', 'table', 'table-column', 'tag', 'card', 'select', 'option',
   'radio-group', 'radio-button', 'tabs', 'tab-pane', 'pagination', 'upload', 'alert', 'skeleton', 'empty', 'descriptions', 'descriptions-item',
-  'divider', 'link', 'result', 'checkbox', 'icon', 'drawer', 'dropdown', 'dropdown-menu', 'dropdown-item', 'progress',
+  'divider', 'link', 'result', 'checkbox', 'icon', 'drawer', 'dropdown', 'dropdown-menu', 'dropdown-item', 'progress', 'tooltip',
 ]
 
 export default defineConfig({
