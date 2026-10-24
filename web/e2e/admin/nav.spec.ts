@@ -6,10 +6,11 @@ const ROLE_LABEL: Record<Role, string> = { super: '超级管理员', ops: '运�
 
 test('A-NAV-01 菜单按角色过滤', async ({ page }) => {
   await page.clock.install() // 角标 60 秒刷新用；pauseClock 之前时间照常流逝
+  // 计划 7 增加「应用」「应用部署」两项（全部角色可见），与 admin/src/__tests__/menu.spec.ts 的 17 / 12 / 11 一致
   const cases: [Role, number, string[]][] = [
-    ['super', 15, []],
-    ['ops', 10, ['orders', 'ledger', 'recharges', 'catalog', 'admins']],
-    ['finance', 9, ['machines', 'pdus', 'groups', 'kyc', 'catalog', 'admins']],
+    ['super', 17, []],
+    ['ops', 12, ['orders', 'ledger', 'recharges', 'catalog', 'admins']],
+    ['finance', 11, ['machines', 'pdus', 'groups', 'kyc', 'catalog', 'admins']],
   ]
   for (const [role, count, missing] of cases) {
     const admin = await createAdmin(role)

@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { durationLabel, fmtYuan, labelOf, messageOf, type Duration, type Image, type Listed, type Product } from '@spark/shared'
+import { durationLabel, fmtYuan, labelOf, messageOf, type AppCatalogItem, type Duration, type Image, type Listed, type Product } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
+import AppPicker from '../components/AppPicker.vue'
 import GuideDialog from '../components/GuideDialog.vue'
 import RentDialog, { type PlacedResult } from '../components/RentDialog.vue'
 import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
+import { compatibleImages } from '../logic/apps'
 import { notifyError } from '../logic/notify'
 import { refreshBalance, session } from '../store/session'
 
@@ -16,6 +18,7 @@ const router = useRouter()
 const guide = useGuide()
 const products = ref<Product[]>([])
 const images = ref<Image[]>([])
+const apps = ref<AppCatalogItem[]>([]) // 一键部署：GET /apps（匿名可访问）
 const loading = ref(true)
 const loadError = ref('')
 let loaded = false
@@ -23,7 +26,17 @@ let failing = false
 // 每个商品卡片内的选择：租期默认第一档、镜像默认第一个
 const sel = reactive<Record<number, { duration: Duration; imageId: number | null }>>({})
 
+/** 应用目录失败不阻塞商品列表：只是不显示「一键部署」区，下次轮询再试。 */
+async function loadApps() {
+  try {
+    apps.value = (await api.get<{ items: AppCatalogItem[] }>('/apps')).items
+  } catch {
+    // 静默：商品卡片照常可租
+  }
+}
+
 async function load() {
+  void loadApps()
   try {
     const [p, i] = await Promise.all([api.get<Listed<Product>>('/products'), api.get<Listed<Image>>('/images')])
     products.value = p.items
@@ -60,9 +73,9 @@ const specItems = (p: Product) => [
 ]
 
 // ---- 租用 / 预订对话框（RentDialog）----
-const dialog = reactive<{ visible: boolean; product: Product | null; mode: 'immediate' | 'booking' }>({ visible: false, product: null, mode: 'immediate' })
+const dialog = reactive<{ visible: boolean; product: Product | null; mode: 'immediate' | 'booking'; appId: number | null }>({ visible: false, product: null, mode: 'immediate', appId: null })
 
-async function open(p: Product, mode: 'immediate' | 'booking') {
+async function open(p: Product, mode: 'immediate' | 'booking', appId: number | null = null) {
   if (p.prices.length === 0) return // 全部档位已下架：按钮已禁用，这里再兜一层，不会发出没有价格的订单
   if (session.status !== 'authed') {
     await router.push({ path: '/login', query: { redirect: route.fullPath } })
@@ -80,9 +93,17 @@ async function open(p: Product, mode: 'immediate' | 'booking') {
   }
   dialog.product = p
   dialog.mode = mode
+  dialog.appId = appId
   dialog.visible = true
 }
-const rent = (p: Product) => open(p, 'immediate')
+const rent = (p: Product, appId: number | null = null) => open(p, 'immediate', appId)
+/** 一键部署卡片的灰显原因：与「立即租用」按钮同口径，另加「没有兼容镜像」。 */
+function appBlocked(p: Product, a: AppCatalogItem): string | null {
+  if (p.prices.length === 0) return '暂未开放'
+  if (p.idle_count === 0) return '暂无空闲'
+  if (compatibleImages(a, images.value).length === 0) return '暂无可用镜像'
+  return null
+}
 const book = (p: Product) => open(p, 'booking')
 
 async function onPlaced(r: PlacedResult) {
@@ -133,10 +154,14 @@ async function onPlaced(r: PlacedResult) {
           </el-button>
           <el-button class="rent" data-testid="market-book-btn" :disabled="p.prices.length === 0" @click="book(p)">预订档期</el-button>
         </el-form>
+        <div v-if="apps.length" class="one-click" data-testid="market-apps">
+          <div class="one-click-title">一键部署</div>
+          <AppPicker :apps="apps" :model-value="null" testid="market-app" :disabled="(a) => appBlocked(p, a)" @update:model-value="(id) => id != null && rent(p, id)" />
+        </div>
       </el-card>
     </div>
 
-    <RentDialog v-if="dialog.product" v-model="dialog.visible" :product="dialog.product" :images="images" :mode="dialog.mode" :duration="sel[dialog.product.id].duration" :image-id="sel[dialog.product.id].imageId" @placed="onPlaced" @no-capacity="load" />
+    <RentDialog v-if="dialog.product" v-model="dialog.visible" :product="dialog.product" :images="images" :mode="dialog.mode" :duration="sel[dialog.product.id].duration" :image-id="sel[dialog.product.id].imageId" :apps="apps" :app-id="dialog.appId" @placed="onPlaced" @no-capacity="load" />
     <GuideDialog :guide="guide" />
   </div>
 </template>
@@ -153,4 +178,6 @@ async function onPlaced(r: PlacedResult) {
 .rent + .rent { margin: 8px 0 0; }
 .warn { color: var(--el-color-warning); }
 .muted { color: #909399; font-size: 13px; margin: 0 0 8px; }
+.one-click { margin-top: 16px; padding-top: 12px; border-top: 1px solid #ebeef5; }
+.one-click-title { font-weight: 600; margin-bottom: 8px; }
 </style>

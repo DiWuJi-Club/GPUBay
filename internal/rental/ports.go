@@ -60,8 +60,9 @@ func (s *Service) ListPorts(ctx context.Context, instanceID string) ([]Port, err
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Port, error) { return scanPort(r) })
 }
 
-// lockOwned 锁实例行并校验归属；released / failed 不允许管理端口。
-func lockOwned(ctx context.Context, tx pgx.Tx, userID int64, id string) (Instance, error) {
+// LockOwned 锁实例行并校验归属（不属于该用户 → not_found）；released / failed / cancelled → invalid_state。
+// 导出给 appdeploy 的用户操作用：先锁实例、再锁部署行，与 rental 钩子同序（计划 7 规格 §14）。
+func LockOwned(ctx context.Context, tx pgx.Tx, userID int64, id string) (Instance, error) {
 	inst, err := lockInstance(ctx, tx, id)
 	if err != nil {
 		return Instance{}, err
@@ -92,7 +93,7 @@ func (s *Service) AddPort(ctx context.Context, userID int64, id string, port int
 	now := s.d.Clock.Now()
 	var out Port
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		if _, err := lockOwned(ctx, tx, userID, id); err != nil {
+		if _, err := LockOwned(ctx, tx, userID, id); err != nil {
 			return err
 		}
 		var n int
@@ -132,7 +133,7 @@ func (s *Service) UpdatePort(ctx context.Context, userID int64, id string, port 
 	now := s.d.Clock.Now()
 	var out Port
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		if _, err := lockOwned(ctx, tx, userID, id); err != nil {
+		if _, err := LockOwned(ctx, tx, userID, id); err != nil {
 			return err
 		}
 		cur, err := scanPort(tx.QueryRow(ctx, `SELECT `+portCols+` FROM instance_ports WHERE instance_id = $1 AND port = $2 FOR UPDATE`, id, port))
@@ -162,7 +163,7 @@ func (s *Service) UpdatePort(ctx context.Context, userID int64, id string, port 
 func (s *Service) DeletePort(ctx context.Context, userID int64, id string, port int, ip string) error {
 	now := s.d.Clock.Now()
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		if _, err := lockOwned(ctx, tx, userID, id); err != nil {
+		if _, err := LockOwned(ctx, tx, userID, id); err != nil {
 			return err
 		}
 		if _, err := scanPort(tx.QueryRow(ctx, `DELETE FROM instance_ports WHERE instance_id = $1 AND port = $2 RETURNING `+portCols, id, port)); err != nil {

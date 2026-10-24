@@ -14,6 +14,8 @@ func toStateReport(r *agentpb.StateReport) fleet.StateReport {
 	for _, s := range r.GetInstances() {
 		out.Instances = append(out.Instances, fleet.InstanceState{InstanceID: s.GetInstanceId(), Phase: s.GetPhase()})
 	}
+	// proto3 的 repeated 空列表在线上不编码：没有镜像的新 Agent 与旧 Agent 一样收到 nil，都不覆盖已有记录。
+	out.Images = r.GetImages()
 	return out
 }
 

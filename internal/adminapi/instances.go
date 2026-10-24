@@ -88,12 +88,23 @@ func (s *Server) handleInstance(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	// 应用部署含已卸载 / 已丢失的历史（排障用），按创建时间
+	deps, err := s.Apps.ListForInstance(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	apps, err := s.Apps.AdminViews(r.Context(), deps)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	if events == nil {
 		events = []rental.Event{}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"instance": s.instanceView(inst), "events": events, "orders": orderViews(orders), "commands": commandViews(cmds),
-		"ports": s.portViews(id, ports), "ssh_host_pubkey_fingerprint": hostKeyFingerprint(inst.SSHHostPubkey),
+		"ports": s.portViews(id, ports), "ssh_host_pubkey_fingerprint": hostKeyFingerprint(inst.SSHHostPubkey), "apps": apps,
 	})
 }
 

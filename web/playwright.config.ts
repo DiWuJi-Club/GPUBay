@@ -57,6 +57,15 @@ export default defineConfig({
   // 每个用例最多推进约 1 天（C-DET-22 / 23 推进 23 小时，C-BKG-08 推进 3 小时，到点开通的用例推进 2～3 小时；没有用例推进到 3 天以上），
   // 预订都下在自己新建的机组（helpers/booking.ts privateGroup）里的新机器上，不依赖共享机器池；C-BKG-11 与 C-MKT-06 一样用
   // drainIdleMachines 把当时所有空闲机器置为维护（构造旧接口 /orders 的 no_capacity）。
+  // 计划 7 的应用部署用例（C-MKT-09～12 / C-APP / C-ING-07 / A-APP / A-INS-14）：e2e-server 不自己跑 Runner，用例用
+  // hooks.appsTick 逐轮推进，每轮把假时钟推进 5 秒（一个部署从排队到运行中约 5～10 轮，即不到 1 分钟）；只有 C-APP-08 推进
+  // 25 小时（让 1 天的实例到期停机，与 C-INS-01 同量级）。部署都在用例自己 runningInstance 新开的实例上（机器来自 hooks.machines），
+  // 每个用例开始时 seedApps（幂等）重新把 3000 / 8000 / 8188 / 8888 端口转到 fake 应用服务（会覆盖 ingressUpstream 登记的同端口），
+  // afterEach 的 cleanupApps 卸载本用例的全部部署并推进到 removed（假容器是 shell 模式，fake 服务是 setsid 出去的 sleep，
+  // 不卸载就一直留着；实例已停机的先续费开机再卸载）。要「后台发布新版本」的用例（C-APP-04 / 09）用 helpers/apps.ts 的
+  // privateApp 建自己的已上架应用，结束时改为已退役，不动共享的四个 fake 应用。A-APP-04 新建一个启用的镜像，并用
+  // hooks.agent({images}) 把所有在线 fake Agent 的已缓存镜像整体设为它（覆盖率断言要求全部在线机器都上报过）；
+  // A-MCH-10 只设自己那台机器。
   projects: [
     {
       name: 'console-desktop',

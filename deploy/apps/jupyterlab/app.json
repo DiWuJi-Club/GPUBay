@@ -1,0 +1,3 @@
+{"name": "JupyterLab", "summary": "网页版 Python 开发环境，直接使用实例的 GPU 与 /root/data 数据盘", "category": "notebook", "icon": "notebook", "sort": 40, "version": "1.0.0",
+ "images": ["LLM Serving", "ComfyUI", "PyTorch"], "changelog": "初始版本",
+ "description": "在实例上启动 JupyterLab，工作目录为数据盘 /root/data（笔记本与数据随实例保留）。\n\n- 打开页面时需要输入部署时填写的访问令牌。\n- 以 root 运行，可直接 pip install 与使用 GPU。"}

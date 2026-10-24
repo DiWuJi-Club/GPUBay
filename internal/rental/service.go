@@ -16,6 +16,7 @@
 //   AdminDeleteGroup：machine_groups(FOR UPDATE) → instances(清 group_id) → machines(只读计数) → 删机组
 //     下单插实例取机组行 KEY SHARE：先插的一方先拿到锁，另一方等它提交；删除方不锁机器，与下单不成环
 //   AdminMigrate：原实例 → machines(SKIP LOCKED) → 新 lease → agent_commands → 旧 lease 收缩
+//   应用部署钩子（AppHooks，计划 7）：都在已持实例行锁之后调用，再锁 app_deployments → instance_ports（appdeploy 一律同序）
 // 持机器行锁的事务只会在插入 lease 撞到别的事务未提交的 lease 增长时等待；而让 lease 增长的路径都不等机器锁，等待链不成环。
 
 package rental
@@ -91,7 +92,8 @@ type KeyCounter interface {
 }
 
 type Service struct {
-	d Deps
+	d        Deps
+	appHooks AppHooks // 计划 7：应用部署钩子（SetAppHooks）；nil = noop
 }
 
 func NewService(d Deps) *Service {

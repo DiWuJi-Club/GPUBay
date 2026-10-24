@@ -1,0 +1,8 @@
+{
+  "ports": [{"port": 8888, "label": "JupyterLab", "health_path": "/api"}],
+  "timeout_minutes": 10,
+  "min_data_free_gib": 2,
+  "env": [
+    {"name": "JUPYTER_TOKEN", "label": "访问令牌", "type": "secret", "required": true, "pattern": "^[A-Za-z0-9]{16,64}$", "help": "点「生成」得到随机令牌，打开页面时需要输入"}
+  ]
+}
