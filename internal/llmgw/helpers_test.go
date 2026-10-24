@@ -49,8 +49,18 @@ type genv struct {
 	imageID, productID, systemUserID int64
 
 	mu    sync.Mutex
-	nodes map[string]string // nodeID → 假节点监听地址
+	nodes map[string]string        // nodeID → 假节点监听地址（dialTimeoutAddr = 拨号超时）
+	conns map[string]*atomic.Int32 // nodeID → 假节点收到的新 TCP 连接数
 }
+
+// dialTimeoutAddr 作为节点地址时，测试 Transport 的 DialContext 返回一个超时的 dialFailure（模拟 SSH 拨号超时）。
+const dialTimeoutAddr = "dial-timeout"
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
 
 var seq atomic.Int64
 
@@ -62,7 +72,7 @@ func newGEnv(t *testing.T, mod ...func(*Config)) *genv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &genv{t: t, ctx: context.Background(), pool: pool, clk: clk, box: box, nodes: map[string]string{}}
+	e := &genv{t: t, ctx: context.Background(), pool: pool, clk: clk, box: box, nodes: map[string]string{}, conns: map[string]*atomic.Int32{}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	e.svc = llm.NewService(llm.Deps{Pool: pool, Clock: clk, Log: log, Box: box, Wallet: wallet.NewService(pool, clk),
 		Users: allowAll{}, Fleet: fleet.NewService(pool, clk)})
@@ -74,6 +84,9 @@ func newGEnv(t *testing.T, mod ...func(*Config)) *genv {
 			e.mu.Lock()
 			addr := e.nodes[node.ID]
 			e.mu.Unlock()
+			if addr == dialTimeoutAddr {
+				return nil, &dialFailure{err: timeoutErr{}}
+			}
 			var d net.Dialer
 			return d.DialContext(ctx, "tcp", addr)
 		}}
@@ -137,7 +150,14 @@ func (e *genv) node(m llm.Model, fake *llmtest.FakeVLLM, id string) (string, *ht
 	if len(fake.Served) == 0 {
 		fake.Served = []string{m.Slug}
 	}
-	srv := httptest.NewServer(fake)
+	conns := &atomic.Int32{}
+	srv := httptest.NewUnstartedServer(fake)
+	srv.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
 	e.t.Cleanup(srv.Close)
 	mach := dbtest.CreateMachine(e.t, e.pool, fmt.Sprintf("SN-GW-%d", n))
 	ins := fmt.Sprintf("ins-gw%06d", n)
@@ -148,9 +168,24 @@ func (e *genv) node(m llm.Model, fake *llmtest.FakeVLLM, id string) (string, *ht
 		VALUES ($1, $2, $3, $4, 'ready', $5, $6, $6)`, id, m.ID, mach, ins, e.box.Seal([]byte(key)), now)
 	e.mu.Lock()
 	e.nodes[id] = srv.Listener.Addr().String()
+	e.conns[id] = conns
 	e.mu.Unlock()
 	e.refresh()
 	return id, srv
+}
+
+// setNodeAddr 改节点的拨号地址（如 dialTimeoutAddr）。
+func (e *genv) setNodeAddr(id, addr string) {
+	e.mu.Lock()
+	e.nodes[id] = addr
+	e.mu.Unlock()
+}
+
+// nodeConns 假节点收到的新 TCP 连接数。
+func (e *genv) nodeConns(id string) int32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.conns[id].Load()
 }
 
 func (e *genv) refresh() {

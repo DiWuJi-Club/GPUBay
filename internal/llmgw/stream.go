@@ -13,39 +13,48 @@ import (
 	"spark-cloud/internal/llm"
 )
 
-// maxEventBytes：缓冲里超过这么多字节仍没有事件分隔符时原样转发（不再等分隔符，避免无界缓冲）。
-const maxEventBytes = 1 << 20
+// maxEventBytes：缓冲里超过这么多字节仍没有结束空行时原样转发（不再等，避免无界缓冲；与非流式响应上限一致）。
+const maxEventBytes = llm.MaxUpstreamBodyBytes
 
-// sseScanner 按事件切分上游 SSE 流（以空行 "\n\n" 或 "\r\n\r\n" 结束），返回每个事件的原始字节（含分隔符，
-// 用于逐字节透传）与其 data 字段（多行 data 以 "\n" 连接；没有 data 行为 nil）。流末尾不完整的事件原样返回、data 为 nil。
+// drainAfterDone / drainTimeout：[DONE] 之后把上游剩余字节读掉（通常只有 chunked 结束块），让连接能复用。
+const (
+	drainAfterDone = 64 << 10
+	drainTimeout   = 2 * time.Second
+)
+
+// sseScanner 按事件切分上游 SSE 流，返回每个事件的原始字节（含结束空行，用于逐字节透传）与其 data 字段
+// （多行 data 以 "\n" 连接；没有 data 行为 nil）。行结束符按 SSE 规范认 CRLF、LF、CR 三种，事件以空行结束
+// （"\n\n"、"\r\n\r\n"、"\n\r\n"、"\r\r" 等）。流末尾不完整的事件原样返回、data 为 nil。
 type sseScanner struct {
 	r   io.Reader
 	buf []byte
 	tmp []byte
+	max int
 	err error // 读错误（io.EOF = 正常结束）
+
+	pos       int // buf 里下一个待检查的字节（跨 Read 续扫，不重扫）
+	lineStart int // 当前行的起点
 }
 
 func newSSEScanner(r io.Reader) *sseScanner {
-	return &sseScanner{r: r, tmp: make([]byte, 32<<10)}
+	return &sseScanner{r: r, tmp: make([]byte, 32<<10), max: maxEventBytes}
 }
 
 // Next 返回下一个事件；ok=false 表示流已结束（Err 区分正常结束与读错误）。
 func (s *sseScanner) Next() (event []byte, data []byte, ok bool) {
 	for {
-		if i, n := eventEnd(s.buf); i >= 0 {
-			event = bytes.Clone(s.buf[:i+n])
-			s.buf = s.buf[i+n:]
+		if end := s.scan(); end >= 0 {
+			event = bytes.Clone(s.buf[:end])
+			s.buf = s.buf[end:]
+			s.pos, s.lineStart = 0, 0
 			return event, eventData(event), true
 		}
-		if len(s.buf) > maxEventBytes {
+		if len(s.buf) > s.max || (s.err != nil && len(s.buf) > 0) {
 			event, s.buf = s.buf, nil
+			s.pos, s.lineStart = 0, 0
 			return event, nil, true
 		}
 		if s.err != nil {
-			if len(s.buf) > 0 {
-				event, s.buf = s.buf, nil
-				return event, nil, true
-			}
 			return nil, nil, false
 		}
 		n, err := s.r.Read(s.tmp)
@@ -56,6 +65,34 @@ func (s *sseScanner) Next() (event []byte, data []byte, ok bool) {
 	}
 }
 
+// scan 从 pos 续扫，找到结束空行时返回事件末尾（不含）的下标，否则 -1。
+// 缓冲末尾的 CR 可能是被拆开的 CRLF：流未结束时等下一次读再判。
+func (s *sseScanner) scan() int {
+	b := s.buf
+	for s.pos < len(b) {
+		c := b[s.pos]
+		if c != '\n' && c != '\r' {
+			s.pos++
+			continue
+		}
+		next := s.pos + 1
+		if c == '\r' {
+			if next >= len(b) {
+				if s.err == nil {
+					return -1
+				}
+			} else if b[next] == '\n' {
+				next++
+			}
+		}
+		if s.pos == s.lineStart { // 空行：事件结束
+			return next
+		}
+		s.pos, s.lineStart = next, next
+	}
+	return -1
+}
+
 // Err 返回导致流结束的读错误；正常结束（EOF）为 nil。
 func (s *sseScanner) Err() error {
 	if errors.Is(s.err, io.EOF) {
@@ -64,26 +101,31 @@ func (s *sseScanner) Err() error {
 	return s.err
 }
 
-// eventEnd 返回第一个事件分隔符的位置与长度；没有返回 -1。
-func eventEnd(b []byte) (int, int) {
-	i := bytes.Index(b, []byte("\n\n"))
-	j := bytes.Index(b, []byte("\r\n\r\n"))
-	switch {
-	case i < 0 && j < 0:
-		return -1, 0
-	case j >= 0 && (i < 0 || j < i):
-		return j, 4
-	default:
-		return i, 2
+// sseLines 按 CRLF / LF / CR 切行（不含结束符）。
+func sseLines(b []byte) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\n' && b[i] != '\r' {
+			continue
+		}
+		out = append(out, string(b[start:i]))
+		if b[i] == '\r' && i+1 < len(b) && b[i+1] == '\n' {
+			i++
+		}
+		start = i + 1
 	}
+	if start < len(b) {
+		out = append(out, string(b[start:]))
+	}
+	return out
 }
 
 // eventData 取事件里的 data 行（"data:" 后去掉一个可选空格）。
 func eventData(ev []byte) []byte {
 	var out []byte
 	found := false
-	for _, line := range strings.Split(string(ev), "\n") {
-		line = strings.TrimSuffix(line, "\r")
+	for _, line := range sseLines(ev) {
 		v, ok := strings.CutPrefix(line, "data:")
 		if !ok {
 			continue
@@ -102,7 +144,8 @@ func eventData(ev []byte) []byte {
 }
 
 // countChunk 解析一个 data 块：choices 里任一 delta.content / delta.reasoning_content（completions 端点是 text）非空 → 计一块；
-// 带非 null 的 usage → 返回它。不是合法 JSON 的块不计数。
+// 带非 null 的 usage → 返回它。choices 与 usage 分开解码：一边类型不对不影响另一边。不是合法 JSON 的块不计数。
+// n > 1 时一个块里多个 choice 也只计一块（估算只在客户端中断时用，且 vLLM 对 n > 1 本来就分块发送；保留）。
 func countChunk(data []byte) (content bool, u *usageJSON) {
 	var ch struct {
 		Choices []struct {
@@ -112,18 +155,22 @@ func countChunk(data []byte) (content bool, u *usageJSON) {
 			} `json:"delta"`
 			Text string `json:"text"`
 		} `json:"choices"`
-		Usage *usageJSON `json:"usage"`
 	}
-	if json.Unmarshal(data, &ch) != nil {
-		return false, nil
-	}
-	for _, c := range ch.Choices {
-		if c.Delta.Content != "" || c.Delta.ReasoningContent != "" || c.Text != "" {
-			content = true
-			break
+	if json.Unmarshal(data, &ch) == nil {
+		for _, c := range ch.Choices {
+			if c.Delta.Content != "" || c.Delta.ReasoningContent != "" || c.Text != "" {
+				content = true
+				break
+			}
 		}
 	}
-	return content, ch.Usage
+	var us struct {
+		Usage *usageJSON `json:"usage"`
+	}
+	if json.Unmarshal(data, &us) == nil {
+		u = us.Usage
+	}
+	return content, u
 }
 
 // firstByteReader 记下第一次读到数据的时刻（ttft）。
@@ -200,7 +247,13 @@ func (c *call) stream(ctx context.Context, node *llm.RouteNode, up upstreamResp)
 		ms := int(fr.first.Sub(c.start).Milliseconds())
 		ttft = &ms
 	}
-	if done || clientGone {
+	switch {
+	case done:
+		// [DONE] 之后读掉剩余字节（有上限、有时限），连接回到池里复用
+		t := time.AfterFunc(drainTimeout, up.cancel)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainAfterDone))
+		t.Stop()
+	case clientGone:
 		up.cancel() // 不再读上游：取消请求（vLLM 随之停止生成）
 	}
 	switch {

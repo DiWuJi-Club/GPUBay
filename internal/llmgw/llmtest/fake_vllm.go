@@ -31,6 +31,7 @@ type RecordedRequest struct {
 //   - POST /v1/embeddings：返回一个 3 维向量与 usage（只有 prompt）。
 //
 // 可配置：RequireKey（Authorization 必须是 Bearer RequireKey，否则 401）；Delay（非流式在响应前、流式在每块前等待）；
+// HeaderDelay（POST 在写响应头之前等待，模拟首字节慢）；
 // FailFirstN（前 N 个 POST 返回 503）；DropAfterChunks（>0：流式发完 N 个内容块后直接断开连接）；
 // ErrorStatus（≠0：POST 一律返回该状态码与 vLLM 风格错误体）。Served 非空时，请求的 model 不在其中 → 404。
 // 字段在开始服务前设置；运行中只读（Requests 由 mu 保护）。
@@ -41,6 +42,7 @@ type FakeVLLM struct {
 	CompletionTokens int
 	Chunks           []string
 	Delay            time.Duration
+	HeaderDelay      time.Duration
 	FailFirstN       int32
 	DropAfterChunks  int
 	ErrorStatus      int
@@ -131,6 +133,9 @@ func (f *FakeVLLM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !sleepFor(r, f.HeaderDelay) {
+		return
+	}
 	if f.failed.Add(1) <= f.FailFirstN {
 		sw.writeJSON(http.StatusServiceUnavailable, vllmError("Service Unavailable", http.StatusServiceUnavailable))
 		return
@@ -242,11 +247,13 @@ func (f *FakeVLLM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // sleep 等 Delay；请求被取消返回 false。
-func (f *FakeVLLM) sleep(r *http.Request) bool {
-	if f.Delay <= 0 {
+func (f *FakeVLLM) sleep(r *http.Request) bool { return sleepFor(r, f.Delay) }
+
+func sleepFor(r *http.Request, d time.Duration) bool {
+	if d <= 0 {
 		return true
 	}
-	t := time.NewTimer(f.Delay)
+	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-t.C:
