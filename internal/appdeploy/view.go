@@ -51,6 +51,7 @@ type View struct {
 	FinishedAt      *time.Time        `json:"finished_at"`
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
+	appInternal     bool              // 应用是否内部；只给 AdminView 用，用户视图不输出
 }
 
 // Summary 是实例列表 / 详情里 apps_summary 的一项。
@@ -62,14 +63,18 @@ type Summary struct {
 	URL      *string `json:"url"`
 }
 
-// AdminView 后台视图：多 log_tail（回写时已脱敏）与 user_id。
+// AdminView 后台视图：多 log_tail（回写时已脱敏）、user_id 与应用是否内部（计划 9 的 vllm-node 节点部署）。
 type AdminView struct {
 	View
-	LogTail string `json:"log_tail"`
-	UserID  int64  `json:"user_id"`
+	LogTail  string `json:"log_tail"`
+	UserID   int64  `json:"user_id"`
+	Internal bool   `json:"internal"`
 }
 
-type appBrief struct{ slug, name, icon string }
+type appBrief struct {
+	slug, name, icon string
+	internal         bool
+}
 
 type verBrief struct {
 	version string
@@ -99,14 +104,14 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 		depIDs = append(depIDs, d.ID)
 	}
 	apps := map[int64]appBrief{}
-	rows, err := s.d.Pool.Query(ctx, `SELECT id, slug, name, icon FROM apps WHERE id = ANY($1)`, appIDs)
+	rows, err := s.d.Pool.Query(ctx, `SELECT id, slug, name, icon, internal FROM apps WHERE id = ANY($1)`, appIDs)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var id int64
 		var a appBrief
-		if err := rows.Scan(&id, &a.slug, &a.name, &a.icon); err != nil {
+		if err := rows.Scan(&id, &a.slug, &a.name, &a.icon, &a.internal); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -183,7 +188,7 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 
 	for _, d := range deps {
 		a, ver := apps[d.AppID], vers[d.AppVersionID]
-		v := View{ID: d.ID, InstanceID: d.InstanceID, AppID: d.AppID, AppSlug: a.slug, AppName: a.name, AppIcon: a.icon,
+		v := View{ID: d.ID, InstanceID: d.InstanceID, AppID: d.AppID, AppSlug: a.slug, AppName: a.name, AppIcon: a.icon, appInternal: a.internal,
 			VersionID: d.AppVersionID, Version: ver.version, State: d.State, Desired: d.Desired, Phase: d.Phase, Progress: d.Progress,
 			Message: d.Message, Health: d.Health, ErrorCode: d.ErrorCode, Env: map[string]string{}, SecretEnv: map[string]bool{},
 			Spec: normalizeSpec(ver.spec), Port: d.Port, Links: []LinkView{}, Attempt: d.Attempt, CleanupPending: d.CleanupPending,
@@ -284,7 +289,7 @@ func (s *Service) AdminViews(ctx context.Context, deps []Deployment) ([]AdminVie
 	}
 	out := make([]AdminView, len(views))
 	for i, v := range views {
-		out[i] = AdminView{View: v, LogTail: deps[i].LogTail, UserID: deps[i].UserID}
+		out[i] = AdminView{View: v, LogTail: deps[i].LogTail, UserID: deps[i].UserID, Internal: v.appInternal}
 	}
 	return out, nil
 }

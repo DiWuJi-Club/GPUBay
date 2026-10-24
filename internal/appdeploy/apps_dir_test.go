@@ -135,12 +135,14 @@ func TestVLLMNodeApp(t *testing.T) {
 	}
 }
 
-// runVLLMNodeStart 用假的 vllm 真跑 deploy/apps/vllm-node/app.sh start，返回 vllm 收到的参数。
-func runVLLMNodeStart(t *testing.T, extraEnv ...string) string {
+// runVLLMNodeStart 用假的 vllm 真跑 deploy/apps/vllm-node/app.sh start，返回 vllm 收到的参数与环境变量 VLLM_API_KEY。
+func runVLLMNodeStart(t *testing.T, extraEnv ...string) (string, string) {
 	t.Helper()
 	appDir, bin := t.TempDir(), t.TempDir()
 	argsFile := filepath.Join(appDir, "args")
-	fake := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + appdeploy.ShellQuote(argsFile) + "\nexec sleep 30\n"
+	// 假 vllm 记下参数与它看到的 VLLM_API_KEY（节点密钥经环境变量传入，不在 argv 里）
+	fake := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + appdeploy.ShellQuote(argsFile+".tmp") + "\nprintf '%s' \"${VLLM_API_KEY:-}\" > " +
+		appdeploy.ShellQuote(filepath.Join(appDir, "envkey")) + "\nmv " + appdeploy.ShellQuote(argsFile+".tmp") + " " + appdeploy.ShellQuote(argsFile) + "\nexec sleep 30\n"
 	if err := os.WriteFile(filepath.Join(bin, "vllm"), []byte(fake), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -181,13 +183,18 @@ func runVLLMNodeStart(t *testing.T, extraEnv ...string) string {
 	if !strings.HasPrefix(strings.Join(args, " "), "serve "+filepath.Join(appDir, "models", "modelscope", "Qwen/Qwen3-8B")+" ") {
 		t.Errorf("vllm args = %v", args)
 	}
-	return strings.Join(args, " ")
+	envKey, _ := os.ReadFile(filepath.Join(appDir, "envkey"))
+	return strings.Join(args, " "), string(envKey)
 }
 
 func TestVLLMNodeStartArgs(t *testing.T) {
-	joined := runVLLMNodeStart(t)
+	const nodeKey = "node-key-0123456789abcdefghijklmnop"
+	joined, envKey := runVLLMNodeStart(t)
+	if envKey != nodeKey || strings.Contains(joined, nodeKey) || strings.Contains(joined, "--api-key") {
+		t.Errorf("node key must reach vllm via VLLM_API_KEY only: env %q args %s", envKey, joined)
+	}
 	for _, want := range []string{"--host 127.0.0.1", "--port 8000", "--served-model-name qwen3-8b", "--max-model-len 40960",
-		"--gpu-memory-utilization 0.85", "--max-num-seqs 64", "--api-key node-key-0123456789abcdefghijklmnop", "--enable-auto-tool-choice --tool-call-parser hermes"} {
+		"--gpu-memory-utilization 0.85", "--max-num-seqs 64", "--enable-auto-tool-choice --tool-call-parser hermes"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("vllm args missing %q: %s", want, joined)
 		}
@@ -197,14 +204,20 @@ func TestVLLMNodeStartArgs(t *testing.T) {
 			t.Errorf("vllm args should not have %q by default: %s", absent, joined)
 		}
 	}
-	joined = runVLLMNodeStart(t, "TASK=embed", "QUANTIZATION=fp8", "REASONING_PARSER=qwen3", "TOOL_CALL_PARSER=none", "GPU_MEMORY_UTILIZATION=0.6", "MAX_NUM_SEQS=16")
-	for _, want := range []string{"--task embed", "--quantization fp8", "--reasoning-parser qwen3", "--gpu-memory-utilization 0.6", "--max-num-seqs 16"} {
+	joined, _ = runVLLMNodeStart(t, "QUANTIZATION=fp8", "REASONING_PARSER=qwen3", "TOOL_CALL_PARSER=none", "GPU_MEMORY_UTILIZATION=0.6", "MAX_NUM_SEQS=16")
+	for _, want := range []string{"--quantization fp8", "--reasoning-parser qwen3", "--gpu-memory-utilization 0.6", "--max-num-seqs 16"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("vllm args missing %q: %s", want, joined)
 		}
 	}
-	if strings.Contains(joined, "--tool-call-parser") || strings.Contains(joined, "--enable-auto-tool-choice") {
-		t.Errorf("TOOL_CALL_PARSER=none must not enable tool calls: %s", joined)
+	if strings.Contains(joined, "--tool-call-parser") || strings.Contains(joined, "--enable-auto-tool-choice") || strings.Contains(joined, "--task") {
+		t.Errorf("TOOL_CALL_PARSER=none must not enable tool calls; no --task for generate: %s", joined)
+	}
+	// 向量模型：--task embed，且不带推理内容 / 工具调用解析参数（即使变量设了）
+	joined, _ = runVLLMNodeStart(t, "TASK=embed", "REASONING_PARSER=qwen3", "TOOL_CALL_PARSER=hermes")
+	if !strings.Contains(joined, "--task embed") || strings.Contains(joined, "--reasoning-parser") || strings.Contains(joined, "--tool-call-parser") ||
+		strings.Contains(joined, "--enable-auto-tool-choice") {
+		t.Errorf("embed args = %s", joined)
 	}
 }
 

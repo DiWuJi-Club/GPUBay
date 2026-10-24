@@ -3,6 +3,7 @@ package appdeploy_test
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -917,6 +918,29 @@ func TestInternalAppCreateOnlySystemUser(t *testing.T) {
 	d, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.systemID, InstanceID: sys.ID, AppID: a.ID, Env: map[string]string{"API_KEY": "node-secret-0123456789"}})
 	if err != nil || d.UserID != e.systemID || d.AppID != a.ID || d.State != appdeploy.StateQueued {
 		t.Fatalf("system create = %+v, %v", d, err)
+	}
+	// 后台视图带 internal；用户视图不输出
+	avs, err := e.svc.AdminViews(e.ctx, []appdeploy.Deployment{d})
+	if err != nil || len(avs) != 1 || !avs[0].Internal {
+		t.Fatalf("AdminViews = %+v, %v", avs, err)
+	}
+	if b, _ := json.Marshal(avs[0]); !strings.Contains(string(b), `"internal":true`) {
+		t.Fatalf("admin view json = %s", b)
+	}
+	uvs, err := e.svc.Views(e.ctx, []appdeploy.Deployment{d})
+	if b, _ := json.Marshal(uvs); err != nil || strings.Contains(string(b), "internal") {
+		t.Fatalf("user view json = %s, %v", b, err)
+	}
+	// 没有已发布版本的内部应用：对用户也是 app_not_found（不是 app_unavailable）
+	bare, err := e.cat.CreateApp(e.ctx, e.actor(), appdeploy.AppInput{Slug: "bare-node", Name: "bare", Category: "llm", Status: appdeploy.StatusPublished, Internal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.userID, InstanceID: inst.ID, AppID: bare.ID}); codeOf(err) != "app_not_found" {
+		t.Fatalf("user create bare internal = %v", err)
+	}
+	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, bare.ID, e.imageID, nil); codeOf(err) != "app_not_found" {
+		t.Fatalf("preinstall bare internal = %v", err)
 	}
 	// SystemUserID 未配置（0）时谁都不能部署内部应用
 	svc0 := appdeploy.NewService(appdeploy.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Catalog: e.cat, Images: e.catalog, Rental: e.rental, Fleet: e.fleet})

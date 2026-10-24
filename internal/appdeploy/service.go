@@ -100,12 +100,11 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Deployment, er
 		default:
 			return apperr.ErrInvalidState
 		}
-		app, ver, err := s.resolveVersion(ctx, tx, req.AppID, req.VersionID)
+		// 内部应用只有系统账号能部署，对其他用户按不存在处理
+		isSystem := s.d.SystemUserID != 0 && req.UserID == s.d.SystemUserID
+		app, ver, err := s.resolveVersion(ctx, tx, req.AppID, req.VersionID, isSystem)
 		if err != nil {
 			return err
-		}
-		if app.Internal && (s.d.SystemUserID == 0 || req.UserID != s.d.SystemUserID) {
-			return apperr.ErrAppNotFound // 内部应用对用户按不存在处理
 		}
 		if err := s.checkImage(ctx, tx, ver, inst.ImageID); err != nil {
 			return err

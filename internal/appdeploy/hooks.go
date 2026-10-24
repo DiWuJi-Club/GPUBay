@@ -8,7 +8,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/audit"
-	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/rental"
@@ -161,12 +160,10 @@ type installPlan struct {
 // PrepareInstall 下单预装校验：published 的非内部应用的最新 published 版本、镜像兼容、变量。错误都是 4xx 的 apperr
 // （app_not_found / app_unavailable / app_image_mismatch / app_env_*），rental 在扣款前整单失败。
 func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, imageID int64, env map[string]string) (rental.InstallPlan, error) {
-	app, ver, err := s.resolveVersion(ctx, q, appID, nil)
+	// 内部应用不能随下单预装（系统实例由 llm.Controller 直接 Create）
+	app, ver, err := s.resolveVersion(ctx, q, appID, nil, false)
 	if err != nil {
 		return nil, err
-	}
-	if app.Internal { // 内部应用不能随下单预装（系统实例由 llm.Controller 直接 Create）
-		return nil, apperr.ErrAppNotFound
 	}
 	if err := s.checkImage(ctx, q, ver, imageID); err != nil {
 		return nil, err

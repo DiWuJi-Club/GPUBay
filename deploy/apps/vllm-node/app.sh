@@ -60,15 +60,22 @@ case "${1:-}" in
     ;;
   start)
     _dir=$(model_dir)
-    # 只监听容器内回环：平台网关经 SSH 通道访问，并用节点密钥（--api-key）鉴权
+    # 只监听容器内回环：平台网关经 SSH 通道访问，并用节点密钥鉴权。
+    # 密钥经环境变量 VLLM_API_KEY 传给 vLLM（未给 --api-key 时 vLLM 读它），不放进命令行：ps / /proc/<pid>/cmdline 看不到
+    export VLLM_API_KEY="$API_KEY"
     set -- vllm serve "$_dir" --host 127.0.0.1 --port "$SPARK_PORT" --served-model-name "$SERVED_MODEL_NAME" \
       --max-model-len "${MAX_MODEL_LEN:-32768}" --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.85}" \
-      --max-num-seqs "${MAX_NUM_SEQS:-64}" --api-key "$API_KEY"
-    if [ "${TASK:-generate}" = embed ]; then set -- "$@" --task embed; fi
+      --max-num-seqs "${MAX_NUM_SEQS:-64}"
     if [ "${QUANTIZATION:-none}" != none ]; then set -- "$@" --quantization "$QUANTIZATION"; fi
-    if [ "${REASONING_PARSER:-none}" != none ]; then set -- "$@" --reasoning-parser "$REASONING_PARSER"; fi
-    # 工具调用：请求带 tool_choice=auto 时 vLLM 不开 auto tool choice 会回 400；hermes 适用于 Qwen 系列
-    if [ "${TOOL_CALL_PARSER:-hermes}" != none ]; then set -- "$@" --enable-auto-tool-choice --tool-call-parser "${TOOL_CALL_PARSER:-hermes}"; fi
+    if [ "${TASK:-generate}" = embed ]; then
+      # 向量模型：--task embed 对应镜像 spark/llm-serving:25.09 里的 vLLM 0.10.1；更新的 vLLM 改为 --runner pooling --convert embed，
+      # 升级镜像时同步改这里。向量模型没有对话输出，不传推理内容 / 工具调用解析参数
+      set -- "$@" --task embed
+    else
+      if [ "${REASONING_PARSER:-none}" != none ]; then set -- "$@" --reasoning-parser "$REASONING_PARSER"; fi
+      # 工具调用：请求带 tool_choice=auto 时 vLLM 不开 auto tool choice 会回 400；hermes 适用于 Qwen 系列
+      if [ "${TOOL_CALL_PARSER:-hermes}" != none ]; then set -- "$@" --enable-auto-tool-choice --tool-call-parser "${TOOL_CALL_PARSER:-hermes}"; fi
+    fi
     # 每次启动换新的 vllm.log（上一次的留一份 vllm.log.1）：下面的 tail -n 200 只并入本次运行的输出
     if [ -f "$SPARK_APP_DIR/vllm.log" ]; then mv -f "$SPARK_APP_DIR/vllm.log" "$SPARK_APP_DIR/vllm.log.1"; fi
     "$@" </dev/null >>"$SPARK_APP_DIR/vllm.log" 2>&1 &
