@@ -25,6 +25,7 @@ import (
 
 	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/app"
+	"spark-cloud/internal/comfywf/comfytest"
 	"spark-cloud/internal/e2ehooks"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
@@ -153,8 +154,9 @@ func run() error {
 	go func() { defer close(loopsDone); a.RunAccessLoops(gwCtx) }() // 路由表 2 秒刷新、活动流撤销
 	// 在 fake Agent 停掉之后（defer 逆序）先取消 gwCtx，再等 Agent 网关、SSH 网关与接入层循环全部退出
 	defer func() { stopGW(); <-gwErr; <-sshErr; <-loopsDone; a.Upstream.Close() }()
+	// fake ComfyUI（快速出图的上游）：/hooks/apps/seed、/hooks/workflows/seed 之后所有实例的 8188 都转到它，由 /hooks/comfy/* 控制
 	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr, SSHAddr: sshAddr, Upstream: upstream,
-		HealthAddr: healthAddr}
+		HealthAddr: healthAddr, Comfy: comfytest.New()}
 	defer hooksSrv.Close()
 
 	public, adminSrv := a.Servers(cfg) // 与 cmd/platform 完全相同的监听与路由；不启动定时清扫器，清扫由钩子触发
