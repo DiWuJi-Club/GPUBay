@@ -19,7 +19,8 @@
 # 程序的非零退出是预期结果之一（alloc 3、fault 5、OOM-kill 137），脚本只记录不中止。
 # dmesg（OOM 记录、Xid、oops）需要 root，由协调人另行 `sudo dmesg` 采集。
 #
-# 环境变量：POC_IMAGE（默认 spark/poc-shared:1）、POC_NET（默认 spark0）、POC_LOGDIR（默认 /tmp/poc）。
+# 环境变量：POC_IMAGE（默认 spark/poc-shared:1）、POC_NET（默认 spark0）、POC_LOGDIR（默认 /tmp/poc）、
+#           POC_EXTRA_ARGS（追加的 docker run 参数，例如 MPS 第二轮的 -v <pipe>:/tmp/nvidia-mps -e CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps --ipc=host）。
 set -eu
 
 IMAGE="${POC_IMAGE:-spark/poc-shared:1}"
@@ -69,7 +70,11 @@ run_ctr() {
         --memory "${mem}g" --memory-swap "${mem}g" --shm-size "${shm}g"
         --cpus 5 --pids-limit 8192 --oom-score-adj 500
         --cap-drop SYS_NICE --cap-add IPC_LOCK --cap-add SYS_PTRACE
-        --ulimit memlock=-1:-1 "$IMAGE" "$@")
+        --ulimit memlock=-1:-1)
+    # POC_EXTRA_ARGS：追加的 docker run 参数（按空白拆分），MPS 第二轮用来挂管道目录与共享 IPC（规格 §3.5）。
+    # shellcheck disable=SC2206
+    [ -z "${POC_EXTRA_ARGS:-}" ] || cmd+=(${POC_EXTRA_ARGS})
+    cmd+=("$IMAGE" "$@")
     echo "+ ${cmd[*]}" | tee "$log"
     echo "start_ts=$(date +%s)" >>"$log"
     local rc=0
