@@ -61,6 +61,12 @@ type appsEnv struct {
 
 func newAppsEnv(t *testing.T, machines int) *appsEnv {
 	t.Helper()
+	return newAppsEnvWith(t, machines, nil)
+}
+
+// newAppsEnvWith 同 newAppsEnv；tweak 非 nil 时在 app.Build 之前改配置与选项（如打开 AI 管家并注入 mock LLM）。
+func newAppsEnvWith(t *testing.T, machines int, tweak func(*config.Config, *app.Options)) *appsEnv {
+	t.Helper()
 	ctx := context.Background()
 	pool := dbtest.New(t)
 	t.Cleanup(func() { assertConsistent(t, pool) }) // 最后注册的先执行：在停进程、关服务之前检查
@@ -94,10 +100,14 @@ func newAppsEnv(t *testing.T, machines int) *appsEnv {
 	e.appRootFor = func(id string) string { return filepath.Join(root, id, "root", "data") }
 	cfg := config.Config{UpstreamSSHKeyFile: keyFile, Env: "dev", UploadDir: t.TempDir(), Domain: "spark.test", SecretKey: dbtest.Key,
 		SMSDriver: "mock", KYCDriver: "mock", UpstreamSSHPort: up.Port()}
-	e.a, err = app.Build(cfg, pool, discardLog(), app.Options{Clock: clk, SMS: &sms.Mock{}, DisableRateLimits: true,
+	opt := app.Options{Clock: clk, SMS: &sms.Mock{}, DisableRateLimits: true,
 		HostKeyGen:    func() (string, []byte, error) { return hostPub, hostPEM, nil },
 		AppHealthAddr: func(int) string { return e.healthAddr },
-		AppRootFor:    e.appRootFor})
+		AppRootFor:    e.appRootFor}
+	if tweak != nil {
+		tweak(&cfg, &opt)
+	}
+	e.a, err = app.Build(cfg, pool, discardLog(), opt)
 	if err != nil {
 		t.Fatal(err)
 	}
