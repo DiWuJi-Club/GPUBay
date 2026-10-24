@@ -104,6 +104,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/apps/seed", s.handle(s.appsSeed))
 	mux.HandleFunc("POST /hooks/apps/tick", s.handle(s.appsTick))
 	mux.HandleFunc("POST /hooks/workflows/seed", s.handle(s.workflowsSeed))
+	mux.HandleFunc("POST /hooks/workflows/seed-many", s.handle(s.workflowsSeedMany))
 	mux.HandleFunc("POST /hooks/workflows/version", s.handle(s.workflowsVersion))
 	mux.HandleFunc("POST /hooks/comfy/history", s.handle(s.comfyHistory))
 	mux.HandleFunc("GET /hooks/comfy/prompts", s.handle(s.comfyPrompts))

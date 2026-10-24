@@ -197,3 +197,43 @@ func mustJSON(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+// /hooks/workflows/seed-many {n} 幂等地建 n 个额外的 fake 工作流 e2e-wf-c、e2e-wf-d…（上架、已发布 1.0.0、无封面无节点），
+// 只返回这些额外项；n 超出 1～7 → 400。
+func TestWorkflowSeedMany(t *testing.T) {
+	e := newEnvWith(t, false)
+	ctx := context.Background()
+	slugs := func(out map[string]any) []string {
+		var s []string
+		for _, it := range out["workflows"].([]any) {
+			s = append(s, it.(map[string]any)["slug"].(string))
+		}
+		return s
+	}
+	first := e.must("POST", "/hooks/workflows/seed-many", map[string]any{"n": 2})
+	if got := strings.Join(slugs(first), ","); got != "e2e-wf-c,e2e-wf-d" {
+		t.Fatalf("seed-many 2 = %v", got)
+	}
+	more := e.must("POST", "/hooks/workflows/seed-many", map[string]any{"n": 3})
+	if got := strings.Join(slugs(more), ","); got != "e2e-wf-c,e2e-wf-d,e2e-wf-e" {
+		t.Fatalf("seed-many 3 = %v", got)
+	}
+	c0 := first["workflows"].([]any)[0].(map[string]any)
+	c1 := more["workflows"].([]any)[0].(map[string]any)
+	if c0["id"] != c1["id"] || c0["version_id"] != c1["version_id"] || c1["version"] != "1.0.0" {
+		t.Fatalf("not idempotent: %v then %v", c0, c1)
+	}
+	w, err := e.a.Workflows.GetWorkflow(ctx, int64(c1["id"].(float64)))
+	if err != nil || w.Status != comfywf.StatusPublished || w.HasCover || w.Category != comfywf.CategoryOther {
+		t.Fatalf("C = %+v %v", w, err)
+	}
+	v, err := e.a.Workflows.GetVersion(ctx, int64(c1["version_id"].(float64)))
+	if err != nil || len(v.Manifest.Nodes) != 0 || v.Manifest.Models[0].Name != "e2e-c.safetensors" || len(v.Manifest.Inputs) != 3 {
+		t.Fatalf("C version = %+v %v", v, err)
+	}
+	for _, n := range []int{0, 8} {
+		if code, _ := e.call("POST", "/hooks/workflows/seed-many", map[string]any{"n": n}); code != 400 {
+			t.Errorf("seed-many %d = %d, want 400", n, code)
+		}
+	}
+}

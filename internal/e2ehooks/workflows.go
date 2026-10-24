@@ -244,6 +244,29 @@ func SeedWorkflows(ctx context.Context, a *app.App) ([]SeededWorkflow, error) {
 	return out, nil
 }
 
+// MaxExtraWorkflows 是 /hooks/workflows/seed-many 最多建的额外工作流数（c～i：加上 A、B 共 9 个，比每部署上限多一个）。
+const MaxExtraWorkflows = 7
+
+// ExtraWorkflow 返回第 i 个（0 起）额外 fake 工作流：e2e-wf-c、e2e-wf-d…，分类「其它」、无封面、无节点、模型 e2e-<x>.safetensors 0.5GB。
+func ExtraWorkflow(i int) FakeWorkflow {
+	x := string(rune('c' + i))
+	return FakeWorkflow{Slug: "e2e-wf-" + x, Name: "E2E 工作流 " + strings.ToUpper(x), Summary: "fake 额外工作流（上限用例）",
+		Category: comfywf.CategoryOther, Model: "e2e-" + x + ".safetensors", SizeGB: 0.5, Sort: 100 + i}
+}
+
+// SeedExtraWorkflows 幂等地建前 n 个额外工作流（按顺序返回）。
+func SeedExtraWorkflows(ctx context.Context, a *app.App, n int) ([]SeededWorkflow, error) {
+	out := []SeededWorkflow{}
+	for i := 0; i < n; i++ {
+		s, err := CreateFakeWorkflow(ctx, a, ExtraWorkflow(i))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
 // PublishFakeVersion 以工作流最新已发布版本的内容（graph / api_prompt / manifest 不变）建并发布新版本 version
 // （空 = 已有 X.Y.Z 版本中最大者的 Z + 1）；changelog 空 = "e2e 新版本 <version>"。
 func PublishFakeVersion(ctx context.Context, a *app.App, slug, version, changelog string) (SeededWorkflow, error) {
@@ -302,6 +325,24 @@ func (s *Server) workflowsSeed(ctx context.Context, _ json.RawMessage) (any, err
 		return nil, err
 	}
 	ws, err := SeedWorkflows(ctx, s.App)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"workflows": ws}, nil
+}
+
+// workflowsSeedMany：POST /hooks/workflows/seed-many {n: 1～7} → {workflows: [...]}（额外的 e2e-wf-c…，幂等；不含 A、B）。
+func (s *Server) workflowsSeedMany(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := decode[struct {
+		N int `json:"n"`
+	}](body)
+	if err != nil {
+		return nil, err
+	}
+	if req.N < 1 || req.N > MaxExtraWorkflows {
+		return nil, badRequest(fmt.Sprintf("n 必须在 1～%d 之间", MaxExtraWorkflows))
+	}
+	ws, err := SeedExtraWorkflows(ctx, s.App, req.N)
 	if err != nil {
 		return nil, err
 	}
