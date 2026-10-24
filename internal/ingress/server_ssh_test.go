@@ -132,3 +132,44 @@ func TestIngressThroughUpstreamPool(t *testing.T) {
 		t.Fatalf("alerts after pool close = %d", e.alerts.count())
 	}
 }
+
+// 路由带容器 sshd 端口（rental.IngressRoute.SSHPort）：经真实连接池按该端口拨，不用池的默认端口；端口变化后不复用旧的空闲连接。
+func TestIngressDialsRouteSSHPort(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	up, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	alt, err := srv.ListenAlso(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := srv.ServeHTTP(8888, http.HandlerFunc(wsEchoHandler))
+	defer stop()
+	// 池的默认端口无人监听：只有路由上的端口生效才连得上
+	pool := upstream.New(upstream.Config{Signer: up, Port: 1, DialTimeout: 300 * time.Millisecond}, &pubStore{pubs: map[string]string{}})
+	defer pool.Close()
+	e := newEnvWith(t, pool)
+	const id = "ins-a1b2c3d4"
+	h := id + "-8888.spark.test"
+	e.addRoute(rental.IngressRoute{InstanceID: id, UserID: 7, Port: 8888, Visibility: "public", State: rental.StateRunning,
+		LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine(), SSHPort: alt})
+	if r := e.get(h, "/"); r.StatusCode != 200 || body(r) != "plain" {
+		t.Fatalf("via route ssh port = %d", r.StatusCode)
+	}
+	// 端口改为 0 → 池默认端口（不可达）：502，且不能复用经旧端口建立的空闲连接
+	e.src.mu.Lock()
+	for i := range e.src.routes {
+		e.src.routes[i].SSHPort = 0
+	}
+	e.src.mu.Unlock()
+	e.table.Refresh(context.Background())
+	if r := e.get(h, "/"); r.StatusCode != 502 {
+		t.Fatalf("fallback to pool port = %d", r.StatusCode)
+	}
+}

@@ -822,3 +822,45 @@ func TestPoolExecUnreadStdinRunsOnce(t *testing.T) {
 		t.Fatalf("pool=%d conns=%d, want the shared connection kept", p.Len(), srv.ConnCount())
 	}
 }
+
+// Target.Port 非 0 时优先于 Config.Port（共享机每个容器一个 sshd 端口）；同一实例端口变化不复用旧连接。
+func TestPoolTargetPortOverridesConfig(t *testing.T) {
+	up := signer(t)
+	srv, _ := sshtest.New(sshtest.Options{AuthorizedKey: up.PublicKey()})
+	defer srv.Close()
+	alt, err := srv.ListenAlso(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := srv.ServeHTTP(8888, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") }))
+	defer stop()
+	// Config.Port 指向没人监听的端口 1：只有 Target.Port 生效才连得上
+	p := upstream.New(upstream.Config{Signer: up, Port: 1, DialTimeout: 300 * time.Millisecond}, &memStore{pubs: map[string]string{}})
+	defer p.Close()
+	tg := upstream.Target{InstanceID: "ins-pppppppp", LanIP: "127.0.0.1", HostPubkey: srv.HostPubLine(), Port: alt}
+	for i := 0; i < 2; i++ {
+		if body, err := httpGet(t, p, tg, 8888); err != nil || body != "ok" {
+			t.Fatalf("get %d via target port = %q %v", i, body, err)
+		}
+	}
+	if p.Len() != 1 || srv.ConnCount() != 1 {
+		t.Fatalf("pool=%d upstream conns=%d, want one shared connection", p.Len(), srv.ConnCount())
+	}
+	// 端口为 0 → 退回 Config.Port（端口 1，不可达）；已有的 alt 连接不能被当成同一目标复用
+	var de *upstream.DialError
+	zero := tg
+	zero.Port = 0
+	if _, err := httpGet(t, p, zero, 8888); !errors.As(err, &de) || de.InstanceID != tg.InstanceID {
+		t.Fatalf("port 0 falls back to config = %v", err)
+	}
+	if p.Len() != 0 {
+		t.Fatalf("stale-port connection kept: len=%d", p.Len())
+	}
+	waitFor(t, "old alt-port conn closed upstream", func() bool { return srv.ConnCount() == 0 })
+	// 再按主端口：Config 默认端口与显式端口等价
+	main := tg
+	main.Port = srv.Port()
+	if body, err := httpGet(t, p, main, 8888); err != nil || body != "ok" {
+		t.Fatalf("primary port = %q %v", body, err)
+	}
+}

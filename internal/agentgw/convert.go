@@ -30,6 +30,17 @@ type metricsDoc struct {
 	RootDiskUsed  uint64  `json:"root_disk_used"`
 	DataDiskUsed  uint64  `json:"data_disk_used"`
 	Load1         float64 `json:"load1"`
+	// Instances 是每个实例容器的 cgroup 用量（计划 10）；旧 Agent 不发，写空数组（不是 null）。
+	Instances []instanceMetricsDoc `json:"instances"`
+}
+
+// instanceMetricsDoc 是 last_metrics.instances 的元素。
+type instanceMetricsDoc struct {
+	InstanceID   string  `json:"instance_id"`
+	MemCurrent   uint64  `json:"mem_current"`
+	MemMax       uint64  `json:"mem_max"` // 0 = 不限
+	CPUPercent   float64 `json:"cpu_percent"`
+	DataDiskUsed uint64  `json:"data_disk_used"`
 }
 
 func finite(v float64) float64 {
@@ -39,11 +50,15 @@ func finite(v float64) float64 {
 	return v
 }
 
-// metricsJSON 把指标转成 JSON；NaN / Inf 置 0，否则 json.Marshal 会失败导致断流。
-func metricsJSON(m *agentpb.Metrics) (json.RawMessage, error) {
+// metricsJSON 把机器指标与每实例指标转成 JSON；NaN / Inf 置 0，否则 json.Marshal 会失败导致断流。
+func metricsJSON(m *agentpb.Metrics, instances []*agentpb.InstanceMetrics) (json.RawMessage, error) {
 	d := metricsDoc{GPUUtil: finite(m.GetGpuUtil()), GPUTempC: finite(m.GetGpuTempC()), GPUPowerW: finite(m.GetGpuPowerW()),
 		MemTotal: m.GetMemTotal(), MemUsed: m.GetMemUsed(), RootDiskTotal: m.GetRootDiskTotal(), RootDiskUsed: m.GetRootDiskUsed(),
-		DataDiskUsed: m.GetDataDiskUsed(), Load1: finite(m.GetLoad1())}
+		DataDiskUsed: m.GetDataDiskUsed(), Load1: finite(m.GetLoad1()), Instances: make([]instanceMetricsDoc, 0, len(instances))}
+	for _, x := range instances {
+		d.Instances = append(d.Instances, instanceMetricsDoc{InstanceID: x.GetInstanceId(), MemCurrent: x.GetMemCurrent(), MemMax: x.GetMemMax(),
+			CPUPercent: finite(x.GetCpuPercent()), DataDiskUsed: x.GetDataDiskUsed()})
+	}
 	return json.Marshal(d)
 }
 

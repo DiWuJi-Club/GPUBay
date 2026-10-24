@@ -194,7 +194,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
-		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen,
+		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SSHBasePort: cfg.UpstreamSSHPort,
 	})
 	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r, Alerts: f})
 	ids.SetReferral(ref)

@@ -39,6 +39,7 @@ type Options struct {
 
 type Server struct {
 	lis    net.Listener
+	alsos  []net.Listener // ListenAlso 追加的监听器（一台机器多个容器 sshd）；受 mu 保护
 	signer ssh.Signer
 	cfg    *ssh.ServerConfig
 
@@ -111,8 +112,28 @@ func New(o Options) (*Server, error) {
 	s := &Server{lis: lis, signer: signer, cfg: cfg, targets: map[int]string{}, extras: map[io.Closer]bool{}, holds: map[int]*hold{},
 		shell: o.Shell, root: root, rootTemp: rootTemp, ctx: ctx, cancel: cancel}
 	s.wg.Add(1)
-	go s.accept()
+	go s.accept(lis)
 	return s, nil
+}
+
+// ListenAlso 让服务器在 127.0.0.1:<port> 上也应答（同主机密钥、同行为、同一组连接与目标），模拟一台机器上多个容器 sshd；
+// port 为 0 时取随机端口。返回实际端口；端口被占用或服务器已关闭时返回错误。追加的监听器随 Close 关闭。
+func (s *Server) ListenAlso(port int) (int, error) {
+	lis, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		lis.Close()
+		return 0, errors.New("sshtest: server closed")
+	}
+	s.alsos = append(s.alsos, lis)
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go s.accept(lis)
+	return lis.Addr().(*net.TCPAddr).Port, nil
 }
 
 func (s *Server) Addr() string       { return s.lis.Addr().String() }
@@ -162,8 +183,13 @@ func (s *Server) Close() {
 	for _, h := range s.holds {
 		h.release()
 	}
+	alsos := s.alsos
+	s.alsos = nil
 	s.mu.Unlock()
 	s.lis.Close()
+	for _, l := range alsos {
+		l.Close()
+	}
 	s.DropAll()
 	s.cancel() // 杀掉 Shell 模式下仍在跑的命令（整个进程组）
 	s.wg.Wait()
@@ -321,10 +347,10 @@ func (s *Server) untrack(c io.Closer) {
 	s.mu.Unlock()
 }
 
-func (s *Server) accept() {
+func (s *Server) accept(lis net.Listener) {
 	defer s.wg.Done()
 	for {
-		nc, err := s.lis.Accept()
+		nc, err := lis.Accept()
 		if err != nil {
 			return
 		}

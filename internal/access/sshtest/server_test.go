@@ -484,3 +484,41 @@ func TestShellModeCloseKillsBackgroundChild(t *testing.T) {
 		t.Fatalf("background child %d survived Close", pid)
 	}
 }
+
+// 一台机器多个容器 sshd：ListenAlso 让同一个假 sshd 在另一个端口也应答（同主机密钥、同行为），Close 时一并关闭。
+func TestListenAlso(t *testing.T) {
+	up := newSigner(t)
+	srv := newServer(t, up)
+	port, err := srv.ListenAlso(0)
+	if err != nil || port == 0 || port == srv.Port() {
+		t.Fatalf("ListenAlso = %d, %v (primary %d)", port, err, srv.Port())
+	}
+	if _, err := srv.ListenAlso(port); err == nil {
+		t.Fatal("listening twice on the same port must fail")
+	}
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	cfg := &ssh.ClientConfig{User: "root", Auth: []ssh.AuthMethod{ssh.PublicKeys(up)},
+		HostKeyCallback: ssh.FixedHostKey(srv.Signer().PublicKey()), Timeout: 5 * time.Second}
+	c, err := ssh.Dial("tcp", addr, cfg)
+	if err != nil {
+		t.Fatalf("dial extra port: %v", err)
+	}
+	if out, err := output(t, c, "echo alt"); err != nil || out != "alt\n" {
+		t.Fatalf("exec on extra port = %q %v", out, err)
+	}
+	if out, err := output(t, dial(t, srv, up), "echo main"); err != nil || out != "main\n" {
+		t.Fatalf("exec on primary port = %q %v", out, err)
+	}
+	if srv.ConnCount() != 2 {
+		t.Fatalf("conns = %d, want 2 (one per port)", srv.ConnCount())
+	}
+	c.Close()
+	srv.Close()
+	if nc, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		nc.Close()
+		t.Fatal("extra listener still open after Close")
+	}
+	if _, err := srv.ListenAlso(0); err == nil {
+		t.Fatal("ListenAlso after Close must fail")
+	}
+}

@@ -62,7 +62,7 @@ type Server struct {
 	mu          sync.Mutex
 	sessCache   map[string]cachedSession
 	lastUnreach map[string]time.Time
-	dialedAt    map[string]string // 实例 → 最近一次转发所用的 lan_ip|主机公钥；变化时丢弃 Transport 空闲连接
+	dialedAt    map[string]string // 实例 → 最近一次转发所用的 lan_ip|sshd 端口|主机公钥；变化时丢弃 Transport 空闲连接
 	streams     map[*stream]struct{}
 	closing     bool // Shutdown 之后不再接受新的转发
 
@@ -227,10 +227,10 @@ func isUpgrade(r *http.Request) bool {
 	return false
 }
 
-// noteTarget：实例的 lan_ip / 主机公钥变化（换机、重建）时丢弃 Transport 的空闲连接，
+// noteTarget：实例的 lan_ip / sshd 端口 / 主机公钥变化（换机、重建）时丢弃 Transport 的空闲连接，
 // 避免复用经旧上游建立的通道（空闲连接按 http://<instance>:<port> 复用，看不到地址变化）。
 func (s *Server) noteTarget(r rental.IngressRoute) {
-	key := r.LanIP + "|" + strings.TrimSpace(r.HostPubkey)
+	key := r.LanIP + "|" + strconv.Itoa(r.SSHPort) + "|" + strings.TrimSpace(r.HostPubkey)
 	s.mu.Lock()
 	prev, seen := s.dialedAt[r.InstanceID]
 	s.dialedAt[r.InstanceID] = key
@@ -329,7 +329,7 @@ func (s *Server) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 			return nil, fmt.Errorf("ingress: route %s vanished", addr)
 		}
 	}
-	return s.dialer.Dial(ctx, upstream.Target{InstanceID: route.InstanceID, LanIP: route.LanIP, HostPubkey: route.HostPubkey}, route.Port)
+	return s.dialer.Dial(ctx, upstream.Target{InstanceID: route.InstanceID, LanIP: route.LanIP, HostPubkey: route.HostPubkey, Port: route.SSHPort}, route.Port)
 }
 
 // sessionValid：Cookie 绑定的控制台会话仍有效且属于 userID（登出即失效）。查询出错（数据库故障）视为无效。

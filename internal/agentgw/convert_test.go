@@ -2,8 +2,10 @@ package agentgw
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
+	"spark-cloud/internal/agentpb"
 	"spark-cloud/internal/fleet"
 )
 
@@ -60,5 +62,32 @@ func TestCreateInstancePayloadJSONCompat(t *testing.T) {
 	b, _ := json.Marshal(fleet.CreateInstancePayload{ImageRef: "img:1", SSHPort: 2223, ShareSlots: 2})
 	if string(b) != `{"image_ref":"img:1","ssh_port":2223,"share_slots":2}` {
 		t.Fatalf("%s", b)
+	}
+}
+
+// last_metrics 的结构快照：机器级字段 + instances 数组（无实例时为 []，不是 null）。
+func TestMetricsJSONInstancesSnapshot(t *testing.T) {
+	m := &agentpb.Metrics{GpuUtil: 12, GpuTempC: 55, GpuPowerW: 30, MemTotal: 100, MemUsed: 40, RootDiskTotal: 1000, RootDiskUsed: 500, DataDiskUsed: 7, Load1: 0.5}
+	got, err := metricsJSON(m, []*agentpb.InstanceMetrics{
+		{InstanceId: "ins-aaaaaaaa", MemCurrent: 1 << 30, MemMax: 2 << 30, CpuPercent: 150.5, DataDiskUsed: 4096},
+		{InstanceId: "ins-bbbbbbbb", CpuPercent: math.NaN()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"gpu_util":12,"gpu_temp_c":55,"gpu_power_w":30,"mem_total":100,"mem_used":40,"root_disk_total":1000,"root_disk_used":500,` +
+		`"data_disk_used":7,"load1":0.5,"instances":[` +
+		`{"instance_id":"ins-aaaaaaaa","mem_current":1073741824,"mem_max":2147483648,"cpu_percent":150.5,"data_disk_used":4096},` +
+		`{"instance_id":"ins-bbbbbbbb","mem_current":0,"mem_max":0,"cpu_percent":0,"data_disk_used":0}]}`
+	if string(got) != want {
+		t.Fatalf("metrics json =\n%s\nwant\n%s", got, want)
+	}
+	// 旧 Agent（心跳不带 instances）→ "instances":[]
+	got, err = metricsJSON(&agentpb.Metrics{Load1: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"gpu_util":0,"gpu_temp_c":0,"gpu_power_w":0,"mem_total":0,"mem_used":0,"root_disk_total":0,"root_disk_used":0,"data_disk_used":0,"load1":1,"instances":[]}`; string(got) != want {
+		t.Fatalf("old agent metrics json = %s", got)
 	}
 }
