@@ -5,6 +5,8 @@ package comfywf
 import (
 	"slices"
 	"time"
+
+	"spark-cloud/internal/storage"
 )
 
 const (
@@ -19,7 +21,7 @@ const (
 	RunsPerHour               = 120
 	MaxUploadBytes            = 16 << 20
 	MaxViewBytes              = 64 << 20
-	MaxCoverBytes             = 2 << 20
+	MaxCoverBytes             = storage.MaxCoverSize // 2MB：storage 的 workflow_cover 用途按它限制
 	ProxyTimeout              = 30 * time.Second
 	ViewTimeout               = 120 * time.Second
 	RunWaitMax                = 30 * time.Minute
