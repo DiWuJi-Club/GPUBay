@@ -19,6 +19,7 @@ import (
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/apperr"
@@ -64,6 +65,8 @@ type Server struct {
 	Gateway       *agentgw.Server    // 机器接入命令与撤销（计划 2）
 	Apps          *appdeploy.Service // 应用部署（计划 7）：部署列表 / 详情 / 强制卸载、实例详情与仪表盘
 	AppCatalog    *appdeploy.Catalog // 应用目录（计划 7）：应用、版本、发布、预拉取、覆盖率
+	Workflows     *comfywf.Catalog   // ComfyUI 工作流目录（计划 11）：工作流、版本、发布、封面、安装列表、仪表盘数字
+	Installer     *comfywf.Installer // 工作流安装（计划 11）：部署详情里的工作流集合
 	Clock         clock.Clock
 	Log           *slog.Logger
 	SecureCookie  bool                                     // 生产环境为 true：Cookie 仅经 HTTPS 发送
@@ -121,6 +124,7 @@ func (s *Server) Router() http.Handler {
 			s.financeRoutes(g)
 			s.catalogRoutes(g)
 			s.appRoutes(g)
+			s.workflowRoutes(g)
 		})
 	})
 	static := s.Static
@@ -150,9 +154,10 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // requireJSONForWrites 要求写请求使用 application/json；配合 SameSite=Strict Cookie 防止跨站请求。
+// 例外：工作流封面上传（multipart/form-data，由处理器自己校验类型；同站防护 SameSiteGuard 照常生效）。
 func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions &&
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && !isCoverUpload(r) &&
 			!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 			s.writeError(w, r, apperr.BadRequest("请求格式必须为 JSON"))
 			return

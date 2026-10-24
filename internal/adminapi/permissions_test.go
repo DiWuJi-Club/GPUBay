@@ -59,6 +59,14 @@ var expectedRoutes = []struct {
 	{"POST", "/apps/{id}/versions/{vid}/publish", super}, {"POST", "/apps/{id}/versions/{vid}/prepull", ops},
 	{"GET", "/apps/{id}/versions/{vid}/script", all},
 	{"GET", "/deployments", all}, {"GET", "/deployments/{dep}", all}, {"POST", "/deployments/{dep}/force-remove", ops},
+
+	// 计划 11 D6：全部角色可读工作流目录 / 版本详情 / 安装列表；super 维护目录与版本、上传封面；发布 = super + 动态码
+	{"GET", "/workflows", all}, {"POST", "/workflows", super}, {"GET", "/workflows/{id}", all}, {"PUT", "/workflows/{id}", super},
+	{"DELETE", "/workflows/{id}", super}, {"GET", "/workflows/{id}/cover", all}, {"POST", "/workflows/{id}/cover", super},
+	{"GET", "/workflows/{id}/installs", all},
+	{"GET", "/workflows/{id}/versions", all}, {"POST", "/workflows/{id}/versions", super},
+	{"GET", "/workflows/{id}/versions/{vid}", all}, {"PUT", "/workflows/{id}/versions/{vid}", super},
+	{"POST", "/workflows/{id}/versions/{vid}/publish", super},
 }
 
 func roleKey(roles []admin.Role) string {

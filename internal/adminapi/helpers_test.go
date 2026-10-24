@@ -24,6 +24,7 @@ import (
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/pki"
@@ -69,6 +70,8 @@ type env struct {
 	gw       *agentgw.Server
 	apps     *appdeploy.Service
 	appCat   *appdeploy.Catalog
+	wfCat    *comfywf.Catalog
+	wfInst   *comfywf.Installer
 }
 
 func newEnv(t *testing.T) *env { return newEnvWith(t, nil) }
@@ -111,10 +114,15 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	}
 	portURL := func(id string, port int) string { return fmt.Sprintf("http://%s-%d.spark.test/", id, port) }
 	appCat := appdeploy.NewCatalog(pool, clk, f, c, log)
-	apps := appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
-		PortURL: portURL})
+	wfCat := comfywf.NewCatalog(pool, clk, uploads, log)
+	appDeps := appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
+		PortURL: portURL}
+	comfywf.NewHooks(pool, wfCat).Wire(&appDeps) // 与 app.go 一致：部署视图带 workflows
+	apps := appdeploy.NewService(appDeps)
+	wfInst := comfywf.NewInstaller(pool, clk, wfCat, apps, appCat, log)
 	srv := &adminapi.Server{Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: b,
-		Uploads: uploads, Gateway: gw, Clock: clk, Log: log, Apps: apps, AppCatalog: appCat, PortURL: portURL}
+		Uploads: uploads, Gateway: gw, Clock: clk, Log: log, Apps: apps, AppCatalog: appCat, PortURL: portURL,
+		Workflows: wfCat, Installer: wfInst}
 	if tweak != nil {
 		tweak(srv)
 	}
@@ -122,7 +130,7 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	t.Cleanup(ts.Close)
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, srv: srv, ts: ts, admins: admins, identity: ids,
 		wallet: w, catalog: c, fleet: f, rental: r, billing: b, uploads: uploads, pdu: pduMock, pay: payMock, gw: gw,
-		apps: apps, appCat: appCat}
+		apps: apps, appCat: appCat, wfCat: wfCat, wfInst: wfInst}
 }
 
 type client struct {
