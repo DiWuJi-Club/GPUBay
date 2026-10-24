@@ -519,6 +519,13 @@ func TestLoadLLMErrors(t *testing.T) {
 			t.Errorf("%s: err = %v, want contains %q", tc.name, err, tc.want)
 		}
 	}
+	// BaseURL 带凭据：拒绝，且错误信息不回显密码
+	for _, v := range []string{"http://user:s3cret-pw@token-mall/v1", "ftp://user:s3cret-pw@token-mall/v1", "http://user:s3cret-pw@[::1/v1"} {
+		_, err := config.Load(env(base("SPARK_LLM_BASE_URL", v)))
+		if err == nil || !strings.Contains(err.Error(), "SPARK_LLM_BASE_URL") || strings.Contains(err.Error(), "s3cret-pw") {
+			t.Errorf("%s: err = %v, want SPARK_LLM_BASE_URL error without password", v, err)
+		}
+	}
 	// prod 关闭管家时不要求 BaseURL / APIKey
 	if c, err := config.Load(env(prod("SPARK_BUTLER", "off", "SPARK_LLM_BASE_URL", "", "SPARK_LLM_API_KEY", ""))); err != nil || c.Butler {
 		t.Fatalf("prod butler off: butler=%v err=%v", c.Butler, err)

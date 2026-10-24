@@ -569,9 +569,16 @@ func (c *Config) loadButler(getenv func(string) string, or func(key, def string)
 		l.Model = DefaultLLMModel(l.Provider)
 	}
 	if l.BaseURL != "" {
+		// 错误信息不回显原值：URL 里可能带着凭据
 		u, err := url.Parse(l.BaseURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("SPARK_LLM_BASE_URL 必须以 http:// 或 https:// 开头，当前为 %q", l.BaseURL)
+		if err != nil {
+			return errors.New("SPARK_LLM_BASE_URL 不是合法的 URL")
+		}
+		if u.User != nil {
+			return errors.New("SPARK_LLM_BASE_URL 不能包含用户名或密码（密钥请放 SPARK_LLM_API_KEY）")
+		}
+		if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("SPARK_LLM_BASE_URL 必须以 http:// 或 https:// 开头，当前为 %q", u.Redacted())
 		}
 	}
 	if l.MaxOutputTokens, err = positiveInt("SPARK_LLM_MAX_OUTPUT_TOKENS", or("SPARK_LLM_MAX_OUTPUT_TOKENS", strconv.Itoa(DefaultLLMMaxOutputTokens))); err != nil {
