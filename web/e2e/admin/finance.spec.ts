@@ -5,6 +5,8 @@ import {
 } from '../helpers/admin'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
+import { yuan } from '../helpers/money'
+import { seedReward } from '../helpers/referral'
 import { cstDate, cstTime, cstTimeSec } from '../helpers/time'
 
 interface Order { id: string; user_id: number; kind: string; instance_id: string; duration: string; amount: number; refunded_amount: number; status: string; created_at: string }
@@ -706,4 +708,17 @@ test('A-FIN-04 三张表导出 CSV：与列表同筛选参数（含状态、跨�
       expect(table.slice(1).map((c) => c[0]).sort()).toEqual(api.map((x) => String(x.id)).sort())
     }
   })
+})
+
+test('A-FIN-05 流水页筛选「邀请返利」', async ({ page }) => {
+  const { inv } = await seedReward({ settle: true })
+  await loginAdmin(page, await createAdmin('finance'))
+  await page.goto('/admin/ledger')
+  await page.getByTestId('fin-filter-user').fill(String(inv.id))
+  await pick(page, 'fin-filter-kind', '邀请返利')
+  await page.getByTestId('fin-search').click()
+  await expect(rows(page, 'led-id')).toHaveCount(1)
+  await expect(page.getByTestId('led-kind').first()).toHaveText('邀请返利')
+  await expect(page.getByTestId('led-amount').first()).toHaveText(`+${yuan(690)}`)
+  await expect(page.getByTestId('led-user').first()).toHaveText(String(inv.id))
 })

@@ -230,10 +230,14 @@ func (s *Service) Heartbeat(ctx context.Context, machineID int64) (bool, error) 
 
 // MarkOfflineStale 把超过 timeout 没有心跳的在线机器标记为离线，返回这些机器的 ID。
 // 同时清空 state_reported_at：流若撑过了离线期（未重连），清扫器不能拿离线前的报告恢复计时，须等新的 StateReport。
+// 候选行按 id 顺序加锁并跳过别的事务正锁着的行（SKIP LOCKED）：多行 UPDATE 不定序加锁，会与下单、指令回报等
+// 同样锁机器行的事务形成死锁环（并发用例里见过）；被跳过的机器正被别的事务处理，下一轮清扫再判定。
 func (s *Service) MarkOfflineStale(ctx context.Context, timeout time.Duration) ([]int64, error) {
 	now := s.clock.Now()
 	rows, err := s.pool.Query(ctx, `UPDATE machines SET agent_online = false, state_reported_at = NULL, updated_at = $1
-		WHERE agent_online AND (last_seen_at IS NULL OR last_seen_at < $2) RETURNING id`, now, now.Add(-timeout))
+		WHERE id IN (SELECT id FROM machines WHERE agent_online AND (last_seen_at IS NULL OR last_seen_at < $2)
+			ORDER BY id FOR UPDATE SKIP LOCKED)
+		RETURNING id`, now, now.Add(-timeout))
 	if err != nil {
 		return nil, err
 	}

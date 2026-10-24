@@ -80,3 +80,14 @@ func (s *Service) ListOrders(ctx context.Context, userID int64, limit int) ([]Or
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Order, error) { return scanOrder(r) })
 }
+
+// OrderForReferral 供 referral 模块（计划 8）只读：订单的用户与预订单的计划开始时刻（非预订为 nil）。
+func (s *Service) OrderForReferral(ctx context.Context, q db.Querier, orderID string) (int64, *time.Time, error) {
+	var userID int64
+	var start *time.Time
+	err := q.QueryRow(ctx, `SELECT o.user_id, i.scheduled_start_at FROM orders o JOIN instances i ON i.id = o.instance_id WHERE o.id = $1`, orderID).Scan(&userID, &start)
+	if db.IsNoRows(err) {
+		return 0, nil, apperr.ErrNotFound
+	}
+	return userID, start, err
+}

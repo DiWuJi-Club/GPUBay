@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  durationLabel, fmtTime, fmtYuan, instanceStateLabel, isApiError, kycResultLabel, kycStatusLabel, labelOf, ledgerKindLabel, messageOf, orderKindLabel, orderStatusLabel,
+  bindingStatusLabel, durationLabel, fmtTime, fmtYuan, instanceStateLabel, isApiError, kycResultLabel, kycStatusLabel, labelOf, ledgerKindLabel, messageOf, orderKindLabel, orderStatusLabel,
   userKindLabel, userStatusLabel, type Recharge, type UserDetail,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
@@ -10,6 +10,7 @@ import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
 import { validateAdjust, validateManualRecharge } from '../logic/money'
 import { notifyError } from '../logic/notify'
+import { accountStatusLabel, maskPhone } from '../logic/referral'
 import { session } from '../store/session'
 
 const route = useRoute()
@@ -199,6 +200,27 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
         </div>
       </el-card>
 
+      <!-- 邀请返利：作为被邀请人时的邀请人（脱敏手机号）；作为邀请人时的统计 -->
+      <el-card header="邀请" data-testid="user-referral">
+        <template v-if="data.referral?.inviter || data.referral?.account">
+          <p v-if="data.referral.inviter" class="ref-line" data-testid="user-referral-inviter">
+            邀请人 <IdLink kind="user" :id="data.referral.inviter.user_id" /> <span class="mono muted">{{ maskPhone(data.referral.inviter.phone) }}</span> · 绑定{{ labelOf(bindingStatusLabel, data.referral.inviter.binding_status) }}
+          </p>
+          <template v-if="data.referral.account">
+            <el-descriptions :column="3" border>
+              <el-descriptions-item label="邀请码"><span class="mono" data-testid="user-referral-code">{{ data.referral.account.code }}</span></el-descriptions-item>
+              <el-descriptions-item label="邀请状态"><span data-testid="user-referral-status">{{ labelOf(accountStatusLabel, data.referral.account.status) }}</span></el-descriptions-item>
+              <el-descriptions-item label="被邀请人"><span data-testid="user-referral-invitees">{{ data.referral.account.invitees }}</span></el-descriptions-item>
+              <el-descriptions-item label="累计返利（净额）"><span data-testid="user-referral-net">{{ fmtYuan(data.referral.account.settled_net) }}</span></el-descriptions-item>
+              <el-descriptions-item label="待发放"><span data-testid="user-referral-pending">{{ fmtYuan(data.referral.account.pending) }}</span></el-descriptions-item>
+              <el-descriptions-item label="欠账"><span data-testid="user-referral-debt">{{ fmtYuan(data.referral.account.debt) }}</span></el-descriptions-item>
+            </el-descriptions>
+            <router-link v-if="canFinance" class="more" :to="{ path: '/referral', query: { tab: 'inviters', q: String(data.user.id) } }" data-testid="user-referral-link">查看邀请返利</router-link>
+          </template>
+        </template>
+        <span v-else class="muted" data-testid="user-referral-none">无邀请关系</span>
+      </el-card>
+
       <el-card>
         <el-tabs v-model="tab">
           <el-tab-pane label="实例" name="instances">
@@ -350,4 +372,5 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
 .grid th, .grid td { padding: 8px; text-align: left; border-bottom: 1px solid var(--el-border-color-lighter); }
 .grid th { color: #909399; font-weight: 500; }
 .empty { text-align: center; }
+.ref-line { margin: 0 0 12px; }
 </style>
