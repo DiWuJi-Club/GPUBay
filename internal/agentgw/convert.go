@@ -7,7 +7,11 @@ import (
 
 	"spark-cloud/internal/agentpb"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/rental"
 )
+
+// maxMetricsInstances 是 last_metrics.instances 最多保留的条数（一台机器的实例数远小于它；防异常 Agent 撑大每次心跳的写入）。
+const maxMetricsInstances = 16
 
 func toStateReport(r *agentpb.StateReport) fleet.StateReport {
 	out := fleet.StateReport{Instances: []fleet.InstanceState{}}
@@ -51,11 +55,18 @@ func finite(v float64) float64 {
 }
 
 // metricsJSON 把机器指标与每实例指标转成 JSON；NaN / Inf 置 0，否则 json.Marshal 会失败导致断流。
+// 每实例指标只收实例 ID 合法的条目，最多 maxMetricsInstances 条。
 func metricsJSON(m *agentpb.Metrics, instances []*agentpb.InstanceMetrics) (json.RawMessage, error) {
 	d := metricsDoc{GPUUtil: finite(m.GetGpuUtil()), GPUTempC: finite(m.GetGpuTempC()), GPUPowerW: finite(m.GetGpuPowerW()),
 		MemTotal: m.GetMemTotal(), MemUsed: m.GetMemUsed(), RootDiskTotal: m.GetRootDiskTotal(), RootDiskUsed: m.GetRootDiskUsed(),
-		DataDiskUsed: m.GetDataDiskUsed(), Load1: finite(m.GetLoad1()), Instances: make([]instanceMetricsDoc, 0, len(instances))}
+		DataDiskUsed: m.GetDataDiskUsed(), Load1: finite(m.GetLoad1()), Instances: make([]instanceMetricsDoc, 0, min(len(instances), maxMetricsInstances))}
 	for _, x := range instances {
+		if len(d.Instances) >= maxMetricsInstances {
+			break
+		}
+		if !rental.InstanceIDPattern.MatchString(x.GetInstanceId()) { // 不是平台实例 ID 的条目不落库
+			continue
+		}
 		d.Instances = append(d.Instances, instanceMetricsDoc{InstanceID: x.GetInstanceId(), MemCurrent: x.GetMemCurrent(), MemMax: x.GetMemMax(),
 			CPUPercent: finite(x.GetCpuPercent()), DataDiskUsed: x.GetDataDiskUsed()})
 	}

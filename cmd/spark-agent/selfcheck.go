@@ -85,7 +85,6 @@ func selfcheck(ctx context.Context, run cmdrun.Runner, stateDir string, out io.W
 	report("disk free", err, fmt.Sprintf("%d GiB", free>>30))
 	detail, err = cpuCount(ctx, run)
 	warn("nproc", err, detail) // 只和已搁置的共享机（按份 --cpus）有关，整机不需要
-
 	detail, err = cgroupV2(ctx, run)
 	report("cgroup v2", err, detail)
 	if failed {

@@ -2,6 +2,7 @@ package agentgw
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"testing"
 
@@ -89,5 +90,30 @@ func TestMetricsJSONInstancesSnapshot(t *testing.T) {
 	}
 	if want := `{"gpu_util":0,"gpu_temp_c":0,"gpu_power_w":0,"mem_total":0,"mem_used":0,"root_disk_total":0,"root_disk_used":0,"data_disk_used":0,"load1":1,"instances":[]}`; string(got) != want {
 		t.Fatalf("old agent metrics json = %s", got)
+	}
+}
+
+// 心跳 instances 落库有界：实例 ID 不合法的条目跳过，最多 16 条。
+func TestMetricsJSONInstancesBounded(t *testing.T) {
+	in := []*agentpb.InstanceMetrics{{InstanceId: ""}, {InstanceId: "ins-ABCDEFGH"}, {InstanceId: "ins-abc"}, {InstanceId: "../etc/passwd"},
+		{InstanceId: "ins-abcdefgh1"}, {InstanceId: "xins-abcdefgh"}}
+	for i := 0; i < 20; i++ {
+		in = append(in, &agentpb.InstanceMetrics{InstanceId: fmt.Sprintf("ins-%08d", i), MemCurrent: uint64(i)})
+	}
+	got, err := metricsJSON(&agentpb.Metrics{}, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc metricsDoc
+	if err := json.Unmarshal(got, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Instances) != maxMetricsInstances || maxMetricsInstances != 16 {
+		t.Fatalf("instances = %d, want 16", len(doc.Instances))
+	}
+	for i, x := range doc.Instances {
+		if x.InstanceID != fmt.Sprintf("ins-%08d", i) || x.MemCurrent != uint64(i) {
+			t.Fatalf("instances[%d] = %+v", i, x)
+		}
 	}
 }

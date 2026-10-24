@@ -19,6 +19,15 @@ func TestInstanceSSHPort(t *testing.T) {
 	}
 }
 
+func TestServiceInstanceSSHPort(t *testing.T) {
+	if got := rental.NewService(rental.Deps{SSHBasePort: testSSHBasePort}).InstanceSSHPort("ins-abcdefgh"); got != testSSHBasePort {
+		t.Fatalf("InstanceSSHPort = %d, want %d", got, testSSHBasePort)
+	}
+	if got := rental.NewService(rental.Deps{}).InstanceSSHPort("ins-abcdefgh"); got != rental.DefaultSSHPort {
+		t.Fatalf("InstanceSSHPort (no base) = %d, want %d", got, rental.DefaultSSHPort)
+	}
+}
+
 // createPayloadOn 返回机器上唯一一条 Create 指令的原始 payload（解析成 map，检查线上字段名）。
 func createPayloadOn(e *env, machineID int64) map[string]any {
 	e.t.Helper()

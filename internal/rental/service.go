@@ -151,6 +151,12 @@ func (i Instance) SSHPort(base int) int {
 	return base
 }
 
+// InstanceSSHPort 按实例 ID 给出容器 sshd 端口（Instance.SSHPort(Deps.SSHBasePort)），供只查了实例 ID 的上游拨号方
+// （应用部署 Runner / 实时日志）与 AccessInfo、IngressRoute 保持一致。共享机落地后改为按实例槽位算。
+func (s *Service) InstanceSSHPort(instanceID string) int {
+	return Instance{ID: instanceID}.SSHPort(s.d.SSHBasePort)
+}
+
 // enqueueCreate 给实例所在机器入队 Create 指令：镜像地址由调用方解析，端口按 Instance.SSHPort，份数恒为 1（整机）。
 // 所有开通路径（即时下单、预订开通、改派、换机）都经这里，保证指令形态一致。
 func (s *Service) enqueueCreate(ctx context.Context, q db.Querier, inst Instance, imageRef string) error {

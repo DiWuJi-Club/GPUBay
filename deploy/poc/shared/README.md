@@ -69,8 +69,9 @@ sudo /tmp/multicheck --lan-ip 192.168.1.221 2>/tmp/multicheck.log | tee /tmp/mul
 sudo systemctl start spark-agent
 ```
 
-- 参数：`--state-dir`（默认 `/var/tmp/spark-multicheck/<unix>`，与生产 `/var/lib/spark-agent` 隔离）、`--image`（默认 `spark/cuda-ssh:13.0.1`，须已在本机）、`--lan-ip`（默认默认路由的源地址）、`--data-gib`（默认 2048）、`--bridge`（默认 `spark0`）、`--allow`（出网白名单 CIDR，逗号分隔）、`--keep`（不洗机）、`--whole`（默认开，检查整机实例 D）。
+- 参数：`--state-dir`（默认 `/var/tmp/spark-multicheck/<unix>`，与生产 `/var/lib/spark-agent` 隔离）、`--image`（默认 `spark/cuda-ssh:13.0.1`，须已在本机）、`--lan-ip`（默认默认路由的源地址）、`--data-gib`（默认 2048）、`--bridge`（默认 `spark0`）、`--allow`（出网白名单 CIDR，逗号分隔）、`--keep`（不洗机）、`--whole`（默认开，检查整机实例 D）、`--force`（`spark-agent` 服务在运行也继续；默认 `systemctl is-active --quiet spark-agent` 成功即拒绝启动，退出码 2）。
 - 步骤：1 建 A（4 份，2223）、B（4 份，2224）→ 2 `docker inspect` 核对 Memory / MemorySwap = (MemTotal − 8GiB)/4、NanoCpus = nproc/4、PidsLimit 8192、CapAdd 无 SYS_NICE、ShmSize = Memory/2、端口发布、数据盘镜像 512 GiB 且已挂载 → 3 C 用 2223 必须报 `SSH 端口冲突` 且不留容器 / 数据盘 → 4 `Mounts()` 的 cgroup 目录存在，`metrics.Collector` 两次采样（间隔 3 s），mem_max = docker Memory；A 内两个空转循环时 A 的 cpu_percent 150～250、B < 20 → 5 容器内 `memory.max` / `cpu.max`（`500000 100000`）→ 6 A 连不到 B 的容器地址 :22 与宿主机 :2224，宿主机能连到两个 sshd（对照）→ 7 洗 A/B，建整机 D（share_slots 1，2225）核对 Memory = MemTotal − 8GiB、NanoCpus 0、PidsLimit 32768、有 SYS_NICE、数据盘 2048 GiB，再洗 D → 8 独立确认容器、镜像文件、loop 设备、挂载、ssh 目录都已消失。
 - 输出：每步 `== step N …`，每项 `PASS` / `FAIL <项>: <实测值>`，最后 `RESULT: PASS` 或 `RESULT: FAIL (n checks failed)`（退出码 1）。执行器日志（Warn 以上）走 stderr。
+- 超时：单条 create / wipe 指令 10 分钟、单条查询命令 2 分钟；清理（洗机 + 最终校验）整体 5 分钟，超时的项记 FAIL，残留按下一条手工处理。
 - 中途失败或 Ctrl-C 也会洗掉已创建的实例（之后的 Ctrl-C 被忽略，等清理跑完）；`kill -9` 时按 `--state-dir` 与实例 ID（`ins-m<6 位>{a,b,c,d}`，输出里有）手工 `docker rm -f`、`umount`、`losetup -d`、删镜像。
-- 副作用：会按 `--allow` 重写 `SPARK-FWD` 链（默认空白名单），正在跑的平台实例在真 Agent 重启并收到平台配置之前出网只剩公网（与 Agent 冷启动时相同）。需要 2048+100 GiB（D）与 2×(512+100) GiB 的根分区可用空间（稀疏文件，实际占用很小）；端口 2223～2225 须空闲。
+- 副作用：会按 `--allow` 重写 `SPARK-FWD` 链（默认空白名单），启动时打印 `WARNING` 提示；正在跑的平台实例在真 Agent 重启并收到平台配置重新同步之前出网只剩公网（与 Agent 冷启动时相同），所以跑完务必 `systemctl start spark-agent`。需要 2048+100 GiB（D）与 2×(512+100) GiB 的根分区可用空间（稀疏文件，实际占用很小）；端口 2223～2225 须空闲。

@@ -82,7 +82,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_SSH_ADDR` | SSH 网关监听地址（compose 把公网 22 映射到它） | :2222 |
 | `SPARK_SSH_PUBLIC_PORT` | 写进用户 SSH 命令的公网端口；非 22 时命令带 `-p` | 22 |
 | `SPARK_SSH_MAX_SESSIONS_PER_INSTANCE` / `SPARK_SSH_DRAIN_TIMEOUT` | 每实例并发 SSH 会话上限 / 停机时等待会话结束的时间 | 16 / 30s |
-| `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的**基准**端口：平台按实例计算端口（`rental.Instance.SSHPort`，目前恒等于基准），写进 Create 指令的 `ssh_port`，SSH 网关与 Web 入口按同一值拨上游 | 2222 |
+| `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的**基准**端口：平台按实例计算端口（`rental.Instance.SSHPort`，目前恒等于基准），写进 Create 指令的 `ssh_port`，SSH 网关、Web 入口与应用部署按同一值拨上游。端口在 Create **入队时**就固定进指令：有待下发的 Create 时修改，这些实例仍发布在旧端口上（平台却按新端口拨，连不上），所以只在没有待下发 Create 时修改；已在运行的实例要重新开通才会换端口 | 2222 |
 | `SPARK_INGRESS_DOMAIN` | 租户 Web 子域的父域（`ins-<id>-<port>.<此域>`）；生产推荐用与 `SPARK_DOMAIN` **不同的注册域（eTLD+1）**，子域不算；「不是 SPARK_DOMAIN 子域」的启动校验只防误配 | = SPARK_DOMAIN |
 | `SPARK_PUBLIC_BASE_URL` | 对外地址，支付回调为 `<地址>/api/v1/pay/notify/{wechat,alipay}`（real 支付必填，须 https）；域名必须等于 `SPARK_DOMAIN`；prod 必填且 https；dev 默认 `http://spark.local:8080`。本地测 ingress 需在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或改用 sslip.io 域 | 见左 |
 | `SPARK_ADMIN_PUBLIC_BASE_URL` | 后台对外地址（经反向代理或 `ssh -L` 隧道访问时填浏览器地址栏里的后台地址），用于后台写请求的 Origin 校验。为空时只认 `Sec-Fetch-Site`：带 `Origin` 而不带 `Sec-Fetch-Site` 的客户端（旧版 Safari、部分内嵌 WebView）后台写请求一律 403；staging / prod 为空时启动日志会打 WARN | 空 |

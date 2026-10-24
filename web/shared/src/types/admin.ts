@@ -74,6 +74,14 @@ export interface MachineMetrics {
   root_disk_used: number
   data_disk_used: number
   load1: number
+  /** 每个实例容器的 cgroup 用量（计划 10，≤ 16 项；mem_max 0 = 不限）；升级前写入的 last_metrics 没有此字段 */
+  instances?: {
+    instance_id: string
+    mem_current: number
+    mem_max: number
+    cpu_percent: number
+    data_disk_used: number
+  }[]
 }
 
 export interface EnrollCommand {

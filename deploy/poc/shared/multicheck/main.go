@@ -1,6 +1,6 @@
 // multicheck 在真机上直接驱动 Agent 执行器（与 spark-agent run 同一套 docker / loop / iptables 构造），
 // 验收一台机器多个容器：按份配额、端口冲突兜底、Mounts + 每实例 cgroup 指标、容器间隔离、整机实例、洗机。
-// 以 root 运行，运行前先停掉 spark-agent 服务。用法见 deploy/poc/shared/README.md。
+// 以 root 运行，运行前先停掉 spark-agent 服务（服务在跑时拒绝启动，除非 --force）。用法见 deploy/poc/shared/README.md。
 package main
 
 import (
@@ -37,6 +37,12 @@ import (
 	"spark-cloud/internal/agent/state"
 )
 
+const (
+	submitTimeout  = 10 * time.Minute // 单条 create / wipe 指令（建 2 TiB 稀疏数据盘 + mkfs 也远用不了这么久）
+	commandTimeout = 2 * time.Minute  // 单条查询命令（docker inspect / exec、losetup、findmnt）
+	cleanupTimeout = 5 * time.Minute  // 一次清理（洗掉全部实例 + 最终校验）的总时限
+)
+
 type harness struct {
 	ctx      context.Context
 	run      cmdrun.Exec
@@ -68,12 +74,23 @@ func run() (code int) {
 	allow := flag.String("allow", "", "出网白名单 CIDR（逗号分隔）；会覆盖 SPARK-FWD 链，真 Agent 重启收到配置后恢复")
 	keep := flag.Bool("keep", false, "结束时不洗机（保留容器与数据盘便于排查）")
 	whole := flag.Bool("whole", true, "洗掉 A/B 后再建一个整机实例 D（ssh 端口 2225）检查整机参数")
+	force := flag.Bool("force", false, "spark-agent 服务在运行也继续（两边会抢着对账 / 清理容器，一般不要用）")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
 		fmt.Println("必须以 root 运行")
 		return 2
 	}
+	if exec.Command("systemctl", "is-active", "--quiet", "spark-agent").Run() == nil && !*force {
+		fmt.Println("spark-agent 服务正在运行：先 systemctl stop spark-agent（或加 --force）")
+		return 2
+	}
+	allowShown := *allow
+	if allowShown == "" {
+		allowShown = "空：只放行公网"
+	}
+	fmt.Printf("WARNING: 本工具会按 --allow（%s）重写 SPARK-FWD 链，直到真 Agent 重启并从平台收到配置重新同步为止；\n"+
+		"         这期间本机其它容器的出网白名单都按此生效。结束后务必 systemctl start spark-agent。\n", allowShown)
 	if *lanIP == "" {
 		*lanIP = defaultRouteIP()
 	}
@@ -276,8 +293,10 @@ func (h *harness) leftover(id string) bool {
 }
 
 func (h *harness) submit(c executor.Command) executor.ResultMsg {
+	ctx, cancel := context.WithTimeout(h.ctx, submitTimeout)
+	defer cancel()
 	h.ex.Submit(c)
-	for _, r := range h.ex.RunPending(h.ctx, nil) {
+	for _, r := range h.ex.RunPending(ctx, nil) {
 		if r.ID == c.ID {
 			return r
 		}
@@ -352,7 +371,9 @@ func (h *harness) sample(col *metrics.Collector, mounts []metrics.InstanceMount)
 // cleanup 洗掉还没洗的实例，再独立确认容器、镜像文件、loop 设备、挂载、ssh 目录都已消失。
 func (h *harness) cleanup() {
 	header("8 清理与最终校验")
-	h.ctx = context.Background() // 被 SIGINT 取消后仍要能执行
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout) // 被 SIGINT 取消后仍要能执行，但不无限挂住
+	defer cancel()
+	h.ctx = ctx
 	for _, id := range h.created {
 		h.wipe(id)
 	}
@@ -397,7 +418,9 @@ func (h *harness) inspect(id string) inspectDoc {
 
 // out 执行命令返回 stdout；出错时打印并返回空串。
 func (h *harness) out(name string, args ...string) string {
-	b, err := h.run.Run(h.ctx, name, args...)
+	ctx, cancel := context.WithTimeout(h.ctx, commandTimeout)
+	defer cancel()
+	b, err := h.run.Run(ctx, name, args...)
 	if err != nil {
 		fmt.Printf("  (%s %s: %v)\n", name, strings.Join(args, " "), err)
 	}
@@ -405,7 +428,9 @@ func (h *harness) out(name string, args ...string) string {
 }
 
 func (h *harness) runErr(name string, args ...string) error {
-	_, err := h.run.Run(h.ctx, name, args...)
+	ctx, cancel := context.WithTimeout(h.ctx, commandTimeout)
+	defer cancel()
+	_, err := h.run.Run(ctx, name, args...)
 	return err
 }
 

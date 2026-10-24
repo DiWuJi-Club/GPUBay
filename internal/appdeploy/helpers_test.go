@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -37,6 +38,7 @@ type env struct {
 	box       *secretbox.Box
 	cat       *appdeploy.Catalog
 	rental    *rental.Service
+	ids       *identity.Service
 	svc       *appdeploy.Service
 	imageID   int64
 	userID    int64
@@ -63,9 +65,29 @@ func newEnv(t *testing.T, machines int) *env {
 	}
 	e.exec(`UPDATE machines SET agent_online = true`)
 	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: box})
-	e.rental = rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: wallet.NewService(pool, clk), Catalog: c, Fleet: f})
-	e.svc = e.newService(nil, "")
+	e.ids = ids
+	e.setSSHBasePort(0)
 	return e
+}
+
+// setSSHBasePort 以给定的容器 sshd 基准端口重建 rental 与部署服务（0 = 默认 2222）。
+// 上游测试把 sshtest 端口放在这里、给上游池一个死端口：证明部署 Runner / 实时日志按实例端口拨号（与 sshgw / ingress 一致）。
+func (e *env) setSSHBasePort(port int) {
+	e.rental = rental.NewService(rental.Deps{Pool: e.pool, Clock: e.clk, Box: e.box, Users: e.ids, Wallet: wallet.NewService(e.pool, e.clk),
+		Catalog: e.catalog, Fleet: e.fleet, SSHBasePort: port})
+	e.svc = e.newService(nil, "")
+}
+
+// deadPort 返回一个刚关闭、无人监听的本机端口（上游池默认端口用它：没走实例端口就连不上）。
+func deadPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return port
 }
 
 // newService 用给定的上游连接池与 AppRoot 组装部署服务（nil / 空 = 无上游 / DefaultAppRoot）。
