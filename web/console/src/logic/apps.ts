@@ -251,8 +251,11 @@ export function mergeTimeline(inst: UserEvent[], apps: { name: string; events: D
 /** 每个 ComfyUI 部署最多安装的工作流数（与 comfywf.MaxWorkflowsPerDeployment 一致；logic/workflows.ts 转出同一常量）。 */
 export const MAX_WORKFLOWS = 8
 
-/** 显示工作流子区块的部署：应用 slug 为 comfyui（与后端 Installer 按 slug 判断一致）。 */
-export const isWorkflowHost = (d: Pick<Deployment, 'app_slug'>) => d.app_slug === 'comfyui'
+/** 能装工作流的应用 slug（与后端 Installer 按 slug 判断一致；logic/workflows.ts 转出同一常量）。 */
+export const WORKFLOW_APP_SLUG = 'comfyui'
+
+/** 显示工作流子区块的部署：应用 slug 为 comfyui。 */
+export const isWorkflowHost = (d: Pick<Deployment, 'app_slug'>) => d.app_slug === WORKFLOW_APP_SLUG
 
 /** 部署视图里的已装工作流；字段缺省（非 comfyui 部署 / 旧接口）或 null 时为空数组。 */
 export function deploymentWorkflows(d: Pick<Deployment, 'workflows'>): InstalledWorkflow[] {
@@ -309,9 +312,9 @@ export function addWorkflowReason(item: Pick<WorkflowCatalogItem, 'id'>, install
   return installed.some((w) => w.workflow_id === item.id) ? '已安装' : null
 }
 
-const RESTART_NOTE = '会重启实例上的 ComfyUI，正在生成的任务会中断' // D9
+export const RESTART_NOTE = '会重启实例上的 ComfyUI，正在生成的任务会中断' // D9
 
-/** 安装确认文案（D9：重启 ComfyUI；需下载量）。 */
+/** 安装确认文案（D9：重启 ComfyUI；需下载量）。工作流市场「一键安装」与实例详情「添加工作流」共用。 */
 export function workflowAddConfirmText(item: Pick<WorkflowCatalogItem, 'name' | 'version'>): string {
   const gb = item.version.download_gb
   return `安装「${item.name}」${RESTART_NOTE}${gb > 0 ? `；需下载约 ${formatGB(gb)} 模型` : ''}`

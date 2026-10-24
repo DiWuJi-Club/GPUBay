@@ -7,17 +7,18 @@ import { MAX_WORKFLOWS, sortWorkflows, toggleWorkflow, totalDownloadGB } from '.
 /**
  * 工作流选择器（市场页式的小列表）。
  * - mode = 'multiple'（内嵌多选，RentDialog「预装工作流」）：v-model 为选中的工作流 ID（按选择顺序），最多 max 个，底部显示合计下载量。
- * - mode = 'single'（实例详情「添加工作流」）：点一项 emit('select', item)，v-model 不用。
- * disabledIds 灰显（如已装在该 ComfyUI 上的）。items 不传时自己拉 GET /workflows；拉到后 emit('loaded')。
+ * - mode = 'single'（实例详情「添加工作流」）：点一项 emit('select', item)，selectedId 高亮当前选中，v-model 不用。
+ * disabledIds 灰显并显示「已安装」（如已装在该 ComfyUI 上的）；每项带 data-disabled。items 不传时自己拉 GET /workflows；拉到后 emit('loaded')。
  * testid 为 data-testid 前缀：每项 `<testid>-<slug>`，合计 `<testid>-total`。
  */
 const props = withDefaults(defineProps<{
   mode?: 'multiple' | 'single'
   max?: number
   disabledIds?: number[]
+  selectedId?: number | null
   items?: WorkflowCatalogItem[] | null
   testid?: string
-}>(), { mode: 'multiple', max: MAX_WORKFLOWS, disabledIds: () => [], items: null, testid: 'wf-pick' })
+}>(), { mode: 'multiple', max: MAX_WORKFLOWS, disabledIds: () => [], selectedId: null, items: null, testid: 'wf-pick' })
 const model = defineModel<number[]>({ default: () => [] })
 const emit = defineEmits<{ select: [item: WorkflowCatalogItem]; loaded: [items: WorkflowCatalogItem[]] }>()
 
@@ -42,10 +43,10 @@ async function load() {
   }
 }
 onMounted(load)
-watch(() => props.items, (v) => { if (!v && !own.value.length) void load() })
+watch(() => props.items, (v) => { if (!v) void load() }) // 父组件清掉目录（如重新打开）：重新拉
 
 const isDisabled = (w: WorkflowCatalogItem) => props.disabledIds.includes(w.id)
-const picked = (w: WorkflowCatalogItem) => props.mode === 'multiple' && model.value.includes(w.id)
+const picked = (w: WorkflowCatalogItem) => (props.mode === 'multiple' ? model.value.includes(w.id) : props.selectedId === w.id)
 /** 不可选的原因：已装；多选已满（已选中的仍可取消）。 */
 function reason(w: WorkflowCatalogItem): string {
   if (isDisabled(w)) return '已安装'
@@ -67,12 +68,13 @@ function pick(w: WorkflowCatalogItem) {
     <template v-else>
       <button
         v-for="w in list" :key="w.id" type="button" class="item" :class="{ picked: picked(w), off: !!reason(w) }"
-        :aria-pressed="mode === 'multiple' ? picked(w) : undefined" :aria-disabled="reason(w) ? 'true' : undefined" :data-testid="`${testid}-${w.slug}`" @click="pick(w)"
+        :aria-pressed="picked(w)" :aria-disabled="reason(w) ? 'true' : undefined" :data-testid="`${testid}-${w.slug}`" :data-disabled="String(!!reason(w))" @click="pick(w)"
       >
         <span v-if="mode === 'multiple'" class="check" aria-hidden="true">{{ picked(w) ? '✓' : '' }}</span>
         <span class="body">
           <span class="name">{{ w.name }}</span>
-          <span class="meta">{{ labelOf(workflowCategoryLabel, w.category) }} · 约 {{ formatGB(w.version.download_gb) }}<template v-if="w.version.quick_run"> · 快速出图</template></span>
+          <span class="meta">{{ labelOf(workflowCategoryLabel, w.category) }} · v{{ w.version.version }} · 约 {{ formatGB(w.version.download_gb) }}<template v-if="w.version.nodes"> · {{ w.version.nodes }} 个自定义节点</template><template v-if="w.version.quick_run"> · 快速出图</template></span>
+          <span v-if="mode === 'single' && w.summary" class="meta summary">{{ w.summary }}</span>
           <span v-if="reason(w)" class="reason">{{ reason(w) }}</span>
         </span>
       </button>
@@ -93,6 +95,7 @@ function pick(w: WorkflowCatalogItem) {
 .name { font-weight: 600; font-size: 13px; }
 .meta { font-size: 12px; color: #909399; }
 .reason { font-size: 12px; color: var(--el-color-warning); }
+.summary { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
 .total { grid-column: 1 / -1; font-size: 13px; color: #606266; }
 .muted { grid-column: 1 / -1; color: #909399; font-size: 13px; }
 </style>

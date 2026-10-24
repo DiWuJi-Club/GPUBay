@@ -47,9 +47,9 @@ function resumeInstall() {
 <template>
   <div class="workflows" data-testid="wf-market">
     <div class="toolbar">
-      <div class="cats" role="tablist">
+      <div class="cats" role="group" aria-label="按分类筛选">
         <button
-          v-for="t in tabs" :key="t.key" type="button" role="tab" class="cat" :class="{ active: category === t.key }" :aria-selected="category === t.key"
+          v-for="t in tabs" :key="t.key" type="button" class="cat" :class="{ active: category === t.key }" :aria-pressed="category === t.key"
           :data-testid="`wf-category-${t.key}`" @click="category = t.key"
         >{{ t.label }}</button>
       </div>

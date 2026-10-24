@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import type { AppCatalogItem, Duration, Image, Listed, Product, WorkflowCatalogItem } from '@spark/shared'
+import { workflowErrorLabel, type AppCatalogItem, type Duration, type Image, type Listed, type Product, type WorkflowCatalogItem } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { useGuide } from '../composables/useGuide'
 import { compatibleImages } from '../logic/apps'
-import { firstDuration, rentChoice, WORKFLOW_APP_SLUG, WORKFLOW_RENT_ENV } from '../logic/workflows'
+import { firstDuration, isWorkflowApp, rentChoice, WORKFLOW_APP_SLUG, WORKFLOW_RENT_ENV } from '../logic/workflows'
 import { refreshBalance, session } from '../store/session'
 import GuideDialog from './GuideDialog.vue'
 import RentDialog, { type PlacedResult } from './RentDialog.vue'
@@ -53,6 +53,7 @@ async function onRent(workflowId: number) {
     const [p, i, a] = await Promise.all([api.get<Listed<Product>>('/products'), api.get<Listed<Image>>('/images'), api.get<Listed<AppCatalogItem>>('/apps')])
     const comfy = a.items.find((x) => x.slug === WORKFLOW_APP_SLUG)
     if (!comfy) return void ElMessage.warning('ComfyUI 应用暂未上架')
+    if (!isWorkflowApp(comfy)) return void ElMessage.warning(workflowErrorLabel.workflow_app_unsupported) // 下单会被后端拒绝：不打开
     const imageId = compatibleImages(comfy, i.items)[0]?.id ?? null
     if (imageId == null) return void ElMessage.warning('暂无 ComfyUI 可用的镜像')
     const choice = rentChoice(p.items)

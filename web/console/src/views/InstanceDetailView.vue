@@ -419,9 +419,11 @@ function onDeployments(items: Deployment[]) {
   if (items.length || !first) void loadAppEvents()
   if (!first && inst.value && canManagePorts(inst.value.state)) void loadPorts()
 }
-/** 工作流市场安装 / 开通后跳来（?highlight=workflows）：滚到工作流子区块（没有则到应用卡片）。 */
+/** 工作流市场安装 / 开通后跳来（?highlight=workflows[&dep=…]）：滚到该部署的工作流子区块（没有 dep 取第一个；都没有则到应用卡片）。 */
 function scrollToWorkflows() {
-  const el = document.querySelector('[data-testid="wf-panel"]') ?? document.querySelector('[data-testid="detail-apps-card"]')
+  const dep = typeof route.query.dep === 'string' ? route.query.dep : ''
+  const panels = [...document.querySelectorAll<HTMLElement>('[data-testid="wf-panel"]')]
+  const el = panels.find((p) => p.dataset.dep === dep) ?? panels[0] ?? document.querySelector('[data-testid="detail-apps-card"]')
   el?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
 }
 async function loadAppEvents() {

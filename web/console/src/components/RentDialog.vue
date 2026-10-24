@@ -98,7 +98,8 @@ function applyApp() {
   form.appWorkflowIds = preset && isWorkflowApp(app) ? knownWorkflows(props.presetWorkflowIds).slice(0, MAX_WORKFLOWS) : []
 }
 
-// ---- 预装工作流（计划 11）：选了 ComfyUI 才显示；目录由 WorkflowPicker 拉一次后留在这里（确认页显示名称、回到表单不再拉）----
+// ---- 预装工作流（计划 11）：选了 ComfyUI 才显示；目录由 WorkflowPicker 拉取后留在这里（确认页显示名称、回到表单不再拉）；
+// 每次打开对话框、下单遇到 workflow_* 错误时清掉，让选择器重新拉（目录可能已变）----
 const showWorkflows = computed(() => isWorkflowApp(selectedApp.value))
 const wfCatalog = ref<WorkflowCatalogItem[] | null>(null)
 /** 目录已加载时去掉不在目录里的 ID（预选的工作流已下架）；未加载时原样。 */
@@ -108,7 +109,9 @@ function knownWorkflows(ids: number[]): number[] {
 }
 function onWorkflowsLoaded(items: WorkflowCatalogItem[]) {
   wfCatalog.value = items
-  form.appWorkflowIds = knownWorkflows(form.appWorkflowIds)
+  const kept = knownWorkflows(form.appWorkflowIds)
+  if (kept.length < form.appWorkflowIds.length) ElMessage.warning('所选工作流已下架，已从预装列表移除')
+  form.appWorkflowIds = kept
 }
 const pickedWorkflows = computed(() => form.appWorkflowIds.map((id) => wfCatalog.value?.find((w) => w.id === id)).filter((w): w is WorkflowCatalogItem => w != null))
 const workflowsText = computed(() => {
@@ -253,6 +256,7 @@ watch(visible, (v) => {
   if (!v) return
   step.value = props.mode === 'immediate' && props.appId == null ? 'confirm' : 'form'
   expanded.value = props.mode === 'booking' || props.appId != null
+  wfCatalog.value = null // 先于 applyApp：预设 ID 等目录拉到后再按目录过滤
   Object.assign(form, { groupId: null, count: 1, immediate: props.mode === 'immediate', duration: props.duration, quantity: 1, imageId: props.imageId, machineId: null, autoRenew: false, autoRenewDuration: props.duration, appId: props.appId })
   applyApp() // appId 与上次相同时 watch 不触发：显式重置镜像、变量与预装工作流
   availability.value = null
@@ -311,6 +315,7 @@ async function submit() {
     } else if (isApiError(e) && (e.code.startsWith('app_') || e.code.startsWith('workflow_'))) {
       // app_image_mismatch / app_env_* / app_not_found / app_unavailable / workflow_*（预装工作流下架、应用版本不支持等）：显示后端文案，回到表单改
       ElMessage.warning(e.message)
+      if (e.code.startsWith('workflow_')) wfCatalog.value = null // 工作流下架 / 版本变了：回到表单时重新拉目录
       backToForm()
       appError.value = e.message
     } else if (isApiError(e) && e.code.startsWith('booking_')) {
