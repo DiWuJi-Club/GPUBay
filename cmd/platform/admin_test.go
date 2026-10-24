@@ -56,7 +56,7 @@ func TestAdminCreateBindsTOTPAndPrintsRecoveryCodes(t *testing.T) {
 	ctx := context.Background()
 	var out bytes.Buffer
 	pw := "correct horse battery"
-	if err := runAdmin(ctx, svc, nil, []string{"create", "--username", "root"}, &out, scripted(t, &out, clk, pw, pw)); err != nil {
+	if err := runAdmin(ctx, svc, nil, nil, []string{"create", "--username", "root"}, &out, scripted(t, &out, clk, pw, pw)); err != nil {
 		t.Fatalf("create: %v\n%s", err, out.String())
 	}
 	text := out.String()
@@ -72,7 +72,7 @@ func TestAdminCreateBindsTOTPAndPrintsRecoveryCodes(t *testing.T) {
 	}
 
 	out.Reset()
-	if err := runAdmin(ctx, svc, nil, []string{"reset-totp", "--username", "root"}, &out, nil); err != nil {
+	if err := runAdmin(ctx, svc, nil, nil, []string{"reset-totp", "--username", "root"}, &out, nil); err != nil {
 		t.Fatal(err)
 	}
 	if a, _ := svc.FindByUsername(ctx, "root"); a.TOTPConfirmed {
@@ -88,20 +88,20 @@ func TestAdminCreateErrors(t *testing.T) {
 	svc, clk := newAdminService(t)
 	ctx := context.Background()
 	var out bytes.Buffer
-	if err := runAdmin(ctx, svc, nil, nil, &out, nil); err == nil || !strings.Contains(err.Error(), "用法") {
+	if err := runAdmin(ctx, svc, nil, nil, nil, &out, nil); err == nil || !strings.Contains(err.Error(), "用法") {
 		t.Fatalf("no args = %v", err)
 	}
-	if err := runAdmin(ctx, svc, nil, []string{"create"}, &out, nil); err == nil || !strings.Contains(err.Error(), "--username") {
+	if err := runAdmin(ctx, svc, nil, nil, []string{"create"}, &out, nil); err == nil || !strings.Contains(err.Error(), "--username") {
 		t.Fatalf("missing username = %v", err)
 	}
-	err := runAdmin(ctx, svc, nil, []string{"create", "--username", "root"}, &out, scripted(t, &out, clk, "correct horse battery", "different password!"))
+	err := runAdmin(ctx, svc, nil, nil, []string{"create", "--username", "root"}, &out, scripted(t, &out, clk, "correct horse battery", "different password!"))
 	if err == nil || !strings.Contains(err.Error(), "不一致") {
 		t.Fatalf("mismatch = %v", err)
 	}
 	if _, err := svc.FindByUsername(ctx, "root"); err == nil {
 		t.Fatal("admin must not be created when passwords differ")
 	}
-	if err := runAdmin(ctx, svc, nil, []string{"reset-totp", "--username", "ghost"}, &out, nil); err == nil {
+	if err := runAdmin(ctx, svc, nil, nil, []string{"reset-totp", "--username", "ghost"}, &out, nil); err == nil {
 		t.Fatal("reset-totp for unknown admin must fail")
 	}
 }
@@ -117,13 +117,13 @@ func TestListensOnAllInterfaces(t *testing.T) {
 func TestAdminGenUpstreamKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "up.key")
 	var out bytes.Buffer
-	if err := runAdmin(context.Background(), nil, nil, []string{"gen-upstream-key", "--path", path}, &out, nil); err != nil {
+	if err := runAdmin(context.Background(), nil, nil, nil, []string{"gen-upstream-key", "--path", path}, &out, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path + ".pub"); err != nil || !strings.Contains(out.String(), "ssh-ed25519 ") {
 		t.Fatalf("output = %s, err = %v", out.String(), err)
 	}
-	if err := runAdmin(context.Background(), nil, nil, []string{"gen-upstream-key"}, &out, nil); err == nil {
+	if err := runAdmin(context.Background(), nil, nil, nil, []string{"gen-upstream-key"}, &out, nil); err == nil {
 		t.Fatal("missing --path accepted")
 	}
 }

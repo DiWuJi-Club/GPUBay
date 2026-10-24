@@ -2,6 +2,7 @@ package comfywf
 
 import (
 	"encoding/json"
+	"strconv"
 	"time"
 )
 
@@ -14,7 +15,8 @@ type Workflow struct {
 	Description string    `json:"description"`
 	Category    string    `json:"category"`
 	Tags        []string  `json:"tags"`
-	CoverKey    *string   `json:"-"` // 对外只给 cover_url（视图里拼）
+	CoverKey    *string   `json:"-"`         // 对外只给 cover_url（视图里拼，见 CoverURL）/ has_cover
+	HasCover    bool      `json:"has_cover"` // = CoverKey != nil（读库时填）
 	Sort        int       `json:"sort"`
 	Status      string    `json:"status"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -30,12 +32,30 @@ type Version struct {
 	Graph        json.RawMessage `json:"graph"`
 	APIPrompt    json.RawMessage `json:"api_prompt"` // nil = 不支持快速出图
 	Manifest     Manifest        `json:"manifest"`
-	DownloadGB   string          `json:"download_gb"` // NUMERIC(8,2) 原文（如 "6.90"），不经 float 往返
+	DownloadGB   string          `json:"download_gb"` // NUMERIC(8,2) 原文（如 "6.90"），不经 float 往返；JSON 输出为数字（MarshalJSON）
 	ManifestHash string          `json:"manifest_hash"`
 	Changelog    string          `json:"changelog"`
 	PublishedAt  *time.Time      `json:"published_at"`
 	CreatedAt    time.Time       `json:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at"`
+}
+
+// DownloadGBValue 是 DownloadGB 的数值（空 / 无法解析 → 0）。
+func (v Version) DownloadGBValue() float64 {
+	f, err := strconv.ParseFloat(v.DownloadGB, 64)
+	if err != nil {
+		return 0
+	}
+	return f
+}
+
+// MarshalJSON 与字段标签相同，只是 download_gb 输出为 JSON 数字（前端类型是 number）。
+func (v Version) MarshalJSON() ([]byte, error) {
+	type plain Version
+	return json.Marshal(struct {
+		plain
+		DownloadGB float64 `json:"download_gb"`
+	}{plain(v), v.DownloadGBValue()})
 }
 
 // Manifest 是版本的清单（comfy_workflow_versions.manifest，规格 §3.2），校验见 ValidateManifest。
