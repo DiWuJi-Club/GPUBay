@@ -9,7 +9,7 @@
 | `graph.json` | 是 | ComfyUI 前端保存的 **UI 格式**工作流（`nodes` / `links` / `widgets_values`，≤ 256KB），原样装进容器，用户在 ComfyUI 里打开的就是它 |
 | `api.json` | 否 | 同一工作流的 **API 格式**（「导出 (API)」，≤ 256KB），快速出图提交的就是它；没有它 = 不支持快速出图（`manifest.inputs / outputs` 必须为空） |
 | `manifest.json` | 是 | 模型、自定义节点、快速出图参数、输出节点（规则见设计文档 §3.2，`comfywf.ValidateManifest`） |
-| `cover.png` / `cover.jpg` / `cover.webp` | 否 | 市场卡片封面，≤ 2MB；建议 512×288（16:9） |
+| `cover.png` / `cover.jpg`（或 `cover.jpeg`）/ `cover.webp` | 否 | 市场卡片封面，≤ 2MB；建议 512×288（16:9） |
 
 `workflow.json` 字段：
 
@@ -45,7 +45,7 @@ platform admin workflow import deploy/workflows
 | `sdxl-img2img` | SDXL 图生图 | img2img | 同上（共用） | 6.94 GB | — | image、prompt、negative、denoise（0.2～1，默认 0.75）、steps、cfg、seed | `image2image.json` |
 | `flux-schnell-txt2img` | FLUX.1-schnell 文生图（fp8） | txt2img | `flux1-schnell-fp8.safetensors` → checkpoints | 17.24 GB | — | prompt、width、height、steps（1～8，默认 4）、seed | `flux_schnell.json` |
 | `qwen-image-txt2img` | Qwen-Image 文生图 | txt2img | `qwen_image_fp8_e4m3fn` → diffusion_models、`qwen_2.5_vl_7b_fp8_scaled` → text_encoders、`qwen_image_vae` → vae | 30.06 GB | — | prompt、negative、width、height（默认 1328，步长 16）、steps、cfg、seed | `image_qwen_image.json` |
-| `wan22-5b-ti2v` | Wan2.2 5B 文 / 图生视频 | video | `wan2.2_ti2v_5B_fp16` → diffusion_models、`umt5_xxl_fp8_e4m3fn_scaled` → text_encoders、`wan2.2_vae` → vae | 18.15 GB | — | prompt、negative、width（1280）、height（704）、length（帧数 121，min 1 步长 4）、steps（20）、seed | `video_wan2_2_5B_ti2v.json` |
+| `wan22-5b-ti2v` | Wan2.2 5B 文 / 图生视频 | video | `wan2.2_ti2v_5B_fp16` → diffusion_models、`umt5_xxl_fp8_e4m3fn_scaled` → text_encoders、`wan2.2_vae` → vae | 18.15 GB | — | prompt、negative、width（320～1280，默认 1280）、height（320～1280，默认 704，步长 32）、length（帧数 1～121，步长 4，默认 121）、steps（20）、seed | `video_wan2_2_5B_ti2v.json` |
 | `sdxl-ultimate-upscale` | SDXL 放大修复（2×） | upscale | SDXL base（共用）+ `RealESRGAN_x4plus.safetensors` → upscale_models | 7.01 GB | `ComfyUI_UltimateSDUpscale` | image、prompt、denoise（默认 0.3）、upscale_by（1～4，默认 2）、seed | 节点仓库自带的 `example_workflows/basic-usdu.json` |
 
 六个全装在同一个 ComfyUI 上时，SDXL base 只下一次（按 `<dir>/<name>` 去重），合计约 72.46 GB。
@@ -61,7 +61,7 @@ platform admin workflow import deploy/workflows
   `shift` 3.1000000000000005 → 3.1；清掉 `extra` 里作者插件留下的 `VHS_*` / `ue_links`。默认 1328×1328，步长 16。
 - **wan22-5b-ti2v**：快速出图**只做文生视频**——模板的 `LoadImage`（id 56）默认旁路，「导出 (API)」时会被丢掉，
   `manifest` 无法表达「可选图片」，所以没有 `image` 参数；graph 里保留旁路的 `LoadImage`，用户在 ComfyUI 里 Ctrl + B
-  启用即可图生视频。默认 1280×704、121 帧、20 步。`umt5` 的 `properties.models` 地址从 Wan 2.1 仓库改成 Wan 2.2 仓库（同一文件）。
+  启用即可图生视频。默认 1280×704、121 帧、20 步；快速出图宽高上限 1280、帧数上限 121（模板默认就是 5B 模型的推荐上限）。`umt5` 的 `properties.models` 地址从 Wan 2.1 仓库改成 Wan 2.2 仓库（同一文件）。
 - **sdxl-ultimate-upscale**：放大模型用 `RealESRGAN_x4plus.safetensors`（BSD-3-Clause，Comfy-Org 官方重新打包的 safetensors），
   **不用**规格里的 `4x-UltraSharp.pth`（CC BY-NC-SA 4.0，非商用许可，不能在付费平台上分发）。图由节点自带示例改成：
   `LoadImage → UltimateSDUpscale（SDXL checkpoint、正 / 反 CLIPTextEncode、UpscaleModelLoader）→ SaveImage`；
@@ -115,7 +115,7 @@ go test ./internal/comfywf/ -run TestWorkflowsDir
 
 检查：六个首批目录都在、只有允许的文件；`workflow.json` 字段（未知字段报错）；`manifest.json` 过 `ValidateManifest`（含 D16
 交叉校验）、`inputs` / `outputs` 非空、模型都有 sha256 与两个来源、`download_gb` > 0；`graph.json` 节点 ≥ 3 且连线自洽；
-`api.json` 与 graph 的启用节点一一对应（类型、连线）；参数默认值等于 api 现值，只填图片也能生成 prompt；封面类型与大小；
+`api.json` 与 graph 的启用节点一一对应（类型、连线，且 `widgets_values` 按 `widgetNames` 表逐项等于 api 的输入值；用到表外的节点类型时要在测试里补上它的 widget 顺序）；参数默认值等于 api 现值，只填图片也能生成 prompt；封面类型与大小；
 六个工作流一起生成部署包（`BundleFiles`）不冲突、同名模型的 sha256 / 大小一致。
 
 ## 核实记录（2026-10-24 Mac 元数据核实（未下载权重）；容器内实跑待验收）

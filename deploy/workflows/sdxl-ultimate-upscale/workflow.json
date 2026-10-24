@@ -11,6 +11,6 @@
   ],
   "sort": 60,
   "version": "1.0.0",
-  "changelog": "首个版本：基于 ComfyUI v0.3.60 官方模板（comfyui-workflow-templates 0.1.86），支持快速出图。",
+  "changelog": "首个版本：图基于 ComfyUI_UltimateSDUpscale 仓库自带的 example_workflows/basic-usdu.json 改成「LoadImage → UltimateSDUpscale → SaveImage」（SDXL base + RealESRGAN x4plus），支持快速出图。",
   "comfyui_min": "0.3.60"
 }

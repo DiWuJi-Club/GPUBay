@@ -71,7 +71,7 @@
       "input": "width",
       "default": 1280,
       "min": 320,
-      "max": 1920,
+      "max": 1280,
       "step": 32
     },
     {
@@ -82,7 +82,7 @@
       "input": "height",
       "default": 704,
       "min": 320,
-      "max": 1920,
+      "max": 1280,
       "step": 32
     },
     {
@@ -93,7 +93,7 @@
       "input": "length",
       "default": 121,
       "min": 1,
-      "max": 241,
+      "max": 121,
       "step": 4
     },
     {
