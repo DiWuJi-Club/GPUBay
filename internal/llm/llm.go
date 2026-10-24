@@ -99,7 +99,8 @@ type Service struct {
 	d Deps
 	// keyCache：key_hash → keyCacheEntry（Authorize 的 KeyCacheTTL 缓存，见 authorize.go）。
 	keyCache sync.Map
-	// Task 9 增加：余额缓存、Limiter、Router
+	limiter  *Limiter
+	router   *Router
 }
 
 func NewService(d Deps) *Service {
@@ -109,5 +110,13 @@ func NewService(d Deps) *Service {
 	if d.Clock == nil {
 		d.Clock = clock.Real{}
 	}
-	return &Service{d: d}
+	s := &Service{d: d, limiter: NewLimiter()}
+	s.router = NewRouter(s)
+	return s
 }
+
+// Limiter 返回进程内的按用户限流器（网关用）。
+func (s *Service) Limiter() *Limiter { return s.limiter }
+
+// Router 返回进程内的节点路由表（网关选节点、Controller 读在途）。
+func (s *Service) Router() *Router { return s.router }
