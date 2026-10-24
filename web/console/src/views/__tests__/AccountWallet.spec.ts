@@ -64,7 +64,7 @@ afterEach(() => {
 describe('我的：Token 商城入口', () => {
   it('入口链接到 /tokens，进入页面刷新 /me 后显示「本月 ¥X」', async () => {
     await mountAt('/account')
-    expect(get).toHaveBeenCalledWith('/me', undefined, { quiet: true })
+    expect(get).toHaveBeenCalledWith('/me') // 不 quiet：会话过期时与其它需登录页面一样跳登录页
     expect(byId('account-tokens')!.getAttribute('href')).toBe('/tokens')
     expect(byId('account-tokens')!.textContent).toContain('Token 商城')
     expect(byId('account-tokens-month')!.textContent).toBe('本月 ¥45.67')
@@ -112,8 +112,8 @@ describe('钱包：Token 消费流水', () => {
     expect(byId('ledger-focus-missing')!.textContent).toContain('未找到流水 #45')
   })
 
-  it('?ledger= 非法值忽略', async () => {
-    await mountAt('/wallet?ledger=abc')
+  it.each(['abc', '0', '123456789012345'])('?ledger=%s 非法值忽略', async (v) => {
+    await mountAt(`/wallet?ledger=${v}`)
     expect(get).toHaveBeenCalledWith('/wallet/ledger', { before_id: undefined, limit: 20 })
     expect(byId('ledger-focus')).toBeNull()
   })

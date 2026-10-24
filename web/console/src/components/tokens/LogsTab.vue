@@ -4,14 +4,18 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
 import { copyText } from '../../logic/clipboard'
 import { notifyError } from '../../logic/notify'
-import { addDays, beijingToday, defaultUsageRange, latencyLabel, tokenCount, usageStatusTag, USAGE_MAX_DAYS, validateUsageRange } from '../../logic/tokens'
+import { addDays, beijingToday, defaultUsageRange, keyHintMask, latencyLabel, tokenCount, usageStatusTag, USAGE_MAX_DAYS, validateUsageRange } from '../../logic/tokens'
 
 // 请求日志 Tab（规格 §9.2 第 4 项）：筛选（模型、Key、日期，最长 90 天，默认最近 7 天）+ GET /llm/usage 分页。
 const props = defineProps<{ models: LLMModelPublic[] }>()
 const mobile = useMobile()
 
-const today = beijingToday(new Date())
-const earliest = addDays(today, -(USAGE_MAX_DAYS - 1)) // 明细只保留 90 天
+// 「今天」在页面停留跨过零点后会变：每次加载前、日期框获得焦点时重算（日期框的 min / max 随之更新）
+const today = ref(beijingToday(new Date()))
+const earliest = computed(() => addDays(today.value, -(USAGE_MAX_DAYS - 1))) // 明细只保留 90 天
+const refreshToday = () => {
+  today.value = beijingToday(new Date())
+}
 const filter = reactive({ model: '', keyId: null as number | null, ...defaultUsageRange(new Date()) })
 const rangeError = computed(() => validateUsageRange(filter.from, filter.to))
 
@@ -34,6 +38,7 @@ const loadError = ref('')
 // 筛选连续变化时，只认最后一次请求的结果
 let gen = 0
 async function load() {
+  refreshToday()
   if (rangeError.value) return
   const my = ++gen
   loading.value = true
@@ -67,12 +72,17 @@ onMounted(() => {
   void load()
 })
 function resetRange() {
+  refreshToday()
   Object.assign(filter, defaultUsageRange(new Date()))
 }
 
+/** Key 显示：名称 + 提示（有提示时），区分同名 Key */
+const keyLabel = (name: string, hint?: string) => (hint ? `${name}（${keyHintMask(hint)}）` : name)
 const rows = computed(() =>
   items.value.map((u) => ({
     u,
+    key: keyLabel(u.key_name, u.key_hint),
+    httpStatus: u.http_status && u.http_status !== 200 ? String(u.http_status) : '',
     time: fmtTimeSec(u.created_at),
     endpoint: labelOf(llmEndpointLabel, u.endpoint),
     tokens: `${tokenCount(u.prompt_tokens, u.estimated)} / ${tokenCount(u.completion_tokens, u.estimated)}`,
@@ -90,12 +100,12 @@ const rows = computed(() =>
         <el-option v-for="m in props.models" :key="m.slug" :label="m.slug" :value="m.slug" :data-testid="`tokens-logs-model-option-${m.slug}`" />
       </el-select>
       <el-select v-model="filter.keyId" clearable placeholder="全部 Key" class="sel" data-testid="tokens-logs-key">
-        <el-option v-for="k in keys" :key="k.id" :label="k.name" :value="k.id" :data-testid="`tokens-logs-key-option-${k.id}`" />
+        <el-option v-for="k in keys" :key="k.id" :label="keyLabel(k.name, k.key_hint)" :value="k.id" :data-testid="`tokens-logs-key-option-${k.id}`" />
       </el-select>
       <span class="range">
-        <input v-model="filter.from" type="date" :min="earliest" :max="today" class="el-input__inner native-date" aria-label="开始日期" data-testid="tokens-logs-from" />
+        <input v-model="filter.from" type="date" :min="earliest" :max="today" class="el-input__inner native-date" aria-label="开始日期" @focus="refreshToday" data-testid="tokens-logs-from" />
         <span class="muted">至</span>
-        <input v-model="filter.to" type="date" :min="earliest" :max="today" class="el-input__inner native-date" aria-label="结束日期" data-testid="tokens-logs-to" />
+        <input v-model="filter.to" type="date" :min="earliest" :max="today" class="el-input__inner native-date" aria-label="结束日期" @focus="refreshToday" data-testid="tokens-logs-to" />
       </span>
       <el-button size="small" data-testid="tokens-logs-reset" @click="resetRange">最近 7 天</el-button>
     </div>
@@ -113,11 +123,14 @@ const rows = computed(() =>
       <el-card v-for="r in rows" :key="r.u.request_id" shadow="never" :data-testid="`tokens-log-row-${r.u.request_id}`">
         <div class="card-head">
           <b>{{ r.u.model }}</b>
-          <el-tag :type="r.status.type" size="small" data-testid="tokens-log-status">{{ r.status.label }}</el-tag>
+          <span>
+            <el-tag :type="r.status.type" size="small" data-testid="tokens-log-status">{{ r.status.label }}</el-tag>
+            <span v-if="r.httpStatus" class="muted" data-testid="tokens-log-http"> {{ r.httpStatus }}</span>
+          </span>
         </div>
         <ul class="meta">
           <li><span class="label">时间</span>{{ r.time }}</li>
-          <li><span class="label">Key</span>{{ r.u.key_name }}</li>
+          <li><span class="label">Key</span><span data-testid="tokens-log-key">{{ r.key }}</span></li>
           <li><span class="label">端点</span>{{ r.endpoint }}{{ r.u.stream ? ' · 流式' : '' }}</li>
           <li><span class="label">输入/输出</span><span data-testid="tokens-log-tokens">{{ r.tokens }}</span></li>
           <li><span class="label">费用</span><span data-testid="tokens-log-cost">{{ r.cost }}</span></li>
@@ -140,7 +153,7 @@ const rows = computed(() =>
         <template #default="{ row }">{{ row.u.model }}</template>
       </el-table-column>
       <el-table-column label="Key" min-width="100">
-        <template #default="{ row }">{{ row.u.key_name }}</template>
+        <template #default="{ row }"><span data-testid="tokens-log-key">{{ row.key }}</span></template>
       </el-table-column>
       <el-table-column label="端点" min-width="60">
         <template #default="{ row }"><span data-testid="tokens-log-endpoint">{{ row.endpoint }}</span></template>
@@ -157,7 +170,7 @@ const rows = computed(() =>
       <el-table-column label="状态" min-width="100">
         <template #default="{ row }">
           <el-tag :type="row.status.type" size="small" data-testid="tokens-log-status">{{ row.status.label }}</el-tag>
-          <span v-if="row.u.http_status && row.u.http_status !== 200" class="muted"> {{ row.u.http_status }}</span>
+          <span v-if="row.httpStatus" class="muted" data-testid="tokens-log-http"> {{ row.httpStatus }}</span>
         </template>
       </el-table-column>
       <el-table-column label="延迟 / TTFT" min-width="130">

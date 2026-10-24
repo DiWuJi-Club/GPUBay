@@ -9,9 +9,10 @@ import { clearSession, session, setUser } from '../store/session'
 const router = useRouter()
 const loggingOut = ref(false)
 
-// 会话里的 /me 是应用启动时取的；进入本页静默刷新一次，让「本月 Token 消费」是最新的（失败不提示，沿用会话里的值）
+// 会话里的 /me 是应用启动时取的；进入本页刷新一次，让「本月 Token 消费」是最新的。
+// 不加 quiet：会话过期时与其它需登录页面一样提示并跳登录页；其它失败沿用会话里的值
 onMounted(() => {
-  api.get<User>('/me', undefined, { quiet: true }).then((u) => session.status === 'authed' && setUser(u), () => {})
+  api.get<User>('/me').then((u) => session.status === 'authed' && setUser(u), () => {})
 })
 /** 本月 Token 消费（分）；后端为 0 时省略字段 → 不显示 */
 const llmMonth = computed(() => (session.user?.llm_month_cost ? fmtYuan(session.user.llm_month_cost) : ''))

@@ -90,6 +90,8 @@ describe('结算记录', () => {
     expect(settlementDetail(settlement({ usage_amount: 120, debt_amount: 0, charged: 20 }))).toEqual(['用量 ¥1.20', '余额不足，¥1.00 计入欠费'])
     // 纯补扣欠费（没有新用量）
     expect(settlementDetail(settlement({ usage_amount: 0, debt_amount: 300, charged: 100, requests: 0 }))).toEqual(['补扣欠费 ¥3.00', '余额不足，¥2.00 计入欠费'])
+    // 一分没扣到：只说应补
+    expect(settlementDetail(settlement({ usage_amount: 50, debt_amount: 300, charged: 0, wallet_ledger_id: null }))).toEqual(['用量 ¥0.50', '应补欠费 ¥3.00', '余额不足，¥3.50 计入欠费'])
   })
 
   it('流水链接：有 wallet_ledger_id 才有', () => {

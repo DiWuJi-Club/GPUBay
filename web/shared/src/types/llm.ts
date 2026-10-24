@@ -76,6 +76,8 @@ export interface LLMUsageRow {
   created_at: string
   model: string
   key_name: string
+  /** Key 提示（sk-spark-…末 4 位）；后端可能不返回 */
+  key_hint?: string
   endpoint: LLMEndpoint
   stream: boolean
   prompt_tokens: number

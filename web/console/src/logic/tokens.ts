@@ -247,7 +247,8 @@ export function validateUsageRange(from: string, to: string): string | null {
 export function settlementDetail(s: LLMSettlement): string[] {
   const out: string[] = []
   if (s.usage_amount > 0 || s.debt_amount === 0) out.push(`用量 ${fmtYuan(s.usage_amount)}`)
-  if (s.debt_amount > 0) out.push(`补扣欠费 ${fmtYuan(s.debt_amount)}`)
+  // 一分钱都没扣到时不说「补扣」，只说应补多少
+  if (s.debt_amount > 0) out.push(`${s.charged > 0 ? '补扣欠费' : '应补欠费'} ${fmtYuan(s.debt_amount)}`)
   const short = s.usage_amount + s.debt_amount - s.charged
   if (short > 0) out.push(`余额不足，${fmtYuan(short)} 计入欠费`)
   return out

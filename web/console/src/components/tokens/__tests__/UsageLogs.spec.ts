@@ -82,7 +82,7 @@ beforeEach(() => {
   logs = {
     items: [
       usage('req-aaaaaaaaaaaaaaaa'),
-      usage('req-bbbbbbbbbbbbbbbb', { status: 'client_abort', estimated: true, prompt_tokens: 1000, completion_tokens: 40, cost_micro: 300, latency_ms: 800, ttft_ms: null, stream: false, endpoint: 'embeddings' }),
+      usage('req-bbbbbbbbbbbbbbbb', { key_hint: 'sk-spark-…9z9z', http_status: 499, status: 'client_abort', estimated: true, prompt_tokens: 1000, completion_tokens: 40, cost_micro: 300, latency_ms: 800, ttft_ms: null, stream: false, endpoint: 'embeddings' }),
     ],
     total: 45,
   }
@@ -178,7 +178,7 @@ describe('用量 Tab', () => {
     expect(byId('tokens-settlement-ledger-2')!.getAttribute('href')).toBe('/wallet?ledger=902')
     // charged = 0：没有流水
     expect(byId('tokens-settlement-ledger-1')).toBeNull()
-    expect(byId('tokens-settlement-detail-1')!.textContent).toBe('补扣欠费 ¥0.30；余额不足，¥0.30 计入欠费')
+    expect(byId('tokens-settlement-detail-1')!.textContent).toBe('应补欠费 ¥0.30；余额不足，¥0.30 计入欠费')
     byId('tokens-settlement-ledger-2')!.click()
     await flushPromises()
     expect(router.currentRoute.value.fullPath).toBe('/wallet?ledger=902')
@@ -213,7 +213,8 @@ describe('请求日志 Tab', () => {
     const a = byId('tokens-log-row-req-aaaaaaaaaaaaaaaa')!.closest('tr')!
     expect(a.textContent).toContain('2026-10-24 10:30:05')
     expect(a.textContent).toContain('qwen3-4b')
-    expect(a.textContent).toContain('生产')
+    expect(a.querySelector('[data-testid="tokens-log-key"]')!.textContent).toBe('生产')
+    expect(a.querySelector('[data-testid="tokens-log-http"]')).toBeNull()
     expect(a.querySelector('[data-testid="tokens-log-endpoint"]')!.textContent).toBe('对话')
     expect(a.querySelector('[data-testid="tokens-log-stream"]')!.textContent).toBe('是')
     expect(a.querySelector('[data-testid="tokens-log-tokens"]')!.textContent).toBe('1,200 / 345')
@@ -228,6 +229,8 @@ describe('请求日志 Tab', () => {
     expect(b.querySelector('[data-testid="tokens-log-status"]')!.textContent).toBe('客户端中断')
     expect(b.querySelector('[data-testid="tokens-log-endpoint"]')!.textContent).toBe('向量')
     expect(b.querySelector('[data-testid="tokens-log-stream"]')!.textContent).toBe('否')
+    expect(b.querySelector('[data-testid="tokens-log-key"]')!.textContent).toBe('生产（sk-spark-…9z9z）')
+    expect(b.querySelector('[data-testid="tokens-log-http"]')!.textContent!.trim()).toBe('499')
     expect(b.querySelector('[data-testid="tokens-log-latency"]')!.textContent).toBe('800 ms / —')
     expect(byId('tokens-logs-total')!.textContent).toBe('共 45 条')
 
@@ -239,6 +242,7 @@ describe('请求日志 Tab', () => {
   it('按模型、Key 筛选，Key 列表来自 /llm/keys；换筛选回到第一页', async () => {
     await mountAt('/tokens?tab=logs')
     expect(get).toHaveBeenCalledWith('/llm/keys')
+    expect(byId('tokens-logs-key-option-6')!.textContent).toBe('测试（sk-spark-…abcd）')
     byId('tokens-logs-pager')!.querySelector<HTMLElement>('.btn-next')!.click()
     await flushPromises()
     expect(get).toHaveBeenLastCalledWith('/llm/usage', expect.objectContaining({ page: 2 }))
@@ -272,6 +276,8 @@ describe('请求日志 Tab', () => {
     expect(card.querySelector('[data-testid="tokens-log-tokens"]')!.textContent).toBe('≈1,000 / ≈40')
     expect(card.querySelector('[data-testid="tokens-log-status"]')!.textContent).toBe('客户端中断')
     expect(card.textContent).toContain('向量')
+    expect(card.querySelector('[data-testid="tokens-log-http"]')!.textContent!.trim()).toBe('499')
+    expect(card.querySelector('[data-testid="tokens-log-key"]')!.textContent).toBe('生产（sk-spark-…9z9z）')
   })
 
   it('空结果', async () => {

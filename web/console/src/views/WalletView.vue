@@ -45,7 +45,7 @@ const PAGE = 20
 // ?ledger=<id>（Token 商城结算记录的「流水」链接）：从这条开始加载（before_id = id + 1），它排在第一行并高亮
 const focusId = computed(() => {
   const v = route.query.ledger
-  return typeof v === 'string' && /^[1-9]\d{0,15}$/.test(v) ? Number(v) : null
+  return typeof v === 'string' && /^[1-9]\d{0,13}$/.test(v) ? Number(v) : null
 })
 const focusMissing = computed(() => focusId.value != null && !ledgerLoading.value && !ledgerError.value && ledger.value[0]?.id !== focusId.value)
 const kindTag = (kind: string) => (ledgerKindType[kind] ?? 'info') as 'success' | 'warning' | 'info'
