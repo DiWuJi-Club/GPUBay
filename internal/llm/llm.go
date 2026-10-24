@@ -101,6 +101,8 @@ type Service struct {
 	keyCache keyCache
 	limiter  *Limiter
 	router   *Router
+	// settleBeforeMark 仅测试：settleAccount 读到 max_id 之后、标记用量之前调用（见 settle_export_test.go）。
+	settleBeforeMark func(userID int64)
 }
 
 func NewService(d Deps) *Service {
