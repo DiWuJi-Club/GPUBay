@@ -548,6 +548,43 @@ func TestImportDir(t *testing.T) {
 	}
 }
 
+// 已有部署升级时整个 deploy/apps 重新导入：已存在且内容相同的版本跳过并继续导入后面的应用（如计划 9 新增的 vllm-node）；
+// 版本号相同但内容不同仍报错（提醒提高版本号），不静默覆盖。
+func TestImportDirSkipsIdenticalExistingVersion(t *testing.T) {
+	e := newEnv(t, 0)
+	root := t.TempDir()
+	meta := func(version string) map[string]any {
+		return map[string]any{"name": "测试", "summary": "s", "category": "llm", "icon": "chat", "sort": 10, "version": version, "images": []string{"PyTorch"}, "changelog": "c"}
+	}
+	writeApp(t, root, "alpha", meta("1.0.0"))
+	if _, err := e.cat.ImportDir(e.ctx, e.actor(), root); err != nil {
+		t.Fatal(err)
+	}
+	writeApp(t, root, "beta", meta("1.0.0"))
+	res, err := e.cat.ImportDir(e.ctx, e.actor(), root)
+	if err != nil {
+		t.Fatalf("re-import: %v", err)
+	}
+	want := []appdeploy.ImportResult{{Slug: "alpha", Version: "1.0.0", Skipped: "版本 1.0.0 已存在且内容相同，已跳过"}, {Slug: "beta", Version: "1.0.0", Created: true}}
+	if !slices.Equal(res, want) {
+		t.Fatalf("re-import = %+v", res)
+	}
+	if n := e.count(`SELECT count(*) FROM app_versions`); n != 2 {
+		t.Fatalf("versions = %d, want 2", n)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "alpha", "app.sh"), []byte(goodScript+"\n# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = e.cat.ImportDir(e.ctx, e.actor(), root)
+	if err == nil || !strings.Contains(err.Error(), "alpha") || !strings.Contains(err.Error(), "内容不同") {
+		t.Fatalf("changed content, same version: %v", err)
+	}
+	if len(res) != 0 {
+		t.Fatalf("results = %+v", res)
+	}
+}
+
 // 镜像登记成 Docker Hub 全名（或省略 tag）时，与 docker image ls 的短名（Agent 上报的形态）对得上。
 func TestCoverageMatchesFamiliarRef(t *testing.T) {
 	e := newEnv(t, 2)
