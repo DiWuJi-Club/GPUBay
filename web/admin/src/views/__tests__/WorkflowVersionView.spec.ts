@@ -1,6 +1,6 @@
 import { ApiError } from '@spark/shared'
 import { flushPromises, mount } from '@vue/test-utils'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -8,6 +8,8 @@ import { createMemoryHistory, createRouter, RouterView, type Router } from 'vue-
 
 const { get, post, put } = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), put: vi.fn() }))
 vi.mock('../../api', () => ({ api: { get, post, put, del: vi.fn(), upload: vi.fn() }, onUnauthorized: vi.fn(), onTotpSetupRequired: vi.fn() }))
+const { notifyError } = vi.hoisted(() => ({ notifyError: vi.fn() }))
+vi.mock('../../logic/notify', () => ({ notifyError }))
 
 import { session } from '../../store/session'
 import WorkflowVersionView from '../WorkflowVersionView.vue'
@@ -53,6 +55,8 @@ beforeEach(() => {
     throw new ApiError(404, 'not_found', '不存在')
   })
   put.mockResolvedValue({ ok: true, manifest_hash: 'abcdef0123456789', download_gb: 6.94, warnings: ['未填 sha256'] })
+  notifyError.mockReset()
+  vi.restoreAllMocks()
 })
 afterEach(() => {
   wrapper?.unmount()
@@ -151,5 +155,94 @@ describe('WorkflowVersionView', () => {
     expect($('adm-wf-save')).toBeNull()
     expect($('adm-wf-validate')).toBeNull()
     expect(($('adm-wf-graph') as HTMLTextAreaElement).readOnly).toBe(true)
+  })
+})
+
+async function typeInto(id: string, v: string) {
+  const el = $(id) as HTMLInputElement | HTMLTextAreaElement
+  el.value = v
+  el.dispatchEvent(new Event('input'))
+  await flushPromises()
+}
+
+describe('WorkflowVersionView（T14 评审修正）', () => {
+  it('I-1：text / textarea 无默认值显示为「必填」并保持无默认值', async () => {
+    const m = { ...manifest, inputs: manifest.inputs.map((i: Record<string, unknown>) => (i.key === 'negative' ? { ...i, default: undefined } : i)) }
+    current = version({ manifest: m })
+    await mountAt('/workflows/1/versions/7')
+    const rows = $$('adm-wf-input-row')
+    const idx = m.inputs.findIndex((i: Record<string, unknown>) => i.key === 'negative')
+    const box = rows[idx].querySelector('[data-testid="adm-wf-input-required"]')!
+    expect(box.querySelector('input[type=checkbox]')!.hasAttribute('checked') || box.classList.contains('is-checked')).toBe(true)
+    expect(rows[0].querySelector('[data-testid="adm-wf-input-required"]')!.classList.contains('is-checked')).toBe(false)
+    await click('adm-wf-validate')
+    const sent = put.mock.calls[0][1].manifest.inputs[idx]
+    expect('default' in sent).toBe(false)
+  })
+
+  it('I-2：有未保存的修改时离开页面要确认；取消则留下，确认才离开', async () => {
+    await mountAt('/workflows/1/versions/7')
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockRejectedValueOnce('cancel')
+    await router.push('/workflows/1') // 未修改：不确认
+    expect(confirm).not.toHaveBeenCalled()
+    await router.push('/workflows/1/versions/7')
+    await flushPromises()
+    await typeInto('adm-wf-changelog', '改了')
+    await router.push('/workflows/1')
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(router.currentRoute.value.path).toBe('/workflows/1/versions/7')
+    confirm.mockResolvedValueOnce('confirm' as never)
+    await router.push('/workflows/1')
+    expect(router.currentRoute.value.path).toBe('/workflows/1')
+  })
+
+  it('I-2：有未保存的修改时关闭 / 刷新浏览器页签会提示（beforeunload）', async () => {
+    await mountAt('/workflows/1/versions/7')
+    const clean = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(clean)
+    expect(clean.defaultPrevented).toBe(false)
+    await typeInto('adm-wf-changelog', '改了')
+    const dirty = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(dirty)
+    expect(dirty.defaultPrevented).toBe(true)
+  })
+
+  it('I-2：已发布版本改了更新说明未保存时，退役先提示保存', async () => {
+    current = version({ status: 'published' })
+    const warn = vi.spyOn(ElMessage, 'warning')
+    await mountAt('/workflows/1/versions/7')
+    await typeInto('adm-wf-changelog', '改了')
+    await click('adm-wf-retire')
+    expect(warn).toHaveBeenCalled()
+    expect(($('adm-wf-retire-dialog')?.closest('.el-overlay') as HTMLElement | null)?.style.display ?? 'none').toBe('none')
+  })
+
+  it('修改表单后清掉上一次后端错误的定位', async () => {
+    put.mockRejectedValue(new ApiError(400, 'workflow_version_invalid', 'manifest.models[0].modelscope.repo：仓库应形如 owner/name'))
+    await mountAt('/workflows/1/versions/7')
+    await click('adm-wf-validate')
+    expect($$('adm-wf-model-row')[0].classList.contains('err-row')).toBe(true)
+    await typeInto('adm-wf-model-ms-repo', 'a/b')
+    expect($$('adm-wf-model-row')[0].classList.contains('err-row')).toBe(false)
+    expect($('adm-wf-error')).toBeNull()
+  })
+
+  it('本地拦截时显示真正拦住请求的那一项', async () => {
+    current = version({ version: '', manifest: { ...manifest, models: [{ ...manifest.models[0], size_gb: 'x' }] } })
+    await mountAt('/workflows/1/versions/7')
+    await click('adm-wf-validate')
+    expect(put).not.toHaveBeenCalled()
+    expect($('adm-wf-error')!.textContent).toContain('manifest.models[0].size_gb')
+  })
+
+  it('保存遇到 workflow_version_invalid：页面内显示，不再重复弹提示', async () => {
+    put.mockRejectedValue(new ApiError(400, 'workflow_version_invalid', 'version：只能由字母…'))
+    await mountAt('/workflows/1/versions/7')
+    await click('adm-wf-save')
+    expect($('adm-wf-error')!.textContent).toContain('version')
+    expect(notifyError).not.toHaveBeenCalled()
+    put.mockRejectedValue(new ApiError(409, 'duplicate', '版本号已存在'))
+    await click('adm-wf-save')
+    expect(notifyError).toHaveBeenCalledTimes(1)
   })
 })

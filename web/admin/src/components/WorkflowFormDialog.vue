@@ -12,6 +12,8 @@ const props = defineProps<{ modelValue: boolean; workflow: AdminWorkflow | null 
 const emit = defineEmits<{ 'update:modelValue': [boolean]; saved: [AdminWorkflow] }>()
 
 const STATUSES: WorkflowStatus[] = ['draft', 'published', 'retired']
+/** 控制台按简易 Markdown 渲染介绍（段落、列表、粗体、行内代码，不渲染链接）。 */
+const DESC_LABEL = `介绍（≤ ${LIMITS.description} 字；空行分段，「- 」开头为列表，支持 **粗体** 与 \`代码\`，不支持链接）`
 
 interface Form {
   slug: string
@@ -68,7 +70,7 @@ async function submit() {
   busy.value = true
   try {
     const body: AdminWorkflowInput = {
-      slug: form.slug.trim(), name: form.name.trim(), summary: form.summary.trim(), description: form.description, category: form.category,
+      slug: form.slug.trim(), name: form.name.trim(), summary: form.summary.trim(), description: form.description.trim(), category: form.category,
       tags: parseTags(form.tags), sort: Number(form.sort ?? 0),
     }
     let saved = props.workflow ? await api.put<AdminWorkflow>(`/workflows/${props.workflow.id}`, { ...body, status: form.status }) : await api.post<AdminWorkflow>('/workflows', body)
@@ -136,7 +138,7 @@ async function submit() {
       </div>
       <div v-if="cover.error" class="field-error" data-testid="adm-wf-cover-error">{{ cover.error }}</div>
       <el-form-item :label="`一句话简介（≤ ${LIMITS.summary} 字）`"><el-input v-model="form.summary" :maxlength="LIMITS.summary" data-testid="adm-wf-summary" /></el-form-item>
-      <el-form-item :label="`介绍（≤ ${LIMITS.description} 字，支持段落、列表、链接）`">
+      <el-form-item :label="DESC_LABEL">
         <el-input v-model="form.description" type="textarea" :rows="5" :maxlength="LIMITS.description" data-testid="adm-wf-description" />
       </el-form-item>
       <div class="three">

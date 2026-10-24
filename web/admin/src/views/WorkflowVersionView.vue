@@ -2,14 +2,14 @@
 import {
   appStatusLabel, fmtTime, formatGB, isApiError, labelOf, messageOf, type AdminWorkflow, type AdminWorkflowVersion, type WorkflowValidateResult,
 } from '@spark/shared'
-import { ElMessage } from 'element-plus'
-import { computed, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter, type RouteLocationNormalized } from 'vue-router'
 import { api } from '../api'
 import { notifyError } from '../logic/notify'
 import {
-  collectRefs, downloadGB, emptyInputRow, emptyManifest, emptyModelRow, emptyNodeRow, emptyOutputRow, formatBytes, formToManifest, hasNaN, INPUT_TYPES,
-  inputHas, LIMITS, manifestIssues, manifestToForm, missingRefs, MODEL_DIRS, OUTPUT_CLASS_TYPES, parseApiFile, parseGraphFile, pathToCell,
+  collectRefs, downloadGB, emptyInputRow, emptyManifest, emptyModelRow, emptyNodeRow, emptyOutputRow, formatBytes, formToManifest, INPUT_TYPES,
+  inputHas, LIMITS, manifestIssues, manifestToForm, missingRefs, MODEL_DIRS, nonFiniteIssue, OUTPUT_CLASS_TYPES, parseApiFile, parseGraphFile, pathToCell,
   splitFieldError, suggestInput, versionIssues, type FieldIssue, type InputRow, type ManifestForm, type ManifestTable,
 } from '../logic/workflowManifest'
 import { session } from '../store/session'
@@ -161,11 +161,14 @@ const body = () => (editable.value ? fullBody() : { changelog: form.changelog })
 function localCheck(): boolean {
   showHints.value = true
   if (!editable.value) return true
-  const blocking = !graphInfo.value.ok || !apiInfo.value.ok || hasNaN(manifest.value)
+  const blocking: FieldIssue | null = !graphInfo.value.ok
+    ? { path: 'graph', reason: graphInfo.value.error }
+    : !apiInfo.value.ok
+      ? { path: 'api_prompt', reason: apiInfo.value.error }
+      : nonFiniteIssue(manifest.value)
   if (!blocking) return true
-  const first = localIssues.value[0]
-  fieldError.value = null
-  result.value = { ok: false, text: first ? `${first.path}：${first.reason}` : '表单有未填写或格式不正确的内容', warnings: [] }
+  fieldError.value = blocking
+  result.value = { ok: false, text: `${blocking.path}：${blocking.reason}`, warnings: [] }
   return false
 }
 
@@ -213,7 +216,7 @@ async function save() {
     }
   } catch (e) {
     showError(e)
-    notifyError(e)
+    if (!isApiError(e) || e.code !== 'workflow_version_invalid') notifyError(e) // 校验错误已在页面内显示并定位
   } finally {
     busy.value = false
   }
@@ -243,9 +246,8 @@ async function confirmPublish() {
   } catch (e) {
     if (isApiError(e) && e.code === 'workflow_version_invalid') {
       showError(e)
-      Object.assign(publish, { ok: false, text: e.message })
-    }
-    notifyError(e) // 取消动态码时静默
+      Object.assign(publish, { ok: false, text: e.message }) // 弹窗内显示，不再弹提示
+    } else notifyError(e) // 取消动态码时静默
   } finally {
     busy.value = false
   }
@@ -253,6 +255,13 @@ async function confirmPublish() {
 
 // ---- 退役（super）----
 const retiring = ref(false)
+function openRetire() {
+  if (dirty.value) {
+    ElMessage.warning('有未保存的修改，请先保存再退役')
+    return
+  }
+  retiring.value = true
+}
 async function confirmRetire() {
   if (busy.value) return
   busy.value = true
@@ -287,7 +296,10 @@ const apiFile = ref<HTMLInputElement | null>(null)
 // ---- 表格 ----
 const showJson = ref(false)
 const manifestJson = computed(() => JSON.stringify(manifest.value, null, 2))
-const removeAt = <T,>(list: T[], i: number) => list.splice(i, 1)
+const removeAt = <T,>(list: T[], i: number) => {
+  list.splice(i, 1)
+  clearResult() // 行号变了，上一次的定位不再对得上
+}
 const addModel = () => form.manifest.models.push(emptyModelRow())
 const addNode = () => form.manifest.nodes.push(emptyNodeRow())
 const addInput = () => form.manifest.inputs.push(emptyInputRow())
@@ -310,6 +322,29 @@ const currentValue = (row: InputRow) => {
 }
 
 const GIT_PLACEHOLDER = 'https://github.com/owner/repo.git'
+
+// ---- 未保存修改的保护（I-2）----
+// 用户改了表单：上一次校验 / 保存的结果与字段定位不再对应当前内容，清掉（load 里整体赋值时也会触发，无害）。
+watch(form, () => clearResult(), { deep: true })
+async function confirmLeave(): Promise<boolean> {
+  if (!dirty.value) return true
+  try {
+    await ElMessageBox.confirm('有未保存的修改，离开后会丢失。确定离开？', '未保存的修改', { confirmButtonText: '离开', cancelButtonText: '留下', type: 'warning' })
+    return true
+  } catch {
+    return false
+  }
+}
+onBeforeRouteLeave(() => confirmLeave())
+// 同一页面换版本（如 /new 保存后 replace 到 /<id>，保存前已更新快照，不会误拦）
+onBeforeRouteUpdate((to: RouteLocationNormalized, from: RouteLocationNormalized) => (to.path === from.path ? true : confirmLeave()))
+function onBeforeUnload(e: BeforeUnloadEvent) {
+  if (!dirty.value) return
+  e.preventDefault()
+  e.returnValue = ''
+}
+onMounted(() => window.addEventListener('beforeunload', onBeforeUnload))
+onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload))
 
 // 放在最后：immediate 加载会用到上面声明的 ref
 watch(() => [route.params.id, route.params.vid, route.query.copy_from], load, { immediate: true })
@@ -338,7 +373,7 @@ watch(() => [route.params.id, route.params.vid, route.query.copy_from], load, { 
             <el-button v-if="editable" :loading="validating" data-testid="adm-wf-validate" @click="onValidate">校验</el-button>
             <el-button v-if="changelogEditable" type="primary" :loading="busy" data-testid="adm-wf-save" @click="save">保存</el-button>
             <el-button v-if="isSuper && !isNew && status === 'draft'" type="success" data-testid="adm-wf-publish" @click="openPublish">发布</el-button>
-            <el-button v-if="isSuper && status === 'published'" type="danger" plain data-testid="adm-wf-retire" @click="retiring = true">退役</el-button>
+            <el-button v-if="isSuper && status === 'published'" type="danger" plain data-testid="adm-wf-retire" @click="openRetire">退役</el-button>
           </span>
         </div>
       </template>
@@ -533,14 +568,17 @@ watch(() => [route.params.id, route.params.vid, route.query.copy_from], load, { 
                       <el-select v-if="r.type === 'bool'" v-model="r.default" size="small" clearable style="width: 100px" data-testid="adm-wf-input-default">
                         <el-option label="true" value="true" /><el-option label="false" value="false" />
                       </el-select>
-                      <el-input
-                        v-else-if="inputHas.default(r.type)"
-                        v-model="r.default"
-                        size="small"
-                        :placeholder="r.type === 'seed' ? '-1 = 随机' : ''"
-                        style="width: 140px"
-                        data-testid="adm-wf-input-default"
-                      />
+                      <div v-else-if="inputHas.default(r.type)" class="stack">
+                        <el-input
+                          v-model="r.default"
+                          size="small"
+                          :disabled="inputHas.maxLen(r.type) && r.required"
+                          :placeholder="r.type === 'seed' ? '-1 = 随机' : inputHas.maxLen(r.type) && r.required ? '无默认值' : ''"
+                          style="width: 140px"
+                          data-testid="adm-wf-input-default"
+                        />
+                        <el-checkbox v-if="inputHas.maxLen(r.type)" v-model="r.required" size="small" data-testid="adm-wf-input-required">必填（无默认值）</el-checkbox>
+                      </div>
                       <span v-else class="muted">—</span>
                     </td>
                     <td :class="{ 'err-cell': cellErr('inputs', i, 'min', 'max', 'step') }">

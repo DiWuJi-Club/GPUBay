@@ -4,7 +4,7 @@ import {
   type Listed,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import WorkflowFormDialog from '../components/WorkflowFormDialog.vue'
@@ -14,7 +14,7 @@ import { session } from '../store/session'
 // 工作流详情（计划 11 规格 §12）：信息 + 版本表；编辑 / 删除 / 新建版本只有 super。
 const route = useRoute()
 const router = useRouter()
-const wfId = Number(route.params.id)
+const wfId = computed(() => Number(route.params.id))
 const wf = ref<AdminWorkflow | null>(null)
 /** 列表里的统计（安装数、7 日出图）；单个 GET 不带，取不到时不显示 */
 const stats = ref<AdminWorkflowRow | null>(null)
@@ -32,19 +32,22 @@ const canDelete = computed(() => canWrite.value && wf.value?.status === 'draft' 
 const statusType: Record<string, 'info' | 'success' | 'warning'> = { draft: 'info', published: 'success', retired: 'warning' }
 
 async function load() {
+  const id = wfId.value
   loading.value = true
   try {
     const [w, vs, list] = await Promise.all([
-      api.get<AdminWorkflow>(`/workflows/${wfId}`),
-      api.get<Listed<AdminWorkflowVersionRow>>(`/workflows/${wfId}/versions`),
+      api.get<AdminWorkflow>(`/workflows/${id}`),
+      api.get<Listed<AdminWorkflowVersionRow>>(`/workflows/${id}/versions`),
       api.get<Listed<AdminWorkflowRow>>('/workflows').catch(() => null),
     ])
+    if (id !== wfId.value) return // 加载期间换了工作流：丢弃旧结果
     wf.value = w
     versions.value = vs.items
-    stats.value = list?.items.find((x) => x.id === wfId) ?? null
+    stats.value = list?.items.find((x) => x.id === id) ?? null
     notFound.value = false
     error.value = ''
   } catch (e) {
+    if (id !== wfId.value) return
     if (isApiError(e) && e.code === 'workflow_not_found') {
       notFound.value = true
       return
@@ -55,19 +58,25 @@ async function load() {
     loading.value = false
   }
 }
-onMounted(load)
+// 同一组件内换工作流（/workflows/1 → /workflows/2）也重新加载；离开详情页（id 变为 undefined）时不加载
+watch(wfId, (id) => {
+  if (Number.isInteger(id) && id > 0) {
+    copyFrom.value = undefined
+    void load()
+  }
+}, { immediate: true })
 
 function openVersion(v: AdminWorkflowVersionRow) {
-  void router.push(`/workflows/${wfId}/versions/${v.id}`)
+  void router.push(`/workflows/${wfId.value}/versions/${v.id}`)
 }
 function createVersion() {
-  void router.push({ path: `/workflows/${wfId}/versions/new`, query: copyFrom.value ? { copy_from: String(copyFrom.value) } : {} })
+  void router.push({ path: `/workflows/${wfId.value}/versions/new`, query: copyFrom.value ? { copy_from: String(copyFrom.value) } : {} })
 }
 async function confirmDelete() {
   if (busy.value) return
   busy.value = true
   try {
-    await api.del(`/workflows/${wfId}`, {})
+    await api.del(`/workflows/${wfId.value}`, {})
     ElMessage.success('工作流已删除')
     deleting.value = false
     void router.push('/workflows')
