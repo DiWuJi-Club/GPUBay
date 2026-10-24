@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net/http"
 	"slices"
@@ -210,6 +211,7 @@ func TestWorkflowMarketAnonymous(t *testing.T) {
 	resp, img := anon.raw("GET", "/workflows/sdxl-img2img/cover", nil, nil)
 	etag := resp.Header.Get("ETag")
 	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "image/png" || resp.Header.Get("Cache-Control") != "public, max-age=86400" ||
+		resp.Header.Get("Content-Security-Policy") != "default-src 'none'; sandbox" ||
 		resp.Header.Get("X-Content-Type-Options") != "nosniff" || !strings.HasPrefix(etag, `"`) || len(img) == 0 || !bytes.HasPrefix(img, []byte("\x89PNG")) {
 		t.Fatalf("cover = %d %v (%d bytes)", resp.StatusCode, resp.Header, len(img))
 	}
@@ -240,13 +242,19 @@ func TestWorkflowMarketIPRateLimit(t *testing.T) {
 	e := newWorkflowsTestEnv(t, func(s *api.Server) { s.CalendarLimit = 3 })
 	e.seedWorkflows()
 	anon := e.client()
-	for i, p := range []string{"/workflows", "/workflows/sdxl-img2img", "/workflows/sdxl-img2img/cover"} {
+	for i, p := range []string{"/workflows", "/workflows/sdxl-img2img", "/workflows"} {
 		if resp, _ := anon.raw("GET", p, nil, nil); resp.StatusCode != 200 {
 			t.Fatalf("request %d %s = %d", i, p, resp.StatusCode)
 		}
 	}
 	if code, out := anon.do("GET", "/workflows", nil); code != http.StatusTooManyRequests || out["code"] != "rate_limited" {
 		t.Fatalf("4th = %d %v", code, out)
+	}
+	// 封面不占列表 / 详情的额度（一页市场有十几张封面），有自己的宽松限流
+	for i := 0; i < 20; i++ {
+		if resp, _ := anon.raw("GET", "/workflows/sdxl-img2img/cover", nil, nil); resp.StatusCode != 200 {
+			t.Fatalf("cover %d after list limit = %d", i, resp.StatusCode)
+		}
 	}
 	if code, out := anon.do("GET", "/apps", nil); code != http.StatusTooManyRequests {
 		t.Fatalf("shared limiter with /apps = %d %v", code, out)
@@ -262,6 +270,7 @@ func TestOrderAndBookingWithWorkflows(t *testing.T) {
 	s := e.seedWorkflows()
 	dbtest.CreateMachine(t, e.pool, "SN001")
 	dbtest.CreateMachine(t, e.pool, "SN002")
+	dbtest.CreateMachine(t, e.pool, "SN003")
 	c, _ := e.fundedClient("13800000201")
 	img := dbtest.ImageID(t, e.pool)
 	pid := dbtest.ProductID(t, e.pool)
@@ -284,6 +293,28 @@ func TestOrderAndBookingWithWorkflows(t *testing.T) {
 	if code, out := c.do("POST", "/orders", map[string]any{"product_id": pid, "duration": "1d", "image_id": img, "app_id": s.comfy.ID,
 		"app_workflow_ids": []int64{s.ids["qwen-image-txt2img"]}}); code != 404 || out["code"] != "workflow_not_found" {
 		t.Fatalf("order with draft workflow = %d %v", code, out)
+	}
+
+	// 超过上限：去重后 > 8 → workflow_limit（ResolveWorkflows）；列表本身 > 64 → 在进事务之前就拒绝
+	nine := []int64{}
+	for i := int64(1); i <= 9; i++ {
+		nine = append(nine, 100000+i)
+	}
+	huge := slices.Repeat(wids, 33) // 66 个（去重后只有 2 个）也拒绝：只看列表长度
+	for _, ids := range [][]int64{nine, huge} {
+		if code, out := c.do("POST", "/orders", map[string]any{"product_id": pid, "duration": "1d", "image_id": img, "app_id": s.comfy.ID,
+			"app_workflow_ids": ids}); code != 409 || out["code"] != "workflow_limit" {
+			t.Fatalf("order with %d workflows = %d %v", len(ids), code, out)
+		}
+		b := maps.Clone(booking)
+		b["app_id"], b["app_workflow_ids"] = s.comfy.ID, ids
+		if code, out := c.do("POST", "/bookings", b); code != 409 || out["code"] != "workflow_limit" {
+			t.Fatalf("booking with %d workflows = %d %v", len(ids), code, out)
+		}
+	}
+	if code, out := c.do("POST", "/orders", map[string]any{"product_id": pid, "duration": "1d", "image_id": img, "app_id": s.comfy.ID,
+		"app_workflow_ids": slices.Repeat(wids, 32)}); code != 201 { // 64 个（去重后 2 个）可以
+		t.Fatalf("order with 64 ids = %d %v", code, out)
 	}
 
 	code, out := c.do("POST", "/orders", map[string]any{"product_id": pid, "duration": "1d", "image_id": img, "app_id": s.comfy.ID, "app_workflow_ids": wids})
@@ -351,8 +382,47 @@ func TestInstanceWorkflowsInstall(t *testing.T) {
 		t.Fatalf("list = %d %v", code, out)
 	}
 
+	// 已装工作流详情：按已装的版本给表单（快速出图抽屉用），即使有了新版本
+	ctx := context.Background()
+	base0, err := e.wfCat.GetVersion(ctx, s.vers["sdxl-img2img"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2 := base0.Manifest
+	m2.Inputs = m2.Inputs[:len(m2.Inputs)-1]
+	e.clk.Advance(time.Minute)
+	v2, err := e.wfCat.CreateVersion(ctx, audit.Actor{AdminID: 1}, wid, comfywf.VersionInput{Version: "1.1.0", CopyFrom: &base0.ID, Manifest: m2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.wfCat.PublishVersion(ctx, audit.Actor{AdminID: 1}, wid, v2.ID); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := c.raw("GET", fmt.Sprintf("%s/%d", base, wid), nil, nil)
+	if resp.StatusCode != 200 || strings.Contains(string(body), "class_type") || strings.Contains(string(body), "api_prompt") {
+		t.Fatalf("installed detail = %d %s", resp.StatusCode, body)
+	}
+	var det map[string]any
+	if err := json.Unmarshal(body, &det); err != nil {
+		t.Fatal(err)
+	}
+	dw := det["workflow"].(map[string]any)
+	if dw["slug"] != "sdxl-img2img" || dw["version"] != "1.0.0" || dw["update_available"] != true || dw["latest_version"] != "1.1.0" ||
+		det["quick_run"] != true || len(det["inputs"].([]any)) != len(base0.Manifest.Inputs) || len(det["outputs"].([]any)) != len(base0.Manifest.Outputs) {
+		t.Fatalf("installed detail = %v", det)
+	}
+	if in0 := det["inputs"].([]any)[0].(map[string]any); in0["key"] != base0.Manifest.Inputs[0].Key || in0["type"] == nil || in0["label"] == nil {
+		t.Fatalf("input = %v", in0)
+	}
+	if code, out := c.do("GET", fmt.Sprintf("%s/%d", base, s.ids["sdxl-txt2img"]), nil); code != 404 || out["code"] != "workflow_not_found" {
+		t.Fatalf("not installed detail = %d %v", code, out)
+	}
+	if code, out := c.do("GET", base+"/abc", nil); code != 404 || out["code"] != "workflow_not_found" {
+		t.Fatalf("bad wid detail = %d %v", code, out)
+	}
+
 	// 更新：不带请求体 / 带 version_id 都可以；目标就是当前版本 → 无操作，同样形状
-	resp, body := c.raw("PUT", fmt.Sprintf("%s/%d", base, wid), nil, map[string]string{"Content-Type": "application/json"})
+	resp, body = c.raw("PUT", fmt.Sprintf("%s/%d", base, wid), nil, map[string]string{"Content-Type": "application/json"})
 	if resp.StatusCode != 200 || !strings.Contains(string(body), `"deployment"`) || !strings.Contains(string(body), `"workflows"`) {
 		t.Fatalf("update empty body = %d %s", resp.StatusCode, body)
 	}
@@ -371,7 +441,7 @@ func TestInstanceWorkflowsInstall(t *testing.T) {
 		method, path string
 		body         any
 	}{
-		{"GET", base, nil}, {"POST", base, map[string]any{"workflow_id": s.ids["sdxl-txt2img"]}},
+		{"GET", base, nil}, {"GET", fmt.Sprintf("%s/%d", base, wid), nil}, {"POST", base, map[string]any{"workflow_id": s.ids["sdxl-txt2img"]}},
 		{"PUT", fmt.Sprintf("%s/%d", base, wid), map[string]any{}}, {"DELETE", fmt.Sprintf("%s/%d", base, wid), nil},
 		{"GET", "/instances/" + oid + "/apps/" + depID + "/workflows", nil},
 		{"POST", "/instances/" + oid + "/apps/" + depID + "/workflows", map[string]any{"workflow_id": s.ids["sdxl-txt2img"]}},
@@ -529,6 +599,13 @@ func TestQuickRunFlow(t *testing.T) {
 	if code, out := other.uploadFile(base+"/uploads", comfytest.OnePixelPNG); code != 404 || out["code"] != "not_found" {
 		t.Fatalf("stranger upload = %d %v", code, out)
 	}
+	// 大文件被拒时服务端先读完请求体再回错误：客户端拿到 JSON 404，而不是发送中途连接被重置
+	big := append(slices.Clone(comfytest.OnePixelPNG), make([]byte, 12<<20)...)
+	for i := 0; i < 3; i++ {
+		if code, out := other.uploadFile(base+"/uploads", big); code != 404 || out["code"] != "not_found" {
+			t.Fatalf("stranger big upload %d = %d %v", i, code, out)
+		}
+	}
 
 	// 每用户每小时 120 次（按库计数，含已结束的）：第 121 次 → 429
 	var uid int64
@@ -544,5 +621,35 @@ func TestQuickRunFlow(t *testing.T) {
 	if code, out := c.do("POST", base+"/runs", map[string]any{"inputs": map[string]any{"image": name}}); code != http.StatusTooManyRequests ||
 		out["code"] != "rate_limited" {
 		t.Fatalf("121st run = %d %v", code, out)
+	}
+}
+
+// POST …/runs 的进程内尝试限流（每用户每小时 240 次，在解析请求体之前计数；按库的 120 次仍是权威限制）。
+func TestQuickRunAttemptLimit(t *testing.T) {
+	e := newWorkflowsTestEnv(t, nil)
+	s := e.seedWorkflows()
+	c := e.client()
+	id, depID := c.comfyDeployment(t, e, s, "13800000241")
+	base := fmt.Sprintf("/instances/%s/apps/%s/workflows", id, depID)
+	for i := 1; i <= 240; i++ { // 失败的尝试（不存在的工作流）也计数
+		if code, out := c.do("POST", base+"/abc/runs", map[string]any{}); code != 404 {
+			t.Fatalf("attempt %d = %d %v", i, code, out)
+		}
+	}
+	if code, out := c.do("POST", fmt.Sprintf("%s/%d/runs", base, s.ids["sdxl-img2img"]), map[string]any{"inputs": map[string]any{}}); code != http.StatusTooManyRequests ||
+		out["code"] != "rate_limited" {
+		t.Fatalf("241st attempt = %d %v", code, out)
+	}
+	if code, _ := c.do("POST", base+"/abc/runs", "not json"); code != http.StatusTooManyRequests {
+		t.Fatalf("limited before decoding = %d", code)
+	}
+	other := e.client()
+	_, odep := other.comfyDeployment(t, e, s, "13800000242")
+	if code, _ := other.do("POST", "/instances/x/apps/"+odep+"/workflows/abc/runs", map[string]any{}); code != 404 {
+		t.Fatalf("other user = %d", code)
+	}
+	e.clk.Advance(time.Hour)
+	if code, _ := c.do("POST", base+"/abc/runs", map[string]any{}); code != 404 {
+		t.Fatalf("after an hour = %d", code)
 	}
 }

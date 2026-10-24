@@ -109,17 +109,18 @@ func (h *Hooks) OnTransition(ctx context.Context, tx pgx.Tx, d appdeploy.Deploym
 // 每个工作流已上架（workflow_not_found）且有已发布版本（workflow_unavailable，取 published_at 最新的），
 // 整组能生成部署包（同名节点 commit 冲突 → workflow_version_invalid）。空 → nil。
 func (h *Hooks) ResolveWorkflows(ctx context.Context, q db.Querier, ids []int64) ([]appdeploy.WorkflowRef, error) {
-	uniq := make([]int64, 0, len(ids))
+	// 去重时一超过上限就返回：uniq 最多 MaxWorkflowsPerDeployment + 1 个，整体 O(len(ids))，列表再长也不会 O(n²)
+	uniq := make([]int64, 0, MaxWorkflowsPerDeployment+1)
 	for _, id := range ids {
 		if !slices.Contains(uniq, id) {
 			uniq = append(uniq, id)
+			if len(uniq) > MaxWorkflowsPerDeployment {
+				return nil, apperr.ErrWorkflowLimit
+			}
 		}
 	}
 	if len(uniq) == 0 {
 		return nil, nil
-	}
-	if len(uniq) > MaxWorkflowsPerDeployment {
-		return nil, apperr.ErrWorkflowLimit
 	}
 	refs := make([]appdeploy.WorkflowRef, 0, len(uniq))
 	bundle := make([]BundleWorkflow, 0, len(uniq))

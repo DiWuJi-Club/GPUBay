@@ -230,6 +230,10 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	if err := checkAppWorkflowIDs(req.AppWorkflowIDs); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	ord, inst, err := s.Rental.Place(r.Context(), rental.PlaceRequest{
 		UserID: currentUser(r).ID, ProductID: req.ProductID, ImageID: req.ImageID, Duration: catalog.Duration(req.Duration),
 		IdempotencyKey: r.Header.Get(idempotencyHeader), AppID: req.AppID, AppEnv: req.AppEnv, AppWorkflowIDs: req.AppWorkflowIDs,
