@@ -97,6 +97,27 @@
 | D15 | `comfyui` 1.1.0 的 `MODEL_ID` 新增选项 `none`（不下预置模型）并设为默认：装工作流的用户不需要 1.0.0 的「先选一个模型」；市场页「一键部署 ComfyUI」卡片（计划 7）行为不变（仍可选 SDXL 等） | 工作流清单已经带模型；默认再下 7GB SDXL 是浪费 |
 | D16 | 工作流版本的 `graph` 引用到的模型文件名（`CheckpointLoaderSimple.ckpt_name`、`UNETLoader.unet_name`、`VAELoader.vae_name`、`CLIPLoader / DualCLIPLoader.clip_name*`、`LoraLoader.lora_name`、`UpscaleModelLoader.model_name`）必须出现在 `manifest.models[].name` 里，否则发布校验**报错**（`?validate=1` 同样返回）；`graph` 里出现的非内置节点类型（`properties.cnr_id` / `aux_id` 不是 `comfy-core`）必须对应 `manifest.nodes[]` 里的某一项（按节点声明的 `node_types` 列表匹配），否则报错 | 「装好打不开」是工作流市场最常见的差评；校验在发布时就把它堵住 |
 
+### 1.4 实施期裁定（2026-10-24～25，实施方代负责人裁定，可推翻）
+
+实施中发现的规格与真实代码 / 上游不符之处，以下裁定优先于本文其它章节的原文：
+
+| # | 裁定 | 理由 / 影响 |
+|---|---|---|
+| D17 | 自定义节点安装在 checkout 之后执行 `git submodule update --init --recursive`（经 Git 镜像的 `url.<镜像>https://github.com/.insteadOf`，失败整体回退直连）；子模块主机不单独做白名单校验 | `ComfyUI_UltimateSDUpscale` 的算法在子模块里，不初始化会在首次导入时直连 GitHub 下载并失败；子模块 commit 由主仓库 gitlink 钉死，发布时一起评审（super + TOTP） |
+| D18 | D16 交叉校验忽略 `mode` 为 2（静音）/ 4（旁路）的节点；对缺 `properties`、`widgets_values` 非数组等不完整节点容错；同时校验 `api_prompt`（`class_type` 与加载器输入）；模型 `dir` 必须与引用它的加载器匹配（如 `UNETLoader` → `diffusion_models`/`unet`）；快速出图输入若指向加载器文件名输入，只能是 `enum` 且选项全部是已声明模型 | 官方 Qwen 模板带一个旁路的 LoRA 节点；目录错同样会「装好打不开」 |
+| D19 | `wan22-5b-ti2v` 的快速出图只做文生视频（不提供 `image` 输入）；宽高 ≤ 1280、帧数 ≤ 121 | 官方模板里的 LoadImage 是旁路的，API 格式里没有该节点，`BuildPrompt` 只能覆盖已有输入；更大的尺寸远超 5B 模型训练范围 |
+| D20 | 放大修复工作流的放大模型改用 `RealESRGAN_x4plus.safetensors`（BSD-3-Clause；ModelScope `Comfy-Org/Real-ESRGAN_repackaged`，hf `Comfy-Org/Real-ESRGAN`），不用 `4x-UltraSharp.pth` | 4x-UltraSharp 是 CC BY-NC-SA 4.0（非商用），不适合付费平台；§9 表与 §16.4 第 4 项相应替换 |
+| D21 | 两个 SDXL 工作流基于官方 SD1.5 模板（`default` / `image2image`）改成 SDXL base、1024×1024 / 1MP | ComfyUI v0.1.86 模板没有 SDXL 版 |
+| D22 | `SPARK_APP_GIT_MIRROR=off` 表示直连（§5.1/§13 的「空 = 直连」作废）；`SPARK_GIT_MIRROR` 只写入 `supports_workflows` 版本的部署 env | 配置加载无法区分「未设置」与「设为空」；只给工作流版本写，存量部署 env 字节不变、升级后不会重跑 install |
+| D23 | `queued` 部署上的集合变化（Add/Update/Remove）要把部署 `row_version + 1`（`appdeploy.TouchDeployment`） | Runner 在事务外生成部署包，不加版本号会把旧包装上去并把新加的工作流误标「已安装」 |
+| D24 | `RedeployRequest.VersionID == nil` 在计划 7 里表示「最新已发布版本」，Installer 改为显式传当前版本；部署自身的当前版本即使已下线也允许原样重装；目标版本还要匹配实例镜像 | 原计划「nil = 不换版本」与代码不符 |
+| D25 | `OnTransition(running)`：版本支持工作流时 `pending`/`failed` → `installed`；不支持时 `pending` → `failed`。§14 的不变量改为：running 部署上没有 `pending`/`failed` 行；`installed` 行都有 `installed_at`；每部署 ≤ 8；只出现在 comfyui 部署上；版本属于该工作流；不引用 draft 版本 | 原文「installed 行只在 running/stopped 部署上」不成立：新增工作流会让部署回到 queued，而已装的行保持 installed |
+| D26 | 迁移 00024 同时修改 `uploads`：`purpose` 允许 `workflow_cover`，`user_id` 可空，加约束「封面 ⇔ user_id 为空」；Down 删除封面行并还原约束（§2、§15「只加四张表」的说法据此修正） | 封面所有者 `user_id = 0` 无法满足原外键与 NOT NULL |
+| D27 | 快速出图：ComfyUI 重启后队列与历史都查不到的运行判为失败（「任务已丢失（ComfyUI 可能已重启）」）；超过 30 分钟仍未完成的判为失败；每用户同时 ≤ 2 个上传；每用户每小时 ≤ 240 次运行尝试（含失败，DB 里 120 次成功运行的上限不变）；单副本假设下用进程内锁串行化计数 → `/prompt` → 入库 | D9 每次装 / 改工作流都会重启 ComfyUI，丢失的运行否则会把部署占住 30 分钟 |
+| D28 | 输出文件代理不透传上游 `Content-Type`，按扩展名推断，加 `nosniff`、`CSP: default-src 'none'; sandbox`、`CORP: same-origin`；只放行图片 / 视频扩展名，单次结果最多 64 个文件 | 容器内用户有 root，上游响应一律视为不可信 |
+| D29 | 新增 `GET /instances/{id}/apps/{dep}/workflows/{wid}`：返回已装版本的 `inputs/outputs/quick_run`，快速出图表单按已装版本渲染 | 已装版本可能落后于最新版本，`BuildPrompt` 用的是已装版本 |
+| D30 | 节点 `requirements.txt` 用约束文件安装（镜像的 `PIP_CONSTRAINT` + 当前 torch/numpy/transformers 等版本），防止替换 NGC 镜像里的 torch | NGC 镜像的 torch 是定制构建 |
+
 ## 2. 数据模型（迁移 `00024_comfy_workflows.sql`，带 `+goose Down`）
 
 ```sql
