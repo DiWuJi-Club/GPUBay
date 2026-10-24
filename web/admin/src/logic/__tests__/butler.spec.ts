@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { defaultUsageRange, fmtCount, tabOf, userIdOf, validateSettingsForm } from '../butler'
+import { adoptRange, fmtCount, hasAudit, stepView, tabOf, userIdOf, validateSettingsForm } from '../butler'
 
 describe('tabOf', () => {
   it.each([
@@ -25,10 +25,32 @@ describe('userIdOf', () => {
   })
 })
 
-describe('defaultUsageRange', () => {
-  it('北京时间今天往前共 30 天', () => {
-    // 2026-10-25 01:00 北京时间 = 2026-10-24T17:00Z
-    expect(defaultUsageRange(new Date('2026-10-24T17:00:00Z'))).toEqual({ from: '2026-09-26', to: '2026-10-25' })
+describe('adoptRange', () => {
+  const out = { from: '2026-09-26', to: '2026-10-25' }
+  it('两端都空：采用后端默认', () => {
+    const r = { from: '', to: '' }
+    expect(adoptRange(r, out)).toBe(true)
+    expect(r).toEqual(out)
+  })
+  it('用户已选过日期：不覆盖', () => {
+    const r = { from: '2026-10-01', to: '' }
+    expect(adoptRange(r, out)).toBe(false)
+    expect(r).toEqual({ from: '2026-10-01', to: '' })
+  })
+})
+
+describe('stepView / hasAudit', () => {
+  it('待确认的调用不显示失败', () => {
+    expect(stepView('error', 'pending')).toEqual({ mark: '…', cls: 'pending', suffix: '（待确认）' })
+    expect(stepView('pending', undefined).cls).toBe('pending')
+    expect(stepView('ok', 'executed').mark).toBe('✓')
+    expect(stepView('error', 'failed').mark).toBe('✗')
+  })
+  it('只有 executed / failed 的写调用有审计', () => {
+    expect(hasAudit('write', 'executed')).toBe(true)
+    expect(hasAudit('write', 'failed')).toBe(true)
+    for (const s of ['pending', 'approved', 'rejected', 'expired']) expect(hasAudit('write', s)).toBe(false)
+    expect(hasAudit('read', 'executed')).toBe(false)
   })
 })
 

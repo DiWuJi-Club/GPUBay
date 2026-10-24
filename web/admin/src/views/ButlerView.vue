@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  digitsOnly, fmtTime, fmtYuan, isApiError, labelOf, messageOf,
+  ApiError, digitsOnly, fmtTime, fmtYuan, isApiError, labelOf, messageOf,
   type AdminButlerConversation, type AdminButlerConversationDetail, type ButlerSettingsView, type ButlerUsageReport, type ButlerUserUsage,
   type ButlerUserUsagePage, type Paged,
 } from '@spark/shared'
@@ -12,7 +12,7 @@ import DateRange from '../components/DateRange.vue'
 import IdLink from '../components/IdLink.vue'
 import { usePaged } from '../composables/usePaged'
 import {
-  argsText, convStatusLabel, defaultUsageRange, fmtCount, roleLabel, tabOf, todayCST, toolCallStatusLabel, toolCallStatusType, userIdOf,
+  adoptRange, argsText, convStatusLabel, fmtCount, hasAudit, roleLabel, stepView, tabOf, toolCallStatusLabel, toolCallStatusType, userIdOf,
   validateSettingsForm, type ButlerTab, type SettingsForm,
 } from '../logic/butler'
 import { notifyError } from '../logic/notify'
@@ -33,11 +33,19 @@ const tab = computed<ButlerTab>({
 })
 
 /** 平台没启用管家时后台路由不注册（404）：页内统一提示 */
+const OFF_TEXT = '平台未启用 AI 管家（SPARK_BUTLER=off）'
 const notEnabled = (e: unknown) => isApiError(e) && e.status === 404
-const errorText = (e: unknown) => (notEnabled(e) ? '平台未启用 AI 管家（SPARK_BUTLER=off）' : messageOf(e))
+const errorText = (e: unknown) => (notEnabled(e) ? OFF_TEXT : messageOf(e))
+/** 列表类请求（usePaged 负责提示与占位）：404 换成「未启用」文案 */
+function offAware(e: unknown): never {
+  if (notEnabled(e)) throw new ApiError(404, 'not_found', OFF_TEXT)
+  throw e
+}
+const butlerOff = ref(false)
 
 // ---- 用量：按日合计 ----
-const usageQ = reactive({ range: defaultUsageRange() })
+// 日期初值为空：第一次请求由后端按服务器时钟取默认的最近 30 天，再把响应里的 from / to 填回（不用浏览器时钟）
+const usageQ = reactive({ range: { from: '', to: '' } })
 const usage = ref<ButlerUsageReport | null>(null)
 const usageError = ref('')
 const usageLoading = ref(false)
@@ -51,8 +59,10 @@ async function loadUsage() {
     if (mine !== usageSeq) return
     usage.value = out
     usageError.value = ''
+    adoptRange(usageQ.range, out)
   } catch (e) {
     if (mine !== usageSeq) return
+    butlerOff.value = notEnabled(e)
     if (!notEnabled(e)) notifyError(e)
     usage.value = null
     usageError.value = errorText(e)
@@ -64,27 +74,44 @@ async function loadUsage() {
 const usageRows = computed(() => [...(usage.value?.items ?? [])].reverse())
 
 // ---- 用量：某日按用户 ----
-const usersDay = ref(todayCST())
-const users = usePaged<ButlerUserUsage>((page, size) =>
-  api.get<ButlerUserUsagePage>('/butler/usage/users', { day: usersDay.value, page, page_size: size }) as Promise<Paged<ButlerUserUsage>>,
-)
+// 日期初值为空：第一次请求不带 day，后端按服务器时钟取今天，再把响应里的 day 填回（填回不触发重新加载）
+const usersDay = ref('')
+let adoptingDay = false
+const users = usePaged<ButlerUserUsage>(async (page, size) => {
+  const out = await api.get<ButlerUserUsagePage>('/butler/usage/users', { day: usersDay.value, page, page_size: size }).catch(offAware)
+  if (!usersDay.value && out.day) {
+    adoptingDay = true
+    usersDay.value = out.day
+  }
+  return out as Paged<ButlerUserUsage>
+})
 function pickDay(day: string) {
   usersDay.value = day
 }
 watch(usersDay, (d) => {
+  if (adoptingDay) {
+    adoptingDay = false
+    return
+  }
   if (d) users.reset()
 })
 
 // ---- 对话（ops） ----
+// 筛选框是草稿；点「查询」才生效（applied 快照），翻页沿用已生效的条件
 const conv = reactive({ user_id: userIdOf(route.query.user_id), range: { from: '', to: '' } })
+let applied = { user_id: conv.user_id, range: { ...conv.range } }
 const convs = usePaged<AdminButlerConversation>((page, size) =>
   api.get<Paged<AdminButlerConversation>>('/butler/conversations', {
-    user_id: conv.user_id, from: conv.range.from, to: conv.range.to, page, page_size: size,
-  }),
+    user_id: applied.user_id, from: applied.range.from, to: applied.range.to, page, page_size: size,
+  }).catch(offAware),
 )
+function searchConv() {
+  applied = { user_id: userIdOf(conv.user_id), range: { ...conv.range } }
+  convs.reset()
+}
 function resetConv() {
   Object.assign(conv, { user_id: '', range: { from: '', to: '' } })
-  convs.reset()
+  searchConv()
 }
 
 const detail = reactive({ open: false, id: '', loading: false, error: '', data: null as AdminButlerConversationDetail | null })
@@ -170,8 +197,10 @@ function ensure(t: ButlerTab) {
   if (loaded[t]) return
   loaded[t] = true
   if (t === 'usage') {
-    void loadUsage()
-    void users.load()
+    // 平台未启用（404）时不再请求按用户
+    void loadUsage().then(() => {
+      if (!butlerOff.value) void users.load()
+    })
   } else if (t === 'conversations') void convs.load()
   else void loadSettings()
 }
@@ -180,13 +209,15 @@ watch(tab, ensure, { immediate: true })
 // 已在本页时又从用户详情点「查看对话」（?user_id= 变了）：按新用户重新筛选
 onBeforeRouteUpdate((to) => {
   const uid = userIdOf(to.query.user_id)
-  if (uid && uid !== conv.user_id) {
+  if (uid && uid !== applied.user_id) {
     conv.user_id = uid
+    applied = { user_id: uid, range: { ...conv.range } }
     if (loaded.conversations) convs.reset()
   }
 })
 
-const stepMark = (s: string) => (s === 'ok' ? '✓' : '✗')
+/** 工具调用 ID → 状态（步骤行据此把待确认的调用显示为「待确认」而不是失败） */
+const callStatus = computed(() => new Map((detail.data?.tool_calls ?? []).map((c) => [c.id, c.status])))
 const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
 </script>
 
@@ -235,6 +266,7 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
           </tfoot>
         </table>
 
+        <template v-if="!butlerOff">
         <h4 class="sub">按用户</h4>
         <el-form inline class="filters" @submit.prevent>
           <el-form-item label="日期">
@@ -264,13 +296,14 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
           <span class="muted">共 {{ users.total.value }} 人</span>
           <el-pagination v-model:current-page="users.page.value" v-model:page-size="users.size.value" :total="users.total.value" layout="prev, pager, next" />
         </div>
+        </template>
       </el-tab-pane>
 
       <!-- 对话（ops / super；其它角色不渲染） -->
       <el-tab-pane v-if="canConversations" name="conversations">
         <template #label><span data-testid="admin-butler-tab-conversations">对话</span></template>
         <p class="muted gap-b">对话是用户数据，只用于客服与排障；页面只读，不能修改或删除。</p>
-        <el-form inline class="filters" @submit.prevent="convs.reset()">
+        <el-form inline class="filters" @submit.prevent="searchConv">
           <el-form-item label="用户 ID">
             <el-input :model-value="conv.user_id" clearable style="width: 120px" data-testid="admin-butler-conv-user" @update:model-value="(v: string) => (conv.user_id = digitsOnly(v))" />
           </el-form-item>
@@ -282,7 +315,7 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
           <el-button size="small" :loading="convs.loading.value" data-testid="admin-butler-conv-retry" @click="convs.load()">重试</el-button>
         </el-alert>
         <table class="grid" v-loading="convs.loading.value">
-          <thead><tr><th>对话</th><th>用户</th><th>标题</th><th>状态</th><th>消息</th><th>输入 / 输出 token</th><th>写操作</th><th>最后消息</th></tr></thead>
+          <thead><tr><th>对话</th><th>用户</th><th>标题</th><th>状态</th><th>消息</th><th>输入 / 输出 token</th><th>写操作（含未确认）</th><th>最后消息</th></tr></thead>
           <tbody>
             <tr
               v-for="c in convs.items.value" :key="c.id" class="clickable" role="button" tabindex="0" data-testid="admin-butler-conv-row" :data-id="c.id"
@@ -319,7 +352,7 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
             <el-switch v-model="form.enabled" :disabled="!isSuper" active-text="开放" inactive-text="关闭" data-testid="admin-butler-enabled" />
           </el-form-item>
           <el-form-item label="关闭说明">
-            <el-input v-model="form.notice" type="textarea" :rows="3" maxlength="200" show-word-limit :disabled="!isSuper" placeholder="关闭时展示给用户，例如：系统维护中，预计 18:00 恢复" data-testid="admin-butler-notice" />
+            <el-input v-model="form.notice" type="textarea" :rows="3" :disabled="!isSuper" placeholder="关闭时展示给用户，例如：系统维护中，预计 18:00 恢复" data-testid="admin-butler-notice" />
           </el-form-item>
           <el-form-item label="每用户每日 token">
             <el-input :model-value="form.daily" :disabled="!isSuper" inputmode="numeric" style="width: 200px" data-testid="admin-butler-daily" @update:model-value="(v: string) => (form.daily = digitsOnly(v))" />
@@ -366,7 +399,7 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
             <template v-for="(b, i) in m.content" :key="i">
               <!-- 纯文本：插值自动转义，white-space: pre-wrap 保留换行 -->
               <div v-if="b.type === 'text'" class="text" data-testid="admin-butler-conv-text">{{ b.text }}</div>
-              <div v-else-if="b.type === 'tool'" class="step" :class="b.status" data-testid="admin-butler-conv-step">{{ stepMark(b.status) }} {{ b.label }} <span class="mono muted">{{ b.name }}</span></div>
+              <div v-else-if="b.type === 'tool'" class="step" :class="stepView(b.status, callStatus.get(b.id)).cls" data-testid="admin-butler-conv-step">{{ stepView(b.status, callStatus.get(b.id)).mark }} {{ b.label }}{{ stepView(b.status, callStatus.get(b.id)).suffix }} <span class="mono muted">{{ b.name }}</span></div>
               <details v-else-if="b.type === 'tool_result'" class="result" :class="{ suspicious: b.suspicious }">
                 <summary>
                   工具结果<span class="mono muted"> {{ b.tool_call_id }}</span>
@@ -403,7 +436,7 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
                 <div v-if="c.result_ref" class="mono">产生：{{ c.result_ref }}</div>
                 <details v-if="c.result_summary"><summary>结果摘要</summary><pre class="pre">{{ c.result_summary }}</pre></details>
                 <span v-if="!c.error_code && !c.result_ref && !c.result_summary" class="muted">—</span>
-                <div v-if="c.kind === 'write'" class="muted">审计：butler_tool_call / {{ c.id }}</div>
+                <div v-if="hasAudit(c.kind, c.status)" class="muted">审计：butler_tool_call / {{ c.id }}</div>
               </td>
             </tr>
             <tr v-if="!detail.data.tool_calls.length"><td colspan="6" class="muted empty">没有工具调用</td></tr>
@@ -447,6 +480,7 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
 .step { font-size: 13px; }
 .step.ok { color: var(--el-color-success); }
 .step.error { color: var(--el-color-danger); }
+.step.pending { color: var(--el-color-warning); }
 .result { font-size: 13px; }
 .result.suspicious { border-left: 3px solid var(--el-color-danger); padding-left: 6px; }
 .pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0 0; font-size: 12px; max-height: 240px; overflow: auto; background: var(--el-fill-color-lighter); padding: 6px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }

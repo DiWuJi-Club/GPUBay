@@ -29,6 +29,7 @@ const t = (id: string) => w!.find(`[data-testid="${id}"]`)
 afterEach(() => {
   w?.unmount()
   w = null
+  session.admin = null
 })
 
 describe('用户详情 AI 管家卡', () => {

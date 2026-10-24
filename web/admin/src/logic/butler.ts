@@ -1,4 +1,4 @@
-import { fmtDate, type ButlerSettingsInput, type LabelMap } from '@spark/shared'
+import type { ButlerSettingsInput, LabelMap } from '@spark/shared'
 
 // 后台 AI 管家页（计划 12 Task 14）的纯函数：tab 选择、默认日期、设置校验、标签。
 
@@ -25,13 +25,19 @@ export function tabOf(query: { tab?: unknown; user_id?: unknown }, canConversati
   return 'usage'
 }
 
-/** 用量默认范围：北京时间今天往前共 30 天（两端含），与后端默认一致。 */
-export function defaultUsageRange(now: Date = new Date()): { from: string; to: string } {
-  return { from: fmtDate(new Date(now.getTime() - 29 * 86_400_000)), to: fmtDate(now) }
+/**
+ * 默认日期不用浏览器时钟（e2e 用假时钟，浏览器与服务器的「今天」可能不同）：第一次请求不带日期，
+ * 由后端按服务器时钟取默认值，再把响应里的日期填回仍为空的输入框。返回是否有字段被填入。
+ */
+export function adoptRange(range: { from: string; to: string }, out: { from: string; to: string }): boolean {
+  let changed = false
+  if (!range.from && !range.to) {
+    range.from = out.from
+    range.to = out.to
+    changed = true
+  }
+  return changed
 }
-
-/** 北京时间今天 YYYY-MM-DD */
-export const todayCST = (now: Date = new Date()) => fmtDate(now)
 
 /** token 等计数加千分位 */
 export function fmtCount(n: number | null | undefined): string {
@@ -70,6 +76,15 @@ export const toolCallStatusLabel: LabelMap = {
 export const toolCallStatusType: LabelMap = {
   executed: 'success', failed: 'danger', pending: 'warning', approved: 'primary', rejected: 'info', expired: 'info',
 }
+/** 对话详情里工具步骤的显示：对应的工具调用仍待确认时显示「待确认」（后端也可能直接给 status: pending）。 */
+export function stepView(status: string, callStatus: string | undefined): { mark: string; cls: string; suffix: string } {
+  if (status === 'pending' || callStatus === 'pending') return { mark: '…', cls: 'pending', suffix: '（待确认）' }
+  return status === 'ok' ? { mark: '✓', cls: 'ok', suffix: '' } : { mark: '✗', cls: 'error', suffix: '' }
+}
+
+/** 只有真正执行过（executed / failed）的写调用才有审计 butler.tool_execute */
+export const hasAudit = (kind: string, status: string) => kind === 'write' && (status === 'executed' || status === 'failed')
+
 export const roleLabel: LabelMap = { user: '用户', assistant: '管家', tool: '工具结果' }
 
 /** 工具参数（落库的 *** 版本）格式化成多行 JSON；只做展示，不解析内容。 */
