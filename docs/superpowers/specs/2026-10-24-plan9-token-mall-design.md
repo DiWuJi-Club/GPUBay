@@ -110,6 +110,28 @@
 | T19 | 支持的端点：`POST /v1/chat/completions`、`POST /v1/completions`、`POST /v1/embeddings`（仅 `kind='embedding'` 的模型，只计输入）、`GET /v1/models`；其它 `/v1/*` 返回 404 OpenAI 格式错误 | 覆盖 OpenAI SDK 的主流用法 |
 | T20 | `/v1` 的错误体用 OpenAI 格式 `{"error":{"message","type","code"}}`，响应头 `X-Request-Id`；`/v1` 免除 `requireJSONForWrites` 与 `SameSiteGuard`（网关自己校验 `Content-Type`，Bearer 鉴权没有 CSRF 面），并开放 CORS（`*`，无凭据） | SDK 兼容；浏览器端应用可直接调用 |
 
+### 1.4 实施裁定（2026-10-24～25 实施期间代负责人作出，可推翻）
+
+| # | 裁定 | 理由 |
+|---|---|---|
+| I1 | 实施开始时计划 8 尚未合入：只摘了 `wallet.ApplyUpTo`（231613e、5dd1430）与返利流水类型常量；`llm.UserLookup` 只有 `CanRent`，用户状态 / 实名由 llm 包在 Key 查询里直接 JOIN `users` 读取。计划 7、8 合入 `main` 后已整体合并。 | 不提前引入计划 8 的大部分代码 |
+| I2 | `00022` 重建的 `wallet_ledger_kind_check` 列出 7 种（含 `referral_*`），Down 恢复计划 8 的 6 种；Up 对系统账号与池机组按唯一键 upsert（Down 保留这两行）；Down 另在仍有未结束的系统实例时拒绝 | 与 00021 前后都兼容；往返可重放 |
+| I3 | 不变量：第 4 条要求流水恰是本次结算的 `llm_pay`（`ref_id` = 结算 ID 十进制）；第 6 条「ready ⇒ 部署 running」只在 `deployment_id` 非空时核对（e2e 钩子的节点无部署），`removing` 节点允许实例已 released；第 2、5 条只在 90 天清理开始前严格成立；日桶统一为 `(created_at AT TIME ZONE 'Asia/Shanghai')::date`（`usageDaySQL`） | 与实现与测试场景一致 |
+| I4 | 系统实例：`ReleaseSystem` 直接进入 wipe（不先 Stop，`beginWipe` 会取消在途指令，与 `Release` 一致）；wiping 中的系统实例 lease 上界按普通 `WipeBuffer`；后台改派到指定机器时拒绝池内机器；`PlaceSystem` 要求机组 `purpose='llm'`，允许已停用镜像 | 防止洗机失败时占机 10 年；池机器只给平台节点 |
+| I5 | 内部应用：`PrepareInstall`（下单预装）也拒绝 internal 应用；importer 只在新建应用时写 `internal`，后台应用 API 不能改它；internal 校验在选版本之前（用户永远得到 `app_not_found`） | 防止用户经任何路径部署 `vllm-node` |
+| I6 | `vllm-node`：`TASK` 也是平台保留变量（按模型 `kind` 填 `embed/generate`）；`node_env` 不接受 secret 类变量；节点密钥经环境变量 `VLLM_API_KEY` 传给 vLLM（不进 argv）；embed 节点不加工具 / 推理解析参数；`--task embed` 绑定 25.09 镜像的 vLLM 0.10.1；`MAX_MODEL_LEN` 有默认值 32768（平台总会传） | 纵深防御；版本差异写进注释 |
+| I7 | 模型：`kind` 只在草稿时可改；`max_output_tokens` 缺省为 `min(8192, context_len)`；`node_env` 按固定的 `app_version_id`（为空则最新已发布版本）的 spec 校验；改价等不涉及节点参数的修改不重新校验目录 | 避免已上线模型类型与节点不符 |
+| I8 | Key：后台「停用」就是普通 `disabled`（用户可自行启用，彻底停用请停用账户）且总写审计；不存在的 Key 不缓存（每 IP 401 限流兜底）；缓存失效带代际计数，进程内撤销立即生效；`InvalidateUser` 在调额度、结算改变欠费 / 未结算后调用 | 30 秒缓存窗口内尽量准确 |
+| I9 | 用量：`request_id` 重复 → 整笔回滚（`ErrDuplicateUsage`，只记日志不告警）；`ok / client_abort` 之外的状态费用强制 0；账户视图费用向下取整到分、未结算向上取整 | 记账幂等；与结算口径一致 |
+| I10 | 结算：候选账户按「到期条件」本身筛选（未结算 ≥ ¥1、或有超过 10 分钟的未结算行（含 0 费用行）、或欠费且余额 > 0），避免 500 个未到期账户占满名额；每次结算后 `InvalidateUser`；标记后把 `unsettled_micro` 重算为剩余未结算行之和（自愈漂移，不一致记 Error）；纯补扣欠费且一分没扣到时回滚，不留空结算行 | 防饿死；账实一致 |
+| I11 | 限流 / 路由：TPM 估算在 `Acquire` 内夹到用户 TPM 上限；路由表只含在线模型、实例 running 且未暂停的 ready 节点；同 Key 粘滞按 (Key, 模型)；`PickAcquire` 在同一把锁内选节点并占在途 | 大请求不会永远 429；不超节点并发 |
+| I12 | 网关：首字节超时只对流式请求生效（vLLM 非流式要生成完才发响应头，非流式只受 10 分钟总超时约束）；写期限 = 总期限 + 30 秒宽限，超时记 `upstream_timeout` 不收费；拨号超时也走失败转移；CORS 预检回显请求头（兼容 OpenAI JS SDK 的 `x-stainless-*`）；节点返回 401 → 502 `upstream_error` 并丢弃缓存的节点密钥；预算预检额外扣掉本进程在 Key 缓存加载之后记下的费用 | 修正规格 §6.1 第 8 步对非流式的误伤；减少透支 |
+| I13 | Controller：排空先刷新路由表，且 `drain_since + 2 × RouterRefresh` 之后才相信「在途 0」；重建后的部署失败 / 超时回到 `unhealthy` 继续重建循环，满 3 次 `failed` + 严重告警；首次部署失败 → `failed` + 告警 `llm_node_failed`「节点部署失败，详情见后台节点页」（warning）；`Redeploy` 永久错误或部署已 removed / lost → `failed` + 严重告警；`vllm-node` 未标记 internal 时不建部署并告警；超过 2 分钟无节点引用的系统实例视为孤儿释放；后台「重建」`failed` 节点会新建节点行（模型须有缺额、同机器未被替换） | 自愈但不无限重试；崩溃恢复 |
+| I14 | 池机组：机器有非终态节点或未结束的系统实例时，移出池 / 改机组 / 分配到别的机组一律 `llm_pool_machine_busy`，校验放在 fleet 事务内（锁机器行之后，按 SQL 读 `llm_nodes`，不 import llm） | 消除并发窗口 |
+| I15 | 后台角色：`GET /llm/accounts`、`GET /llm/keys` 对 ops 与 finance 开放（规格表分别写 finance / ops）；改额度、停用 Key 仍只 ops；`GET /llm/accounts` 增加精确 `user_id` 筛选 | 两种角色都需要看账户 |
+| I16 | 前端：控制台底部导航 5 项都加图标（声明已是传递依赖的 `@element-plus/icons-vue`，不新增安装）；钱包流水类型以标签着色并支持 `?ledger=<id>` 定位；Key 到期日按所选北京日期的 23:59:59 提交；admin 与 console 各自有微分格式化函数 | 一致的导航；从结算记录跳到流水 |
+| I17 | e2e 覆盖表编号：计划 8 已占 `C-WAL-05`、`C-ACC-03`，本计划顺延（`C-WAL-06` 等） | 不冲突 |
+
 ## 2. 数据模型（迁移 `00022_llm.sql`，带 `+goose Down`）
 
 ```sql
