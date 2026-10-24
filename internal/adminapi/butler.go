@@ -259,7 +259,7 @@ func compactJSON(raw json.RawMessage) json.RawMessage {
 
 func toButlerToolCallView(c butler.ToolCall) butlerToolCallView {
 	args := compactJSON(c.Args)
-	if len(args) == 0 {
+	if len(args) == 0 || string(args) == "null" { // 模型给的参数可能是 JSON null（落库原样），前端约定为对象
 		args = json.RawMessage(`{}`)
 	}
 	result := compactJSON(c.Result)
@@ -305,18 +305,18 @@ func (s *Server) handleButlerConversations(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleButlerConversation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	ctx := r.Context()
-	row, err := s.Butler.AdminConvRowOf(ctx, id)
-	if err != nil {
-		s.writeError(w, r, err)
-		return
-	}
+	// 一次读出对话、消息与调用；头部计数由同一份数据算出，手机号另查 users
 	conv, msgs, calls, err := s.Butler.AdminConversation(ctx, id)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	// 两次读之间对话可能有新进展：头部的状态与计数以同时读出的消息 / 调用为准
-	row.Conversation, row.Messages, row.WriteCalls = conv, len(msgs), 0
+	u, err := s.Identity.GetUser(ctx, conv.UserID)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	row := butler.AdminConvRow{Conversation: conv, Phone: u.Phone, Messages: len(msgs)}
 	for _, c := range calls {
 		if c.Kind == butler.KindWrite {
 			row.WriteCalls++
@@ -345,16 +345,25 @@ type butlerUserStatsView struct {
 	WriteCalls30d int   `json:"write_calls_30d"`
 }
 
-// addButlerUserStats 给 GET /users/{id} 的响应加 butler（近 30 天）。
+// addButlerUserStats 给 GET /users/{id} 的响应加 butler（近 30 天）。两个窗口口径不同：
+//   - tokens_30d 按日汇总，取含今天在内的 30 个东八区自然日（今天 00:00 往前 29 天起）；
+//   - write_calls_30d 按精确时刻，created_at ≥ now − 30 天。
+//
+// UserButlerStats 只收一个 since（token 取 since 所在自然日起），所以查两次各取一项；对话数不受 since 影响。
 func (s *Server) addButlerUserStats(ctx context.Context, userID int64, out map[string]any) error {
 	if s.Butler == nil {
 		return nil
 	}
-	st, err := s.Butler.UserButlerStats(ctx, userID, s.Clock.Now().AddDate(0, 0, -30))
+	now := s.Clock.Now()
+	byDay, err := s.Butler.UserButlerStats(ctx, userID, tz.DayStart(now).AddDate(0, 0, -29))
 	if err != nil {
 		return err
 	}
-	out["butler"] = butlerUserStatsView{Conversations: st.Conversations, Tokens30d: st.Tokens30d, WriteCalls30d: st.WriteCalls30d}
+	exact, err := s.Butler.UserButlerStats(ctx, userID, now.AddDate(0, 0, -30))
+	if err != nil {
+		return err
+	}
+	out["butler"] = butlerUserStatsView{Conversations: exact.Conversations, Tokens30d: byDay.Tokens30d, WriteCalls30d: exact.WriteCalls30d}
 	return nil
 }
 
