@@ -51,6 +51,34 @@ type ViewBlock struct {
 	Summary    string `json:"summary,omitempty"`
 }
 
+// MarshalJSON 按块类型输出该类型的全部必有字段（空字符串也输出，前端不必判 undefined）：
+// text {type, text} / tool {type, id, name, label, status} / tool_result {type, tool_call_id, summary}。
+func (b ViewBlock) MarshalJSON() ([]byte, error) {
+	switch b.Type {
+	case BlockText:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{b.Type, b.Text})
+	case "tool":
+		return json.Marshal(struct {
+			Type   string `json:"type"`
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Label  string `json:"label"`
+			Status string `json:"status"`
+		}{b.Type, b.ID, b.Name, b.Label, b.Status})
+	case BlockToolResult:
+		return json.Marshal(struct {
+			Type       string `json:"type"`
+			ToolCallID string `json:"tool_call_id"`
+			Summary    string `json:"summary"`
+		}{b.Type, b.ToolCallID, b.Summary})
+	}
+	type plain ViewBlock
+	return json.Marshal(plain(b))
+}
+
 // MessageView 是控制台会话详情的一条消息。
 type MessageView struct {
 	ID        int64       `json:"id"`
@@ -73,6 +101,29 @@ type AdminBlock struct {
 	Summary    string `json:"summary,omitempty"`
 	Suspicious *bool  `json:"suspicious,omitempty"`
 	InstanceID string `json:"instance_id,omitempty"`
+}
+
+// MarshalJSON 同 ViewBlock：按类型输出全部必有字段；tool_result 多 ok / suspicious（nil 视为 false），context {type, instance_id}。
+func (b AdminBlock) MarshalJSON() ([]byte, error) {
+	switch b.Type {
+	case BlockText, "tool":
+		return ViewBlock{Type: b.Type, Text: b.Text, ID: b.ID, Name: b.Name, Label: b.Label, Status: b.Status}.MarshalJSON()
+	case BlockToolResult:
+		return json.Marshal(struct {
+			Type       string `json:"type"`
+			ToolCallID string `json:"tool_call_id"`
+			OK         bool   `json:"ok"`
+			Summary    string `json:"summary"`
+			Suspicious bool   `json:"suspicious"`
+		}{b.Type, b.ToolCallID, b.OK != nil && *b.OK, b.Summary, b.Suspicious != nil && *b.Suspicious})
+	case BlockContext:
+		return json.Marshal(struct {
+			Type       string `json:"type"`
+			InstanceID string `json:"instance_id"`
+		}{b.Type, b.InstanceID})
+	}
+	type plain AdminBlock
+	return json.Marshal(plain(b))
 }
 
 // AdminMessageView 是后台会话详情的一条消息（多一个 tokens）。

@@ -1,14 +1,18 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
 	"spark-cloud/internal/butler"
 	"spark-cloud/internal/platform/apperr"
@@ -114,7 +118,9 @@ func (s *Server) butlerPing() time.Duration {
 }
 
 // streamButler 以 SSE 跑完一轮（run 即 Send / Confirm）：清除本请求的读写期限（轮次最长 RunTimeout，超过服务器 WriteTimeout），
-// 期间每 ButlerPing 一条保活注释；run 在流建立前返回的错误写 JSON。run 返回后保活协程已退出，不再写 w。
+// 期间每 ButlerPing 一条保活注释；run 在流建立前返回的错误写 JSON。无论正常返回还是 panic，退出前保活协程都已停止、
+// sseWriter 已关闭，之后不会再写 w。流建立后 panic：记日志并以 http.ErrAbortHandler 中断连接（Recoverer 原样上抛），
+// 不让 Recoverer 把 500 JSON 写进事件流；流建立前 panic 照常交给 Recoverer 返回 500 JSON。
 func (s *Server) streamButler(w http.ResponseWriter, r *http.Request, run func(sink butler.Sink) error) {
 	rc := http.NewResponseController(w)
 	if err := errors.Join(rc.SetReadDeadline(time.Time{}), rc.SetWriteDeadline(time.Time{})); err != nil {
@@ -137,11 +143,33 @@ func (s *Server) streamButler(w http.ResponseWriter, r *http.Request, run func(s
 			}
 		}
 	}()
+	var once sync.Once
+	started := false
+	cleanup := func() {
+		once.Do(func() {
+			close(stop)
+			wg.Wait()
+			started = sw.close()
+		})
+	}
+	defer func() {
+		rec := recover()
+		cleanup()
+		if rec == nil {
+			return
+		}
+		if started && rec != http.ErrAbortHandler { //nolint:errorlint // 与 net/http 约定一致
+			s.Log.Error("butler: panic after stream start", "panic", fmt.Sprint(rec), "stack", string(debug.Stack()),
+				"request_id", middleware.GetReqID(r.Context()), "path", r.URL.Path)
+			panic(http.ErrAbortHandler)
+		}
+		panic(rec)
+	}()
 	err := run(sw)
-	close(stop)
-	wg.Wait()
-	started := sw.close()
+	cleanup()
 	switch {
+	case !started && err != nil && errors.Is(err, context.Canceled) && r.Context().Err() != nil:
+		// 客户端在流建立前就断开了：没有人读响应，也不是服务端错误
 	case !started && err != nil:
 		s.writeError(w, r, err)
 	case !started:

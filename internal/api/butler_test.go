@@ -628,3 +628,49 @@ func TestButlerStreamOutlivesWriteTimeout(t *testing.T) {
 		t.Fatalf("stream cut by WriteTimeout: %d %v\n%s", res.status, res.names(), res.raw)
 	}
 }
+
+// 流建立前的其它 JSON 错误：未登录 401、busy 409、轮数上限 409、确认时已关闭 503。
+func TestButlerPreStreamErrorsJSON(t *testing.T) {
+	e := newButlerEnv(t, nil)
+	anon := e.client()
+	for _, p := range []string{"/butler/conversations/new/messages", "/butler/conversations/cv-x/tool-calls/tc-x/confirm"} {
+		body := map[string]any{"text": "hi"}
+		if strings.HasSuffix(p, "/confirm") {
+			body = map[string]any{"approve": true}
+		}
+		if res := anon.stream(p, body); res.status != 401 || res.errJSON["code"] != "unauthorized" {
+			t.Fatalf("anonymous %s = %d %s", p, res.status, res.raw)
+		}
+	}
+
+	c := e.client()
+	id := c.runningInstance(t, e.testEnv, "13800001215")
+	res := c.stream("/butler/conversations/new/messages", map[string]any{"text": "你好"})
+	convID := res.first("start")["conversation_id"].(string)
+
+	e.exec(`UPDATE butler_conversations SET status = 'running', run_token = 'x' WHERE id = $1`, convID)
+	if res := c.stream("/butler/conversations/"+convID+"/messages", map[string]any{"text": "再来"}); res.status != 409 || res.errJSON["code"] != "butler_busy" {
+		t.Fatalf("busy = %d %s", res.status, res.raw)
+	}
+	e.exec(`UPDATE butler_conversations SET status = 'idle', run_token = '', user_turns = 60 WHERE id = $1`, convID)
+	if res := c.stream("/butler/conversations/"+convID+"/messages", map[string]any{"text": "再来"}); res.status != 409 || res.errJSON["code"] != "butler_turn_limit" {
+		t.Fatalf("turn limit = %d %s", res.status, res.raw)
+	}
+
+	card, convID := proposeRenew(t, e, c, id)
+	e.exec(`UPDATE butler_settings SET enabled = false, notice = '维护'`)
+	e.svc.InvalidateSettings()
+	confirm := "/butler/conversations/" + convID + "/tool-calls/" + card["id"].(string) + "/confirm"
+	if res := c.stream(confirm, map[string]any{"approve": true}); res.status != 503 || res.errJSON["code"] != "butler_disabled" || res.errJSON["message"] != "AI 管家暂未开放：维护" {
+		t.Fatalf("confirm while disabled = %d %s", res.status, res.raw)
+	}
+	if _, out := c.do("GET", "/orders", nil); len(out["items"].([]any)) != 1 {
+		t.Fatalf("disabled confirm must not execute: %v", out)
+	}
+	// 收尾：重新打开并拒绝，保持不变量检查干净
+	e.exec(`UPDATE butler_settings SET enabled = true, notice = ''`)
+	e.svc.InvalidateSettings()
+	if res := c.stream(confirm, map[string]any{"approve": false}); res.status != 200 {
+		t.Fatalf("reject = %d %s", res.status, res.raw)
+	}
+}
