@@ -76,9 +76,15 @@ export const toolCallStatusLabel: LabelMap = {
 export const toolCallStatusType: LabelMap = {
   executed: 'success', failed: 'danger', pending: 'warning', approved: 'primary', rejected: 'info', expired: 'info',
 }
-/** 对话详情里工具步骤的显示：对应的工具调用仍待确认时显示「待确认」（后端也可能直接给 status: pending）。 */
+/**
+ * 对话详情里工具步骤的显示。status 为后端块状态（ok | error | rejected | expired | pending | running），
+ * callStatus 为工具调用表里同 id 的状态（写调用才有）：待确认 / 执行中 / 已拒绝 / 已过期优先按它显示。
+ */
 export function stepView(status: string, callStatus: string | undefined): { mark: string; cls: string; suffix: string } {
   if (status === 'pending' || callStatus === 'pending') return { mark: '…', cls: 'pending', suffix: '（待确认）' }
+  if (status === 'running' || callStatus === 'approved') return { mark: '…', cls: 'pending', suffix: '（执行中）' }
+  if (status === 'rejected' || callStatus === 'rejected') return { mark: '–', cls: 'muted', suffix: '（已拒绝）' }
+  if (status === 'expired' || callStatus === 'expired') return { mark: '–', cls: 'muted', suffix: '（已过期）' }
   return status === 'ok' ? { mark: '✓', cls: 'ok', suffix: '' } : { mark: '✗', cls: 'error', suffix: '' }
 }
 

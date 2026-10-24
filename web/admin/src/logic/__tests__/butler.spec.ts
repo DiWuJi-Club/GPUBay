@@ -46,6 +46,13 @@ describe('stepView / hasAudit', () => {
     expect(stepView('ok', 'executed').mark).toBe('✓')
     expect(stepView('error', 'failed').mark).toBe('✗')
   })
+  it('拒绝 / 过期 / 执行中不显示失败', () => {
+    expect(stepView('rejected', 'rejected')).toEqual({ mark: '–', cls: 'muted', suffix: '（已拒绝）' })
+    expect(stepView('expired', undefined).suffix).toBe('（已过期）')
+    expect(stepView('pending', 'approved').cls).toBe('pending')
+    expect(stepView('running', undefined)).toEqual({ mark: '…', cls: 'pending', suffix: '（执行中）' })
+    expect(stepView('ok', 'executed').cls).toBe('ok')
+  })
   it('只有 executed / failed 的写调用有审计', () => {
     expect(hasAudit('write', 'executed')).toBe(true)
     expect(hasAudit('write', 'failed')).toBe(true)

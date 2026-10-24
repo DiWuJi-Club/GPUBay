@@ -67,6 +67,11 @@ var expectedRoutes = []struct {
 	{"POST", "/apps/{id}/versions/{vid}/publish", super}, {"POST", "/apps/{id}/versions/{vid}/prepull", ops},
 	{"GET", "/apps/{id}/versions/{vid}/script", all},
 	{"GET", "/deployments", all}, {"GET", "/deployments/{dep}", all}, {"POST", "/deployments/{dep}/force-remove", ops},
+
+	// 计划 12 D8：AI 管家设置与用量全员可看、只有 super 改设置（不需动态码）；对话内容只给 ops
+	{"GET", "/butler/settings", all}, {"PUT", "/butler/settings", super},
+	{"GET", "/butler/usage", all}, {"GET", "/butler/usage/users", all},
+	{"GET", "/butler/conversations", ops}, {"GET", "/butler/conversations/{id}", ops},
 }
 
 func roleKey(roles []admin.Role) string {

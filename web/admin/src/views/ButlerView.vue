@@ -481,6 +481,7 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
 .step.ok { color: var(--el-color-success); }
 .step.error { color: var(--el-color-danger); }
 .step.pending { color: var(--el-color-warning); }
+.step.muted { color: var(--el-text-color-secondary); }
 .result { font-size: 13px; }
 .result.suspicious { border-left: 3px solid var(--el-color-danger); padding-left: 6px; }
 .pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0 0; font-size: 12px; max-height: 240px; overflow: auto; background: var(--el-fill-color-lighter); padding: 6px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }

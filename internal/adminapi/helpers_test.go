@@ -23,6 +23,8 @@ import (
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/billing"
+	"spark-cloud/internal/butler"
+	"spark-cloud/internal/butler/llm/mock"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
@@ -70,6 +72,7 @@ type env struct {
 	gw       *agentgw.Server
 	apps     *appdeploy.Service
 	appCat   *appdeploy.Catalog
+	butler   *butler.Service // 计划 12：后台只读查询与设置；不跑对话轮次（不配工具）
 }
 
 func newEnv(t *testing.T) *env { return newEnvWith(t, nil) }
@@ -116,8 +119,10 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	appCat := appdeploy.NewCatalog(pool, clk, f, c, log)
 	apps := appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
 		PortURL: portURL})
+	bt := butler.NewService(butler.Deps{Pool: pool, Clock: clk, Log: log, Provider: mock.New(), Box: box})
 	srv := &adminapi.Server{Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: b,
-		Uploads: uploads, Gateway: gw, Referral: ref, Clock: clk, Log: log, Apps: apps, AppCatalog: appCat, PortURL: portURL}
+		Uploads: uploads, Gateway: gw, Referral: ref, Clock: clk, Log: log, Apps: apps, AppCatalog: appCat, PortURL: portURL,
+		Butler: bt}
 	if tweak != nil {
 		tweak(srv)
 	}
@@ -125,7 +130,7 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	t.Cleanup(ts.Close)
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, srv: srv, ts: ts, admins: admins, identity: ids,
 		wallet: w, catalog: c, fleet: f, rental: r, billing: b, uploads: uploads, pdu: pduMock, pay: payMock, gw: gw,
-		apps: apps, appCat: appCat}
+		apps: apps, appCat: appCat, butler: bt}
 }
 
 type client struct {

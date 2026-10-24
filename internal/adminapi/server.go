@@ -18,6 +18,7 @@ import (
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/billing"
+	"spark-cloud/internal/butler"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
@@ -74,6 +75,12 @@ type Server struct {
 	PortURL       func(instanceID string, port int) string // Web 入口端口地址（app 传 ingress.Auth.PortURL）；nil 时 url 为空
 	PublicBaseURL string                                   // 后台对外地址（SPARK_ADMIN_PUBLIC_BASE_URL），用于同站防护的 Origin 比对；空表示有 Origin 就拒绝
 
+	// 计划 12：AI 管家（butlerRoutes、用户详情 butler 区块、仪表盘今日三个数字）；nil 表示平台未启用管家，相关路由与字段都不出现
+	Butler *butler.Service
+	// 估算费用的模型单价（分 / 百万 token，来自 SPARK_LLM_PRICE_*_CENTS_PER_M）；0 表示不估算（cost_cents 恒为 0）
+	LLMPriceInCentsPerM  int
+	LLMPriceOutCentsPerM int
+
 	limiter *ipLimiter
 	routes  []Route
 }
@@ -124,6 +131,7 @@ func (s *Server) Router() http.Handler {
 			s.referralRoutes(g)
 			s.catalogRoutes(g)
 			s.appRoutes(g)
+			s.butlerRoutes(g)
 		})
 	})
 	static := s.Static

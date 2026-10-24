@@ -164,8 +164,8 @@ export interface AdminButlerConversation {
 /** 后台对话详情的消息块：控制台前端块 + context 块 + tool_result 的可疑标记 */
 export type AdminButlerBlock =
   | { type: 'text'; text: string }
-  /** pending：对应的写调用仍待确认 */
-  | { type: 'tool'; id: string; name: string; label: string; status: 'ok' | 'error' | 'pending' }
+  /** 状态同控制台（ButlerStepStatus）：写调用按工具调用表（pending 待确认 / rejected / expired），读调用按结果，尚无结果且对话 running → running */
+  | { type: 'tool'; id: string; name: string; label: string; status: ButlerStepStatus }
   | { type: 'tool_result'; tool_call_id: string; ok: boolean; summary: string; suspicious: boolean }
   | { type: 'context'; instance_id: string }
 
