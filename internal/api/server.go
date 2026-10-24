@@ -17,6 +17,7 @@ import (
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
+	"spark-cloud/internal/llm"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/httpx"
@@ -54,6 +55,11 @@ type Server struct {
 	// 计划 7：应用部署；nil 时不注册 /apps* 与 /instances/{id}/apps*，实例视图的 apps_summary 恒为空数组
 	Apps      *appdeploy.Service
 	AppsLimit int // 应用部署类写操作每用户每小时上限；零值 appdeploy.UserOpsPerHour（60）
+	// 计划 9：Token 商城。LLM 为 nil 时不注册 /llm/*（/me 也不带 llm_month_cost）；
+	// LLMGateway 为 nil 时不挂载 /v1（OpenAI 兼容网关，llmgw.Server.Router()），/v1/* 返回 JSON 404。
+	LLM        *llm.Service
+	LLMGateway http.Handler
+	LLMBaseURL string // 控制台展示的网关地址；空 = PublicBaseURL + "/v1"
 
 	authorizeLim *userLimiter
 	calendarLim  *ipLimiter
@@ -99,19 +105,25 @@ func (s *Server) Router() http.Handler {
 	if s.TrustProxy {
 		r.Use(httpx.ProxyRealIP(s.TrustedProxyHops)) // 与租户入口同一套取法；不看 X-Real-IP / True-Client-IP
 	}
+	// /v1 网关（Bearer 鉴权、无 Cookie，没有 CSRF 面）免同站防护与 JSON 要求，Content-Type 由网关自己校验（规格 T20）。
 	r.Use(httpx.Recoverer(s.Log), s.requireJSONForWrites,
-		httpx.SameSiteGuard(s.PublicBaseURL, func(req *http.Request) bool { return strings.HasPrefix(req.URL.Path, notifyPathPrefix) }, s.Log))
+		httpx.SameSiteGuard(s.PublicBaseURL, func(req *http.Request) bool {
+			return strings.HasPrefix(req.URL.Path, notifyPathPrefix) || isGatewayPath(req.URL.Path)
+		}, s.Log))
 	static := s.Static
 	if static == nil {
 		static = web.Console()
 	}
 	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
-		if strings.HasPrefix(req.URL.Path, "/api/") {
-			s.writeError(w, req, apperr.ErrNotFound) // 未知 API 路径返回 JSON 404，不回退页面
+		if strings.HasPrefix(req.URL.Path, "/api/") || isGatewayPath(req.URL.Path) {
+			s.writeError(w, req, apperr.ErrNotFound) // 未知 API 路径（含未挂载的 /v1）返回 JSON 404，不回退页面
 			return
 		}
 		static.ServeHTTP(w, req)
 	})
+	if s.LLMGateway != nil {
+		r.Mount("/v1", s.LLMGateway) // 在 /api/v1 之外；不加超时中间件（流式响应的写期限由网关自己延长）
+	}
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/sms-code", s.handleSendCode)
 		r.Post("/auth/login", s.handleLogin)
@@ -129,6 +141,9 @@ func (s *Server) Router() http.Handler {
 			if s.Apps != nil {
 				r.Get("/apps", s.handleAppCatalog)
 				r.Get("/apps/{slug}", s.handleAppCatalogItem)
+			}
+			if s.LLM != nil {
+				r.Get("/llm/models", s.handleLLMModels)
 			}
 		})
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
@@ -190,6 +205,16 @@ func (s *Server) Router() http.Handler {
 				r.Get("/referral/invitees", s.handleReferralInvitees)
 				r.Get("/referral/rewards", s.handleReferralRewards)
 			}
+			if s.LLM != nil {
+				r.Get("/llm/account", s.handleLLMAccount)
+				r.Get("/llm/keys", s.handleLLMKeys)
+				r.Post("/llm/keys", s.handleLLMCreateKey)
+				r.Put("/llm/keys/{id}", s.handleLLMUpdateKey)
+				r.Delete("/llm/keys/{id}", s.handleLLMRevokeKey)
+				r.Get("/llm/usage", s.handleLLMUsage)
+				r.Get("/llm/usage/daily", s.handleLLMDaily)
+				r.Get("/llm/settlements", s.handleLLMSettlements)
+			}
 			if s.DevPay {
 				r.Post("/dev/recharges/{id}/pay", s.handleDevPay)
 			}
@@ -206,7 +231,7 @@ func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, notifyPathPrefix) { // 支付回调的格式由渠道决定，由插件自行验签解析
+		if strings.HasPrefix(r.URL.Path, notifyPathPrefix) || isGatewayPath(r.URL.Path) { // 支付回调的格式由渠道决定，由插件自行验签解析；/v1 由网关回 OpenAI 格式错误
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -221,6 +246,9 @@ func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// isGatewayPath /v1 与 /v1/*（OpenAI 兼容网关）；/v1x 之类不算。
+func isGatewayPath(p string) bool { return p == "/v1" || strings.HasPrefix(p, "/v1/") }
 
 func (s *Server) requireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
