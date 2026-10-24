@@ -5,8 +5,9 @@ import {
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api'
-import { deploymentHealthLabel } from '../../logic/deployments'
+import { deploymentHealthLabel, firstOf } from '../../logic/deployments'
 import { canDrainNode, canRebuildNode, canRemoveNode, NODES_REFRESH_MS, nodeDeployText, poolLeaseText, validateNodeRemoveReason } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'
 import { OPS_ROLES } from '../../menu'
@@ -99,6 +100,23 @@ const drawerRef = ref<InstanceType<typeof NodeDrawer> | null>(null)
 const openNode = (id: string) => {
   drawerId.value = id
 }
+// ?node=<id>：直接打开该节点的抽屉（机器详情的节点链接）；关闭抽屉时去掉参数
+const route = useRoute()
+const router = useRouter()
+watch(
+  () => route.query.node,
+  (q) => {
+    const id = firstOf(q)
+    if (id && id !== drawerId.value) drawerId.value = id
+  },
+  { immediate: true },
+)
+function closeNode() {
+  drawerId.value = null
+  if (route.query.node) void router.replace({ path: route.path, query: { ...route.query, node: undefined } })
+}
+/** 机器上有未结束的节点：移出会被后端拒绝（llm_pool_machine_busy），按钮先禁用 */
+const nodeLive = (m: LLMPoolMachine) => !!m.node && m.node.state !== 'removed' && m.node.state !== 'failed'
 
 // ---- 机器池：加入 / 移出 ----
 const addVisible = ref(false)
@@ -198,7 +216,12 @@ const healthText = (n: LLMNode) => (n.deployment ? labelOf(deploymentHealthLabel
             <span v-else class="muted">—</span>
           </td>
           <td data-testid="llm-pool-lease">{{ poolLeaseText(m) }}</td>
-          <td v-if="canOperate"><el-button size="small" data-testid="llm-pool-remove" @click="openUnassign(m)">移出</el-button></td>
+          <td v-if="canOperate">
+            <el-tooltip :disabled="!nodeLive(m)" content="机器上有运行中的节点，请先移除节点" placement="top">
+              <!-- 包一层 span：禁用的按钮不触发鼠标事件，提示挂在外层 -->
+              <span><el-button size="small" :disabled="nodeLive(m)" data-testid="llm-pool-remove" @click="openUnassign(m)">移出</el-button></span>
+            </el-tooltip>
+          </td>
         </tr>
         <tr v-if="pool && !pool.machines.length"><td :colspan="canOperate ? 7 : 6" class="muted empty" data-testid="llm-pool-empty">池里还没有机器，点「加入机器」</td></tr>
       </tbody>
@@ -246,7 +269,7 @@ const healthText = (n: LLMNode) => (n.deployment ? labelOf(deploymentHealthLabel
     </table>
 
     <AddPoolMachineDialog v-if="pool" v-model:visible="addVisible" :group-id="pool.group_id" @done="onAdded" />
-    <NodeDrawer ref="drawerRef" :node-id="drawerId" @close="drawerId = null" />
+    <NodeDrawer ref="drawerRef" :node-id="drawerId" @close="closeNode" />
 
     <el-dialog v-model="unassign.visible" title="移出 Token 服务池" width="440" align-center data-testid="llm-pool-remove-dialog">
       <p v-if="unassign.target">将把「{{ machineName(unassign.target.machine) }}」移出 Token 服务池，移出后变为未分组机器、恢复对外出租。机器上有运行中的节点时会被拒绝。</p>

@@ -34,7 +34,7 @@ async function load(quiet = false) {
   const id = props.nodeId
   if (!id) return
   const mine = ++seq
-  st.loading = true
+  if (!quiet) st.loading = true // 自动刷新不转圈
   try {
     const d = await api.get<LLMNodeDetail>(`/llm/nodes/${encodeURIComponent(id)}`)
     if (mine !== seq) return

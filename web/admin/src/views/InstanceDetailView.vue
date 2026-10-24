@@ -266,9 +266,9 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
           <el-descriptions-item label="机器"><span data-testid="adetail-machine"><IdLink kind="machine" :id="inst.machine_id" :disabled="isFinance" /></span></el-descriptions-item>
           <el-descriptions-item label="商品"><span data-testid="adetail-product">{{ productName }}</span></el-descriptions-item>
           <el-descriptions-item label="镜像"><span data-testid="adetail-image">{{ imageName }}</span></el-descriptions-item>
-          <el-descriptions-item label="剩余时长"><span data-testid="adetail-remaining" :data-remaining="inst.remaining_seconds">{{ inst.state === 'running' ? fmtDuration(inst.remaining_seconds) : '—' }}</span></el-descriptions-item>
+          <el-descriptions-item label="剩余时长"><span data-testid="adetail-remaining" :data-remaining="inst.remaining_seconds">{{ inst.system ? '不计时' : inst.state === 'running' ? fmtDuration(inst.remaining_seconds) : '—' }}</span></el-descriptions-item>
           <el-descriptions-item label="待开始"><span data-testid="adetail-pending">{{ inst.pending_seconds > 0 ? fmtDuration(inst.pending_seconds) : '—' }}</span></el-descriptions-item>
-          <el-descriptions-item label="到期时间"><span data-testid="adetail-expires">{{ fmtTime(inst.expires_at) || '—' }}</span></el-descriptions-item>
+          <el-descriptions-item label="到期时间"><span data-testid="adetail-expires">{{ inst.system ? '不计时' : fmtTime(inst.expires_at) || '—' }}</span></el-descriptions-item>
           <el-descriptions-item label="停机时间">{{ fmtTime(inst.stopped_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ fmtTime(inst.created_at) }}</el-descriptions-item>
           <el-descriptions-item v-if="inst.scheduled_start_at" label="预订开始"><span key="start" data-testid="adetail-start">{{ fmtTime(inst.scheduled_start_at) }} ～ {{ fmtTime(inst.scheduled_end_at) }}</span></el-descriptions-item>
@@ -332,7 +332,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
 
       <el-card data-testid="admin-instance-apps">
         <template #header>
-          <div class="head"><span>应用</span><router-link :to="{ path: '/deployments', query: { instance_id: inst.id } }" data-testid="admin-instance-apps-all">在部署列表中查看</router-link></div>
+          <div class="head"><span>应用<span v-if="inst.system" class="muted tag-gap" data-testid="admin-instance-apps-system-hint">平台节点的部署由 Token 商城管理，请在「节点与机器池」里排空 / 重建 / 移除节点</span></span><router-link :to="{ path: '/deployments', query: { instance_id: inst.id } }" data-testid="admin-instance-apps-all">在部署列表中查看</router-link></div>
         </template>
         <table class="grid">
           <thead><tr><th>应用 / 版本</th><th>状态</th><th>进度 / 错误</th><th>端口</th><th>更新时间</th><th>操作</th></tr></thead>
@@ -348,7 +348,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
               <td>{{ fmtTime(a.updated_at) }}</td>
               <td>
                 <router-link :to="{ path: '/deployments', query: { instance_id: inst.id, dep: a.id } }" data-testid="admin-instance-app-detail">详情</router-link>
-                <el-button v-if="showForceRemove(role, a.state)" size="small" type="danger" plain class="tag-gap" data-testid="admin-instance-app-force-remove" @click="removingApp = a">强制卸载</el-button>
+                <el-button v-if="!inst.system && showForceRemove(role, a.state)" size="small" type="danger" plain class="tag-gap" data-testid="admin-instance-app-force-remove" @click="removingApp = a">强制卸载</el-button>
               </td>
             </tr>
             <tr v-if="!apps.length"><td colspan="6" class="muted empty" data-testid="admin-instance-apps-empty">无应用部署</td></tr>

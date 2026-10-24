@@ -2,7 +2,7 @@ import { ApiError, type Admin, type LLMNode, type LLMPool, type Machine, type Ro
 import { flushPromises, mount } from '@vue/test-utils'
 import ElementPlus, { ElMessage } from 'element-plus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMemoryHistory, createRouter } from 'vue-router'
+import { createMemoryHistory, createRouter, type Router } from 'vue-router'
 
 const { get, post, put, del } = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), put: vi.fn(), del: vi.fn() }))
 vi.mock('../../api', () => ({ api: { get, post, put, del }, onUnauthorized: vi.fn(), onTotpSetupRequired: vi.fn() }))
@@ -34,9 +34,10 @@ function login(role: Role) {
   session.status = 'authed'
   session.admin = { id: 1, username: 'a', role, status: 'active', totp_confirmed: true, last_login_at: null, last_login_ip: '', created_at: '' } as Admin
 }
-async function mountTab(active = true) {
-  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:p(.*)*', component: { template: '<div />' } }] })
-  await router.push('/llm')
+let router: Router
+async function mountTab(active = true, url = '/llm') {
+  router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:p(.*)*', component: { template: '<div />' } }] })
+  await router.push(url)
   wrapper = mount(NodesTab, { props: { active }, global: { plugins: [router, ElementPlus] }, attachTo: document.body })
   await flushPromises()
 }
@@ -117,12 +118,20 @@ describe('NodesTab 机器池', () => {
     await click(inBody('llm-pool-remove-ok'))
     expect(del).toHaveBeenCalledWith('/groups/9/machines', { machine_ids: [12] })
 
+    // 前端看不到的节点（并发刚建）：后端 409 文案原样提示
     del.mockRejectedValueOnce(new ApiError(409, 'llm_pool_machine_busy', '机器上有运行中的节点，请先下线'))
-    await allById('llm-pool-remove')[0].trigger('click')
+    await allById('llm-pool-remove')[1].trigger('click')
     await flushPromises()
     await click(inBody('llm-pool-remove-ok'))
-    expect(del).toHaveBeenLastCalledWith('/groups/9/machines', { machine_ids: [11] })
+    expect(del).toHaveBeenCalledTimes(2)
     expect(err).toHaveBeenCalledWith('机器上有运行中的节点，请先下线')
+  })
+
+  it('机器上有未结束的节点：「移出」禁用', async () => {
+    await mountTab()
+    const btns = allById('llm-pool-remove')
+    expect(btns[0].attributes('disabled')).toBeDefined() // 节点 ready
+    expect(btns[1].attributes('disabled')).toBeUndefined() // 没有节点
   })
 })
 
@@ -190,6 +199,15 @@ describe('NodesTab 节点', () => {
     expect(inBody('llm-node-deployment-log')!.textContent).toBe('ok')
   })
 
+  it('?node=<id> 直接打开抽屉；关闭后去掉参数', async () => {
+    await mountTab(true, '/llm?tab=nodes&node=n2')
+    expect(get).toHaveBeenCalledWith('/llm/nodes/n2')
+    expect(inBody('llm-node-drawer')).not.toBeNull()
+    ;(wrapper!.findComponent({ name: 'NodeDrawer' }).vm as unknown as { $emit: (e: string) => void }).$emit('close')
+    await flushPromises()
+    expect(router.currentRoute.value.query).toEqual({ tab: 'nodes' })
+  })
+
   it('finance（无运维权限）不显示加入 / 移出 / 行操作', async () => {
     login('finance')
     await mountTab()
@@ -234,6 +252,42 @@ describe('NodesTab 自动刷新', () => {
     wrapper = undefined
     await vi.advanceTimersByTimeAsync(30_000)
     expect(calls(get, '/llm/pool')).toHaveLength(5)
+  })
+
+  it('上一轮还没返回时跳过本轮，不叠加请求', async () => {
+    vi.useFakeTimers()
+    await mountTab(true)
+    expect(calls(get, '/llm/pool')).toHaveLength(1)
+    const base = get.getMockImplementation()!
+    get.mockImplementation((path: string, q?: Record<string, unknown>) => (path === '/llm/pool' ? new Promise(() => {}) : base(path, q)))
+    await vi.advanceTimersByTimeAsync(10_000) // 第 2 次请求挂起
+    await vi.advanceTimersByTimeAsync(20_000) // 后两轮都跳过
+    expect(calls(get, '/llm/pool')).toHaveLength(2)
+  })
+
+  it('抽屉打开时随定时刷新静默重载：不弹提示、不转圈', async () => {
+    vi.useFakeTimers()
+    const err = vi.spyOn(ElMessage, 'error')
+    await mountTab(true)
+    await allById('llm-node-open')[0].trigger('click')
+    await flushPromises()
+    expect(calls(get, '/llm/nodes/n1')).toHaveLength(1)
+    const base = get.getMockImplementation()!
+    let release: () => void = () => {}
+    get.mockImplementation((path: string, q?: Record<string, unknown>) => {
+      if (path !== '/llm/nodes/n1') return base(path, q)
+      return new Promise((_, reject) => {
+        release = () => reject(new ApiError(500, 'internal', '服务器错误'))
+      })
+    })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(calls(get, '/llm/nodes/n1')).toHaveLength(2)
+    const refresh = inBody('llm-node-refresh')!
+    expect(refresh.classList.contains('is-loading')).toBe(false) // 静默刷新不转圈
+    release()
+    await flushPromises()
+    expect(err).not.toHaveBeenCalled()
+    expect(inBody('llm-node-model')!.textContent).toBe('qwen3-32b') // 失败保留已显示的数据
   })
 
   it('不可见时挂载不加载、不计时', async () => {

@@ -46,6 +46,7 @@ declare module 'vue' {
     ElTag: typeof import('element-plus/es')['ElTag']
     ElTimeline: typeof import('element-plus/es')['ElTimeline']
     ElTimelineItem: typeof import('element-plus/es')['ElTimelineItem']
+    ElTooltip: typeof import('element-plus/es')['ElTooltip']
     FinancePage: typeof import('./components/FinancePage.vue')['default']
     ForceRemoveDialog: typeof import('./components/ForceRemoveDialog.vue')['default']
     IdLink: typeof import('./components/IdLink.vue')['default']
