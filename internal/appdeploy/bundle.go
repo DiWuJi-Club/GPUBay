@@ -22,6 +22,14 @@ type BundleInput struct {
 	ImageEnv []EnvKV
 }
 
+// BundleFile 是部署包里由调用方追加的额外文件（如 comfywf 生成的 workflows/manifest.json 与 workflows/<slug>.json）。
+// Name 为包内相对路径，Mode 为 tar 里的权限位（如 0o644），Body 为文件内容。
+type BundleFile struct {
+	Name string
+	Mode int64
+	Body []byte
+}
+
 func AppDir(appRoot, slug string) string { return path.Join(appRoot, AppDirName, slug) }
 
 // ReservedEnv 平台注入的保留变量（顺序固定，写在用户变量之前）。
