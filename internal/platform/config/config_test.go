@@ -422,6 +422,45 @@ func TestLoadAppDefaultsAndValues(t *testing.T) {
 	}
 }
 
+func TestLoadLLMSwitches(t *testing.T) {
+	base := func(kv ...string) map[string]string {
+		m := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	c, err := config.Load(env(base()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.LLMGateway || !c.LLMController {
+		t.Fatalf("llm defaults = gateway %v controller %v, want both on", c.LLMGateway, c.LLMController)
+	}
+	for _, tc := range []struct {
+		gw, ctl         string
+		wantGW, wantCtl bool
+	}{{"off", "on", false, true}, {"on", "off", true, false}, {"off", "off", false, false}, {"on", "on", true, true}} {
+		c, err := config.Load(env(base("SPARK_LLM_GATEWAY", tc.gw, "SPARK_LLM_CONTROLLER", tc.ctl)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.LLMGateway != tc.wantGW || c.LLMController != tc.wantCtl {
+			t.Fatalf("gateway=%s controller=%s → %v %v", tc.gw, tc.ctl, c.LLMGateway, c.LLMController)
+		}
+	}
+	for _, bad := range []map[string]string{
+		base("SPARK_LLM_GATEWAY", "true"),
+		base("SPARK_LLM_GATEWAY", "OFF"),
+		base("SPARK_LLM_CONTROLLER", "1"),
+		base("SPARK_LLM_CONTROLLER", "disabled"),
+	} {
+		if _, err := config.Load(env(bad)); err == nil || !strings.Contains(err.Error(), "SPARK_LLM_") {
+			t.Fatalf("%v: err = %v, want SPARK_LLM_* error", bad, err)
+		}
+	}
+}
+
 // 计划 11：SPARK_APP_GIT_MIRROR 默认 https://gh-proxy.com/；off = 直连（空）；非空须 https:// 开头、/ 结尾。
 func TestLoadAppGitMirror(t *testing.T) {
 	base := func(kv ...string) map[string]string {

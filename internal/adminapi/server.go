@@ -22,6 +22,7 @@ import (
 	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/llm"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/httpx"
@@ -67,6 +68,7 @@ type Server struct {
 	Referral      *referral.Service  // 计划 8：邀请返利（referralRoutes、用户详情 referral 区块、仪表盘本月返利净额）
 	Apps          *appdeploy.Service // 应用部署（计划 7）：部署列表 / 详情 / 强制卸载、实例详情与仪表盘
 	AppCatalog    *appdeploy.Catalog // 应用目录（计划 7）：应用、版本、发布、预拉取、覆盖率
+	LLM           *llm.Service       // Token 商城（计划 9）；nil 时不注册 /llm/*，仪表盘 / 用户详情不带 llm 字段（池机器移出的节点检查在 fleet 的机组事务里）
 	Workflows     *comfywf.Catalog   // ComfyUI 工作流目录（计划 11）：工作流、版本、发布、封面、安装列表、仪表盘数字
 	Installer     *comfywf.Installer // 工作流安装（计划 11）：部署详情里的工作流集合
 	Clock         clock.Clock
@@ -92,7 +94,9 @@ var (
 	allRoles     = []admin.Role{admin.RoleSuper, admin.RoleOps, admin.RoleFinance}
 	opsRoles     = []admin.Role{admin.RoleSuper, admin.RoleOps}
 	financeRoles = []admin.Role{admin.RoleSuper, admin.RoleFinance}
-	superOnly    = []admin.Role{admin.RoleSuper}
+	// opsFinanceRoles 只读的运营 + 财务视图（计划 9：Token 商城账户与 Key 列表）
+	opsFinanceRoles = []admin.Role{admin.RoleSuper, admin.RoleOps, admin.RoleFinance}
+	superOnly       = []admin.Role{admin.RoleSuper}
 )
 
 func (s *Server) Router() http.Handler {
@@ -127,6 +131,9 @@ func (s *Server) Router() http.Handler {
 			s.referralRoutes(g)
 			s.catalogRoutes(g)
 			s.appRoutes(g)
+			if s.LLM != nil {
+				s.llmRoutes(g)
+			}
 			if s.Workflows != nil { // 计划 11：没接工作流目录时不注册这些路由（404），仪表盘的工作流数字为 0
 				s.workflowRoutes(g)
 			}

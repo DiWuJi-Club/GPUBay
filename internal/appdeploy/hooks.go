@@ -177,11 +177,12 @@ func dedupeRefs(refs []WorkflowRef) []WorkflowRef {
 	return out
 }
 
-// PrepareInstall 下单预装校验：published 应用的最新 published 版本、镜像兼容、变量；workflowIDs 非空时（计划 11）
+// PrepareInstall 下单预装校验：published 的非内部应用的最新 published 版本、镜像兼容、变量；workflowIDs 非空时（计划 11）
 // 应用须是 comfyui、版本须支持工作流且接了 Deps.ResolveWorkflows（否则 workflow_app_unsupported），由它解析出集合。错误都是 4xx 的 apperr
 // （app_not_found / app_unavailable / app_image_mismatch / app_env_* / workflow_*），rental 在扣款前整单失败。
 func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, imageID int64, env map[string]string, workflowIDs []int64) (rental.InstallPlan, error) {
-	app, ver, err := s.resolveVersion(ctx, q, appID, nil)
+	// 内部应用不能随下单预装（系统实例由 llm.Controller 直接 Create）
+	app, ver, err := s.resolveVersion(ctx, q, appID, nil, false)
 	if err != nil {
 		return nil, err
 	}

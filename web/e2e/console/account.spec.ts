@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test'
 import { loginConsole, nav, placeOrder, seedUser, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { yuan } from '../helpers/money'
+import { callChat, cleanupLLM, createKey, createPoolMachineAndNode, seedLLMModel, waitGatewayModel } from '../helpers/llm'
 import { DAY, inviteeOf, inviterWithCode } from '../helpers/referral'
 
 test('C-ACC-01 我的页显示手机号、实名状态链接与退出', async ({ page }, info) => {
@@ -43,4 +44,30 @@ test('C-ACC-03 我的页「邀请返利」入口与本月金额', async ({ page 
   await hooks.sweep()
   await page.reload()
   await expect(page.getByTestId('account-invite-month')).toHaveText(`本月返利 ${yuan(690)}`)
+})
+
+test('C-ACC-04 我的页「Token 商城」入口与本月消费（含未结算）', async ({ page }, info) => {
+  try {
+    const u = await seedUser()
+    const api = await userApi(u.phone)
+    await loginConsole(page, u.phone)
+    await nav(page, info, 'account')
+    await expect(page.getByTestId('account-tokens')).toHaveAttribute('href', '/tokens')
+    await expect(page.getByTestId('account-tokens-month')).toHaveCount(0) // 本月没有消费：不显示金额
+    const m = await seedLLMModel({ input_price: 500_000, output_price: 1_000_000 }) // ¥1.00 一次
+    await createPoolMachineAndNode(m)
+    const k = await createKey(api)
+    await waitGatewayModel(k.key, m.slug)
+    expect((await callChat(k.key, m.slug)).status).toBe(200) // 未结算也计入本月
+    await page.reload()
+    await expect(page.getByTestId('account-tokens-month')).toHaveText(`本月 ${yuan(100)}`)
+    await hooks.sweep() // 结算后口径不变
+    expect((await callChat(k.key, m.slug)).status).toBe(200)
+    await page.reload()
+    await expect(page.getByTestId('account-tokens-month')).toHaveText(`本月 ${yuan(200)}`)
+    await page.getByTestId('account-tokens').click()
+    await expect(page).toHaveURL(/\/tokens$/)
+  } finally {
+    await cleanupLLM()
+  }
 })

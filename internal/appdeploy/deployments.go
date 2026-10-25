@@ -124,9 +124,10 @@ func (s *Service) pickVersion(ctx context.Context, q db.Querier, appID int64, ve
 }
 
 // resolveVersion 新建部署用：应用须已上架（published），版本见 pickVersion。
-func (s *Service) resolveVersion(ctx context.Context, q db.Querier, appID int64, versionID *int64) (App, Version, error) {
+// allowInternal 为 false 时内部应用按不存在处理（先于版本解析判断：没有已发布版本的内部应用也是 app_not_found，不是 app_unavailable）。
+func (s *Service) resolveVersion(ctx context.Context, q db.Querier, appID int64, versionID *int64, allowInternal bool) (App, Version, error) {
 	app, err := scanApp(q.QueryRow(ctx, `SELECT `+appCols+` FROM apps WHERE id = $1 AND status = 'published'`, appID))
-	if errors.Is(err, apperr.ErrNotFound) {
+	if errors.Is(err, apperr.ErrNotFound) || (err == nil && app.Internal && !allowInternal) {
 		return App{}, Version{}, apperr.ErrAppNotFound
 	}
 	if err != nil {

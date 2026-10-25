@@ -31,7 +31,7 @@ export async function loginConsoleAt(page: Page, origin: string, phone: string, 
   await expect(page).toHaveURL(new RegExp(`${expectPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\?|$)`))
 }
 
-export type ConsoleTab = 'market' | 'instances' | 'wallet' | 'account'
+export type ConsoleTab = 'market' | 'instances' | 'wallet' | 'account' | 'tokens'
 
 /** 电脑点侧边菜单，手机点底部标签。 */
 export async function nav(page: Page, info: TestInfo, tab: ConsoleTab) {

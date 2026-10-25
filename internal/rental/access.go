@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"spark-cloud/internal/access/upstream"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
@@ -174,6 +175,22 @@ func (s *Service) Access(ctx context.Context, instanceID string) (AccessInfo, er
 		info.RetainUntil = &t
 	}
 	return info, nil
+}
+
+// UpstreamTarget 实例的拨号目标（机器 lan_ip、容器主机公钥），供 LLM 网关 / 探测经 upstream.Pool 拨号；
+// 与 ingress 路由表、appdeploy 的 readTarget 取同样的列；端口同 InstanceSSHPort（计划 10 按实例端口）。
+// 不看状态（调用方自己判断能否拨）；实例不存在 → ErrNotFound。
+func (s *Service) UpstreamTarget(ctx context.Context, instanceID string) (upstream.Target, error) {
+	t := upstream.Target{InstanceID: instanceID, Port: s.InstanceSSHPort(instanceID)}
+	err := s.d.Pool.QueryRow(ctx, `SELECT m.lan_ip, i.ssh_host_pubkey FROM instances i JOIN machines m ON m.id = i.machine_id WHERE i.id = $1`, instanceID).
+		Scan(&t.LanIP, &t.HostPubkey)
+	if db.IsNoRows(err) {
+		return upstream.Target{}, apperr.ErrNotFound
+	}
+	if err != nil {
+		return upstream.Target{}, err
+	}
+	return t, nil
 }
 
 // SessionState 是 SSH 网关周期扫描所需的实例状态（不含密码等需解密的字段）。

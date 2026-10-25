@@ -5,19 +5,24 @@ import { runningInstance } from '../helpers/instances'
 /** Element Plus 打开对话框时外层包装有 dialog-fade-in 动画（translateY -20px），几何断言前等页面上所有动画结束（被取消的动画也算结束）。 */
 const settled = (l: Locator) => l.evaluate(() => Promise.allSettled(document.getAnimations().map((a) => a.finished)).then(() => undefined))
 
-test('C-NAV-01 响应式布局：电脑侧边菜单、手机底部五个标签', async ({ page }, info) => {
+test('C-NAV-01 响应式布局：电脑侧边菜单、手机底部六个标签（含工作流市场、Token 商城）', async ({ page }, info) => {
   const u = await seedUser()
   await loginConsole(page, u.phone)
-  const tabs = ['market', 'workflows', 'instances', 'wallet', 'account']
+  const tabs = ['market', 'workflows', 'instances', 'wallet', 'account', 'tokens']
   if (isMobile(info)) {
     await expect(page.getByTestId('layout-tabbar')).toBeVisible()
     for (const t of tabs) await expect(page.getByTestId(`tabbar-${t}`)).toBeVisible()
+    await expect(page.getByTestId('layout-tabbar').locator('a')).toHaveCount(6)
+    await expect(page.getByTestId('tabbar-tokens')).toContainText('Token')
+    await expect(page.getByTestId('tabbar-workflows')).toContainText('工作流')
     await expect(page.getByTestId('layout-side')).toHaveCount(0)
     const box = await page.getByTestId('tabbar-wallet').boundingBox()
     expect(box?.height ?? 0).toBeGreaterThanOrEqual(44)
   } else {
     await expect(page.getByTestId('layout-side')).toBeVisible()
     for (const t of tabs) await expect(page.getByTestId(`menu-${t}`)).toBeVisible()
+    await expect(page.getByTestId('menu-tokens')).toContainText('Token 商城')
+    await expect(page.getByTestId('menu-tokens')).toHaveAttribute('href', '/tokens')
     await expect(page.getByTestId('layout-tabbar')).toHaveCount(0)
     await expect(page.getByTestId('layout-help')).toBeVisible()
   }

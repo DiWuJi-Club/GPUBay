@@ -11,7 +11,7 @@ import (
 )
 
 // appImport 实现 `platform admin app import <dir>`：把 deploy/apps 风格的目录导入为 draft 应用 / 版本；
-// 每行输出 `slug version created|version-added`，跳过的（符号链接）输出 `slug skipped: 原因`。
+// 每行输出 `slug version created|version-added`，跳过的（符号链接、已存在且内容相同的版本）输出 `slug skipped: 原因`。
 func appImport(ctx context.Context, cat *appdeploy.Catalog, args []string, out io.Writer) error {
 	if len(args) != 2 || args[0] != "import" {
 		return errors.New("用法：platform admin app import <目录>")

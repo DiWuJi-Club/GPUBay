@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type AdminGroup, type EnrollCommand, type Listed, type MachineDetail } from '@spark/shared'
+import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type AdminGroup, type EnrollCommand, type LLMPool, type Listed, type MachineDetail } from '@spark/shared'
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
+import { isPoolGroup } from '../logic/llm'
 import { fmtBytes, fmtPercent, fmtTemp } from '../logic/metrics'
 import { notifyError } from '../logic/notify'
 
@@ -23,6 +24,27 @@ const groups = ref<AdminGroup[]>([])
 const edit = reactive({ visible: false, groupId: '' as string, displayName: '', busy: false })
 /** Agent 上报的镜像（repository:tag），按文本显示 */
 const cachedImages = computed(() => data.value?.machine.cached_images ?? [])
+/** 机器在 Token 服务池（purpose='llm' 的机组）：显示标签与节点页链接（详情的 group 或 GET /groups 带 purpose） */
+const inPool = computed(() => isPoolGroup(data.value?.machine.group_id ?? null, data.value?.group ?? null, groups.value))
+/** 池内机器上的节点（GET /llm/pool 里本机那一行）：有则链接直接打开节点详情；查不到只链接到节点页，不提示错误 */
+const poolNode = ref<{ id: string; model_slug: string } | null>(null)
+let poolSeq = 0
+async function loadPoolNode() {
+  const mine = ++poolSeq
+  const machineId = data.value?.machine.id
+  poolNode.value = null
+  if (!inPool.value || machineId == null) return
+  try {
+    const p = await api.get<LLMPool>('/llm/pool')
+    if (mine !== poolSeq) return
+    const n = p.machines.find((m) => m.machine.id === machineId)?.node
+    poolNode.value = n && n.state !== 'removed' && n.state !== 'failed' ? { id: n.id, model_slug: n.model_slug } : null
+  } catch {
+    // 节点链接只是便利：失败时退回到节点页链接
+  }
+}
+watch(() => [inPool.value, data.value?.machine.id] as const, () => void loadPoolNode())
+const poolLink = computed(() => ({ path: '/llm', query: poolNode.value ? { tab: 'nodes', node: poolNode.value.id } : { tab: 'nodes' } }))
 const inMaintenance = computed(() => data.value?.machine.state === 'maintenance' || data.value?.machine.state === 'faulty')
 
 let seq = 0
@@ -179,7 +201,12 @@ async function revokeEnrollment() {
           <el-descriptions-item label="内网 IP"><span class="mono">{{ data.machine.lan_ip }}</span></el-descriptions-item>
           <el-descriptions-item label="在线"><span data-testid="mdetail-online">{{ data.machine.agent_online ? '在线' : '离线' }}</span>（{{ fmtTime(data.machine.last_seen_at) || '从未心跳' }}）</el-descriptions-item>
           <el-descriptions-item label="PDU">{{ data.machine.pdu_id ? `#${data.machine.pdu_id} 插座 ${data.machine.pdu_outlet}` : '未配置' }}</el-descriptions-item>
-          <el-descriptions-item label="机组"><span data-testid="mdetail-group">{{ data.group?.name ?? '未分组' }}</span></el-descriptions-item>
+          <el-descriptions-item label="机组"><span data-testid="mdetail-group">{{ data.group?.name ?? '未分组' }}</span>
+            <template v-if="inPool">
+              <el-tag size="small" type="warning" class="pool-tag" data-testid="mdetail-pool-tag">Token 服务池</el-tag>
+              <router-link :to="poolLink" class="pool-link" data-testid="mdetail-pool-link">{{ poolNode ? `节点 ${poolNode.model_slug}` : '查看节点' }}</router-link>
+            </template>
+          </el-descriptions-item>
           <el-descriptions-item label="展示名"><span data-testid="mdetail-display">{{ data.machine.display_name || `机器 #${data.machine.id}` }}</span></el-descriptions-item>
           <el-descriptions-item label="登记时间">{{ fmtTime(data.machine.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="当前实例">
@@ -283,7 +310,8 @@ async function revokeEnrollment() {
       <el-dialog v-model="edit.visible" title="编辑机组 / 展示名" width="460" align-center data-testid="medit-dialog">
         <el-form label-position="top" @submit.prevent="submitEdit">
           <el-form-item label="机组">
-            <el-select v-model="edit.groupId" clearable placeholder="未分组" data-testid="medit-group"><el-option v-for="g in groups" :key="g.id" :label="g.name" :value="String(g.id)" /></el-select>
+            <el-select v-model="edit.groupId" clearable placeholder="未分组" :disabled="inPool" data-testid="medit-group"><el-option v-for="g in groups" :key="g.id" :label="g.name" :value="String(g.id)" /></el-select>
+            <p v-if="inPool" class="muted" data-testid="medit-pool-hint">Token 服务池机器请在 Token 商城 → 节点与机器池 中移出</p>
           </el-form-item>
           <el-form-item label="展示名（对用户，≤ 32 字；留空显示「机器 #ID」）"><el-input v-model="edit.displayName" maxlength="32" data-testid="medit-display" /></el-form-item>
           <el-button type="primary" native-type="submit" :loading="edit.busy" data-testid="medit-submit">保存</el-button>
@@ -302,6 +330,8 @@ async function revokeEnrollment() {
 
 <style scoped>
 .detail { display: grid; gap: 16px; }
+.pool-tag { margin-left: 6px; }
+.pool-link { margin-left: 6px; font-size: 13px; }
 .head { display: flex; justify-content: space-between; align-items: center; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; }

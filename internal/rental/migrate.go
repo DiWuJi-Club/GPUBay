@@ -27,7 +27,7 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 		if err != nil {
 			return err
 		}
-		if old.State != StateRunning {
+		if old.System || old.State != StateRunning { // 系统实例不换机：机器坏了由 llm Controller 另建节点
 			return apperr.ErrInvalidState
 		}
 		paid := int64(old.Remaining(now) / time.Second)

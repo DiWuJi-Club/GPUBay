@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wechatpay-apiv3/wechatpay-go/utils"
 	"golang.org/x/crypto/ssh"
@@ -31,6 +32,8 @@ import (
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
+	"spark-cloud/internal/llm"
+	"spark-cloud/internal/llmgw"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
@@ -106,6 +109,9 @@ type App struct {
 	AppCatalog *appdeploy.Catalog
 	AppRunner  *appdeploy.Runner // 部署后台执行者；由 cmd/platform 按 SPARK_APP_RUNNER 启动
 
+	LLM               *llm.Service       // Token 商城（计划 9）；Settle 挂在清扫器上，Router 由 RunAccessLoops 刷新
+	LLMController     *llm.Controller    // 节点生命周期；由 cmd/platform 按 SPARK_LLM_CONTROLLER 启动（e2e-server 不启动，用钩子驱动）
+	LLMGateway        *llmgw.Server      // /v1 网关；SPARK_LLM_GATEWAY=off 时 nil。cmd/platform 停机时与公网 http.Server.Shutdown 并发调用它的 Shutdown
 	Workflows         *comfywf.Catalog   // ComfyUI 工作流目录（计划 11）
 	WorkflowInstaller *comfywf.Installer // 部署上的工作流集合（添加 / 更新 / 移除）
 	WorkflowRuns      *comfywf.Runs      // 快速出图代理
@@ -185,6 +191,14 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		return nil, err
 	}
 	uploads := storage.NewService(pool, clk, disk)
+	// 系统账号（迁移 00022 写入）：系统实例、内部应用部署与 Token 节点都挂在它名下；缺失说明迁移没跑全，拒绝启动。
+	var systemUserID int64
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM users WHERE system AND phone = $1`, llm.SystemUserPhone).Scan(&systemUserID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("找不到系统账号（users.system，phone=%q）：请先执行数据库迁移", llm.SystemUserPhone)
+		}
+		return nil, fmt.Errorf("读取系统账号: %w", err)
+	}
 
 	// 与 `platform referral backfill-fingerprints`（cmd/platform/referral.go 的 referralKeys）相同的输入：config.Load 解出的原始密钥字节
 	fpKey, err := referral.DeriveFingerprintKey(cfg.SecretKey)
@@ -199,7 +213,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
-		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SSHBasePort: cfg.UpstreamSSHPort,
+		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SystemUserID: systemUserID, SSHBasePort: cfg.UpstreamSSHPort,
 	})
 	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r, Alerts: f})
 	ids.SetReferral(ref)
@@ -307,7 +321,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	wfCat := comfywf.NewCatalog(pool, clk, uploads, log)
 	appDeps := appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
 		Upstream: upstreamPool, PortURL: ingressAuth.PortURL, HFEndpoint: cfg.AppHFEndpoint, PipIndexURL: cfg.AppPipIndexURL, GitMirror: cfg.AppGitMirror,
-		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor}
+		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor, SystemUserID: systemUserID}
 	comfywf.NewHooks(pool, wfCat).Wire(&appDeps)
 	apps := appdeploy.NewService(appDeps)
 	r.SetAppHooks(apps)
@@ -319,6 +333,18 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	wfRuns := comfywf.NewRuns(pool, clk, wfCat, apps, comfywf.NewClient(upstreamPool), log)
 	srv.Workflows, srv.Installer, srv.Runs = wfCat, wfInst, wfRuns
 	adminSrv.Workflows, adminSrv.Installer = wfCat, wfInst
+	// Token 商城：节点即系统实例上的 vllm-node 部署，探测与转发走同一个上游连接池。网关（/v1）由 SPARK_LLM_GATEWAY 决定是否挂载；
+	// 必须在 srv.Router() 之前设置（Router 按字段是否为 nil 注册路由）。
+	llmSvc := llm.NewService(llm.Deps{Pool: pool, Clock: clk, Log: log, Box: box, Wallet: w, Users: ids, Rental: r, Apps: apps, AppCat: appCat,
+		Images: c, Fleet: f, Upstream: upstreamPool, SystemUserID: systemUserID})
+	llmCtl := llm.NewController(llmSvc)
+	srv.LLM, adminSrv.LLM = llmSvc, llmSvc
+	var llmGW *llmgw.Server
+	if cfg.LLMGateway {
+		// 401 的按 IP 限流：零值取默认（每 IP 每分钟 60 次）；DisableRateLimits 时为 noRateLimit（同其它按 IP 限流）
+		llmGW = llmgw.New(llmSvc, llmgw.Config{AuthFailLimit: authorizeLimit}, clk, log)
+		srv.LLMGateway = llmGW.Router()
+	}
 	routes := ingress.NewTable(r, log)
 	ingSrv := ingress.NewServer(ingressAuth, routes, ids, upstreamPool, r, clk, log)
 	proxyHops := 0 // 不信任代理：入口不看任何转发头
@@ -329,7 +355,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
 		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner,
-		Workflows: wfCat, WorkflowInstaller: wfInst, WorkflowRuns: wfRuns}, nil
+		Workflows: wfCat, WorkflowInstaller: wfInst, WorkflowRuns: wfRuns, LLM: llmSvc, LLMController: llmCtl, LLMGateway: llmGW}, nil
 }
 
 // upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。
@@ -527,7 +553,7 @@ func poolKeep(routes []rental.IngressRoute) map[string]bool {
 	return keep
 }
 
-// RunAccessLoops：路由表每 2 秒刷新、活动流（WebSocket / SSE）按访问权限变化撤销、离开 running 的实例从上游连接池丢弃、
+// RunAccessLoops：路由表每 2 秒刷新、Token 节点表每 llm.RouterRefresh 刷新、活动流（WebSocket / SSE）按访问权限变化撤销、离开 running 的实例从上游连接池丢弃、
 // TLS 到期每日检查；ctx 结束后等所有子循环退出再返回。连接池不在这里关闭：停机时 HTTP / ingress 关闭之后由 cmd/platform 关。
 func (a *App) RunAccessLoops(ctx context.Context) {
 	var wg sync.WaitGroup
@@ -536,6 +562,7 @@ func (a *App) RunAccessLoops(ctx context.Context) {
 		wg.Go(func() { a.TLS.RunExpiryCheck(ctx, 24*time.Hour, 14*24*time.Hour) })
 	}
 	wg.Go(func() { a.Routes.Run(ctx, 2*time.Second) })
+	wg.Go(func() { a.LLM.Router().Run(ctx, llm.RouterRefresh) })
 	wg.Go(func() { a.Ingress.Run(ctx, accessSweepInterval) })
 	running := map[string]bool{}
 	t := time.NewTicker(2 * time.Second)

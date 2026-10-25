@@ -29,7 +29,7 @@ type AdminLedgerRow struct {
 }
 
 var ledgerKinds = []string{string(KindRecharge), string(KindAdminAdjust), string(KindOrderPay), string(KindRefund),
-	string(KindReferralRebate), string(KindReferralClawback)}
+	string(KindReferralRebate), string(KindReferralClawback), string(KindLLMPay)}
 
 func (f LedgerFilter) where() (db.Where, error) {
 	var w db.Where

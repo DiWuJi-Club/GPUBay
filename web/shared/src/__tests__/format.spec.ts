@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-  centsToYuanInput, digitsOnly, fmtDate, fmtDuration, fmtTime, fmtTimeSec, fmtYuan, RECHARGE_MAX_CENTS, RECHARGE_MIN_CENTS, toHalfWidthDigits, useCountdown, validateYuanRange, yuanToCents,
+  centsToYuanInput, digitsOnly, fmtDate, formatMicroFen, formatPricePerM, formatTokens, fmtDuration, fmtTime, fmtTimeSec, fmtYuan, RECHARGE_MAX_CENTS, RECHARGE_MIN_CENTS, toHalfWidthDigits, useCountdown, validateYuanRange, yuanToCents,
 } from '../format'
 
 describe('fmtYuan (U-01)', () => {
@@ -168,5 +168,44 @@ describe('toHalfWidthDigits / digitsOnly', () => {
     expect(digitsOnly('12ab34')).toBe('1234')
     expect(digitsOnly('abc')).toBe('')
     expect(digitsOnly('０')).toBe('0')
+  })
+})
+
+describe('Token 商城格式化（计划 9）', () => {
+  it.each([
+    [0, '¥0.00'],
+    [50, '¥0.50'],
+    [200, '¥2.00'],
+    [123456, '¥1,234.56'],
+  ])('formatPricePerM(%i 分 / 百万 token) → %s', (fen, want) => {
+    expect(formatPricePerM(fen)).toBe(want)
+  })
+
+  it.each([
+    [0, '¥0.00'],
+    [1, '< ¥0.01'],
+    [12500, '< ¥0.01'],
+    [999_999, '< ¥0.01'],
+    [-12500, '< ¥0.01'],
+    [-1_250_000, '-¥0.0125'],
+    [1_000_000, '¥0.01'],
+    [1_250_000, '¥0.0125'],
+    [123_456_789, '¥1.234568'],
+    [100_000_000_000, '¥1,000.00'],
+  ])('formatMicroFen(%i 微分) → %s', (micro, want) => {
+    expect(formatMicroFen(micro)).toBe(want)
+  })
+
+  it.each([
+    [0, '0'],
+    [999, '999'],
+    [1000, '1K'],
+    [1500, '1.5K'],
+    [12_345, '12.3K'],
+    [999_960, '1M'],
+    [2_500_000, '2.5M'],
+    [3_000_000_000, '3B'],
+  ])('formatTokens(%i) → %s', (n, want) => {
+    expect(formatTokens(n)).toBe(want)
   })
 })

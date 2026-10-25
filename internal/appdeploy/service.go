@@ -50,7 +50,9 @@ type Deps struct {
 	// AppRootFor 按实例给出应用根目录（测试 / e2e 多实例共用一个假容器时各用各的目录）；nil → AppRoot。
 	AppRootFor              func(instanceID string) string
 	HFEndpoint, PipIndexURL string
-	GitMirror               string // 注入 SPARK_GIT_MIRROR（计划 11，配置 SPARK_APP_GIT_MIRROR；空 = 直连）
+	// SystemUserID 系统账号（users.system，计划 9）：只有它能部署内部应用；0 = 未配置，谁都不能部署内部应用。
+	SystemUserID int64
+	GitMirror    string // 注入 SPARK_GIT_MIRROR（计划 11，配置 SPARK_APP_GIT_MIRROR；空 = 直连）
 
 	// 计划 11 扩展点（comfywf 实现、app.go 接线；appdeploy 不 import comfywf）。都可为 nil。
 
@@ -121,7 +123,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Deployment, er
 		default:
 			return apperr.ErrInvalidState
 		}
-		app, ver, err := s.resolveVersion(ctx, tx, req.AppID, req.VersionID)
+		// 内部应用只有系统账号能部署，对其他用户按不存在处理
+		isSystem := s.d.SystemUserID != 0 && req.UserID == s.d.SystemUserID
+		app, ver, err := s.resolveVersion(ctx, tx, req.AppID, req.VersionID, isSystem)
 		if err != nil {
 			return err
 		}

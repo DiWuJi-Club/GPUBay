@@ -18,7 +18,8 @@
 | `category` | `llm` / `image` / `notebook` / `tool` |
 | `icon` | `app` / `llm` / `chat` / `image` / `notebook` / `tool` / `code` / `audio` |
 | `sort` | 市场页排序，小的在前 |
-| `version` | 版本号（如 `1.0.0`）；同一应用重复导入同一版本号会报错，改脚本请升版本 |
+| `internal` | 可选，`true` = 平台内部应用：控制台市场页 / 添加应用弹窗不可见，用户部署按「应用不存在」处理，只有系统账号能部署；新建应用时写入，已有应用导入 `true` 时补标为内部应用（`false` / 不写不会清除，计划 9） |
+| `version` | 版本号（如 `1.0.0`）；重复导入同一版本号时内容（spec、脚本、镜像）完全相同则跳过，内容不同则报错——改了脚本或 spec 请升版本 |
 | `images` | 兼容镜像的**名称**（`images.name`），导入时按名称找已登记的镜像 |
 | `changelog` | 本版本的更新说明 |
 
@@ -26,9 +27,15 @@
 
 | 名称 | 镜像 | 用到它的应用 |
 |---|---|---|
-| `LLM Serving` | `spark/llm-serving:25.09` | vllm、open-webui、jupyterlab |
+| `LLM Serving` | `spark/llm-serving:25.09` | vllm、vllm-node、open-webui、jupyterlab |
 | `ComfyUI` | `spark/comfyui:25.09` | comfyui、jupyterlab |
 | `PyTorch` | `spark/pytorch:25.09` | jupyterlab |
+
+## 内部应用
+
+| 应用 | 用途 |
+|---|---|
+| `vllm-node` | Token 商城推理节点（计划 9）：`llm.Controller` 在「Token 服务池」机器的系统实例上自动部署。`MODEL_ID / MODEL_SOURCE / SERVED_MODEL_NAME / MAX_MODEL_LEN / API_KEY` 由平台按后台模型目录填写（`API_KEY` 是平台生成的节点密钥，必填，`^[A-Za-z0-9_-]{32,128}$`）；`GPU_MEMORY_UTILIZATION / MAX_NUM_SEQS / QUANTIZATION / REASONING_PARSER / TOOL_CALL_PARSER / TASK / MODEL_SIZE_GB` 可经模型的 `node_env` 覆盖。vLLM 只监听 `127.0.0.1:$SPARK_PORT` 并用节点密钥鉴权；下载进度按 `MODEL_SIZE_GB`（缺省 20）估算。导入后同样要在后台发布（目录页显示「内部」标签） |
 
 ## 导入
 
@@ -65,6 +72,7 @@ platform admin app import deploy/apps
 | 应用 | 选项 | 实际下载 | 大小 |
 |---|---|---|---|
 | vllm | `Qwen/Qwen3-4B` / `Qwen3-8B` / `Qwen2.5-7B-Instruct` / `Qwen3-14B` | 整个仓库 | 8 / 16 / 15 / 29GB |
+| vllm-node | 后台模型目录的 `source_id`（任意仓库） | 整个仓库 | 按模型的 `MODEL_SIZE_GB` |
 | comfyui | `AI-ModelScope/stable-diffusion-xl-base-1.0` | `sd_xl_base_1.0.safetensors` → `checkpoints` | 7GB |
 | comfyui | `AI-ModelScope/FLUX.1-schnell`（ModelScope） | `flux1-schnell.safetensors` → `unet`、`ae.safetensors` → `vae`，`AI-ModelScope/flux_text_encoders` 的 `clip_l` + `t5xxl_fp16` → `clip` | 34GB |
 | comfyui | `AI-ModelScope/FLUX.1-schnell`（hf-mirror） | `Comfy-Org/flux1-schnell` 的 fp8 单文件 checkpoint（HF 官方仓库需登录同意协议） | 17GB |

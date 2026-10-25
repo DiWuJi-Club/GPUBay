@@ -17,6 +17,8 @@
 //     下单插实例取机组行 KEY SHARE：先插的一方先拿到锁，另一方等它提交；删除方不锁机器，与下单不成环
 //   AdminMigrate：原实例 → machines(SKIP LOCKED) → 新 lease → agent_commands → 旧 lease 收缩
 //   应用部署钩子（AppHooks，计划 7）：都在已持实例行锁之后调用，再锁 app_deployments → instance_ports（appdeploy 一律同序）
+//   PlaceSystem（计划 9）：machines(NO KEY UPDATE，等待) → 插实例 / lease → agent_commands；不碰 orders / wallet
+//   ReleaseSystem（计划 9）：与 Release 相同（instance → lease → agent_commands，经 beginWipe）
 // 持机器行锁的事务只会在插入 lease 撞到别的事务未提交的 lease 增长时等待；而让 lease 增长的路径都不等机器锁，等待链不成环。
 
 package rental
@@ -85,6 +87,8 @@ type Deps struct {
 	// 计划 3
 	Keys       KeyCounter                                 // 关闭密码登录前校验用户至少有一把公钥；nil 视为 0 把
 	HostKeyGen func() (pub string, pem []byte, err error) // 实例主机密钥生成；nil → pki.GenerateInstanceHostKey
+	// 计划 9：系统账号（users.system AND phone='system:llm'）的 ID，系统实例挂在它名下；0 = 未配置（PlaceSystem 报错）
+	SystemUserID int64
 	// 计划 10：容器 sshd 的基准端口（SPARK_UPSTREAM_SSH_PORT）；<= 0 视为 2222。Create 指令按 Instance.SSHPort 带端口。
 	SSHBasePort int
 }
@@ -137,6 +141,8 @@ type Instance struct {
 	ReassignCount         int
 	ProvisionedAt         *time.Time // 预订开通（reserved → creating）时刻
 	CancelledAt           *time.Time
+	// 计划 9：平台节点的系统实例（PlaceSystem）：无订单、expires_at 恒为 NULL、不到期不计费，后台计费类操作一律拒绝
+	System bool
 }
 
 // DefaultSSHPort 是未配置基准端口时容器 sshd 的端口。
@@ -201,7 +207,7 @@ func (i Instance) Remaining(now time.Time) time.Duration {
 const instanceCols = `id, user_id, machine_id, product_id, image_id, state, pending_seconds, expires_at,
 	stopped_at, suspended_at, paused_remaining, reminded_24h, reminded_1h, created_at, password_auth, ssh_host_pubkey,
 	scheduled_start_at, group_id, batch_id, auto_renew, auto_renew_duration, auto_renew_failed_at, auto_renew_failed_reason,
-	reassign_count, provisioned_at, cancelled_at`
+	reassign_count, provisioned_at, cancelled_at, system`
 
 func scanInstance(row pgx.Row) (Instance, error) {
 	var i Instance
@@ -209,7 +215,7 @@ func scanInstance(row pgx.Row) (Instance, error) {
 	err := row.Scan(&i.ID, &i.UserID, &i.MachineID, &i.ProductID, &i.ImageID, &i.State, &i.PendingSeconds, &i.ExpiresAt,
 		&i.StoppedAt, &i.SuspendedAt, &i.PausedRemaining, &i.Reminded24h, &i.Reminded1h, &i.CreatedAt, &i.PasswordAuth, &i.SSHHostPubkey,
 		&i.ScheduledStartAt, &i.GroupID, &i.BatchID, &i.AutoRenew, &autoDur, &i.AutoRenewFailedAt, &i.AutoRenewFailedReason,
-		&i.ReassignCount, &i.ProvisionedAt, &i.CancelledAt)
+		&i.ReassignCount, &i.ProvisionedAt, &i.CancelledAt, &i.System)
 	if db.IsNoRows(err) {
 		return Instance{}, apperr.ErrNotFound
 	}

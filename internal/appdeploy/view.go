@@ -51,6 +51,7 @@ type View struct {
 	FinishedAt      *time.Time        `json:"finished_at"`
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
+	appInternal     bool              // 应用是否内部；只给 AdminView 用，用户视图不输出
 	// Workflows（计划 11）：已装 / 应装的工作流（comfywf 的视图，appdeploy 不解释）。只对 comfyui 或版本支持工作流的部署给出，
 	// 此时恒为数组（没有工作流 = []）；其它部署为 nil，omitzero 省略该字段。
 	Workflows []json.RawMessage `json:"workflows,omitzero"`
@@ -65,14 +66,18 @@ type Summary struct {
 	URL      *string `json:"url"`
 }
 
-// AdminView 后台视图：多 log_tail（回写时已脱敏）与 user_id。
+// AdminView 后台视图：多 log_tail（回写时已脱敏）、user_id 与应用是否内部（计划 9 的 vllm-node 节点部署）。
 type AdminView struct {
 	View
-	LogTail string `json:"log_tail"`
-	UserID  int64  `json:"user_id"`
+	LogTail  string `json:"log_tail"`
+	UserID   int64  `json:"user_id"`
+	Internal bool   `json:"internal"`
 }
 
-type appBrief struct{ slug, name, icon string }
+type appBrief struct {
+	slug, name, icon string
+	internal         bool
+}
 
 // comfyUISlug 是 ComfyUI 应用的 slug（计划 11：部署视图带 workflows 的判断之一；与 comfywf 的识别口径一致）。
 const comfyUISlug = "comfyui"
@@ -105,14 +110,14 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 		depIDs = append(depIDs, d.ID)
 	}
 	apps := map[int64]appBrief{}
-	rows, err := s.d.Pool.Query(ctx, `SELECT id, slug, name, icon FROM apps WHERE id = ANY($1)`, appIDs)
+	rows, err := s.d.Pool.Query(ctx, `SELECT id, slug, name, icon, internal FROM apps WHERE id = ANY($1)`, appIDs)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var id int64
 		var a appBrief
-		if err := rows.Scan(&id, &a.slug, &a.name, &a.icon); err != nil {
+		if err := rows.Scan(&id, &a.slug, &a.name, &a.icon, &a.internal); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -205,7 +210,7 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 
 	for _, d := range deps {
 		a, ver := apps[d.AppID], vers[d.AppVersionID]
-		v := View{ID: d.ID, InstanceID: d.InstanceID, AppID: d.AppID, AppSlug: a.slug, AppName: a.name, AppIcon: a.icon,
+		v := View{ID: d.ID, InstanceID: d.InstanceID, AppID: d.AppID, AppSlug: a.slug, AppName: a.name, AppIcon: a.icon, appInternal: a.internal,
 			VersionID: d.AppVersionID, Version: ver.version, State: d.State, Desired: d.Desired, Phase: d.Phase, Progress: d.Progress,
 			Message: d.Message, Health: d.Health, ErrorCode: d.ErrorCode, Env: map[string]string{}, SecretEnv: map[string]bool{},
 			Spec: normalizeSpec(ver.spec), Port: d.Port, Links: []LinkView{}, Attempt: d.Attempt, CleanupPending: d.CleanupPending,
@@ -312,7 +317,7 @@ func (s *Service) AdminViews(ctx context.Context, deps []Deployment) ([]AdminVie
 	}
 	out := make([]AdminView, len(views))
 	for i, v := range views {
-		out[i] = AdminView{View: v, LogTail: deps[i].LogTail, UserID: deps[i].UserID}
+		out[i] = AdminView{View: v, LogTail: deps[i].LogTail, UserID: deps[i].UserID, Internal: v.appInternal}
 	}
 	return out, nil
 }
@@ -383,10 +388,10 @@ func (s *Service) CatalogViews(ctx context.Context, withDescription bool) ([]Cat
 	return out, nil
 }
 
-// CatalogViewBySlug 单个已上架应用（带说明）；不存在、未上架或没有已发布版本 → app_not_found（与列表口径一致）。
+// CatalogViewBySlug 单个已上架应用（带说明）；不存在、未上架、内部应用或没有已发布版本 → app_not_found（与列表口径一致）。
 func (s *Service) CatalogViewBySlug(ctx context.Context, slug string) (CatalogView, error) {
 	a, err := s.d.Catalog.AppBySlug(ctx, slug)
-	if errors.Is(err, apperr.ErrNotFound) || (err == nil && a.Status != StatusPublished) {
+	if errors.Is(err, apperr.ErrNotFound) || (err == nil && (a.Status != StatusPublished || a.Internal)) {
 		return CatalogView{}, apperr.ErrAppNotFound
 	}
 	if err != nil {

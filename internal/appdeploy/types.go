@@ -50,6 +50,7 @@ type App struct {
 	Icon        string    `json:"icon"`
 	Sort        int       `json:"sort"`
 	Status      string    `json:"status"`
+	Internal    bool      `json:"internal"` // 平台内部应用（计划 9 的 vllm-node）：用户目录不可见，只有系统账号能部署
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }

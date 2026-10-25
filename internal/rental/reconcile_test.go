@@ -1,6 +1,7 @@
 package rental_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -237,4 +238,55 @@ func TestReconcileOrphanWipeOnOtherMachineDoesNotReleaseWipingInstance(t *testin
 			t.Fatalf("ok=%v: orphan_wipe_failed=%d machineB=%s", ok, failed, e.machineState(mb))
 		}
 	}
+}
+
+// 系统实例（Token 服务节点）的容器不在：只发 warning「平台节点容器异常，节点将自动重建」（llm Controller 重建节点），
+// 不发 critical「换机或退款」——上报 stopped、整个没上报、机器恢复时容器不在三条路径都一样。
+func TestSystemInstanceContainerDownIsWarning(t *testing.T) {
+	e := newEnv(t, 2)
+	_, a := e.place(catalog.D1d)
+	_, b := e.place(catalog.D1d)
+	e.ack(true)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET system = true WHERE id IN ($1, $2)`, a.ID, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	ma, mb := e.get(a.ID).MachineID, e.get(b.ID).MachineID
+	serial := func(m int64) string {
+		var s string
+		if err := e.pool.QueryRow(e.ctx, `SELECT serial FROM machines WHERE id = $1`, m).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	expect := func(what, instID string, m int64) {
+		t.Helper()
+		var level, msg string
+		var n int
+		if err := e.pool.QueryRow(e.ctx, `SELECT count(*), min(level), min(message) FROM alerts WHERE kind = 'container_down' AND instance_id = $1`,
+			instID).Scan(&n, &level, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 || level != "warning" || msg != rental.AlertSystemContainerDown(serial(m), instID) || !strings.Contains(msg, "平台节点容器异常，节点将自动重建") {
+			t.Fatalf("%s: alerts = %d level %q message %q", what, n, level, msg)
+		}
+	}
+	if err := e.svc.Reconcile(e.ctx, ma, report(fleet.InstanceState{InstanceID: a.ID, Phase: fleet.PhaseStopped})); err != nil {
+		t.Fatal(err)
+	}
+	expect("reported stopped", a.ID, ma)
+	if err := e.svc.Reconcile(e.ctx, mb, report()); err != nil {
+		t.Fatal(err)
+	}
+	expect("missing from report", b.ID, mb)
+	if n := e.alertCount("", ""); n != 2 {
+		t.Fatalf("alerts = %d, want 2 (no critical alert)", n)
+	}
+	// 机器离线后恢复、容器不在
+	if _, err := e.pool.Exec(e.ctx, `DELETE FROM alerts`); err != nil {
+		t.Fatal(err)
+	}
+	mustCount(t, firstOf(e.svc.SuspendMachines(e.ctx, e.machines)), nil, 2, "suspended")
+	n, err := e.svc.ResumeMachine(e.ctx, ma, nil)
+	mustCount(t, n, err, 0, "resumed with container down")
+	expect("resume with container down", a.ID, ma)
 }

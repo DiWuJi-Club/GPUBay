@@ -43,10 +43,36 @@ func TestGroupAPI(t *testing.T) {
 	}
 	code, out = fin.do("GET", "/groups", nil)
 	items := out["items"].([]any)
-	if code != 200 || len(items) != 1 {
+	// 迁移 00022 种子：不可见的「Token 服务池」（sort 1000，排在最后）
+	if code != 200 || len(items) != 2 || items[1].(map[string]any)["name"] != "Token 服务池" {
 		t.Fatalf("list = %d %v", code, out)
 	}
 	row := items[0].(map[string]any)
+	poolRow := items[1].(map[string]any)
+	if row["purpose"] != "rental" || poolRow["purpose"] != "llm" || poolRow["visible"] != false {
+		t.Fatalf("purpose: %v / %v", row, poolRow)
+	}
+	poolID := itoa(int64(poolRow["id"].(float64)))
+	// 计划 9：池机组不能对用户可见、不能改名、不能改用途、不能删除；不能经接口再建一个池
+	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": true}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("pool visible = %d %v", code, out)
+	}
+	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": false, "purpose": "rental"}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("pool purpose = %d %v", code, out)
+	}
+	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "推理池", "visible": false}); code != 409 || codeOf(out) != "invalid_state" ||
+		out["message"] != "Token 服务池不能改名" {
+		t.Fatalf("pool rename = %d %v", code, out)
+	}
+	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": false, "sort": 1000, "description": "推理节点"}); code != 200 || out["purpose"] != "llm" {
+		t.Fatalf("pool edit = %d %v", code, out)
+	}
+	if code, out := ops.do("DELETE", "/groups/"+poolID, map[string]any{}); code != 409 || codeOf(out) != "invalid_state" {
+		t.Fatalf("pool delete = %d %v", code, out)
+	}
+	if code, out := ops.do("POST", "/groups", map[string]any{"name": "第二池", "purpose": "llm"}); code != 400 || codeOf(out) != "bad_request" {
+		t.Fatalf("create llm group = %d %v", code, out)
+	}
 	if row["machine_count"].(float64) != 2 || row["idle_now"].(float64) != 2 || row["reserved_upcoming"].(float64) != 0 {
 		t.Fatalf("row = %v", row)
 	}
@@ -71,7 +97,7 @@ func TestGroupAPI(t *testing.T) {
 	if code, _ := ops.do("DELETE", "/groups/"+itoa(gid), map[string]any{}); code != 200 {
 		t.Fatalf("delete = %d", code)
 	}
-	if code, out := ops.do("GET", "/groups", nil); code != 200 || len(out["items"].([]any)) != 0 {
+	if code, out := ops.do("GET", "/groups", nil); code != 200 || len(out["items"].([]any)) != 1 { // 只剩种子「Token 服务池」
 		t.Fatalf("after delete = %d %v", code, out)
 	}
 	if code, out := ops.do("PUT", "/machines/"+itoa(m1), map[string]any{"group_id": gid}); code != 404 || codeOf(out) != "group_not_found" {

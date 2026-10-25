@@ -26,6 +26,7 @@ type groupRequest struct {
 	Description string `json:"description"`
 	Sort        int    `json:"sort"`
 	Visible     *bool  `json:"visible"`
+	Purpose     string `json:"purpose"` // 可选：建组只能是 rental；改组空 = 不改（池的用途不可改，规格 §3.3）
 }
 
 func (q groupRequest) input() fleet.GroupInput {
@@ -33,7 +34,7 @@ func (q groupRequest) input() fleet.GroupInput {
 	if q.Visible != nil {
 		visible = *q.Visible
 	}
-	return fleet.GroupInput{Name: q.Name, Region: q.Region, Description: q.Description, Sort: q.Sort, Visible: visible}
+	return fleet.GroupInput{Name: q.Name, Region: q.Region, Description: q.Description, Sort: q.Sort, Visible: visible, Purpose: q.Purpose}
 }
 
 // groupView 列表行：fleet.GroupRow 加未开通预订数（rental 统计）。

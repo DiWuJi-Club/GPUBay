@@ -66,6 +66,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 type meView struct {
 	identity.User
 	ReferralMonthSettled int64 `json:"referral_month_settled,omitempty"` // 计划 8：「我的」页入口小字；0 时省略
+	LLMMonthCost         int64 `json:"llm_month_cost,omitempty"`         // 计划 9：Token 商城本月消费（分）；0 或未启用时省略
 }
 
 const touchSessionTimeout = 2 * time.Second
@@ -86,6 +87,14 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 			s.Log.Error("referral month settled failed", "err", err, "user_id", u.ID)
 		} else {
 			v.ReferralMonthSettled = n
+		}
+	}
+	if s.LLM != nil {
+		// 读不到只记日志：/me 是登录态入口，不能因为 Token 商城出错而失败
+		if a, err := s.LLM.Account(r.Context(), u.ID); err != nil {
+			s.Log.Warn("me: llm account failed", "user_id", u.ID, "err", err)
+		} else {
+			v.LLMMonthCost = a.MonthCost
 		}
 	}
 	writeJSON(w, http.StatusOK, v)

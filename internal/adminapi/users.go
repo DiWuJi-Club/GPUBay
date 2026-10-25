@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"path"
@@ -9,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/httpx"
 	"spark-cloud/internal/platform/paging"
 	"spark-cloud/internal/rental"
@@ -34,8 +36,13 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	list, total, err := s.Identity.AdminListUsers(r.Context(),
-		identity.UserFilter{Q: q.Get("q"), KYCStatus: q.Get("kyc_status"), Status: q.Get("status")}, p)
+	incSystem, err := parseBoolParam(q.Get("include_system"), "include_system")
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	list, total, err := s.Identity.AdminListUsers(r.Context(), identity.UserFilter{Q: q.Get("q"), KYCStatus: q.Get("kyc_status"),
+		Status: q.Get("status"), IncludeSystem: incSystem != nil && *incSystem}, p)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -90,11 +97,20 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"user": u, "balance": balance, "instances": s.instanceViews(insts), "orders": orderViews(orders),
 		"ledger": httpx.List(ledger)["items"], "kyc": httpx.List(kyc)["items"], "ssh_keys": httpx.List(keys)["items"],
 		"referral": ref,
-	})
+	}
+	if s.LLM != nil { // 计划 9：Token 商城概况
+		l, err := s.LLM.AdminUserLLM(ctx, id)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		out["llm"] = l
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleBan(w http.ResponseWriter, r *http.Request) {
@@ -114,6 +130,9 @@ func (s *Server) handleBan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	if s.LLM != nil { // 计划 9：本进程网关的 Key 鉴权缓存立即失效，封禁即刻生效（其它进程最多 llm.KeyCacheTTL）
+		s.LLM.InvalidateUser(id)
+	}
 	httpx.OK(w)
 }
 
@@ -126,6 +145,9 @@ func (s *Server) handleUnban(w http.ResponseWriter, r *http.Request) {
 	if err := s.Identity.Unban(r.Context(), s.actor(r), id); err != nil {
 		s.writeError(w, r, err)
 		return
+	}
+	if s.LLM != nil {
+		s.LLM.InvalidateUser(id)
 	}
 	httpx.OK(w)
 }
@@ -204,13 +226,15 @@ type moneyRequest struct {
 	TOTP   string `json:"totp"`
 }
 
-// decodeMoney 解析调账 / 入账请求（二次验证由调用方经 withStepUp 与操作一起完成）。
+// decodeMoney 解析调账 / 入账请求（二次验证由调用方经 withStepUp 与操作一起完成）。系统账号不能调账 / 入账（invalid_state）。
 func (s *Server) decodeMoney(w http.ResponseWriter, r *http.Request) (int64, moneyRequest, bool) {
 	id, err := pathID(r, "id")
 	if err == nil {
 		var req moneyRequest
 		if err = httpx.DecodeJSON(r, &req); err == nil {
-			return id, req, true
+			if err = s.Identity.CheckNotSystem(r.Context(), id); err == nil || errors.Is(err, apperr.ErrNotFound) {
+				return id, req, true // 用户不存在交给资金操作本身报错（保持原有错误码）
+			}
 		}
 	}
 	s.writeError(w, r, err)

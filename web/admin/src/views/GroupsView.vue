@@ -14,6 +14,8 @@ const busy = ref(false)
 const blank = (): GroupInput => ({ name: '', region: '', description: '', sort: 0, visible: true })
 const form = reactive<GroupInput>(blank())
 const deleting = ref<AdminGroup | null>(null)
+/** Token 服务池（purpose='llm'，规格 §3.3）：不能删、不能设为可见；机器加入 / 移出在 Token 商城的节点与机器池里看节点状态 */
+const isPool = (g: AdminGroup | null | undefined) => g?.purpose === 'llm'
 
 async function load() {
   loading.value = true
@@ -199,7 +201,12 @@ async function saveDisplay(m: Machine) {
       <el-button size="small" :loading="loading" data-testid="groups-retry" @click="load">重试</el-button>
     </el-alert>
     <el-table :data="items" v-loading="loading" row-key="id">
-      <el-table-column label="名称" min-width="140"><template #default="{ row }"><span data-testid="group-row"><span data-testid="group-name">{{ row.name }}</span></span></template></el-table-column>
+      <el-table-column label="名称" min-width="220"><template #default="{ row }"><span data-testid="group-row"><span data-testid="group-name">{{ row.name }}</span></span>
+          <template v-if="isPool(row as AdminGroup)">
+            <el-tag size="small" type="warning" class="gap" data-testid="group-pool-tag">Token 服务池</el-tag>
+            <router-link :to="{ path: '/llm', query: { tab: 'nodes' } }" class="gap" data-testid="group-pool-link">节点与机器池</router-link>
+          </template>
+        </template></el-table-column>
       <el-table-column label="位置" width="120"><template #default="{ row }"><span data-testid="group-region">{{ row.region || '—' }}</span></template></el-table-column>
       <el-table-column label="机器数" width="90"><template #default="{ row }"><span data-testid="group-count">{{ row.machine_count }}</span></template></el-table-column>
       <el-table-column label="现空闲" width="90"><template #default="{ row }"><span data-testid="group-idle">{{ row.idle_now }}</span></template></el-table-column>
@@ -210,7 +217,7 @@ async function saveDisplay(m: Machine) {
         <template #default="{ row }">
           <el-button size="small" data-testid="group-machines" @click="openMachines(row as AdminGroup)">管理机器</el-button>
           <el-button size="small" data-testid="group-edit" @click="openEdit(row as AdminGroup)">编辑</el-button>
-          <el-button size="small" type="danger" plain data-testid="group-delete" @click="deleting = row as AdminGroup">删除</el-button>
+          <el-button v-if="!isPool(row as AdminGroup)" size="small" type="danger" plain data-testid="group-delete" @click="deleting = row as AdminGroup">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -222,8 +229,9 @@ async function saveDisplay(m: Machine) {
         <el-form-item label="描述（可选）"><el-input v-model="form.description" type="textarea" maxlength="200" data-testid="group-form-description" /></el-form-item>
         <div class="two">
           <el-form-item label="排序"><el-input-number v-model="form.sort" :controls="false" data-testid="group-form-sort" /></el-form-item>
-          <el-form-item label="控制台可见"><el-switch v-model="form.visible" data-testid="group-form-visible" /></el-form-item>
+          <el-form-item label="控制台可见"><el-switch v-model="form.visible" :disabled="isPool(editing)" data-testid="group-form-visible" /></el-form-item>
         </div>
+        <p v-if="isPool(editing)" class="muted" data-testid="group-form-pool-hint">Token 服务池只供平台节点使用，不能对用户可见、不能删除。</p>
         <p class="muted">不可见的机组留给运维 / 大客户：用户看不到、不能下单，其机器也不参与「不限机组」的分配。</p>
         <el-button type="primary" native-type="submit" :loading="busy" data-testid="group-form-submit">保存</el-button>
       </el-form>
@@ -305,6 +313,7 @@ async function saveDisplay(m: Machine) {
 .error { margin-bottom: 12px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; font-size: 13px; }
+.gap { margin-left: 6px; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
 .grid { width: 100%; border-collapse: collapse; font-size: 13px; }

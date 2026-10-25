@@ -11,6 +11,8 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AccountsTab: typeof import('./components/llm/AccountsTab.vue')['default']
+    AddPoolMachineDialog: typeof import('./components/llm/AddPoolMachineDialog.vue')['default']
     AppFormDialog: typeof import('./components/AppFormDialog.vue')['default']
     BatchLink: typeof import('./components/BatchLink.vue')['default']
     BookingOpsDialogs: typeof import('./components/BookingOpsDialogs.vue')['default']
@@ -20,6 +22,7 @@ declare module 'vue' {
     ElButton: typeof import('element-plus/es')['ElButton']
     ElCard: typeof import('element-plus/es')['ElCard']
     ElCheckbox: typeof import('element-plus/es')['ElCheckbox']
+    ElCheckboxGroup: typeof import('element-plus/es')['ElCheckboxGroup']
     ElDatePicker: typeof import('element-plus/es')['ElDatePicker']
     ElDescriptions: typeof import('element-plus/es')['ElDescriptions']
     ElDescriptionsItem: typeof import('element-plus/es')['ElDescriptionsItem']
@@ -45,13 +48,19 @@ declare module 'vue' {
     ElTag: typeof import('element-plus/es')['ElTag']
     ElTimeline: typeof import('element-plus/es')['ElTimeline']
     ElTimelineItem: typeof import('element-plus/es')['ElTimelineItem']
+    ElTooltip: typeof import('element-plus/es')['ElTooltip']
     ElUpload: typeof import('element-plus/es')['ElUpload']
     FinancePage: typeof import('./components/FinancePage.vue')['default']
     ForceRemoveDialog: typeof import('./components/ForceRemoveDialog.vue')['default']
     IdLink: typeof import('./components/IdLink.vue')['default']
+    ModelDrawer: typeof import('./components/llm/ModelDrawer.vue')['default']
+    ModelsTab: typeof import('./components/llm/ModelsTab.vue')['default']
+    NodeDrawer: typeof import('./components/llm/NodeDrawer.vue')['default']
+    NodesTab: typeof import('./components/llm/NodesTab.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     TotpDialog: typeof import('./components/TotpDialog.vue')['default']
+    UsageTab: typeof import('./components/llm/UsageTab.vue')['default']
     WorkflowFormDialog: typeof import('./components/WorkflowFormDialog.vue')['default']
   }
   export interface GlobalDirectives {

@@ -15,7 +15,13 @@ export const instanceStateType: LabelMap = {
 }
 export const orderKindLabel: LabelMap = { new: '新购', renew: '续费' }
 export const orderStatusLabel: LabelMap = { paid: '已支付', refunded: '已退款', partially_refunded: '部分退款' }
-export const ledgerKindLabel: LabelMap = { recharge: '充值', order_pay: '扣款', refund: '退款', admin_adjust: '调账', referral_rebate: '邀请返利', referral_clawback: '返利扣回' }
+export const ledgerKindLabel: LabelMap = {
+  recharge: '充值', order_pay: '扣款', refund: '退款', admin_adjust: '调账', referral_rebate: '邀请返利', referral_clawback: '返利扣回', llm_pay: 'Token 消费',
+}
+/** el-tag 的 type：入账（充值 / 退款 / 邀请返利）绿、扣款类（扣款 / 返利扣回 / Token 消费）橙、调账灰；未登记的种类用 info。 */
+export const ledgerKindType: LabelMap = {
+  recharge: 'success', refund: 'success', referral_rebate: 'success', order_pay: 'warning', referral_clawback: 'warning', llm_pay: 'warning', admin_adjust: 'info',
+}
 export const bindingStatusLabel: LabelMap = { active: '有效', held: '审核中', revoked: '已失效' }
 export const rewardStatusLabel: LabelMap = { pending: '待发放', settled: '已发放', void: '已作废' }
 export const rechargeStatusLabel: LabelMap = { pending: '待支付', paid: '已支付', closed: '已关闭' }
@@ -32,6 +38,7 @@ export const alertKindLabel: LabelMap = {
   booking_at_risk: '预订机器不可用', booking_unfulfilled: '预订无法履约', booking_cancel_failed: '预订取消失败',
   referral_scan_stuck: '邀请返利扫描卡住',
   app_deploy_unreachable: '应用部署无法连接容器',
+  llm_pool_short: 'Token 服务池机器不足', llm_node_unhealthy: '模型节点健康检查失败', llm_node_failed: '模型节点多次重建失败', llm_usage_record_failed: 'Token 用量记账失败',
 }
 export const roleLabel: LabelMap = { super: '超级管理员', ops: '运维', finance: '财务' }
 export const adminStatusLabel: LabelMap = { active: '正常', disabled: '已停用' }
@@ -66,6 +73,10 @@ export const auditActions: readonly string[] = [
   'app.create', 'app.update', 'app.delete', 'app.version.create', 'app.version.update', 'app.version.publish', 'app.version.prepull',
   'app.deployment.force_remove',
   'instance.app_deploy', 'instance.app_redeploy', 'instance.app_stop', 'instance.app_start', 'instance.app_remove',
+  'llm.model.create', 'llm.model.update', 'llm.model.status', 'llm.model.delete',
+  'llm.node.drain', 'llm.node.rebuild', 'llm.node.remove',
+  'llm.account.update',
+  'llm.key.create', 'llm.key.update', 'llm.key.revoke', 'llm.key.admin_disable',
   'workflow.create', 'workflow.update', 'workflow.delete', 'workflow.version.create', 'workflow.version.update', 'workflow.version.publish',
   'instance.workflow_add', 'instance.workflow_update', 'instance.workflow_remove',
 ]
@@ -95,6 +106,24 @@ export function deploymentErrorText(code: string, message: string, fallback = ''
 export const appCategoryLabel: LabelMap = { llm: '大模型', image: '图像生成', notebook: 'Notebook', tool: '工具' }
 export const appStatusLabel: LabelMap = { draft: '草稿', published: '已发布', retired: '已退役' }
 
+// 计划 9：Token 商城
+export const llmModelStatusLabel: LabelMap = { draft: '草稿', online: '已上线', offline: '已下线' }
+export const llmModelStatusType: LabelMap = { draft: 'info', online: 'success', offline: 'warning' }
+export const llmModelKindLabel: LabelMap = { chat: '对话', embedding: '向量' }
+export const llmNodeStateLabel: LabelMap = {
+  provisioning: '部署中', ready: '就绪', unhealthy: '不健康', draining: '排空中', removing: '移除中', removed: '已移除', failed: '失败',
+}
+/** el-tag 的 type：部署中蓝、就绪绿、不健康 / 排空中橙、移除中 / 已移除灰、失败红。 */
+export const llmNodeStateType: LabelMap = {
+  provisioning: 'primary', ready: 'success', unhealthy: 'warning', draining: 'warning', removing: 'info', removed: 'info', failed: 'danger',
+}
+export const llmUsageStatusLabel: LabelMap = {
+  ok: '成功', client_abort: '客户端中断', upstream_error: '上游错误', upstream_timeout: '上游超时', no_node: '无可用节点',
+}
+export const llmKeyStatusLabel: LabelMap = { active: '启用', disabled: '已停用', revoked: '已撤销' }
+/** 模型 features 标签；未登记的原样显示（labelOf 回落）。 */
+export const llmFeatureLabel: LabelMap = { tools: '工具调用', reasoning: '深度思考', vision: '视觉', 'long-context': '长上下文' }
+export const llmEndpointLabel: LabelMap = { chat: '对话', completions: '补全', embeddings: '向量' }
 // 计划 11：ComfyUI 工作流市场
 export const workflowCategoryLabel: LabelMap = { txt2img: '文生图', img2img: '图生图', video: '视频', upscale: '放大修复', other: '其它' }
 export const workflowStateLabel: LabelMap = { pending: '待安装', installed: '已安装', failed: '安装失败' }

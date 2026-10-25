@@ -33,6 +33,9 @@ func TestAdminListLedgerAndExport(t *testing.T) {
 	if _, total, _ := svc.AdminListLedger(ctx, wallet.LedgerFilter{UserID: a, Kind: "admin_adjust"}, paging.Page{}); total != 1 {
 		t.Fatalf("user filter = %d", total)
 	}
+	if n := countKind(t, svc, wallet.KindLLMPay); n != 0 {
+		t.Fatalf("llm_pay filter before = %d", n)
+	}
 	if _, _, err := svc.AdminListLedger(ctx, wallet.LedgerFilter{Kind: "gift"}, paging.Page{}); err == nil {
 		t.Fatal("bad kind accepted")
 	}
@@ -43,6 +46,29 @@ func TestAdminListLedgerAndExport(t *testing.T) {
 	if len(users) != 2 || users[0] != a {
 		t.Fatalf("export = %v", users)
 	}
+	// 计划 9：llm_pay 可作为筛选类型
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Apply(ctx, tx, wallet.Entry{UserID: a, Amount: -10, Kind: wallet.KindLLMPay, RefType: "llm_settlement", RefID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := countKind(t, svc, wallet.KindLLMPay); n != 1 {
+		t.Fatalf("llm_pay filter = %d", n)
+	}
+}
+
+func countKind(t *testing.T, svc *wallet.Service, k wallet.Kind) int {
+	t.Helper()
+	_, total, err := svc.AdminListLedger(context.Background(), wallet.LedgerFilter{Kind: string(k)}, paging.Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return total
 }
 
 func TestLedgerFilterAcceptsReferralKinds(t *testing.T) {
