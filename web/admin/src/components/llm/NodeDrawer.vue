@@ -136,7 +136,8 @@ defineExpose({ load })
           <el-descriptions-item label="进度"><span data-testid="llm-node-deployment-progress">{{ progressText(dep) || '—' }}</span></el-descriptions-item>
           <el-descriptions-item label="版本">{{ dep.app_name }} · {{ dep.version }}</el-descriptions-item>
           <el-descriptions-item label="错误" :span="2">
-            <span data-testid="llm-node-deployment-err">{{ dep.error_code ? deploymentErrorText(dep.error_code, dep.message) : dep.message || '—' }}</span>
+            <!-- 没有错误码时 message 只是进度 / 健康说明（如 healthy），不当作错误显示 -->
+            <span data-testid="llm-node-deployment-err">{{ dep.error_code ? deploymentErrorText(dep.error_code, dep.message) : '—' }}</span>
           </el-descriptions-item>
         </el-descriptions>
         <h4>部署事件</h4>

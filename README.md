@@ -165,7 +165,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
      ```
 
      或不往运行中的容器里写文件，用一次性容器只读挂载：`docker compose run --rm --no-deps -v "$(cd ../apps && pwd):/apps:ro" platform admin app import /apps`。
-     每个应用输出 `<slug> <版本> created|version-added`；引用的镜像没登记时该应用导入失败（先登记再重跑；同一版本号重复导入会报错，改脚本请升版本）。
+     每个应用输出 `<slug> <版本> created|version-added`；引用的镜像没登记时该应用导入失败（先登记再重跑）。已存在的同一版本号若内容（spec、脚本、镜像）相同则输出 `skipped` 并继续导入后面的应用，所以在已有部署上重跑整个目录是安全的；同一版本号但内容不同会报错，改脚本请升版本。
   3. 后台「应用」逐个发布版本（super + TOTP）。发布时平台向全部在线机器广播预拉取，版本页显示每个兼容镜像「已缓存 X / 在线 Y」；llm-serving 约 29GB，首次预拉取耗时较长，发布不受覆盖率限制。
 - **安全**：`run.sh` 与应用脚本在用户容器里**以 root 执行**，发布一个应用版本的权限等同于发布一个镜像——只给 super，发布要 TOTP；导入的脚本须经代码评审（`deploy/apps/README.md` 的约定）。
 - **回滚**：
@@ -177,7 +177,9 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - **接入地址**：OpenAI 兼容接口在 `https://<SPARK_DOMAIN>/v1`（与控制台同域同端口，无独立子域），用户在控制台「Token 商城」创建 API Key，按 token 用量从钱包扣费。`SPARK_LLM_GATEWAY=off` 时不挂 `/v1`。
 - **发布**：迁移 `00022_llm.sql` 写入系统账号（`users.phone='system:llm'`，`system=true`）与「Token 服务池」机组；系统账号缺失时 platform 启动失败（报「找不到系统账号」）。本计划不改 Agent 协议，platform 单独发布即可（节点依赖计划 7 的新版 Agent 与 `LLM Serving` 镜像）。迁移按乱序方式执行（`WithAllowOutofOrder`）：已跑过 `00024` 的库升级时会补跑 `00022`，两者互不依赖。
 - **节点应用 `vllm-node`**：节点是系统账号名下的系统实例上的 `vllm-node` 内部应用部署（不在控制台应用市场展示）。上线后按「应用一键部署」的步骤用 `platform admin app import` 导入 `deploy/apps`（含 `vllm-node`），再在后台「应用」里发布 `vllm-node` 的版本（super + TOTP）；未导入 / 未发布时后台无法创建模型（模型绑定 `vllm-node` 的已发布版本）。镜像沿用计划 7 登记的 `LLM Serving`。
-- **Token 服务池**：迁移建好的唯一机组「Token 服务池」（不可见、不可删除、不能改成可见）。在后台「Token 商城 → 节点与机器池」把机器加入池；**池内机器永不出租**（即时 / 预订 / 换机 / 改派都拿不到），Controller 只在池内空闲在线机器上建节点。机器上还有未结束的节点或系统实例时不能移出池（先在后台排空 / 移除节点）。池机器数量应 ≥ 全部上线模型的副本数之和，不足时告警 `llm_pool_short`。
+- **Token 服务池**：迁移建好的唯一机组「Token 服务池」（不可见、不可删除、不能改成可见）。在后台「Token 商城 → 节点与机器池」把机器加入池；**池内机器永不出租**（即时 / 预订 / 换机 / 改派都拿不到），Controller 只在池内空闲在线机器上建节点。机器上还有未结束的节点或系统实例时不能移出池（先在后台排空 / 移除节点）。池机器数量应 ≥ 全部上线模型的副本数之和，不足时告警 `llm_pool_short`（告警需人工处理，不会自动关闭）。
+- **上线顺序**：先在「节点与机器池」把机器加入池，再在「模型」里上线模型（或调大副本数）。反过来做，上线的那一刻池里没有空闲机器，会先发一条 `llm_pool_short`。上线后 Controller 约 10 秒内建节点：系统实例开通 → 部署 `vllm-node` → 下载模型（Qwen3-4B 约 8 GB，真机约 4 分钟）→ vLLM 启动（约 2 分钟）→ 节点「就绪」，控制台模型卡片变为「可用」。节点释放时会洗机，模型缓存不保留，下次建节点重新下载。
+- **下线与腾出机器**：模型「下线」（上线中的模型副本数不能改为 0）→ 节点排空（等在途请求结束，最多 60 秒）→ 洗机 → 机器回到池内空闲；然后在「节点与机器池」点「移出」。移出后机器是**未分组**（不会回到入池前的机组），已可即时出租；要回到原来的出租机组，在「机组」里重新分配。节点或系统实例未结束时「移出」被拒（`llm_pool_machine_busy`）。
 - **网关与 Controller 放在同一个副本**：网关的 RPM / TPM / 并发限额与节点在途计数都在**进程内**；Controller 排空节点（模型下线、副本数调小、后台排空 / 重建 / 移除）时，看的就是本进程里该节点的在途请求数，归零才释放机器。因此 Controller 只在 `SPARK_LLM_GATEWAY=on` 的副本上启动（网关 off 的副本即使 `SPARK_LLM_CONTROLLER=on` 也只打 WARN、不启动）。
   - **推荐**：用户 API 单副本，`SPARK_LLM_GATEWAY` 与 `SPARK_LLM_CONTROLLER` 都保持 on。
   - 必须多副本时，二选一：只在一个副本上 `SPARK_LLM_GATEWAY=on`（其它副本两个开关都 off），并在前置代理把 `/v1` 全部路由到它；或多个副本都开网关，把后台的用户限额按副本数折算（例如 2 副本各设一半）——此时 Controller 咨询锁只让一个副本工作，**它排空时只看得到自己进程的在途请求**，别的副本上仍在进行的请求可能在节点释放时被中断（中断的请求记 `upstream_error`、不收费）。

@@ -199,6 +199,23 @@ describe('NodesTab 节点', () => {
     expect(inBody('llm-node-deployment-log')!.textContent).toBe('ok')
   })
 
+  it('抽屉「错误」只显示错误码对应文案：运行中部署的 message（healthy）不当作错误', async () => {
+    let dep: Record<string, unknown> = { id: 'd1', state: 'running', health: 'ok', phase: 'health', progress: 100, message: 'healthy', error_code: '', log_tail: '', app_name: 'vllm-node', version: '1' }
+    const base = get.getMockImplementation()!
+    get.mockImplementation(async (path: string, query?: Record<string, unknown>) => (path.startsWith('/deployments/') ? { deployment: dep, events: [] } : base(path, query)))
+    await mountTab()
+    await allById('llm-node-open')[0].trigger('click')
+    await flushPromises()
+    expect(inBody('llm-node-deployment-err')!.textContent).toBe('—')
+    wrapper!.unmount()
+    document.body.innerHTML = ''
+    dep = { ...dep, state: 'failed', error_code: 'crashed', message: '服务进程已退出' }
+    await mountTab()
+    await allById('llm-node-open')[0].trigger('click')
+    await flushPromises()
+    expect(inBody('llm-node-deployment-err')!.textContent).toContain('服务进程已退出')
+  })
+
   it('?node=<id> 直接打开抽屉；关闭后去掉参数', async () => {
     await mountTab(true, '/llm?tab=nodes&node=n2')
     expect(get).toHaveBeenCalledWith('/llm/nodes/n2')
