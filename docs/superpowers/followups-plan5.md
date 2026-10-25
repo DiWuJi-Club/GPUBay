@@ -65,6 +65,7 @@
 
 ### 测试基础设施
 - e2e project 顺序依赖：全量用例共享一个嵌入式数据库和一个假时钟，只在 console-desktop → console-mobile → admin 的顺序下验证过。会改全局状态且不恢复的用例：A-INS-07 推进 301 秒、A-FIN-04 推进接近 24 小时、A-AUTH / A-DASH 会话过期用例推进 13 小时、A-ALT-01 让全部机器失联一轮、控制台每个 project 推进约 1 天各若干次（`console/instances.spec.ts:18,94`，`console/instance-detail.spec.ts:76,136,169`，C-DET-10 的 `:274,308`）、C-MKT-06 / A-INS-04 把当时所有空闲机器置为维护。说明写在 `web/playwright.config.ts` 的 `projects` 上方；调整顺序或新增此类用例时要跑完整 `make check`。
+  - 计划 12（AI 管家，`console/butler.spec.ts`、`admin/butler.spec.ts`）每个控制台 project 各推进：C-BOT-01 61 秒（验证码冷却）、C-BOT-06 / C-BOT-08 各 11 分钟（确认卡过期）、C-BOT-09 1 天（额度次日恢复）、C-BOT-11 1 秒（两段对话的最后消息时间错开）；C-BOT-09、A-BOT-01、A-BOT-05 开头用 `helpers/butler.ts` 的 `ensureFarFromMidnight` 在离北京时间午夜不足 1 小时时先推过午夜（最多约 1 小时）。管家设置是全局的：每个用例 beforeEach 经 `/hooks/butler/settings {defaults: true}` 复位（与当前相同则不写审计），A-BOT-03 关闭后在 finally 里恢复；按日用量 / 仪表盘是全站数字，只与接口值或增量比对。
 - e2e-server 的 `waitListening` 可能把占着端口的旧进程当成已就绪（应先 `net.Listen`）。
 - e2e 钩子：`/hooks/users` 非原子；钩子服务错误一律 500；重复 `serial_prefix` 会部分插入；分块传输的空请求体返回 400；钩子单测对 `totp_secret` 只做了弱断言。
 - 覆盖表核对器识别不了 `test['skip']` 或 `const t = test` 这类别名写法。

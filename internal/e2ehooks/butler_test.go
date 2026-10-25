@@ -185,9 +185,33 @@ func TestButlerSettingsHook(t *testing.T) {
 	if out["enabled"] != true || out["notice"] != "" || out["daily_token_limit"] != float64(300000) || out["max_turns"] != float64(60) {
 		t.Fatalf("defaults = %v", out)
 	}
-	var n int
-	if err := e.a.Fleet.Pool().QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action = 'butler.settings' AND actor_type = 'system'`).Scan(&n); err != nil || n != 3 {
-		t.Fatalf("system butler.settings audits = %d %v, want 3", n, err)
+	audits := func() int {
+		var n int
+		if err := e.a.Fleet.Pool().QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action = 'butler.settings' AND actor_type = 'system'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := audits(); n != 3 {
+		t.Fatalf("system butler.settings audits = %d, want 3", n)
+	}
+	// 合并后与当前设置相同：不保存、不写审计（每个用例开始前的 {defaults: true} 不刷审计页），返回值仍是当前设置
+	for _, body := range []map[string]any{{"defaults": true}, {"notice": "  "}, {"enabled": true, "max_turns": 60}, {}} {
+		out = e.must("POST", "/hooks/butler/settings", body)
+		if out["enabled"] != true || out["notice"] != "" || out["daily_token_limit"] != float64(300000) || out["max_turns"] != float64(60) {
+			t.Fatalf("no-op %v = %v", body, out)
+		}
+	}
+	if n := audits(); n != 3 {
+		t.Fatalf("no-op settings wrote audits: %d, want 3", n)
+	}
+	// 缓存过时也以库里为准：别处改了库（绕过缓存）后，相同的请求仍会保存
+	if _, err := e.a.Fleet.Pool().Exec(ctx, `UPDATE butler_settings SET enabled = false`); err != nil {
+		t.Fatal(err)
+	}
+	out = e.must("POST", "/hooks/butler/settings", map[string]any{"defaults": true})
+	if out["enabled"] != true || audits() != 4 {
+		t.Fatalf("after external change: %v audits=%d, want enabled and 4 audits", out, audits())
 	}
 }
 

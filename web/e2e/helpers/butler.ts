@@ -17,6 +17,18 @@ export async function resetButler() {
   await hooks.butlerSettings({ defaults: true })
 }
 
+const HOUR = 3600_000
+const DAY = 24 * HOUR
+
+/**
+ * 用量按北京时间自然日统计：离午夜不足 1 小时就先把假时钟推过午夜，让整个用例（只推进几分钟）落在同一天
+ * （与 admin/bookings.spec.ts A-BKG-06 的做法一致）。读「今天」或写当日用量之前调用。
+ */
+export async function ensureFarFromMidnight() {
+  const toMidnight = DAY - ((await hooks.clock()).getTime() + 8 * HOUR) % DAY
+  if (toMidnight < HOUR) await hooks.advance(Math.ceil(toMidnight / 1000) + 60)
+}
+
 /** 当前可见的聊天区（抽屉或 /butler 页）。 */
 export function chat(page: Page): Locator {
   return page.getByTestId('butler-chat').filter({ visible: true })
@@ -30,7 +42,7 @@ export async function openDrawer(page: Page, info: TestInfo): Promise<Locator> {
     await expect(page.getByTestId('butler-page')).toBeVisible()
   } else {
     await page.getByTestId('butler-launcher').click()
-    await expect(page.locator('.butler-drawer')).toBeVisible()
+    await expect(page.getByTestId('butler-drawer')).toBeVisible()
   }
   const c = chat(page)
   await expect(c).toBeVisible()
@@ -44,8 +56,8 @@ export async function closeDrawer(page: Page, info: TestInfo, mobileBackTo: stri
     await expect(page.getByTestId('butler-page')).toHaveCount(0)
     return
   }
-  await page.locator('.butler-drawer .el-drawer__close-btn').click()
-  await expect(page.locator('.butler-drawer')).toBeHidden()
+  await page.getByTestId('butler-drawer').locator('.el-drawer__close-btn').click() // el-drawer 自带的关闭按钮没有 testid
+  await expect(page.getByTestId('butler-drawer')).toBeHidden()
 }
 
 /** 在输入框里写入并点「发送」，等用户气泡出现。 */
@@ -87,10 +99,6 @@ export function replyText(text: string, extra: { usage?: { input_tokens: number;
   return hooks.butlerReply({ text, ...extra })
 }
 
-/** 注入一轮工具调用（模型「决定」调用 name）；之后的轮次回到队列 / 规则。 */
-export function replyTool(name: string, args: Record<string, unknown> = {}) {
-  return hooks.butlerReply({ tool_calls: [{ name, args }] })
-}
 
 /** 带提示注入的部署日志：install 输出注入文本后失败（guard.Suspicious 与 mock 规则 0 都能识别）。 */
 export const INJECTION_APP_SCRIPT = `#!/bin/sh

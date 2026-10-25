@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { adminApi, createAdmin, expectAdminUrl, getJSON, loginAdmin, logout } from '../helpers/admin'
 import { cleanupApps } from '../helpers/apps'
-import { INJECTION_APP_SCRIPT, resetButler, seedRunningInstanceWithFailedApp, sendViaApi } from '../helpers/butler'
+import { INJECTION_APP_SCRIPT, ensureFarFromMidnight, resetButler, seedRunningInstanceWithFailedApp, sendViaApi } from '../helpers/butler'
 import { loginConsole, seedUser, toast, userApi } from '../helpers/console'
 import { CONSOLE_URL, hooks } from '../helpers/hooks'
 import { runStamp } from '../helpers/phone'
@@ -18,6 +18,7 @@ type UsageRow = { day: string; requests: number; input_tokens: number; output_to
 type UsageReport = { from: string; to: string; items: UsageRow[]; totals: Omit<UsageRow, 'day' | 'users'> }
 
 test('A-BOT-01 用量页：按日合计与接口一致，点某天看按用户用量', async ({ page }) => {
+  await ensureFarFromMidnight() // 「今天」与「昨天」在整个用例里不变
   const u = await seedUser()
   const now = await hooks.clock()
   const today = cstDate(now)
@@ -164,6 +165,7 @@ test('A-BOT-04 用户详情「AI 管家」卡：对话数、近 30 天 token 与
 
 test('A-BOT-05 仪表盘「AI 管家（今日）」三个数字随当日用量变化', async ({ page }) => {
   type Dash = { butler_requests_today: number; butler_tokens_today: number; butler_failures_today: number }
+  await ensureFarFromMidnight() // 基线与增量都在同一个「今天」
   const admin = await createAdmin('finance')
   const ctx = await adminApi(admin)
   const before = await getJSON<Dash>(ctx, '/admin/api/v1/dashboard')

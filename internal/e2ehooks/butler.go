@@ -208,6 +208,7 @@ func (s *Server) butlerUsage(ctx context.Context, body json.RawMessage) (any, er
 // butlerSettings：{defaults?: bool, enabled?, daily_token_limit?, max_turns?, notice?} → 以当前设置（defaults: true 时以迁移默认值）
 // 为底合并给出的字段，经 Store.UpdateSettings 保存（同一校验，校验失败 → 400；审计 butler.settings，actor = system）并让本进程缓存失效；
 // 返回保存后的 {"enabled","daily_token_limit","max_turns","notice"}。
+// 合并结果与库里的当前设置相同（如每个用例开始前的 {defaults: true}）时不保存，也就不写审计：免得审计页被系统行刷屏。
 func (s *Server) butlerSettings(ctx context.Context, body json.RawMessage) (any, error) {
 	bt, err := s.butlerService()
 	if err != nil {
@@ -223,12 +224,14 @@ func (s *Server) butlerSettings(ctx context.Context, body json.RawMessage) (any,
 	if err != nil {
 		return nil, err
 	}
-	cur := butler.DefaultSettings()
-	if !req.Defaults {
-		bt.InvalidateSettings() // 以库里的当前值为底，不用可能过时的缓存
-		if cur, err = bt.Settings(ctx); err != nil {
-			return nil, err
-		}
+	bt.InvalidateSettings() // 以库里的当前值为底，不用可能过时的缓存
+	stored, err := bt.Settings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cur := stored
+	if req.Defaults {
+		cur = butler.DefaultSettings()
 	}
 	if req.Enabled != nil {
 		cur.Enabled = *req.Enabled
@@ -242,6 +245,9 @@ func (s *Server) butlerSettings(ctx context.Context, body json.RawMessage) (any,
 	if req.Notice != nil {
 		cur.Notice = *req.Notice
 	}
+	if sameSettings(cur, stored) {
+		return settingsOut(stored), nil
+	}
 	v, err := bt.UpdateSettings(ctx, audit.Actor{}, cur)
 	if err != nil {
 		if e := apperr.As(err); e != nil && e.Status == 400 {
@@ -250,5 +256,15 @@ func (s *Server) butlerSettings(ctx context.Context, body json.RawMessage) (any,
 		return nil, err
 	}
 	bt.InvalidateSettings()
-	return map[string]any{"enabled": v.Enabled, "daily_token_limit": v.DailyTokenLimit, "max_turns": v.MaxTurns, "notice": v.Notice}, nil
+	return settingsOut(v), nil
+}
+
+// sameSettings：四个可改字段是否相同（notice 按保存时的去首尾空白比较）。
+func sameSettings(a, b butler.Settings) bool {
+	return a.Enabled == b.Enabled && a.DailyTokenLimit == b.DailyTokenLimit && a.MaxTurns == b.MaxTurns &&
+		strings.TrimSpace(a.Notice) == strings.TrimSpace(b.Notice)
+}
+
+func settingsOut(v butler.Settings) map[string]any {
+	return map[string]any{"enabled": v.Enabled, "daily_token_limit": v.DailyTokenLimit, "max_turns": v.MaxTurns, "notice": v.Notice}
 }

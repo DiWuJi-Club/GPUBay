@@ -1,7 +1,7 @@
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 import { appRow, cleanupApps, listDeployments, ownInstance, seedApps } from '../helpers/apps'
 import {
-  INJECTION_APP_SCRIPT, chat, closeDrawer, expectAssistantContains, expectIdle, gotoButlerPage, historyItem, lastConfirmCard, lastStep, openConversation,
+  INJECTION_APP_SCRIPT, chat, closeDrawer, ensureFarFromMidnight, expectAssistantContains, expectIdle, gotoButlerPage, historyItem, lastConfirmCard, lastStep, openConversation,
   openDrawer, openHistory, replyText, resetButler, seedRunningInstanceWithFailedApp, send,
 } from '../helpers/butler'
 import { isMobile, loginConsole, seedUser, toast } from '../helpers/console'
@@ -52,7 +52,7 @@ test('C-BOT-01 未登录点 AI 管家入口跳登录，登录后回到原页', a
     await expect(page.getByTestId('butler-page')).toBeVisible()
   } else {
     await page.getByTestId('butler-launcher').click()
-    await expect(page.locator('.butler-drawer')).toBeVisible()
+    await expect(page.getByTestId('butler-drawer')).toBeVisible()
   }
   await expect(chat(page).getByTestId('butler-welcome')).toBeVisible()
 })
@@ -114,6 +114,12 @@ test('C-BOT-03 部署 vLLM：确认卡显示应用与生成的密钥，确认后
   await expect(lastStep(page, 'deploy_app')).toHaveText('✓ 部署应用')
   await expect(chat(page).getByTestId('butler-confirm-card')).toHaveCount(0)
   await expect(chat(page)).not.toContainText(key!)
+  // 接口层面也不再返回明文密钥（对话详情的文本、步骤与工具结果摘要都已脱敏）
+  const convs = ((await (await api.get('/api/v1/butler/conversations')).json()) as { items: { id: string }[] }).items
+  expect(convs).toHaveLength(1)
+  const detail = await api.get(`/api/v1/butler/conversations/${convs[0].id}`)
+  expect(detail.ok()).toBe(true)
+  expect(await detail.text()).not.toContain(key!)
 })
 
 test('C-BOT-04 续费卡显示套餐日价，取消 → 「用户拒绝」收尾文本，余额不变', async ({ page }, info) => {
@@ -224,6 +230,7 @@ test('C-BOT-08 注入：部署日志里有注入文本 → 管家只提出释放
 })
 
 test('C-BOT-09 今日额度用完：横幅与 429 文案；次日恢复', async ({ page }, info) => {
+  await ensureFarFromMidnight() // 用量写在「今天」：用例中途跨午夜会提前恢复
   const u = await seedUser()
   await hooks.butlerUsage({ user_id: u.id, input_tokens: 300_000 })
   await loginConsole(page, u.phone)
