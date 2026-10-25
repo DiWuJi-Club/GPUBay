@@ -126,8 +126,12 @@ func (h writeHandlers) guarded(fn execFunc) execFunc {
 	}
 }
 
+// ExecutedNote 写在写工具的执行结果里：执行结果作为原工具调用的结果回填，小模型分不清「出卡」与「已执行」，
+// 真机验收（Qwen3-4B）里执行成功后仍回答「已生成确认卡，请核对后确认」，并在后续轮次照抄这句而不再调用写工具。
+const ExecutedNote = "用户已在确认卡上确认，平台已执行完成"
+
 func okResult(name string, c Caller, v map[string]any, ref string) (Result, error) {
-	v["ok"] = true
+	v["ok"], v["executed"], v["note"] = true, true, ExecutedNote
 	return wrapOne(name, c, v, smallLimit, ref)
 }
 
