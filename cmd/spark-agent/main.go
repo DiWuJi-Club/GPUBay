@@ -280,7 +280,9 @@ func runAgent(ctx context.Context, args []string, out io.Writer) error {
 	collector := &metrics.Collector{Run: runner, ReadFile: os.ReadFile}
 	hostname, _ := os.Hostname()
 	c := client.New(client.Config{Addr: cfg.Platform, TLS: tc, Version: agentVersion, Hostname: hostname, LocalIPs: localIPs},
-		ex, func(ctx context.Context) metrics.Metrics { return collector.Collect(ctx, ex.DataMount()) }, log)
+		ex, func(ctx context.Context) (metrics.Metrics, []metrics.InstanceMetrics) {
+			return collector.Collect(ctx, ex.Mounts())
+		}, log)
 	exDone := make(chan struct{})
 	go func() { defer close(exDone); ex.Run(ctx) }()
 	log.Info("spark-agent running", "platform", cfg.Platform, "version", agentVersion, "fake", *fake)

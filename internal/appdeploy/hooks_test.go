@@ -319,7 +319,7 @@ func TestPrepareAndQueueInstall(t *testing.T) {
 	other, _ := e.publishedApp("webui", specPorts(8080), goodScript, []int64{e.otherImage()})
 
 	prep := func(appID, imageID int64, env map[string]string) (rental.InstallPlan, error) {
-		return e.svc.PrepareInstall(e.ctx, e.pool, appID, imageID, env)
+		return e.svc.PrepareInstall(e.ctx, e.pool, appID, imageID, env, nil)
 	}
 	for _, id := range []int64{draft.ID, 999999} {
 		if _, err := prep(id, e.imageID, nil); !errors.Is(err, apperr.ErrAppNotFound) {

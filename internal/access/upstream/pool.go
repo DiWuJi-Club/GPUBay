@@ -27,7 +27,7 @@ var ErrClosed = errors.New("upstream: 连接池已关闭")
 
 type Config struct {
 	Signer      ssh.Signer
-	Port        int           // 容器 sshd 在机器上的端口
+	Port        int           // 容器 sshd 在机器上的默认端口（Target.Port 为 0 时用）
 	DialTimeout time.Duration // 零值 10s
 	Keepalive   time.Duration // 零值 30s；连续 2 次无回应即关闭
 	Log         *slog.Logger
@@ -38,6 +38,7 @@ type Target struct {
 	InstanceID string
 	LanIP      string
 	HostPubkey string // 为空 → 首连信任并写回
+	Port       int    // 容器 sshd 在机器上的端口（rental.Instance.SSHPort）；0 → Config.Port
 }
 
 // DialError 表示到达不了容器 sshd（拨号失败、握手失败、主机密钥不符）；端口未监听不算。
@@ -52,6 +53,7 @@ func (e *DialError) Unwrap() error { return e.Err }
 type entry struct {
 	client  *ssh.Client
 	lanIP   string
+	port    int    // 建立连接时实际拨的 sshd 端口
 	hostPub string // 建立连接时校验通过的主机公钥（固定公钥或首连信任的公钥）
 	stop    chan struct{}
 	once    sync.Once // dropEntry 可能被 keepalive 与 Dial 并发调用
@@ -115,6 +117,10 @@ func (p *Pool) client(ctx context.Context, t Target) (*ssh.Client, error) {
 		return nil, &DialError{InstanceID: t.InstanceID, Err: fmt.Errorf("机器内网地址无效 %q", t.LanIP)}
 	}
 	want := strings.TrimSpace(t.HostPubkey)
+	port := t.Port
+	if port <= 0 {
+		port = p.cfg.Port
+	}
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -136,13 +142,14 @@ func (p *Pool) client(ctx context.Context, t Target) (*ssh.Client, error) {
 	e := p.conns[t.InstanceID]
 	p.mu.Unlock()
 	// 路由公钥为空（存量实例、路由表未刷新）时沿用连接上已校验的公钥
-	if e != nil && e.lanIP == t.LanIP && (want == "" || want == e.hostPub) {
+	// 池键仍是实例 ID：地址、sshd 端口或主机公钥任一变化都丢弃旧连接重拨
+	if e != nil && e.lanIP == t.LanIP && e.port == port && (want == "" || want == e.hostPub) {
 		return e.client, nil
 	}
 	if e != nil {
-		p.dropEntry(t.InstanceID, e) // 登记地址或主机公钥变了
+		p.dropEntry(t.InstanceID, e) // 登记地址、端口或主机公钥变了
 	}
-	addr := net.JoinHostPort(t.LanIP, strconv.Itoa(p.cfg.Port))
+	addr := net.JoinHostPort(t.LanIP, strconv.Itoa(port))
 	trusted := want
 	tofu := func(pub string) error {
 		ok, err := p.store.SetSSHHostPubkeyIfEmpty(ctx, t.InstanceID, pub)
@@ -191,7 +198,7 @@ func (p *Pool) client(ctx context.Context, t Target) (*ssh.Client, error) {
 	}
 	nc.SetDeadline(time.Time{})
 	client := ssh.NewClient(cc, chans, reqs)
-	e = &entry{client: client, lanIP: t.LanIP, hostPub: trusted, stop: make(chan struct{})}
+	e = &entry{client: client, lanIP: t.LanIP, port: port, hostPub: trusted, stop: make(chan struct{})}
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()

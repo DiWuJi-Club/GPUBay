@@ -28,6 +28,7 @@ import (
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
@@ -108,9 +109,12 @@ type App struct {
 	AppCatalog *appdeploy.Catalog
 	AppRunner  *appdeploy.Runner // 部署后台执行者；由 cmd/platform 按 SPARK_APP_RUNNER 启动
 
-	LLM           *llm.Service    // Token 商城（计划 9）；Settle 挂在清扫器上，Router 由 RunAccessLoops 刷新
-	LLMController *llm.Controller // 节点生命周期；由 cmd/platform 按 SPARK_LLM_CONTROLLER 启动（e2e-server 不启动，用钩子驱动）
-	LLMGateway    *llmgw.Server   // /v1 网关；SPARK_LLM_GATEWAY=off 时 nil。cmd/platform 停机时与公网 http.Server.Shutdown 并发调用它的 Shutdown
+	LLM               *llm.Service       // Token 商城（计划 9）；Settle 挂在清扫器上，Router 由 RunAccessLoops 刷新
+	LLMController     *llm.Controller    // 节点生命周期；由 cmd/platform 按 SPARK_LLM_CONTROLLER 启动（e2e-server 不启动，用钩子驱动）
+	LLMGateway        *llmgw.Server      // /v1 网关；SPARK_LLM_GATEWAY=off 时 nil。cmd/platform 停机时与公网 http.Server.Shutdown 并发调用它的 Shutdown
+	Workflows         *comfywf.Catalog   // ComfyUI 工作流目录（计划 11）
+	WorkflowInstaller *comfywf.Installer // 部署上的工作流集合（添加 / 更新 / 移除）
+	WorkflowRuns      *comfywf.Runs      // 快速出图代理
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
@@ -209,7 +213,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
-		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SystemUserID: systemUserID,
+		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SystemUserID: systemUserID, SSHBasePort: cfg.UpstreamSSHPort,
 	})
 	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r, Alerts: f})
 	ids.SetReferral(ref)
@@ -313,13 +317,22 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	upstreamPool := upstream.New(upstream.Config{Signer: upstreamSigner, Port: cfg.UpstreamSSHPort, Log: log}, r)
 	// 应用一键部署：服务需要上游连接池（实时日志）与入口地址；接上 rental 钩子之后带 app_id 的下单才可用（noop 钩子报 app_not_found）。
 	// 应用根目录生产用默认的容器路径 /root/data（appdeploy.DefaultAppRoot）；测试 / e2e 经 Options 注入，Runner 与「查看日志」用同一个。
-	apps := appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
-		Upstream: upstreamPool, PortURL: ingressAuth.PortURL, HFEndpoint: cfg.AppHFEndpoint, PipIndexURL: cfg.AppPipIndexURL,
-		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor, SystemUserID: systemUserID})
+	// 计划 11：工作流目录与四个 appdeploy 钩子（部署包 / 状态回写 / 视图 / 下单预装解析）在 appdeploy.NewService 之前接上。
+	wfCat := comfywf.NewCatalog(pool, clk, uploads, log)
+	appDeps := appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
+		Upstream: upstreamPool, PortURL: ingressAuth.PortURL, HFEndpoint: cfg.AppHFEndpoint, PipIndexURL: cfg.AppPipIndexURL, GitMirror: cfg.AppGitMirror,
+		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor, SystemUserID: systemUserID}
+	comfywf.NewHooks(pool, wfCat).Wire(&appDeps)
+	apps := appdeploy.NewService(appDeps)
 	r.SetAppHooks(apps)
 	appRunner := appdeploy.NewRunner(apps, upstreamPool, appdeploy.RunnerConfig{HealthAddr: opt.AppHealthAddr, AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor})
 	srv.Apps, srv.AppsLimit = apps, authorizeLimit // 零值取默认（每用户每小时 60 次写）；DisableRateLimits 时为 noRateLimit
 	adminSrv.Apps, adminSrv.AppCatalog = apps, appCat
+	// 快速出图代理与 Runner 健康检查走同一个上游连接池（Pool.Dial 到容器内 127.0.0.1:<ComfyUI 端口>）
+	wfInst := comfywf.NewInstaller(pool, clk, wfCat, apps, appCat, log)
+	wfRuns := comfywf.NewRuns(pool, clk, wfCat, apps, comfywf.NewClient(upstreamPool), log)
+	srv.Workflows, srv.Installer, srv.Runs = wfCat, wfInst, wfRuns
+	adminSrv.Workflows, adminSrv.Installer = wfCat, wfInst
 	// Token 商城：节点即系统实例上的 vllm-node 部署，探测与转发走同一个上游连接池。网关（/v1）由 SPARK_LLM_GATEWAY 决定是否挂载；
 	// 必须在 srv.Router() 之前设置（Router 按字段是否为 nil 注册路由）。
 	llmSvc := llm.NewService(llm.Deps{Pool: pool, Clock: clk, Log: log, Box: box, Wallet: w, Users: ids, Rental: r, Apps: apps, AppCat: appCat,
@@ -342,7 +355,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
 		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner,
-		LLM: llmSvc, LLMController: llmCtl, LLMGateway: llmGW}, nil
+		Workflows: wfCat, WorkflowInstaller: wfInst, WorkflowRuns: wfRuns, LLM: llmSvc, LLMController: llmCtl, LLMGateway: llmGW}, nil
 }
 
 // upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。

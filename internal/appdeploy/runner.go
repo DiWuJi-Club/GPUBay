@@ -191,10 +191,11 @@ type target struct {
 	LanIP      string
 	HostPubkey string
 	MachineID  int64
+	SSHPort    int // 容器 sshd 端口（rental.Service.InstanceSSHPort）；0 → 上游池默认端口
 }
 
 func (t target) upstream(id string) upstream.Target {
-	return upstream.Target{InstanceID: id, LanIP: t.LanIP, HostPubkey: t.HostPubkey}
+	return upstream.Target{InstanceID: id, LanIP: t.LanIP, HostPubkey: t.HostPubkey, Port: t.SSHPort}
 }
 
 func readTarget(ctx context.Context, q db.Querier, instanceID string) (target, error) {
@@ -295,6 +296,7 @@ func (r *Runner) step(ctx context.Context, id string, now time.Time) (bool, erro
 	if err != nil {
 		return false, err
 	}
+	tg.SSHPort = r.s.instanceSSHPort(d.InstanceID)
 	ut := tg.upstream(d.InstanceID)
 	switch act {
 	case actWait:
@@ -330,7 +332,7 @@ func (r *Runner) writeback(ctx context.Context, d Deployment, fn func(tx pgx.Tx,
 		if _, err := tx.Exec(ctx, `SELECT 1 FROM instances WHERE id = $1 FOR KEY SHARE`, d.InstanceID); err != nil {
 			return err
 		}
-		cur, err := lockDeployment(ctx, tx, d.ID)
+		cur, err := LockDeployment(ctx, tx, d.ID)
 		if errors.Is(err, apperr.ErrNotFound) {
 			return nil
 		}
@@ -772,6 +774,9 @@ func (r *Runner) stepPoll(ctx context.Context, d Deployment, ut upstream.Target,
 			if _, err := tx.Exec(ctx, `UPDATE app_deployments SET state = 'running', phase = $2, progress = 100, message = $3, health = 'ok', error_code = '',
 				log_tail = $4, status_seq = $5, unreachable_count = 0, crash_count = 0, finished_at = $6, next_poll_at = $7, updated_at = $6,
 				row_version = row_version + 1 WHERE id = $1`, cur.ID, phase, msg, logTail, st.Seq, now, now.Add(HealthInterval)); err != nil {
+				return err
+			}
+			if err := r.s.onTransition(ctx, tx, cur, StateRunning, now); err != nil {
 				return err
 			}
 			return addEvent(ctx, tx, cur.ID, cur.State, StateRunning, "部署完成", now)

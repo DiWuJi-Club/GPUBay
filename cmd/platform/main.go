@@ -17,11 +17,13 @@ import (
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/secretbox"
+	"spark-cloud/internal/storage"
 )
 
 func main() {
@@ -49,7 +51,7 @@ func main() {
 // adminMain 执行 `platform admin ...`：使用与服务相同的配置连接数据库（会先执行迁移）。
 func adminMain(args []string) error {
 	if len(args) > 0 && args[0] == "gen-upstream-key" { // 不需要数据库
-		return runAdmin(context.Background(), nil, nil, args, os.Stdout, nil)
+		return runAdmin(context.Background(), nil, nil, nil, args, os.Stdout, nil)
 	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -74,7 +76,15 @@ func adminMain(args []string) error {
 	svc := admin.NewService(admin.Deps{Pool: pool, Clock: clock.Real{}, Box: box})
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	cat := appdeploy.NewCatalog(pool, clock.Real{}, fleet.NewService(pool, clock.Real{}), catalog.NewService(pool), log)
-	return runAdmin(ctx, svc, cat, args, os.Stdout, terminalPrompter(os.Stdin, os.Stdout))
+	var wf *comfywf.Catalog
+	if len(args) > 0 && args[0] == "workflow" { // 工作流导入要存封面：与服务同一个上传目录（只在需要时创建）
+		disk, err := storage.NewLocalDisk(cfg.UploadDir)
+		if err != nil {
+			return err
+		}
+		wf = comfywf.NewCatalog(pool, clock.Real{}, storage.NewService(pool, clock.Real{}, disk), log)
+	}
+	return runAdmin(ctx, svc, cat, wf, args, os.Stdout, terminalPrompter(os.Stdin, os.Stdout))
 }
 
 func run(log *slog.Logger) error {

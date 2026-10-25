@@ -78,6 +78,13 @@ var expectedRoutes = []struct {
 	{"GET", "/llm/keys", all}, {"POST", "/llm/keys/{id}/disable", ops},
 	{"GET", "/llm/usage", finance}, {"GET", "/llm/usage/export", finance}, {"GET", "/llm/usage/daily", finance},
 	{"GET", "/llm/settlements", finance}, {"GET", "/llm/summary", all},
+	// 计划 11 D6：全部角色可读工作流目录 / 版本详情 / 安装列表；super 维护目录与版本、上传封面；发布 = super + 动态码
+	{"GET", "/workflows", all}, {"POST", "/workflows", super}, {"GET", "/workflows/{id}", all}, {"PUT", "/workflows/{id}", super},
+	{"DELETE", "/workflows/{id}", super}, {"GET", "/workflows/{id}/cover", all}, {"POST", "/workflows/{id}/cover", super},
+	{"GET", "/workflows/{id}/installs", all},
+	{"GET", "/workflows/{id}/versions", all}, {"POST", "/workflows/{id}/versions", super},
+	{"GET", "/workflows/{id}/versions/{vid}", all}, {"PUT", "/workflows/{id}/versions/{vid}", super},
+	{"POST", "/workflows/{id}/versions/{vid}/publish", super},
 }
 
 func roleKey(roles []admin.Role) string {
@@ -128,7 +135,14 @@ func TestPermissionMatrix(t *testing.T) {
 			if r.method != "GET" {
 				body = map[string]any{}
 			}
-			code, out := c.do(r.method, path, body)
+			var code int
+			var out map[string]any
+			if r.method == "POST" && r.path == "/workflows/{id}/cover" { // 封面上传只收 multipart（字段名不对 → 有权角色 400）
+				resp, o := c.upload(path, "x", "x.png", []byte("x"))
+				code, out = resp.StatusCode, o
+			} else {
+				code, out = c.do(r.method, path, body)
+			}
 			allowed := slices.Contains(r.roles, role)
 			name := fmt.Sprintf("%s %s as %s", r.method, path, role)
 			switch {

@@ -113,18 +113,19 @@ describe('ConsoleLayout 导航', () => {
     return mount(ConsoleLayout, { global: { plugins: [router, ElementPlus] } })
   }
 
-  it('电脑侧边菜单第 5 项是 Token 商城 → /tokens', () => {
+  it('电脑侧边菜单最后一项是 Token 商城 → /tokens', () => {
     const w = mountLayout(false)
     const items = w.findAll('[data-testid^="menu-"]')
-    expect(items.map((i) => i.attributes('data-testid'))).toEqual(['menu-market', 'menu-instances', 'menu-wallet', 'menu-account', 'menu-tokens'])
+    expect(items.map((i) => i.attributes('data-testid'))).toEqual(['menu-market', 'menu-workflows', 'menu-instances', 'menu-wallet', 'menu-account', 'menu-tokens'])
     const tokens = w.get('[data-testid="menu-tokens"]')
     expect(tokens.text()).toContain('Token 商城')
     expect(tokens.attributes('href')).toBe('/tokens')
   })
 
-  it('手机底部导航 5 项，含 Token 商城', () => {
+  it('手机底部导航 6 项，Token 商城与工作流市场用短名', () => {
     const w = mountLayout(true)
-    expect(w.findAll('[data-testid^="tabbar-"]')).toHaveLength(5)
-    expect(w.get('[data-testid="tabbar-tokens"]').text()).toContain('Token 商城')
+    expect(w.findAll('[data-testid^="tabbar-"]')).toHaveLength(6)
+    expect(w.get('[data-testid="tabbar-tokens"]').text()).toBe('Token')
+    expect(w.get('[data-testid="tabbar-workflows"]').text()).toBe('工作流')
   })
 })

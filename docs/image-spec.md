@@ -15,6 +15,7 @@ Agent 创建容器时用 `--entrypoint /.spark/init.sh` 覆盖镜像入口：`in
 - `/root/data`：实例数据盘（ext4，大小见后台配置，默认 2TiB），持久化，用户大文件放这里；容器可写层（`/` 下其它路径）不持久，也没有限额，不要往里写大文件。
 - `/.spark`（只读）：`authorized_keys`、`hostkeys/`、`init.sh`。
 - 内存上限 = 机器内存 - 8GiB（`/sys/fs/cgroup/memory.max`），无 swap；`--shm-size` = 机器内存一半；`pids-limit 32768`。
+- GPU 内存：GB10 是统一内存，`cudaMalloc` 分配的页**不计入**容器 cgroup（计划 10 PoC 实测），`cudaMallocManaged` 与普通主机内存计入；`nvidia-smi` 的显存列为 `Not Supported`，`cudaMemGetInfo` 返回整机数值。整机实例独占 GPU，这不影响使用；共享机因此搁置（见 `docs/superpowers/acceptance-plan10.md`）。
 - 网络：专用网桥 `spark0`，只能访问公网与白名单内网地址（Harbor、HF 镜像站等），不能访问宿主机与机房内网；DNS 由平台下发；没有 IPv6。
 - SSH 端口 22 发布到机器内网 IP 的上游 SSH 端口（`SPARK_UPSTREAM_SSH_PORT`，默认 2222）；用户经平台 SSH 网关（`ssh ins-xxxxxxxx@ssh.<domain>`）登录，Web 端口经平台入口访问，都只由控制面持有的上游私钥连入。
 - sftp 由 sshd 内置实现（`Subsystem sftp internal-sftp`）提供，镜像**不需要** `openssh-sftp-server`；`scp`（OpenSSH ≥ 9 默认走 SFTP）、`sftp`、`rsync` 都可用。

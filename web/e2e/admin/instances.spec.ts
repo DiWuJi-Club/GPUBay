@@ -9,6 +9,7 @@ import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
 import { cleanupLLM, createPoolMachineAndNode, seedLLMModel } from '../helpers/llm'
 import { yuan } from '../helpers/money'
+import { comfySetup, installedRunning, installWorkflowViaApi, seedExtraWorkflows } from '../helpers/workflows'
 import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
 import { cstTime, duration } from '../helpers/time'
 
@@ -35,9 +36,9 @@ const balanceOf = async (api: APIRequestContext) => ((await (await api.get('/api
 
 const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestId('ainst-id') })
 
-// A-INS-14 部署了应用：afterEach 卸载（其余用例没有部署，清理是空操作）
+// A-INS-14 / 15 部署了应用：afterEach 卸载（其余用例没有部署，清理是空操作）
 test.afterEach(cleanupApps)
-// A-INS-15 造了 Token 商城模型与平台节点：afterEach 下线模型、释放节点、机器移出池
+// A-INS-16 造了 Token 商城模型与平台节点：afterEach 下线模型、释放节点、机器移出池
 test.afterEach(cleanupLLM)
 const rowOf = (page: Page, id: string) => rows(page).filter({ has: page.getByTestId('ainst-id').getByText(id, { exact: true }) })
 
@@ -1000,7 +1001,37 @@ test('A-INS-14 实例详情「应用」卡片：部署状态、进度 / 错误�
   await expect(app(webui.id).getByTestId('admin-instance-app-force-remove')).toBeVisible()
 })
 
-test('A-INS-15 平台节点（系统实例）：列表「平台节点」标签与「不计时」，详情没有退款 / 延长 / 换机 / 改派', async ({ page }) => {
+test('A-INS-15 部署抽屉的工作流表：版本、有新版本、安装状态，名称链接到工作流详情；没装时显示「未安装工作流」', async ({ page }) => {
+  const [c] = await seedExtraWorkflows(1)
+  const s = await comfySetup()
+  await loginAdmin(page, await createAdmin('ops'))
+  await page.goto(`/admin/deployments?instance_id=${s.id}&dep=${s.dep.id}`)
+  await expect(page.getByTestId('deployment-state')).toHaveAttribute('data-state', 'running')
+  await expect(page.getByTestId('adm-dep-workflows')).toContainText('未安装工作流')
+  await expect(page.getByTestId('adm-dep-workflow-row')).toHaveCount(0)
+
+  const [, installedC] = await installedRunning(s, s.wf.a.id, c.id)
+  const nv = await hooks.workflowsVersion({ slug: c.slug }) // C 有新版本
+  await installWorkflowViaApi(s.api, s.id, s.dep.id, s.wf.b.id) // B 待安装（部署重新排队）
+  await page.getByTestId('deployment-refresh').click()
+  await expect(page.getByTestId('deployment-state')).toHaveAttribute('data-state', 'queued')
+  const row = (slug: string) => page.locator(`[data-testid="adm-dep-workflow-row"][data-slug="${slug}"]`)
+  await expect(page.getByTestId('adm-dep-workflow-row')).toHaveCount(3)
+  await expect(row('e2e-wf-a').getByTestId('adm-dep-workflow-name')).toHaveText('E2E 文生图 A')
+  await expect(row('e2e-wf-a').getByTestId('adm-dep-workflow-version')).toHaveText('1.0.0')
+  await expect(row('e2e-wf-a').getByTestId('adm-dep-workflow-state')).toHaveAttribute('data-state', 'installed')
+  await expect(row('e2e-wf-a').getByTestId('adm-dep-workflow-state')).toHaveText('已安装')
+  await expect(row('e2e-wf-a').getByTestId('adm-dep-workflow-update')).toHaveCount(0)
+  await expect(row(c.slug).getByTestId('adm-dep-workflow-version')).toHaveText(installedC.version)
+  await expect(row(c.slug).getByTestId('adm-dep-workflow-update')).toHaveText(`有新版本 ${nv.version}`)
+  await expect(row('e2e-wf-b').getByTestId('adm-dep-workflow-state')).toHaveAttribute('data-state', 'pending')
+  await expect(row('e2e-wf-b').getByTestId('adm-dep-workflow-state')).toHaveText('待安装')
+  await row('e2e-wf-a').getByTestId('adm-dep-workflow-name').click()
+  await expectAdminUrl(page, `/workflows/${s.wf.a.id}`)
+  await expect(page.getByTestId('adm-wf-detail-name')).toHaveText('E2E 文生图 A')
+})
+
+test('A-INS-16 平台节点（系统实例）：列表「平台节点」标签与「不计时」，详情没有退款 / 延长 / 换机 / 改派', async ({ page }) => {
   const m = await seedLLMModel()
   const { machineId, instanceId } = await createPoolMachineAndNode(m)
   await loginAdmin(page, await createAdmin('super')) // 超级管理员：普通实例上这些按钮都有（A-INS-09）

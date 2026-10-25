@@ -18,6 +18,7 @@ func TestValidKey(t *testing.T) {
 	for key, ok := range map[string]bool{
 		goodKey: true,
 		"2026/01/abcdefghijklmnopqrstuvwxyz012345.pdf":    true,
+		"2026/01/abcdefghijklmnopqrstuvwxyz012345.webp":   true,
 		"2026/01/abcdefghijklmnopqrstuvwxyz012345.exe":    false,
 		"2026/01/ABCDEFGHIJKLMNOPQRSTUVWXYZ012345.png":    false,
 		"../01/abcdefghijklmnopqrstuvwxyz012345.png":      false,

@@ -16,16 +16,22 @@ export interface RentForm {
   autoRenew: boolean
   autoRenewDuration: Duration
   appId: number | null
+  /** 计划 11：预装工作流（只在预装 ComfyUI 时非空，RentDialog 换应用时清空） */
+  appWorkflowIds: number[]
 }
 
-/** 预装应用部分：appId 为 null（不预装 / 应用不在目录里）时什么都不带，请求体与计划 6 一致；变量去掉空值交给服务器补默认。 */
-function appPart(appId: number | null, env: Record<string, string>) {
-  return appId != null ? { app_id: appId, app_env: stripEmpty(env) } : {}
+/**
+ * 预装应用部分：appId 为 null（不预装 / 应用不在目录里）时什么都不带，请求体与计划 6 一致；变量去掉空值交给服务器补默认。
+ * 预装工作流（计划 11）只随应用发送，空列表不带 app_workflow_ids（后端：有 app_workflow_ids 无 app_id → 400）。
+ */
+function appPart(appId: number | null, env: Record<string, string>, workflowIds: number[]) {
+  if (appId == null) return {}
+  return { app_id: appId, app_env: stripEmpty(env), ...(workflowIds.length ? { app_workflow_ids: [...workflowIds] } : {}) }
 }
 
 /** POST /orders（单台、立即开始的旧接口）。 */
 export function orderBody(productId: number, f: RentForm, appId: number | null, env: Record<string, string>) {
-  return { product_id: productId, duration: f.duration, image_id: f.imageId, ...appPart(appId, env) }
+  return { product_id: productId, duration: f.duration, image_id: f.imageId, ...appPart(appId, env, f.appWorkflowIds) }
 }
 
 /** POST /bookings。startAt 为 null（立即开始）时不带 start_at。 */
@@ -33,13 +39,13 @@ export function bookingBody(productId: number, f: RentForm, startAt: string | nu
   return {
     product_id: productId, image_id: f.imageId, group_id: f.groupId, machine_id: f.machineId, count: f.count,
     duration: f.duration, quantity: f.quantity, start_at: startAt ?? undefined, auto_renew: f.autoRenew, auto_renew_duration: f.autoRenewDuration,
-    ...appPart(appId, env),
+    ...appPart(appId, env, f.appWorkflowIds),
   }
 }
 
-/** 幂等键的派生参数（序列化为字符串）：变量按提交时的样子（去掉空值）参与。 */
+/** 幂等键的派生参数（序列化为字符串）：变量按提交时的样子（去掉空值）参与；预装工作流按选择顺序参与（与请求体一致）。 */
 export function rentKeySignature(productId: number, f: RentForm, env: Record<string, string>): string {
-  return JSON.stringify([productId, f.groupId, f.count, f.immediate, f.day, f.hour, f.duration, f.quantity, f.imageId, f.machineId, f.autoRenew, f.autoRenewDuration, f.appId, stripEmpty(env)])
+  return JSON.stringify([productId, f.groupId, f.count, f.immediate, f.day, f.hour, f.duration, f.quantity, f.imageId, f.machineId, f.autoRenew, f.autoRenewDuration, f.appId, stripEmpty(env), f.appWorkflowIds])
 }
 
 /**

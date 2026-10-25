@@ -665,7 +665,8 @@ func TestLogLiveAndFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(srv.Close)
-	up := upstream.New(upstream.Config{Signer: signer, Port: srv.Port(), DialTimeout: 500 * time.Millisecond}, e.rental)
+	e.setSSHBasePort(srv.Port()) // 按实例端口拨号；池默认端口是死的
+	up := upstream.New(upstream.Config{Signer: signer, Port: deadPort(t), DialTimeout: 500 * time.Millisecond}, e.rental)
 	t.Cleanup(up.Close)
 	appRoot := filepath.Join(srv.Root(), "root", "data")
 	svc := e.newService(up, appRoot)
@@ -906,7 +907,7 @@ func TestInternalAppCreateOnlySystemUser(t *testing.T) {
 	if _, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.userID, InstanceID: inst.ID, AppID: a.ID}); codeOf(err) != "app_not_found" {
 		t.Fatalf("user create internal = %v", err)
 	}
-	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, a.ID, e.imageID, nil); codeOf(err) != "app_not_found" {
+	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, a.ID, e.imageID, nil, nil); codeOf(err) != "app_not_found" {
 		t.Fatalf("preinstall internal = %v", err)
 	}
 	if n := e.count(`SELECT count(*) FROM app_deployments`); n != 0 {
@@ -939,7 +940,7 @@ func TestInternalAppCreateOnlySystemUser(t *testing.T) {
 	if _, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.userID, InstanceID: inst.ID, AppID: bare.ID}); codeOf(err) != "app_not_found" {
 		t.Fatalf("user create bare internal = %v", err)
 	}
-	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, bare.ID, e.imageID, nil); codeOf(err) != "app_not_found" {
+	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, bare.ID, e.imageID, nil, nil); codeOf(err) != "app_not_found" {
 		t.Fatalf("preinstall bare internal = %v", err)
 	}
 	// SystemUserID 未配置（0）时谁都不能部署内部应用

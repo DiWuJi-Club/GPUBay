@@ -22,8 +22,8 @@ type AppHooks interface {
 	OnInstanceGone(ctx context.Context, tx pgx.Tx, instanceID, reason string, now time.Time) error
 	// OnInstanceMigrated：换机；旧实例部署 → lost，复制到新实例（queued；用户停止的仍为 stopped），不迁移的部署的端口不留在新实例上。
 	OnInstanceMigrated(ctx context.Context, tx pgx.Tx, oldID, newID string, now time.Time) error
-	// PrepareInstall：下单预装校验（应用 / 镜像兼容 / 变量），失败整单不下。
-	PrepareInstall(ctx context.Context, q db.Querier, appID, imageID int64, env map[string]string) (InstallPlan, error)
+	// PrepareInstall：下单预装校验（应用 / 镜像兼容 / 变量；计划 11：workflowIDs 非空时一并预装这些工作流），失败整单不下。
+	PrepareInstall(ctx context.Context, q db.Querier, appID, imageID int64, env map[string]string, workflowIDs []int64) (InstallPlan, error)
 	// QueueInstall：为一台刚插入的实例写一条 queued 部署。
 	QueueInstall(ctx context.Context, tx pgx.Tx, inst Instance, plan InstallPlan, now time.Time) error
 }
@@ -37,7 +37,7 @@ func (noopAppHooks) OnInstanceGone(context.Context, pgx.Tx, string, string, time
 func (noopAppHooks) OnInstanceMigrated(context.Context, pgx.Tx, string, string, time.Time) error {
 	return nil
 }
-func (noopAppHooks) PrepareInstall(context.Context, db.Querier, int64, int64, map[string]string) (InstallPlan, error) {
+func (noopAppHooks) PrepareInstall(context.Context, db.Querier, int64, int64, map[string]string, []int64) (InstallPlan, error) {
 	return nil, apperr.ErrAppNotFound
 }
 func (noopAppHooks) QueueInstall(context.Context, pgx.Tx, Instance, InstallPlan, time.Time) error {

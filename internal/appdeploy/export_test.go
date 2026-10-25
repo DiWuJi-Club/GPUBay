@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"spark-cloud/internal/platform/db"
 )
 
@@ -14,8 +16,12 @@ var (
 	RegisterPorts = registerPorts
 )
 
+// MarkFailed 在 q 是事务时直接用它，否则另开一个事务（markFailed 要求事务：OnTransition 在同一事务里调用）。
 func (s *Service) MarkFailed(ctx context.Context, q db.Querier, cur Deployment, code, msg string, now time.Time) error {
-	return s.markFailed(ctx, q, cur, code, msg, now)
+	if tx, ok := q.(pgx.Tx); ok {
+		return s.markFailed(ctx, tx, cur, code, msg, now)
+	}
+	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error { return s.markFailed(ctx, tx, cur, code, msg, now) })
 }
 
 func (s *Service) MarkRemoved(ctx context.Context, q db.Querier, cur Deployment, code, detail string, now time.Time) error {

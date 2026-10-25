@@ -77,6 +77,8 @@ export const auditActions: readonly string[] = [
   'llm.node.drain', 'llm.node.rebuild', 'llm.node.remove',
   'llm.account.update',
   'llm.key.create', 'llm.key.update', 'llm.key.revoke', 'llm.key.admin_disable',
+  'workflow.create', 'workflow.update', 'workflow.delete', 'workflow.version.create', 'workflow.version.update', 'workflow.version.publish',
+  'instance.workflow_add', 'instance.workflow_update', 'instance.workflow_remove',
 ]
 
 export const deploymentStateLabel: LabelMap = {
@@ -122,3 +124,22 @@ export const llmKeyStatusLabel: LabelMap = { active: '启用', disabled: '已停
 /** 模型 features 标签；未登记的原样显示（labelOf 回落）。 */
 export const llmFeatureLabel: LabelMap = { tools: '工具调用', reasoning: '深度思考', vision: '视觉', 'long-context': '长上下文' }
 export const llmEndpointLabel: LabelMap = { chat: '对话', completions: '补全', embeddings: '向量' }
+// 计划 11：ComfyUI 工作流市场
+export const workflowCategoryLabel: LabelMap = { txt2img: '文生图', img2img: '图生图', video: '视频', upscale: '放大修复', other: '其它' }
+export const workflowStateLabel: LabelMap = { pending: '待安装', installed: '已安装', failed: '安装失败' }
+export const workflowStateType: LabelMap = { pending: 'info', installed: 'success', failed: 'danger' }
+export const runStateLabel: LabelMap = { queued: '排队中', running: '生成中', done: '完成', error: '失败' }
+/** 工作流相关错误码的中文（与后端 apperr 一致；带参数的错误以后端 message 为准）。 */
+export const workflowErrorLabel: LabelMap = {
+  workflow_not_found: '工作流不存在或未上架', workflow_unavailable: '该工作流当前没有可用版本', workflow_exists: '该工作流已安装在此 ComfyUI 上',
+  workflow_limit: '每个 ComfyUI 最多安装 8 个工作流', workflow_app_unsupported: '当前 ComfyUI 应用版本不支持工作流市场',
+  workflow_version_invalid: '工作流版本校验未通过', workflow_version_frozen: '已发布的工作流版本不能修改',
+  workflow_busy: 'ComfyUI 正在处理其它任务，请稍后再试', workflow_prompt_rejected: 'ComfyUI 拒绝了该任务', workflow_input_invalid: '参数不正确',
+  upstream_unreachable: '无法连接实例内的 ComfyUI',
+}
+/** 下载量（GB）→ `6.9 GB` / `17 GB`：小于 10 最多两位小数，否则最多一位，去掉尾零；非法或负数为 0。 */
+export function formatGB(n: number | string): string {
+  const v = typeof n === 'string' ? Number(n) : n
+  if (!Number.isFinite(v) || v <= 0) return '0 GB'
+  return `${Number(v.toFixed(v < 10 ? 2 : 1))} GB`
+}

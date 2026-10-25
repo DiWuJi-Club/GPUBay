@@ -21,6 +21,7 @@ import (
 	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf/comfytest"
 	"spark-cloud/internal/e2ehooks"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/pki"
@@ -37,12 +38,13 @@ import (
 func TestMain(m *testing.M) { dbtest.Main(m) }
 
 type env struct {
-	t    *testing.T
-	a    *app.App
-	clk  *clock.Fake
-	ts   *httptest.Server
-	up   *sshtest.Server
-	pool *pgxpool.Pool
+	t     *testing.T
+	a     *app.App
+	clk   *clock.Fake
+	ts    *httptest.Server
+	up    *sshtest.Server
+	comfy *comfytest.Server // 只在 newEnvWith(apps = true) 时非 nil（同 cmd/e2e-server）
+	pool  *pgxpool.Pool
 }
 
 func newEnv(t *testing.T) *env { t.Helper(); return newEnvWith(t, false) }
@@ -83,7 +85,9 @@ func newEnvWith(t *testing.T, apps bool) *env {
 	opt := app.Options{Clock: clk, KYC: k, DisableRateLimits: true, AgentTick: 20 * time.Millisecond,
 		HostKeyGen: func() (string, []byte, error) { return hostPub, hostPEM, nil }}
 	healthAddr := ""
+	var comfy *comfytest.Server
 	if apps {
+		comfy = comfytest.New()
 		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "spark-app-ok|path=%s", r.URL.Path) }))
 		t.Cleanup(health.Close)
 		healthAddr = strings.TrimPrefix(health.URL, "http://")
@@ -113,7 +117,7 @@ func newEnvWith(t *testing.T, apps bool) *env {
 	sshDone := make(chan struct{})
 	go func() { defer close(sshDone); _ = a.SSH.Serve(ctx, sshLis) }()
 	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String(), SSHAddr: sshLis.Addr().String(), Upstream: up,
-		HealthAddr: healthAddr}
+		HealthAddr: healthAddr, Comfy: comfy}
 	ts := httptest.NewServer(hooks.Handler())
 	t.Cleanup(func() {
 		ts.Close()
@@ -124,7 +128,7 @@ func newEnvWith(t *testing.T, apps bool) *env {
 		a.Upstream.Close()
 		up.Close()
 	})
-	return &env{t: t, a: a, clk: clk, ts: ts, up: up, pool: pool}
+	return &env{t: t, a: a, clk: clk, ts: ts, up: up, comfy: comfy, pool: pool}
 }
 
 func (e *env) call(method, path string, body any) (int, map[string]any) {

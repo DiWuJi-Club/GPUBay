@@ -47,7 +47,7 @@ func newLLMTestEnv(t *testing.T, mods ...func(*api.Server)) *llmEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := buildTestEnvPool(t, false, func(s *api.Server, pool *pgxpool.Pool) {
+	e := buildTestEnvPool(t, envPlain, func(s *api.Server, pool *pgxpool.Pool) {
 		quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 		svc = llm.NewService(llm.Deps{Pool: pool, Clock: s.Clock, Log: quiet, Box: box, Wallet: s.Wallet, Users: s.Identity})
 		cfg := llmgw.Config{Transport: func(node llm.RouteNode) http.RoundTripper {

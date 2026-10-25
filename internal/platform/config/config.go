@@ -61,6 +61,7 @@ type Config struct {
 	// 计划 7：应用一键部署
 	AppHFEndpoint  string // 注入应用容器的 HF_ENDPOINT（HuggingFace 镜像站）
 	AppPipIndexURL string // 注入应用容器的 PIP_INDEX_URL
+	AppGitMirror   string // 计划 11：注入应用容器的 SPARK_GIT_MIRROR（GitHub 加速前缀，如 https://gh-proxy.com/）；空 = 直连
 	AppRunner      bool   // 是否在本副本启动应用部署 Runner（多副本都开时由咨询锁保证只有一个在工作）
 
 	// 计划 9：Token 商城。经 Load 默认都是 on；Config 字面量（测试、e2e-server）零值为 off，需要时显式设置。
@@ -489,6 +490,9 @@ func (c *Config) loadAccess(getenv func(string) string, or func(key, def string)
 const (
 	DefaultAppHFEndpoint  = "https://hf-mirror.com"
 	DefaultAppPipIndexURL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+	DefaultAppGitMirror   = "https://gh-proxy.com/"
+	// AppGitMirrorOff 是 SPARK_APP_GIT_MIRROR 的「直连」取值：环境变量设成空串与未设置无法区分（都取默认值）。
+	AppGitMirrorOff = "off"
 )
 
 // loadApps 读取并校验应用一键部署（计划 7）配置。
@@ -500,6 +504,15 @@ func (c *Config) loadApps(or func(key, def string) string) error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("%s 必须以 http:// 或 https:// 开头，当前为 %q", v.name, v.value)
 		}
+	}
+	// 自定义节点 clone 用的 GitHub 加速前缀：容器内拼成 <mirror>https://github.com/…，所以必须 https:// 开头、/ 结尾；off = 直连
+	switch v := strings.TrimSpace(or("SPARK_APP_GIT_MIRROR", DefaultAppGitMirror)); {
+	case v == AppGitMirrorOff:
+		c.AppGitMirror = ""
+	case strings.HasPrefix(v, "https://") && strings.HasSuffix(v, "/") && len(v) > len("https:///") && !strings.ContainsAny(v, " '\"\\\n\t"):
+		c.AppGitMirror = v
+	default:
+		return fmt.Errorf("SPARK_APP_GIT_MIRROR 必须以 https:// 开头、以 / 结尾（或 off 表示直连），当前为 %q", v)
 	}
 	switch v := or("SPARK_APP_RUNNER", "on"); v {
 	case "on":
@@ -531,6 +544,7 @@ func (c *Config) loadLLM(or func(key, def string) string) error {
 }
 
 // FillAppDefaults 给没有经过 Load 的 Config 字面量（测试、e2e-server）补上应用部署镜像站的默认值；Load 之后调用无副作用。
+// AppGitMirror 不补：空串是合法取值（直连，Load 读到 SPARK_APP_GIT_MIRROR=off），app.go 在 Load 之后也会调用本函数。
 // AppRunner 不在这里补：它只由 cmd/platform 读取（经 Load，默认 on）。
 func (c Config) FillAppDefaults() Config {
 	if c.AppHFEndpoint == "" {

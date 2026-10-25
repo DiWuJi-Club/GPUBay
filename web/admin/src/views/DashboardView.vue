@@ -89,6 +89,13 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
         </ul>
         <router-link to="/deployments" class="more" data-testid="dash-apps-link">查看部署</router-link>
       </el-card>
+      <el-card header="工作流">
+        <ul class="kv">
+          <li><span>已安装（在用部署）</span><b data-testid="dash-workflow-installs">{{ data.workflow_installs ?? 0 }}</b></li>
+          <li><span>24 小时快速出图</span><b data-testid="dash-workflow-runs">{{ data.workflow_runs_24h ?? 0 }}</b></li>
+        </ul>
+        <router-link to="/workflows" class="more" data-testid="dash-workflows-link">查看工作流</router-link>
+      </el-card>
       <el-card v-if="data.llm" header="Token 商城" data-testid="dash-llm">
         <ul class="kv">
           <li><span>节点就绪 / 总数</span><b><span data-testid="dash-llm-nodes-ready" :class="{ bad: data.llm.nodes_ready < data.llm.nodes_total }">{{ data.llm.nodes_ready }}</span> / <span data-testid="dash-llm-nodes-total">{{ data.llm.nodes_total }}</span></b></li>
@@ -116,7 +123,7 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
 
 <style scoped>
 .dash { display: grid; gap: 16px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
 .big { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
 .kv { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .kv li { display: flex; justify-content: space-between; }

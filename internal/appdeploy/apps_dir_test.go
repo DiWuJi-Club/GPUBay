@@ -31,7 +31,8 @@ func allowedVar(name string) bool {
 	case strings.HasPrefix(name, "SPARK_"), strings.HasPrefix(name, "HF_"):
 		return true
 	}
-	return slices.Contains([]string{"MODELSCOPE_CACHE", "PIP_INDEX_URL", "PATH", "HOME"}, name)
+	// PIP_CONSTRAINT：镜像 ENV（NVIDIA 镜像用它钉住自家编译的 torch），经 image.env 加载
+	return slices.Contains([]string{"MODELSCOPE_CACHE", "PIP_INDEX_URL", "PIP_CONSTRAINT", "PATH", "HOME"}, name)
 }
 
 // importAppJSON 与 importer.go 的 appJSON 字段一致；未知字段报错（拼写错误不会被导入静默忽略）。

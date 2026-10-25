@@ -255,3 +255,34 @@ func TestReportWithoutImagesKeepsCache(t *testing.T) {
 		t.Fatalf("state report itself not recorded: %v", m.StateReportedAt)
 	}
 }
+
+// 心跳的每实例指标写进 machines.last_metrics.instances；旧 Agent（不带 instances）写 []。
+func TestHeartbeatInstanceMetricsInLastMetrics(t *testing.T) {
+	e := newEnv(t)
+	mid := e.machine("SN-001")
+	a := e.up(e.enroll(mid), mid)
+	instances := func() string {
+		var raw string
+		if err := e.pool.QueryRow(e.ctx, `SELECT (last_metrics->'instances')::text FROM machines WHERE id = $1`, mid).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	before := e.srv.HeartbeatCount(mid)
+	a.heartbeat(&agentpb.Metrics{Load1: 0.5}) // 旧 Agent
+	e.waitFor("heartbeat", func() bool { return e.srv.HeartbeatCount(mid) > before })
+	if got := instances(); got != "[]" {
+		t.Fatalf("old agent instances = %s", got)
+	}
+	before = e.srv.HeartbeatCount(mid)
+	a.heartbeat(&agentpb.Metrics{Load1: 0.7}, &agentpb.InstanceMetrics{InstanceId: "ins-aaaaaaaa", MemCurrent: 1 << 30, MemMax: 2 << 30, CpuPercent: 42.5, DataDiskUsed: 4096})
+	e.waitFor("heartbeat", func() bool { return e.srv.HeartbeatCount(mid) > before })
+	want := `[{"mem_max": 2147483648, "cpu_percent": 42.5, "instance_id": "ins-aaaaaaaa", "mem_current": 1073741824, "data_disk_used": 4096}]`
+	if got := instances(); got != want {
+		t.Fatalf("instances = %s\nwant %s", got, want)
+	}
+	m, _ := e.fleet.Get(e.ctx, e.pool, mid)
+	if !containsJSON(string(m.LastMetrics), `"load1": 0.7`) {
+		t.Fatalf("machine-level metrics lost: %s", m.LastMetrics)
+	}
+}

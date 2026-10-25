@@ -17,6 +17,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"spark-cloud/internal/agent/fakeagent"
+	"spark-cloud/internal/agent/features"
+	"spark-cloud/internal/agent/metrics"
 	"spark-cloud/internal/agentpb"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
@@ -33,6 +35,8 @@ type gateway struct {
 	mu      sync.Mutex
 	enrolls int
 	hellos  int
+	feats   []uint32 // 每次 Hello 的 features
+	beats   []*agentpb.Heartbeat
 	results []string
 	refuse  bool
 	stream  agentpb.AgentGateway_ConnectServer
@@ -73,6 +77,9 @@ func (g *gateway) Connect(stream agentpb.AgentGateway_ConnectServer) error {
 		switch {
 		case m.GetHello() != nil:
 			g.hellos++
+			g.feats = append(g.feats, m.GetHello().GetFeatures())
+		case m.GetHeartbeat() != nil:
+			g.beats = append(g.beats, m.GetHeartbeat())
 		case m.GetResult() != nil:
 			g.results = append(g.results, m.GetResult().GetCommandId())
 		}
@@ -224,5 +231,60 @@ func TestStartReturnsCallerCancellation(t *testing.T) {
 	_, err = fakeagent.Start(ctx, fakeagent.Options{Addr: addr, Creds: ag.Creds(), Dir: ag.Dir})
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
 		t.Fatalf("err = %v after %v", err, time.Since(start))
+	}
+}
+
+// Hello.features 默认 SharedSlots，可设为 0 模拟旧 Agent；心跳带每实例指标（本地实例 + 注入值）。
+func TestFeaturesAndInstanceMetrics(t *testing.T) {
+	g, addr := newGateway(t)
+	ctx := context.Background()
+	old, err := fakeagent.Start(ctx, fakeagent.Options{Addr: addr, CAPEM: g.ca.CertPEM(), Token: "spk1_x", Stepped: true, Features: new(uint32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Stop()
+	ag, err := fakeagent.Start(ctx, fakeagent.Options{Addr: addr, Creds: old.Creds(), Stepped: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag.Stop()
+	waitFor(t, "two hellos", func() bool { _, h, _ := g.count(); return h == 2 })
+	g.mu.Lock()
+	feats := append([]uint32(nil), g.feats...)
+	g.mu.Unlock()
+	if feats[0] != 0 || feats[1] != features.SharedSlots {
+		t.Fatalf("features = %v", feats)
+	}
+	if err := g.push(&agentpb.Command{Id: "c-create", InstanceId: "ins-aaaaaaaa", Body: &agentpb.Command_Create{Create: &agentpb.CreateInstance{
+		ImageRef: "img:1", UpstreamPubkey: "ssh-ed25519 AAAA", SshPort: 2223, DataSizeGib: 8, ShareSlots: 2}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "create received", func() bool { return ag.Client.Received("c-create") })
+	if _, err := ag.Client.Step(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if sp, ok := ag.Runtime.Spec("ins-aaaaaaaa"); !ok || sp.CPUs != 10 || sp.PidsLimit != 16384 || sp.MemoryBytes != 60<<30 || ag.Disk.SizeGiB("ins-aaaaaaaa") != 4 {
+		t.Fatalf("spec = %+v disk = %d", sp, ag.Disk.SizeGiB("ins-aaaaaaaa"))
+	}
+	ag.SetInstanceMetrics("ins-aaaaaaaa", metrics.InstanceMetrics{MemCurrent: 58 << 30, MemMax: 60 << 30, CPUPercent: 300})
+	ag.SetInstanceMetrics("ins-zzzzzzzz", metrics.InstanceMetrics{MemCurrent: 1})
+	if err := ag.Client.SendHeartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ag.ClearInstanceMetrics("ins-zzzzzzzz")
+	ag.ClearInstanceMetrics("ins-aaaaaaaa")
+	if err := ag.Client.SendHeartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "two heartbeats", func() bool { g.mu.Lock(); defer g.mu.Unlock(); return len(g.beats) >= 2 })
+	g.mu.Lock()
+	b1, b2 := g.beats[0].GetInstances(), g.beats[1].GetInstances()
+	g.mu.Unlock()
+	if len(b1) != 2 || b1[0].GetInstanceId() != "ins-aaaaaaaa" || b1[0].GetMemCurrent() != 58<<30 || b1[0].GetMemMax() != 60<<30 || b1[0].GetCpuPercent() != 300 ||
+		b1[1].GetInstanceId() != "ins-zzzzzzzz" || b1[1].GetMemCurrent() != 1 {
+		t.Fatalf("first heartbeat instances = %v", b1)
+	}
+	if len(b2) != 1 || b2[0].GetInstanceId() != "ins-aaaaaaaa" || b2[0].GetMemCurrent() != 0 {
+		t.Fatalf("second heartbeat instances = %v", b2)
 	}
 }

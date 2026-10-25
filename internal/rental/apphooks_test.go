@@ -37,11 +37,15 @@ func (h *recHooks) OnInstanceMigrated(_ context.Context, _ pgx.Tx, oldID, newID 
 	h.rec("migrated:" + oldID + "->" + newID)
 	return nil
 }
-func (h *recHooks) PrepareInstall(_ context.Context, _ db.Querier, appID, imageID int64, env map[string]string) (rental.InstallPlan, error) {
+func (h *recHooks) PrepareInstall(_ context.Context, _ db.Querier, appID, imageID int64, env map[string]string, workflowIDs []int64) (rental.InstallPlan, error) {
 	if h.plan == "fail" {
 		return nil, fmt.Errorf("plan failed")
 	}
-	return fmt.Sprintf("plan:%d:%d:%s", appID, imageID, env["MODEL_ID"]), nil
+	p := fmt.Sprintf("plan:%d:%d:%s", appID, imageID, env["MODEL_ID"])
+	if len(workflowIDs) > 0 {
+		p += fmt.Sprintf(":wf%v", workflowIDs)
+	}
+	return p, nil
 }
 func (h *recHooks) QueueInstall(_ context.Context, _ pgx.Tx, inst rental.Instance, plan rental.InstallPlan, _ time.Time) error {
 	h.rec("queue:" + inst.ID + ":" + plan.(string))
@@ -374,5 +378,44 @@ func TestSuspendResumeCallNoHooks(t *testing.T) {
 	}
 	if got := h.snapshot(); len(got) != n {
 		t.Fatalf("suspend / resume called hooks: %v", got[n:])
+	}
+}
+
+// 计划 11：预装工作流 ID 原样交给 PrepareInstall（Place 与 PlaceBatch 都是）；没有 app_id 时整单 400、无副作用。
+func TestPlaceWithAppWorkflows(t *testing.T) {
+	e := newEnv(t, 2)
+	h := &recHooks{}
+	e.svc.SetAppHooks(h)
+	appID := int64(5)
+	_, inst, err := e.svc.Place(e.ctx, rental.PlaceRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Duration: catalog.D1d,
+		AppID: &appID, AppEnv: map[string]string{"MODEL_ID": "none"}, AppWorkflowIDs: []int64{3, 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.snapshot(); len(got) != 1 || got[0] != fmt.Sprintf("queue:%s:plan:5:%d:none:wf[3 1]", inst.ID, e.imageID) {
+		t.Fatalf("place calls = %v", got)
+	}
+	res, err := e.svc.PlaceBatch(e.ctx, rental.BatchRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Count: 1, Duration: catalog.D1d,
+		AppID: &appID, AppWorkflowIDs: []int64{2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.snapshot(); len(got) != 2 || got[1] != fmt.Sprintf("queue:%s:plan:5:%d::wf[2]", res.Instances[0].ID, e.imageID) {
+		t.Fatalf("batch calls = %v", got)
+	}
+
+	before, n := e.balance(e.userID), e.countInstances()
+	_, err = e.svc.PlaceBatch(e.ctx, rental.BatchRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Count: 1, Duration: catalog.D1d,
+		AppWorkflowIDs: []int64{1}})
+	if ae := apperr.As(err); ae == nil || ae.Code != "bad_request" || ae.Status != 400 || ae.Message != "预装工作流需要同时选择 ComfyUI 应用" {
+		t.Fatalf("batch workflows without app_id = %v", err)
+	}
+	_, _, err = e.svc.Place(e.ctx, rental.PlaceRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Duration: catalog.D1d,
+		AppWorkflowIDs: []int64{1}})
+	if ae := apperr.As(err); ae == nil || ae.Code != "bad_request" {
+		t.Fatalf("place workflows without app_id = %v", err)
+	}
+	if e.balance(e.userID) != before || e.countInstances() != n || len(h.snapshot()) != 2 {
+		t.Fatalf("rejected order left side effects: balance %d→%d instances %d→%d calls %v", before, e.balance(e.userID), n, e.countInstances(), h.snapshot())
 	}
 }

@@ -52,6 +52,9 @@ type View struct {
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
 	appInternal     bool              // 应用是否内部；只给 AdminView 用，用户视图不输出
+	// Workflows（计划 11）：已装 / 应装的工作流（comfywf 的视图，appdeploy 不解释）。只对 comfyui 或版本支持工作流的部署给出，
+	// 此时恒为数组（没有工作流 = []）；其它部署为 nil，omitzero 省略该字段。
+	Workflows []json.RawMessage `json:"workflows,omitzero"`
 }
 
 // Summary 是实例列表 / 详情里 apps_summary 的一项。
@@ -75,6 +78,9 @@ type appBrief struct {
 	slug, name, icon string
 	internal         bool
 }
+
+// comfyUISlug 是 ComfyUI 应用的 slug（计划 11：部署视图带 workflows 的判断之一；与 comfywf 的识别口径一致）。
+const comfyUISlug = "comfyui"
 
 type verBrief struct {
 	version string
@@ -186,6 +192,22 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 		return nil, err
 	}
 
+	// 计划 11：comfyui / 支持工作流的部署批量取工作流视图（摘要不需要：withSecrets = false 的调用不取）
+	var wfDeps []string
+	wantWF := map[string]bool{}
+	for _, d := range deps {
+		if apps[d.AppID].slug == comfyUISlug || vers[d.AppVersionID].spec.SupportsWorkflows {
+			wantWF[d.ID] = true
+			wfDeps = append(wfDeps, d.ID)
+		}
+	}
+	var wfViews map[string][]json.RawMessage
+	if len(wfDeps) > 0 && withSecrets && s.d.WorkflowViews != nil {
+		if wfViews, err = s.d.WorkflowViews(ctx, wfDeps); err != nil {
+			return nil, fmt.Errorf("appdeploy: workflow views: %w", err)
+		}
+	}
+
 	for _, d := range deps {
 		a, ver := apps[d.AppID], vers[d.AppVersionID]
 		v := View{ID: d.ID, InstanceID: d.InstanceID, AppID: d.AppID, AppSlug: a.slug, AppName: a.name, AppIcon: a.icon, appInternal: a.internal,
@@ -198,6 +220,12 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 		}
 		if withSecrets {
 			v.SecretEnv = s.secretNames(d, ver.spec)
+			if wantWF[d.ID] {
+				v.Workflows = wfViews[d.ID]
+				if v.Workflows == nil {
+					v.Workflows = []json.RawMessage{}
+				}
+			}
 		}
 		if l, ok := latest[d.AppID]; ok {
 			id := l.id
@@ -304,6 +332,8 @@ type CatalogVersionView struct {
 	Env            []EnvSpec  `json:"env"`
 	Links          []LinkSpec `json:"links"`
 	TimeoutMinutes int        `json:"timeout_minutes"`
+	// SupportsWorkflows（计划 11）：控制台据此决定是否显示「预装工作流」。
+	SupportsWorkflows bool `json:"supports_workflows"`
 }
 
 // CatalogView 与前端 AppCatalogItem 对应；Description 只在单个应用接口里给。
@@ -322,7 +352,7 @@ type CatalogView struct {
 func catalogView(a App, v Version, images []ImageBrief, withDescription bool) CatalogView {
 	cv := CatalogView{ID: a.ID, Slug: a.Slug, Name: a.Name, Summary: a.Summary, Category: a.Category, Icon: a.Icon,
 		Version: CatalogVersionView{ID: v.ID, Version: v.Version, Ports: v.Spec.Ports, Env: v.Spec.Env, Links: v.Spec.Links,
-			TimeoutMinutes: v.Spec.TimeoutMinutes},
+			TimeoutMinutes: v.Spec.TimeoutMinutes, SupportsWorkflows: v.Spec.SupportsWorkflows},
 		Images: images}
 	if withDescription {
 		cv.Description = a.Description

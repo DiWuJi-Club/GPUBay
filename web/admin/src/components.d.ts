@@ -49,6 +49,7 @@ declare module 'vue' {
     ElTimeline: typeof import('element-plus/es')['ElTimeline']
     ElTimelineItem: typeof import('element-plus/es')['ElTimelineItem']
     ElTooltip: typeof import('element-plus/es')['ElTooltip']
+    ElUpload: typeof import('element-plus/es')['ElUpload']
     FinancePage: typeof import('./components/FinancePage.vue')['default']
     ForceRemoveDialog: typeof import('./components/ForceRemoveDialog.vue')['default']
     IdLink: typeof import('./components/IdLink.vue')['default']
@@ -60,6 +61,7 @@ declare module 'vue' {
     RouterView: typeof import('vue-router')['RouterView']
     TotpDialog: typeof import('./components/TotpDialog.vue')['default']
     UsageTab: typeof import('./components/llm/UsageTab.vue')['default']
+    WorkflowFormDialog: typeof import('./components/WorkflowFormDialog.vue')['default']
   }
   export interface GlobalDirectives {
     vLoading: typeof import('element-plus/es')['ElLoadingDirective']

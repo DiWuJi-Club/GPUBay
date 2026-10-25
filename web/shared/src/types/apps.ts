@@ -1,3 +1,5 @@
+import type { InstalledWorkflow } from './workflows'
+
 export type AppCategory = 'llm' | 'image' | 'notebook' | 'tool'
 export type AppStatus = 'draft' | 'published' | 'retired'
 export type AppEnvType = 'string' | 'int' | 'bool' | 'enum' | 'secret'
@@ -23,6 +25,8 @@ export interface AppSpec {
   min_data_free_gib?: number
   env?: AppEnvSpec[]
   links?: AppLinkSpec[]
+  /** 计划 11：该版本支持 ComfyUI 工作流市场（false 时后端省略） */
+  supports_workflows?: boolean
 }
 
 /** GET /apps 的条目（市场页 / 添加应用弹窗）。 */
@@ -34,7 +38,16 @@ export interface AppCatalogItem {
   description?: string
   category: AppCategory
   icon: string
-  version: { id: number; version: string; ports: AppPortSpec[]; env: AppEnvSpec[]; links: AppLinkSpec[]; timeout_minutes: number }
+  version: {
+    id: number
+    version: string
+    ports: AppPortSpec[]
+    env: AppEnvSpec[]
+    links: AppLinkSpec[]
+    timeout_minutes: number
+    /** 计划 11：后端恒给出；可选只为兼容旧测试夹具 */
+    supports_workflows?: boolean
+  }
   images: { id: number; name: string }[]
 }
 
@@ -73,6 +86,8 @@ export interface Deployment {
   finished_at: string | null
   created_at: string
   updated_at: string
+  /** 计划 11：只对 comfyui / 支持工作流的部署给出（恒为数组，可能为空）；其它部署没有该字段 */
+  workflows?: InstalledWorkflow[]
 }
 
 export interface DeploymentEvent { id: number; at: string; from_state: string; to_state: string; detail: string }

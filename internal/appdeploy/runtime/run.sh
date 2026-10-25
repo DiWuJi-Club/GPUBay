@@ -76,8 +76,16 @@ free_gib() {
   echo $(( $(num "$_kb") / 1024 / 1024 ))
 }
 
-# install 跳过标记的键：spec_hash + env 文件校验和（换 MODEL_ID 等变量也要重跑 install；install 自身幂等，模型缓存保留）
-install_key() { printf '%s %s' "$SPARK_SPEC_HASH" "$(cksum < "$DIR/env" 2>/dev/null | awk '{print $1 "-" $2}')"; }
+# install 跳过标记的键：spec_hash + env 文件校验和 + workflows/manifest.json 校验和（换 MODEL_ID 等变量、改工作流集合都要重跑
+# install；install 自身幂等，模型缓存保留）。没有 manifest 时第三段为空串（键以空格结尾）。
+install_key() {
+  _mk=""
+  [ -f "$DIR/workflows/manifest.json" ] && _mk=$(cksum < "$DIR/workflows/manifest.json" 2>/dev/null | awk '{print $1 "-" $2}')
+  printf '%s %s %s' "$SPARK_SPEC_HASH" "$(cksum < "$DIR/env" 2>/dev/null | awk '{print $1 "-" $2}')" "$_mk"
+}
+
+# 去掉尾部空格：旧版两段式 .installed（「hash env」）与没有 manifest 的新键（「hash env 」）视为相同，升级后不重跑 install
+rtrim() { printf '%s' "$1" | sed 's/ *$//'; }
 
 # 脱离当前 SSH 会话后台运行。输出「<pid> <1|0>」：1 = 已成为新会话 / 进程组的组长（pgid = pid）
 detach() {
@@ -323,8 +331,8 @@ cmd_bg_deploy() {
   write_status installing prepare 1 "prepare"
   _key=$(install_key)
   _installed=$(cat "$DIR/.installed" 2>/dev/null || echo "")
-  if [ "$_installed" = "$_key" ] && [ -n "$SPARK_SPEC_HASH" ]; then
-    printf 'skip install: spec_hash %s and env unchanged\n' "$SPARK_SPEC_HASH"
+  if [ "$(rtrim "$_installed")" = "$(rtrim "$_key")" ] && [ -n "$SPARK_SPEC_HASH" ]; then
+    printf 'skip install: spec_hash %s, env and workflows unchanged\n' "$SPARK_SPEC_HASH"
   else
     PHASE=install
     write_status installing install 5 "install"
@@ -334,7 +342,11 @@ cmd_bg_deploy() {
     if [ "$_rc" -ne 0 ]; then
       # phase 取 app.sh 最后一次 spark_status 汇报的阶段（如 download），失败点更具体
       _ph=$(sed -n 's/.*"phase":"\([A-Za-z0-9_.-]*\)".*/\1/p' "$DIR/status.json" 2>/dev/null)
-      fail_exit "${_ph:-install}" 0 "install 失败，退出码 $_rc" 0 "$_rc"
+      # app.sh 磁盘预检失败时最后一次汇报的消息以 disk: 开头（计划 11 D7）：沿用它，平台据前缀映射为错误码 disk
+      # 取 "message":"…","pid": 之间（write_status 的字段顺序：message 后紧跟 pid；消息里的引号已转义成 \"，不会提前匹配），
+      # 再还原 json_escape 的转义（先 \" → "，再 \\ → \），fail_exit 写回时重新转义
+      _msg=$(sed -n 's/.*"message":"\(disk:.*\)","pid":.*/\1/p' "$DIR/status.json" 2>/dev/null | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g')
+      fail_exit "${_ph:-install}" 0 "${_msg:-install 失败，退出码 $_rc}" 0 "$_rc"
     fi
     put "$DIR/.installed" "$_key"
   fi

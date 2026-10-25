@@ -57,7 +57,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_SECRET_KEY` | 32 字节密钥的 base64，加密身份证号、实例密码、内置 CA 私钥、SSH 网关主机密钥与实例主机私钥（轮换的后果见「部署注意」） | 必填 |
 | `SPARK_DOMAIN` | 控制台域名（须等于 `SPARK_PUBLIC_BASE_URL` 的域名）；用户 SSH 命令连 `ssh.<此域>`；未设 `SPARK_INGRESS_DOMAIN` 时也是租户 Web 子域的父域 | spark.local |
 | `SPARK_ADMIN_ADDR` | 后台 API 监听地址（只应绑定内网地址） | 127.0.0.1:8081 |
-| `SPARK_UPLOAD_DIR` | 上传文件（营业执照）保存目录，需定期备份 | ./.devdata/uploads |
+| `SPARK_UPLOAD_DIR` | 上传文件（营业执照、工作流封面）保存目录，需定期备份；`platform admin workflow import` 须用同一目录 | ./.devdata/uploads |
 | `SPARK_SMS_DRIVER` / `SPARK_KYC_DRIVER` | mock / aliyun（生产禁止 mock） | mock |
 | `SPARK_PAY_DRIVER` | mock / real（生产禁止 mock；real 时启用已配置的微信和 / 或支付宝） | mock |
 | `SPARK_PDU_DRIVER` | mock / snmp（生产禁止 mock；snmp 时按每台 PDU 的配置） | mock |
@@ -82,7 +82,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_SSH_ADDR` | SSH 网关监听地址（compose 把公网 22 映射到它） | :2222 |
 | `SPARK_SSH_PUBLIC_PORT` | 写进用户 SSH 命令的公网端口；非 22 时命令带 `-p` | 22 |
 | `SPARK_SSH_MAX_SESSIONS_PER_INSTANCE` / `SPARK_SSH_DRAIN_TIMEOUT` | 每实例并发 SSH 会话上限 / 停机时等待会话结束的时间 | 16 / 30s |
-| `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的端口（Create 指令的 `ssh_port` 与网关上游拨号共用） | 2222 |
+| `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的**基准**端口：平台按实例计算端口（`rental.Instance.SSHPort`，目前恒等于基准），写进 Create 指令的 `ssh_port`，SSH 网关、Web 入口与应用部署按同一值拨上游。端口在 Create **入队时**就固定进指令：有待下发的 Create 时修改，这些实例仍发布在旧端口上（平台却按新端口拨，连不上），所以只在没有待下发 Create 时修改；已在运行的实例要重新开通才会换端口 | 2222 |
 | `SPARK_INGRESS_DOMAIN` | 租户 Web 子域的父域（`ins-<id>-<port>.<此域>`）；生产推荐用与 `SPARK_DOMAIN` **不同的注册域（eTLD+1）**，子域不算；「不是 SPARK_DOMAIN 子域」的启动校验只防误配 | = SPARK_DOMAIN |
 | `SPARK_PUBLIC_BASE_URL` | 对外地址，支付回调为 `<地址>/api/v1/pay/notify/{wechat,alipay}`（real 支付必填，须 https）；域名必须等于 `SPARK_DOMAIN`；prod 必填且 https；dev 默认 `http://spark.local:8080`。本地测 ingress 需在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或改用 sslip.io 域 | 见左 |
 | `SPARK_ADMIN_PUBLIC_BASE_URL` | 后台对外地址（经反向代理或 `ssh -L` 隧道访问时填浏览器地址栏里的后台地址），用于后台写请求的 Origin 校验。为空时只认 `Sec-Fetch-Site`：带 `Origin` 而不带 `Sec-Fetch-Site` 的客户端（旧版 Safari、部分内嵌 WebView）后台写请求一律 403；staging / prod 为空时启动日志会打 WARN | 空 |
@@ -93,6 +93,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_APP_RUNNER` | on / off：是否在本副本启动应用部署 Runner（多副本都 on，咨询锁保证只有一个在工作；e2e 用 off） | on |
 | `SPARK_LLM_GATEWAY` | on / off：是否在用户 API 上挂 Token 商城的 OpenAI 兼容网关 `/v1`（off 时 `/v1/*` 返回 404，控制台的 Token 商城页面仍可用）；限额按进程各算，见「Token 商城」 | on |
 | `SPARK_LLM_CONTROLLER` | on / off：是否在本副本启动 Token 节点 Controller（按副本数建节点、健康探测、排空与重建；咨询锁保证同一时刻只有一个副本在工作）。只在 `SPARK_LLM_GATEWAY=on` 的副本上生效（排空看本进程的在途请求），网关 off 时打 WARN 不启动；e2e 用 off，由钩子驱动 | on |
+| `SPARK_APP_GIT_MIRROR` | 注入应用容器的 `SPARK_GIT_MIRROR`：ComfyUI 安装工作流的自定义节点时 `git clone <前缀>https://github.com/...`（失败再直连）。须以 `https://` 开头、以 `/` 结尾；`off` = 直连 | https://gh-proxy.com/ |
 
 ## 节点 Agent
 
@@ -141,6 +142,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
   `SELECT l.id, l.status, i.state FROM machine_leases l JOIN instances i ON i.id = l.instance_id WHERE isempty(l.period) AND (l.status <> 'ended' OR i.state NOT IN ('released','failed'));`
 - 计划 8（邀请返利）发布：迁移 `00021`（设计文档写作 `00020`，计划 7 先占用了该编号）在存在 `referral_rebate / referral_clawback` 流水时拒绝回滚；多副本滚动期间旧副本的登录接口不认 `invite_code`，窗口内注册的用户不会绑定（窗口很短，可接受；一次性重启全部副本可消除）；发布后执行 `platform referral backfill-fingerprints`；`SPARK_PUBLIC_BASE_URL` 必须是用户可访问的控制台地址（邀请链接据此生成）。
 - 计划 8 必须在计划 7 合入 `main` 之后发布（goose 不接受乱序迁移：`00021` 先于 `00020` 落库后，`00020` 再也不会执行）。迁移 `00021` 扩展 `wallet_ledger.kind` 的 CHECK 约束，会对 `wallet_ledger` 持有 ACCESS EXCLUSIVE 锁并全表校验，随后在同一事务里建 `wallet_ledger_order_scan_idx`（非 CONCURRENTLY）：迁移期间所有充值 / 扣款 / 退款都会等待。先 `SELECT count(*) FROM wallet_ledger` 估算耗时，选低峰窗口发布。
+- 计划 10（共享机）真机 PoC 结论为 no-go，**共享机商品搁置**（记录见 `docs/superpowers/acceptance-plan10.md`），本次只发布 Agent 多容器与按实例端口的基础设施。没有迁移：`00023` 编号保留未用；goose 不接受乱序迁移，以后的共享机迁移要用发布时最大编号之后的新号。Agent 协议新增 `Hello.features`、`CreateInstance.share_slots`、`Heartbeat.instances`，新旧两侧互相忽略未知字段；照例先升级 Agent 再发布 platform。新 platform 在 Create 指令里显式写 `ssh_port`（= `SPARK_UPSTREAM_SSH_PORT`）与 `share_slots = 1`，Agent 发布到该端口；机器详情的 `last_metrics.instances` 带每实例的 cgroup 内存 / CPU / 数据盘用量（旧 Agent 为空数组）。新 Agent 在同一端口已被本机另一个**仍存在**的容器占用时拒绝开通（「SSH 端口冲突」）；`selfcheck` 新增 cgroup v2 与 cpu / memory / pids 控制器检查（硬性），核数 < 4 只告警。
 - 邀请返利的「同 IP」标记与邀请码查询限流（每 IP 每分钟 60 次）都按客户端 IP：platform 在反向代理之后时必须设 `SPARK_TRUST_PROXY=true`（及 `SPARK_TRUSTED_PROXY_HOPS`），否则所有绑定都带「同IP」、所有用户共用一个查码额度。即便设对了，同一 NAT 出口（公司 / 校园网）的邀请也会带「同IP」——该标记只提示、不搁置。
 
 ### 应用一键部署（计划 7）
@@ -173,7 +175,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 ### Token 商城（计划 9）
 
 - **接入地址**：OpenAI 兼容接口在 `https://<SPARK_DOMAIN>/v1`（与控制台同域同端口，无独立子域），用户在控制台「Token 商城」创建 API Key，按 token 用量从钱包扣费。`SPARK_LLM_GATEWAY=off` 时不挂 `/v1`。
-- **发布**：迁移 `00022_llm.sql` 写入系统账号（`users.phone='system:llm'`，`system=true`）与「Token 服务池」机组；系统账号缺失时 platform 启动失败（报「找不到系统账号」）。本计划不改 Agent 协议，platform 单独发布即可（节点依赖计划 7 的新版 Agent 与 `LLM Serving` 镜像）。合并前核对 `main` 已含 `00020` / `00021`（goose 不接受乱序迁移）。
+- **发布**：迁移 `00022_llm.sql` 写入系统账号（`users.phone='system:llm'`，`system=true`）与「Token 服务池」机组；系统账号缺失时 platform 启动失败（报「找不到系统账号」）。本计划不改 Agent 协议，platform 单独发布即可（节点依赖计划 7 的新版 Agent 与 `LLM Serving` 镜像）。迁移按乱序方式执行（`WithAllowOutofOrder`）：已跑过 `00024` 的库升级时会补跑 `00022`，两者互不依赖。
 - **节点应用 `vllm-node`**：节点是系统账号名下的系统实例上的 `vllm-node` 内部应用部署（不在控制台应用市场展示）。上线后按「应用一键部署」的步骤用 `platform admin app import` 导入 `deploy/apps`（含 `vllm-node`），再在后台「应用」里发布 `vllm-node` 的版本（super + TOTP）；未导入 / 未发布时后台无法创建模型（模型绑定 `vllm-node` 的已发布版本）。镜像沿用计划 7 登记的 `LLM Serving`。
 - **Token 服务池**：迁移建好的唯一机组「Token 服务池」（不可见、不可删除、不能改成可见）。在后台「Token 商城 → 节点与机器池」把机器加入池；**池内机器永不出租**（即时 / 预订 / 换机 / 改派都拿不到），Controller 只在池内空闲在线机器上建节点。机器上还有未结束的节点或系统实例时不能移出池（先在后台排空 / 移除节点）。池机器数量应 ≥ 全部上线模型的副本数之和，不足时告警 `llm_pool_short`。
 - **网关与 Controller 放在同一个副本**：网关的 RPM / TPM / 并发限额与节点在途计数都在**进程内**；Controller 排空节点（模型下线、副本数调小、后台排空 / 重建 / 移除）时，看的就是本进程里该节点的在途请求数，归零才释放机器。因此 Controller 只在 `SPARK_LLM_GATEWAY=on` 的副本上启动（网关 off 的副本即使 `SPARK_LLM_CONTROLLER=on` 也只打 WARN、不启动）。
@@ -186,6 +188,30 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - **反向代理**：platform 前面若还有七层代理，`/v1` 必须允许至少 10 分钟的读超时（网关单请求总时限 10 分钟、首字节 120 秒），并关闭响应缓冲以免流式（SSE）输出被攒住；网关已在流式响应上发送 `X-Accel-Buffering: no`（nginx 会据此关闭缓冲），其它代理需另行配置，例如 nginx 的 `proxy_read_timeout 600s; proxy_buffering off;`。请求体上限 2 MiB。platform 自己终止 TLS 时（默认 compose）无需额外配置，网关自行延长流式响应的写期限。
 - **回滚**：`00022` 的 Down 在存在 `llm_pay` 流水或活动节点时拒绝；先在后台把所有模型置为下线、等节点排空再执行。
 - **上线前核对**：首批模型清单与定价；池机器数量；多副本部署下两个开关的配置（见上）；帮助页与控制台的计费说明文案；`vllm-node` 的 NGC 镜像标签复核；默认限额（每用户 RPM 60 / TPM 200,000 / 并发 8）是否调整。
+
+### ComfyUI 工作流市场（计划 11）
+
+- **发布顺序**：只发 platform（迁移 `00024_comfy_workflows.sql`：四张新表，并修改 `uploads`——`purpose` 允许 `workflow_cover`、`user_id` 可空、加约束「封面 ⇔ `user_id` 为空」），不改 Agent。发布后依次：
+  1. 导入 comfyui 应用 **1.1.0**（`supports_workflows`、`MODEL_ID` 默认 `none`、模型 / 自定义节点 / 用户目录放到数据盘 `/root/data/comfyui`）。**只导入 comfyui 一个目录**：`app import` 按目录名顺序导入、遇到第一个失败的目录（例如已导入过的 vllm 1.0.0，同版本号重复导入报错）就停止，整个 `deploy/apps` 再导一遍会报错退出。用一次性容器只读挂载 `deploy/apps/comfyui`（在 `deploy/compose/` 下执行）：
+
+     ```bash
+     docker compose run --rm --no-deps -v "$(cd ../apps/comfyui && pwd):/apps-p11/comfyui:ro" platform admin app import /apps-p11
+     ```
+
+     预期输出一行 `comfyui 1.1.0 version-added`（全新环境首次导入则是 `comfyui 1.1.0 created`）。然后在后台「应用」发布 comfyui 1.1.0（super + TOTP）。1.0.0 的部署照常运行，用户第一次给它装工作流时自动换到 1.1.0。
+  2. 导入工作流为草稿：`platform admin workflow import <目录>`，目录形如 `deploy/workflows`（每个 `<slug>/` 下 `workflow.json`、`graph.json`、`manifest.json`，可选 `api.json`、`cover.png|jpg|webp`；格式见 `deploy/workflows/README.md`）。同计划 7，命令读的是 platform 容器内的目录：
+
+     ```bash
+     docker compose cp ../workflows/. platform:/workflows
+     docker compose exec platform /platform admin workflow import /workflows
+     ```
+
+     每个工作流输出一行：`<slug> <版本> created`（新工作流）或 `<slug> <版本> version-added`（已有工作流加版本）；符号链接目录输出 `<slug> skipped: 原因`；校验失败的输出 `<slug> error: 原因`（与 `app import` 不同，其它目录照常导入，最后以非零退出）。**封面写进 `SPARK_UPLOAD_DIR`**：在 platform 容器内执行（`exec`）或用 compose 的一次性容器（`run --rm`，挂的是同一个 `uploads` 卷）都是同一目录；在宿主机上直接跑 `platform admin` 时，必须让它的 `SPARK_UPLOAD_DIR` 指向与服务**同一个**目录，否则数据库里有封面记录而服务读不到文件。
+  3. 后台「工作流」逐个检查版本（模型 / 节点 / 快速出图参数）并发布（super + TOTP，发布后不可变），再把工作流状态改为「上架」，控制台 `/workflows` 才能看到。
+- **国内网络**：模型从 ModelScope（或 `SPARK_APP_HF_ENDPOINT` 的 hf-mirror）下载；自定义节点从 GitHub 经 `SPARK_APP_GIT_MIRROR` 前缀 clone，镜像失效时改这个变量（或设 `off` 直连）后用户重新部署即可。若指向内网镜像站，网段要加进 `SPARK_AGENT_ALLOW_CIDRS`。
+- **安全**：自定义节点是第三方代码，在用户容器里以 root 安装运行；只有 super 能发布工作流版本，Git 主机限 github.com / gitee.com / gitcode.com 且钉死 commit，导入前须评审节点仓库。
+- **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。这些限制与每用户同时上传数、每小时运行尝试数用的是进程内锁与计数（「计数 → `/prompt` → 入库」靠进程内锁串行化），**假设 platform 只有一个副本**；多副本部署时它们只是每个副本各自的软上限（落在不同副本上的并发请求可以同时通过检查）。
+- **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），并删除 `uploads` 里的封面登记（`workflow_cover` 行）、把 `uploads` 的约束还原（`purpose` 只允许 `license`、`user_id` 非空）；`SPARK_UPLOAD_DIR` 里的封面文件留在磁盘上（可手工清理），容器内文件不受影响。
 
 ## API 约定
 

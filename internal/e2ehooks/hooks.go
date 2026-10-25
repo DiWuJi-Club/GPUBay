@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"sort"
 	"strconv"
@@ -29,6 +30,7 @@ import (
 	"spark-cloud/internal/agent/state"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/comfywf/comfytest"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/clock"
@@ -54,10 +56,14 @@ type Server struct {
 	Upstream  *sshtest.Server // 假「容器 sshd」（所有 e2e 机器的 lan_ip 都是 127.0.0.1）；/hooks/ingress-upstream 在它上面登记端口
 	// HealthAddr 是 fake 应用的健康检查 / Web 服务地址（host:port）：/hooks/apps/seed 把每个应用端口的 direct-tcpip 转到它
 	HealthAddr string
+	// Comfy 是进程内 fake ComfyUI（快速出图代理的上游）：/hooks/apps/seed 与 /hooks/workflows/seed 之后所有实例的 8188 都转到它，
+	// /hooks/comfy/* 控制它；nil = 不提供（这些钩子报错）。
+	Comfy *comfytest.Server
 
 	sweepMu       sync.Mutex // 进程内串行化 /hooks/sweep（再加清扫咨询锁防跨进程交叠）；见 sweep
 	llmMu         sync.Mutex // 进程内串行化 /hooks/llm/tick（Playwright 超时重发时不让两轮 Controller 交叠）
 	mu            sync.Mutex
+	comfyTS       *httptest.Server
 	agents        map[int64]*fakeagent.Agent
 	upstreamStops map[int]func() // ingress-upstream 起的回显服务 / llm/upstream 起的 FakeVLLM，按端口
 }
@@ -74,6 +80,10 @@ func (s *Server) Close() {
 		stop()
 	}
 	s.upstreamStops = nil
+	if s.comfyTS != nil {
+		s.comfyTS.Close()
+		s.comfyTS = nil
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -97,6 +107,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/llm/upstream", s.handle(s.llmUpstream))
 	mux.HandleFunc("POST /hooks/llm/node", s.handle(s.llmNode))
 	mux.HandleFunc("POST /hooks/llm/tick", s.handle(s.llmTick))
+	mux.HandleFunc("POST /hooks/workflows/seed", s.handle(s.workflowsSeed))
+	mux.HandleFunc("POST /hooks/workflows/seed-many", s.handle(s.workflowsSeedMany))
+	mux.HandleFunc("POST /hooks/workflows/version", s.handle(s.workflowsVersion))
+	mux.HandleFunc("POST /hooks/comfy/history", s.handle(s.comfyHistory))
+	mux.HandleFunc("GET /hooks/comfy/prompts", s.handle(s.comfyPrompts))
+	mux.HandleFunc("POST /hooks/comfy/reject", s.handle(s.comfyReject))
+	mux.HandleFunc("POST /hooks/comfy/reset", s.handle(s.comfyReset))
 	return loopbackOnly(mux)
 }
 

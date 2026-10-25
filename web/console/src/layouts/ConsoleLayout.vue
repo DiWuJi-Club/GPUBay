@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChatDotRound, Monitor, Shop, User, Wallet } from '@element-plus/icons-vue'
+import { ChatDotRound, Monitor, Picture, Shop, User, Wallet } from '@element-plus/icons-vue'
 import { brand, useMobile } from '@spark/shared'
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
@@ -9,11 +9,13 @@ import { session } from '../store/session'
 const mobile = useMobile()
 const route = useRoute()
 const tabs = [
-  { key: 'market', path: '/market', label: '算力市场', icon: Shop },
-  { key: 'instances', path: '/instances', label: '我的实例', icon: Monitor },
-  { key: 'wallet', path: '/wallet', label: '钱包', icon: Wallet },
-  { key: 'account', path: '/account', label: '我的', icon: User },
-  { key: 'tokens', path: '/tokens', label: 'Token 商城', icon: ChatDotRound },
+  // 手机底栏 6 个标签，320px 宽每格约 53px：工作流 / Token 商城用短名（电脑侧边菜单用全名）
+  { key: 'market', path: '/market', label: '算力市场', short: '算力市场', icon: Shop },
+  { key: 'workflows', path: '/workflows', label: '工作流市场', short: '工作流', icon: Picture },
+  { key: 'instances', path: '/instances', label: '我的实例', short: '我的实例', icon: Monitor },
+  { key: 'wallet', path: '/wallet', label: '钱包', short: '钱包', icon: Wallet },
+  { key: 'account', path: '/account', label: '我的', short: '我的', icon: User },
+  { key: 'tokens', path: '/tokens', label: 'Token 商城', short: 'Token', icon: ChatDotRound },
 ] as const
 const active = computed(() => tabs.find((t) => route.path === t.path || route.path.startsWith(t.path + '/'))?.key ?? '')
 const logo = import.meta.env.BASE_URL + brand.logoUrl
@@ -42,7 +44,7 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
     </div>
     <nav v-if="mobile" class="tabbar" data-testid="layout-tabbar">
       <router-link v-for="t in tabs" :key="t.key" :to="t.path" :class="{ active: active === t.key }" :data-testid="`tabbar-${t.key}`">
-        <el-icon :size="20"><component :is="t.icon" /></el-icon><span>{{ t.label }}</span>
+        <el-icon :size="20"><component :is="t.icon" /></el-icon><span>{{ t.short }}</span>
       </router-link>
     </nav>
   </div>

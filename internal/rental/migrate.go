@@ -8,7 +8,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/audit"
-	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/randx"
@@ -88,7 +87,7 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			VALUES ($1, $2, $3, $4, $5, $6)`, old.ID, id, paid, reason, actor.AdminID, now); err != nil {
 			return err
 		}
-		if _, err := s.d.Fleet.Enqueue(ctx, tx, newMachine, id, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref}); err != nil {
+		if err := s.enqueueCreate(ctx, tx, moved, ref); err != nil { // moved 即新实例（machine_id = newMachine）
 			return err
 		}
 		if err := s.beginWipe(ctx, tx, old, "migrated to "+id+": "+reason, now); err != nil {
