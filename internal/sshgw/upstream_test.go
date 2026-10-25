@@ -339,3 +339,26 @@ func TestUpstreamGlobalRequestsDirectional(t *testing.T) {
 		t.Fatalf("client saw global requests %v", seen)
 	}
 }
+
+// 拨号端口取 AccessInfo.SSHPort（平台按实例算好的容器 sshd 端口），为 0 时退回 Config.UpstreamPort。
+func TestUpstreamDialsInstanceSSHPort(t *testing.T) {
+	e := newEnvWith(t, func(c *sshgw.Config) { c.UpstreamPort = 1 }) // 默认端口无人监听
+	alt, err := e.upstream.ListenAlso(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := runningInfo(e, instA, 7, "pw-correct-16chr")
+	info.SSHPort = alt
+	e.store.set(instA, info)
+	c := e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	if out, _, err := run(t, c, "echo slot"); err != nil || out != "slot\n" {
+		t.Fatalf("exec via instance port = %q %v", out, err)
+	}
+	// 端口为 0（旧数据 / 假存储）：退回 Config.UpstreamPort（这里不可达）
+	info.SSHPort = 0
+	e.store.set(instA, info)
+	c = e.mustDial(instA, ssh.Password("pw-correct-16chr"))
+	if _, stderr, err := run(t, c, "echo x"); err == nil || !strings.Contains(stderr, sshgw.MsgUpstreamUnreachable) {
+		t.Fatalf("fallback to config port: err=%v stderr=%q", err, stderr)
+	}
+}

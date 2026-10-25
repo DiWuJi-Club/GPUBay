@@ -43,6 +43,9 @@ import (
 
 const appsPhone = "13800007777"
 
+// testGitMirror 是集成测试配置的 SPARK_APP_GIT_MIRROR：只注入支持工作流的版本（comfyui 1.1.0）的 env。
+const testGitMirror = "https://mirror.test/"
+
 type appsEnv struct {
 	t          *testing.T
 	ctx        context.Context
@@ -77,7 +80,7 @@ func newAppsEnvWith(t *testing.T, machines int, tweak func(*appsBuild)) *appsEnv
 	t.Helper()
 	ctx := context.Background()
 	pool := dbtest.New(t)
-	t.Cleanup(func() { assertConsistent(t, pool) }) // 最后注册的先执行：在停进程、关服务之前检查
+	t.Cleanup(func() { assertConsistent(t, pool); assertWorkflowsConsistent(t, pool) }) // 最后注册的先执行：在停进程、关服务之前检查
 	clk := clock.NewFake(dbtest.T0)
 	keyFile := upstreamKeyFile(t)
 	upSigner, err := pki.LoadUpstreamSigner(keyFile)
@@ -107,7 +110,7 @@ func newAppsEnvWith(t *testing.T, machines int, tweak func(*appsBuild)) *appsEnv
 	e := &appsEnv{t: t, ctx: ctx, pool: pool, clk: clk, up: up, healthAddr: strings.TrimPrefix(health.URL, "http://")}
 	e.appRootFor = func(id string) string { return filepath.Join(root, id, "root", "data") }
 	cfg := config.Config{UpstreamSSHKeyFile: keyFile, Env: "dev", UploadDir: t.TempDir(), Domain: "spark.test", SecretKey: dbtest.Key,
-		SMSDriver: "mock", KYCDriver: "mock", UpstreamSSHPort: up.Port()}
+		SMSDriver: "mock", KYCDriver: "mock", UpstreamSSHPort: up.Port(), AppGitMirror: testGitMirror}
 	opt := app.Options{Clock: clk, SMS: &sms.Mock{}, DisableRateLimits: true,
 		HostKeyGen:    func() (string, []byte, error) { return hostPub, hostPEM, nil },
 		AppHealthAddr: func(int) string { return e.healthAddr },
@@ -439,6 +442,9 @@ func TestAppsFullLifecycle(t *testing.T) {
 		t.Fatal("secret in log tail")
 	}
 	e.untilState(depID, appdeploy.StateRunning)
+	if env, err := os.ReadFile(filepath.Join(e.appDir(id, "vllm"), "env")); err != nil || strings.Contains(string(env), "SPARK_GIT_MIRROR") {
+		t.Fatalf("vllm env has SPARK_GIT_MIRROR (or unreadable %v):\n%s", err, env)
+	}
 	if got := e.ports(id); len(got) != 1 || got[0] != (portRow{8000, "private", depID}) {
 		t.Fatalf("instance_ports = %+v", got)
 	}

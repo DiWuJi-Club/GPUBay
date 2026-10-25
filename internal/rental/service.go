@@ -85,6 +85,8 @@ type Deps struct {
 	// 计划 3
 	Keys       KeyCounter                                 // 关闭密码登录前校验用户至少有一把公钥；nil 视为 0 把
 	HostKeyGen func() (pub string, pem []byte, err error) // 实例主机密钥生成；nil → pki.GenerateInstanceHostKey
+	// 计划 10：容器 sshd 的基准端口（SPARK_UPSTREAM_SSH_PORT）；<= 0 视为 2222。Create 指令按 Instance.SSHPort 带端口。
+	SSHBasePort int
 }
 
 type KeyCounter interface {
@@ -135,6 +137,32 @@ type Instance struct {
 	ReassignCount         int
 	ProvisionedAt         *time.Time // 预订开通（reserved → creating）时刻
 	CancelledAt           *time.Time
+}
+
+// DefaultSSHPort 是未配置基准端口时容器 sshd 的端口。
+const DefaultSSHPort = 2222
+
+// SSHPort 返回实例容器 sshd 在机器上的端口（平台上游 SSH 拨号与 Create 指令共用）。
+// 目前一台机器只有一个实例，恒为基准端口（base <= 0 时为 2222）；共享机落地后再加槽位偏移 base + slot（规格 §1.3 S5）。
+func (i Instance) SSHPort(base int) int {
+	if base <= 0 {
+		return DefaultSSHPort
+	}
+	return base
+}
+
+// InstanceSSHPort 按实例 ID 给出容器 sshd 端口（Instance.SSHPort(Deps.SSHBasePort)），供只查了实例 ID 的上游拨号方
+// （应用部署 Runner / 实时日志）与 AccessInfo、IngressRoute 保持一致。共享机落地后改为按实例槽位算。
+func (s *Service) InstanceSSHPort(instanceID string) int {
+	return Instance{ID: instanceID}.SSHPort(s.d.SSHBasePort)
+}
+
+// enqueueCreate 给实例所在机器入队 Create 指令：镜像地址由调用方解析，端口按 Instance.SSHPort，份数恒为 1（整机）。
+// 所有开通路径（即时下单、预订开通、改派、换机）都经这里，保证指令形态一致。
+func (s *Service) enqueueCreate(ctx context.Context, q db.Querier, inst Instance, imageRef string) error {
+	_, err := s.d.Fleet.Enqueue(ctx, q, inst.MachineID, inst.ID, fleet.CmdCreateInstance,
+		fleet.CreateInstancePayload{ImageRef: imageRef, SSHPort: inst.SSHPort(s.d.SSHBasePort), ShareSlots: 1})
+	return err
 }
 
 // Booked 表示这是一个预订（有预定开始时刻）的实例。

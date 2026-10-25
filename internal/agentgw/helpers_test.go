@@ -73,7 +73,6 @@ func newEnvFull(t *testing.T, tweak func(*agentgw.Config), tweakDeps func(*agent
 	ids := identity.NewService(identity.Deps{Pool: pool, Clock: clk, SMS: &sms.Mock{}, KYC: kyc.Mock{}, Box: box})
 	w := wallet.NewService(pool, clk)
 	f := fleet.NewService(pool, clk)
-	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: catalog.NewService(pool), Fleet: f, Notifier: noopNotifier{}})
 	ca, err := pki.EnsureCA(ctx, pool, box, clk)
 	if err != nil {
 		t.Fatal(err)
@@ -83,6 +82,9 @@ func newEnvFull(t *testing.T, tweak func(*agentgw.Config), tweakDeps func(*agent
 	if tweak != nil {
 		tweak(&cfg)
 	}
+	// 与 internal/app 一致：平台入队 Create 的基准端口与网关的 SSHPort 同取 SPARK_UPSTREAM_SSH_PORT
+	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: catalog.NewService(pool), Fleet: f, Notifier: noopNotifier{},
+		SSHBasePort: cfg.SSHPort})
 	deps := agentgw.Deps{Pool: pool, Fleet: f, Rental: r, HostKeys: r, CA: ca, Clock: clk, Log: log}
 	if tweakDeps != nil {
 		tweakDeps(&deps)
@@ -217,8 +219,8 @@ func (a *agentStream) hello(ips ...string) {
 func (a *agentStream) report(states ...*agentpb.InstanceState) {
 	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Instances: states}}})
 }
-func (a *agentStream) heartbeat(m *agentpb.Metrics) {
-	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Heartbeat{Heartbeat: &agentpb.Heartbeat{Metrics: m}}})
+func (a *agentStream) heartbeat(m *agentpb.Metrics, inst ...*agentpb.InstanceMetrics) {
+	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Heartbeat{Heartbeat: &agentpb.Heartbeat{Metrics: m, Instances: inst}}})
 }
 func (a *agentStream) result(id string, ok bool, msg string) {
 	a.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Result{Result: &agentpb.CommandResult{CommandId: id, Ok: ok, Message: msg}}})

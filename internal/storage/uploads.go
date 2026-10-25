@@ -22,6 +22,11 @@ import (
 const (
 	MaxUploadSize  = 10 << 20 // 10MB
 	PurposeLicense = "license"
+	// PurposeWorkflowCover 工作流封面（计划 11 D13）：后台上传，所有者 userID = 0（uploads.user_id 为 NULL），
+	// 只接受 PNG / JPG / WebP，≤ MaxCoverSize，不计入每用户每日上传次数。
+	PurposeWorkflowCover = "workflow_cover"
+	// MaxCoverSize 封面上限；comfywf.MaxCoverBytes 直接引用它。
+	MaxCoverSize = 2 << 20 // 2MB
 
 	maxUploadsPerDay = 20 // 每个用户每 24 小时最多上传次数，防止占满磁盘
 )
@@ -29,11 +34,27 @@ const (
 var (
 	ErrFileTooLarge    = apperr.New("file_too_large", "文件不能超过 10MB", 413)
 	ErrUnsupportedType = apperr.New("unsupported_file_type", "仅支持 JPG、PNG、PDF 文件", 415)
-	errInvalidUpload   = apperr.BadRequest("营业执照文件无效，请重新上传")
+	// ErrCoverTooLarge / ErrUnsupportedCoverType 是封面用途的同码错误（文案按封面的限制写）。
+	ErrCoverTooLarge        = apperr.New("file_too_large", "封面图片不能超过 2MB", 413)
+	ErrUnsupportedCoverType = apperr.New("unsupported_file_type", "封面仅支持 PNG、JPG、WebP 图片", 415)
+	errInvalidUpload        = apperr.BadRequest("营业执照文件无效，请重新上传")
 )
 
-// extByType 是允许的文件类型（按文件内容判断，不看扩展名）。
-var extByType = map[string]string{"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}
+// purposeRule 是每种用途允许的文件类型（按文件内容判断，不看扩展名）、大小上限与对应错误。
+type purposeRule struct {
+	extByType   map[string]string
+	limit       int
+	tooLarge    *apperr.Error
+	unsupported *apperr.Error
+	anonymous   bool // true = 所有者必须是 0（平台自己的文件），不计每日次数
+}
+
+var purposeRules = map[string]purposeRule{
+	PurposeLicense: {extByType: map[string]string{"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"},
+		limit: MaxUploadSize, tooLarge: ErrFileTooLarge, unsupported: ErrUnsupportedType},
+	PurposeWorkflowCover: {extByType: map[string]string{"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"},
+		limit: MaxCoverSize, tooLarge: ErrCoverTooLarge, unsupported: ErrUnsupportedCoverType, anonymous: true},
+}
 
 type Upload struct {
 	Key         string    `json:"key"`
@@ -54,16 +75,18 @@ func NewService(pool *pgxpool.Pool, clk clock.Clock, store Store) *Service {
 	return &Service{pool: pool, clock: clk, store: store}
 }
 
-// Save 读取文件内容（最多 10MB），按内容判断类型后保存，并登记归属。
+// Save 读取文件内容（不超过该用途的上限），按内容判断类型后保存，并登记归属。
+// workflow_cover 用途的 userID 必须为 0（登记为 NULL），且不计每用户每日次数；其它用途 userID 必须是真实用户。
 func (s *Service) Save(ctx context.Context, userID int64, purpose string, r io.Reader) (Upload, error) {
-	if purpose != PurposeLicense {
+	rule, ok := purposeRules[purpose]
+	if !ok || rule.anonymous != (userID == 0) {
 		return Upload{}, apperr.BadRequest("不支持的上传用途")
 	}
 	now := s.clock.Now()
-	data, err := io.ReadAll(io.LimitReader(r, MaxUploadSize+1))
+	data, err := io.ReadAll(io.LimitReader(r, int64(rule.limit)+1))
 	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) || len(data) > MaxUploadSize {
-		return Upload{}, ErrFileTooLarge
+	if errors.As(err, &tooLarge) || len(data) > rule.limit {
+		return Upload{}, rule.tooLarge
 	}
 	if err != nil {
 		return Upload{}, apperr.BadRequest("读取上传文件失败")
@@ -72,33 +95,39 @@ func (s *Service) Save(ctx context.Context, userID int64, purpose string, r io.R
 		return Upload{}, apperr.BadRequest("文件为空")
 	}
 	contentType := http.DetectContentType(data)
-	ext, ok := extByType[contentType]
+	ext, ok := rule.extByType[contentType]
 	if !ok {
-		return Upload{}, ErrUnsupportedType
+		return Upload{}, rule.unsupported
 	}
 	up := Upload{
 		Key:    fmt.Sprintf("%04d/%02d/%s.%s", now.Year(), int(now.Month()), randx.ID("", 32), ext),
 		UserID: userID, Size: int64(len(data)), ContentType: contentType, Purpose: purpose, CreatedAt: now,
 	}
 	stored := false
+	var owner *int64 // 0 → NULL（uploads.user_id 引用 users）
+	if userID != 0 {
+		owner = &userID
+	}
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "upload:"+strconv.FormatInt(userID, 10)); err != nil {
-			return err
-		}
-		var recent int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM uploads WHERE user_id = $1 AND created_at > $2`,
-			userID, now.Add(-24*time.Hour)).Scan(&recent); err != nil {
-			return err
-		}
-		if recent >= maxUploadsPerDay {
-			return apperr.ErrRateLimited
+		if owner != nil {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "upload:"+strconv.FormatInt(userID, 10)); err != nil {
+				return err
+			}
+			var recent int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM uploads WHERE user_id = $1 AND created_at > $2`,
+				userID, now.Add(-24*time.Hour)).Scan(&recent); err != nil {
+				return err
+			}
+			if recent >= maxUploadsPerDay {
+				return apperr.ErrRateLimited
+			}
 		}
 		if _, err := s.store.Put(ctx, up.Key, bytes.NewReader(data)); err != nil {
 			return fmt.Errorf("store upload: %w", err)
 		}
 		stored = true
 		_, err := tx.Exec(ctx, `INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`, up.Key, userID, up.Size, contentType, purpose, now)
+			VALUES ($1, $2, $3, $4, $5, $6)`, up.Key, owner, up.Size, contentType, purpose, now)
 		return err
 	})
 	if err != nil {
@@ -132,7 +161,7 @@ func (s *Service) Open(ctx context.Context, key string) (Upload, io.ReadCloser, 
 		return Upload{}, nil, apperr.ErrNotFound
 	}
 	var up Upload
-	err := s.pool.QueryRow(ctx, `SELECT key, user_id, size, content_type, purpose, created_at FROM uploads WHERE key = $1`, key).
+	err := s.pool.QueryRow(ctx, `SELECT key, COALESCE(user_id, 0), size, content_type, purpose, created_at FROM uploads WHERE key = $1`, key).
 		Scan(&up.Key, &up.UserID, &up.Size, &up.ContentType, &up.Purpose, &up.CreatedAt)
 	if db.IsNoRows(err) {
 		return Upload{}, nil, apperr.ErrNotFound
@@ -145,4 +174,20 @@ func (s *Service) Open(ctx context.Context, key string) (Upload, io.ReadCloser, 
 		return Upload{}, nil, err
 	}
 	return up, rc, nil
+}
+
+// Delete 删除指定用途的文件登记与文件内容（工作流换封面时删旧文件用）；登记不存在或用途不符 → 什么都不删并视为成功
+// （不会误删另一种用途的文件，例如营业执照）。先删登记再删文件：文件删除失败只会留下无人引用的孤儿文件。
+func (s *Service) Delete(ctx context.Context, key, purpose string) error {
+	if !ValidKey(key) {
+		return errBadKey
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM uploads WHERE key = $1 AND purpose = $2`, key, purpose)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	return s.store.Delete(ctx, key)
 }

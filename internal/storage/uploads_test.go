@@ -182,3 +182,111 @@ func TestSaveDailyLimitConcurrent(t *testing.T) {
 		t.Fatalf("uploads rows = %d, want 20", cnt)
 	}
 }
+
+var webpHeader = []byte("RIFF\x24\x00\x00\x00WEBPVP8 ")
+
+func TestSaveWorkflowCover(t *testing.T) {
+	svc, pool, _ := newUploads(t)
+	ctx := context.Background()
+	uid := dbtest.CreateUser(t, pool, "13900000001", true)
+	for header, ext := range map[string]string{string(pngHeader): "png", string(jpgHeader): "jpg", string(webpHeader): "webp"} {
+		up, err := svc.Save(ctx, 0, storage.PurposeWorkflowCover, strings.NewReader(header+"payload"))
+		if err != nil {
+			t.Fatalf("%s: %v", ext, err)
+		}
+		if !regexp.MustCompile(`^2026/01/[a-z0-9]{32}\.`+ext+`$`).MatchString(up.Key) || up.Purpose != storage.PurposeWorkflowCover {
+			t.Fatalf("upload = %+v", up)
+		}
+		got, rc, err := svc.Open(ctx, up.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc.Close()
+		if got.UserID != 0 || got.ContentType != up.ContentType {
+			t.Fatalf("open = %+v", got)
+		}
+	}
+	var nulls int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM uploads WHERE user_id IS NULL AND purpose = 'workflow_cover'`).Scan(&nulls)
+	if nulls != 3 {
+		t.Fatalf("cover rows with NULL owner = %d", nulls)
+	}
+	cases := []struct {
+		name   string
+		uid    int64
+		purp   string
+		body   io.Reader
+		code   string
+		substr string
+	}{
+		{"pdf cover", 0, storage.PurposeWorkflowCover, bytes.NewReader(pdfHeader), "unsupported_file_type", "WebP"},
+		{"webp license", uid, storage.PurposeLicense, bytes.NewReader(webpHeader), "unsupported_file_type", "PDF"},
+		{"cover too large", 0, storage.PurposeWorkflowCover, io.MultiReader(bytes.NewReader(pngHeader), bytes.NewReader(make([]byte, storage.MaxCoverSize))), "file_too_large", "2MB"},
+		{"cover with user owner", uid, storage.PurposeWorkflowCover, bytes.NewReader(pngHeader), "bad_request", ""},
+		{"license without owner", 0, storage.PurposeLicense, bytes.NewReader(pngHeader), "bad_request", ""},
+	}
+	for _, c := range cases {
+		_, err := svc.Save(ctx, c.uid, c.purp, c.body)
+		if code(err) != c.code || !strings.Contains(err.Error(), c.substr) {
+			t.Fatalf("%s: err = %v, want %s (%s)", c.name, err, c.code, c.substr)
+		}
+		if ae := apperr.As(err); c.code == "file_too_large" && ae.Status != 413 {
+			t.Fatalf("%s: status = %d", c.name, ae.Status)
+		}
+	}
+	exact := append(append([]byte{}, pngHeader...), make([]byte, storage.MaxCoverSize-len(pngHeader))...)
+	if _, err := svc.Save(ctx, 0, storage.PurposeWorkflowCover, bytes.NewReader(exact)); err != nil {
+		t.Fatalf("exactly 2MB must be accepted: %v", err)
+	}
+}
+
+// 封面不计每日次数（所有者是平台）。
+func TestSaveWorkflowCoverNoDailyLimit(t *testing.T) {
+	svc, _, _ := newUploads(t)
+	ctx := context.Background()
+	for i := 0; i < 25; i++ {
+		if _, err := svc.Save(ctx, 0, storage.PurposeWorkflowCover, bytes.NewReader(pngHeader)); err != nil {
+			t.Fatalf("cover %d: %v", i+1, err)
+		}
+	}
+}
+
+func TestDeleteUpload(t *testing.T) {
+	svc, pool, _ := newUploads(t)
+	ctx := context.Background()
+	up, err := svc.Save(ctx, 0, storage.PurposeWorkflowCover, bytes.NewReader(webpHeader))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(ctx, up.Key, storage.PurposeWorkflowCover); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.Open(ctx, up.Key); code(err) != "not_found" {
+		t.Fatalf("open after delete = %v", err)
+	}
+	var n int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM uploads`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("rows after delete = %d", n)
+	}
+	if err := svc.Delete(ctx, up.Key, storage.PurposeWorkflowCover); err != nil { // 幂等
+		t.Fatalf("second delete = %v", err)
+	}
+	if err := svc.Delete(ctx, "../x.png", storage.PurposeWorkflowCover); code(err) != "bad_request" {
+		t.Fatalf("bad key delete = %v", err)
+	}
+	// 用途不符：什么都不删（不会经封面路径误删营业执照）
+	uid := dbtest.CreateUser(t, pool, "13900000001", true)
+	lic, err := svc.Save(ctx, uid, storage.PurposeLicense, bytes.NewReader(pngHeader))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(ctx, lic.Key, storage.PurposeWorkflowCover); err != nil {
+		t.Fatal(err)
+	}
+	_, rc, err := svc.Open(ctx, lic.Key)
+	if err != nil {
+		t.Fatalf("license deleted via cover purpose: %v", err)
+	}
+	rc.Close()
+}

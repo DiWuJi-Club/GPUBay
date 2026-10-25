@@ -20,6 +20,7 @@ import (
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/butler"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/apperr"
@@ -67,6 +68,8 @@ type Server struct {
 	Referral      *referral.Service  // 计划 8：邀请返利（referralRoutes、用户详情 referral 区块、仪表盘本月返利净额）
 	Apps          *appdeploy.Service // 应用部署（计划 7）：部署列表 / 详情 / 强制卸载、实例详情与仪表盘
 	AppCatalog    *appdeploy.Catalog // 应用目录（计划 7）：应用、版本、发布、预拉取、覆盖率
+	Workflows     *comfywf.Catalog   // ComfyUI 工作流目录（计划 11）：工作流、版本、发布、封面、安装列表、仪表盘数字
+	Installer     *comfywf.Installer // 工作流安装（计划 11）：部署详情里的工作流集合
 	Clock         clock.Clock
 	Log           *slog.Logger
 	SecureCookie  bool                                     // 生产环境为 true：Cookie 仅经 HTTPS 发送
@@ -131,6 +134,9 @@ func (s *Server) Router() http.Handler {
 			s.referralRoutes(g)
 			s.catalogRoutes(g)
 			s.appRoutes(g)
+			if s.Workflows != nil { // 计划 11：没接工作流目录时不注册这些路由（404），仪表盘的工作流数字为 0
+				s.workflowRoutes(g)
+			}
 			s.butlerRoutes(g)
 		})
 	})
@@ -161,8 +167,23 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // requireJSONForWrites 要求写请求使用 application/json；配合 SameSite=Strict Cookie 防止跨站请求。
+// 例外：工作流封面上传要求 multipart/form-data。浏览器跨站表单可以发 multipart，所以这条路由还要求请求带 Origin 或
+// Sec-Fetch-Site（浏览器的 fetch / XHR 一定带其一），两个都没有 → 403；带了的由随后的 SameSiteGuard 比对。
 func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isCoverUpload(r) {
+			if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+				s.writeError(w, r, apperr.BadRequest("请使用 multipart/form-data 上传文件"))
+				return
+			}
+			if r.Header.Get("Origin") == "" && r.Header.Get("Sec-Fetch-Site") == "" {
+				s.Log.Warn("cover upload without Origin / Sec-Fetch-Site rejected", "path", r.URL.Path)
+				s.writeError(w, r, apperr.ErrForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions &&
 			!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 			s.writeError(w, r, apperr.BadRequest("请求格式必须为 JSON"))

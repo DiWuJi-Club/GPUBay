@@ -21,7 +21,7 @@ type Store interface {
 	Delete(ctx context.Context, key string) error
 }
 
-var keyRe = regexp.MustCompile(`^\d{4}/\d{2}/[a-z0-9]{32}\.(jpg|png|pdf)$`)
+var keyRe = regexp.MustCompile(`^\d{4}/\d{2}/[a-z0-9]{32}\.(jpg|png|pdf|webp)$`)
 
 // ValidKey 报告 key 是否是服务端签发格式的文件键（同时防止路径穿越）。
 func ValidKey(key string) bool { return keyRe.MatchString(key) }

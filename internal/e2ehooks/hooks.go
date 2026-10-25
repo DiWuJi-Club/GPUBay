@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"sort"
 	"strconv"
@@ -30,6 +31,7 @@ import (
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/butler/llm/mock"
+	"spark-cloud/internal/comfywf/comfytest"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/clock"
@@ -57,9 +59,13 @@ type Server struct {
 	HealthAddr string
 	// LLM 是 app.Options.LLM 注入的同一个 mock 提供方：/hooks/butler/reply 往它的队列里塞下一轮回复；nil 时管家钩子报 400
 	LLM *mock.Mock
+	// Comfy 是进程内 fake ComfyUI（快速出图代理的上游）：/hooks/apps/seed 与 /hooks/workflows/seed 之后所有实例的 8188 都转到它，
+	// /hooks/comfy/* 控制它；nil = 不提供（这些钩子报错）。
+	Comfy *comfytest.Server
 
 	sweepMu       sync.Mutex // 进程内串行化 /hooks/sweep（再加清扫咨询锁防跨进程交叠）；见 sweep
 	mu            sync.Mutex
+	comfyTS       *httptest.Server
 	agents        map[int64]*fakeagent.Agent
 	upstreamStops map[int]func() // ingress-upstream 起的回显服务，按端口
 }
@@ -76,6 +82,10 @@ func (s *Server) Close() {
 		stop()
 	}
 	s.upstreamStops = nil
+	if s.comfyTS != nil {
+		s.comfyTS.Close()
+		s.comfyTS = nil
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -100,6 +110,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/butler/reset", s.handle(s.butlerReset))
 	mux.HandleFunc("POST /hooks/butler/usage", s.handle(s.butlerUsage))
 	mux.HandleFunc("POST /hooks/butler/settings", s.handle(s.butlerSettings))
+	mux.HandleFunc("POST /hooks/workflows/seed", s.handle(s.workflowsSeed))
+	mux.HandleFunc("POST /hooks/workflows/seed-many", s.handle(s.workflowsSeedMany))
+	mux.HandleFunc("POST /hooks/workflows/version", s.handle(s.workflowsVersion))
+	mux.HandleFunc("POST /hooks/comfy/history", s.handle(s.comfyHistory))
+	mux.HandleFunc("GET /hooks/comfy/prompts", s.handle(s.comfyPrompts))
+	mux.HandleFunc("POST /hooks/comfy/reject", s.handle(s.comfyReject))
+	mux.HandleFunc("POST /hooks/comfy/reset", s.handle(s.comfyReset))
 	return loopbackOnly(mux)
 }
 

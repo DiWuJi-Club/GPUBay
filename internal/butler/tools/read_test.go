@@ -534,7 +534,7 @@ func TestGetCancelQuote(t *testing.T) {
 func TestGetHelp(t *testing.T) {
 	r := NewRegistry(newFakes().deps)
 	secs := help.Sections()
-	if len(secs) != 11 {
+	if len(secs) != 12 {
 		t.Fatalf("sections = %v", secs)
 	}
 	for _, s := range secs {

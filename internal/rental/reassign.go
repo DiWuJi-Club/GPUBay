@@ -92,8 +92,7 @@ func (s *Service) reassignAfterCreateFailure(ctx context.Context, tx pgx.Tx, ins
 		if err != nil {
 			return err
 		}
-		_, err = s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref})
-		return err
+		return s.enqueueCreate(ctx, tx, inst, ref)
 	}
 	if now.Before(inst.ScheduledStartAt.Add(BookingGrace)) {
 		if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'reserved', provisioned_at = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {

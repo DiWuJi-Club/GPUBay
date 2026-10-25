@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  deploymentErrorLabel, deploymentStateLabel, deploymentStateType, fmtTime, fmtTimeSec, labelOf, messageOf,
+  deploymentErrorLabel, deploymentStateLabel, deploymentStateType, fmtTime, fmtTimeSec, labelOf, messageOf, workflowStateLabel, workflowStateType,
   type AdminApp, type AdminDeployment, type AdminDeploymentDetail, type DeploymentState, type Listed, type Paged,
 } from '@spark/shared'
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -59,6 +59,9 @@ function resetFilter() {
 const detail = reactive({ open: false, id: '', loading: false, error: '', data: null as AdminDeploymentDetail | null })
 const dep = computed(() => detail.data?.deployment ?? null)
 const env = computed(() => (dep.value ? envRows(dep.value) : []))
+/** 计划 11：部署上的工作流集合；ComfyUI 部署（或已有工作流）才显示这一节 */
+const workflows = computed(() => detail.data?.workflows ?? [])
+const showWorkflows = computed(() => dep.value?.app_slug === 'comfyui' || workflows.value.length > 0)
 let seq = 0
 /** 只采用最后一次请求的结果：快速点不同的行时，先发后到的旧详情被丢弃。 */
 async function loadDetail() {
@@ -196,6 +199,27 @@ const errorText = (d: AdminDeployment) => (d.error_code ? labelOf(deploymentErro
             <tr v-if="!env.length"><td colspan="3" class="muted empty">无变量</td></tr>
           </tbody>
         </table>
+
+        <template v-if="showWorkflows">
+          <h4>工作流</h4>
+          <table class="grid" data-testid="adm-dep-workflows">
+            <thead><tr><th>工作流</th><th>版本</th><th>状态</th><th>快速出图</th><th>加入</th><th>装好</th></tr></thead>
+            <tbody>
+              <tr v-for="w in workflows" :key="w.workflow_id" data-testid="adm-dep-workflow-row" :data-slug="w.slug">
+                <td><router-link :to="`/workflows/${w.workflow_id}`" data-testid="adm-dep-workflow-name">{{ w.name }}</router-link> <span class="muted mono">{{ w.slug }}</span></td>
+                <td>
+                  <span data-testid="adm-dep-workflow-version">{{ w.version }}</span>
+                  <el-tag v-if="w.update_available" size="small" type="warning" class="gap" data-testid="adm-dep-workflow-update">有新版本 {{ w.latest_version }}</el-tag>
+                </td>
+                <td><el-tag size="small" :type="labelOf(workflowStateType, w.state) as 'primary'" data-testid="adm-dep-workflow-state" :data-state="w.state">{{ labelOf(workflowStateLabel, w.state) }}</el-tag></td>
+                <td>{{ w.quick_run ? '支持' : '—' }}</td>
+                <td class="time">{{ fmtTime(w.added_at) }}</td>
+                <td class="time">{{ fmtTime(w.installed_at) || '—' }}</td>
+              </tr>
+              <tr v-if="!workflows.length"><td colspan="6" class="muted empty">未安装工作流</td></tr>
+            </tbody>
+          </table>
+        </template>
 
         <h4>事件（最近 100 条）</h4>
         <table class="grid" data-testid="deployment-events">

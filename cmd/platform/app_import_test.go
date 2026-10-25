@@ -22,7 +22,7 @@ func TestAdminAppImportArgs(t *testing.T) {
 	ctx := context.Background()
 	var out bytes.Buffer
 	for _, args := range [][]string{{"app"}, {"app", "import"}, {"app", "export", "dir"}, {"app", "import", "a", "b"}} {
-		if err := runAdmin(ctx, nil, nil, args, &out, nil); err == nil || err.Error() != appImportUsage {
+		if err := runAdmin(ctx, nil, nil, nil, args, &out, nil); err == nil || err.Error() != appImportUsage {
 			t.Errorf("%v: want %q, got %v", args, appImportUsage, err)
 		}
 	}
@@ -57,14 +57,14 @@ func TestAdminAppImportPrintsResults(t *testing.T) {
 	}
 	var out bytes.Buffer
 	write("1.0.0")
-	if err := runAdmin(context.Background(), nil, cat, []string{"app", "import", root}, &out, nil); err != nil {
+	if err := runAdmin(context.Background(), nil, cat, nil, []string{"app", "import", root}, &out, nil); err != nil {
 		t.Fatal(err)
 	}
 	write("1.0.1")
 	if err := os.Symlink(filepath.Join(root, "demo"), filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
-	if err := runAdmin(context.Background(), nil, cat, []string{"app", "import", root}, &out, nil); err != nil {
+	if err := runAdmin(context.Background(), nil, cat, nil, []string{"app", "import", root}, &out, nil); err != nil {
 		t.Fatal(err)
 	}
 	if want := "demo 1.0.0 created\ndemo 1.0.1 version-added\nlink skipped: link 是符号链接，已跳过\n"; out.String() != want {

@@ -7,7 +7,11 @@ import (
 
 	"spark-cloud/internal/agentpb"
 	"spark-cloud/internal/fleet"
+	"spark-cloud/internal/rental"
 )
+
+// maxMetricsInstances 是 last_metrics.instances 最多保留的条数（一台机器的实例数远小于它；防异常 Agent 撑大每次心跳的写入）。
+const maxMetricsInstances = 16
 
 func toStateReport(r *agentpb.StateReport) fleet.StateReport {
 	out := fleet.StateReport{Instances: []fleet.InstanceState{}}
@@ -30,6 +34,17 @@ type metricsDoc struct {
 	RootDiskUsed  uint64  `json:"root_disk_used"`
 	DataDiskUsed  uint64  `json:"data_disk_used"`
 	Load1         float64 `json:"load1"`
+	// Instances 是每个实例容器的 cgroup 用量（计划 10）；旧 Agent 不发，写空数组（不是 null）。
+	Instances []instanceMetricsDoc `json:"instances"`
+}
+
+// instanceMetricsDoc 是 last_metrics.instances 的元素。
+type instanceMetricsDoc struct {
+	InstanceID   string  `json:"instance_id"`
+	MemCurrent   uint64  `json:"mem_current"`
+	MemMax       uint64  `json:"mem_max"` // 0 = 不限
+	CPUPercent   float64 `json:"cpu_percent"`
+	DataDiskUsed uint64  `json:"data_disk_used"`
 }
 
 func finite(v float64) float64 {
@@ -39,11 +54,22 @@ func finite(v float64) float64 {
 	return v
 }
 
-// metricsJSON 把指标转成 JSON；NaN / Inf 置 0，否则 json.Marshal 会失败导致断流。
-func metricsJSON(m *agentpb.Metrics) (json.RawMessage, error) {
+// metricsJSON 把机器指标与每实例指标转成 JSON；NaN / Inf 置 0，否则 json.Marshal 会失败导致断流。
+// 每实例指标只收实例 ID 合法的条目，最多 maxMetricsInstances 条。
+func metricsJSON(m *agentpb.Metrics, instances []*agentpb.InstanceMetrics) (json.RawMessage, error) {
 	d := metricsDoc{GPUUtil: finite(m.GetGpuUtil()), GPUTempC: finite(m.GetGpuTempC()), GPUPowerW: finite(m.GetGpuPowerW()),
 		MemTotal: m.GetMemTotal(), MemUsed: m.GetMemUsed(), RootDiskTotal: m.GetRootDiskTotal(), RootDiskUsed: m.GetRootDiskUsed(),
-		DataDiskUsed: m.GetDataDiskUsed(), Load1: finite(m.GetLoad1())}
+		DataDiskUsed: m.GetDataDiskUsed(), Load1: finite(m.GetLoad1()), Instances: make([]instanceMetricsDoc, 0, min(len(instances), maxMetricsInstances))}
+	for _, x := range instances {
+		if len(d.Instances) >= maxMetricsInstances {
+			break
+		}
+		if !rental.InstanceIDPattern.MatchString(x.GetInstanceId()) { // 不是平台实例 ID 的条目不落库
+			continue
+		}
+		d.Instances = append(d.Instances, instanceMetricsDoc{InstanceID: x.GetInstanceId(), MemCurrent: x.GetMemCurrent(), MemMax: x.GetMemMax(),
+			CPUPercent: finite(x.GetCpuPercent()), DataDiskUsed: x.GetDataDiskUsed()})
+	}
 	return json.Marshal(d)
 }
 
@@ -56,8 +82,14 @@ func toProtoCommand(cmd fleet.Command, cfg Config, hostKeyPEM string) (*agentpb.
 		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
 			return nil, err
 		}
+		// 端口优先取指令（平台按槽位算好）；为 0 的存量 pending 指令沿用全局配置。
+		port := cfg.SSHPort
+		if p.SSHPort > 0 {
+			port = p.SSHPort
+		}
 		out.Body = &agentpb.Command_Create{Create: &agentpb.CreateInstance{ImageRef: p.ImageRef, UpstreamPubkey: cfg.UpstreamPubKey,
-			BandwidthMbps: uint32(cfg.BandwidthMbps), SshPort: uint32(cfg.SSHPort), DataSizeGib: uint32(cfg.DataSizeGiB), HostKeyPem: hostKeyPEM}}
+			BandwidthMbps: uint32(cfg.BandwidthMbps), SshPort: uint32(port), DataSizeGib: uint32(cfg.DataSizeGiB), HostKeyPem: hostKeyPEM,
+			ShareSlots: uint32(max(0, p.ShareSlots))}}
 	case fleet.CmdStartInstance:
 		out.Body = &agentpb.Command_Start{Start: &agentpb.StartInstance{}}
 	case fleet.CmdStopInstance:

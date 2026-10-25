@@ -67,6 +67,8 @@ export const auditActions: readonly string[] = [
   'app.create', 'app.update', 'app.delete', 'app.version.create', 'app.version.update', 'app.version.publish', 'app.version.prepull',
   'app.deployment.force_remove',
   'instance.app_deploy', 'instance.app_redeploy', 'instance.app_stop', 'instance.app_start', 'instance.app_remove',
+  'workflow.create', 'workflow.update', 'workflow.delete', 'workflow.version.create', 'workflow.version.update', 'workflow.version.publish',
+  'instance.workflow_add', 'instance.workflow_update', 'instance.workflow_remove',
   'butler.tool_execute', 'butler.settings',
 ]
 
@@ -94,6 +96,26 @@ export function deploymentErrorText(code: string, message: string, fallback = ''
 }
 export const appCategoryLabel: LabelMap = { llm: '大模型', image: '图像生成', notebook: 'Notebook', tool: '工具' }
 export const appStatusLabel: LabelMap = { draft: '草稿', published: '已发布', retired: '已退役' }
+
+// 计划 11：ComfyUI 工作流市场
+export const workflowCategoryLabel: LabelMap = { txt2img: '文生图', img2img: '图生图', video: '视频', upscale: '放大修复', other: '其它' }
+export const workflowStateLabel: LabelMap = { pending: '待安装', installed: '已安装', failed: '安装失败' }
+export const workflowStateType: LabelMap = { pending: 'info', installed: 'success', failed: 'danger' }
+export const runStateLabel: LabelMap = { queued: '排队中', running: '生成中', done: '完成', error: '失败' }
+/** 工作流相关错误码的中文（与后端 apperr 一致；带参数的错误以后端 message 为准）。 */
+export const workflowErrorLabel: LabelMap = {
+  workflow_not_found: '工作流不存在或未上架', workflow_unavailable: '该工作流当前没有可用版本', workflow_exists: '该工作流已安装在此 ComfyUI 上',
+  workflow_limit: '每个 ComfyUI 最多安装 8 个工作流', workflow_app_unsupported: '当前 ComfyUI 应用版本不支持工作流市场',
+  workflow_version_invalid: '工作流版本校验未通过', workflow_version_frozen: '已发布的工作流版本不能修改',
+  workflow_busy: 'ComfyUI 正在处理其它任务，请稍后再试', workflow_prompt_rejected: 'ComfyUI 拒绝了该任务', workflow_input_invalid: '参数不正确',
+  upstream_unreachable: '无法连接实例内的 ComfyUI',
+}
+/** 下载量（GB）→ `6.9 GB` / `17 GB`：小于 10 最多两位小数，否则最多一位，去掉尾零；非法或负数为 0。 */
+export function formatGB(n: number | string): string {
+  const v = typeof n === 'string' ? Number(n) : n
+  if (!Number.isFinite(v) || v <= 0) return '0 GB'
+  return `${Number(v.toFixed(v < 10 ? 2 : 1))} GB`
+}
 
 /** AI 管家 23 个工具的中文名（与 Go internal/butler/tools.Labels 同表；前 15 个读、后 8 个写）。 */
 export const butlerToolLabel: LabelMap = {

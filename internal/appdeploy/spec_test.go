@@ -142,3 +142,35 @@ func TestSpecHashIgnoresKeyOrder(t *testing.T) {
 		t.Fatalf("hash = %q", h)
 	}
 }
+
+// 计划 11：supports_workflows 往返；false 时省略（既有版本的 spec JSON 与 spec_hash 不变），true 时改变 hash；ValidateSpec 不加约束。
+func TestSpecSupportsWorkflows(t *testing.T) {
+	s := goodSpec()
+	if err := appdeploy.ValidateSpec(&s); err != nil {
+		t.Fatal(err)
+	}
+	before := appdeploy.SpecHash(s, "x")
+	b, _ := json.Marshal(s)
+	if strings.Contains(string(b), "supports_workflows") {
+		t.Fatalf("false must be omitted: %s", b)
+	}
+	s.SupportsWorkflows = true
+	if err := appdeploy.ValidateSpec(&s); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = json.Marshal(s)
+	if !strings.Contains(string(b), `"supports_workflows":true`) {
+		t.Fatalf("spec json = %s", b)
+	}
+	var back appdeploy.Spec
+	if err := json.Unmarshal(b, &back); err != nil || !back.SupportsWorkflows {
+		t.Fatalf("round trip = %+v, %v", back, err)
+	}
+	if appdeploy.SpecHash(s, "x") == before {
+		t.Fatal("supports_workflows must change spec_hash")
+	}
+	s.SupportsWorkflows = false
+	if appdeploy.SpecHash(s, "x") != before {
+		t.Fatal("false changed spec_hash of existing versions")
+	}
+}

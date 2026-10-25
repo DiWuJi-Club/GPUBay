@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -15,6 +16,7 @@ import (
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/butler"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
@@ -55,16 +57,25 @@ type Server struct {
 	// 计划 7：应用部署；nil 时不注册 /apps* 与 /instances/{id}/apps*，实例视图的 apps_summary 恒为空数组
 	Apps      *appdeploy.Service
 	AppsLimit int // 应用部署类写操作每用户每小时上限；零值 appdeploy.UserOpsPerHour（60）
+	// 计划 11：ComfyUI 工作流市场。Workflows nil 时不注册 /workflows*；Installer / Runs nil（或 Apps nil）时不注册
+	// /instances/{id}/apps/{dep}/workflows* 的安装 / 快速出图接口。安装写接口与应用部署写操作共用 AppsLimit。
+	Workflows *comfywf.Catalog
+	Installer *comfywf.Installer
+	Runs      *comfywf.Runs
 	// 计划 12：AI 管家；nil 时不注册 /butler/*（前端按「未开放」处理）
 	Butler      *butler.Service
 	ButlerLimit int           // 发消息 + 确认每用户每分钟上限；零值 butler.SendRatePerMinute（20）
 	ButlerPing  time.Duration // SSE 保活注释间隔；零值 15 秒（测试调小）
 
-	authorizeLim *userLimiter
-	calendarLim  *ipLimiter
-	referralLim  *ipLimiter
-	appsLim      *userLimiter
-	butlerLim    *userLimiter
+	authorizeLim  *userLimiter
+	calendarLim   *ipLimiter
+	referralLim   *ipLimiter
+	appsLim       *userLimiter
+	wfUploadLim   *userLimiter
+	runAttemptLim *userLimiter
+	coverLim      *ipLimiter
+	butlerLim     *userLimiter
+	deadlineOnce  sync.Once
 }
 
 const sessionCookie = "sc_session"
@@ -100,6 +111,9 @@ func (s *Server) Router() http.Handler {
 		alimit = appdeploy.UserOpsPerHour
 	}
 	s.appsLim = &userLimiter{limit: alimit, window: time.Hour}
+	s.wfUploadLim = &userLimiter{limit: comfywf.RunsPerHour, window: time.Hour}
+	s.runAttemptLim = &userLimiter{limit: runAttemptsPerHour, window: time.Hour}
+	s.coverLim = &ipLimiter{limit: coverIPLimit}
 	blimit := s.ButlerLimit
 	if blimit <= 0 {
 		blimit = butler.SendRatePerMinute
@@ -141,7 +155,15 @@ func (s *Server) Router() http.Handler {
 				r.Get("/apps", s.handleAppCatalog)
 				r.Get("/apps/{slug}", s.handleAppCatalogItem)
 			}
+			if s.Workflows != nil {
+				r.Get("/workflows", s.handleWorkflowCatalog)
+				r.Get("/workflows/{slug}", s.handleWorkflowDetail)
+			}
 		})
+		if s.Workflows != nil {
+			// 封面：公共长缓存（处理器设 Cache-Control），自己的按 IP 限流，不占列表 / 详情的额度
+			r.With(s.coverRateLimit).Get("/workflows/{slug}/cover", s.handleWorkflowCover)
+		}
 		r.Post("/pay/notify/{channel}", s.handlePayNotify)
 		if s.Ingress != nil {
 			r.With(httpx.NoStore).Get("/ingress/authorize", s.handleIngressAuthorize) // 组外：未登录要 302 到登录页而不是 JSON 401
@@ -193,6 +215,21 @@ func (s *Server) Router() http.Handler {
 				r.Get("/instances/{id}/apps/{dep}/log", s.handleAppLog)
 				r.Get("/instances/{id}/apps/{dep}/events", s.handleAppEvents)
 			}
+			if s.Apps != nil && s.Installer != nil {
+				r.Get("/instances/{id}/apps/{dep}/workflows", s.handleDeploymentWorkflows)
+				r.Post("/instances/{id}/apps/{dep}/workflows", s.handleAddWorkflow)
+				if s.Workflows != nil {
+					r.Get("/instances/{id}/apps/{dep}/workflows/{wid}", s.handleDeploymentWorkflow)
+				}
+				r.Put("/instances/{id}/apps/{dep}/workflows/{wid}", s.handleUpdateWorkflow)
+				r.Delete("/instances/{id}/apps/{dep}/workflows/{wid}", s.handleRemoveWorkflow)
+			}
+			if s.Apps != nil && s.Runs != nil {
+				r.Post("/instances/{id}/apps/{dep}/workflows/{wid}/uploads", s.handleWorkflowUpload)
+				r.Post("/instances/{id}/apps/{dep}/workflows/{wid}/runs", s.handleStartRun)
+				r.Get("/instances/{id}/apps/{dep}/workflows/{wid}/runs/{run}", s.handleGetRun)
+				r.Get("/instances/{id}/apps/{dep}/workflows/{wid}/runs/{run}/files/{index}", s.handleRunFile)
+			}
 			r.Get("/recharges", s.handleRecharges)
 			r.Post("/recharges", s.handleCreateRecharge)
 			r.Get("/recharges/{id}", s.handleRecharge)
@@ -230,7 +267,7 @@ func (s *Server) requireJSONForWrites(next http.Handler) http.Handler {
 			return
 		}
 		want, msg := "application/json", "请求格式必须为 JSON"
-		if r.URL.Path == uploadPath {
+		if r.URL.Path == uploadPath || (r.Method == http.MethodPost && isWorkflowUploadPath(r.URL.Path)) {
 			want, msg = "multipart/form-data", "请使用 multipart/form-data 上传文件"
 		}
 		if !strings.HasPrefix(r.Header.Get("Content-Type"), want) {

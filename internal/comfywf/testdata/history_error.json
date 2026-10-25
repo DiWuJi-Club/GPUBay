@@ -1,0 +1,200 @@
+{
+  "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a": {
+    "prompt": [
+      3,
+      "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a",
+      {
+        "3": {
+          "inputs": {
+            "seed": 156680208700286,
+            "steps": 25,
+            "cfg": 7,
+            "sampler_name": "euler",
+            "scheduler": "normal",
+            "denoise": 1,
+            "model": [
+              "4",
+              0
+            ],
+            "positive": [
+              "6",
+              0
+            ],
+            "negative": [
+              "7",
+              0
+            ],
+            "latent_image": [
+              "5",
+              0
+            ]
+          },
+          "class_type": "KSampler",
+          "_meta": {
+            "title": "KSampler"
+          }
+        },
+        "4": {
+          "inputs": {
+            "ckpt_name": "sd_xl_base_1.0.safetensors"
+          },
+          "class_type": "CheckpointLoaderSimple",
+          "_meta": {
+            "title": "Load Checkpoint"
+          }
+        },
+        "5": {
+          "inputs": {
+            "width": 1024,
+            "height": 1024,
+            "batch_size": 1
+          },
+          "class_type": "EmptyLatentImage",
+          "_meta": {
+            "title": "Empty Latent Image"
+          }
+        },
+        "6": {
+          "inputs": {
+            "text": "a photo of an astronaut riding a horse on mars, highly detailed",
+            "clip": [
+              "4",
+              1
+            ]
+          },
+          "class_type": "CLIPTextEncode",
+          "_meta": {
+            "title": "CLIP Text Encode (Prompt)"
+          }
+        },
+        "7": {
+          "inputs": {
+            "text": "blurry, low quality, watermark",
+            "clip": [
+              "4",
+              1
+            ]
+          },
+          "class_type": "CLIPTextEncode",
+          "_meta": {
+            "title": "CLIP Text Encode (Prompt)"
+          }
+        },
+        "8": {
+          "inputs": {
+            "samples": [
+              "3",
+              0
+            ],
+            "vae": [
+              "4",
+              2
+            ]
+          },
+          "class_type": "VAEDecode",
+          "_meta": {
+            "title": "VAE Decode"
+          }
+        },
+        "9": {
+          "inputs": {
+            "filename_prefix": "ComfyUI",
+            "images": [
+              "8",
+              0
+            ]
+          },
+          "class_type": "SaveImage",
+          "_meta": {
+            "title": "Save Image"
+          }
+        },
+        "10": {
+          "inputs": {
+            "image": "example.png"
+          },
+          "class_type": "LoadImage",
+          "_meta": {
+            "title": "Load Image"
+          }
+        },
+        "11": {
+          "inputs": {
+            "images": [
+              "10",
+              0
+            ]
+          },
+          "class_type": "PreviewImage",
+          "_meta": {
+            "title": "Preview Image"
+          }
+        }
+      },
+      {
+        "client_id": "r7k2m9q4x1z8"
+      },
+      [
+        "9",
+        "11"
+      ]
+    ],
+    "outputs": {},
+    "status": {
+      "status_str": "error",
+      "completed": false,
+      "messages": [
+        [
+          "execution_start",
+          {
+            "prompt_id": "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a",
+            "timestamp": 1761300000000
+          }
+        ],
+        [
+          "execution_cached",
+          {
+            "nodes": [],
+            "prompt_id": "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a",
+            "timestamp": 1761300000002
+          }
+        ],
+        [
+          "execution_error",
+          {
+            "prompt_id": "2f3c5a1e-8b7d-4c1a-9e0f-6d5b4a3c2b1a",
+            "node_id": "3",
+            "node_type": "KSampler",
+            "executed": [
+              "4",
+              "5",
+              "6",
+              "7"
+            ],
+            "exception_message": "Allocation on device \nThis error means you ran out of memory on your GPU.\n\nTIPS: If the workflow worked before you might have accidentally set the batch_size to a large number.",
+            "exception_type": "torch.OutOfMemoryError",
+            "traceback": [
+              "  File \"/opt/ComfyUI/execution.py\", line 496, in execute\n    output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, hidden_inputs=hidden_inputs)\n"
+            ],
+            "current_inputs": {
+              "seed": [
+                "156680208700286"
+              ],
+              "steps": [
+                "25"
+              ]
+            },
+            "current_outputs": [
+              "4",
+              "5",
+              "6",
+              "7"
+            ],
+            "timestamp": 1761300005120
+          }
+        ]
+      ]
+    },
+    "meta": {}
+  }
+}

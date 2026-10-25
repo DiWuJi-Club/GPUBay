@@ -83,7 +83,7 @@ var appKeywords = []struct{ kw, slug string }{
 // 帮助章节关键词（help/*.md 的节名）。
 var helpKeywords = []struct{ kw, section string }{
 	{"密钥", "ssh-keys"}, {"公钥", "ssh-keys"}, {"端口", "forward"}, {"转发", "forward"}, {"网页", "web"},
-	{"应用", "apps"}, {"预订", "booking"}, {"批量", "batch"}, {"自动续费", "auto-renew"}, {"保留", "retention"},
+	{"工作流", "workflows"}, {"应用", "apps"}, {"预订", "booking"}, {"批量", "batch"}, {"自动续费", "auto-renew"}, {"保留", "retention"},
 	{"计费", "billing"}, {"扣费", "billing"}, {"价格", "billing"}, {"管家", "butler"},
 }
 

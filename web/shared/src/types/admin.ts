@@ -1,5 +1,5 @@
 import type { InstancePort, SshKey } from './access'
-import type { AppCategory, AppSpec, AppStatus, Deployment, DeploymentEvent } from './apps'
+import type { AppCategory, AppSpec, AppStatus, Deployment, DeploymentEvent, DeploymentState } from './apps'
 import type { CalendarPeriod } from './booking'
 import type { Duration } from './catalog'
 import type { InstanceState, OrderKind, OrderStatus } from './instance'
@@ -8,6 +8,7 @@ import type { LedgerKind, LedgerRow } from './wallet'
 import type { RechargeChannel, RechargeStatus } from './recharge'
 import type { BindingStatus, RebateRule, ReferralAccountStatus, RewardStatus } from './referral'
 import type { User } from './user'
+import type { InstalledWorkflow, WorkflowCategory, WorkflowInstallState, WorkflowManifestPublic, WorkflowStatus } from './workflows'
 
 export interface Paged<T> {
   items: T[]
@@ -74,6 +75,14 @@ export interface MachineMetrics {
   root_disk_used: number
   data_disk_used: number
   load1: number
+  /** 每个实例容器的 cgroup 用量（计划 10，≤ 16 项；mem_max 0 = 不限）；升级前写入的 last_metrics 没有此字段 */
+  instances?: {
+    instance_id: string
+    mem_current: number
+    mem_max: number
+    cpu_percent: number
+    data_disk_used: number
+  }[]
 }
 
 export interface EnrollCommand {
@@ -350,6 +359,10 @@ export interface Dashboard {
   apps_installing: number
   apps_running: number
   apps_failed_24h: number
+  /** 计划 11：已装好（installed）且部署非终态的工作流安装数 */
+  workflow_installs: number
+  /** 计划 11：近 24 小时快速出图次数 */
+  workflow_runs_24h: number
 }
 
 // ---- 邀请返利（计划 8，金额单位：分）。手机号为原文，页面显示前须脱敏；后端从不返回实名指纹 / 证件号 ----
@@ -539,4 +552,122 @@ export interface AdminDeployment extends Deployment {
 export interface AdminDeploymentDetail {
   deployment: AdminDeployment
   events: DeploymentEvent[]
+  /** 计划 11：部署上的工作流集合（非 ComfyUI 部署为 []；旧后端缺省） */
+  workflows?: InstalledWorkflow[]
+}
+
+// ---- 计划 11：ComfyUI 工作流目录（/admin/api/v1/workflows*）----
+
+/** 后台工作流（POST / PUT / GET /workflows/{id}、封面上传的响应）。cover_url 是后台预览地址（带 ?v=），无封面为 null。 */
+export interface AdminWorkflow {
+  id: number
+  slug: string
+  name: string
+  summary: string
+  description: string
+  category: WorkflowCategory
+  tags: string[]
+  has_cover: boolean
+  cover_url: string | null
+  sort: number
+  status: WorkflowStatus
+  created_at: string
+  updated_at: string
+}
+
+/** GET /workflows 的一行：+ 版本数、在用安装数、近 7 日快速出图次数。 */
+export interface AdminWorkflowRow extends AdminWorkflow {
+  versions: number
+  installs_live: number
+  runs_7d: number
+}
+
+/** POST / PUT /workflows 的请求体（slug 创建后不可改；PUT 的 status 省略 = 不改）。 */
+export interface AdminWorkflowInput {
+  slug: string
+  name: string
+  summary: string
+  description: string
+  category: WorkflowCategory
+  tags: string[]
+  sort: number
+  status?: WorkflowStatus
+}
+
+/** GET /workflows/{id}/versions 的一项（不含 graph / api_prompt / manifest 本体），按创建倒序。 */
+export interface AdminWorkflowVersionRow {
+  id: number
+  workflow_id: number
+  version: string
+  status: WorkflowStatus
+  download_gb: number
+  manifest_hash: string
+  changelog: string
+  /** 模型数 */
+  models: number
+  /** 自定义节点数 */
+  nodes: number
+  quick_run: boolean
+  comfyui_min: string
+  /** 该版本的在用安装数 */
+  installs: number
+  published_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** API 格式的工作流（ComfyUI「导出 (API)」）。 */
+export type ComfyApiPrompt = Record<string, { class_type: string; inputs: Record<string, unknown>; _meta?: unknown }>
+
+/** GET /workflows/{id}/versions/{vid}（唯一带 graph / api_prompt / manifest 全文的接口）；api_prompt 为 null = 不支持快速出图。 */
+export interface AdminWorkflowVersion {
+  id: number
+  workflow_id: number
+  version: string
+  status: WorkflowStatus
+  graph: unknown
+  api_prompt: ComfyApiPrompt | null
+  manifest: WorkflowManifestPublic
+  download_gb: number
+  manifest_hash: string
+  changelog: string
+  published_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * POST / PUT /workflows/{id}/versions[/{vid}] 的请求体。PUT 草稿：省略的字段沿用当前值，api_prompt 显式 null = 去掉快速出图；
+ * PUT 已发布：只能改 changelog 或 status = retired。
+ */
+export interface AdminWorkflowVersionInput {
+  version?: string
+  graph?: unknown
+  api_prompt?: ComfyApiPrompt | null
+  manifest?: WorkflowManifestPublic
+  changelog?: string
+  copy_from?: number
+  status?: WorkflowStatus
+}
+
+/** ?validate=1 的响应（只校验不保存）。 */
+export interface WorkflowValidateResult {
+  ok: boolean
+  manifest_hash: string
+  download_gb: number
+  warnings: string[]
+}
+
+/** GET /workflows/{id}/installs 的一行（按加入时间倒序）。 */
+export interface AdminWorkflowInstall {
+  deployment_id: string
+  deployment_state: DeploymentState
+  instance_id: string
+  user_id: number
+  phone: string
+  version_id: number
+  version: string
+  state: WorkflowInstallState
+  added_at: string
+  installed_at: string | null
 }

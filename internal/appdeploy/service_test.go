@@ -664,7 +664,8 @@ func TestLogLiveAndFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(srv.Close)
-	up := upstream.New(upstream.Config{Signer: signer, Port: srv.Port(), DialTimeout: 500 * time.Millisecond}, e.rental)
+	e.setSSHBasePort(srv.Port()) // 按实例端口拨号；池默认端口是死的
+	up := upstream.New(upstream.Config{Signer: signer, Port: deadPort(t), DialTimeout: 500 * time.Millisecond}, e.rental)
 	t.Cleanup(up.Close)
 	appRoot := filepath.Join(srv.Root(), "root", "data")
 	svc := e.newService(up, appRoot)

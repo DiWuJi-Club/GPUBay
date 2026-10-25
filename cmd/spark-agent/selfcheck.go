@@ -9,18 +9,25 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"spark-cloud/internal/agent/cmdrun"
 )
 
-const minFreeBytes = uint64(100) << 30
+const (
+	minFreeBytes = uint64(100) << 30
+	// minCPUs：共享机 1/4 每份至少 1 核。共享机已搁置，不足只告警。
+	minCPUs = 4
+	// cgroupControllers 是根 cgroup 的可用控制器文件；共享机按份限额需要 cpu / memory / pids。
+	cgroupControllers = "/sys/fs/cgroup/cgroup.controllers"
+)
 
 // requiredCommands 是 Agent 运行时会 exec、但上面没有单独检查的系统命令。
 var requiredCommands = []string{"iptables-restore", "mkfs.ext4", "blkid", "findmnt", "mountpoint", "nsenter", "chattr", "fstrim", "ip", "truncate", "nvidia-smi"}
 
-// selfcheck 逐项检查并打印 ok/FAIL；任一失败返回错误（安装脚本据此中止）。
+// selfcheck 逐项检查并打印 ok/WARN/FAIL；任一 FAIL 返回错误（安装脚本据此中止），WARN 只提示不中止。
 func selfcheck(ctx context.Context, run cmdrun.Runner, stateDir string, out io.Writer) error {
 	failed := false
 	report := func(name string, err error, detail string) {
@@ -33,6 +40,14 @@ func selfcheck(ctx context.Context, run cmdrun.Runner, stateDir string, out io.W
 			name += " " + detail
 		}
 		fmt.Fprintf(out, "ok: %s\n", name)
+	}
+	// warn：只提示、不让自检失败的项。
+	warn := func(name string, err error, detail string) {
+		if err != nil {
+			fmt.Fprintf(out, "WARN: %s: %v\n", name, err)
+			return
+		}
+		report(name, nil, detail)
 	}
 	v, err := run.Run(ctx, "docker", "version", "--format", "{{.Server.Version}}")
 	report("docker", err, strings.TrimSpace(string(v)))
@@ -68,6 +83,10 @@ func selfcheck(ctx context.Context, run cmdrun.Runner, stateDir string, out io.W
 		}
 	}
 	report("disk free", err, fmt.Sprintf("%d GiB", free>>30))
+	detail, err = cpuCount(ctx, run)
+	warn("nproc", err, detail) // 只和已搁置的共享机（按份 --cpus）有关，整机不需要
+	detail, err = cgroupV2(ctx, run)
+	report("cgroup v2", err, detail)
 	if failed {
 		return errors.New("自检未通过")
 	}
@@ -103,6 +122,48 @@ func gpuSupport(ctx context.Context, run cmdrun.Runner) (string, error) {
 		return "CDI " + files[0], nil
 	}
 	return "", noGPU
+}
+
+// cpuCount 检查 CPU 核数 ≥ 4（共享机按份 --cpus；调用方只告警）。
+func cpuCount(ctx context.Context, run cmdrun.Runner) (string, error) {
+	out, err := run.Run(ctx, "nproc")
+	if err != nil {
+		return "", err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return "", fmt.Errorf("无法解析 nproc 输出 %q", strings.TrimSpace(string(out)))
+	}
+	if n < minCPUs {
+		return "", fmt.Errorf("只有 %d 个 CPU，少于 %d", n, minCPUs)
+	}
+	return strconv.Itoa(n), nil
+}
+
+// cgroupV2 检查 docker 使用 cgroup v2，且 cpu / memory / pids 控制器可用（容器 --cpus / --memory / --pids-limit 与每实例指标依赖它们）。
+func cgroupV2(ctx context.Context, run cmdrun.Runner) (string, error) {
+	out, err := run.Run(ctx, "docker", "info", "--format", "{{.CgroupVersion}}")
+	if err != nil {
+		return "", err
+	}
+	if v := strings.TrimSpace(string(out)); v != "2" {
+		return "", fmt.Errorf("docker 的 Cgroup Version 为 %q，需要 2", v)
+	}
+	raw, err := run.Run(ctx, "cat", cgroupControllers)
+	if err != nil {
+		return "", fmt.Errorf("读取 %s 失败：%w", cgroupControllers, err)
+	}
+	have := strings.Fields(string(raw))
+	var missing []string
+	for _, c := range []string{"cpu", "memory", "pids"} {
+		if !slices.Contains(have, c) {
+			missing = append(missing, c)
+		}
+	}
+	if len(missing) > 0 {
+		return "", fmt.Errorf("cgroup 缺少控制器 %s", strings.Join(missing, " "))
+	}
+	return "cpu memory pids", nil
 }
 
 // existingAncestor 返回 dir 本身或其最近的已存在上级目录：首次安装时状态目录还没建，df 要查它将来所在的分区。

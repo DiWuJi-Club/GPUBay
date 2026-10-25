@@ -12,6 +12,7 @@
 - 查看或重置实例的 SSH 密码、开放 / 公开 / 删除端口、开关自动续费：实例详情页 `/instances/<实例 ID>`；
 - 管理 SSH 公钥：`/account/ssh-keys`；
 - 账号信息：`/account`；
+- 安装 / 更新 / 移除 ComfyUI 工作流、快速出图：工作流市场 `/workflows`，或实例详情页 `/instances/<实例 ID>`；
 - 为实例换机、改派机器（由平台运维处理，可联系客服）；
 - 充值：`/wallet/recharge`；
 - 实名认证：`/kyc`；

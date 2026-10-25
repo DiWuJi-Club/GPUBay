@@ -11,8 +11,10 @@ const mobile = useMobile()
 const route = useRoute()
 /** short：手机底部标签的短名（缺省同 label） */
 const tabs: readonly { key: string; path: string; label: string; short?: string }[] = [
-  { key: 'market', path: '/market', label: '算力市场' },
-  { key: 'instances', path: '/instances', label: '我的实例' },
+  // 手机底栏 6 个标签，320px 宽每格约 53px：四个字以上的用短名
+  { key: 'market', path: '/market', label: '算力市场', short: '市场' },
+  { key: 'workflows', path: '/workflows', label: '工作流市场', short: '工作流' },
+  { key: 'instances', path: '/instances', label: '我的实例', short: '实例' },
   { key: 'butler', path: '/butler', label: 'AI 管家', short: '管家' },
   { key: 'wallet', path: '/wallet', label: '钱包' },
   { key: 'account', path: '/account', label: '我的' },
@@ -74,6 +76,6 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
   position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: #fff; border-top: 1px solid #ebeef5;
   height: calc(var(--sc-tabbar-height) + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom); box-sizing: border-box;
 }
-.tabbar a { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 44px; color: #606266; text-decoration: none; font-size: 13px; }
+.tabbar a { flex: 1; min-width: 0; white-space: nowrap; display: flex; align-items: center; justify-content: center; min-height: 44px; color: #606266; text-decoration: none; font-size: 13px; }
 .tabbar a.active { color: var(--el-color-primary); }
 </style>

@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"spark-cloud/internal/agent/executor"
+	"spark-cloud/internal/agent/features"
 	"spark-cloud/internal/agent/metrics"
 	"spark-cloud/internal/agent/state"
 	"spark-cloud/internal/agentpb"
@@ -43,12 +44,22 @@ type Config struct {
 	ReportInterval    time.Duration // 零值 60s
 	Backoff           Backoff
 	NoReconnect       bool // 会话结束后不重连；测试里模拟「被顶掉 / 被撤销就退出」的旧 Agent，避免与新 Agent 互相顶替
+	// Features 是 Hello.features 能力位图；nil → features.SharedSlots（本版本的全部能力）。测试用 new(uint32) 模拟旧 Agent。
+	Features *uint32
+}
+
+// CollectFunc 采集一次心跳指标：机器级指标与每实例用量（metrics.Collector.Collect 的形状）。
+type CollectFunc func(context.Context) (metrics.Metrics, []metrics.InstanceMetrics)
+
+type sample struct {
+	m     metrics.Metrics
+	insts []metrics.InstanceMetrics
 }
 
 type Client struct {
 	cfg     Config
 	ex      *executor.Executor
-	collect func(context.Context) metrics.Metrics
+	collect CollectFunc
 	log     *slog.Logger
 
 	mu         sync.Mutex
@@ -65,7 +76,7 @@ type Client struct {
 	metricsTimeout time.Duration
 }
 
-func New(cfg Config, ex *executor.Executor, collect func(context.Context) metrics.Metrics, log *slog.Logger) *Client {
+func New(cfg Config, ex *executor.Executor, collect CollectFunc, log *slog.Logger) *Client {
 	explicitHB := cfg.HeartbeatInterval > 0
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 10 * time.Second
@@ -75,6 +86,10 @@ func New(cfg Config, ex *executor.Executor, collect func(context.Context) metric
 	}
 	if cfg.LocalIPs == nil {
 		cfg.LocalIPs = func() []string { return nil }
+	}
+	if cfg.Features == nil {
+		f := features.SharedSlots
+		cfg.Features = &f
 	}
 	if log == nil {
 		log = slog.Default()
@@ -154,7 +169,7 @@ func (c *Client) session(ctx context.Context) error {
 	}
 	// 网关要求第一条消息是 Hello，并且处理完第一份 StateReport 之后才开始投递指令。
 	// 先在本地流上发完这两条再公开 c.stream，避免并发的 Step / SendHeartbeat 抢在 Hello 之前发出。
-	if err := c.sendOn(stream, &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Hello{Hello: &agentpb.Hello{AgentVersion: c.cfg.Version, Hostname: c.cfg.Hostname, Ips: c.cfg.LocalIPs()}}}); err != nil {
+	if err := c.sendOn(stream, &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Hello{Hello: &agentpb.Hello{AgentVersion: c.cfg.Version, Hostname: c.cfg.Hostname, Ips: c.cfg.LocalIPs(), Features: *c.cfg.Features}}}); err != nil {
 		return streamErr(stream, err)
 	}
 	if err := c.sendOn(stream, c.stateReport(ctx)); err != nil {
@@ -326,6 +341,7 @@ func toCommand(cmd *agentpb.Command) executor.Command {
 		out.ImageRef, out.UpstreamPubKey = b.Create.GetImageRef(), b.Create.GetUpstreamPubkey()
 		out.BandwidthMbps, out.SSHPort, out.DataSizeGiB = int(b.Create.GetBandwidthMbps()), int(b.Create.GetSshPort()), int(b.Create.GetDataSizeGib())
 		out.HostKeyPEM = b.Create.GetHostKeyPem()
+		out.ShareSlots = int(b.Create.GetShareSlots())
 	case *agentpb.Command_Start:
 		out.Type = "start_instance"
 	case *agentpb.Command_Stop:
@@ -369,32 +385,39 @@ func (c *Client) sendResult(id string, r state.Result) error {
 
 // collectMetrics 在限定时间内采集指标；超时（采集函数不理会 ctx 也一样）返回空指标，心跳照发。
 // 上一次采集仍未返回时不再启动新的采集（单飞），卡死的采集最多占一个 goroutine。
-func (c *Client) collectMetrics(ctx context.Context) metrics.Metrics {
+func (c *Client) collectMetrics(ctx context.Context) sample {
 	if !c.collecting.CompareAndSwap(false, true) {
 		c.log.Warn("previous metrics collection still running, sending heartbeat without metrics")
-		return metrics.Metrics{}
+		return sample{}
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.metricsTimeout)
 	defer cancel()
-	ch := make(chan metrics.Metrics, 1)
+	ch := make(chan sample, 1)
 	go func() {
 		defer c.collecting.Store(false)
-		ch <- c.collect(ctx)
+		m, insts := c.collect(ctx)
+		ch <- sample{m: m, insts: insts}
 	}()
 	select {
-	case m := <-ch:
-		return m
+	case s := <-ch:
+		return s
 	case <-ctx.Done():
 		c.log.Warn("metrics collection timed out, sending heartbeat without metrics", "timeout", c.metricsTimeout)
-		return metrics.Metrics{}
+		return sample{}
 	}
 }
 
 func (c *Client) SendHeartbeat(ctx context.Context) error {
-	m := c.collectMetrics(ctx)
-	return c.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Heartbeat{Heartbeat: &agentpb.Heartbeat{Metrics: &agentpb.Metrics{
+	s := c.collectMetrics(ctx)
+	m := s.m
+	hb := &agentpb.Heartbeat{Metrics: &agentpb.Metrics{
 		GpuUtil: m.GPUUtil, GpuTempC: m.GPUTempC, GpuPowerW: m.GPUPowerW, MemTotal: m.MemTotal, MemUsed: m.MemUsed,
-		RootDiskTotal: m.RootDiskTotal, RootDiskUsed: m.RootDiskUsed, DataDiskUsed: m.DataDiskUsed, Load1: m.Load1}}}})
+		RootDiskTotal: m.RootDiskTotal, RootDiskUsed: m.RootDiskUsed, DataDiskUsed: m.DataDiskUsed, Load1: m.Load1}}
+	for _, im := range s.insts {
+		hb.Instances = append(hb.Instances, &agentpb.InstanceMetrics{InstanceId: im.InstanceID, MemCurrent: im.MemCurrent, MemMax: im.MemMax,
+			CpuPercent: im.CPUPercent, DataDiskUsed: im.DataDiskUsed})
+	}
+	return c.send(&agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Heartbeat{Heartbeat: hb}})
 }
 
 func (c *Client) SendStateReport(ctx context.Context) error {

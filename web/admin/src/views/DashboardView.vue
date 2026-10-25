@@ -89,6 +89,13 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
         </ul>
         <router-link to="/deployments" class="more" data-testid="dash-apps-link">查看部署</router-link>
       </el-card>
+      <el-card header="工作流">
+        <ul class="kv">
+          <li><span>已安装（在用部署）</span><b data-testid="dash-workflow-installs">{{ data.workflow_installs ?? 0 }}</b></li>
+          <li><span>24 小时快速出图</span><b data-testid="dash-workflow-runs">{{ data.workflow_runs_24h ?? 0 }}</b></li>
+        </ul>
+        <router-link to="/workflows" class="more" data-testid="dash-workflows-link">查看工作流</router-link>
+      </el-card>
       <!-- AI 管家（计划 12）：平台未启用管家时后端不返回这三个数字，卡片不显示 -->
       <el-card v-if="data.butler_requests_today != null" header="AI 管家（今日）">
         <ul class="kv">
@@ -117,7 +124,7 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
 
 <style scoped>
 .dash { display: grid; gap: 16px; }
-.grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
 .big { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
 .kv { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .kv li { display: flex; justify-content: space-between; }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {
-  durationLabel, fmtTime, fmtYuan, isApiError, labelOf,
-  type AppCatalogItem, type Availability, type BookingResult, type CalendarDay, type CalendarPeriod, type Duration, type Group, type GroupMachine, type Image, type Instance, type Listed, type Order, type Product,
+  durationLabel, fmtTime, fmtYuan, formatGB, isApiError, labelOf,
+  type AppCatalogItem, type WorkflowCatalogItem, type Availability, type BookingResult, type CalendarDay, type CalendarPeriod, type Duration, type Group, type GroupMachine, type Image, type Instance, type Listed, type Order, type Product,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
@@ -12,15 +12,23 @@ import { appConfirmText, appOptionLabel, compatibleImages, envDefaults } from '.
 import { cstDay, describeDuration, earliestStart, hourOptions, isLegacyImmediate, latestStart, MAX_COUNT, MAX_QUANTITY, startAtISO, totalPrice } from '../logic/booking'
 import { notifyError } from '../logic/notify'
 import { bookingBody, orderBody, useRentKey } from '../logic/rent'
+import { isWorkflowApp, MAX_WORKFLOWS, presetEnvFor, totalDownloadGB } from '../logic/workflows'
 import { refreshBalance, session } from '../store/session'
 import AppDialog from './AppDialog.vue'
 import AppEnvForm from './AppEnvForm.vue'
 import GuideDialog from './GuideDialog.vue'
+import WorkflowPicker from './WorkflowPicker.vue'
 
 // apps：可预装的应用（GET /apps）；appId：市场页应用卡片预选的应用
-const props = withDefaults(defineProps<{ product: Product; images: Image[]; mode: 'immediate' | 'booking'; duration: Duration; imageId: number | null; apps?: AppCatalogItem[]; appId?: number | null }>(), {
+// presetEnv / presetWorkflowIds（计划 11，工作流市场「新开一台实例」）：只在所选应用就是 appId 时套用，变量只取应用里有且合法的
+const props = withDefaults(defineProps<{
+  product: Product; images: Image[]; mode: 'immediate' | 'booking'; duration: Duration; imageId: number | null; apps?: AppCatalogItem[]; appId?: number | null
+  presetEnv?: Record<string, string>; presetWorkflowIds?: number[]
+}>(), {
   apps: () => [],
   appId: null,
+  presetEnv: () => ({}),
+  presetWorkflowIds: () => [],
 })
 const visible = defineModel<boolean>({ required: true })
 export interface PlacedResult { instances: { id: string }[]; batchId: string | null; immediate: boolean }
@@ -44,6 +52,7 @@ const form = reactive({
   autoRenew: false,
   autoRenewDuration: props.duration,
   appId: props.appId,
+  appWorkflowIds: [] as number[],
 })
 // 预选了应用时先停在表单步：要锁定镜像、填变量（如 JupyterLab 必填令牌）
 const step = ref<'form' | 'confirm'>(props.mode === 'immediate' && props.appId == null ? 'confirm' : 'form')
@@ -79,13 +88,38 @@ const imageOptions = computed(() => (selectedApp.value ? compatibleImages(select
 const envValues = ref<Record<string, string>>({})
 const envForm = ref<InstanceType<typeof AppEnvForm> | null>(null)
 const appError = ref('') // 后端 app_* 错误文案，显示在表单里
-/** 按所选应用重置镜像与变量；取消预装时镜像恢复为打开时的选择。 */
+/** 按所选应用重置镜像、变量与预装工作流；取消预装时镜像恢复为打开时的选择。预设只对打开时预选的应用生效。 */
 function applyApp() {
   const app = selectedApp.value
+  const preset = app != null && app.id === props.appId
   appError.value = ''
   form.imageId = app ? (compatibleImages(app, props.images)[0]?.id ?? null) : props.imageId
-  envValues.value = app ? envDefaults(app.version.env) : {}
+  envValues.value = app ? { ...envDefaults(app.version.env), ...(preset ? presetEnvFor(app, props.presetEnv) : {}) } : {}
+  form.appWorkflowIds = preset && isWorkflowApp(app) ? knownWorkflows(props.presetWorkflowIds).slice(0, MAX_WORKFLOWS) : []
 }
+
+// ---- 预装工作流（计划 11）：选了 ComfyUI 才显示；目录由 WorkflowPicker 拉取后留在这里（确认页显示名称、回到表单不再拉）；
+// 每次打开对话框、下单遇到 workflow_* 错误时清掉，让选择器重新拉（目录可能已变）----
+const showWorkflows = computed(() => isWorkflowApp(selectedApp.value))
+const wfCatalog = ref<WorkflowCatalogItem[] | null>(null)
+/** 目录已加载时去掉不在目录里的 ID（预选的工作流已下架）；未加载时原样。 */
+function knownWorkflows(ids: number[]): number[] {
+  const items = wfCatalog.value
+  return items ? ids.filter((id) => items.some((w) => w.id === id)) : [...ids]
+}
+function onWorkflowsLoaded(items: WorkflowCatalogItem[]) {
+  wfCatalog.value = items
+  const kept = knownWorkflows(form.appWorkflowIds)
+  if (kept.length < form.appWorkflowIds.length) ElMessage.warning('所选工作流已下架，已从预装列表移除')
+  form.appWorkflowIds = kept
+}
+const pickedWorkflows = computed(() => form.appWorkflowIds.map((id) => wfCatalog.value?.find((w) => w.id === id)).filter((w): w is WorkflowCatalogItem => w != null))
+const workflowsText = computed(() => {
+  const ws = pickedWorkflows.value
+  if (!form.appWorkflowIds.length) return ''
+  if (!ws.length) return `${form.appWorkflowIds.length} 个` // 目录没加载到（不应发生）：至少让用户看到会预装
+  return `${ws.map((w) => w.name).join('、')}（合计需下载约 ${formatGB(totalDownloadGB(ws, form.appWorkflowIds))}）`
+})
 watch(() => form.appId, applyApp)
 watch(envValues, () => { appError.value = '' })
 const unitPrice = computed(() => props.product.prices.find((p) => p.duration === form.duration)?.amount ?? null)
@@ -104,7 +138,7 @@ const dayMax = computed(() => cstDay(latestStart(nowServer())))
 const canSpecifyMachine = computed(() => form.count === 1 && form.groupId !== null)
 const notEnough = computed(() => availability.value != null && availability.value.available < form.count)
 const legacy = computed(() => isLegacyImmediate({ immediate: form.immediate, count: form.count, quantity: form.quantity, groupId: form.groupId, machineId: form.machineId, autoRenew: form.autoRenew }))
-// 派生参数（含应用与去掉空值的变量）的值变了才换键；同参数重试复用
+// 派生参数（含应用、去掉空值的变量与预装工作流）的值变了才换键；同参数重试复用
 const key = useRentKey(() => props.product.id, form, () => envValues.value)
 
 watch(() => form.duration, (d) => {
@@ -222,8 +256,9 @@ watch(visible, (v) => {
   if (!v) return
   step.value = props.mode === 'immediate' && props.appId == null ? 'confirm' : 'form'
   expanded.value = props.mode === 'booking' || props.appId != null
+  wfCatalog.value = null // 先于 applyApp：预设 ID 等目录拉到后再按目录过滤
   Object.assign(form, { groupId: null, count: 1, immediate: props.mode === 'immediate', duration: props.duration, quantity: 1, imageId: props.imageId, machineId: null, autoRenew: false, autoRenewDuration: props.duration, appId: props.appId })
-  applyApp() // appId 与上次相同时 watch 不触发：显式重置镜像与变量
+  applyApp() // appId 与上次相同时 watch 不触发：显式重置镜像、变量与预装工作流
   availability.value = null
   availError.value = ''
   form.day = ''
@@ -277,9 +312,10 @@ async function submit() {
       if (legacy.value && e.code === 'no_capacity') emit('noCapacity') // 市场页刷新「现在可租」台数
       backToForm()
       void loadAvailability()
-    } else if (isApiError(e) && e.code.startsWith('app_')) {
-      // app_image_mismatch / app_env_* / app_not_found / app_unavailable：显示后端文案，回到表单改
+    } else if (isApiError(e) && (e.code.startsWith('app_') || e.code.startsWith('workflow_'))) {
+      // app_image_mismatch / app_env_* / app_not_found / app_unavailable / workflow_*（预装工作流下架、应用版本不支持等）：显示后端文案，回到表单改
       ElMessage.warning(e.message)
+      if (e.code.startsWith('workflow_')) wfCatalog.value = null // 工作流下架 / 版本变了：回到表单时重新拉目录
       backToForm()
       appError.value = e.message
     } else if (isApiError(e) && e.code.startsWith('booking_')) {
@@ -343,6 +379,10 @@ async function submit() {
         <template v-if="selectedApp">
           <el-alert v-if="appError" type="error" :title="appError" :closable="false" show-icon data-testid="rent-app-error" />
           <AppEnvForm v-if="selectedApp.version.env.length" :key="selectedApp.id" ref="envForm" v-model="envValues" :spec="selectedApp.version.env" />
+          <el-form-item v-if="showWorkflows" :label="`预装工作流（可选，最多 ${MAX_WORKFLOWS} 个）`">
+            <WorkflowPicker v-model="form.appWorkflowIds" :items="wfCatalog" :max="MAX_WORKFLOWS" testid="rent-workflows" @loaded="onWorkflowsLoaded" />
+            <div class="muted">开通后随 ComfyUI 一起安装；模型在实例里下载，下载量越大首次部署越久</div>
+          </el-form-item>
         </template>
         <el-form-item v-if="canSpecifyMachine" label="指定机器（可选）">
           <el-select v-model="form.machineId" clearable placeholder="由系统分配" data-testid="rent-machine">
@@ -382,6 +422,7 @@ async function submit() {
         <el-descriptions-item label="租期"><span data-testid="market-confirm-duration">{{ form.quantity === 1 ? labelOf(durationLabel, form.duration) : describeDuration(form.duration, form.quantity) }}</span></el-descriptions-item>
         <el-descriptions-item label="镜像"><span data-testid="market-confirm-image">{{ imageName }}</span></el-descriptions-item>
         <el-descriptions-item v-if="selectedApp" label="预装应用"><span data-testid="market-confirm-app">{{ appConfirmText(selectedApp, envValues) }}</span></el-descriptions-item>
+        <el-descriptions-item v-if="showWorkflows && workflowsText" label="预装工作流"><span data-testid="rent-confirm-workflows">{{ workflowsText }}</span></el-descriptions-item>
         <el-descriptions-item v-if="form.count > 1" label="单台价"><span data-testid="market-confirm-unit">{{ unitPrice == null ? '—' : fmtYuan(unitPrice * form.quantity) }}</span></el-descriptions-item>
         <el-descriptions-item :label="form.count > 1 ? '总价' : '价格'"><span data-testid="market-confirm-price">{{ total == null ? '—' : fmtYuan(total) }}</span></el-descriptions-item>
         <el-descriptions-item label="当前余额"><span data-testid="market-confirm-balance">{{ fmtYuan(balance) }}</span></el-descriptions-item>

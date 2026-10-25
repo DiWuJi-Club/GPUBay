@@ -12,7 +12,7 @@ import DashboardView from '../DashboardView.vue'
 const base: Dashboard = {
   machines: { by_state: {}, online: 0, total: 0 }, instances: {},
   recharge_today: 0, recharge_month: 0, order_today: 0, order_month: 0, utilization: [], ssh_sessions_open: 0, bookings_upcoming_7d: 0,
-  referral_month_settled: 0, apps_installing: 0, apps_running: 0, apps_failed_24h: 0,
+  referral_month_settled: 0, apps_installing: 0, apps_running: 0, apps_failed_24h: 0, workflow_installs: 0, workflow_runs_24h: 0,
 }
 
 let w: VueWrapper | null = null
