@@ -12,6 +12,7 @@ import {
   MAX_APPS, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, deploymentParams, instanceAppHint, isWorkflowHost,
   llmCallInfo,
 } from '../logic/apps'
+import { copyText as copy } from '../logic/clipboard'
 import { notifyError } from '../logic/notify'
 import { butlerAvailable } from '../store/butler'
 import AppDeployDialog from './AppDeployDialog.vue'
@@ -63,15 +64,6 @@ const atLimit = computed(() => items.value.length >= MAX_APPS)
 
 const rowStatus = (d: Deployment) => appRowStatus(d, props.instance.state)
 const phaseText = (d: Deployment) => labelOf(deploymentPhaseLabel, d.phase)
-
-async function copy(text: string) {
-  try {
-    await navigator.clipboard.writeText(text)
-    ElMessage.success('已复制')
-  } catch {
-    ElMessage.warning('复制失败，请手动选择复制')
-  }
-}
 
 function open(url: string) {
   // 私有端口：实例域名没有票据 Cookie 时会自己跳到控制台的 authorize，再带票据回来

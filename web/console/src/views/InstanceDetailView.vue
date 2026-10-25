@@ -18,6 +18,7 @@ import { MAX_PORTS, validatePort } from '../logic/access'
 import { mergeTimeline } from '../logic/apps'
 import { describeDuration } from '../logic/booking'
 import { autoRenewFailureText, canCancel, canRelease, canRenew, canSetAutoRenew, releaseWarning, renewQuantityMax } from '../logic/instance'
+import { copyText as copy } from '../logic/clipboard'
 import { notifyError } from '../logic/notify'
 import { refreshBalance, session } from '../store/session'
 
@@ -98,14 +99,6 @@ async function showPassword() {
     notifyError(e)
   } finally {
     loadingPassword.value = false
-  }
-}
-async function copy(text: string) {
-  try {
-    await navigator.clipboard.writeText(text)
-    ElMessage.success('已复制')
-  } catch {
-    ElMessage.error('复制失败，请手动选择复制')
   }
 }
 

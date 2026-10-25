@@ -3,11 +3,11 @@ import {
   bindingStatusLabel, fmtDate, fmtTime, fmtYuan, labelOf, messageOf, rewardStatusLabel,
   type Invitee, type Paged, type ReferralMe, type RewardItem,
 } from '@spark/shared'
-import { ElMessage } from 'element-plus'
 import QRCode from 'qrcode'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
+import { copyText as copy } from '../logic/clipboard'
 import { notifyError } from '../logic/notify'
 
 const route = useRoute()
@@ -82,28 +82,6 @@ async function loadRewards() {
 }
 
 const loadTab = (t: Tab) => (t === 'rewards' ? loadRewards() : loadInvitees())
-
-/** navigator.clipboard 只在安全上下文（https / localhost）里有；局域网 http 访问时退回 execCommand。 */
-async function copy(text: string) {
-  try {
-    if (navigator.clipboard) await navigator.clipboard.writeText(text)
-    else {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.setAttribute('readonly', '')
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
-      const ok = document.execCommand('copy')
-      ta.remove()
-      if (!ok) throw new Error('copy failed')
-    }
-    ElMessage.success('已复制')
-  } catch {
-    ElMessage.error('复制失败，请手动选择复制')
-  }
-}
 
 onMounted(() => {
   void load()
