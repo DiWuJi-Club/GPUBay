@@ -1,0 +1,74 @@
+{
+  "models": [
+    {
+      "name": "flux1-schnell-fp8.safetensors",
+      "dir": "checkpoints",
+      "size_gb": 17.24,
+      "modelscope": {
+        "repo": "Comfy-Org/flux1-schnell",
+        "file": "flux1-schnell-fp8.safetensors"
+      },
+      "hf": {
+        "repo": "Comfy-Org/Flux-1-Schnell",
+        "file": "flux1-schnell-fp8.safetensors"
+      },
+      "sha256": "ead426278b49030e9da5df862994f25ce94ab2ee4df38b556ddddb3db093bf72"
+    }
+  ],
+  "nodes": [],
+  "inputs": [
+    {
+      "key": "prompt",
+      "label": "提示词",
+      "type": "textarea",
+      "node": "6",
+      "input": "text",
+      "default": "a bottle with a beautiful rainbow galaxy inside it on top of a wooden table in the middle of a modern kitchen beside a plate of vegetables and mushrooms and a wine glasse that contains a planet earth with a plate with a half eaten apple pie on it",
+      "max_len": 2000
+    },
+    {
+      "key": "width",
+      "label": "宽",
+      "type": "int",
+      "node": "27",
+      "input": "width",
+      "default": 1024,
+      "min": 512,
+      "max": 2048,
+      "step": 64
+    },
+    {
+      "key": "height",
+      "label": "高",
+      "type": "int",
+      "node": "27",
+      "input": "height",
+      "default": 1024,
+      "min": 512,
+      "max": 2048,
+      "step": 64
+    },
+    {
+      "key": "steps",
+      "label": "步数",
+      "type": "int",
+      "node": "31",
+      "input": "steps",
+      "default": 4,
+      "min": 1,
+      "max": 8
+    },
+    {
+      "key": "seed",
+      "label": "种子",
+      "type": "seed",
+      "node": "31",
+      "input": "seed"
+    }
+  ],
+  "outputs": [
+    {
+      "node": "9"
+    }
+  ]
+}

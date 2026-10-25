@@ -105,6 +105,12 @@ describe('选项与确认文案', () => {
   it('确认页按当前选择的模型', () => {
     expect(appConfirmText(app(), { MODEL_ID: 'Qwen/Qwen3-4B' })).toBe('vLLM 推理服务（Qwen/Qwen3-4B）')
     expect(appConfirmText(app(), {})).toBe('vLLM 推理服务（Qwen/Qwen3-8B）')
+    // comfyui 1.1.0：MODEL_ID 默认 none（不下预置模型）时不显示「none」
+    const comfy = app({ name: 'ComfyUI 图像生成', version: { ...app().version, env: [{ name: 'MODEL_ID', type: 'enum', options: ['none', 'sdxl'], default: 'none' }] } })
+    expect(appOptionLabel(comfy)).toBe('ComfyUI 图像生成')
+    expect(appConfirmText(comfy, {})).toBe('ComfyUI 图像生成')
+    expect(appConfirmText(comfy, { MODEL_ID: 'none' })).toBe('ComfyUI 图像生成')
+    expect(appConfirmText(comfy, { MODEL_ID: 'sdxl' })).toBe('ComfyUI 图像生成（sdxl）')
   })
 })
 

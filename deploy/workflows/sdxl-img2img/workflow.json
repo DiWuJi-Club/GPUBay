@@ -1,0 +1,15 @@
+{
+  "name": "SDXL 图生图",
+  "summary": "上传一张图片，用 SDXL 按提示词重绘；denoise 控制保留原图的程度。",
+  "description": "ComfyUI 官方「Image to Image」工作流，模型换成 SDXL 1.0 base；输入图先缩放到约 1 百万像素再编码。\n\n- 模型：sd_xl_base_1.0.safetensors（checkpoints，约 6.94 GB，与「SDXL 文生图」共用，已装过不会重复下载）\n- denoise：越小越像原图，越大越接近重新生成，0.5～0.8 常用（默认 0.75）\n- 输出尺寸跟随输入图的比例，约 1MP\n- 快速出图可调：输入图片、提示词、反向提示词、denoise、步数、CFG、种子",
+  "category": "img2img",
+  "tags": [
+    "SDXL",
+    "图生图",
+    "重绘"
+  ],
+  "sort": 20,
+  "version": "1.0.0",
+  "changelog": "首个版本：基于 ComfyUI v0.3.60 官方模板（comfyui-workflow-templates 0.1.86），支持快速出图。",
+  "comfyui_min": "0.3.60"
+}

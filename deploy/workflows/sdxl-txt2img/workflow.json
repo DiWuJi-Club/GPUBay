@@ -1,0 +1,15 @@
+{
+  "name": "SDXL 文生图",
+  "summary": "Stable Diffusion XL 1.0 基础模型，输入提示词生成 1024×1024 图片，入门首选。",
+  "description": "ComfyUI 官方「Image Generation」默认工作流，模型换成 SDXL 1.0 base，画布 1024×1024。\n\n- 模型：sd_xl_base_1.0.safetensors（checkpoints，约 6.94 GB，许可 CreativeML Open RAIL++-M）\n- 建议：25 步、CFG 7、euler；宽高取 64 的倍数，接近 1 百万像素（如 1024×1024、1152×896、1344×768）效果最好\n- 提示词用英文效果更好；反向提示词写不想要的内容\n- 快速出图可调：提示词、反向提示词、宽、高、步数、CFG、采样器、种子",
+  "category": "txt2img",
+  "tags": [
+    "SDXL",
+    "文生图",
+    "入门"
+  ],
+  "sort": 10,
+  "version": "1.0.0",
+  "changelog": "首个版本：基于 ComfyUI v0.3.60 官方模板（comfyui-workflow-templates 0.1.86），支持快速出图。",
+  "comfyui_min": "0.3.60"
+}

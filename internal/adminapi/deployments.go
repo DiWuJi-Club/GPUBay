@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/httpx"
 )
@@ -66,7 +67,16 @@ func (s *Server) handleDeployment(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"deployment": views[0], "events": events})
+	// 计划 11：部署上的工作流集合（含安装状态与版本；非 ComfyUI 部署为 []）。deployment.workflows 只在 appdeploy 接了
+	// WorkflowViews 钩子且是 comfyui 部署时才有；后台抽屉统一读这里。
+	workflows := []comfywf.Installed{}
+	if s.Installer != nil {
+		if workflows, err = s.Installer.ListInstalled(r.Context(), d.ID); err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"deployment": views[0], "events": events, "workflows": workflows})
 }
 
 // handleForceRemoveDeployment 平台强制卸载（ops，必须填原因）：事件「平台卸载：<原因>」，审计 app.deployment.force_remove 记在当前管理员名下。

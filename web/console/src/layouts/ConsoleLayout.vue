@@ -9,6 +9,7 @@ const mobile = useMobile()
 const route = useRoute()
 const tabs = [
   { key: 'market', path: '/market', label: '算力市场' },
+  { key: 'workflows', path: '/workflows', label: '工作流市场', short: '工作流' }, // 手机底栏 5 个标签，320px 宽每格约 64px：用短名
   { key: 'instances', path: '/instances', label: '我的实例' },
   { key: 'wallet', path: '/wallet', label: '钱包' },
   { key: 'account', path: '/account', label: '我的' },
@@ -40,7 +41,7 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
     </div>
     <nav v-if="mobile" class="tabbar" data-testid="layout-tabbar">
       <router-link v-for="t in tabs" :key="t.key" :to="t.path" :class="{ active: active === t.key }" :data-testid="`tabbar-${t.key}`">
-        {{ t.label }}
+        {{ 'short' in t ? t.short : t.label }}
       </router-link>
     </nav>
   </div>
@@ -62,6 +63,6 @@ const logo = import.meta.env.BASE_URL + brand.logoUrl
   position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: #fff; border-top: 1px solid #ebeef5;
   height: calc(var(--sc-tabbar-height) + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom); box-sizing: border-box;
 }
-.tabbar a { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 44px; color: #606266; text-decoration: none; font-size: 13px; }
+.tabbar a { flex: 1; min-width: 0; white-space: nowrap; display: flex; align-items: center; justify-content: center; min-height: 44px; color: #606266; text-decoration: none; font-size: 13px; }
 .tabbar a.active { color: var(--el-color-primary); }
 </style>

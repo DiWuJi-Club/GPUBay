@@ -1,0 +1,16 @@
+{
+  "name": "SDXL 放大修复（2×）",
+  "summary": "Ultimate SD Upscale：先用 RealESRGAN 放大，再用 SDXL 分块重绘补细节，默认放大 2 倍。",
+  "description": "上传一张图片，先用 RealESRGAN x4plus 放大，再把大图切成 1024×1024 的块用 SDXL 低 denoise 重绘、补回细节。\n\n- 模型：sd_xl_base_1.0.safetensors（checkpoints，约 6.94 GB，与 SDXL 工作流共用）、RealESRGAN_x4plus.safetensors（upscale_models，约 0.07 GB，许可 BSD-3-Clause）\n- 自定义节点：ComfyUI_UltimateSDUpscale（ssitu，钉在 commit a5547db）\n- denoise 0.2～0.4 只补细节（默认 0.3），再大会改变画面内容\n- 放大倍数 1～4（默认 2）；输入图越大越慢\n- 快速出图可调：输入图片、提示词、denoise、放大倍数、种子",
+  "category": "upscale",
+  "tags": [
+    "SDXL",
+    "放大",
+    "高清修复",
+    "自定义节点"
+  ],
+  "sort": 60,
+  "version": "1.0.0",
+  "changelog": "首个版本：图基于 ComfyUI_UltimateSDUpscale 仓库自带的 example_workflows/basic-usdu.json 改成「LoadImage → UltimateSDUpscale → SaveImage」（SDXL base + RealESRGAN x4plus），支持快速出图。",
+  "comfyui_min": "0.3.60"
+}

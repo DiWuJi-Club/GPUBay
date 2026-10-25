@@ -77,3 +77,39 @@ describe('DeploymentsView 详情抽屉与查询串', () => {
     expect(listCalls()[1]).toMatchObject({ instance_id: 'ins-b', page: 1 })
   })
 })
+
+describe('DeploymentsView 详情抽屉的工作流表（计划 11，A-INS-15）', () => {
+  const wf = {
+    workflow_id: 3, slug: 'sdxl-txt2img', name: 'SDXL 文生图', category: 'txt2img', version_id: 5, version: '1.0.0', state: 'installed',
+    latest_version_id: 6, latest_version: '1.1.0', update_available: true, quick_run: true, added_at: '2026-10-20T00:00:00Z', installed_at: '2026-10-20T00:10:00Z',
+  }
+  it('ComfyUI 部署显示工作流表（状态、版本、有新版本）', async () => {
+    get.mockImplementation(async (path: string) => {
+      if (path === '/apps') return { items: [] }
+      if (path === '/deployments') return { items: [], total: 0 }
+      return { deployment: { ...dep('dep-c'), app_slug: 'comfyui', app_name: 'ComfyUI' }, events: [], workflows: [wf, { ...wf, workflow_id: 4, slug: 'b', name: 'B', state: 'failed', update_available: false }] }
+    })
+    await mountAt('/deployments?dep=dep-c')
+    const table = document.querySelector('[data-testid="adm-dep-workflows"]')!
+    expect(table).not.toBeNull()
+    const rows = [...table.querySelectorAll('[data-testid="adm-dep-workflow-row"]')]
+    expect(rows.map((r) => r.getAttribute('data-slug'))).toEqual(['sdxl-txt2img', 'b'])
+    expect(rows[0].querySelector('[data-testid="adm-dep-workflow-state"]')!.textContent).toBe('已安装')
+    expect(rows[0].querySelector('[data-testid="adm-dep-workflow-update"]')!.textContent).toContain('1.1.0')
+    expect(rows[1].querySelector('[data-testid="adm-dep-workflow-state"]')!.getAttribute('data-state')).toBe('failed')
+  })
+  it('非 ComfyUI 部署且没有工作流：不显示这一节', async () => {
+    await mountAt('/deployments?dep=dep-1')
+    expect(document.querySelector('[data-testid="deployment-app"]')).not.toBeNull()
+    expect(document.querySelector('[data-testid="adm-dep-workflows"]')).toBeNull()
+  })
+  it('ComfyUI 部署没有工作流：显示空表', async () => {
+    get.mockImplementation(async (path: string) => {
+      if (path === '/apps') return { items: [] }
+      if (path === '/deployments') return { items: [], total: 0 }
+      return { deployment: { ...dep('dep-c'), app_slug: 'comfyui' }, events: [], workflows: [] }
+    })
+    await mountAt('/deployments?dep=dep-c')
+    expect(document.querySelector('[data-testid="adm-dep-workflows"]')!.textContent).toContain('未安装工作流')
+  })
+})

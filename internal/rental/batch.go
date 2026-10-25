@@ -34,6 +34,8 @@ type BatchRequest struct {
 	// 计划 7：开通时预装应用（nil = 不预装）；每台实例在同一事务里插入一条 queued 部署，校验失败整单不下
 	AppID  *int64
 	AppEnv map[string]string
+	// 计划 11：随应用一并预装的 ComfyUI 工作流（须同时给 AppID；校验在 PrepareInstall）
+	AppWorkflowIDs []int64
 }
 
 type Batch struct {
@@ -78,6 +80,9 @@ func validateBatch(req *BatchRequest, now time.Time) (int64, error) {
 	}
 	if req.AppID == nil && len(req.AppEnv) > 0 {
 		return 0, apperr.BadRequest("未选择预装应用时不能填写应用变量")
+	}
+	if req.AppID == nil && len(req.AppWorkflowIDs) > 0 {
+		return 0, apperr.BadRequest("预装工作流需要同时选择 ComfyUI 应用")
 	}
 	if req.StartAt != nil {
 		start := req.StartAt.UTC()
@@ -135,7 +140,7 @@ func (s *Service) placeBatch(ctx context.Context, req BatchRequest, withBatch bo
 			// 预装校验在挑机器、扣款之前：应用 / 镜像不兼容 / 变量错误整单失败（4xx）
 			var plan InstallPlan
 			if req.AppID != nil {
-				if plan, err = s.apps().PrepareInstall(ctx, tx, *req.AppID, req.ImageID, req.AppEnv); err != nil {
+				if plan, err = s.apps().PrepareInstall(ctx, tx, *req.AppID, req.ImageID, req.AppEnv, req.AppWorkflowIDs); err != nil {
 					return err
 				}
 			}

@@ -39,6 +39,11 @@ export const routes: RouteRecordRaw[] = [
   { path: '/apps/:id/versions/:vid', component: () => import('./views/AppVersionView.vue'), meta: { title: '应用版本', roles: ALL_ROLES } },
   // ?state=&app_id=&user_id=&instance_id= 预填筛选，?dep= 打开详情抽屉；写操作（强制卸载）按角色显示
   { path: '/deployments', component: () => import('./views/DeploymentsView.vue'), meta: { title: '应用部署', roles: ALL_ROLES } },
+  // 计划 11：ComfyUI 工作流目录（all 角色可看；写操作只有 super，发布要动态码）。vid 为 new 时是新建（可带 ?copy_from=<版本 id> 预填）
+  { path: '/workflows', component: () => import('./views/WorkflowsView.vue'), meta: { title: '工作流', roles: ALL_ROLES } },
+  { path: '/workflows/:id', component: () => import('./views/WorkflowDetailView.vue'), meta: { title: '工作流详情', roles: ALL_ROLES } },
+  { path: '/workflows/:id/versions/:vid', component: () => import('./views/WorkflowVersionView.vue'), meta: { title: '工作流版本', roles: ALL_ROLES } },
+  { path: '/workflows/:id/installs', component: () => import('./views/WorkflowInstallsView.vue'), meta: { title: '工作流安装', roles: ALL_ROLES } },
   { path: '/catalog', component: () => import('./views/CatalogView.vue'), meta: { title: '价格与镜像', roles: SUPER_ONLY } },
   { path: '/admins', component: () => import('./views/AdminsView.vue'), meta: { title: '管理员', roles: SUPER_ONLY } },
   { path: '/audit', component: () => import('./views/AuditView.vue'), meta: { title: '审计日志', roles: ALL_ROLES } },

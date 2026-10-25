@@ -1,0 +1,11 @@
+{
+  "name": "SDXL 演示",
+  "summary": "导入测试用的 SDXL 文生图",
+  "description": "SDXL base 1.0 文生图，**测试用**。",
+  "category": "txt2img",
+  "tags": ["SDXL", "文生图"],
+  "sort": 10,
+  "version": "1.0.0",
+  "changelog": "首个版本",
+  "comfyui_min": "0.3.60"
+}

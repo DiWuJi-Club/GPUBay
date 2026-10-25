@@ -67,6 +67,16 @@ var (
 	ErrAppExists        = New("app_exists", "该应用已在此实例上部署", 409)
 	ErrAppInvalidState  = New("app_invalid_state", "当前状态不允许该操作", 409)
 	ErrAppVersionFrozen = New("app_version_frozen", "已发布的版本不能修改", 409)
+	// 计划 11
+	ErrWorkflowNotFound       = New("workflow_not_found", "工作流不存在或未上架", 404)
+	ErrWorkflowUnavailable    = New("workflow_unavailable", "该工作流当前没有可用版本", 409)
+	ErrWorkflowExists         = New("workflow_exists", "该工作流已安装在此 ComfyUI 上", 409)
+	ErrWorkflowLimit          = New("workflow_limit", "每个 ComfyUI 最多安装 8 个工作流", 409)
+	ErrWorkflowAppUnsupported = New("workflow_app_unsupported", "当前 ComfyUI 应用版本不支持工作流市场", 409)
+	ErrWorkflowVersionFrozen  = New("workflow_version_frozen", "已发布的工作流版本不能修改", 409)
+	ErrWorkflowBusy           = New("workflow_busy", "ComfyUI 正在处理其它任务，请稍后再试", 429)
+	// ErrUpstreamUnreachable 快速出图代理连不上实例内的 ComfyUI（Pool.Dial 失败）。
+	ErrUpstreamUnreachable = New("upstream_unreachable", "无法连接实例内的 ComfyUI", 503)
 )
 
 // As 取出错误链中的 *Error；不是业务错误时返回 nil。
@@ -95,4 +105,19 @@ func AppEnvRequired(label string) *Error { return New("app_env_required", "请�
 
 func AppVersionInvalid(path, reason string) *Error {
 	return New("app_version_invalid", path+"："+reason, 400)
+}
+
+// WorkflowVersionInvalid 工作流版本校验失败；path 为字段路径（如 manifest.models[2].repo、graph.nodes[5]）。
+func WorkflowVersionInvalid(path, reason string) *Error {
+	return New("workflow_version_invalid", path+"："+reason, 400)
+}
+
+// WorkflowPromptRejected ComfyUI 拒绝了提交的 prompt（/prompt 返回 node_errors）；msg 为其第一条错误（调用方截断）。
+func WorkflowPromptRejected(msg string) *Error {
+	return New("workflow_prompt_rejected", "ComfyUI 拒绝了该任务："+msg, 422)
+}
+
+// WorkflowInputInvalid 快速出图的某个输入不合法。
+func WorkflowInputInvalid(label, reason string) *Error {
+	return New("workflow_input_invalid", label+"："+reason, 400)
 }

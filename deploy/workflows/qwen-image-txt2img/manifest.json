@@ -1,0 +1,122 @@
+{
+  "models": [
+    {
+      "name": "qwen_image_fp8_e4m3fn.safetensors",
+      "dir": "diffusion_models",
+      "size_gb": 20.43,
+      "modelscope": {
+        "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+        "file": "split_files/diffusion_models/qwen_image_fp8_e4m3fn.safetensors"
+      },
+      "hf": {
+        "repo": "Comfy-Org/Qwen-Image",
+        "file": "split_files/diffusion_models/qwen_image_fp8_e4m3fn.safetensors"
+      },
+      "sha256": "98763a127701eb6fb59096f7742cb3aa7d64ed510b9f4e882d8351f8176e3ce3"
+    },
+    {
+      "name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "dir": "text_encoders",
+      "size_gb": 9.38,
+      "modelscope": {
+        "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+        "file": "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"
+      },
+      "hf": {
+        "repo": "Comfy-Org/Qwen-Image",
+        "file": "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"
+      },
+      "sha256": "cb5636d852a0ea6a9075ab1bef496c0db7aef13c02350571e388aea959c5c0b4"
+    },
+    {
+      "name": "qwen_image_vae.safetensors",
+      "dir": "vae",
+      "size_gb": 0.25,
+      "modelscope": {
+        "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+        "file": "split_files/vae/qwen_image_vae.safetensors"
+      },
+      "hf": {
+        "repo": "Comfy-Org/Qwen-Image",
+        "file": "split_files/vae/qwen_image_vae.safetensors"
+      },
+      "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
+    }
+  ],
+  "nodes": [],
+  "inputs": [
+    {
+      "key": "prompt",
+      "label": "提示词",
+      "type": "textarea",
+      "node": "6",
+      "input": "text",
+      "default": "\"A vibrant, warm neon-lit street scene in Hong Kong at the afternoon, with a mix of colorful Chinese and English signs glowing brightly. The atmosphere is lively, cinematic, and rain-washed with reflections on the pavement. The colors are vivid, full of pink, blue, red, and green hues. Crowded buildings with overlapping neon signs. 1980s Hong Kong style. Signs include:\n\"龍鳳冰室\" \"金華燒臘\" \"HAPPY HAIR\" \"鴻運茶餐廳\" \"EASY BAR\" \"永發魚蛋粉\" \"添記粥麵\" \"SUNSHINE MOTEL\" \"美都餐室\" \"富記糖水\" \"太平館\" \"雅芳髮型屋\" \"STAR KTV\" \"銀河娛樂城\" \"百樂門舞廳\" \"BUBBLE CAFE\" \"萬豪麻雀館\" \"CITY LIGHTS BAR\" \"瑞祥香燭莊\" \"文記文具\" \"GOLDEN JADE HOTEL\" \"LOVELY BEAUTY\" \"合興百貨\" \"興旺電器\" And the background is warm yellow street and with all stores' lights on.",
+      "max_len": 2000
+    },
+    {
+      "key": "negative",
+      "label": "反向提示词",
+      "type": "textarea",
+      "node": "7",
+      "input": "text",
+      "default": "",
+      "max_len": 2000
+    },
+    {
+      "key": "width",
+      "label": "宽",
+      "type": "int",
+      "node": "58",
+      "input": "width",
+      "default": 1328,
+      "min": 512,
+      "max": 2048,
+      "step": 16
+    },
+    {
+      "key": "height",
+      "label": "高",
+      "type": "int",
+      "node": "58",
+      "input": "height",
+      "default": 1328,
+      "min": 512,
+      "max": 2048,
+      "step": 16
+    },
+    {
+      "key": "steps",
+      "label": "步数",
+      "type": "int",
+      "node": "3",
+      "input": "steps",
+      "default": 20,
+      "min": 1,
+      "max": 100
+    },
+    {
+      "key": "cfg",
+      "label": "CFG",
+      "type": "float",
+      "node": "3",
+      "input": "cfg",
+      "default": 2.5,
+      "min": 1,
+      "max": 10,
+      "step": 0.1
+    },
+    {
+      "key": "seed",
+      "label": "种子",
+      "type": "seed",
+      "node": "3",
+      "input": "seed"
+    }
+  ],
+  "outputs": [
+    {
+      "node": "60"
+    }
+  ]
+}
