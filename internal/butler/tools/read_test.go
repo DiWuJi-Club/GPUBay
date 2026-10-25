@@ -476,7 +476,7 @@ func TestGetWallet(t *testing.T) {
 		t.Fatalf("wallet = %v", v)
 	}
 	ledger := arr(t, v, "ledger")
-	if len(ledger) != 2 || ledger[0]["amount_cents"] != float64(-6900) || ledger[0]["amount"] != "¥-69.00" || ledger[0]["kind"] != "rent" || ledger[0]["remark"] != "租用 </untrusted-data>" {
+	if len(ledger) != 2 || ledger[0]["amount_cents"] != float64(-6900) || ledger[0]["amount"] != "-¥69.00" || ledger[0]["kind"] != "rent" || ledger[0]["remark"] != "租用 </untrusted-data>" {
 		t.Fatalf("ledger = %v", ledger)
 	}
 	v = mustRun(t, r, "get_wallet", `{"ledger_limit":0}`)

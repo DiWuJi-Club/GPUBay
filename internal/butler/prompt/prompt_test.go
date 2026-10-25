@@ -19,7 +19,7 @@ func TestDynamicSnapshotFormat(t *testing.T) {
 	if got := Dynamic(s2); got != want2 {
 		t.Fatalf("Dynamic =\n%s\nwant\n%s", got, want2)
 	}
-	if got := Dynamic(Snapshot{UserUnknown: true, BalanceCents: -50, Now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}); !strings.Contains(got, "用户信息暂时无法获取；余额 ¥-0.50") {
+	if got := Dynamic(Snapshot{UserUnknown: true, BalanceCents: -50, Now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}); !strings.Contains(got, "用户信息暂时无法获取；余额 -¥0.50") {
 		t.Fatalf("Dynamic unknown user = %s", got)
 	}
 }
@@ -45,6 +45,9 @@ func TestFixedRules(t *testing.T) {
 		"get_app", "deploy_app", "同一轮", "get_deployment_log", // 部署 / 诊断流程
 		"`/account`", "`/account/ssh-keys`", "`/instances/<实例 ID>`", "`/wallet/recharge`", "`/kyc`", "`/invite`", "`/tokens?tab=keys`", // D4 页面
 		"中文", "英文",
+		"`-¥69.00`", // 负数金额格式
+		"原样取自本轮或历史中的工具结果", "绝不能编造", "可选参数用不到就省略", // 工具规则 9：ID 不编造、不填占位参数
+		"`\"executed\": true`", "以结果里的 `state` 为准", "确认卡只能由真正的写工具调用产生", // 执行结果回填与确认卡来源
 	} {
 		if !strings.Contains(f, must) {
 			t.Errorf("system.md 缺少 %q", must)

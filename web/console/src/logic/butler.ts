@@ -90,7 +90,7 @@ function parseData<T>(data: string): T | null {
  * - tool：同 id 的确认卡 → executed / failed（确认执行的结果）；同 id 的步骤 → 更新；否则追加步骤；
  * - confirm：追加确认卡（同 id 则替换），status = awaiting_confirm；
  * - usage：更新今日额度；
- * - done：结束流式，max_tokens → 本轮最后一个助手气泡 truncated；awaiting_confirm 保持待确认，其余回到 idle；
+ * - done：结束流式，max_tokens → 末尾的助手气泡（其后没有步骤 / 卡片）truncated；awaiting_confirm 保持待确认，其余回到 idle；
  * - error：追加错误项（retryText = 最近一条用户消息，供「重试」），回到 idle。
  */
 export function applyEvent(s: ChatState, e: SSEEvent): ChatState {
@@ -113,9 +113,10 @@ export function applyEvent(s: ChatState, e: SSEEvent): ChatState {
       const d = parseData<ButlerToolEvent>(e.data)
       if (!d || !d.id) return s
       const status = d.status === 'error' ? 'error' : 'ok'
-      const ci = s.items.findIndex((it) => it.kind === 'confirm' && it.card.id === d.id)
-      if (ci >= 0) {
+      if (s.items.some((it) => it.kind === 'confirm' && it.card.id === d.id)) {
+        // 先结束流式再找下标：endStreaming 会去掉只有空白的气泡，之前算的下标会错位
         const items = endStreaming(s.items)
+        const ci = items.findIndex((it) => it.kind === 'confirm' && it.card.id === d.id)
         const card = items[ci] as Extract<ChatItem, { kind: 'confirm' }>
         // 只有待确认 / 已批准的卡片才会有执行结果；已拒绝 / 已失效的卡片不被改写
         if (card.state !== 'pending' && card.state !== 'approved') return s
@@ -149,14 +150,10 @@ export function applyEvent(s: ChatState, e: SSEEvent): ChatState {
       if (!d) return s
       const items = endStreaming(s.items)
       if (d.reason === 'max_tokens') {
-        // 只标记本轮（最近一条用户消息之后）的助手气泡，不回头改上一轮的
-        for (let i = items.length - 1; i >= 0 && items[i].kind !== 'user'; i--) {
-          const it = items[i]
-          if (it.kind === 'assistant') {
-            items[i] = { ...it, truncated: true }
-            break
-          }
-        }
+        // 只标记本轮最后一段（最后一个步骤 / 确认卡 / 错误之后）的助手气泡：被截断的是最后一次模型调用的输出；
+        // 那段输出只有空白（已被 endStreaming 去掉）或是半截工具调用时不标记，不回头改步骤之前或上一轮的气泡
+        const last = items[items.length - 1]
+        if (last?.kind === 'assistant') items[items.length - 1] = { ...last, truncated: true }
       }
       return { ...s, items, status: d.reason === 'awaiting_confirm' ? 'awaiting_confirm' : 'idle' }
     }

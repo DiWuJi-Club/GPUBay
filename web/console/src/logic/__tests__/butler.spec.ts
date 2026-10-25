@@ -162,6 +162,43 @@ describe('applyEvent', () => {
     ])
   })
 
+  it('done max_tokens 不标记步骤 / 卡片之前的气泡：最后一次模型调用的输出只有空白（被去掉）或是半截工具调用', () => {
+    const s = run(appendUser(emptyState(), '部署'), [
+      ev('start', { conversation_id: 'cv-1', message_id: 1 }),
+      ev('delta', { text: '我先查一下' }),
+      ev('tool', { id: 'tc-1', name: 'get_app', label: '查看应用', status: 'ok' }),
+      ev('delta', { text: '\n\n' }),
+      ev('done', { reason: 'max_tokens' }),
+    ])
+    expect(s.items).toEqual([
+      { kind: 'user', text: '部署' },
+      { kind: 'assistant', text: '我先查一下', streaming: false },
+      { kind: 'tool', id: 'tc-1', name: 'get_app', label: '查看应用', status: 'ok' },
+    ])
+    // 步骤之后的气泡照常标记
+    const t = run(s, [ev('delta', { text: '半截' }), ev('done', { reason: 'max_tokens' })])
+    expect(t.items.at(-1)).toEqual({ kind: 'assistant', text: '半截', streaming: false, truncated: true })
+  })
+
+  it('确认卡的执行结果：卡片前有被去掉的空白气泡时仍改写正确的卡片', () => {
+    const base: ChatState = {
+      ...emptyState(),
+      status: 'running',
+      items: [
+        { kind: 'user', text: '续费' },
+        { kind: 'assistant', text: '\n\n', streaming: true },
+        { kind: 'confirm', card, state: 'approved' },
+        { kind: 'assistant', text: '好的', streaming: false },
+      ],
+    }
+    const s = applyEvent(base, ev('tool', { id: card.id, name: 'renew_instance', label: '续费实例', status: 'ok' }))
+    expect(s.items).toEqual([
+      { kind: 'user', text: '续费' },
+      { kind: 'confirm', card, state: 'executed' },
+      { kind: 'assistant', text: '好的', streaming: false },
+    ])
+  })
+
   it('error 事件：追加错误项并带上最近的用户消息作为重试文本', () => {
     const s = run(appendUser(emptyState(), '看看日志'), [
       ev('start', { conversation_id: 'cv-1', message_id: 1 }),

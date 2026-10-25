@@ -302,11 +302,22 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 		}
 		return &llm.RequestError{Status: resp.StatusCode, Body: string(b)}
 	}
-	if p.cfg.NoStream {
+	if p.cfg.NoStream && !isEventStream(resp.Header.Get("Content-Type")) {
 		return p.readCompletion(ctx, resp.Body, emit)
 	}
+	// 流式；或请求了 stream:false 但端点仍回 text/event-stream（忽略 stream 参数的实现）→ 同样按 SSE 读
+	return p.readStream(ctx, resp.Body, emit)
+}
 
-	sc := bufio.NewScanner(resp.Body)
+// isEventStream：响应 Content-Type 是 text/event-stream（忽略参数与大小写）。
+func isEventStream(ct string) bool {
+	mt, _, _ := strings.Cut(ct, ";")
+	return strings.EqualFold(strings.TrimSpace(mt), "text/event-stream")
+}
+
+// readStream 读 SSE 响应：正文增量逐个发 delta，工具调用按 index 累积，finish_reason / [DONE] 收尾。
+func (p *Provider) readStream(ctx context.Context, r io.Reader, emit func(llm.Event)) error {
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 	// 调用按出现顺序放进 calls；cur 把增量里的 index 映射到当前累积中的调用。
 	// 有的实现并行调用都不带 index（默认 0）：同一 index 上出现另一个非空 id → 视为新调用。
@@ -440,13 +451,18 @@ type completion struct {
 
 // readCompletion 解析一次性的 chat.completion，按流式同样的顺序发事件：正文（一个 delta）→ 工具调用 → usage → done。
 // 停止原因与流式一致：length 丢弃半截工具调用；有工具调用而没有 finish_reason 也算 tool_use。
+// 响应没有 usage 时与流式相同：不发 usage 事件（由调用方按估算记账）。
 func (p *Provider) readCompletion(ctx context.Context, r io.Reader, emit func(llm.Event)) error {
-	raw, err := io.ReadAll(io.LimitReader(r, maxCompletionBytes))
+	raw, err := io.ReadAll(io.LimitReader(r, maxCompletionBytes+1))
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return &llm.UnavailableError{Cause: err}
+	}
+	if len(raw) > maxCompletionBytes {
+		// 多读 1 字节判断超限：截断的 JSON 只会报「不是合法 JSON」，看不出原因
+		return &llm.UnavailableError{Cause: fmt.Errorf("模型响应过大（超过 %d MB）", maxCompletionBytes>>20)}
 	}
 	var c completion
 	if err := json.Unmarshal(raw, &c); err != nil {

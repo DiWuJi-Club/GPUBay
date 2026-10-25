@@ -128,7 +128,8 @@ func (h writeHandlers) guarded(fn execFunc) execFunc {
 
 // ExecutedNote 写在写工具的执行结果里：执行结果作为原工具调用的结果回填，小模型分不清「出卡」与「已执行」，
 // 真机验收（Qwen3-4B）里执行成功后仍回答「已生成确认卡，请核对后确认」，并在后续轮次照抄这句而不再调用写工具。
-const ExecutedNote = "用户已在确认卡上确认，平台已执行完成"
+// 只说「已提交执行」：下单 / 部署等的结果可能还在开通中、排队中、部署中、擦除中，不能让模型说成已全部完成。
+const ExecutedNote = "用户已在确认卡上确认，平台已提交执行；进度以结果中的 state 为准（开通中 / 排队中 / 部署中不等于已完成）"
 
 func okResult(name string, c Caller, v map[string]any, ref string) (Result, error) {
 	v["ok"], v["executed"], v["note"] = true, true, ExecutedNote
@@ -137,13 +138,13 @@ func okResult(name string, c Caller, v map[string]any, ref string) (Result, erro
 
 // ---- 格式化 ----
 
-// yuan 把分格式化为「¥X.XX」。
+// yuan 把分格式化为「¥X.XX」，负数为「-¥X.XX」（负号在 ¥ 前，与控制台 fmtYuan 一致）。
 func yuan(cents int64) string {
 	sign := ""
 	if cents < 0 {
 		sign, cents = "-", -cents
 	}
-	return fmt.Sprintf("¥%s%d.%02d", sign, cents/100, cents%100)
+	return fmt.Sprintf("%s¥%d.%02d", sign, cents/100, cents%100)
 }
 
 // durationText 是总时长的中文：1d × 3 → 「3 天」，1w × 2 → 「2 周」，1m × 1 → 「1 个月」。
@@ -489,6 +490,10 @@ func (h writeHandlers) placeOrderCard(ctx context.Context, c Caller, args json.R
 	}
 	unit, err := h.d.Catalog.Quote(ctx, h.d.Pool, a.ProductID, d)
 	if err != nil {
+		// 套餐存在但已下架 / 没有任何启用的价格：Quote 也只会说「该规格暂不支持此租期」，会把模型引向换租期
+		if ae := apperr.As(err); ae != nil && ae.Code == "bad_request" && !onSale(ctx, h.d.Catalog, a.ProductID) {
+			return Card{}, apperr.BadRequest(fmt.Sprintf("套餐 %d 已下架或暂不可租：请用 list_products 查看在售套餐", a.ProductID))
+		}
 		return Card{}, err
 	}
 	images, err := h.d.Catalog.ListImages(ctx)
@@ -585,6 +590,16 @@ func (h writeHandlers) placeOrderCard(ctx context.Context, c Caller, args json.R
 		return Card{}, err
 	}
 	return card, nil
+}
+
+// onSale：套餐在售（上架且至少有一个启用的价格）。查询失败时按在售处理，保留 Quote 原来的错误。
+func onSale(ctx context.Context, cat CatalogAPI, id int64) bool {
+	ps, err := cat.ListProducts(ctx)
+	if err != nil {
+		return true
+	}
+	i := slices.IndexFunc(ps, func(p catalog.ProductWithPrices) bool { return p.ID == id })
+	return i >= 0 && len(ps[i].Prices) > 0
 }
 
 func (h writeHandlers) placeOrder(ctx context.Context, c Caller, args json.RawMessage) (Result, error) {

@@ -536,3 +536,12 @@ func TestMockConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestYuanNegative(t *testing.T) {
+	if got := yuan(-6900); got != "-¥69.00" {
+		t.Fatalf("yuan(-6900) = %q", got)
+	}
+	if got := yuan(5); got != "¥0.05" {
+		t.Fatalf("yuan(5) = %q", got)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/butler/llm"
 	"spark-cloud/internal/butler/llm/mock"
+	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/apperr"
@@ -184,6 +185,36 @@ func TestPlaceOrderSummary(t *testing.T) {
 	}
 	if len(f.rental.placeReq) != 0 {
 		t.Fatal("Summary must not place orders")
+	}
+}
+
+// 套餐存在但已下架 / 没有启用的价格 → 「已下架或暂不可租」；在售但不支持该租期 → 仍是租期错误。
+func TestPlaceOrderProductOffSale(t *testing.T) {
+	f := newFakes()
+	f.catalog.names[7] = "旧套餐（已下架）" // 不在 ListProducts 里
+	f.catalog.names[8] = "无价格套餐"
+	f.catalog.names[9] = "只有日租"
+	f.catalog.products = append(f.catalog.products,
+		catalog.ProductWithPrices{Product: catalog.Product{ID: 8, Name: "无价格套餐"}},
+		catalog.ProductWithPrices{Product: catalog.Product{ID: 9, Name: "只有日租"}, Prices: []catalog.Price{{Duration: catalog.D1d, Amount: 100}}})
+	r := NewRegistry(f.deps)
+	for _, tc := range []struct{ name, args, msg string }{
+		{"已下架", `{"product_id":7,"duration":"1d","image_id":2}`, "套餐 7 已下架或暂不可租"},
+		{"没有价格", `{"product_id":8,"duration":"1d","image_id":2}`, "套餐 8 已下架或暂不可租"},
+		{"不支持该租期", `{"product_id":9,"duration":"1w","image_id":2}`, "该规格暂不支持此租期"},
+	} {
+		_, err := card(t, r, "place_order", ownerID, tc.args)
+		if err == nil || codeOf(t, err) != "bad_request" || !strings.Contains(err.Error(), tc.msg) {
+			t.Errorf("%s: err = %v, want %s", tc.name, err, tc.msg)
+		}
+	}
+}
+
+func TestYuanFormat(t *testing.T) {
+	for cents, want := range map[int64]string{0: "¥0.00", 6900: "¥69.00", -6900: "-¥69.00", -5: "-¥0.05", 123456: "¥1234.56"} {
+		if got := yuan(cents); got != want {
+			t.Errorf("yuan(%d) = %q, want %q", cents, got, want)
+		}
 	}
 }
 

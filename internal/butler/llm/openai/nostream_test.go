@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"spark-cloud/internal/butler/llm"
 )
@@ -127,5 +129,90 @@ func TestOpenAINoStreamErrors(t *testing.T) {
 				t.Fatalf("err = %#v", err)
 			}
 		})
+	}
+}
+
+func TestOpenAINoStreamMissingUsage(t *testing.T) {
+	var body map[string]any
+	var accept string
+	srv := jsonServer(t, 200, `{"choices":[{"message":{"content":"好的"},"finish_reason":"stop"}]}`, &body, &accept)
+	evs, err := collect(t, noStreamProvider(srv.URL), llm.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 与流式一致：没有 usage 就不发 usage 事件（调用方按估算记账）
+	if got := strings.Join(types(evs), ","); got != "text_delta,done" {
+		t.Fatalf("events = %s", got)
+	}
+}
+
+func TestOpenAINoStreamTooLarge(t *testing.T) {
+	var body map[string]any
+	var accept string
+	big := `{"choices":[{"message":{"content":"` + strings.Repeat("a", maxCompletionBytes) + `"},"finish_reason":"stop"}]}`
+	srv := jsonServer(t, 200, big, &body, &accept)
+	var evs []llm.Event
+	err := noStreamProvider(srv.URL).Chat(context.Background(), llm.Request{}, func(e llm.Event) { evs = append(evs, e) })
+	var ue *llm.UnavailableError
+	if !errors.As(err, &ue) || !strings.Contains(err.Error(), "过大") {
+		t.Fatalf("err = %#v", err)
+	}
+	if len(evs) != 0 {
+		t.Fatalf("超限不应发任何事件: %v", types(evs))
+	}
+}
+
+// 请求了 stream:false，端点仍回 text/event-stream（忽略 stream 参数）→ 按 SSE 解析，不报「不是合法 JSON」。
+func TestOpenAINoStreamServerStreamsAnyway(t *testing.T) {
+	f := &fakeServer{}
+	srv := f.start(t, 200, []string{
+		`data: {"choices":[{"index":0,"delta":{"content":"你"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":"好"},"finish_reason":"stop"}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":2}}`,
+		"data: [DONE]",
+	})
+	evs, err := collect(t, noStreamProvider(srv.URL), llm.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(types(evs), ","); got != "text_delta,text_delta,usage,done" {
+		t.Fatalf("events = %s", got)
+	}
+	if evs[2].Usage.InputTokens != 12 || evs[3].StopReason != llm.StopEndTurn {
+		t.Fatalf("evs = %+v", evs)
+	}
+	if f.body["stream"] != false {
+		t.Fatalf("请求仍应是 stream:false: %v", f.body["stream"])
+	}
+	for _, ct := range []string{"text/event-stream", "Text/Event-Stream; charset=utf-8"} {
+		if !isEventStream(ct) {
+			t.Fatalf("isEventStream(%q) = false", ct)
+		}
+	}
+	if isEventStream("application/json") {
+		t.Fatal("application/json 不是 SSE")
+	}
+}
+
+// 响应头已到、读正文时 ctx 超时 → 返回 ctx 错误（不是「不可用」）。
+func TestOpenAINoStreamCtxDuringBody(t *testing.T) {
+	stop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"半`)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-stop:
+		}
+	}))
+	defer srv.Close()
+	defer close(stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	err := noStreamProvider(srv.URL).Chat(ctx, llm.Request{}, func(llm.Event) {})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %#v", err)
 	}
 }

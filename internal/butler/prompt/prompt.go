@@ -42,7 +42,7 @@ func yuan(cents int64) string {
 	if cents < 0 {
 		sign, cents = "-", -cents
 	}
-	return fmt.Sprintf("¥%s%d.%02d", sign, cents/100, cents%100)
+	return fmt.Sprintf("%s¥%d.%02d", sign, cents/100, cents%100)
 }
 
 // Dynamic 返回用户快照段（llm.Request.SystemDynamic），固定格式、不含自由文本：

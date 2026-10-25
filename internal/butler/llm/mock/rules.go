@@ -789,7 +789,7 @@ func yuan(cents int64) string {
 	if cents < 0 {
 		sign, cents = "-", -cents
 	}
-	return fmt.Sprintf("¥%s%d.%02d", sign, cents/100, cents%100)
+	return fmt.Sprintf("%s¥%d.%02d", sign, cents/100, cents%100)
 }
 
 func lastLine(s string) string {
