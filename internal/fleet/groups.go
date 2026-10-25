@@ -50,6 +50,7 @@ var (
 	errCreateLLMGroup   = apperr.BadRequest("不能创建 Token 服务池机组")
 	errPoolVisible      = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能对用户可见", apperr.ErrInvalidState.Status)
 	errPurposeImmutable = apperr.New(apperr.ErrInvalidState.Code, "机组用途不能修改", apperr.ErrInvalidState.Status)
+	errPoolRename       = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能改名", apperr.ErrInvalidState.Status)
 	// ErrPoolNotDeletable Token 服务池不能删除（rental.AdminDeleteGroup 锁住机组行后先判断，早于 group_not_empty）。
 	ErrPoolNotDeletable = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能删除", apperr.ErrInvalidState.Status)
 )
@@ -216,6 +217,9 @@ func (s *Service) UpdateGroup(ctx context.Context, actor audit.Actor, id int64, 
 		}
 		if before.Purpose == GroupPurposeLLM && in.Visible {
 			return errPoolVisible
+		}
+		if before.Purpose == GroupPurposeLLM && in.Name != before.Name {
+			return errPoolRename
 		}
 		g, err = scanGroup(tx.QueryRow(ctx, `UPDATE machine_groups SET name = $2, region = $3, description = $4, sort = $5, visible = $6, updated_at = $7
 			WHERE id = $1 RETURNING `+groupCols, id, in.Name, in.Region, in.Description, in.Sort, in.Visible, now))

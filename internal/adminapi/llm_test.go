@@ -648,7 +648,8 @@ func TestDashboardLLM(t *testing.T) {
 	fin := e.loginAs("fin", admin.RoleFinance)
 	code, out := fin.do("GET", "/dashboard", nil)
 	l, _ := out["llm"].(map[string]any)
-	if code != 200 || l == nil || l["nodes_ready"].(float64) != 1 || l["nodes_total"].(float64) != 2 || l["today_requests"].(float64) != 1 ||
+	if code != 200 || l == nil || l["nodes_ready"].(float64) != 1 || l["nodes_total"].(float64) != 2 || l["nodes_unhealthy"].(float64) != 1 ||
+		l["today_requests"].(float64) != 1 ||
 		l["today_settled_amount"].(float64) != 200 {
 		t.Fatalf("dashboard llm = %d %v", code, out["llm"])
 	}
