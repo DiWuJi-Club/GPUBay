@@ -557,7 +557,11 @@ func TestGenerateSecret(t *testing.T) {
 		if err != nil || !res.Secret {
 			t.Fatalf("generate_secret: %v secret=%v", err, res.Secret)
 		}
-		s := unwrapJSON(t, "generate_secret", ownerID, res.Content)["secret"].(string)
+		v := unwrapJSON(t, "generate_secret", ownerID, res.Content)
+		if v["note"] != GenerateSecretNote {
+			t.Fatalf("note = %v", v["note"])
+		}
+		s := v["secret"].(string)
 		if len(s) != c.n || seen[s] {
 			t.Fatalf("secret %q len %d want %d", s, len(s), c.n)
 		}

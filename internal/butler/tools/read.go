@@ -899,6 +899,10 @@ func (h readHandlers) getHelp(_ context.Context, c Caller, args json.RawMessage)
 
 // ---- generate_secret ----
 
+// GenerateSecretNote 随密钥一起给模型：真机验收（Qwen3-4B）里模型拿到密钥后常常只回一段文字（还声称「已生成确认卡」）而不调用
+// deploy_app，密钥随本轮结束丢失；回放中加上这句后多数情况会在同一轮直接出部署卡。
+const GenerateSecretNote = "密钥已生成：请在本轮直接调用 deploy_app（或 place_order 的 app_env）把它填进对应的 secret 变量，确认卡会展示给用户；不要在回复里复述密钥"
+
 func (h readHandlers) generateSecret(_ context.Context, c Caller, args json.RawMessage) (Result, error) {
 	var a struct {
 		Length int `json:"length"`
@@ -909,7 +913,7 @@ func (h readHandlers) generateSecret(_ context.Context, c Caller, args json.RawM
 	if a.Length < 8 || a.Length > 64 {
 		a.Length = 32
 	}
-	r, err := wrapOne("generate_secret", c, map[string]any{"secret": randx.Password(a.Length)}, smallLimit, "")
+	r, err := wrapOne("generate_secret", c, map[string]any{"secret": randx.Password(a.Length), "note": GenerateSecretNote}, smallLimit, "")
 	r.Secret = true
 	return r, err
 }
