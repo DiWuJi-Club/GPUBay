@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ConsoleLayout from '../../layouts/ConsoleLayout.vue'
 import {
-  contextLabel, costYuan, curlExample, DEFAULT_LLM_LIMITS, exampleModel, keyHintMask, llmErrorHelp, llmErrorStatus, lowestInputPrice,
+  contextLabel, costYuan, curlExample, DEFAULT_LLM_LIMITS, exampleModel, keyHintMask, llmErrorHelp, llmErrorStatus, logModelOptions, lowestInputPrice,
   pricePerMillionYuan, pythonExample,
 } from '../tokens'
 
@@ -37,6 +37,11 @@ describe('价格与费用', () => {
   it('lowestInputPrice：最低输入价；没有模型返回 null', () => {
     expect(lowestInputPrice([])).toBeNull()
     expect(lowestInputPrice([model('a', { input_price: 300 }), model('b', { input_price: 50 }), model('c', { input_price: 80 })])).toBe(50)
+  })
+
+  it('lowestInputPrice：只看对话模型（向量模型更便宜也不算）；没有对话模型时取全部', () => {
+    expect(lowestInputPrice([model('chat', { input_price: 200 }), model('emb', { kind: 'embedding', input_price: 10 })])).toBe(200)
+    expect(lowestInputPrice([model('emb1', { kind: 'embedding', input_price: 30 }), model('emb2', { kind: 'embedding', input_price: 10 })])).toBe(10)
   })
 
   it('contextLabel：1024 的整数倍按 K 显示，其余按 formatTokens', () => {
@@ -87,11 +92,23 @@ describe('快速开始示例', () => {
     for (const code of [
       'invalid_api_key', 'account_banned', 'kyc_required', 'account_blocked', 'insufficient_quota', 'model_not_allowed', 'model_not_found', 'not_found',
       'invalid_request_error', 'request_too_large', 'rate_limit_exceeded', 'monthly_cap_exceeded', 'model_unavailable', 'server_overloaded', 'upstream_error',
+      'upstream_timeout', 'internal_error', 'method_not_allowed',
     ]) {
       expect(llmErrorHelp[code], code).toBeTruthy()
       expect(llmErrorStatus[code], code).toBeGreaterThanOrEqual(400)
     }
     expect(Object.keys(llmErrorStatus).sort()).toEqual(Object.keys(llmErrorHelp).sort())
+  })
+
+  it('状态码与网关一致：504 超时、500 内部错误、405 方法不对', () => {
+    expect(llmErrorStatus.upstream_timeout).toBe(504)
+    expect(llmErrorStatus.internal_error).toBe(500)
+    expect(llmErrorStatus.method_not_allowed).toBe(405)
+  })
+
+  it('400 的说明提到 max_tokens 超过最大输出与 n / best_of 大于 8', () => {
+    expect(llmErrorHelp.invalid_request_error).toContain('max_tokens')
+    expect(llmErrorHelp.invalid_request_error).toContain('n / best_of 大于 8')
   })
 })
 
@@ -127,5 +144,13 @@ describe('ConsoleLayout 导航', () => {
     expect(w.findAll('[data-testid^="tabbar-"]')).toHaveLength(6)
     expect(w.get('[data-testid="tabbar-tokens"]').text()).toBe('Token')
     expect(w.get('[data-testid="tabbar-workflows"]').text()).toBe('工作流')
+  })
+})
+
+describe('logModelOptions', () => {
+  it('在线模型在前（保持顺序），日志里已下线的模型与当前选中的追加在后、去重、字母序', () => {
+    expect(logModelOptions(['b', 'a'], ['a', 'old-2', 'old-1', 'old-2'], '')).toEqual(['b', 'a', 'old-1', 'old-2'])
+    expect(logModelOptions(['a'], [], 'gone')).toEqual(['a', 'gone'])
+    expect(logModelOptions([], [], '')).toEqual([])
   })
 })

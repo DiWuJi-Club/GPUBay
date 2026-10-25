@@ -44,7 +44,7 @@ var (
 
 var (
 	modelSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,63}$`)
-	sourceIDRe  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	sourceIDRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`) // 两段都不能以 . - _ 开头（拒绝 ../x、-x 之类）；与 vllm-node spec 的 MODEL_ID 同一模式
 )
 
 const (

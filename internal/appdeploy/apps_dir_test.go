@@ -116,8 +116,19 @@ func TestVLLMNodeApp(t *testing.T) {
 	if k := env["API_KEY"]; k.Type != "secret" || !k.Required || k.Pattern != "^[A-Za-z0-9_-]{32,128}$" {
 		t.Errorf("API_KEY = %+v", k)
 	}
-	if m := env["MODEL_ID"]; !m.Required || m.Type != "string" {
+	if m := env["MODEL_ID"]; !m.Required || m.Type != "string" || m.Pattern != "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$" {
 		t.Errorf("MODEL_ID = %+v", m)
+	}
+	// MODEL_ID 两段都不能以 . - _ 开头（与 llm 模型目录 source_id 的校验同一模式）
+	for _, bad := range []string{"../etc", "Qwen/..", "-rf/x", "Qwen/_x", "Qwen", "a/b/c"} {
+		if _, _, err := appdeploy.ValidateEnv(spec, map[string]string{"MODEL_ID": bad, "SERVED_MODEL_NAME": "qwen3-8b",
+			"API_KEY": strings.Repeat("k", 32)}); err == nil {
+			t.Errorf("MODEL_ID %q accepted", bad)
+		}
+	}
+	if _, _, err := appdeploy.ValidateEnv(spec, map[string]string{"MODEL_ID": "BAAI/bge-m3.v1_x", "SERVED_MODEL_NAME": "bge-m3",
+		"API_KEY": strings.Repeat("k", 32)}); err != nil {
+		t.Errorf("valid MODEL_ID rejected: %v", err)
 	}
 	if s := env["SERVED_MODEL_NAME"]; !s.Required || s.Pattern != "^[a-z0-9][a-z0-9.-]{1,63}$" {
 		t.Errorf("SERVED_MODEL_NAME = %+v", s)

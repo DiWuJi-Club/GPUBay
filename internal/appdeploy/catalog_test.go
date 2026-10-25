@@ -675,3 +675,40 @@ func TestImportReadsInternal(t *testing.T) {
 		t.Fatalf("vllm-node = %+v, %v", node, err)
 	}
 }
+
+// 已有应用（早于 internal 字段导入）：app.json 的 internal=true 时补标为内部应用（同版本跳过也补）；internal=false 从不清除。
+func TestImportSetsInternalOnExistingApp(t *testing.T) {
+	e := newEnv(t, 0)
+	root := t.TempDir()
+	meta := map[string]any{"name": "节点", "category": "llm", "version": "1.0.0", "images": []string{"PyTorch"}}
+	writeApp(t, root, "vllm-node", meta)
+	if res, err := e.cat.ImportDir(e.ctx, e.actor(), root); err != nil || len(res) != 1 || !res[0].Created {
+		t.Fatalf("first import = %+v, %v", res, err)
+	}
+	if a, _ := e.cat.AppBySlug(e.ctx, "vllm-node"); a.Internal {
+		t.Fatal("internal set without app.json internal")
+	}
+	meta["internal"] = true
+	writeApp(t, root, "vllm-node", meta)
+	res, err := e.cat.ImportDir(e.ctx, e.actor(), root)
+	if err != nil || len(res) != 1 || res[0].Created || res[0].Skipped == "" {
+		t.Fatalf("re-import = %+v, %v", res, err)
+	}
+	a, err := e.cat.AppBySlug(e.ctx, "vllm-node")
+	if err != nil || !a.Internal {
+		t.Fatalf("after re-import with internal=true: %+v, %v", a, err)
+	}
+	if logs := e.auditLogs("app.update", id(a.ID)); len(logs) != 1 {
+		t.Fatalf("app.update audit rows = %d", len(logs))
+	}
+	// internal=false（或不写）不会清除
+	delete(meta, "internal")
+	meta["version"] = "1.0.1"
+	writeApp(t, root, "vllm-node", meta)
+	if _, err := e.cat.ImportDir(e.ctx, e.actor(), root); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := e.cat.AppBySlug(e.ctx, "vllm-node"); !a.Internal {
+		t.Fatal("internal cleared by re-import")
+	}
+}

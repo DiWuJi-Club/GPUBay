@@ -198,12 +198,16 @@ func (s *Service) OrderAmount(ctx context.Context, from, to time.Time) (int64, e
 }
 
 // DailyOccupancy 返回从 from 起连续 days 天、每天被租用的机器总秒数（machine_leases 中 active / ended 时段与当天的交集，截止到 now）。
+// 系统实例（Token 服务节点）的租期不算出租：不计入。没有租期的一天是 0（FILTER 掉 LEFT JOIN 的空行：
+// GREATEST / LEAST 会忽略 NULL，空行否则会被算成 [day, min(day+24h, now)) 整段）。
 func (s *Service) DailyOccupancy(ctx context.Context, from time.Time, days int, now time.Time) ([]float64, error) {
 	rows, err := s.d.Pool.Query(ctx, `
 		SELECT COALESCE(sum(GREATEST(EXTRACT(EPOCH FROM
-				LEAST(upper(l.period), d.day + interval '24 hours', $3::timestamptz) - GREATEST(lower(l.period), d.day)), 0)), 0)::float8
+				LEAST(upper(l.period), d.day + interval '24 hours', $3::timestamptz) - GREATEST(lower(l.period), d.day)), 0))
+				FILTER (WHERE l.id IS NOT NULL), 0)::float8
 		FROM generate_series($1::timestamptz, $1::timestamptz + ($2::int - 1) * interval '24 hours', interval '24 hours') AS d(day)
 		LEFT JOIN machine_leases l ON l.status IN ('active', 'ended') AND l.period && tstzrange(d.day, d.day + interval '24 hours')
+			AND NOT EXISTS (SELECT 1 FROM instances i WHERE i.id = l.instance_id AND i.system)
 		GROUP BY d.day ORDER BY d.day`, from, days, now)
 	if err != nil {
 		return nil, err

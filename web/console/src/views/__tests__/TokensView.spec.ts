@@ -109,11 +109,11 @@ describe('TokensView（未登录）', () => {
 })
 
 describe('MarketView 的 Token 商城横幅', () => {
-  it('显示最低输入价并链接到 /tokens', async () => {
+  it('显示对话模型的最低输入价（向量模型更便宜也不算）并链接到 /tokens', async () => {
     await mountAt('/market')
     const banner = byId('market-tokens-banner')!
     expect(banner.getAttribute('href')).toBe('/tokens')
-    expect(byId('market-tokens-banner-price')!.textContent).toBe('¥0.20')
+    expect(byId('market-tokens-banner-price')!.textContent).toBe('¥0.50')
   })
 
   it('没有在线模型时不显示', async () => {

@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
+
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
@@ -24,7 +26,7 @@ type appJSON struct {
 	Category    string   `json:"category"`
 	Icon        string   `json:"icon"`
 	Sort        int      `json:"sort"`
-	Internal    bool     `json:"internal"` // 平台内部应用（只在新建应用时写入）
+	Internal    bool     `json:"internal"` // 平台内部应用：新建时写入；已有应用只会被置为 true，不会被清除
 	Version     string   `json:"version"`
 	Images      []string `json:"images"`
 	Changelog   string   `json:"changelog"`
@@ -144,6 +146,12 @@ func (c *Catalog) importApp(ctx context.Context, actor audit.Actor, dir, slug st
 	if err != nil {
 		return ImportResult{}, err
 	}
+	if !res.Created && meta.Internal && !app.Internal {
+		// 早于 internal 字段导入的已有应用（如 vllm-node）：补标为内部应用；只置 true、从不清除
+		if err := c.markInternal(ctx, actor, app); err != nil {
+			return ImportResult{}, err
+		}
+	}
 	if !res.Created {
 		// 已有部署升级时会把整个 deploy/apps 重新导入：同版本号且内容（spec + 脚本 + 镜像）相同 → 跳过，继续导入后面的应用；
 		// 内容不同 → 报错提醒提高版本号（已发布版本冻结，不能静默覆盖）
@@ -165,4 +173,17 @@ func (c *Catalog) importApp(ctx context.Context, actor audit.Actor, dir, slug st
 		return ImportResult{}, err
 	}
 	return res, nil
+}
+
+// markInternal 把已有应用标为内部应用（导入时 app.json 的 internal=true 而库里是 false），记审计。
+func (c *Catalog) markInternal(ctx context.Context, actor audit.Actor, app App) error {
+	return db.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+		now := c.clock.Now()
+		tag, err := tx.Exec(ctx, `UPDATE apps SET internal = true, updated_at = $2 WHERE id = $1 AND NOT internal`, app.ID, now)
+		if err != nil || tag.RowsAffected() == 0 {
+			return err
+		}
+		return audit.Record(ctx, tx, now, actor.Entry("app.update", "app", appTarget(app.ID),
+			map[string]any{"before": map[string]any{"internal": false}, "after": map[string]any{"internal": true}, "source": "import"}))
+	})
 }

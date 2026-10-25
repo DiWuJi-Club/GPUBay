@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import {
-  appStatusLabel, isApiError, labelOf, llmModelKindLabel, messageOf,
+  appStatusLabel, isApiError, labelOf, llmFeatureLabel, llmModelKindLabel, messageOf,
   type AdminApp, type AdminAppVersion, type AdminImage, type AppEnvSpec, type LLMModelAdmin, type Listed,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
 import {
-  compatibleImages, emptyModelForm, extraEnvKeys, imageNote, LLM_FEATURES, llmFeatureLabel, llmSourceLabel, latestPublished, modelToForm, nodeEnvSpec, staleNodesWarning,
+  compatibleImages, emptyModelForm, extraEnvKeys, imageNote, LLM_FEATURES, llmSourceLabel, latestPublished, modelToForm, nodeEnvSpec, staleNodesWarning,
   validateModelForm, type ModelForm,
 } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'

@@ -116,7 +116,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, err)
 			return
 		}
-		out["llm"] = map[string]any{"nodes_ready": sum.Nodes.Ready, "nodes_total": sum.Nodes.Total,
+		out["llm"] = map[string]any{"nodes_ready": sum.Nodes.Ready, "nodes_total": sum.Nodes.Total, "nodes_unhealthy": sum.Nodes.Unhealthy,
 			"today_requests": sum.Today.Requests, "today_settled_amount": sum.Today.SettledAmount}
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)

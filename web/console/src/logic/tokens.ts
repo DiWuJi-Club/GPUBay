@@ -17,10 +17,12 @@ export function costYuan(costMicro: number): string {
   return `${sign}${units.slice(0, -6)}.${units.slice(-6)}`
 }
 
-/** 市场页横幅「¥X 起」：在线模型的最低输入价（分 / 百万 token）；没有模型返回 null（横幅不显示）。 */
+/** 市场页横幅「¥X 起」：在线对话模型的最低输入价（分 / 百万 token；没有对话模型时取全部模型）；没有模型返回 null（横幅不显示）。 */
 export function lowestInputPrice(models: readonly LLMModelPublic[]): number | null {
-  if (models.length === 0) return null
-  return Math.min(...models.map((m) => m.input_price))
+  const chat = models.filter((m) => m.kind === 'chat')
+  const pool = chat.length > 0 ? chat : models
+  if (pool.length === 0) return null
+  return Math.min(...pool.map((m) => m.input_price))
 }
 
 /** 上下文长度：1024 的整数倍按「32K」「128K」显示（模型惯例），其余按 formatTokens。 */
@@ -91,17 +93,20 @@ export const llmErrorStatus: Record<string, number> = {
   model_not_allowed: 403,
   model_not_found: 404,
   not_found: 404,
+  method_not_allowed: 405,
   request_too_large: 413,
   rate_limit_exceeded: 429,
   monthly_cap_exceeded: 429,
+  internal_error: 500,
   upstream_error: 502,
   model_unavailable: 503,
   server_overloaded: 503,
+  upstream_timeout: 504,
 }
 
 /** 网关（/v1）错误码 → 中文说明（快速开始的错误码表）；错误体为 {"error":{"message","type","code"}}。 */
 export const llmErrorHelp: Record<string, string> = {
-  invalid_request_error: '请求格式错误：Content-Type 不是 application/json、缺少 model，或端点与模型类型不符（如对话模型调 embeddings）',
+  invalid_request_error: '请求参数错误：Content-Type 不是 application/json、缺少 model、端点与模型类型不符（如对话模型调 embeddings）、max_tokens 超过模型的最大输出，或 n / best_of 大于 8',
   invalid_api_key: 'API Key 不存在、格式错误、已停用、已撤销或已过期',
   insufficient_quota: '余额不足以支付本次预估费用，或账户有欠费；充值后即可继续调用',
   account_banned: '账号已被封禁',
@@ -110,12 +115,15 @@ export const llmErrorHelp: Record<string, string> = {
   model_not_allowed: '该 Key 不允许调用这个模型（创建 Key 时限定了模型）',
   model_not_found: '模型不存在或未上线',
   not_found: '接口不存在（只支持 chat/completions、completions、embeddings、models）',
+  method_not_allowed: '请求方法不对：models 用 GET，其余接口用 POST',
   request_too_large: '请求体超过 2 MiB',
   rate_limit_exceeded: '超过每分钟请求数、每分钟 token 数或并发上限，按响应头 Retry-After 稍后重试',
   monthly_cap_exceeded: '该 Key 本月消费已达设定的月上限',
   upstream_error: '模型节点出错，本次不收费，可直接重试',
   model_unavailable: '模型暂无可用节点，请稍后再试',
   server_overloaded: '模型节点繁忙，按响应头 Retry-After 稍后重试',
+  upstream_timeout: '模型节点响应超时（请求总时长上限 10 分钟），未输出内容时不收费，可直接重试',
+  internal_error: '平台内部错误，请稍后重试；持续出现请联系客服',
 }
 
 // ---- API Keys（Task 18）----
@@ -241,6 +249,16 @@ export function validateUsageRange(from: string, to: string): string | null {
   if (from > to) return '开始日期不能晚于结束日期'
   if (daySpan(from, to) > USAGE_MAX_DAYS) return `查询范围最长 ${USAGE_MAX_DAYS} 天`
   return null
+}
+
+/**
+ * 请求日志的模型下拉：在线模型（按市场顺序）∪ 当前已加载日志里出现的模型 ∪ 当前选中的模型，去重。
+ * 已下线的模型不在 /llm/models 里，但旧日志仍要能按它筛；后两者追加在后面，按字母序。
+ */
+export function logModelOptions(online: readonly string[], rowModels: readonly string[], selected: string): string[] {
+  const seen = new Set(online)
+  const extra = [...new Set([...rowModels, selected])].filter((m) => m !== '' && !seen.has(m)).sort()
+  return [...online, ...extra]
 }
 
 /** 结算金额明细：用量折出的金额、并入的历史欠费、扣不到转为欠费的部分。 */

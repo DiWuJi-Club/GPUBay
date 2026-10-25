@@ -226,23 +226,28 @@ func TestPoolGroupCannotBeVisibleOrDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 可以改名、描述、排序（保持不可见）
-	g, err := svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "推理池", Description: "d", Sort: 5, Visible: false})
-	if err != nil || g.Name != "推理池" || g.Visible || g.Purpose != fleet.GroupPurposeLLM {
+	// 可以改描述、排序、地区（保持不可见、名字不变）
+	g, err := svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "Token 服务池", Description: "d", Sort: 5, Visible: false})
+	if err != nil || g.Name != "Token 服务池" || g.Description != "d" || g.Sort != 5 || g.Visible || g.Purpose != fleet.GroupPurposeLLM {
 		t.Fatalf("update = %+v, %v", g, err)
 	}
-	_, err = svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "推理池", Visible: true})
+	// 不能改名
+	_, err = svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "推理池", Visible: false})
+	if ae := apperr.As(err); ae == nil || ae.Code != "invalid_state" || ae.Message != "Token 服务池不能改名" {
+		t.Fatalf("rename = %v", err)
+	}
+	_, err = svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "Token 服务池", Visible: true})
 	if ae := apperr.As(err); ae == nil || ae.Code != "invalid_state" || ae.Message != "Token 服务池不能对用户可见" {
 		t.Fatalf("visible = %v", err)
 	}
-	_, err = svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "推理池", Purpose: fleet.GroupPurposeRental})
+	_, err = svc.UpdateGroup(ctx, opsActor, id, fleet.GroupInput{Name: "Token 服务池", Purpose: fleet.GroupPurposeRental})
 	if ae := apperr.As(err); ae == nil || ae.Code != "invalid_state" {
 		t.Fatalf("purpose change = %v", err)
 	}
 	if err := svc.DeleteGroupIn(ctx, pool, id); !errors.Is(err, apperr.ErrInvalidState) && (apperr.As(err) == nil || apperr.As(err).Code != "invalid_state") {
 		t.Fatalf("delete pool = %v", err)
 	}
-	if g, err := svc.GetGroup(ctx, pool, id); err != nil || g.Visible || g.Purpose != fleet.GroupPurposeLLM {
+	if g, err := svc.GetGroup(ctx, pool, id); err != nil || g.Visible || g.Purpose != fleet.GroupPurposeLLM || g.Name != "Token 服务池" {
 		t.Fatalf("pool after rejected ops = %+v, %v", g, err)
 	}
 	// 普通机组不能改成池

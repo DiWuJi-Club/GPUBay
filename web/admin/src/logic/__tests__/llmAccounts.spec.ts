@@ -1,7 +1,7 @@
-import type { LLMDailyAdminRow } from '@spark/shared'
+import { formatMicroFen, type LLMDailyAdminRow } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  accountFilterFromQuery, accountsQuery, blockBody, buildLimitPatch, currentYM, dailyQuery, defaultUsageRange, emptyAccountFilter, emptyUsageFilter, fmtCostMicro,
+  accountFilterFromQuery, accountsQuery, blockBody, buildLimitPatch, currentYM, dailyQuery, defaultUsageRange, emptyAccountFilter, emptyUsageFilter,
   keyMonthCostText, limitFormOf, limitText, settlementsQuery, sumDaily, summarizeDaily, unblockBody, usageQuery, validateReason, validateUsageRange,
 } from '../llm'
 
@@ -117,12 +117,12 @@ describe('汇总与费用', () => {
     expect(keyMonthCostText({ month_ym: '2026-10', month_cost_micro: 5_000_000, month_cost: 0 }, now)).toBe('¥0.00')
     expect(keyMonthCostText({ month_ym: '2026-11', month_cost_micro: 5_000_000, month_cost: 1234 }, now)).toBe('¥12.34')
   })
-  it('微分 → 元', () => {
-    expect(fmtCostMicro(0)).toBe('¥0.00')
-    expect(fmtCostMicro(999_999)).toBe('< ¥0.01')
-    expect(fmtCostMicro(1_000_000)).toBe('¥0.01')
-    expect(fmtCostMicro(1_250_000)).toBe('¥0.0125')
-    expect(fmtCostMicro(123_456_789_000_000)).toBe('¥1,234,567.89')
-    expect(fmtCostMicro(-2_000_000)).toBe('-¥0.02')
+  it('微分 → 元（后台与控制台共用 shared 的 formatMicroFen）', () => {
+    expect(formatMicroFen(0)).toBe('¥0.00')
+    expect(formatMicroFen(999_999)).toBe('< ¥0.01')
+    expect(formatMicroFen(1_000_000)).toBe('¥0.01')
+    expect(formatMicroFen(1_250_000)).toBe('¥0.0125')
+    expect(formatMicroFen(123_456_789_000_000)).toBe('¥1,234,567.89')
+    expect(formatMicroFen(-2_000_000)).toBe('-¥0.02')
   })
 })

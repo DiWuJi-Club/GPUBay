@@ -53,12 +53,16 @@ func TestGroupAPI(t *testing.T) {
 		t.Fatalf("purpose: %v / %v", row, poolRow)
 	}
 	poolID := itoa(int64(poolRow["id"].(float64)))
-	// 计划 9：池机组不能对用户可见、不能改用途、不能删除；不能经接口再建一个池
+	// 计划 9：池机组不能对用户可见、不能改名、不能改用途、不能删除；不能经接口再建一个池
 	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": true}); code != 409 || codeOf(out) != "invalid_state" {
 		t.Fatalf("pool visible = %d %v", code, out)
 	}
 	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": false, "purpose": "rental"}); code != 409 || codeOf(out) != "invalid_state" {
 		t.Fatalf("pool purpose = %d %v", code, out)
+	}
+	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "推理池", "visible": false}); code != 409 || codeOf(out) != "invalid_state" ||
+		out["message"] != "Token 服务池不能改名" {
+		t.Fatalf("pool rename = %d %v", code, out)
 	}
 	if code, out := ops.do("PUT", "/groups/"+poolID, map[string]any{"name": "Token 服务池", "visible": false, "sort": 1000, "description": "推理节点"}); code != 200 || out["purpose"] != "llm" {
 		t.Fatalf("pool edit = %d %v", code, out)

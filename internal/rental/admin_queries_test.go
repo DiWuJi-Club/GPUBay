@@ -115,7 +115,7 @@ func TestDashboardStats(t *testing.T) {
 	e := newEnv(t, 2)
 	_, inst := e.place(catalog.D1d)
 	e.ack(true) // 计时从 T0 开始，到期 T0+24h，占用时段上界为 T0+31h（含 6 小时保留与 1 小时洗机缓冲）
-	e.place(catalog.D1w)
+	_, week := e.place(catalog.D1w)
 	counts, err := e.svc.InstanceStateCounts(e.ctx)
 	if err != nil || counts[rental.StateRunning] != 1 || counts[rental.StateCreating] != 1 {
 		t.Fatalf("counts = %v, %v", counts, err)
@@ -136,5 +136,13 @@ func TestDashboardStats(t *testing.T) {
 	// 第一个实例在 T0 释放（时段不能为空，收为最短的 1 秒）；第二个实例（1 周）在 e.ack 后开始运行，两天都被占用，第二天截止到 now
 	if occ[0] != 86400+1 || occ[1] != 12*3600 {
 		t.Fatalf("occupancy = %v, want [86401 43200]", occ)
+	}
+	// 系统实例（Token 服务节点）的租期不算出租；没有任何租期的一天是 0（LEFT JOIN 的空行不能被 GREATEST / LEAST 忽略 NULL 算成整段）
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET system = true WHERE id = $1`, week.ID); err != nil {
+		t.Fatal(err)
+	}
+	occ, err = e.svc.DailyOccupancy(e.ctx, dbtest.T0, 2, now)
+	if err != nil || len(occ) != 2 || occ[0] != 1 || occ[1] != 0 {
+		t.Fatalf("occupancy without system instance = %v, %v; want [1 0]", occ, err)
 	}
 }

@@ -193,7 +193,9 @@ func streamErrorEvent(code, msg string) []byte {
 }
 
 // stream 规格 §6.1 第 10 步（流式）：逐 SSE 事件透传并 Flush；统计内容块、取末尾 usage；[DONE] 结束。
-// 客户端断开 → 取消上游、client_abort 按块数估算计费；停机取消 → error 事件、upstream_error 不收费；上游首字节后断开 / 超时 → 写一个 error 事件后结束，不计费。
+// 客户端断开 → 取消上游、client_abort 按块数估算计费；停机取消 → error 事件、upstream_error 不收费；
+// 总超时 → error 事件，已交付过内容块则按已交付的计费（status ok、estimated），否则 upstream_timeout 不收费；
+// 上游首字节后断开 → error 事件、upstream_error 不收费（平台故障，规格 §1.1 #7）。
 func (c *call) stream(ctx context.Context, node *llm.RouteNode, up upstreamResp) {
 	resp := up.resp
 	defer resp.Body.Close()
@@ -277,6 +279,17 @@ func (c *call) stream(ctx context.Context, node *llm.RouteNode, up upstreamResp)
 		c.g.log.Warn("llmgw: stream cancelled by shutdown", "node_id", node.ID, "request_id", c.reqID)
 		c.writeStreamError(codeUpstreamError, "服务正在重启，本次请求不收费，请重试")
 		c.record(outcome{node: node, status: llm.UsageUpstreamError, httpStatus: http.StatusOK, ttft: ttft})
+	case (ctx.Err() != nil || isTimeout(sc.Err())) && chunks > 0:
+		// 总超时前已经交付了内容：按已交付的计费，status ok、estimated（裁定修订 I12；输入 / 输出优先取已解析的 usage，
+		// 否则与客户端中断同样估算：len(body)/3、内容块数）。块数为 0 仍是 upstream_timeout、不收费
+		c.g.log.Warn("llmgw: upstream stream hit total timeout after content", "node_id", node.ID, "chunks", chunks, "request_id", c.reqID)
+		c.writeStreamError(codeUpstreamTimeout, "请求超过总时长上限，已按已输出的内容计费")
+		o := outcome{node: node, status: llm.UsageOK, httpStatus: http.StatusOK, prompt: len(c.body) / 3, completed: chunks,
+			estimated: true, charge: true, ttft: ttft}
+		if usage != nil {
+			o.prompt, o.completed = usage.PromptTokens, usage.CompletionTokens
+		}
+		c.record(o)
 	case ctx.Err() != nil || isTimeout(sc.Err()):
 		c.g.log.Warn("llmgw: upstream stream timed out", "node_id", node.ID, "request_id", c.reqID)
 		c.writeStreamError(codeUpstreamTimeout, "上游节点响应超时，本次请求不收费")

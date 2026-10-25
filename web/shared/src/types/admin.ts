@@ -367,7 +367,7 @@ export interface Dashboard {
   apps_running: number
   apps_failed_24h: number
   /** 计划 9：Token 商城卡片（= /llm/summary 的子集，金额为分）；后端未提供时缺省 */
-  llm?: { nodes_ready: number; nodes_total: number; today_requests: number; today_settled_amount: number }
+  llm?: { nodes_ready: number; nodes_total: number; today_requests: number; today_settled_amount: number; nodes_unhealthy?: number }
   /** 计划 11：已装好（installed）且部署非终态的工作流安装数 */
   workflow_installs: number
   /** 计划 11：近 24 小时快速出图次数 */

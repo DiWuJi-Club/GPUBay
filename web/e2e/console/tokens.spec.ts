@@ -37,8 +37,10 @@ test('C-TOK-01 导航「Token 商城」入口与市场横幅（最低输入价�
   await seedLLMModel({ input_price: 37, output_price: 99 })
   const u = await seedUser()
   await loginConsole(page, u.phone)
-  // 横幅价 = 全部已上线模型里最低的输入价（同一轮里不应有别的已上线模型，但按接口算，不依赖这一点）
-  const min = Math.min(...(await publicModels()).items.map((m) => m.input_price))
+  // 横幅价 = 已上线对话模型里最低的输入价（没有对话模型时取全部；同一轮里不应有别的已上线模型，但按接口算，不依赖这一点）
+  const online = (await publicModels()).items
+  const chat = online.filter((m) => m.kind === 'chat')
+  const min = Math.min(...(chat.length > 0 ? chat : online).map((m) => m.input_price))
   expect(min).toBeLessThanOrEqual(37)
   await expect(page.getByTestId('market-tokens-banner')).toBeVisible()
   await expect(page.getByTestId('market-tokens-banner-price')).toHaveText(yuan(min))

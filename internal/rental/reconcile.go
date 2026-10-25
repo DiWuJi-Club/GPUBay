@@ -86,7 +86,7 @@ func (s *Service) reconcileReported(ctx context.Context, m fleet.Machine, st fle
 			if st.Phase == fleet.PhaseRunning || st.Phase == fleet.PhaseUnknown || inst.Suspended() {
 				return nil // running 的恢复计时与暂停中的告警都由 ResumeMachine 处理
 			}
-			return s.alertOnce(ctx, tx, "container_down", m.ID, inst.ID, AlertContainerDown(m.Serial, inst.ID))
+			return s.d.Fleet.RaiseAlertOnce(ctx, tx, containerDownAlert(m.Serial, m.ID, inst.ID, inst.System))
 		}
 		return nil // creating / wiping：等指令结果
 	})
@@ -104,7 +104,7 @@ func (s *Service) reconcileMissing(ctx context.Context, m fleet.Machine, instanc
 			if inst.Suspended() {
 				return nil
 			}
-			return s.alertOnce(ctx, tx, "container_down", m.ID, inst.ID, AlertContainerDown(m.Serial, inst.ID))
+			return s.d.Fleet.RaiseAlertOnce(ctx, tx, containerDownAlert(m.Serial, m.ID, inst.ID, inst.System))
 		case StateStopped:
 			return s.alertOnce(ctx, tx, "container_missing", m.ID, inst.ID, AlertContainerMissing(m.Serial, inst.ID))
 		}
@@ -128,6 +128,17 @@ func (s *Service) enqueueIfIdle(ctx context.Context, tx pgx.Tx, machineID int64,
 	}
 	_, err = s.d.Fleet.Enqueue(ctx, tx, machineID, instanceID, t, nil)
 	return err
+}
+
+// containerDownAlert 容器未在运行（container_down）：租户实例 critical，由管理员换机或退款；
+// 系统实例（Token 服务节点）只 warning——llm Controller 会自动重建节点。
+func containerDownAlert(serial string, machineID int64, instanceID string, system bool) fleet.Alert {
+	if system {
+		return fleet.Alert{Level: "warning", Kind: "container_down", MachineID: machineID, InstanceID: instanceID,
+			Message: AlertSystemContainerDown(serial, instanceID)}
+	}
+	return fleet.Alert{Level: "critical", Kind: "container_down", MachineID: machineID, InstanceID: instanceID,
+		Message: AlertContainerDown(serial, instanceID)}
 }
 
 func (s *Service) alertOnce(ctx context.Context, q db.Querier, kind string, machineID int64, instanceID, message string) error {
