@@ -676,3 +676,22 @@ test('C-DET-25 续费数量清空后回到 1，按 1 个单位扣款', async ({ 
   await toast(page, '续费成功')
   expect(before - ((await (await api.get('/api/v1/wallet')).json()).balance as number)).toBe(6900)
 })
+
+test('C-DET-26 局域网 http 访问（非安全上下文、没有 navigator.clipboard）时复制退回 execCommand 仍成功', async ({ page }) => {
+  // 模拟 http://192.168.x.x：页面拿不到 navigator.clipboard；原对象留给断言读剪贴板
+  await page.addInitScript(() => {
+    const real = navigator.clipboard
+    ;(window as unknown as { __readClip: () => Promise<string> }).__readClip = () => real.readText()
+    Object.defineProperty(Navigator.prototype, 'clipboard', { get: () => undefined, configurable: true })
+    Object.defineProperty(window, 'isSecureContext', { get: () => false, configurable: true })
+  })
+  const readClip = () => page.evaluate(() => (window as unknown as { __readClip: () => Promise<string> }).__readClip())
+  const u = await seedUser()
+  const { id } = await runningInstance(u.phone)
+  await loginConsole(page, u.phone)
+  await page.goto(`/instances/${id}`)
+  expect(await page.evaluate(() => navigator.clipboard === undefined && !window.isSecureContext)).toBe(true)
+  await page.getByTestId('detail-ssh-copy').click()
+  await toast(page, '已复制')
+  expect(await readClip()).toBe(`ssh ${id}@ssh.spark.test`)
+})
