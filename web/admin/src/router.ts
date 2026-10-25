@@ -46,6 +46,8 @@ export const routes: RouteRecordRaw[] = [
   { path: '/workflows/:id', component: () => import('./views/WorkflowDetailView.vue'), meta: { title: '工作流详情', roles: ALL_ROLES } },
   { path: '/workflows/:id/versions/:vid', component: () => import('./views/WorkflowVersionView.vue'), meta: { title: '工作流版本', roles: ALL_ROLES } },
   { path: '/workflows/:id/installs', component: () => import('./views/WorkflowInstallsView.vue'), meta: { title: '工作流安装', roles: ALL_ROLES } },
+  // AI 管家：?tab=usage|conversations|settings；?user_id= 预填对话筛选并切到对话 tab（对话 tab 只给 ops / super）
+  { path: '/butler', component: () => import('./views/ButlerView.vue'), meta: { title: 'AI 管家', roles: ALL_ROLES } },
   { path: '/catalog', component: () => import('./views/CatalogView.vue'), meta: { title: '价格与镜像', roles: SUPER_ONLY } },
   { path: '/admins', component: () => import('./views/AdminsView.vue'), meta: { title: '管理员', roles: SUPER_ONLY } },
   { path: '/audit', component: () => import('./views/AuditView.vue'), meta: { title: '审计日志', roles: ALL_ROLES } },

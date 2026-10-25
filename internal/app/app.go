@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wechatpay-apiv3/wechatpay-go/utils"
@@ -27,6 +28,12 @@ import (
 	"spark-cloud/internal/api"
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
+	"spark-cloud/internal/butler"
+	butlerllm "spark-cloud/internal/butler/llm"
+	"spark-cloud/internal/butler/llm/anthropic"
+	"spark-cloud/internal/butler/llm/mock"
+	"spark-cloud/internal/butler/llm/openai"
+	"spark-cloud/internal/butler/tools"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
@@ -37,6 +44,7 @@ import (
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
+	"spark-cloud/internal/platform/inproc"
 	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/platform/secretbox"
 	"spark-cloud/internal/platform/tlsfile"
@@ -74,6 +82,10 @@ type Options struct {
 	// 集成测试与 e2e-server 的所有实例共用一个假容器 sshd，用 AppRootFor 让每个实例各用 <Root>/<实例 ID>/root/data；生产环境设置时 Build 直接报错。
 	AppRoot    string
 	AppRootFor func(instanceID string) string
+	// ButlerLLM 是测试 / e2e 注入的 AI 管家模型提供方（通常是 *mock.Mock，钩子往它的队列里塞回复）：非 nil 时取代按 cfg.ButlerLLM 构造的提供方
+	// （cfg.ButlerLLM.Provider / BaseURL / Model 不再起作用，对话记录的 provider / model 取它的 Name / Model）；nil = 按 cfg.ButlerLLM.Provider 构造。
+	// 只有 cfg.Butler 为 true 时才会用到；但生产环境只要设置了就报错（不论管家开没开，与 DisableRateLimits 同款保护）。
+	ButlerLLM butlerllm.Provider
 }
 
 const noRateLimit = 1_000_000
@@ -115,6 +127,10 @@ type App struct {
 	Workflows         *comfywf.Catalog   // ComfyUI 工作流目录（计划 11）
 	WorkflowInstaller *comfywf.Installer // 部署上的工作流集合（添加 / 更新 / 移除）
 	WorkflowRuns      *comfywf.Runs      // 快速出图代理
+	// 计划 12：AI 管家；cfg.Butler 为 false（SPARK_BUTLER=off，或开发环境未配端点被自动关闭）时两者都是 nil、路由不注册。
+	// cmd/platform 把 Butler.Sweep 挂进清扫器。
+	Butler    *butler.Service
+	ButlerLLM butlerllm.Provider
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
@@ -130,6 +146,15 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	}
 	if (opt.AppRoot != "" || opt.AppRootFor != nil) && cfg.Env == "prod" {
 		return nil, errors.New("生产环境禁止注入应用根目录")
+	}
+	if opt.ButlerLLM != nil && cfg.Env == "prod" {
+		return nil, errors.New("生产环境禁止注入 LLM 提供方")
+	}
+	if cfg.ButlerLLM.Provider == config.LLMMock && cfg.Env == "prod" { // config.Load 已拦；这里防配置字面量绕过
+		return nil, errors.New("生产环境禁止使用 mock LLM 提供方")
+	}
+	if cfg.Env == "prod" && cfg.Butler && cfg.ButlerLLM.APIKey == "" { // 同上：与 config.Load 的校验一致
+		return nil, errors.New("生产环境开启 AI 管家需要设置 SPARK_LLM_API_KEY")
 	}
 	ipHourLimit, loginLimit := 0, 0
 	if opt.DisableRateLimits {
@@ -345,6 +370,31 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		llmGW = llmgw.New(llmSvc, llmgw.Config{AuthFailLimit: authorizeLimit}, clk, log)
 		srv.LLMGateway = llmGW.Router()
 	}
+	// AI 管家（计划 12）：openai 且没配 SPARK_LLM_BASE_URL 时默认走上面的 /v1 网关（进程内调用，SPARK_LLM_API_KEY 是平台管家账号的
+	// Token 商城 API Key，用量按该账号与模型单价记账，见 README「AI 管家」）。
+	var bt *butler.Service
+	var provider butlerllm.Provider
+	if cfg.Butler {
+		if provider, err = llmProvider(cfg.ButlerLLM, opt.ButlerLLM, llmGW, cfg.Domain, log); err != nil {
+			return nil, err
+		}
+		// 工具的数据来源与控制台完全相同：machine_label 用 api 实例视图的同一 fleet 查询、ssh_command 用同一 SSH 主机 / 端口、
+		// 端口地址用同一入口 PortURL；所有调用都走 *ForUser 路径（规格 §1.1 第 1 条）。
+		reg := tools.NewRegistry(tools.Deps{Rental: r, Apps: apps, Catalog: c, Wallet: w, Users: ids, Pool: pool,
+			MachineLabel: func(ctx context.Context, machineID int64) (string, error) {
+				m, err := f.Get(ctx, f.Pool(), machineID)
+				if err != nil {
+					return "", err
+				}
+				return m.Label(), nil
+			},
+			PortURL: ingressAuth.PortURL, SSHHost: srv.SSHHost, SSHPort: srv.SSHPort, Clock: clk, IngressDomain: ingressAuth.IngressDomain, Box: box})
+		bt = butler.NewService(butler.Deps{Pool: pool, Clock: clk, Log: log, Provider: provider, Tools: reg, ToolsEnabled: cfg.ButlerLLM.Tools,
+			Users: ids, Wallet: w, Rental: r, Fleet: f, Box: box, MaxOutputTokens: cfg.ButlerLLM.MaxOutputTokens})
+		// 零值取默认（每用户每分钟 20 次发消息 + 确认）；DisableRateLimits 时为 noRateLimit（e2e 假时钟下窗口永不滑过）
+		srv.Butler, srv.ButlerLimit = bt, authorizeLimit
+		adminSrv.Butler, adminSrv.LLMPriceInCentsPerM, adminSrv.LLMPriceOutCentsPerM = bt, cfg.ButlerLLM.PriceInCentsPerM, cfg.ButlerLLM.PriceOutCentsPerM
+	}
 	routes := ingress.NewTable(r, log)
 	ingSrv := ingress.NewServer(ingressAuth, routes, ids, upstreamPool, r, clk, log)
 	proxyHops := 0 // 不信任代理：入口不看任何转发头
@@ -355,7 +405,64 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
 		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner,
-		Workflows: wfCat, WorkflowInstaller: wfInst, WorkflowRuns: wfRuns, LLM: llmSvc, LLMController: llmCtl, LLMGateway: llmGW}, nil
+		Workflows: wfCat, WorkflowInstaller: wfInst, WorkflowRuns: wfRuns, LLM: llmSvc, LLMController: llmCtl, LLMGateway: llmGW,
+		Butler: bt, ButlerLLM: provider}, nil
+}
+
+// ButlerGatewayBaseURL 是 AI 管家经进程内传输调用本进程 Token 商城网关时用的基地址（不解析、不出网；只决定请求路径 /v1/...）。
+const ButlerGatewayBaseURL = "http://llmgw.internal/v1"
+
+// butlerGatewayClient 返回进程内调用 Token 商城网关的 HTTP 客户端：请求直接交给网关的处理器（流式逐块回传、ctx 取消即客户端断开），
+// 对网关而言与一个来自 127.0.0.1、Host 为平台域名的外部请求相同——同样鉴权（SPARK_LLM_API_KEY）、限流、预检与计费。
+// 不经过公网 http.Server：没有它的读写超时，期限由管家自己的 ctx（LLMTimeout）与网关的总超时约束。
+// 网关的请求 ctx 不带管家请求 ctx 的值（inproc 保证；这里再把 chi 的路由状态清掉作双保险）：管家的轮次在控制台
+// POST /api/v1/butler/... 的 chi 处理器里跑，外层的 chi.RouteContext 漏进网关的 chi 路由会让它按外层路径匹配（全部 404），
+// 控制台处理器返回后 chi 还会回收它，而网关的收尾（记账）可能仍在用 → 数据竞争。
+// 停机：网关 Shutdown 取消在途转发后要往管家写错误事件，进程内管道无缓冲，管家若此时不读（卡住），网关的这次 Write 就一直阻塞、
+// Shutdown 等不到它记完账——Shutdown 打断不了一个卡住的进程内读者；上限是管家这次模型请求的 LLMTimeout（到期管家取消 ctx，
+// 网关的 Write 随即失败）。cmd/platform 停机时 Butler.Shutdown 与网关 Shutdown 并发，前者立即取消所有轮次（管家的模型请求 ctx
+// 随之取消、管道关闭），所以通常不会遇到。
+func butlerGatewayClient(gw *llmgw.Server, host string, log *slog.Logger) *http.Client {
+	if host == "" {
+		host = "llmgw.internal"
+	}
+	strip := http.StripPrefix("/v1", gw.Router()) // 与 api.Server 的 r.Mount("/v1", …) 等价
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(chi.RouteCtxKey) != nil {
+			r = r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, nil))
+		}
+		strip.ServeHTTP(w, r)
+	})
+	return &http.Client{Transport: &inproc.Transport{Handler: h, Host: host, Log: log}}
+}
+
+// llmProvider 返回 AI 管家的模型提供方：注入的优先（测试 / e2e），否则按 cfg.Provider 构造。
+// 模型名为空（配置字面量）时取 provider 默认；openai 的 BaseURL 为空时走本进程的 Token 商城网关（gw 非 nil，即 SPARK_LLM_GATEWAY=on），
+// 网关也没开则报错（config.Load 已校验，这里防配置字面量绕过）。
+func llmProvider(cfg config.ButlerLLMConfig, injected butlerllm.Provider, gw *llmgw.Server, host string, log *slog.Logger) (butlerllm.Provider, error) {
+	if injected != nil {
+		return injected, nil
+	}
+	model := cfg.Model
+	if model == "" {
+		model = config.DefaultLLMModel(cfg.Provider)
+	}
+	switch cfg.Provider {
+	case config.LLMOpenAI:
+		if cfg.BaseURL == "" {
+			if gw == nil {
+				return nil, errors.New("SPARK_LLM_PROVIDER=openai 需要设置 SPARK_LLM_BASE_URL，或开启 Token 商城网关（SPARK_LLM_GATEWAY=on）")
+			}
+			return openai.New(openai.Config{BaseURL: ButlerGatewayBaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens,
+				HTTP: butlerGatewayClient(gw, host, log), NoStream: !cfg.Stream}), nil
+		}
+		return openai.New(openai.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens, NoStream: !cfg.Stream}), nil
+	case config.LLMAnthropic:
+		return anthropic.New(anthropic.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens}), nil
+	case config.LLMMock:
+		return mock.New(), nil
+	}
+	return nil, fmt.Errorf("未知的 LLM 提供方 %q", cfg.Provider)
 }
 
 // upstreamKeyPath 返回平台登录容器用的上游私钥路径；非生产环境未配置时自动在临时目录生成并打印路径。

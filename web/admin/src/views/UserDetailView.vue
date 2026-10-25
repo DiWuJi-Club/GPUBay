@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {
   bindingStatusLabel, durationLabel, fmtTime, fmtYuan, instanceStateLabel, isApiError, kycResultLabel, kycStatusLabel, labelOf, ledgerKindLabel, messageOf, orderKindLabel, orderStatusLabel,
-  userKindLabel, userStatusLabel, type Recharge, type UserDetail,
+  userKindLabel, userStatusLabel, type Recharge, type UserButlerStats, type UserDetail,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -15,7 +15,8 @@ import { session } from '../store/session'
 
 const route = useRoute()
 const id = computed(() => String(route.params.id))
-const data = ref<UserDetail | null>(null)
+// butler：AI 管家统计（计划 12；平台未启用管家时缺省）
+const data = ref<(UserDetail & { butler?: UserButlerStats }) | null>(null)
 const loading = ref(false)
 const error = ref('')
 const tab = ref('instances')
@@ -23,6 +24,8 @@ const role = computed(() => session.admin?.role)
 /** 封禁 / 解封：运维与超管；调账 / 手动入账与订单、流水、充值单入口：财务与超管（与后端权限一致） */
 const canOps = computed(() => role.value === 'ops' || role.value === 'super')
 const canFinance = computed(() => role.value === 'finance' || role.value === 'super')
+/** AI 管家对话只给运维与超管看（后端 opsRoles） */
+const canButlerConversations = canOps
 
 let seq = 0
 /**
@@ -33,7 +36,7 @@ async function load(target = id.value) {
   const mine = ++seq
   loading.value = true
   try {
-    const d = await api.get<UserDetail>(`/users/${target}`)
+    const d = await api.get<UserDetail & { butler?: UserButlerStats }>(`/users/${target}`)
     if (mine !== seq) return
     data.value = d
     error.value = ''
@@ -238,6 +241,16 @@ const signed = (n: number) => (n >= 0 ? `+${fmtYuan(n)}` : fmtYuan(n))
           </template>
         </template>
         <span v-else class="muted" data-testid="user-referral-none">无邀请关系</span>
+      </el-card>
+
+      <!-- AI 管家（计划 12）：对话数、30 天 token、30 天写操作；对话链接只给 ops / super -->
+      <el-card v-if="data.butler" header="AI 管家" data-testid="admin-user-butler-card">
+        <el-descriptions :column="3" border>
+          <el-descriptions-item label="对话数"><span data-testid="admin-user-butler-conversations">{{ data.butler.conversations }}</span></el-descriptions-item>
+          <el-descriptions-item label="近 30 天 token"><span data-testid="admin-user-butler-tokens">{{ data.butler.tokens_30d.toLocaleString('en-US') }}</span></el-descriptions-item>
+          <el-descriptions-item label="近 30 天写操作"><span data-testid="admin-user-butler-writes">{{ data.butler.write_calls_30d }}</span></el-descriptions-item>
+        </el-descriptions>
+        <router-link v-if="canButlerConversations" class="more" :to="{ path: '/butler', query: { tab: 'conversations', user_id: String(data.user.id) } }" data-testid="admin-user-butler-link">查看对话</router-link>
       </el-card>
 
       <el-card>

@@ -110,6 +110,10 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		}
 		out["llm"] = l
 	}
+	if err := s.addButlerUserStats(ctx, id, out); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
 

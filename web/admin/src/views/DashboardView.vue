@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { fmtYuan, instanceStateLabel, machineStateLabel, messageOf, type Dashboard } from '@spark/shared'
+import { fmtYuan, instanceStateLabel, machineStateLabel, messageOf, type Dashboard, type DashboardButler } from '@spark/shared'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { barsOf, CHART } from '../logic/chart'
@@ -7,7 +7,7 @@ import { dashLlmNodesBad } from '../logic/llm'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
 
-const data = ref<Dashboard | null>(null)
+const data = ref<(Dashboard & DashboardButler) | null>(null)
 const loadError = ref('')
 const retrying = ref(false)
 const machineStates = ['idle', 'allocated', 'maintenance', 'faulty'] as const
@@ -21,7 +21,7 @@ let seq = 0
 async function load() {
   const mine = ++seq
   try {
-    const out = await api.get<Dashboard>('/dashboard')
+    const out = await api.get<Dashboard & DashboardButler>('/dashboard')
     if (mine !== seq) return
     data.value = out
     loadError.value = ''
@@ -104,6 +104,15 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
           <li><span>今日收入（已结算）</span><b data-testid="dash-llm-income">{{ fmtYuan(data.llm.today_settled_amount) }}</b></li>
         </ul>
         <router-link to="/llm" class="more" data-testid="dash-llm-link">进入 Token 商城</router-link>
+      </el-card>
+      <!-- AI 管家（计划 12）：平台未启用管家时后端不返回这三个数字，卡片不显示 -->
+      <el-card v-if="data.butler_requests_today != null" header="AI 管家（今日）">
+        <ul class="kv">
+          <li><span>请求</span><b data-testid="dash-butler-requests">{{ data.butler_requests_today }}</b></li>
+          <li><span>token</span><b data-testid="dash-butler-tokens">{{ (data.butler_tokens_today ?? 0).toLocaleString('en-US') }}</b></li>
+          <li><span>失败</span><b data-testid="dash-butler-failures" :class="{ bad: (data.butler_failures_today ?? 0) > 0 }">{{ data.butler_failures_today ?? 0 }}</b></li>
+        </ul>
+        <router-link to="/butler" class="more" data-testid="dash-butler-link">查看用量</router-link>
       </el-card>
     </div>
     <el-card header="近 30 天出租率（最后一根为今天，截至当前）">

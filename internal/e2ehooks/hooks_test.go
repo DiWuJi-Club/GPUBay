@@ -20,6 +20,7 @@ import (
 
 	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/app"
+	"spark-cloud/internal/butler/llm/mock"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/comfywf/comfytest"
 	"spark-cloud/internal/e2ehooks"
@@ -45,13 +46,19 @@ type env struct {
 	up    *sshtest.Server
 	comfy *comfytest.Server // 只在 newEnvWith(apps = true) 时非 nil（同 cmd/e2e-server）
 	pool  *pgxpool.Pool
+	llm   *mock.Mock // 只在 newButlerEnv 下非 nil
 }
 
 func newEnv(t *testing.T) *env { t.Helper(); return newEnvWith(t, false) }
 
 // newEnvWith(apps = true) 与 cmd/e2e-server 的应用部署配置相同：假容器 sshd 用 shell 模式、每实例一个应用根目录、
 // 健康检查 / 应用 Web 打到一个 httptest；结束时先停掉容器里 setsid 出去的 fake 服务进程。
-func newEnvWith(t *testing.T, apps bool) *env {
+func newEnvWith(t *testing.T, apps bool) *env { t.Helper(); return newEnvFull(t, apps, false) }
+
+// newButlerEnv 与 cmd/e2e-server 的管家配置相同：cfg.Butler = true、provider mock，同一个 *mock.Mock 注入 app 与钩子。
+func newButlerEnv(t *testing.T) *env { t.Helper(); return newEnvFull(t, false, true) }
+
+func newEnvFull(t *testing.T, apps, withButler bool) *env {
 	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
@@ -99,6 +106,13 @@ func newEnvWith(t *testing.T, apps bool) *env {
 	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(),
 		AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200, AgentDNSServers: []string{"223.5.5.5"}, UpstreamSSHKeyFile: keyFile,
 		UpstreamSSHPort: up.Port(), LLMGateway: true} // 与 cmd/e2e-server 相同：挂 /v1
+	var m *mock.Mock
+	if withButler {
+		m = mock.New()
+		cfg.Butler = true
+		cfg.ButlerLLM = config.ButlerLLMConfig{Provider: config.LLMMock, Model: "mock", Tools: true}
+		opt.ButlerLLM = m
+	}
 	a, err := app.Build(cfg, pool, log, opt)
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +131,7 @@ func newEnvWith(t *testing.T, apps bool) *env {
 	sshDone := make(chan struct{})
 	go func() { defer close(sshDone); _ = a.SSH.Serve(ctx, sshLis) }()
 	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String(), SSHAddr: sshLis.Addr().String(), Upstream: up,
-		HealthAddr: healthAddr, Comfy: comfy}
+		HealthAddr: healthAddr, ButlerLLM: m, Comfy: comfy}
 	ts := httptest.NewServer(hooks.Handler())
 	t.Cleanup(func() {
 		ts.Close()
@@ -128,7 +142,7 @@ func newEnvWith(t *testing.T, apps bool) *env {
 		a.Upstream.Close()
 		up.Close()
 	})
-	return &env{t: t, a: a, clk: clk, ts: ts, up: up, comfy: comfy, pool: pool}
+	return &env{t: t, a: a, clk: clk, ts: ts, up: up, llm: m, comfy: comfy, pool: pool}
 }
 
 func (e *env) call(method, path string, body any) (int, map[string]any) {

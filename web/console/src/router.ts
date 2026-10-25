@@ -1,6 +1,7 @@
 import { brand } from '@spark/shared'
 import { createRouter, createWebHistory } from 'vue-router'
 import { postLoginTarget } from './logic/access'
+import { butlerAvail, probeButler } from './store/butler'
 import { bindRouter, probeSession, session } from './store/session'
 
 declare module 'vue-router' {
@@ -31,14 +32,20 @@ export const router = createRouter({
     // 不要求登录：未登录可看模型与价格、快速开始，其余 Tab 显示登录引导（与 /market 一致）
     { path: '/tokens', component: () => import('./views/TokensView.vue'), meta: { title: 'Token 商城' } },
     { path: '/invite', component: () => import('./views/InviteView.vue'), meta: { title: '邀请返利', auth: true } },
+    { path: '/butler', component: () => import('./views/ButlerView.vue'), meta: { title: 'AI 管家', auth: true } },
     { path: '/help', component: () => import('./views/HelpView.vue'), meta: { title: '使用帮助' } },
     { path: '/:pathMatch(.*)*', component: () => import('./views/NotFoundView.vue'), meta: { title: '页面不存在' } },
   ],
 })
 
 router.beforeEach(async (to) => {
+  const butlerProbe = probeButler() // 与会话探测并行；只有 /butler 需要等它（其它页的入口在探测结果出来前隐藏）
   await probeSession()
   if (to.meta.auth && session.status !== 'authed') return { path: '/login', query: { redirect: to.fullPath } }
+  if (to.path === '/butler') {
+    await butlerProbe
+    if (butlerAvail.state === 'unavailable') return '/' // 平台未启用管家（SPARK_BUTLER=off）：没有这个页面
+  }
   if (to.path === '/login' && session.status === 'authed') {
     const next = postLoginTarget(to.query.redirect)
     if (next.kind === 'assign') {

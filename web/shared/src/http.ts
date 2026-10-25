@@ -95,7 +95,8 @@ function withTimeout(ms: number, extra?: AbortSignal): AbortSignal {
   return extra ? AbortSignal.any([t, extra]) : t
 }
 
-async function errorOf(resp: Response): Promise<ApiError> {
+/** 把非 2xx 响应解析为 ApiError（JSON 错误体 → code / message；网关 HTML、空响应 → network）。sse.ts 的 streamPost 复用。 */
+export async function errorOf(resp: Response): Promise<ApiError> {
   try {
     const body = (await resp.json()) as { code?: unknown; message?: unknown; request_id?: unknown }
     if (typeof body?.code === 'string' && typeof body.message === 'string') {

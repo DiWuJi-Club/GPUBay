@@ -4,9 +4,9 @@ import { routes } from '../router'
 
 describe('menuFor (U-12)', () => {
   it.each([
-    ['super', 20, []],
-    ['ops', 14, ['orders', 'ledger', 'recharges', 'catalog', 'admins', 'referral']],
-    ['finance', 14, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
+    ['super', 21, []],
+    ['ops', 15, ['orders', 'ledger', 'recharges', 'catalog', 'admins', 'referral']],
+    ['finance', 15, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
   ] as const)('%s 有 %d 项', (role, count, missing) => {
     const items = menuFor(role)
     expect(items).toHaveLength(count)
@@ -45,6 +45,13 @@ describe('menuFor (U-12)', () => {
     const route = routes.find((r) => r.path === path)
     expect(route, path).toBeDefined()
     expect([...(route!.meta?.roles ?? [])].sort()).toEqual([...roles].sort())
+  })
+
+  it('AI 管家页对所有角色开放（对话 tab 与改设置在页内按角色控制）', () => {
+    const route = routes.find((r) => r.path === '/butler')
+    expect(route).toBeDefined()
+    expect([...(route!.meta?.roles ?? [])].sort()).toEqual(['finance', 'ops', 'super'])
+    for (const role of ['super', 'ops', 'finance'] as const) expect(menuFor(role).some((m) => m.key === 'butler')).toBe(true)
   })
 
   it('「Token 商城」对所有角色开放（Tab 与写操作按角色显示）', () => {

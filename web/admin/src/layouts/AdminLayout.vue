@@ -6,6 +6,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { menuFor } from '../menu'
 import { refreshUnresolved, unresolvedAlerts } from '../store/alerts'
+import { butlerOff, probeButlerOff } from '../store/butler'
 import { clearSession, session } from '../store/session'
 
 const route = useRoute()
@@ -30,13 +31,15 @@ function toggle() {
   }
 }
 
-const items = computed(() => (session.admin ? menuFor(session.admin.role) : []))
+// 平台关闭了 AI 管家（SPARK_BUTLER=off，GET /butler/settings 404）时不显示该菜单
+const items = computed(() => (session.admin ? menuFor(session.admin.role).filter((m) => m.key !== 'butler' || !butlerOff.value) : []))
 const active = computed(() => items.value.find((m) => (m.path === '/' ? route.path === '/' : route.path === m.path || route.path.startsWith(m.path + '/')))?.key ?? '')
 const logo = import.meta.env.BASE_URL + brand.logoUrl
 
 // 未处理告警角标（store/alerts.ts）：进入时取一次，之后 60 秒刷新一次 total；失败保留上次的数、不提示、不立即重试，等下一个周期
 let timer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
+  void probeButlerOff()
   void refreshUnresolved()
   timer = setInterval(refreshUnresolved, 60_000)
 })

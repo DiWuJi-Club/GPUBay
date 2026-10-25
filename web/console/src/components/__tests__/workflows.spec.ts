@@ -247,7 +247,11 @@ describe('WorkflowInstallDialog：错误与边界（T12 评审）', () => {
     })
     const visible = ref(true)
     await mountWith(defineComponent({ setup: () => () => h(WorkflowInstallDialog, { workflow: catalog[0], modelValue: visible.value, 'onUpdate:modelValue': (v: boolean) => (visible.value = v) }) }))
-    await new Promise((r) => setTimeout(r, 30))
+    // 等全部 20 个查询跑完（不用固定 sleep：负载下 setTimeout(1) 的实际延迟可能远大于 1ms）
+    await vi.waitFor(() => {
+      expect(get.mock.calls.filter((c) => String(c[0]).endsWith('/apps'))).toHaveLength(20)
+      expect(running).toBe(0)
+    })
     await flushPromises()
     expect(get.mock.calls.filter((c) => String(c[0]).endsWith('/apps'))).toHaveLength(20)
     expect(peak).toBeLessThanOrEqual(6)

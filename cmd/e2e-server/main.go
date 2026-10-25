@@ -25,6 +25,7 @@ import (
 
 	"spark-cloud/internal/access/sshtest"
 	"spark-cloud/internal/app"
+	"spark-cloud/internal/butler/llm/mock"
 	"spark-cloud/internal/comfywf/comfytest"
 	"spark-cloud/internal/e2ehooks"
 	"spark-cloud/internal/pki"
@@ -122,15 +123,19 @@ func run() error {
 		AgentDNSServers: []string{"223.5.5.5", "119.29.29.29"}, UpstreamSSHKeyFile: keyFile,
 		IngressDomain: "spark.test", PublicBaseURL: "http://spark.test:18080", SSHAddr: sshAddr, SSHPublicPort: 22, UpstreamSSHPort: upstream.Port(),
 		SSHDrainTimeout: time.Second, // 停机时不为残留会话等 30 秒（Playwright 的 gracefulShutdown 只给 20 秒）
-		LLMGateway:      true,        // 挂 /v1；Token 节点 Controller 不启动（LLMController 不适用于此进程），由 /hooks/llm/tick 驱动
+		// AI 管家用进程内确定性 mock（规格 §16.3）：规则表 + /hooks/butler/reply 入队的脚本化回复
+		Butler: true, ButlerLLM: config.ButlerLLMConfig{Provider: config.LLMMock, Model: "mock", MaxOutputTokens: config.DefaultLLMMaxOutputTokens, Tools: true},
+		LLMGateway: true, // 挂 /v1；Token 节点 Controller 不启动（LLMController 不适用于此进程），由 /hooks/llm/tick 驱动
 	}
+	mockLLM := mock.New()
 	clk := clock.NewFake(time.Now())
 	kycSwitch := &e2ehooks.SwitchableKYC{}
 	// 不启动应用部署 Runner（SPARK_APP_RUNNER 不适用于此进程）：由 /hooks/apps/tick 按假时钟逐轮驱动
 	a, err := app.Build(cfg, pool, log, app.Options{Clock: clk, KYC: kycSwitch, DisableRateLimits: true, AgentTick: 50 * time.Millisecond,
 		HostKeyGen:    func() (string, []byte, error) { return hostPub, hostPEM, nil },
 		AppHealthAddr: func(int) string { return healthAddr },
-		AppRootFor:    func(id string) string { return filepath.Join(appRoot, id, "root", "data") }})
+		AppRootFor:    func(id string) string { return filepath.Join(appRoot, id, "root", "data") },
+		ButlerLLM:     mockLLM})
 	if err != nil {
 		return err
 	}
@@ -157,7 +162,7 @@ func run() error {
 	defer func() { stopGW(); <-gwErr; <-sshErr; <-loopsDone; a.Upstream.Close() }()
 	// fake ComfyUI（快速出图的上游）：/hooks/apps/seed、/hooks/workflows/seed 之后所有实例的 8188 都转到它，由 /hooks/comfy/* 控制
 	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr, SSHAddr: sshAddr, Upstream: upstream,
-		HealthAddr: healthAddr, Comfy: comfytest.New()}
+		HealthAddr: healthAddr, ButlerLLM: mockLLM, Comfy: comfytest.New()}
 	defer hooksSrv.Close()
 
 	public, adminSrv := a.Servers(cfg) // 与 cmd/platform 完全相同的监听与路由；不启动定时清扫器，清扫由钩子触发
@@ -197,11 +202,23 @@ func run() error {
 	defer cancel()
 	ingressDone := make(chan struct{})
 	go func() { defer close(ingressDone); a.Ingress.Shutdown(shutdownCtx, time.Second) }() // 先撤销租户长连接，HTTP Shutdown 才不被拖住
+	// 与 cmd/platform 相同：先让运行中的管家轮次收尾，SSE handler 才不拖住 Shutdown；管家有自己的预算（不受 HTTP 的 10 秒限制），
+	// 但取 15 秒而不是 WriteToolTimeout + 5s：Playwright 的 gracefulShutdown 只给 20 秒（mock 写工具瞬时完成，实际不会等这么久）。
+	butlerCtx, butlerCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer butlerCancel()
+	butlerDone := make(chan struct{})
+	go func() {
+		defer close(butlerDone)
+		if a.Butler != nil {
+			_ = a.Butler.Shutdown(butlerCtx)
+		}
+	}()
 	for _, s := range servers {
 		if err := s.Shutdown(shutdownCtx); err != nil && runErr == nil {
 			runErr = err
 		}
 	}
+	<-butlerDone
 	<-ingressDone
 	return runErr
 }

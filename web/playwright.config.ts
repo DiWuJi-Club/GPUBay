@@ -83,6 +83,11 @@ export default defineConfig({
   // console/workflows.spec.ts 的 afterEach 在 try / finally 里先恢复它再卸载部署；快速出图历史按运行 ID 设置，互不影响。
   // A-WF-06 / 07 读后台全库计数（安装数、24 小时快速出图数）：admin project 串行执行，基线在变化前一刻读取（24 小时窗口按假时钟），
   // 不依赖别的用例留下的数据。部署都在用例自己的 ComfyUI 镜像实例上（helpers/workflows.ts comfySetup），afterEach 卸载。
+  // 计划 12 的 AI 管家用例（C-BOT / A-BOT）：e2e-server 用 mock 模型。回复尽量用 hooks.butlerReply 注入确定性的一轮
+  // （不依赖 mock 规则的顺序）；只有测规则流程本身的用例（推荐、部署 vLLM、续费 / 释放、日志诊断、日志注入）走关键词规则。
+  // 每个用例新建用户，beforeEach（helpers/butler.ts resetButler）清空回复队列并把设置恢复默认；A-BOT-03 关闭管家后在 finally 里恢复。
+  // C-BOT-06 / C-BOT-08 推进 11 分钟（确认卡过期），C-BOT-09 推进 1 天（额度次日恢复）；C-BOT-07 / 08、A-BOT-02 的失败部署
+  // 用 helpers/apps.ts privateApp 的私有应用，由 cleanupApps 卸载并退役。按日合计 / 仪表盘是全站数字，只与接口值或增量比对。
   projects: [
     {
       name: 'console-desktop',

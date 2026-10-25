@@ -119,5 +119,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		out["llm"] = map[string]any{"nodes_ready": sum.Nodes.Ready, "nodes_total": sum.Nodes.Total, "nodes_unhealthy": sum.Nodes.Unhealthy,
 			"today_requests": sum.Today.Requests, "today_settled_amount": sum.Today.SettledAmount}
 	}
+	if err := s.addButlerDashboard(ctx, now, out); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }

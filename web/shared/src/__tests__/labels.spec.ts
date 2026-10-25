@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  alertKindLabel, auditActions, bindingStatusLabel, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel, llmFeatureLabel, llmKeyStatusLabel,
-  llmModelStatusLabel, llmNodeStateLabel, llmNodeStateType, llmUsageStatusLabel, rewardStatusLabel,
+  alertKindLabel, auditActions, bindingStatusLabel, butlerToolLabel, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel, llmFeatureLabel,
+  llmKeyStatusLabel, llmModelStatusLabel, llmNodeStateLabel, llmNodeStateType, llmUsageStatusLabel, rewardStatusLabel,
 } from '../labels'
 import type { LLMNodeState, LLMUsageStatus } from '../types'
 
@@ -32,7 +32,7 @@ describe('labels', () => {
     expect(labelOf(alertKindLabel, 'container_down')).toBe('容器未运行')
   })
   it('审计动作列表与后端写入值一致', () => {
-    expect(auditActions).toHaveLength(91)
+    expect(auditActions).toHaveLength(93) // 计划 9 加 12 个 llm.*、计划 12 加 butler.tool_execute / butler.settings
     expect(new Set(auditActions).size).toBe(auditActions.length)
     expect(auditActions).toContain('instance.port_force_private')
     expect(auditActions).toContain('ssh_key.delete')
@@ -42,6 +42,19 @@ describe('labels', () => {
     expect(auditActions).toContain('referral.rescan')
     expect(auditActions).toContain('referral.kyc_check_failed')
     expect(auditActions).toContain('referral.auto_hold')
+    expect(auditActions).toContain('butler.tool_execute')
+    expect(auditActions).toContain('butler.settings')
+  })
+  it('AI 管家工具中文名覆盖 23 个工具、告警种类', () => {
+    const read = ['list_products', 'check_availability', 'list_apps', 'get_app', 'list_instances', 'get_instance', 'get_instance_events',
+      'list_instance_apps', 'get_deployment_log', 'get_deployment_events', 'get_wallet', 'list_orders', 'get_cancel_quote', 'get_help', 'generate_secret']
+    const write = ['place_order', 'renew_instance', 'release_instance', 'cancel_booking', 'deploy_app', 'redeploy_app', 'set_app_state', 'remove_app']
+    expect(Object.keys(butlerToolLabel).sort()).toEqual([...read, ...write].sort())
+    for (const name of [...read, ...write]) expect(butlerToolLabel[name]).toMatch(/\S/)
+    expect(labelOf(butlerToolLabel, 'list_instances')).toBe('查询实例列表')
+    expect(labelOf(butlerToolLabel, 'release_instance')).toBe('释放实例')
+    expect(labelOf(butlerToolLabel, 'set_app_state')).toBe('停止 / 启动应用')
+    expect(labelOf(alertKindLabel, 'butler_llm_unavailable')).toBe('AI 管家模型不可用')
   })
   it('Token 商城文案', () => {
     expect(labelOf(ledgerKindLabel, 'llm_pay')).toBe('Token 消费')

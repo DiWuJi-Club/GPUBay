@@ -38,6 +38,7 @@ export const alertKindLabel: LabelMap = {
   booking_at_risk: '预订机器不可用', booking_unfulfilled: '预订无法履约', booking_cancel_failed: '预订取消失败',
   referral_scan_stuck: '邀请返利扫描卡住',
   app_deploy_unreachable: '应用部署无法连接容器',
+  butler_llm_unavailable: 'AI 管家模型不可用',
   llm_pool_short: 'Token 服务池机器不足', llm_node_unhealthy: '模型节点健康检查失败', llm_node_failed: '模型节点多次重建失败', llm_usage_record_failed: 'Token 用量记账失败',
 }
 export const roleLabel: LabelMap = { super: '超级管理员', ops: '运维', finance: '财务' }
@@ -79,6 +80,7 @@ export const auditActions: readonly string[] = [
   'llm.key.create', 'llm.key.update', 'llm.key.revoke', 'llm.key.admin_disable',
   'workflow.create', 'workflow.update', 'workflow.delete', 'workflow.version.create', 'workflow.version.update', 'workflow.version.publish',
   'instance.workflow_add', 'instance.workflow_update', 'instance.workflow_remove',
+  'butler.tool_execute', 'butler.settings',
 ]
 
 export const deploymentStateLabel: LabelMap = {
@@ -142,4 +144,14 @@ export function formatGB(n: number | string): string {
   const v = typeof n === 'string' ? Number(n) : n
   if (!Number.isFinite(v) || v <= 0) return '0 GB'
   return `${Number(v.toFixed(v < 10 ? 2 : 1))} GB`
+}
+
+/** AI 管家 23 个工具的中文名（与 Go internal/butler/tools.Labels 同表；前 15 个读、后 8 个写）。 */
+export const butlerToolLabel: LabelMap = {
+  list_products: '查询套餐', check_availability: '查询可租时段', list_apps: '查询应用目录', get_app: '查看应用详情',
+  list_instances: '查询实例列表', get_instance: '查看实例详情', get_instance_events: '查看实例动态', list_instance_apps: '查询实例上的应用',
+  get_deployment_log: '读取部署日志', get_deployment_events: '查看部署事件', get_wallet: '查询钱包', list_orders: '查询订单',
+  get_cancel_quote: '查询取消退款', get_help: '查阅帮助', generate_secret: '生成随机密钥',
+  place_order: '租用实例', renew_instance: '续费实例', release_instance: '释放实例', cancel_booking: '取消预订',
+  deploy_app: '部署应用', redeploy_app: '重新部署应用', set_app_state: '停止 / 启动应用', remove_app: '卸载应用',
 }

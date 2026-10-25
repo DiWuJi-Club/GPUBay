@@ -3,6 +3,7 @@ import { reactive } from 'vue'
 import type { Router } from 'vue-router'
 import type { User } from '@spark/shared'
 import { api, onUnauthorized } from '../api'
+import { resetButler } from './butler'
 
 export type SessionStatus = 'unknown' | 'anon' | 'authed'
 
@@ -41,6 +42,7 @@ export function clearSession() {
   session.user = null
   session.balance = null
   session.status = 'anon'
+  resetButler() // 管家对话属于上一个用户
 }
 
 export async function refreshBalance() {

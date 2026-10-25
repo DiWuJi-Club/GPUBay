@@ -18,7 +18,8 @@
     "C-ACC-01", "C-ACC-02", "C-ACC-03", "C-ACC-04",
     "C-TOK-01", "C-TOK-02", "C-TOK-03", "C-TOK-04", "C-TOK-05", "C-TOK-06", "C-TOK-07", "C-TOK-08", "C-TOK-09", "C-TOK-10",
     "C-REF-01", "C-REF-02", "C-REF-03", "C-REF-04", "C-REF-05", "C-REF-06", "C-REF-07", "C-REF-08",
-    "C-ERR-01", "C-ERR-02"
+    "C-ERR-01", "C-ERR-02",
+    "C-BOT-01", "C-BOT-02", "C-BOT-03", "C-BOT-04", "C-BOT-05", "C-BOT-06", "C-BOT-07", "C-BOT-08", "C-BOT-09", "C-BOT-10", "C-BOT-11", "C-BOT-12", "C-BOT-13"
   ],
   "admin": [
     "A-AUTH-01", "A-AUTH-02", "A-AUTH-03", "A-AUTH-04", "A-AUTH-05", "A-AUTH-06", "A-AUTH-07", "A-AUTH-08",
@@ -41,6 +42,7 @@
     "A-ADM-01", "A-ADM-02", "A-ADM-03",
     "A-SET-01",
     "A-AUD-01",
-    "A-ERR-01"
+    "A-ERR-01",
+    "A-BOT-01", "A-BOT-02", "A-BOT-03", "A-BOT-04", "A-BOT-05"
   ]
 }

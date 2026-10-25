@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,6 +17,7 @@ import (
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/butler"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
@@ -92,6 +94,9 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if cfg.ButlerOffReason != "" {
+		log.Warn("AI 管家未开启", "reason", cfg.ButlerOffReason)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -108,6 +113,22 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	switch {
+	case a.ButlerLLM != nil: // 只记提供方、模型名与端点主机，绝不记密钥（BaseURL 已校验不含用户名密码，这里也只取 host）
+		endpoint := "（SDK 默认）"
+		if u, err := url.Parse(cfg.ButlerLLM.BaseURL); err == nil && u.Host != "" {
+			endpoint = u.Host
+		} else if cfg.ButlerLLM.Provider == config.LLMOpenAI {
+			endpoint = "本进程 Token 商城网关 /v1（进程内调用）"
+		}
+		attrs := []any{"provider", a.ButlerLLM.Name(), "model", a.ButlerLLM.Model(), "endpoint", endpoint, "tools", cfg.ButlerLLM.Tools}
+		if cfg.ButlerLLM.Provider == config.LLMOpenAI { // SPARK_LLM_STREAM 只对 openai 生效：anthropic 总是流式，mock 不走网络
+			attrs = append(attrs, "stream", cfg.ButlerLLM.Stream)
+		}
+		log.Info("AI 管家已开启", attrs...)
+	case cfg.ButlerOffReason == "":
+		log.Info("AI 管家已关闭（SPARK_BUTLER=off）")
+	}
 	sshLis, err := net.Listen("tcp", cfg.SSHAddr) // 先于启动任何服务：端口占用时干净退出
 	if err != nil {
 		return fmt.Errorf("ssh gateway listen: %w", err)
@@ -115,7 +136,11 @@ func run(log *slog.Logger) error {
 	sweeperDone := make(chan struct{})
 	go func() {
 		defer close(sweeperDone)
-		a.Rental.RunSweeper(ctx, cfg.SweepInterval, a.Billing.Sweep, a.Referral.Settle, a.LLM.Settle)
+		extra := []func(context.Context) error{a.Billing.Sweep, a.Referral.Settle, a.LLM.Settle}
+		if a.Butler != nil { // AI 管家：确认过期、崩溃轮次接管、90 天对话保留、用量保留（规格 §8）
+			extra = append(extra, a.Butler.Sweep)
+		}
+		a.Rental.RunSweeper(ctx, cfg.SweepInterval, extra...)
 	}()
 	runnerDone := make(chan struct{})
 	if cfg.AppRunner { // 多副本都开也安全：每轮先拿会话级咨询锁，同一时刻只有一个副本在推进部署
@@ -212,7 +237,7 @@ func run(log *slog.Logger) error {
 	// 与 HTTP 关闭同时进行）；3) HTTP、ingress 与 /v1 网关并发关闭：ingress 立即撤销 WebSocket / SSE，普通请求给 5 秒宽限后撤销剩下的；
 	// /v1 网关给在途请求 5 秒宽限，期满取消仍在转发的（记 upstream_error、不收费）并等它们记完账；
 	// http.Server.Shutdown 因而不被长连接拖住；4) 关上游连接池；5) 关数据库（defer）。
-	// 总耗时约 max(SSH drain 30s, HTTP 10s) + 几秒，compose / systemd 的停止超时应 ≥ 45s。
+	// 总耗时约 max(SSH drain 30s, 管家 35s, HTTP 10s) + 几秒，compose / systemd 的停止超时应 ≥ 45s（compose 为 60s）。
 	stop() // 确保清扫器、网关、访问层循环退出，SSH 网关停止 accept 并开始 drain
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -220,6 +245,21 @@ func run(log *slog.Logger) error {
 	go func() {
 		defer close(ingressDone)
 		a.Ingress.Shutdown(shutdownCtx, ingressShutdownGrace)
+	}()
+	// AI 管家：先取消运行中的轮次（落「服务正在重启」、回 idle），它们的 SSE handler 随即返回，http.Server.Shutdown 不被拖到超时；
+	// 与 HTTP 关闭并发。已批准的写工具不随停机取消、最长跑 WriteToolTimeout，所以管家有自己的预算 WriteToolTimeout + 5s
+	// （不受 HTTP 的 10 秒限制；SSE 连接即使被 HTTP 关闭强行断开，轮次仍在后台收尾），关连接池前等它。
+	// 来不及收尾的轮次由其它副本的清扫器在 StaleRunAfter 后接管。
+	butlerCtx, butlerCancel := context.WithTimeout(context.Background(), butlerShutdownBudget)
+	defer butlerCancel()
+	butlerDone := make(chan struct{})
+	go func() {
+		defer close(butlerDone)
+		if a.Butler != nil {
+			if err := a.Butler.Shutdown(butlerCtx); err != nil {
+				log.Warn("AI 管家停机时仍有未结束的轮次", "err", err)
+			}
+		}
 	}()
 	llmGWDone := make(chan struct{})
 	go func() {
@@ -232,10 +272,18 @@ func run(log *slog.Logger) error {
 		if s == nil {
 			continue
 		}
-		if err := s.Shutdown(shutdownCtx); err != nil && runErr == nil {
-			runErr = err
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) { // 宽限期内没关完的连接直接断开：停机本身不算失败
+				log.Warn("http server shutdown timed out, closing remaining connections", "addr", s.Addr)
+				_ = s.Close()
+				continue
+			}
+			if runErr == nil {
+				runErr = err
+			}
 		}
 	}
+	<-butlerDone // 轮次回写用数据库连接池：先等它们收尾再关池（defer）
 	<-ingressDone
 	<-llmGWDone // 被取消的 /v1 请求记完账（走数据库、上游连接池）之后才往下关
 	<-sweeperDone
@@ -255,6 +303,10 @@ func run(log *slog.Logger) error {
 
 // ingressShutdownGrace：停机时给进行中的普通租户请求的宽限。
 const ingressShutdownGrace = 5 * time.Second
+
+// butlerShutdownBudget：停机时等管家轮次收尾的上限——已批准的写工具最长 WriteToolTimeout，再留 5 秒回写结果与收尾文案。
+// 须小于 compose 的 stop_grace_period（60s）。
+const butlerShutdownBudget = butler.WriteToolTimeout + 5*time.Second
 
 // llmShutdownGrace：停机时给进行中的 /v1 请求（含流式生成）的宽限；比 HTTP 关闭的 10 秒短，期满取消的请求还来得及写完错误。
 const llmShutdownGrace = 5 * time.Second

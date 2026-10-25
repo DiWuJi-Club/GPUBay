@@ -1,7 +1,18 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '@spark/shared'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+// GET /butler/status（管家可用性探测）默认按网络错误处理（保持 unknown、不挡导航）：其它用例不关心
+const get = vi.hoisted(() => vi.fn())
+vi.mock('../api', () => ({ api: { get }, onUnauthorized: vi.fn() }))
+
 import { postLoginTarget } from '../logic/access'
 import { router, safeRedirect } from '../router'
+import { butlerAvail } from '../store/butler'
 import { session } from '../store/session'
+
+beforeEach(() => {
+  get.mockRejectedValue(new ApiError(0, 'network', '网络异常，请稍后重试', ''))
+})
 
 describe('safeRedirect', () => {
   it('只接受站内相对路径', () => {
@@ -55,5 +66,46 @@ describe('邀请返利路由 (计划 8)', () => {
     expect(router.currentRoute.value.path).toBe('/login')
     expect(router.currentRoute.value.query.redirect).toBe('/invite')
     expect(router.resolve('/invite').meta).toEqual({ title: '邀请返利', auth: true })
+  })
+})
+
+describe('AI 管家路由 (计划 12)', () => {
+  afterEach(() => {
+    session.status = 'unknown'
+    butlerAvail.state = 'unknown'
+    get.mockReset()
+  })
+
+  it('/butler 需要登录，标题「AI 管家」', async () => {
+    session.status = 'anon'
+    await router.push('/butler')
+    expect(router.currentRoute.value.path).toBe('/login')
+    expect(router.currentRoute.value.query.redirect).toBe('/butler')
+    expect(router.resolve('/butler').meta).toEqual({ title: 'AI 管家', auth: true })
+  })
+})
+
+describe('平台未启用 AI 管家（SPARK_BUTLER=off）', () => {
+  afterEach(() => {
+    session.status = 'unknown'
+    butlerAvail.state = 'unknown'
+    get.mockReset()
+  })
+
+  it('/butler 等探测结果：404 → 回首页（/market）', async () => {
+    session.status = 'authed'
+    get.mockRejectedValue(new ApiError(404, 'not_found', '接口不存在', 'r1'))
+    await router.push('/butler')
+    expect(butlerAvail.state).toBe('unavailable')
+    expect(router.currentRoute.value.path).toBe('/market')
+  })
+
+  it('/butler 探测为可用（管理员关闭也是 200）→ 正常进入', async () => {
+    session.status = 'authed'
+    get.mockResolvedValue({ enabled: false, notice: '维护中' })
+    await router.push('/butler')
+    expect(butlerAvail.state).toBe('available')
+    expect(router.currentRoute.value.path).toBe('/butler')
+    await router.push('/market') // 离开 /butler，免得之后的用例从这里出发
   })
 })

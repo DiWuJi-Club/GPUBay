@@ -14,6 +14,7 @@ import (
 
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
+	"spark-cloud/internal/butler"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
@@ -67,6 +68,10 @@ type Server struct {
 	Workflows *comfywf.Catalog
 	Installer *comfywf.Installer
 	Runs      *comfywf.Runs
+	// 计划 12：AI 管家；nil 时不注册 /butler/*（前端按「未开放」处理）
+	Butler      *butler.Service
+	ButlerLimit int           // 发消息 + 确认每用户每分钟上限；零值 butler.SendRatePerMinute（20）
+	ButlerPing  time.Duration // SSE 保活注释间隔；零值 15 秒（测试调小）
 
 	authorizeLim  *userLimiter
 	calendarLim   *ipLimiter
@@ -75,6 +80,7 @@ type Server struct {
 	wfUploadLim   *userLimiter
 	runAttemptLim *userLimiter
 	coverLim      *ipLimiter
+	butlerLim     *userLimiter
 	deadlineOnce  sync.Once
 }
 
@@ -114,6 +120,11 @@ func (s *Server) Router() http.Handler {
 	s.wfUploadLim = &userLimiter{limit: comfywf.RunsPerHour, window: time.Hour}
 	s.runAttemptLim = &userLimiter{limit: runAttemptsPerHour, window: time.Hour}
 	s.coverLim = &ipLimiter{limit: coverIPLimit}
+	blimit := s.ButlerLimit
+	if blimit <= 0 {
+		blimit = butler.SendRatePerMinute
+	}
+	s.butlerLim = &userLimiter{limit: blimit, window: time.Minute}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if s.TrustProxy {
@@ -241,6 +252,14 @@ func (s *Server) Router() http.Handler {
 				r.Get("/referral/me", s.handleReferralMe)
 				r.Get("/referral/invitees", s.handleReferralInvitees)
 				r.Get("/referral/rewards", s.handleReferralRewards)
+			}
+			if s.Butler != nil {
+				r.Get("/butler/status", s.handleButlerStatus)
+				r.Get("/butler/conversations", s.handleButlerConversations)
+				r.Get("/butler/conversations/{id}", s.handleButlerConversation)
+				r.Delete("/butler/conversations/{id}", s.handleButlerDelete)
+				r.Post("/butler/conversations/{id}/messages", s.handleButlerSend)                   // SSE；id 可为 new
+				r.Post("/butler/conversations/{id}/tool-calls/{tc}/confirm", s.handleButlerConfirm) // SSE
 			}
 			if s.LLM != nil {
 				r.Get("/llm/account", s.handleLLMAccount)

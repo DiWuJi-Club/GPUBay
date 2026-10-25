@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -64,6 +65,19 @@ type appsEnv struct {
 
 func newAppsEnv(t *testing.T, machines int) *appsEnv {
 	t.Helper()
+	return newAppsEnvWith(t, machines, nil)
+}
+
+// appsBuild 是 newAppsEnvWith 交给 tweak 的 app.Build 参数。
+type appsBuild struct {
+	cfg *config.Config
+	opt *app.Options
+	log *slog.Logger
+}
+
+// newAppsEnvWith 同 newAppsEnv；tweak 非 nil 时在 app.Build 之前改配置、选项与日志（如打开 AI 管家并注入 mock LLM、收集日志）。
+func newAppsEnvWith(t *testing.T, machines int, tweak func(*appsBuild)) *appsEnv {
+	t.Helper()
 	ctx := context.Background()
 	pool := dbtest.New(t)
 	t.Cleanup(func() { assertConsistent(t, pool); assertWorkflowsConsistent(t, pool) }) // 最后注册的先执行：在停进程、关服务之前检查
@@ -97,10 +111,15 @@ func newAppsEnv(t *testing.T, machines int) *appsEnv {
 	e.appRootFor = func(id string) string { return filepath.Join(root, id, "root", "data") }
 	cfg := config.Config{UpstreamSSHKeyFile: keyFile, Env: "dev", UploadDir: t.TempDir(), Domain: "spark.test", SecretKey: dbtest.Key,
 		SMSDriver: "mock", KYCDriver: "mock", UpstreamSSHPort: up.Port(), AppGitMirror: testGitMirror}
-	e.a, err = app.Build(cfg, pool, discardLog(), app.Options{Clock: clk, SMS: &sms.Mock{}, DisableRateLimits: true,
+	opt := app.Options{Clock: clk, SMS: &sms.Mock{}, DisableRateLimits: true,
 		HostKeyGen:    func() (string, []byte, error) { return hostPub, hostPEM, nil },
 		AppHealthAddr: func(int) string { return e.healthAddr },
-		AppRootFor:    e.appRootFor})
+		AppRootFor:    e.appRootFor}
+	b := appsBuild{cfg: &cfg, opt: &opt, log: discardLog()}
+	if tweak != nil {
+		tweak(&b)
+	}
+	e.a, err = app.Build(cfg, pool, b.log, opt)
 	if err != nil {
 		t.Fatal(err)
 	}

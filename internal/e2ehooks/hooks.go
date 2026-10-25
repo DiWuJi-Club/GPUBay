@@ -30,6 +30,7 @@ import (
 	"spark-cloud/internal/agent/state"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/butler/llm/mock"
 	"spark-cloud/internal/comfywf/comfytest"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
@@ -56,6 +57,8 @@ type Server struct {
 	Upstream  *sshtest.Server // 假「容器 sshd」（所有 e2e 机器的 lan_ip 都是 127.0.0.1）；/hooks/ingress-upstream 在它上面登记端口
 	// HealthAddr 是 fake 应用的健康检查 / Web 服务地址（host:port）：/hooks/apps/seed 把每个应用端口的 direct-tcpip 转到它
 	HealthAddr string
+	// ButlerLLM 是 app.Options.ButlerLLM 注入的同一个 mock 提供方：/hooks/butler/reply 往它的队列里塞下一轮回复；nil 时管家钩子报 400
+	ButlerLLM *mock.Mock
 	// Comfy 是进程内 fake ComfyUI（快速出图代理的上游）：/hooks/apps/seed 与 /hooks/workflows/seed 之后所有实例的 8188 都转到它，
 	// /hooks/comfy/* 控制它；nil = 不提供（这些钩子报错）。
 	Comfy *comfytest.Server
@@ -104,6 +107,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/ingress-upstream", s.handle(s.ingressUpstream))
 	mux.HandleFunc("POST /hooks/apps/seed", s.handle(s.appsSeed))
 	mux.HandleFunc("POST /hooks/apps/tick", s.handle(s.appsTick))
+	mux.HandleFunc("POST /hooks/butler/reply", s.handle(s.butlerReply))
+	mux.HandleFunc("POST /hooks/butler/reset", s.handle(s.butlerReset))
+	mux.HandleFunc("POST /hooks/butler/usage", s.handle(s.butlerUsage))
+	mux.HandleFunc("POST /hooks/butler/settings", s.handle(s.butlerSettings))
 	mux.HandleFunc("POST /hooks/llm/upstream", s.handle(s.llmUpstream))
 	mux.HandleFunc("POST /hooks/llm/node", s.handle(s.llmNode))
 	mux.HandleFunc("POST /hooks/llm/tick", s.handle(s.llmTick))
@@ -291,7 +298,7 @@ func (s *Server) heartbeatAll(ctx context.Context) error {
 }
 
 // sweep 先让全部 fake Agent 心跳（除非 heartbeat=false），再跑一轮 Rental.Sweep + Billing.Sweep + Referral.Settle + LLM.Settle
-// （与 cmd/platform 的 RunSweeper 附加任务顺序一致）。
+// （+ 管家开启时 Butler.Sweep；与 cmd/platform 的 RunSweeper 附加任务顺序一致）。
 // Rental.Sweep 先做离线检测与暂停、再做到期停机，而到期停机只处理未暂停的实例：推进 24 小时后不心跳直接清扫，
 // 机器会被判失联、实例被暂停而永远不会停机。
 //
@@ -332,6 +339,11 @@ func (s *Server) sweep(ctx context.Context, body json.RawMessage) (any, error) {
 	}
 	if err := s.App.LLM.Settle(ctx); err != nil {
 		return nil, fmt.Errorf("llm settle: %w", err)
+	}
+	if s.App.Butler != nil { // 与 cmd/platform 的清扫器附加任务相同：确认过期、崩溃轮次、对话保留
+		if err := s.App.Butler.Sweep(ctx); err != nil {
+			return nil, fmt.Errorf("butler sweep: %w", err)
+		}
 	}
 	return map[string]bool{"ok": true}, nil
 }

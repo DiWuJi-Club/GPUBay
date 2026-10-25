@@ -18,6 +18,8 @@ make check        # test + e2e
 
 开发环境短信为 mock，验证码固定为 `000000`；实名核验 mock 全部通过。
 
+AI 管家（计划 12）默认经进程内调用本进程的 Token 商城网关（`/v1`），需要一把 Token 商城 API Key：开发环境未设 `SPARK_LLM_API_KEY`（也没设 `SPARK_LLM_BASE_URL`）且未显式 `SPARK_BUTLER=on` 时自动关闭（启动日志说明原因）；本地体验用 `SPARK_LLM_PROVIDER=mock make run`（确定性 mock 模型）。
+
 开发环境支付为 mock：充值后调用 `POST /api/v1/dev/recharges/{id}/pay` 模拟支付成功（生产环境不注册该接口）。PDU 为 mock，断电重启只记录调用。
 
 ### 管理后台
@@ -94,6 +96,15 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_LLM_GATEWAY` | on / off：是否在用户 API 上挂 Token 商城的 OpenAI 兼容网关 `/v1`（off 时 `/v1/*` 返回 404，控制台的 Token 商城页面仍可用）；限额按进程各算，见「Token 商城」 | on |
 | `SPARK_LLM_CONTROLLER` | on / off：是否在本副本启动 Token 节点 Controller（按副本数建节点、健康探测、排空与重建；咨询锁保证同一时刻只有一个副本在工作）。只在 `SPARK_LLM_GATEWAY=on` 的副本上生效（排空看本进程的在途请求），网关 off 时打 WARN 不启动；e2e 用 off，由钩子驱动 | on |
 | `SPARK_APP_GIT_MIRROR` | 注入应用容器的 `SPARK_GIT_MIRROR`：ComfyUI 安装工作流的自定义节点时 `git clone <前缀>https://github.com/...`（失败再直连）。须以 `https://` 开头、以 `/` 结尾；`off` = 直连 | https://gh-proxy.com/ |
+| `SPARK_BUTLER` | on / off：AI 管家部署级开关（off 时不注册路由、不显示入口；与后台「AI 管家」设置的总开关不同） | on |
+| `SPARK_LLM_PROVIDER` | openai / anthropic / mock（prod 禁 mock） | openai |
+| `SPARK_LLM_BASE_URL` | openai：**空 = 本进程的 Token 商城网关**（进程内调用，不走网络；需 `SPARK_LLM_GATEWAY=on`，否则开发环境自动关闭管家、其它环境启动报错）；填写 = 外部 OpenAI 兼容端点（写到 `/v1` 为止）。anthropic 可空（官方地址） | 空 |
+| `SPARK_LLM_API_KEY` | 模型端点密钥；默认端点时是「平台管家账号」的 Token 商城 API Key（`sk-spark-…`，见「部署注意 · AI 管家」）；prod 开启管家且非 mock 时必填 | |
+| `SPARK_LLM_MODEL` | 模型名；接 Token 商城时是模型的 **slug**（后台「Token 商城 → 模型」的 slug，小写，如 `qwen3-4b`），该模型须已上线且 API Key 允许调用 | openai `qwen3-32b` / anthropic `claude-opus-5-5` / mock `mock` |
+| `SPARK_LLM_MAX_OUTPUT_TOKENS` | 单次输出 token 上限（真实节点流式约 20～30 token/s，单次模型请求超时 90 秒） | 1024 |
+| `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` | 用量页估算费用：输入 / 输出每百万 token 的价格（分） | 0 / 0 |
+| `SPARK_LLM_TOOLS` | on / off：off 时不给模型工具（端点不支持工具调用时的应急开关，管家只答不做） | on |
+| `SPARK_LLM_STREAM` | on / off：模型请求是否流式。off 时 openai 适配器发 `"stream": false`、整段读回（一次模型调用推一个 `delta`）；anthropic 总是流式 | openai off，anthropic on |
 
 ## 节点 Agent
 
@@ -214,6 +225,22 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - **安全**：自定义节点是第三方代码，在用户容器里以 root 安装运行；只有 super 能发布工作流版本，Git 主机限 github.com / gitee.com / gitcode.com 且钉死 commit，导入前须评审节点仓库。
 - **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。这些限制与每用户同时上传数、每小时运行尝试数用的是进程内锁与计数（「计数 → `/prompt` → 入库」靠进程内锁串行化），**假设 platform 只有一个副本**；多副本部署时它们只是每个副本各自的软上限（落在不同副本上的并发请求可以同时通过检查）。
 - **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），并删除 `uploads` 里的封面登记（`workflow_cover` 行）、把 `uploads` 的约束还原（`purpose` 只允许 `license`、`user_id` 非空）；`SPARK_UPLOAD_DIR` 里的封面文件留在磁盘上（可手工清理），容器内文件不受影响。
+### AI 管家（计划 12）
+
+- **模型端点（默认 = 计划 9 的 Token 商城网关，进程内）**：`SPARK_LLM_PROVIDER=openai`（默认）且 `SPARK_LLM_BASE_URL` 为空、本进程 `SPARK_LLM_GATEWAY=on`（默认）时，管家把 Chat Completions 请求直接交给本进程的 `/v1` 网关处理（进程内传输：不经网络和公网 http.Server；流式时 SSE 逐块回传，默认非流式见下文「流式」；管家取消即客户端断开）。对网关而言它就是一个来自 `127.0.0.1`、带 `Authorization: Bearer <SPARK_LLM_API_KEY>` 的普通调用：同样的 Key 鉴权、账户门槛（实名、未停用、无欠费）、RPM / TPM / 并发限额、余额预检、选节点与记账（`llm_usage`）。启动日志「AI 管家已开启」的 endpoint 显示「本进程 Token 商城网关 /v1（进程内调用）」。
+- **平台管家账号（一次性准备）**：Token 商城没有「系统令牌」，管家的调用按一把普通 API Key 计费，所以先准备一个专用账号：1) 用一个运维手机号登录控制台（这个账号只给管家用）；2) 完成实名（或在后台「实名审核」人工通过），未实名的账号调用返回 403 `kyc_required`；3) 在后台「用户 → 手动充值 / 调账」（finance）给它充值；4) 用该账号在控制台「Token 商城 → API Keys」创建 Key（可限定只允许管家用的模型、设月消费上限；明文只显示一次），填进 `SPARK_LLM_API_KEY` 后重启 platform；5) 在后台「Token 商城 → 账户」调高该账号的限额（ops）：默认每分钟 60 次 / 20 万 token / 并发 8 是**全体用户的管家调用共用的**（一轮对话可能调用模型多次，全局最多 32 个轮次并发），建议并发 ≥ 32、RPM ≥ 600、TPM ≥ 2,000,000（上限 512 / 100,000 / 100,000,000），否则高峰期网关回 429、管家提示模型暂不可用。
+- **费用**：管家的 token 按模型单价记在平台管家账号上，由 Token 商城的结算从它的钱包扣款（「Token 消费」流水）；终端用户不付 Token 费，只占自己的管家每日额度。余额不足或欠费时网关回 402，管家每轮都失败（连续 5 次产生告警「AI 管家模型不可用」），给这个账号留足余额并关注它的消费。把 `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` 设成该模型在 Token 商城的输入 / 输出单价（分 / 百万 token），后台「AI 管家 → 用量」的费用估算才与实际扣款一致。
+- **模型要求**：`SPARK_LLM_MODEL` 填模型的 slug（默认 `qwen3-32b`；验收用 `Qwen/Qwen3-4B` 时 slug 为 `qwen3-4b`），模型须已上线并有就绪节点（否则 503 `model_unavailable`）。模型节点参数 `TOOL_CALL_PARSER` 必须是 `hermes`（默认；`vllm-node` 据此加 `--enable-auto-tool-choice --tool-call-parser hermes`），设成 `none` 时模型不会调用工具（应急可设 `SPARK_LLM_TOOLS=off`，管家只答不做）；Qwen3 系列把 `REASONING_PARSER` 设为 `qwen3`，否则 `<think>…</think>` 会作为正文推给用户。模型的「最大输出」须 ≥ `SPARK_LLM_MAX_OUTPUT_TOKENS`（默认 1024，否则网关 400；单次模型请求超时 90 秒，按节点约 20～30 token/s 估算，调大前确认输出速度），上下文建议 ≥ 32768（系统提示 + 工具定义 + 历史）。
+- **多副本**：每个开管家的副本用自己进程里的网关（限额按进程各算，见「Token 商城」），该副本必须 `SPARK_LLM_GATEWAY=on`；只在一个副本开网关时，其它副本要么 `SPARK_BUTLER=off`，要么把 `SPARK_LLM_BASE_URL` 指向开网关的那个副本（如 `https://<SPARK_DOMAIN>/v1`）。
+- **外部端点**：设置了 `SPARK_LLM_BASE_URL` 时改走 HTTP（任意 OpenAI 兼容的流式 Chat Completions 接口，需支持 `tools` 与 `stream_options.include_usage`；vLLM 的 Qwen3 需 `--enable-auto-tool-choice --tool-call-parser hermes`）。**写到 `/v1` 为止**，平台请求 `<base>/chat/completions`，`SPARK_LLM_API_KEY` 以 `Authorization: Bearer` 发送；URL 里不能带用户名密码。端点放在机房内网，platform 到端点的出站要放行。
+- **Claude 模式**：`SPARK_LLM_PROVIDER=anthropic` + `SPARK_LLM_API_KEY`（Anthropic API 密钥），模型默认 `claude-opus-5-5`，`SPARK_LLM_BASE_URL` 可空（官方地址）或填兼容网关。按 token 计费，**每日 token 预算就是钱**：把 `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` 设成实际单价（分 / 百万 token），后台用量页才有费用估算；按需在后台调低每用户每日 token 限额（默认 30 万）。密钥只从环境变量读，不写日志、不入库。
+- **生产校验**：prod 开启管家且提供方不是 mock 时必须有 `SPARK_LLM_API_KEY`（走进程内网关时 staging 同样必填）；走进程内网关时 Key 必须是 Token 商城 Key（`sk-spark-` 开头，任何环境），否则启动失败；`openai` 没有 `SPARK_LLM_BASE_URL` 时必须 `SPARK_LLM_GATEWAY=on`（走进程内网关），否则启动失败（不想开放就设 `SPARK_BUTLER=off`）。**`mock` 提供方在 prod 直接拒绝启动**（配置校验与 `app.Build` 两道），测试注入的提供方同样被拒。
+- **开发环境**：没显式 `SPARK_BUTLER=on` 时，openai 没有可用端点（走进程内网关却没设 `SPARK_LLM_API_KEY`，或网关关闭又没设 `SPARK_LLM_BASE_URL`）则管家自动关闭（启动日志「AI 管家未开启」说明原因），控制台不显示入口；`SPARK_LLM_PROVIDER=mock make run` 用确定性 mock 模型体验全部流程（规则见 `internal/butler/llm/mock/rules.go`）。显式 `SPARK_BUTLER=on` 时：网关关闭又没配端点则启动报错；走进程内网关而没有 Key 照常启动，但每轮都会因 401 失败。
+- **流式（`SPARK_LLM_STREAM`）**：openai 默认 off。原因：节点镜像里的 vLLM 0.10.1（`spark/llm-serving:25.09`）的 hermes 解析器流式输出工具调用时会丢参数片段（真机验收：同一请求非流式得到 `{"product_id": 1, "duration": "1d", …}`，流式得到 `{"product_id": "1d", …` 且缺结尾 `}`），表现为「参数不是合法 JSON」或参数错位、反复重试直到整轮超时；非流式没有这个问题。代价是正文不再逐字出现（一次模型调用一个 `delta`，Qwen3 思考模式下本来也要等十几秒才有正文）。节点的 vLLM 升级并验证流式工具调用正确后，可设 `SPARK_LLM_STREAM=on` 恢复逐字输出。
+- **开关**：后台「AI 管家 → 设置」的总开关（super，不重启，本副本立即生效、其它副本最多 10 秒）用于临时关闭并给用户显示说明；`SPARK_BUTLER=off` 是部署级开关（不注册路由、不显示入口，需重启）。端点不支持工具调用时设 `SPARK_LLM_TOOLS=off` 应急：管家只回答问题、不能查询或操作（重启生效）。
+- **故障**：连续 5 次模型调用失败会产生告警「AI 管家模型不可用」；失败的轮次不计入用户预算。
+- **存储与保留**：对话（消息、工具调用、确认卡）存 PostgreSQL，**保留 90 天**（按最后更新时间，清扫器每轮删除），用量按日汇总保留 400 天；用户可随时删除自己的对话，后台 ops / super 可查看任意对话（帮助页已向用户说明）。写操作一律经用户在确认卡上确认后执行，并写审计 `butler.tool_execute`；部署变量里的 secret 值加密暂存，执行 / 拒绝 / 过期后清除。
+- **发布与回滚**：迁移 `00025_butler.sql` 只新增表，不改 Agent、不改既有表，可滚动发布。回滚只回退 platform 时表留着不用；执行 Down 删除全部对话与用量记录（审计日志保留）。
 
 ## API 约定
 
