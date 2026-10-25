@@ -639,7 +639,7 @@ func (h writeHandlers) placeOrder(ctx context.Context, c Caller, args json.RawMe
 		ref = ids[0]
 	}
 	return okResult("place_order", c, map[string]any{"batch_id": batchID, "instance_ids": ids, "order_ids": orderIDs,
-		"amount_cents": amount, "scheduled_start_at": tsp(start)}, ref)
+		"amount_cents": amount, "amount": yuan(amount), "scheduled_start_at": tsp(start)}, ref)
 }
 
 // ---- renew_instance ----
@@ -733,7 +733,7 @@ func (h writeHandlers) renew(ctx context.Context, c Caller, args json.RawMessage
 	if err != nil {
 		return Result{}, err
 	}
-	out := map[string]any{"order_id": ord.ID, "instance_id": a.InstanceID, "amount_cents": ord.Amount}
+	out := map[string]any{"order_id": ord.ID, "instance_id": a.InstanceID, "amount_cents": ord.Amount, "amount": yuan(ord.Amount)}
 	if inst, err := h.d.Rental.GetForUser(ctx, c.UserID, a.InstanceID); err == nil {
 		out["state"], out["expires_at"] = inst.State, tsp(inst.ExpiresAt)
 	}

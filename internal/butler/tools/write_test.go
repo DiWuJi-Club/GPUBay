@@ -329,7 +329,7 @@ func TestExecIdempotencyKeyPassed(t *testing.T) {
 		t.Fatalf("BatchRequest = %+v", req)
 	}
 	v := unwrapJSON(t, "place_order", ownerID, res.Content)
-	if v["ok"] != true || v["batch_id"] != "bat-1" || fmt.Sprint(v["instance_ids"]) != "[ins-a ins-b]" || v["amount_cents"] != float64(13800) || res.Ref != "ins-a" {
+	if v["ok"] != true || v["batch_id"] != "bat-1" || fmt.Sprint(v["instance_ids"]) != "[ins-a ins-b]" || v["amount_cents"] != float64(13800) || v["amount"] != "¥138.00" || res.Ref != "ins-a" {
 		t.Fatalf("result = %s ref %q", res.Content, res.Ref)
 	}
 
@@ -341,7 +341,7 @@ func TestExecIdempotencyKeyPassed(t *testing.T) {
 		t.Fatalf("renew idem keys = %v", f.rental.renewCalls)
 	}
 	v = unwrapJSON(t, "renew_instance", ownerID, res.Content)
-	if v["ok"] != true || v["order_id"] != "ord-r" || v["amount_cents"] != float64(13800) || res.Ref != "ins-run" {
+	if v["ok"] != true || v["order_id"] != "ord-r" || v["amount_cents"] != float64(13800) || v["amount"] != "¥138.00" || res.Ref != "ins-run" {
 		t.Fatalf("renew result = %s", res.Content)
 	}
 

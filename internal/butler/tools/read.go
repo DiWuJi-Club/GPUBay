@@ -47,7 +47,7 @@ func readTools(d Deps) []Tool {
 	h := readHandlers{d: d}
 	return []Tool{
 		{Name: "list_products", Kind: Read, Exec: h.listProducts, Schema: json.RawMessage(noArgs),
-			Description: "列出在售套餐（规格、各租期实时价格 amount_cents（分）、现在可立即租用的台数 available_now）与可选镜像 images。回答价格时必须以此为准。"},
+			Description: "列出在售套餐（规格、各租期实时价格 price（元，回答时直接使用；amount_cents 为同一金额的分）、现在可立即租用的台数 available_now）与可选镜像 images。回答价格时必须以此为准。"},
 		{Name: "check_availability", Kind: Read, Exec: h.checkAvailability,
 			Schema: objSchema([]string{"product_id", "duration"},
 				`"product_id": {"type": "integer", "minimum": 1, "description": "套餐 ID，来自 list_products"}`,
@@ -81,10 +81,10 @@ func readTools(d Deps) []Tool {
 			Description: "查看一个部署的状态变化事件（新的在前）。"},
 		{Name: "get_wallet", Kind: Read, Exec: h.getWallet,
 			Schema:      objSchema(nil, `"ledger_limit": {"type": "integer", "minimum": 0, "maximum": 20, "default": 10, "description": "返回最近几条流水"}`),
-			Description: "查询余额 balance_cents（分）与最近的资金流水。"},
+			Description: "查询余额与最近的资金流水（balance / amount 为元，回答时直接使用；*_cents 为同一金额的分）。"},
 		{Name: "list_orders", Kind: Read, Exec: h.listOrders,
 			Schema:      objSchema(nil, `"limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10, "description": "最多返回条数（新的在前）"}`),
-			Description: "列出最近的订单（新购、续费、预订；金额 amount_cents 为分）。"},
+			Description: "列出最近的订单（新购、续费、预订；金额 amount 为元，回答时直接使用；amount_cents 为分）。"},
 		{Name: "get_cancel_quote", Kind: Read, Exec: h.getCancelQuote, Schema: objSchema([]string{"instance_id"}, propInstanceID),
 			Description: "查询取消一个未开通预订可退的金额、比例与截止时间。"},
 		{Name: "get_help", Kind: Read, Exec: h.getHelp,
@@ -193,6 +193,7 @@ func decodeArgs(args json.RawMessage, v any) error {
 type priceOut struct {
 	Duration    string `json:"duration"`
 	AmountCents int64  `json:"amount_cents"`
+	Price       string `json:"price"` // 已换算成元的展示金额（如 ¥69.00）：小模型自己从分换算常错一位，回答时直接用它
 }
 
 type productOut struct {
@@ -233,7 +234,7 @@ func (h readHandlers) listProducts(ctx context.Context, c Caller, _ json.RawMess
 		}
 		po.GPU, po.MemoryGB = p.Spec["gpu"], p.Spec["memory_gb"]
 		for _, pr := range p.Prices {
-			po.Prices = append(po.Prices, priceOut{Duration: string(pr.Duration), AmountCents: pr.Amount})
+			po.Prices = append(po.Prices, priceOut{Duration: string(pr.Duration), AmountCents: pr.Amount, Price: yuan(pr.Amount)})
 		}
 		ps = append(ps, po)
 	}
@@ -772,6 +773,7 @@ func (h readHandlers) getDeploymentEvents(ctx context.Context, c Caller, args js
 type ledgerOut struct {
 	ID                int64  `json:"id"`
 	AmountCents       int64  `json:"amount_cents"`
+	Amount            string `json:"amount"` // 元，同 priceOut.Price
 	BalanceAfterCents int64  `json:"balance_after_cents"`
 	Kind              string `json:"kind"`
 	RefType           string `json:"ref_type"`
@@ -802,12 +804,12 @@ func (h readHandlers) getWallet(ctx context.Context, c Caller, args json.RawMess
 			return Result{}, err
 		}
 		for _, r := range ledger {
-			rows = append(rows, ledgerOut{ID: r.ID, AmountCents: r.Amount, BalanceAfterCents: r.BalanceAfter, Kind: string(r.Kind),
+			rows = append(rows, ledgerOut{ID: r.ID, AmountCents: r.Amount, Amount: yuan(r.Amount), BalanceAfterCents: r.BalanceAfter, Kind: string(r.Kind),
 				RefType: r.RefType, RefID: clean(r.RefID, 64), Remark: clean(r.Remark, textLimit), CreatedAt: ts(r.CreatedAt)})
 		}
 	}
 	return wrapList("get_wallet", c, len(rows), func(k int) any {
-		return map[string]any{"balance_cents": bal, "ledger": rows[:k], "meta": meta(len(rows), k)}
+		return map[string]any{"balance_cents": bal, "balance": yuan(bal), "ledger": rows[:k], "meta": meta(len(rows), k)}
 	}, smallLimit, "")
 }
 
@@ -822,6 +824,7 @@ type orderOut struct {
 	Duration            string  `json:"duration"`
 	Quantity            int     `json:"quantity"`
 	AmountCents         int64   `json:"amount_cents"`
+	Amount              string  `json:"amount"` // 元，同 priceOut.Price
 	Status              string  `json:"status"`
 	RefundedAmountCents int64   `json:"refunded_amount_cents"`
 	BatchID             *string `json:"batch_id"`
@@ -852,7 +855,7 @@ func (h readHandlers) listOrders(ctx context.Context, c Caller, args json.RawMes
 			return Result{}, err
 		}
 		out = append(out, orderOut{ID: o.ID, Kind: o.Kind, InstanceID: o.InstanceID, ProductID: o.ProductID, ProductName: name,
-			Duration: string(o.Duration), Quantity: o.Quantity, AmountCents: o.Amount, Status: o.Status,
+			Duration: string(o.Duration), Quantity: o.Quantity, AmountCents: o.Amount, Amount: yuan(o.Amount), Status: o.Status,
 			RefundedAmountCents: o.RefundedAmount, BatchID: o.BatchID, Auto: o.Auto, CreatedAt: ts(o.CreatedAt)})
 	}
 	return wrapList("list_orders", c, len(out), func(k int) any {
@@ -873,8 +876,8 @@ func (h readHandlers) getCancelQuote(ctx context.Context, c Caller, args json.Ra
 	if err != nil {
 		return Result{}, err
 	}
-	out := map[string]any{"instance_id": a.InstanceID, "refund_cents": q.Refund, "percent": q.Percent,
-		"deadline": ts(q.Deadline), "max_refund_cents": q.Max}
+	out := map[string]any{"instance_id": a.InstanceID, "refund_cents": q.Refund, "refund": yuan(q.Refund), "percent": q.Percent,
+		"deadline": ts(q.Deadline), "max_refund_cents": q.Max, "max_refund": yuan(q.Max)}
 	return wrapOne("get_cancel_quote", c, out, smallLimit, a.InstanceID)
 }
 

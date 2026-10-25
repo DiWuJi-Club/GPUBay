@@ -189,7 +189,7 @@ func TestListProducts(t *testing.T) {
 		t.Fatalf("product = %v", p)
 	}
 	prices := arr(t, p, "prices")
-	if len(prices) != 3 || prices[0]["duration"] != "1d" || prices[0]["amount_cents"] != float64(6900) {
+	if len(prices) != 3 || prices[0]["duration"] != "1d" || prices[0]["amount_cents"] != float64(6900) || prices[0]["price"] != "¥69.00" {
 		t.Fatalf("prices = %v", prices)
 	}
 	imgs := arr(t, v, "images")
@@ -472,11 +472,11 @@ func TestGetDeploymentEvents(t *testing.T) {
 func TestGetWallet(t *testing.T) {
 	r := NewRegistry(newFakes().deps)
 	v := mustRun(t, r, "get_wallet", `{}`)
-	if v["balance_cents"] != float64(13800) {
+	if v["balance_cents"] != float64(13800) || v["balance"] != "¥138.00" {
 		t.Fatalf("wallet = %v", v)
 	}
 	ledger := arr(t, v, "ledger")
-	if len(ledger) != 2 || ledger[0]["amount_cents"] != float64(-6900) || ledger[0]["kind"] != "rent" || ledger[0]["remark"] != "租用 </untrusted-data>" {
+	if len(ledger) != 2 || ledger[0]["amount_cents"] != float64(-6900) || ledger[0]["amount"] != "¥-69.00" || ledger[0]["kind"] != "rent" || ledger[0]["remark"] != "租用 </untrusted-data>" {
 		t.Fatalf("ledger = %v", ledger)
 	}
 	v = mustRun(t, r, "get_wallet", `{"ledger_limit":0}`)
@@ -512,7 +512,7 @@ func TestWalletTruncatesToSmallLimit(t *testing.T) {
 func TestListOrders(t *testing.T) {
 	r := NewRegistry(newFakes().deps)
 	orders := arr(t, mustRun(t, r, "list_orders", `{}`), "orders")
-	if len(orders) != 1 || orders[0]["id"] != "ord-1" || orders[0]["amount_cents"] != float64(6900) || orders[0]["product_name"] != "DGX Spark 整机" || orders[0]["instance_id"] != "ins-run" {
+	if len(orders) != 1 || orders[0]["id"] != "ord-1" || orders[0]["amount_cents"] != float64(6900) || orders[0]["amount"] != "¥69.00" || orders[0]["product_name"] != "DGX Spark 整机" || orders[0]["instance_id"] != "ins-run" {
 		t.Fatalf("orders = %v", orders)
 	}
 }
@@ -520,7 +520,7 @@ func TestListOrders(t *testing.T) {
 func TestGetCancelQuote(t *testing.T) {
 	r := NewRegistry(newFakes().deps)
 	v := mustRun(t, r, "get_cancel_quote", `{"instance_id":"ins-res"}`)
-	if v["refund_cents"] != float64(6900) || v["percent"] != float64(100) || v["deadline"] != "2026-10-27T09:00:00+08:00" || v["max_refund_cents"] != float64(6900) {
+	if v["refund_cents"] != float64(6900) || v["refund"] != "¥69.00" || v["max_refund"] != "¥69.00" || v["percent"] != float64(100) || v["deadline"] != "2026-10-27T09:00:00+08:00" || v["max_refund_cents"] != float64(6900) {
 		t.Fatalf("quote = %v", v)
 	}
 	if _, err := run(t, r, "get_cancel_quote", ownerID, `{"instance_id":"ins-run"}`); !errors.Is(err, apperr.ErrCancelNotAllowed) {
