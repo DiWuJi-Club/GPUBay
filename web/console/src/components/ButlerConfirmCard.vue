@@ -15,12 +15,14 @@ const props = defineProps<{ card: PendingToolCall; state: ConfirmState; message?
 const emit = defineEmits<{ approve: []; reject: []; expire: [] }>()
 
 const now = useTicker()
-// 到期时刻按收到卡片时的服务器剩余秒推算（浏览器时钟与服务器不一定一致）
-const deadline = ref(cardDeadline(props.card, Date.now()))
+// 到期时刻按收到卡片时的服务器剩余秒推算（浏览器时钟与服务器不一定一致）。
+// 到期时刻与 now 必须取自同一次读钟：两次 Date.now() 之间差 1ms 就会让 10:00 显示成 10:01、expires_in=0 的卡片多挂 1 秒
+const deadline = ref(cardDeadline(props.card, now.value))
 watch(
   () => props.card,
   (c) => {
-    deadline.value = cardDeadline(c, Date.now())
+    now.value = Date.now()
+    deadline.value = cardDeadline(c, now.value)
   },
 )
 const left = computed(() => Math.max(0, Math.ceil((deadline.value - now.value) / 1000)))
