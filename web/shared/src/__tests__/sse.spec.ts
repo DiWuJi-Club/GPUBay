@@ -170,25 +170,37 @@ describe('streamPost', () => {
   })
 
   it('空闲看门狗：超过 idleTimeoutMs 没有任何数据 → network；每个分块（含 ping）都会重置计时', async () => {
-    const enc = new TextEncoder()
-    let pings = 0
-    const body = new ReadableStream<Uint8Array>({
-      start(c) {
-        c.enqueue(enc.encode('event: delta\ndata: {"text":"a"}\n\n'))
-        const t = setInterval(() => {
-          if (pings++ < 4) c.enqueue(enc.encode(': ping\n\n')) // 每 20ms 一次 ping，4 次后沉默
-          else clearInterval(t)
-        }, 20)
-      },
-    })
-    const { fn } = fakeFetch(new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }))
-    const got: SSEEvent[] = []
-    const t0 = Date.now()
-    const err = await streamPost('', '/x', {}, (e) => got.push(e), { fetch: fn, idleTimeoutMs: 50 }).catch((e) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect(err).toMatchObject({ status: 0, code: 'network' })
-    expect(got).toEqual([{ event: 'delta', data: '{"text":"a"}' }])
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(80 + 50 - 10) // ping 期间没有误触发
+    // 假时钟：ping 间隔与看门狗都按虚拟时间走，负载下的计时器延迟不会让看门狗在 ping 期间误触发
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
+    try {
+      const enc = new TextEncoder()
+      let pings = 0
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(enc.encode('event: delta\ndata: {"text":"a"}\n\n'))
+          const t = setInterval(() => {
+            if (pings++ < 4) c.enqueue(enc.encode(': ping\n\n')) // 每 20ms 一次 ping（20/40/60/80ms），之后沉默
+            else clearInterval(t)
+          }, 20)
+        },
+      })
+      const { fn } = fakeFetch(new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }))
+      const got: SSEEvent[] = []
+      let settled = false
+      const p = streamPost('', '/x', {}, (e) => got.push(e), { fetch: fn, idleTimeoutMs: 50 })
+        .catch((e) => e)
+        .finally(() => (settled = true))
+      await vi.advanceTimersByTimeAsync(80 + 50 - 1)
+      expect(settled).toBe(false) // ping 期间没有误触发：最后一个 ping（80ms）之后再等满 50ms 才超时
+      await vi.advanceTimersByTimeAsync(1)
+      const err = await p
+      expect(settled).toBe(true)
+      expect(err).toBeInstanceOf(ApiError)
+      expect(err).toMatchObject({ status: 0, code: 'network' })
+      expect(got).toEqual([{ event: 'delta', data: '{"text":"a"}' }])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('流正常关闭但没收到 done → 正常 resolve（由调用方判断是否完整）', async () => {

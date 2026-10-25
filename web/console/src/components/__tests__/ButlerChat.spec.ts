@@ -2,6 +2,7 @@ import { ApiError, type ButlerStatus, type ConversationDetail, type PendingToolC
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { nextTick } from 'vue'
 import { createMemoryHistory, createRouter, type Router } from 'vue-router'
 
 type Handler = (e: SSEEvent) => void
@@ -56,7 +57,16 @@ async function type(text: string) {
   await flushPromises()
 }
 
+/** 确认卡的倒计时由 Date.now() 与 useTicker 的 setInterval 驱动：冻结时钟、手动推进，避免负载下毫秒级漂移让 10:00 变成 10:01 / 09:59 */
+const FAKE_NOW = new Date('2026-10-25T08:00:00Z')
+async function tick(ms: number) {
+  await vi.advanceTimersByTimeAsync(ms)
+  await nextTick()
+}
+
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+  vi.setSystemTime(FAKE_NOW)
   status = { enabled: true, notice: '', day_used: 1000, day_limit: 300000, provider_label: '平台模型', ingress_domain: 'spark.test' }
   detail = { conversation: { id: 'cv-1', title: '帮我选一台机器', status: 'idle', last_message_at: null, created_at: '2026-10-25T00:00:00Z' }, messages: [], pending_tool_call: null }
   scripts = []
@@ -78,6 +88,7 @@ afterEach(() => {
   wrapper?.unmount()
   wrapper = null
   document.body.innerHTML = ''
+  vi.useRealTimers()
 })
 
 describe('ButlerChat', () => {
@@ -173,7 +184,8 @@ describe('ButlerChat', () => {
   })
 
   it('流在 done 之前断开 → 拉详情刷新；running 时继续轮询直到结束', async () => {
-    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] })
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] })
+    vi.setSystemTime(FAKE_NOW)
     try {
       await render()
       detail = { ...detail, conversation: { ...detail.conversation, status: 'running' } }
@@ -212,6 +224,8 @@ describe('ButlerChat', () => {
     expect($('butler-confirm-title')!.textContent).toBe('续费实例')
     expect($('butler-confirm-amount')!.textContent).toBe('预计扣款 ¥99.00')
     expect($('butler-confirm-countdown')!.textContent).toBe('10:00 内有效')
+    await tick(1_000)
+    expect($('butler-confirm-countdown')!.textContent).toBe('09:59 内有效')
     expect($('butler-confirm-danger')).toBeNull()
     scripts.push([ev('tool', { id: 'tc-1', name: 'renew_instance', label: '续费实例', status: 'error', message: '余额不足' }), ev('delta', { text: '余额不足，请先充值' }), ev('done', { reason: 'end_turn' })])
     await click('butler-confirm-ok')
@@ -247,6 +261,21 @@ describe('ButlerChat', () => {
     expect($('butler-confirm-result')!.textContent).toBe('已失效')
     expect(($('butler-confirm-ok') as HTMLButtonElement).disabled).toBe(true)
     expect(($('butler-confirm-cancel') as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('倒计时走到 0 → 卡片已失效、按钮禁用，不发 confirm', async () => {
+    detail = { ...detail, conversation: { ...detail.conversation, status: 'awaiting_confirm' }, pending_tool_call: { ...card, expires_in: 3 } }
+    await render({ conversationId: 'cv-1' })
+    expect($('butler-confirm-countdown')!.textContent).toBe('00:03 内有效')
+    await tick(2_000)
+    expect($('butler-confirm-countdown')!.textContent).toBe('00:01 内有效')
+    expect(($('butler-confirm-ok') as HTMLButtonElement).disabled).toBe(false)
+    await tick(1_000)
+    await flushPromises()
+    expect($('butler-confirm-countdown')).toBeNull()
+    expect($('butler-confirm-result')!.textContent).toBe('已失效')
+    expect(($('butler-confirm-ok') as HTMLButtonElement).disabled).toBe(true)
+    expect(mocks.stream).not.toHaveBeenCalled()
   })
 
   it('expires_in = 0 的卡片直接显示已失效', async () => {
