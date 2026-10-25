@@ -43,7 +43,7 @@ type call struct {
 	endpoint string
 	p        parsedRequest
 	body     []byte // 客户端原始请求体（估算 prompt 用）
-	upBody   []byte // 转发给节点的请求体（可能注入了 stream_options）
+	upBody   []byte // 转发给节点的请求体（可能注入了 stream_options.include_usage / max_tokens，见 upstreamBody）
 	ip       string
 
 	start     time.Time // 单调时钟：latency_ms / ttft_ms
@@ -124,19 +124,19 @@ func (g *Server) handleCompletion(endpoint string) http.HandlerFunc {
 			}
 			return
 		}
+		if m.Kind != llm.KindEmbedding {
+			if msg := checkOutputBounds(&p, m); msg != "" {
+				writeErr(w, http.StatusBadRequest, codeInvalidRequest, msg)
+				return
+			}
+		}
 		now := g.clk.Now()
 		if ac.Key.MonthCapExceeded(now) {
 			writeErr(w, http.StatusTooManyRequests, codeMonthlyCapExceeded, "该 API Key 本月消费已达上限")
 			return
 		}
-		maxOut := 0
-		if m.Kind != llm.KindEmbedding {
-			maxOut = m.DefaultMaxTokens
-			if p.maxTokens != nil && *p.maxTokens > 0 {
-				maxOut = *p.maxTokens
-			}
-			maxOut = min(maxOut, m.MaxOutputTokens)
-		}
+		// 输出上界：max_tokens（没给时为注入的 max_output_tokens）× max(n, best_of, 1)；TPM 预占与预算预检同口径
+		maxOut := llm.OutputBudget(m, p.maxTokens, p.fanout)
 		lim := g.svc.Limiter()
 		releaseLimit, err := lim.Acquire(ac.UserID, ac.Limits, len(body)/3+maxOut, now)
 		if err != nil {
@@ -158,7 +158,7 @@ func (g *Server) handleCompletion(endpoint string) http.HandlerFunc {
 			writeErr(w, http.StatusInternalServerError, codeInternal, "服务内部错误，请稍后再试")
 			return
 		}
-		need := max(llm.EstimateFen(m, len(body), p.maxTokens), 1)
+		need := max(llm.EstimateFen(m, len(body), p.maxTokens, p.fanout), 1)
 		// 缓存的 unsettled_micro 最多落后 KeyCacheTTL：补上装载之后本进程新记的用量
 		unsettled := ac.Account.UnsettledMicro + g.recorded.since(ac.UserID, ac.LoadSeq)
 		budget := bal - (unsettled+llm.MicroPerFen-1)/llm.MicroPerFen - ac.Account.Debt

@@ -48,30 +48,42 @@ func TestCostAndEstimate(t *testing.T) {
 		m       llm.Model
 		bodyLen int
 		max     *int
+		fanout  int
 		fen     int64
 	}{
-		// 1000 × 100 + 4096 × 400 = 1,738,400 微分 → 2 分
-		{"default max_tokens", m, 3000, nil, 2},
-		// 夹到 max_output 8192：100,000 + 3,276,800 = 3,376,800 → 4
-		{"clamped to max_output", m, 3000, intp(100_000), 4},
+		// 未给 max_tokens 按 max_output 8192（网关注入同值）：1000 × 100 + 8192 × 400 = 3,376,800 微分 → 4 分
+		{"no max_tokens uses max_output", m, 3000, nil, 1, 4},
+		// 夹到 max_output 8192（网关会先 400，这里只验夹取）
+		{"clamped to max_output", m, 3000, intp(100_000), 1, 4},
 		// 100,000 + 4,000 = 104,000 → 1（向上取整）
-		{"small max_tokens ceil", m, 3000, intp(10), 1},
-		// max_tokens ≤ 0 按模型默认
-		{"zero max_tokens uses default", m, 3000, intp(0), 2},
-		{"negative max_tokens uses default", m, 3000, intp(-5), 2},
+		{"small max_tokens ceil", m, 3000, intp(10), 1, 1},
+		// max_tokens ≤ 0 按 max_output
+		{"zero max_tokens uses max_output", m, 3000, intp(0), 1, 4},
+		{"negative max_tokens uses max_output", m, 3000, intp(-5), 1, 4},
+		// n / best_of 倍数：100,000 + 3 × 10 × 400 = 112,000 → 1；100,000 + 4 × 4096 × 400 = 6,653,600 → 7
+		{"fanout small", m, 3000, intp(10), 3, 1},
+		{"fanout 4", m, 3000, intp(4096), 4, 7},
+		// fanout ≤ 0 按 1
+		{"fanout zero", m, 3000, intp(4096), 0, 2},
 		// bodyLen/3 整数除法：2 字节 → 0 token
-		{"tiny body", m, 2, intp(1), 1},
-		// embedding 只算输入：10000 × 100 = 1,000,000 → 恰好 1 分
-		{"embedding exact", e, 30_000, intp(8192), 1},
-		{"embedding ceil", e, 30_003, nil, 2},
-		{"embedding empty", e, 2, nil, 0},
+		{"tiny body", m, 2, intp(1), 1, 1},
+		// embedding 只算输入：10000 × 100 = 1,000,000 → 恰好 1 分；fanout 不影响
+		{"embedding exact", e, 30_000, intp(8192), 8, 1},
+		{"embedding ceil", e, 30_003, nil, 1, 2},
+		{"embedding empty", e, 2, nil, 1, 0},
 		// 最大请求体：699,050 × 100 + 8192 × 400 = 73,181,800 → 74
-		{"max body", m, llm.MaxBodyBytes, intp(1 << 30), 74},
+		{"max body", m, llm.MaxBodyBytes, intp(1 << 30), 1, 74},
 	}
 	for _, c := range ests {
-		if got := llm.EstimateFen(c.m, c.bodyLen, c.max); got != c.fen {
+		if got := llm.EstimateFen(c.m, c.bodyLen, c.max, c.fanout); got != c.fen {
 			t.Errorf("EstimateFen %s = %d, want %d", c.name, got, c.fen)
 		}
+	}
+	if got := llm.OutputBudget(m, nil, 2); got != 2*8192 {
+		t.Errorf("OutputBudget nil × 2 = %d", got)
+	}
+	if got := llm.OutputBudget(e, intp(10), 2); got != 0 {
+		t.Errorf("OutputBudget embedding = %d", got)
 	}
 }
 

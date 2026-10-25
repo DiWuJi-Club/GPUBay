@@ -42,19 +42,26 @@ func Cost(m Model, promptTokens, completionTokens int) int64 {
 	return c
 }
 
-// EstimateFen 预算预检的本次估算（分，规格 T2）：ceil((bodyLen/3 × input_price + max_out × output_price) / 10^6)。
-// bodyLen/3 用整数除法（经验 token 密度，宁可高估的部分在 max_out）；max_out = min(maxTokens（nil 或 ≤ 0 时取模型
-// default_max_tokens）, 模型 max_output_tokens)；embedding 没有输出部分。返回值可能为 0，「至少 1 分」由调用方取 max。
-func EstimateFen(m Model, bodyLen int, maxTokens *int) int64 {
-	micro := int64(bodyLen/3) * m.InputPrice
-	if m.Kind != KindEmbedding {
-		out := m.DefaultMaxTokens
-		if maxTokens != nil && *maxTokens > 0 {
-			out = *maxTokens
-		}
-		out = min(out, m.MaxOutputTokens)
-		micro += int64(out) * m.OutputPrice
+// OutputBudget 一次对话 / 补全请求最多产出的输出 token（预算预检与 TPM 预占共用）：
+// min(maxTokens（nil 或 ≤ 0 时取模型 max_output_tokens——网关此时向上游注入 max_tokens = max_output_tokens）, max_output_tokens)
+// × max(fanout, 1)（fanout = max(n, best_of)，每个候选各自生成）。embedding 没有输出，返回 0。
+func OutputBudget(m Model, maxTokens *int, fanout int) int {
+	if m.Kind == KindEmbedding {
+		return 0
 	}
+	out := m.MaxOutputTokens
+	if maxTokens != nil && *maxTokens > 0 {
+		out = min(*maxTokens, m.MaxOutputTokens)
+	}
+	return out * max(fanout, 1)
+}
+
+// EstimateFen 预算预检的本次估算（分，规格 T2）：ceil((bodyLen/3 × input_price + OutputBudget × output_price) / 10^6)。
+// bodyLen/3 用整数除法（经验 token 密度，宁可高估的部分在输出）；输出部分见 OutputBudget；embedding 没有输出部分。
+// 返回值可能为 0，「至少 1 分」由调用方取 max。
+func EstimateFen(m Model, bodyLen int, maxTokens *int, fanout int) int64 {
+	micro := int64(bodyLen/3) * m.InputPrice
+	micro += int64(OutputBudget(m, maxTokens, fanout)) * m.OutputPrice
 	return ceilFen(micro)
 }
 

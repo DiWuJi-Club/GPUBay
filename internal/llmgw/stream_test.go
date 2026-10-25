@@ -157,6 +157,51 @@ func TestUpstreamBodyInjection(t *testing.T) {
 	}
 }
 
+func TestCheckOutputBoundsAndMaxTokensInjection(t *testing.T) {
+	m := llm.Model{Kind: llm.KindChat, MaxOutputTokens: 100}
+	// 都没给：注入 max_tokens，与 include_usage 注入叠加
+	body := []byte(`{"model":"m","stream":true,"n":3,"best_of":5}`)
+	p, _ := parseRequest(body)
+	if msg := checkOutputBounds(&p, m); msg != "" || p.injectMaxTokens != 100 || p.fanout != 5 {
+		t.Fatalf("msg %q inject %d fanout %d", msg, p.injectMaxTokens, p.fanout)
+	}
+	out, err := upstreamBody(body, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(out, &got)
+	if got["max_tokens"] != float64(100) || got["stream_options"].(map[string]any)["include_usage"] != true || got["n"] != float64(3) {
+		t.Fatalf("patched body %s", out)
+	}
+	// 给了任一字段：不注入；null 视为未给
+	for _, b := range []string{`{"model":"m","max_tokens":100}`, `{"model":"m","max_completion_tokens":1}`, `{"model":"m","max_tokens":0}`} {
+		p, _ := parseRequest([]byte(b))
+		if msg := checkOutputBounds(&p, m); msg != "" || p.injectMaxTokens != 0 || p.fanout != 1 {
+			t.Fatalf("%s: msg %q inject %d fanout %d", b, msg, p.injectMaxTokens, p.fanout)
+		}
+		if out, _ := upstreamBody([]byte(b), p); string(out) != b {
+			t.Fatalf("%s rewritten: %s", b, out)
+		}
+	}
+	p, _ = parseRequest([]byte(`{"model":"m","max_tokens":null,"n":null}`))
+	if msg := checkOutputBounds(&p, m); msg != "" || p.injectMaxTokens != 100 || p.fanout != 1 {
+		t.Fatalf("null fields: msg %q inject %d fanout %d", msg, p.injectMaxTokens, p.fanout)
+	}
+	for b, want := range map[string]string{
+		`{"model":"m","max_tokens":101}`:                           "max_tokens 不能超过该模型的最大输出 100",
+		`{"model":"m","max_tokens":5,"max_completion_tokens":101}`: "max_completion_tokens 不能超过该模型的最大输出 100",
+		`{"model":"m","n":9}`:                                      "n 不能超过 8",
+		`{"model":"m","best_of":9}`:                                "best_of 不能超过 8",
+		`{"model":"m","best_of":1.5}`:                              "best_of 必须是整数",
+	} {
+		p, _ := parseRequest([]byte(b))
+		if msg := checkOutputBounds(&p, m); msg != want {
+			t.Fatalf("%s: msg %q, want %q", b, msg, want)
+		}
+	}
+}
+
 // readEvents 读完 SSE 响应体，返回原始字节与内容块数。
 func contentChunks(raw []byte) int {
 	n := 0
@@ -226,7 +271,7 @@ func TestGatewayStreamPassthroughAndUsage(t *testing.T) {
 	}
 
 	// 客户端自己带了 include_usage=true：请求体原样转发
-	body2 := chatBody("st-chat", `"stream":true`, `"stream_options":{"include_usage":true}`)
+	body2 := chatBody("st-chat", `"stream":true`, `"stream_options":{"include_usage":true}`, `"max_completion_tokens":32`)
 	resp2, got2 := e.post("/v1/chat/completions", key, body2)
 	if resp2.StatusCode != http.StatusOK || !bytes.Equal(fake.Recorded()[1].Body, []byte(body2)) {
 		t.Fatalf("body rewritten: %s", fake.Recorded()[1].Body)

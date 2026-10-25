@@ -3,7 +3,9 @@ package llmgw
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"spark-cloud/internal/llm"
@@ -78,8 +80,13 @@ type parsedRequest struct {
 	top          map[string]json.RawMessage
 	model        string
 	stream       bool
-	maxTokens    *int // max_completion_tokens 优先，其次 max_tokens
-	includeUsage bool // stream_options.include_usage == true
+	maxTokens    *int           // max_completion_tokens 优先，其次 max_tokens
+	maxFields    map[string]int // 实际给出的 max_tokens / max_completion_tokens（逐个检查上界）
+	includeUsage bool           // stream_options.include_usage == true
+
+	// 以下由 checkOutputBounds 填写（只对对话 / 补全端点）
+	fanout          int // max(n, best_of, 1)：估算的输出部分乘以它
+	injectMaxTokens int // > 0：上游请求体注入 max_tokens = 该值（客户端两个字段都没给）
 }
 
 // parseRequest 解析顶层字段：model 必须是字符串；stream 布尔；max_tokens / max_completion_tokens 整数；
@@ -113,6 +120,10 @@ func parseRequest(body []byte) (parsedRequest, string) {
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return p, f + " 必须是整数"
 		}
+		if p.maxFields == nil {
+			p.maxFields = map[string]int{}
+		}
+		p.maxFields[f] = n
 		if f == "max_completion_tokens" || p.maxTokens == nil {
 			p.maxTokens = &n
 		}
@@ -133,28 +144,70 @@ func parseRequest(body []byte) (parsedRequest, string) {
 
 func isNull(raw json.RawMessage) bool { return strings.TrimSpace(string(raw)) == "null" }
 
-// upstreamBody 返回转发给节点的请求体：流式且没带 stream_options.include_usage=true 时注入（规格 T11，
-// 顶层 map[string]json.RawMessage 补丁后重新编码，字段顺序变化无害）；否则原样。
-func upstreamBody(body []byte, p parsedRequest) ([]byte, error) {
-	if !p.stream || p.includeUsage {
-		return body, nil
-	}
-	so := map[string]json.RawMessage{}
-	if raw, ok := p.top["stream_options"]; ok && !isNull(raw) {
-		if err := json.Unmarshal(raw, &so); err != nil {
-			return nil, err
+// maxFanout n / best_of 的上限：超过直接 400（估算的输出部分按它们放大，放任不管会把预检打穿）。
+const maxFanout = 8
+
+// checkOutputBounds 对话 / 补全端点的输出上界（embeddings 不调用）：max_tokens / max_completion_tokens 任一 > 模型
+// max_output_tokens → 400；两者都没给 → 上游注入 max_tokens = max_output_tokens（vLLM 不给时按上下文剩余长度生成，
+// 估算就没有上界）；n / best_of 须是整数且 ≤ 8，fanout = max(n, best_of, 1)。失败返回给用户看的中文消息。
+func checkOutputBounds(p *parsedRequest, m llm.Model) string {
+	for _, f := range []string{"max_tokens", "max_completion_tokens"} {
+		if n, ok := p.maxFields[f]; ok && n > m.MaxOutputTokens {
+			return fmt.Sprintf("%s 不能超过该模型的最大输出 %d", f, m.MaxOutputTokens)
 		}
 	}
-	so["include_usage"] = json.RawMessage("true")
-	b, err := json.Marshal(so)
-	if err != nil {
-		return nil, err
+	if len(p.maxFields) == 0 {
+		p.injectMaxTokens = m.MaxOutputTokens
 	}
-	top := make(map[string]json.RawMessage, len(p.top)+1)
+	p.fanout = 1
+	for _, f := range []string{"n", "best_of"} {
+		raw, ok := p.top[f]
+		if !ok || isNull(raw) {
+			continue
+		}
+		var n int
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return f + " 必须是整数"
+		}
+		if n > maxFanout {
+			return fmt.Sprintf("%s 不能超过 %d", f, maxFanout)
+		}
+		p.fanout = max(p.fanout, n)
+	}
+	return ""
+}
+
+// upstreamBody 返回转发给节点的请求体。网关只做两处改写，此外请求体一律原样转发：
+//   - 流式且没带 stream_options.include_usage=true 时注入 include_usage（规格 T11）；
+//   - 客户端没给 max_tokens / max_completion_tokens 时注入 max_tokens = 模型 max_output_tokens（见 checkOutputBounds）。
+//
+// 改写是顶层 map[string]json.RawMessage 的字段级补丁后重新编码（字段顺序变化无害）；不需要改写时原样返回。
+func upstreamBody(body []byte, p parsedRequest) ([]byte, error) {
+	needUsage := p.stream && !p.includeUsage
+	if !needUsage && p.injectMaxTokens <= 0 {
+		return body, nil
+	}
+	top := make(map[string]json.RawMessage, len(p.top)+2)
 	for k, v := range p.top {
 		top[k] = v
 	}
-	top["stream_options"] = b
+	if needUsage {
+		so := map[string]json.RawMessage{}
+		if raw, ok := p.top["stream_options"]; ok && !isNull(raw) {
+			if err := json.Unmarshal(raw, &so); err != nil {
+				return nil, err
+			}
+		}
+		so["include_usage"] = json.RawMessage("true")
+		b, err := json.Marshal(so)
+		if err != nil {
+			return nil, err
+		}
+		top["stream_options"] = b
+	}
+	if p.injectMaxTokens > 0 {
+		top["max_tokens"] = json.RawMessage(strconv.Itoa(p.injectMaxTokens))
+	}
 	return json.Marshal(top)
 }
 

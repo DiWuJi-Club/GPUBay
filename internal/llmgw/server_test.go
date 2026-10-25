@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -217,7 +218,7 @@ func TestGatewayBudgetPrecheck(t *testing.T) {
 	fake := &llmtest.FakeVLLM{Delay: 400 * time.Millisecond}
 	e.node(m, fake, "")
 	body := chatBody("budget")
-	need := max(llm.EstimateFen(m, len(body), nil), 1)
+	need := max(llm.EstimateFen(m, len(body), nil, 1), 1)
 
 	poor := e.user(0)
 	pk, _ := e.key(poor)
@@ -293,8 +294,16 @@ func TestGatewayNonStreamUsageAndPassthrough(t *testing.T) {
 	if !bytes.Equal(got, rec[0].Sent) {
 		t.Fatalf("body not passed through:\n got %s\nwant %s", got, rec[0].Sent)
 	}
-	if !bytes.Equal(rec[0].Body, []byte(body)) {
-		t.Fatalf("non-stream body rewritten: %s", rec[0].Body)
+	// 没给 max_tokens：只注入 max_tokens = max_output_tokens，其它字段不变
+	var sentBody, origBody map[string]any
+	_ = json.Unmarshal(rec[0].Body, &sentBody)
+	_ = json.Unmarshal([]byte(body), &origBody)
+	if sentBody["max_tokens"] != float64(m.MaxOutputTokens) {
+		t.Fatalf("max_tokens not injected: %s", rec[0].Body)
+	}
+	delete(sentBody, "max_tokens")
+	if !reflect.DeepEqual(sentBody, origBody) {
+		t.Fatalf("non-stream body rewritten beyond max_tokens: %s", rec[0].Body)
 	}
 	if rec[0].Path != "/v1/chat/completions" || !strings.HasPrefix(rec[0].Authorization, "Bearer nodekey-") {
 		t.Fatalf("upstream path %q auth %q", rec[0].Path, rec[0].Authorization)
@@ -648,21 +657,126 @@ func TestGatewayTimeouts(t *testing.T) {
 		t.Fatalf("ttft usage row %+v", row)
 	}
 
-	// 流式进行中总超时：写期限多留 WriteGrace，error 事件仍写得出去；upstream_timeout 不收费
+	// 流式进行中总超时、已交付内容：写期限多留 WriteGrace，error 事件仍写得出去；按已交付的计费
+	// （status ok、estimated、prompt = len(body)/3、completion = 内容块数、http 200）
 	long := e.model("to-long", llm.KindChat)
 	chunks := make([]string, 50)
 	for i := range chunks {
 		chunks[i] = "z"
 	}
 	e.node(long, &llmtest.FakeVLLM{Chunks: chunks, Delay: 100 * time.Millisecond}, "")
-	r, got := e.post("/v1/chat/completions", key, chatBody("to-long", `"stream":true`))
+	longBody := chatBody("to-long", `"stream":true`)
+	r, got := e.post("/v1/chat/completions", key, longBody)
 	if r.StatusCode != http.StatusOK || !strings.Contains(string(got), `"code":"upstream_timeout"`) {
 		t.Fatalf("total timeout stream: %d tail %q", r.StatusCode, got[max(0, len(got)-200):])
 	}
+	delivered := contentChunks(got)
+	if delivered == 0 || delivered >= len(chunks) {
+		t.Fatalf("delivered %d chunks", delivered)
+	}
+	row := e.usageRow(r.Header.Get("X-Request-Id"))
+	if row.Status != llm.UsageOK || !row.Estimated || row.HTTPStatus != http.StatusOK || row.PromptTokens != len(longBody)/3 ||
+		row.CompletionTokens != delivered || row.CostMicro != llm.Cost(long, len(longBody)/3, delivered) || row.CostMicro == 0 {
+		t.Fatalf("total timeout after content usage row %+v (delivered %d)", row, delivered)
+	}
+
+	// 总超时、一个内容块都没交付（只有角色块）：upstream_timeout、不收费
+	stall := e.model("to-stall", llm.KindChat)
+	e.node(stall, &llmtest.FakeVLLM{Chunks: []string{"z"}, Delay: 3 * time.Second}, "")
+	r, got = e.post("/v1/chat/completions", key, chatBody("to-stall", `"stream":true`))
+	if r.StatusCode != http.StatusOK || !strings.Contains(string(got), `"code":"upstream_timeout"`) || contentChunks(got) != 0 {
+		t.Fatalf("total timeout without content: %d %q", r.StatusCode, got)
+	}
 	if row := e.usageRow(r.Header.Get("X-Request-Id")); row.Status != llm.UsageUpstreamTimeout || row.CostMicro != 0 {
-		t.Fatalf("total timeout usage row %+v", row)
+		t.Fatalf("total timeout without content usage row %+v", row)
 	}
 }
+
+func TestGatewayOutputBounds(t *testing.T) {
+	e := newGEnv(t)
+	m := e.model("ob-chat", llm.KindChat) // max_output_tokens 8192
+	emb := e.model("ob-embed", llm.KindEmbedding)
+	fake := &llmtest.FakeVLLM{PromptTokens: 3, CompletionTokens: 2, Chunks: []string{"x"}}
+	e.node(m, fake, "")
+	e.node(emb, &llmtest.FakeVLLM{PromptTokens: 3}, "")
+	_, key := e.userKey()
+
+	// 拒绝：超过模型最大输出、n / best_of > 8 或不是整数；都不到节点、不记用量
+	for name, c := range map[string]struct{ path, body, msg string }{
+		"max_tokens":            {"/v1/chat/completions", chatBody("ob-chat", `"max_tokens":8193`), "max_tokens 不能超过该模型的最大输出 8192"},
+		"max_completion_tokens": {"/v1/chat/completions", chatBody("ob-chat", `"max_tokens":10`, `"max_completion_tokens":9000`), "max_completion_tokens 不能超过该模型的最大输出 8192"},
+		"completions max":       {"/v1/completions", `{"model":"ob-chat","prompt":"x","max_tokens":100000}`, "max_tokens 不能超过该模型的最大输出 8192"},
+		"n":                     {"/v1/chat/completions", chatBody("ob-chat", `"n":9`), "n 不能超过 8"},
+		"best_of":               {"/v1/completions", `{"model":"ob-chat","prompt":"x","best_of":9}`, "best_of 不能超过 8"},
+		"n not int":             {"/v1/chat/completions", chatBody("ob-chat", `"n":"2"`), "n 必须是整数"},
+	} {
+		r, b := e.post(c.path, key, c.body)
+		d := expectErr(t, r, b, http.StatusBadRequest, codeInvalidRequest)
+		if d.Message != c.msg {
+			t.Fatalf("%s: message %q, want %q", name, d.Message, c.msg)
+		}
+	}
+	if fake.Count() != 0 || e.usageCount() != 0 {
+		t.Fatalf("rejected requests reached node (%d) or recorded usage (%d)", fake.Count(), e.usageCount())
+	}
+
+	// 注入：两个字段都没给 → max_tokens = 8192（对话与补全端点）；给了 = 原样（边界值 8192 放行）
+	if r, b := e.post("/v1/chat/completions", key, chatBody("ob-chat", `"n":8`)); r.StatusCode != http.StatusOK {
+		t.Fatalf("chat without max_tokens: %d %s", r.StatusCode, b)
+	}
+	if r, b := e.post("/v1/completions", key, `{"model":"ob-chat","prompt":"x"}`); r.StatusCode != http.StatusOK {
+		t.Fatalf("completions without max_tokens: %d %s", r.StatusCode, b)
+	}
+	given := chatBody("ob-chat", `"max_tokens":8192`)
+	if r, b := e.post("/v1/chat/completions", key, given); r.StatusCode != http.StatusOK {
+		t.Fatalf("max_tokens at limit: %d %s", r.StatusCode, b)
+	}
+	onlyCompletion := chatBody("ob-chat", `"max_completion_tokens":16`)
+	if r, b := e.post("/v1/chat/completions", key, onlyCompletion); r.StatusCode != http.StatusOK {
+		t.Fatalf("max_completion_tokens only: %d %s", r.StatusCode, b)
+	}
+	rec := fake.Recorded()
+	for i, want := range []float64{8192, 8192} {
+		var sent map[string]any
+		_ = json.Unmarshal(rec[i].Body, &sent)
+		if sent["max_tokens"] != want {
+			t.Fatalf("request %d: max_tokens not injected: %s", i, rec[i].Body)
+		}
+	}
+	if !bytes.Equal(rec[2].Body, []byte(given)) || !bytes.Equal(rec[3].Body, []byte(onlyCompletion)) {
+		t.Fatalf("client max_tokens rewritten: %s / %s", rec[2].Body, rec[3].Body)
+	}
+	// embeddings 不受影响：n 不检查、不注入
+	embBody := `{"model":"ob-embed","input":"hi","n":20}`
+	if r, b := e.post("/v1/embeddings", key, embBody); r.StatusCode != http.StatusOK {
+		t.Fatalf("embeddings with n: %d %s", r.StatusCode, b)
+	}
+
+	// 估算的输出部分 × max(n, best_of, 1)：4096 × 400 ≈ 2 分 / 份；余额 3 分够 n=1、不够 n=2
+	b1 := chatBody("ob-chat", `"max_tokens":4096`)
+	b2 := chatBody("ob-chat", `"max_tokens":4096`, `"n":2`)
+	need1 := max(llm.EstimateFen(m, len(b1), intPtr(4096), 1), 1)
+	need2 := max(llm.EstimateFen(m, len(b2), intPtr(4096), 2), 1)
+	if need1 != 2 || need2 != 4 {
+		t.Fatalf("estimates %d / %d, want 2 / 4", need1, need2)
+	}
+	u1 := e.user(3)
+	k1, _ := e.key(u1)
+	if r, b := e.post("/v1/chat/completions", k1, b1); r.StatusCode != http.StatusOK {
+		t.Fatalf("n=1 with 3 fen: %d %s", r.StatusCode, b)
+	}
+	u2 := e.user(3)
+	k2, _ := e.key(u2)
+	r, b := e.post("/v1/chat/completions", k2, b2)
+	if d := expectErr(t, r, b, http.StatusPaymentRequired, codeInsufficientQuota); !strings.Contains(d.Message, "¥0.04") {
+		t.Fatalf("n=2 message %q", d.Message)
+	}
+	// best_of 同样放大
+	r, b = e.post("/v1/completions", k2, `{"model":"ob-chat","prompt":"x","max_tokens":4096,"best_of":2}`)
+	expectErr(t, r, b, http.StatusPaymentRequired, codeInsufficientQuota)
+}
+
+func intPtr(n int) *int { return &n }
 
 func TestGatewayBudgetCountsRecentUsage(t *testing.T) {
 	e := newGEnv(t)
