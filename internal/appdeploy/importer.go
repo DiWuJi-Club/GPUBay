@@ -8,7 +8,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/platform/apperr"
@@ -23,6 +26,7 @@ type appJSON struct {
 	Category    string   `json:"category"`
 	Icon        string   `json:"icon"`
 	Sort        int      `json:"sort"`
+	Internal    bool     `json:"internal"` // 平台内部应用：新建时写入；已有应用只会被置为 true，不会被清除
 	Version     string   `json:"version"`
 	Images      []string `json:"images"`
 	Changelog   string   `json:"changelog"`
@@ -32,7 +36,7 @@ type ImportResult struct {
 	Slug    string
 	Version string
 	Created bool   // true = 新建了应用；false = 只给已有应用加了版本
-	Skipped string // 非空 = 未导入及原因（符号链接）
+	Skipped string // 非空 = 未导入及原因（符号链接；已有应用的同版本且内容相同）
 }
 
 // maxImportJSON 是 app.json / spec.json 的大小上限（读之前先 stat）。
@@ -44,7 +48,7 @@ type errSymlink struct{ name string }
 func (e errSymlink) Error() string { return e.name + " 是符号链接，已跳过" }
 
 // ImportDir 按目录名顺序导入 dir 下每个 <slug>/{app.json, spec.json, app.sh}：slug 不存在 → 建 draft 应用 + draft 版本；
-// 已存在 → 只建 draft 版本（版本号重复报错）。导入不发布。符号链接的目录或文件跳过（结果里带 Skipped 原因）；
+// 已存在 → 只建 draft 版本（版本号已存在：内容相同则跳过，不同则报错）。导入不发布。符号链接的目录或文件跳过（结果里带 Skipped 原因）；
 // 某个目录失败时返回错误，之前导入的保留。
 func (c *Catalog) ImportDir(ctx context.Context, actor audit.Actor, dir string) ([]ImportResult, error) {
 	entries, err := os.ReadDir(dir) // 已按文件名排序
@@ -136,14 +140,50 @@ func (c *Catalog) importApp(ctx context.Context, actor audit.Actor, dir, slug st
 	app, err := c.AppBySlug(ctx, slug)
 	if errors.Is(err, apperr.ErrNotFound) {
 		app, err = c.CreateApp(ctx, actor, AppInput{Slug: slug, Name: meta.Name, Summary: meta.Summary, Description: meta.Description,
-			Category: meta.Category, Icon: meta.Icon, Sort: meta.Sort, Status: StatusDraft})
+			Category: meta.Category, Icon: meta.Icon, Sort: meta.Sort, Status: StatusDraft, Internal: meta.Internal})
 		res.Created = err == nil
 	}
 	if err != nil {
 		return ImportResult{}, err
 	}
+	if !res.Created && meta.Internal && !app.Internal {
+		// 早于 internal 字段导入的已有应用（如 vllm-node）：补标为内部应用；只置 true、从不清除
+		if err := c.markInternal(ctx, actor, app); err != nil {
+			return ImportResult{}, err
+		}
+	}
+	if !res.Created {
+		// 已有部署升级时会把整个 deploy/apps 重新导入：同版本号且内容（spec + 脚本 + 镜像）相同 → 跳过，继续导入后面的应用；
+		// 内容不同 → 报错提醒提高版本号（已发布版本冻结，不能静默覆盖）
+		var oldHash string
+		var oldImages []int64
+		err := c.pool.QueryRow(ctx, `SELECT spec_hash, image_ids FROM app_versions WHERE app_id = $1 AND version = $2`, app.ID, meta.Version).
+			Scan(&oldHash, &oldImages)
+		switch {
+		case err == nil && oldHash == hash && slices.Equal(oldImages, in.ImageIDs):
+			res.Skipped = "版本 " + meta.Version + " 已存在且内容相同，已跳过"
+			return res, nil
+		case err == nil:
+			return ImportResult{}, fmt.Errorf("版本 %s 已存在且内容不同：请在 app.json 里提高版本号", meta.Version)
+		case !db.IsNoRows(err):
+			return ImportResult{}, err
+		}
+	}
 	if _, err := c.insertVersion(ctx, actor, app.ID, in, norm, hash); err != nil {
 		return ImportResult{}, err
 	}
 	return res, nil
+}
+
+// markInternal 把已有应用标为内部应用（导入时 app.json 的 internal=true 而库里是 false），记审计。
+func (c *Catalog) markInternal(ctx context.Context, actor audit.Actor, app App) error {
+	return db.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+		now := c.clock.Now()
+		tag, err := tx.Exec(ctx, `UPDATE apps SET internal = true, updated_at = $2 WHERE id = $1 AND NOT internal`, app.ID, now)
+		if err != nil || tag.RowsAffected() == 0 {
+			return err
+		}
+		return audit.Record(ctx, tx, now, actor.Entry("app.update", "app", appTarget(app.ID),
+			map[string]any{"before": map[string]any{"internal": false}, "after": map[string]any{"internal": true}, "source": "import"}))
+	})
 }

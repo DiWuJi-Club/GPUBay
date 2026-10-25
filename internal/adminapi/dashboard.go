@@ -107,11 +107,17 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"recharge_today": rechargeToday, "recharge_month": rechargeMonth, "order_today": orderToday, "order_month": orderMonth,
 		"utilization": util, "ssh_sessions_open": sshOpen, "bookings_upcoming_7d": upcoming7,
 		"referral_month_settled": refMonth,
-		"apps_installing":        appsInstalling,
-		"apps_running":           appsRunning,
-		"apps_failed_24h":        appsFailed24h,
-		"workflow_installs":      wfInstalls,
-		"workflow_runs_24h":      wfRuns24h,
+		"apps_installing":        appsInstalling, "apps_running": appsRunning, "apps_failed_24h": appsFailed24h,
+		"workflow_installs": wfInstalls, "workflow_runs_24h": wfRuns24h,
+	}
+	if s.LLM != nil { // 计划 9：Token 商城卡片（= /llm/summary 的子集）
+		sum, err := s.LLM.AdminSummary(ctx)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		out["llm"] = map[string]any{"nodes_ready": sum.Nodes.Ready, "nodes_total": sum.Nodes.Total, "nodes_unhealthy": sum.Nodes.Unhealthy,
+			"today_requests": sum.Today.Requests, "today_settled_amount": sum.Today.SettledAmount}
 	}
 	if err := s.addButlerDashboard(ctx, now, out); err != nil {
 		s.writeError(w, r, err)

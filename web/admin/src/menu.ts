@@ -30,6 +30,7 @@ export const menu: MenuItem[] = [
   { key: 'apps', path: '/apps', label: '应用', roles: ALL_ROLES },
   { key: 'deployments', path: '/deployments', label: '应用部署', roles: ALL_ROLES },
   { key: 'workflows', path: '/workflows', label: '工作流', roles: ALL_ROLES },
+  { key: 'llm', path: '/llm', label: 'Token 商城', roles: ALL_ROLES },
   { key: 'butler', path: '/butler', label: 'AI 管家', roles: ALL_ROLES },
   { key: 'catalog', path: '/catalog', label: '价格与镜像', roles: SUPER_ONLY },
   { key: 'admins', path: '/admins', label: '管理员', roles: SUPER_ONLY },

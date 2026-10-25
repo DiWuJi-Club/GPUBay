@@ -24,17 +24,36 @@ type Group struct {
 	Description string    `json:"description"`
 	Sort        int       `json:"sort"`
 	Visible     bool      `json:"visible"`
+	Purpose     string    `json:"purpose"` // rental（普通机组）/ llm（Token 服务池，唯一、不可见，规格 §3.3）
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// 机组用途（machine_groups.purpose）。
+const (
+	GroupPurposeRental = "rental"
+	GroupPurposeLLM    = "llm"
+)
+
+// GroupInput 建 / 改机组的输入。Purpose：建组时空 = rental，只能是 rental（池由迁移建好，不能经接口创建）；
+// 改组时空 = 不改，非空且与现值不同 → 拒绝（用途不可修改）。
 type GroupInput struct {
 	Name        string
 	Region      string
 	Description string
 	Sort        int
 	Visible     bool
+	Purpose     string
 }
+
+var (
+	errCreateLLMGroup   = apperr.BadRequest("不能创建 Token 服务池机组")
+	errPoolVisible      = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能对用户可见", apperr.ErrInvalidState.Status)
+	errPurposeImmutable = apperr.New(apperr.ErrInvalidState.Code, "机组用途不能修改", apperr.ErrInvalidState.Status)
+	errPoolRename       = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能改名", apperr.ErrInvalidState.Status)
+	// ErrPoolNotDeletable Token 服务池不能删除（rental.AdminDeleteGroup 锁住机组行后先判断，早于 group_not_empty）。
+	ErrPoolNotDeletable = apperr.New(apperr.ErrInvalidState.Code, "Token 服务池不能删除", apperr.ErrInvalidState.Status)
+)
 
 // GroupRow 列表行：机组加机器数与现空闲台数。
 type GroupRow struct {
@@ -43,11 +62,11 @@ type GroupRow struct {
 	IdleNow      int `json:"idle_now"`
 }
 
-const groupCols = `id, name, region, description, sort, visible, created_at, updated_at`
+const groupCols = `id, name, region, description, sort, visible, purpose, created_at, updated_at`
 
 func scanGroup(row pgx.Row) (Group, error) {
 	var g Group
-	err := row.Scan(&g.ID, &g.Name, &g.Region, &g.Description, &g.Sort, &g.Visible, &g.CreatedAt, &g.UpdatedAt)
+	err := row.Scan(&g.ID, &g.Name, &g.Region, &g.Description, &g.Sort, &g.Visible, &g.Purpose, &g.CreatedAt, &g.UpdatedAt)
 	if db.IsNoRows(err) {
 		return Group{}, apperr.ErrGroupNotFound
 	}
@@ -132,7 +151,7 @@ func (s *Service) ListGroups(ctx context.Context, visibleOnly bool, productID *i
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (GroupRow, error) {
 		var g GroupRow
-		err := r.Scan(&g.ID, &g.Name, &g.Region, &g.Description, &g.Sort, &g.Visible, &g.CreatedAt, &g.UpdatedAt, &g.MachineCount, &g.IdleNow)
+		err := r.Scan(&g.ID, &g.Name, &g.Region, &g.Description, &g.Sort, &g.Visible, &g.Purpose, &g.CreatedAt, &g.UpdatedAt, &g.MachineCount, &g.IdleNow)
 		return g, err
 	})
 }
@@ -141,10 +160,27 @@ func (s *Service) GetGroup(ctx context.Context, q db.Querier, id int64) (Group, 
 	return scanGroup(q.QueryRow(ctx, `SELECT `+groupCols+` FROM machine_groups WHERE id = $1`, id))
 }
 
+// LLMPoolGroupID 返回 Token 服务池（purpose='llm'，迁移建好的唯一一个）的 ID；不存在 → apperr.ErrNotFound。
+func (s *Service) LLMPoolGroupID(ctx context.Context, q db.Querier) (int64, error) {
+	var id int64
+	err := q.QueryRow(ctx, `SELECT id FROM machine_groups WHERE purpose = 'llm'`).Scan(&id)
+	if db.IsNoRows(err) {
+		return 0, apperr.ErrNotFound
+	}
+	return id, err
+}
+
 func (s *Service) CreateGroup(ctx context.Context, actor audit.Actor, in GroupInput) (Group, error) {
 	in, err := in.normalize()
 	if err != nil {
 		return Group{}, err
+	}
+	switch in.Purpose {
+	case "", GroupPurposeRental:
+	case GroupPurposeLLM:
+		return Group{}, errCreateLLMGroup
+	default:
+		return Group{}, apperr.BadRequest("机组用途无效")
 	}
 	now := s.clock.Now()
 	var g Group
@@ -176,6 +212,15 @@ func (s *Service) UpdateGroup(ctx context.Context, actor audit.Actor, id int64, 
 		if err != nil {
 			return err
 		}
+		if in.Purpose != "" && in.Purpose != before.Purpose {
+			return errPurposeImmutable
+		}
+		if before.Purpose == GroupPurposeLLM && in.Visible {
+			return errPoolVisible
+		}
+		if before.Purpose == GroupPurposeLLM && in.Name != before.Name {
+			return errPoolRename
+		}
 		g, err = scanGroup(tx.QueryRow(ctx, `UPDATE machine_groups SET name = $2, region = $3, description = $4, sort = $5, visible = $6, updated_at = $7
 			WHERE id = $1 RETURNING `+groupCols, id, in.Name, in.Region, in.Description, in.Sort, in.Visible, now))
 		if db.IsUniqueViolation(err) {
@@ -190,11 +235,19 @@ func (s *Service) UpdateGroup(ctx context.Context, actor audit.Actor, id int64, 
 	return g, err
 }
 
-// DeleteGroupIn 删除没有机器的机组（实例引用由 rental.AdminDeleteGroup 在同一事务里先检查）。
+// DeleteGroupIn 删除没有机器的机组（实例引用由 rental.AdminDeleteGroup 在同一事务里先检查）；Token 服务池不能删除。
 func (s *Service) DeleteGroupIn(ctx context.Context, q db.Querier, id int64) error {
+	var purpose string
 	var machines int
-	if err := q.QueryRow(ctx, `SELECT count(*) FROM machines WHERE group_id = $1`, id).Scan(&machines); err != nil {
+	err := q.QueryRow(ctx, `SELECT purpose, (SELECT count(*) FROM machines WHERE group_id = $1) FROM machine_groups WHERE id = $1`, id).Scan(&purpose, &machines)
+	if db.IsNoRows(err) {
+		return apperr.ErrGroupNotFound
+	}
+	if err != nil {
 		return err
+	}
+	if purpose == GroupPurposeLLM {
+		return ErrPoolNotDeletable
 	}
 	if machines > 0 {
 		return apperr.ErrGroupNotEmpty
@@ -242,6 +295,9 @@ func (s *Service) AssignMachines(ctx context.Context, actor audit.Actor, groupID
 		if len(previous) != len(ids) {
 			return apperr.BadRequest("有机器不存在")
 		}
+		if err := poolLeaveBusy(ctx, tx, ids, &groupID); err != nil {
+			return err
+		}
 		// 机组在 GetGroup 之后被并发删除时外键检查失败，按机组不存在处理。
 		if _, err := tx.Exec(ctx, `UPDATE machines SET group_id = $1, updated_at = $3 WHERE id = ANY($2)`, groupID, ids, now); err != nil {
 			if db.IsForeignKeyViolation(err) {
@@ -252,6 +308,30 @@ func (s *Service) AssignMachines(ctx context.Context, actor audit.Actor, groupID
 		return audit.Record(ctx, tx, now, actor.Entry("group.assign", "group", strconv.FormatInt(groupID, 10),
 			map[string]any{"machine_ids": ids, "previous_group_ids": previous}))
 	})
+}
+
+// poolLeaveBusy 机组变更（计划 9 规格 §3.3）：ids 中当前在 Token 服务池（purpose='llm'）、且将离开池（target 为 nil 或不是池）的机器上
+// 有未结束的系统实例或非终态节点（llm_nodes，按 SQL 读，不依赖 llm 包）→ apperr.ErrLLMPoolMachineBusy。
+// 调用方须已在本事务里对这些机器行 FOR NO KEY UPDATE：rental.PlaceSystem 也先锁机器行并复核 group_id，
+// 所以检查与改组之间不会有新的系统实例 / 节点插进来。
+func poolLeaveBusy(ctx context.Context, tx pgx.Tx, ids []int64, target *int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	var busy bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM machines m JOIN machine_groups g ON g.id = m.group_id AND g.purpose = 'llm'
+		WHERE m.id = ANY($1) AND ($2::bigint IS NULL OR g.id <> $2)
+			AND (EXISTS (SELECT 1 FROM instances i WHERE i.machine_id = m.id AND i.system
+					AND i.state IN ('creating', 'running', 'stopped', 'wiping'))
+				OR EXISTS (SELECT 1 FROM llm_nodes n WHERE n.machine_id = m.id AND n.state NOT IN ('removed', 'failed'))))`,
+		ids, target).Scan(&busy)
+	if err != nil {
+		return err
+	}
+	if busy {
+		return apperr.ErrLLMPoolMachineBusy
+	}
+	return nil
 }
 
 // UnassignMachines 把机器移出机组（只影响当前确实在该组的机器；审计只记实际移出的）。
@@ -265,7 +345,19 @@ func (s *Service) UnassignMachines(ctx context.Context, actor audit.Actor, group
 		if _, err := s.GetGroup(ctx, tx, groupID); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `UPDATE machines SET group_id = NULL, updated_at = $3 WHERE id = ANY($2) AND group_id = $1 RETURNING id`, groupID, ids, now)
+		// 先锁住确实在该组的机器（与 rental.PlaceSystem 同一把机器行锁），再查池内节点
+		rows, err := tx.Query(ctx, `SELECT id FROM machines WHERE id = ANY($2) AND group_id = $1 ORDER BY id FOR NO KEY UPDATE`, groupID, ids)
+		if err != nil {
+			return err
+		}
+		inGroup, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			return err
+		}
+		if err := poolLeaveBusy(ctx, tx, inGroup, nil); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `UPDATE machines SET group_id = NULL, updated_at = $3 WHERE id = ANY($2) AND group_id = $1 RETURNING id`, groupID, ids, now)
 		if err != nil {
 			return err
 		}
@@ -316,6 +408,9 @@ func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64
 				if _, err := s.GetGroup(ctx, tx, *groupID); err != nil {
 					return err
 				}
+			}
+			if err := poolLeaveBusy(ctx, tx, []int64{id}, groupID); err != nil {
+				return err
 			}
 		}
 		if in.DisplayName != nil {

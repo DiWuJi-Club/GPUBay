@@ -4,9 +4,9 @@ import { routes } from '../router'
 
 describe('menuFor (U-12)', () => {
   it.each([
-    ['super', 20, []],
-    ['ops', 14, ['orders', 'ledger', 'recharges', 'catalog', 'admins', 'referral']],
-    ['finance', 14, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
+    ['super', 21, []],
+    ['ops', 15, ['orders', 'ledger', 'recharges', 'catalog', 'admins', 'referral']],
+    ['finance', 15, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
   ] as const)('%s 有 %d 项', (role, count, missing) => {
     const items = menuFor(role)
     expect(items).toHaveLength(count)
@@ -52,5 +52,12 @@ describe('menuFor (U-12)', () => {
     expect(route).toBeDefined()
     expect([...(route!.meta?.roles ?? [])].sort()).toEqual(['finance', 'ops', 'super'])
     for (const role of ['super', 'ops', 'finance'] as const) expect(menuFor(role).some((m) => m.key === 'butler')).toBe(true)
+  })
+
+  it('「Token 商城」对所有角色开放（Tab 与写操作按角色显示）', () => {
+    const item = menu.find((m) => m.key === 'llm')
+    expect(item).toMatchObject({ path: '/llm', label: 'Token 商城' })
+    expect([...item!.roles].sort()).toEqual(['finance', 'ops', 'super'])
+    for (const role of ['super', 'ops', 'finance'] as const) expect(menuFor(role).some((m) => m.key === 'llm')).toBe(true)
   })
 })

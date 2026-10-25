@@ -7,6 +7,7 @@ import { bookViaApi, privateGroup, startAfter } from '../helpers/booking'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
+import { cleanupLLM, createPoolMachineAndNode, seedLLMModel } from '../helpers/llm'
 import { yuan } from '../helpers/money'
 import { comfySetup, installedRunning, installWorkflowViaApi, seedExtraWorkflows } from '../helpers/workflows'
 import { freshPublicKey, XSS, xssFired } from '../helpers/sshkeys'
@@ -37,6 +38,8 @@ const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestI
 
 // A-INS-14 / 15 部署了应用：afterEach 卸载（其余用例没有部署，清理是空操作）
 test.afterEach(cleanupApps)
+// A-INS-16 造了 Token 商城模型与平台节点：afterEach 下线模型、释放节点、机器移出池
+test.afterEach(cleanupLLM)
 const rowOf = (page: Page, id: string) => rows(page).filter({ has: page.getByTestId('ainst-id').getByText(id, { exact: true }) })
 
 test('A-INS-01 实例列表：状态 / 用户 / 机器筛选作为查询参数、地址栏预填、重置、超过一页翻页、首次加载失败可重试', async ({ page }) => {
@@ -1026,4 +1029,27 @@ test('A-INS-15 部署抽屉的工作流表：版本、有新版本、安装状�
   await row('e2e-wf-a').getByTestId('adm-dep-workflow-name').click()
   await expectAdminUrl(page, `/workflows/${s.wf.a.id}`)
   await expect(page.getByTestId('adm-wf-detail-name')).toHaveText('E2E 文生图 A')
+})
+
+test('A-INS-16 平台节点（系统实例）：列表「平台节点」标签与「不计时」，详情没有退款 / 延长 / 换机 / 改派', async ({ page }) => {
+  const m = await seedLLMModel()
+  const { machineId, instanceId } = await createPoolMachineAndNode(m)
+  await loginAdmin(page, await createAdmin('super')) // 超级管理员：普通实例上这些按钮都有（A-INS-09）
+  await page.goto(`/admin/instances?machine_id=${machineId}`)
+  const row = page.getByRole('row').filter({ has: page.getByTestId('ainst-id').getByText(instanceId, { exact: true }) })
+  await expect(row.getByTestId('ainst-system')).toHaveText('平台节点')
+  await expect(row).toContainText('不计时')
+  await row.getByTestId('ainst-id').getByText(instanceId, { exact: true }).click()
+  await expectAdminUrl(page, `/instances/${instanceId}`)
+  await expect(page.getByTestId('adetail-system')).toHaveText('平台节点')
+  await expect(page.getByTestId('adetail-remaining')).toHaveText('不计时')
+  await expect(page.getByTestId('adetail-expires')).toHaveText('不计时')
+  await expect(page.getByTestId('admin-instance-apps-system-hint')).toBeVisible()
+  for (const b of ['extend', 'migrate', 'refund', 'reassign', 'cancel-booking']) await expect(page.getByTestId(`adetail-${b}-btn`)).toHaveCount(0)
+  // 接口层同样拒绝
+  const admin = await createAdmin('super')
+  const ctx = await adminApi(admin)
+  const r = await ctx.post(`/admin/api/v1/instances/${instanceId}/extend`, { data: { seconds: 3600, reason: 'e2e' } })
+  expect(r.status()).toBe(409)
+  expect(((await r.json()) as { code: string }).code).toBe('invalid_state')
 })

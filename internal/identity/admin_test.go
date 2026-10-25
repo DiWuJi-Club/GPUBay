@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"spark-cloud/internal/audit"
@@ -23,8 +24,13 @@ func TestAdminListUsers(t *testing.T) {
 	dbtest.CreateUser(t, pool, "13900000002", false)
 	dbtest.CreateUser(t, pool, "13800000003", false)
 	all, total, err := svc.AdminListUsers(ctx, identity.UserFilter{}, paging.Page{})
+	// 迁移 00022 种子的系统账号 system:llm 默认不列出（include_system=false）
 	if err != nil || total != 3 || len(all) != 3 {
 		t.Fatalf("all = %d, %v", total, err)
+	}
+	withSystem, total, err := svc.AdminListUsers(ctx, identity.UserFilter{IncludeSystem: true}, paging.Page{})
+	if err != nil || total != 4 || !slices.ContainsFunc(withSystem, func(u identity.User) bool { return u.Phone == "system:llm" }) {
+		t.Fatalf("include_system = %d %+v, %v", total, withSystem, err)
 	}
 	if list, total, _ := svc.AdminListUsers(ctx, identity.UserFilter{Q: "13900000002"}, paging.Page{}); total != 1 || list[0].Phone != "13900000002" {
 		t.Fatalf("q=full phone = %+v", list)
@@ -35,7 +41,8 @@ func TestAdminListUsers(t *testing.T) {
 	if _, _, err := svc.AdminListUsers(ctx, identity.UserFilter{Q: "张三"}, paging.Page{}); apperr.As(err) == nil {
 		t.Fatal("non-numeric q must be rejected")
 	}
-	if list, total, _ := svc.AdminListUsers(ctx, identity.UserFilter{Q: itoa(a)}, paging.Page{}); total != 1 || list[0].ID != a {
+	// 数字 q 同时匹配 ID 与手机号尾号：系统账号占了 ID 1 后 a = 2，「2」也命中 13900000002
+	if list, _, _ := svc.AdminListUsers(ctx, identity.UserFilter{Q: itoa(a)}, paging.Page{}); !slices.ContainsFunc(list, func(u identity.User) bool { return u.ID == a }) {
 		t.Fatalf("q=id = %+v", list)
 	}
 	if _, total, _ := svc.AdminListUsers(ctx, identity.UserFilter{KYCStatus: "verified"}, paging.Page{}); total != 1 {
@@ -114,6 +121,20 @@ func TestBanAndUnban(t *testing.T) {
 	}
 	if err := svc.Ban(ctx, opsActor, 9999, "x"); !errors.Is(err, apperr.ErrNotFound) {
 		t.Fatalf("ban missing = %v", err)
+	}
+	// 系统账号（迁移 00022 的 system:llm）不能封禁，也不能做资金操作
+	var sysID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE system`).Scan(&sysID); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Ban(ctx, opsActor, sysID, "x"); !errors.Is(err, apperr.ErrInvalidState) {
+		t.Fatalf("ban system user = %v", err)
+	}
+	if err := svc.CheckNotSystem(ctx, sysID); !errors.Is(err, apperr.ErrInvalidState) {
+		t.Fatalf("CheckNotSystem(system) = %v", err)
+	}
+	if err := svc.CheckNotSystem(ctx, uid); err != nil {
+		t.Fatalf("CheckNotSystem(user) = %v", err)
 	}
 	var n int
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action IN ('user.ban', 'user.unban') AND actor_id = 4`).Scan(&n)

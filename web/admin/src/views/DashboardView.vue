@@ -3,6 +3,7 @@ import { fmtYuan, instanceStateLabel, machineStateLabel, messageOf, type Dashboa
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { barsOf, CHART } from '../logic/chart'
+import { dashLlmNodesBad } from '../logic/llm'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
 
@@ -95,6 +96,14 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
           <li><span>24 小时快速出图</span><b data-testid="dash-workflow-runs">{{ data.workflow_runs_24h ?? 0 }}</b></li>
         </ul>
         <router-link to="/workflows" class="more" data-testid="dash-workflows-link">查看工作流</router-link>
+      </el-card>
+      <el-card v-if="data.llm" header="Token 商城" data-testid="dash-llm">
+        <ul class="kv">
+          <li><span>节点就绪 / 总数</span><b><span data-testid="dash-llm-nodes-ready" :class="{ bad: dashLlmNodesBad(data.llm) }">{{ data.llm.nodes_ready }}</span> / <span data-testid="dash-llm-nodes-total">{{ data.llm.nodes_total }}</span></b></li>
+          <li><span>今日请求</span><b data-testid="dash-llm-requests">{{ data.llm.today_requests.toLocaleString('en-US') }}</b></li>
+          <li><span>今日收入（已结算）</span><b data-testid="dash-llm-income">{{ fmtYuan(data.llm.today_settled_amount) }}</b></li>
+        </ul>
+        <router-link to="/llm" class="more" data-testid="dash-llm-link">进入 Token 商城</router-link>
       </el-card>
       <!-- AI 管家（计划 12）：平台未启用管家时后端不返回这三个数字，卡片不显示 -->
       <el-card v-if="data.butler_requests_today != null" header="AI 管家（今日）">

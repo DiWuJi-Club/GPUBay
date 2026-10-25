@@ -437,7 +437,7 @@ func TestLoadLLMDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := c.LLM
+	l := c.ButlerLLM
 	if !c.Butler || c.ButlerOffReason != "" || l.Provider != "openai" || l.BaseURL != "http://token-mall.spark.internal/v1" || l.Model != "qwen3-32b" ||
 		l.MaxOutputTokens != 2048 || l.PriceInCentsPerM != 0 || l.PriceOutCentsPerM != 0 || !l.Tools || l.APIKey != "" {
 		t.Fatalf("llm defaults = %+v butler=%v reason=%q", l, c.Butler, c.ButlerOffReason)
@@ -445,8 +445,8 @@ func TestLoadLLMDefaults(t *testing.T) {
 	// 模型默认值按 provider
 	for provider, model := range map[string]string{"anthropic": "claude-opus-5-5", "mock": "mock"} {
 		c, err := config.Load(env(base("SPARK_LLM_PROVIDER", provider)))
-		if err != nil || !c.Butler || c.LLM.Model != model {
-			t.Fatalf("%s: model = %q butler=%v err=%v", provider, c.LLM.Model, c.Butler, err)
+		if err != nil || !c.Butler || c.ButlerLLM.Model != model {
+			t.Fatalf("%s: model = %q butler=%v err=%v", provider, c.ButlerLLM.Model, c.Butler, err)
 		}
 	}
 	// 显式值
@@ -456,7 +456,7 @@ func TestLoadLLMDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l := c.LLM; l.Model != "claude-x" || l.APIKey != "test-key" || l.MaxOutputTokens != 4096 || l.PriceInCentsPerM != 3600 ||
+	if l := c.ButlerLLM; l.Model != "claude-x" || l.APIKey != "test-key" || l.MaxOutputTokens != 4096 || l.PriceInCentsPerM != 3600 ||
 		l.PriceOutCentsPerM != 18000 || l.Tools || l.BaseURL != "" || !c.Butler {
 		t.Fatalf("llm values = %+v", l)
 	}
@@ -472,7 +472,7 @@ func TestLoadLLMDefaults(t *testing.T) {
 	}
 	// 生产环境配齐：BaseURL + APIKey
 	c, err = config.Load(env(prodEnv()))
-	if err != nil || !c.Butler || c.LLM.APIKey != "test-key" {
+	if err != nil || !c.Butler || c.ButlerLLM.APIKey != "test-key" {
 		t.Fatalf("prod: butler=%v err=%v", c.Butler, err)
 	}
 }
@@ -529,6 +529,46 @@ func TestLoadLLMErrors(t *testing.T) {
 	// prod 关闭管家时不要求 BaseURL / APIKey
 	if c, err := config.Load(env(prod("SPARK_BUTLER", "off", "SPARK_LLM_BASE_URL", "", "SPARK_LLM_API_KEY", ""))); err != nil || c.Butler {
 		t.Fatalf("prod butler off: butler=%v err=%v", c.Butler, err)
+	}
+}
+
+// 计划 9：Token 商城的两个开关。
+func TestLoadLLMSwitches(t *testing.T) {
+	base := func(kv ...string) map[string]string {
+		m := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	c, err := config.Load(env(base()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.LLMGateway || !c.LLMController {
+		t.Fatalf("llm defaults = gateway %v controller %v, want both on", c.LLMGateway, c.LLMController)
+	}
+	for _, tc := range []struct {
+		gw, ctl         string
+		wantGW, wantCtl bool
+	}{{"off", "on", false, true}, {"on", "off", true, false}, {"off", "off", false, false}, {"on", "on", true, true}} {
+		c, err := config.Load(env(base("SPARK_LLM_GATEWAY", tc.gw, "SPARK_LLM_CONTROLLER", tc.ctl)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.LLMGateway != tc.wantGW || c.LLMController != tc.wantCtl {
+			t.Fatalf("gateway=%s controller=%s → %v %v", tc.gw, tc.ctl, c.LLMGateway, c.LLMController)
+		}
+	}
+	for _, bad := range []map[string]string{
+		base("SPARK_LLM_GATEWAY", "true"),
+		base("SPARK_LLM_GATEWAY", "OFF"),
+		base("SPARK_LLM_CONTROLLER", "1"),
+		base("SPARK_LLM_CONTROLLER", "disabled"),
+	} {
+		if _, err := config.Load(env(bad)); err == nil || !strings.Contains(err.Error(), "SPARK_LLM_") {
+			t.Fatalf("%v: err = %v, want SPARK_LLM_* error", bad, err)
+		}
 	}
 }
 

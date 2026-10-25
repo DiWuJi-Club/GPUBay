@@ -25,6 +25,43 @@ export function yuanToCents(input: string): number | null {
   return yuan * 100 + Number((m[2] ?? '').padEnd(2, '0'))
 }
 
+// ---- 计划 9：Token 商城（价格「分 / 百万 token」，费用 cost_micro「微分」，1 分 = 10^6 微分）----
+
+const thousands = (digits: string) => digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+
+/** 单价（分 / 百万 token）→ 「¥0.50」（元，两位小数，千分位）。 */
+export function formatPricePerM(fen: number): string {
+  return fmtYuan(fen)
+}
+
+/**
+ * 费用（微分）→ 元：0 显示「¥0.00」；不足 1 分显示「< ¥0.01」；其余最多 6 位小数（四舍五入到 10^-6 元 = 100 微分），
+ * 去掉末尾的 0 但至少保留 2 位：1_250_000 → 「¥0.0125」、1_000_000 → 「¥0.01」。全程整数运算。
+ */
+export function formatMicroFen(micro: number): string {
+  const sign = micro < 0 ? '-' : ''
+  const abs = Math.abs(Math.trunc(micro))
+  if (abs === 0) return '¥0.00'
+  if (abs < 1_000_000) return '< ¥0.01' // 不足 1 分不带符号（「-< ¥0.01」没有意义）
+  const units = String(Math.round(abs / 100)).padStart(7, '0') // 10^-6 元
+  const frac = units.slice(-6).replace(/0+$/, '').padEnd(2, '0')
+  return `${sign}¥${thousands(units.slice(0, -6))}.${frac}`
+}
+
+/** token 数 → 「999」「12.3K」「2.5M」「3B」（一位小数，去掉「.0」；进位到 1000 时升一级）。 */
+export function formatTokens(n: number): string {
+  const v = Math.max(0, Math.trunc(n))
+  if (v < 1000) return String(v)
+  const units = ['K', 'M', 'B', 'T']
+  let x = v / 1000
+  let i = 0
+  while (Math.round(x * 10) / 10 >= 1000 && i < units.length - 1) {
+    x /= 1000
+    i++
+  }
+  return `${(Math.round(x * 10) / 10).toFixed(1).replace(/\.0$/, '')}${units[i]}`
+}
+
 /** 充值 / 手动入账的金额范围（分）：1 元～100 万元，与后端 billing.MinAmount / MaxAmount 一致。只在这里定义。 */
 export const RECHARGE_MIN_CENTS = 100
 export const RECHARGE_MAX_CENTS = 100_000_000

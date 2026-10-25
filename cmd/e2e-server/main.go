@@ -124,7 +124,8 @@ func run() error {
 		IngressDomain: "spark.test", PublicBaseURL: "http://spark.test:18080", SSHAddr: sshAddr, SSHPublicPort: 22, UpstreamSSHPort: upstream.Port(),
 		SSHDrainTimeout: time.Second, // 停机时不为残留会话等 30 秒（Playwright 的 gracefulShutdown 只给 20 秒）
 		// AI 管家用进程内确定性 mock（规格 §16.3）：规则表 + /hooks/butler/reply 入队的脚本化回复
-		Butler: true, LLM: config.LLMConfig{Provider: config.LLMMock, Model: "mock", MaxOutputTokens: config.DefaultLLMMaxOutputTokens, Tools: true},
+		Butler: true, ButlerLLM: config.ButlerLLMConfig{Provider: config.LLMMock, Model: "mock", MaxOutputTokens: config.DefaultLLMMaxOutputTokens, Tools: true},
+		LLMGateway: true, // 挂 /v1；Token 节点 Controller 不启动（LLMController 不适用于此进程），由 /hooks/llm/tick 驱动
 	}
 	mockLLM := mock.New()
 	clk := clock.NewFake(time.Now())
@@ -134,7 +135,7 @@ func run() error {
 		HostKeyGen:    func() (string, []byte, error) { return hostPub, hostPEM, nil },
 		AppHealthAddr: func(int) string { return healthAddr },
 		AppRootFor:    func(id string) string { return filepath.Join(appRoot, id, "root", "data") },
-		LLM:           mockLLM})
+		ButlerLLM:     mockLLM})
 	if err != nil {
 		return err
 	}
@@ -161,7 +162,7 @@ func run() error {
 	defer func() { stopGW(); <-gwErr; <-sshErr; <-loopsDone; a.Upstream.Close() }()
 	// fake ComfyUI（快速出图的上游）：/hooks/apps/seed、/hooks/workflows/seed 之后所有实例的 8188 都转到它，由 /hooks/comfy/* 控制
 	hooksSrv := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: kycSwitch, Log: log, AgentAddr: agentAddr, SSHAddr: sshAddr, Upstream: upstream,
-		HealthAddr: healthAddr, LLM: mockLLM, Comfy: comfytest.New()}
+		HealthAddr: healthAddr, ButlerLLM: mockLLM, Comfy: comfytest.New()}
 	defer hooksSrv.Close()
 
 	public, adminSrv := a.Servers(cfg) // 与 cmd/platform 完全相同的监听与路由；不启动定时清扫器，清扫由钩子触发

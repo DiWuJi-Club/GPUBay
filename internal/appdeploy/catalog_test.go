@@ -548,6 +548,43 @@ func TestImportDir(t *testing.T) {
 	}
 }
 
+// 已有部署升级时整个 deploy/apps 重新导入：已存在且内容相同的版本跳过并继续导入后面的应用（如计划 9 新增的 vllm-node）；
+// 版本号相同但内容不同仍报错（提醒提高版本号），不静默覆盖。
+func TestImportDirSkipsIdenticalExistingVersion(t *testing.T) {
+	e := newEnv(t, 0)
+	root := t.TempDir()
+	meta := func(version string) map[string]any {
+		return map[string]any{"name": "测试", "summary": "s", "category": "llm", "icon": "chat", "sort": 10, "version": version, "images": []string{"PyTorch"}, "changelog": "c"}
+	}
+	writeApp(t, root, "alpha", meta("1.0.0"))
+	if _, err := e.cat.ImportDir(e.ctx, e.actor(), root); err != nil {
+		t.Fatal(err)
+	}
+	writeApp(t, root, "beta", meta("1.0.0"))
+	res, err := e.cat.ImportDir(e.ctx, e.actor(), root)
+	if err != nil {
+		t.Fatalf("re-import: %v", err)
+	}
+	want := []appdeploy.ImportResult{{Slug: "alpha", Version: "1.0.0", Skipped: "版本 1.0.0 已存在且内容相同，已跳过"}, {Slug: "beta", Version: "1.0.0", Created: true}}
+	if !slices.Equal(res, want) {
+		t.Fatalf("re-import = %+v", res)
+	}
+	if n := e.count(`SELECT count(*) FROM app_versions`); n != 2 {
+		t.Fatalf("versions = %d, want 2", n)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "alpha", "app.sh"), []byte(goodScript+"\n# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = e.cat.ImportDir(e.ctx, e.actor(), root)
+	if err == nil || !strings.Contains(err.Error(), "alpha") || !strings.Contains(err.Error(), "内容不同") {
+		t.Fatalf("changed content, same version: %v", err)
+	}
+	if len(res) != 0 {
+		t.Fatalf("results = %+v", res)
+	}
+}
+
 // 镜像登记成 Docker Hub 全名（或省略 tag）时，与 docker image ls 的短名（Agent 上报的形态）对得上。
 func TestCoverageMatchesFamiliarRef(t *testing.T) {
 	e := newEnv(t, 2)
@@ -572,5 +609,106 @@ func TestCoverageMatchesTruncatedRef(t *testing.T) {
 	cov, err := e.cat.VersionCoverage(e.ctx, v)
 	if err != nil || len(cov) != 1 || cov[0].Cached != 1 {
 		t.Fatalf("coverage = %+v %v", cov, err)
+	}
+}
+
+// 计划 9：内部应用（apps.internal）不在用户目录里出现，后台列表照常可见并带 internal。
+func TestInternalAppHiddenFromPublished(t *testing.T) {
+	e := newEnv(t, 0)
+	pub := func(a appdeploy.App) {
+		v := e.version(a.ID, "1.0.0")
+		if _, _, err := e.cat.PublishVersion(e.ctx, e.actor(), a.ID, v.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shown := e.app("shown", appdeploy.StatusPublished)
+	pub(shown)
+	node, err := e.cat.CreateApp(e.ctx, e.actor(), appdeploy.AppInput{Slug: "vllm-node", Name: "节点", Category: "llm", Status: appdeploy.StatusPublished, Internal: true})
+	if err != nil || !node.Internal {
+		t.Fatalf("create internal = %+v, %v", node, err)
+	}
+	pub(node)
+	items, err := e.cat.ListPublished(e.ctx)
+	if err != nil || len(items) != 1 || items[0].Slug != "shown" || items[0].Internal {
+		t.Fatalf("ListPublished = %+v, %v", items, err)
+	}
+	views, err := e.svc.CatalogViews(e.ctx, false)
+	if err != nil || len(views) != 1 || views[0].Slug != "shown" {
+		t.Fatalf("CatalogViews = %+v, %v", views, err)
+	}
+	if _, err := e.svc.CatalogViewBySlug(e.ctx, "vllm-node"); codeOf(err) != "app_not_found" {
+		t.Fatalf("CatalogViewBySlug internal = %v", err)
+	}
+	// 后台：列表带 internal；UpdateApp 不改 internal（与 slug 一样创建后不变）
+	rows, err := e.cat.ListAppsAdmin(e.ctx)
+	if err != nil || len(rows) != 2 || rows[0].Internal || !rows[1].Internal {
+		t.Fatalf("ListAppsAdmin = %+v, %v", rows, err)
+	}
+	b, _ := json.Marshal(rows[1])
+	if !strings.Contains(string(b), `"internal":true`) {
+		t.Fatalf("admin row json = %s", b)
+	}
+	up, err := e.cat.UpdateApp(e.ctx, e.actor(), node.ID, appdeploy.AppInput{Name: "节点 2", Category: "llm", Status: appdeploy.StatusPublished})
+	if err != nil || !up.Internal || up.Name != "节点 2" {
+		t.Fatalf("UpdateApp = %+v, %v", up, err)
+	}
+	if got, err := e.cat.AppBySlug(e.ctx, "vllm-node"); err != nil || !got.Internal {
+		t.Fatalf("AppBySlug = %+v, %v", got, err)
+	}
+}
+
+func TestImportReadsInternal(t *testing.T) {
+	e := newEnv(t, 0)
+	root := t.TempDir()
+	writeApp(t, root, "plain", map[string]any{"name": "普通", "category": "llm", "version": "1.0.0", "images": []string{"PyTorch"}})
+	writeApp(t, root, "vllm-node", map[string]any{"name": "节点", "category": "llm", "internal": true, "version": "1.0.0", "images": []string{"PyTorch"}})
+	res, err := e.cat.ImportDir(e.ctx, e.actor(), root)
+	if err != nil || len(res) != 2 || !res[0].Created || !res[1].Created {
+		t.Fatalf("import = %+v, %v", res, err)
+	}
+	plain, err := e.cat.AppBySlug(e.ctx, "plain")
+	if err != nil || plain.Internal {
+		t.Fatalf("plain = %+v, %v", plain, err)
+	}
+	node, err := e.cat.AppBySlug(e.ctx, "vllm-node")
+	if err != nil || !node.Internal || node.Status != appdeploy.StatusDraft {
+		t.Fatalf("vllm-node = %+v, %v", node, err)
+	}
+}
+
+// 已有应用（早于 internal 字段导入）：app.json 的 internal=true 时补标为内部应用（同版本跳过也补）；internal=false 从不清除。
+func TestImportSetsInternalOnExistingApp(t *testing.T) {
+	e := newEnv(t, 0)
+	root := t.TempDir()
+	meta := map[string]any{"name": "节点", "category": "llm", "version": "1.0.0", "images": []string{"PyTorch"}}
+	writeApp(t, root, "vllm-node", meta)
+	if res, err := e.cat.ImportDir(e.ctx, e.actor(), root); err != nil || len(res) != 1 || !res[0].Created {
+		t.Fatalf("first import = %+v, %v", res, err)
+	}
+	if a, _ := e.cat.AppBySlug(e.ctx, "vllm-node"); a.Internal {
+		t.Fatal("internal set without app.json internal")
+	}
+	meta["internal"] = true
+	writeApp(t, root, "vllm-node", meta)
+	res, err := e.cat.ImportDir(e.ctx, e.actor(), root)
+	if err != nil || len(res) != 1 || res[0].Created || res[0].Skipped == "" {
+		t.Fatalf("re-import = %+v, %v", res, err)
+	}
+	a, err := e.cat.AppBySlug(e.ctx, "vllm-node")
+	if err != nil || !a.Internal {
+		t.Fatalf("after re-import with internal=true: %+v, %v", a, err)
+	}
+	if logs := e.auditLogs("app.update", id(a.ID)); len(logs) != 1 {
+		t.Fatalf("app.update audit rows = %d", len(logs))
+	}
+	// internal=false（或不写）不会清除
+	delete(meta, "internal")
+	meta["version"] = "1.0.1"
+	writeApp(t, root, "vllm-node", meta)
+	if _, err := e.cat.ImportDir(e.ctx, e.actor(), root); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := e.cat.AppBySlug(e.ctx, "vllm-node"); !a.Internal {
+		t.Fatal("internal cleared by re-import")
 	}
 }

@@ -29,6 +29,7 @@ import (
 	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
+	"spark-cloud/internal/llm"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
@@ -74,8 +75,11 @@ type env struct {
 	apps     *appdeploy.Service
 	appCat   *appdeploy.Catalog
 	butler   *butler.Service // 计划 12：后台只读查询与设置；不跑对话轮次（不配工具）
-	wfCat    *comfywf.Catalog
-	wfInst   *comfywf.Installer
+	llm      *llm.Service
+	// systemUserID 迁移 00022 的系统账号 system:llm
+	systemUserID int64
+	wfCat        *comfywf.Catalog
+	wfInst       *comfywf.Installer
 }
 
 func newEnv(t *testing.T) *env { return newEnvWith(t, nil) }
@@ -101,8 +105,12 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	f := fleet.NewService(pool, clk)
 	pduMock := &pdu.Mock{}
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, AllowMock: true, Open: func(fleet.PDUConn) (pdu.Driver, error) { return pduMock, nil }})
+	var systemUserID int64 // 迁移 00022 的系统账号 system:llm（计划 9）
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM users WHERE system AND phone = $1`, llm.SystemUserPhone).Scan(&systemUserID); err != nil {
+		t.Fatal(err)
+	}
 	r := rental.NewService(rental.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f,
-		Notifier: noopNotifier{}})
+		Notifier: noopNotifier{}, SystemUserID: systemUserID})
 	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r})
 	ids.SetReferral(ref)
 	payMock := pay.NewMock("s")
@@ -127,9 +135,11 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	apps := appdeploy.NewService(appDeps)
 	wfInst := comfywf.NewInstaller(pool, clk, wfCat, apps, appCat, log)
 	bt := butler.NewService(butler.Deps{Pool: pool, Clock: clk, Log: log, Provider: mock.New(), Box: box})
+	llmSvc := llm.NewService(llm.Deps{Pool: pool, Clock: clk, Log: log, Box: box, Wallet: w, Users: ids, Rental: r, Apps: apps,
+		AppCat: appCat, Images: c, Fleet: f, SystemUserID: systemUserID})
 	srv := &adminapi.Server{Admins: admins, Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: b,
 		Uploads: uploads, Gateway: gw, Referral: ref, Clock: clk, Log: log, Apps: apps, AppCatalog: appCat, PortURL: portURL,
-		Workflows: wfCat, Installer: wfInst, Butler: bt}
+		Workflows: wfCat, Installer: wfInst, LLM: llmSvc, Butler: bt}
 	if tweak != nil {
 		tweak(srv)
 	}
@@ -137,7 +147,7 @@ func newEnvWith(t *testing.T, tweak func(*adminapi.Server)) *env {
 	t.Cleanup(ts.Close)
 	return &env{t: t, ctx: context.Background(), pool: pool, clk: clk, srv: srv, ts: ts, admins: admins, identity: ids,
 		wallet: w, catalog: c, fleet: f, rental: r, billing: b, uploads: uploads, pdu: pduMock, pay: payMock, gw: gw,
-		apps: apps, appCat: appCat, wfCat: wfCat, wfInst: wfInst, butler: bt}
+		apps: apps, appCat: appCat, wfCat: wfCat, wfInst: wfInst, llm: llmSvc, systemUserID: systemUserID, butler: bt}
 }
 
 type client struct {

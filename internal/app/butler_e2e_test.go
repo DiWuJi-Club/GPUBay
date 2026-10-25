@@ -69,8 +69,8 @@ func newButlerEnv(t *testing.T, machines int) *butlerEnv {
 	logs := &lockedBuf{}
 	e := newAppsEnvWith(t, machines, func(b *appsBuild) {
 		b.cfg.Butler = true
-		b.cfg.LLM = config.LLMConfig{Provider: config.LLMMock, Tools: true}
-		b.opt.LLM = m
+		b.cfg.ButlerLLM = config.ButlerLLMConfig{Provider: config.LLMMock, Tools: true}
+		b.opt.ButlerLLM = m
 		b.log = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	})
 	if e.a.Butler == nil {

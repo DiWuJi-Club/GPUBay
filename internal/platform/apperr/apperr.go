@@ -67,6 +67,15 @@ var (
 	ErrAppExists        = New("app_exists", "该应用已在此实例上部署", 409)
 	ErrAppInvalidState  = New("app_invalid_state", "当前状态不允许该操作", 409)
 	ErrAppVersionFrozen = New("app_version_frozen", "已发布的版本不能修改", 409)
+	// 计划 9
+	ErrLLMModelNotFound    = New("llm_model_not_found", "模型不存在", 404)
+	ErrLLMModelSlugExists  = New("llm_model_slug_exists", "模型标识已存在", 409)
+	ErrLLMModelInUse       = New("llm_model_in_use", "模型仍有节点或用量记录，不能删除", 409)
+	ErrLLMKeyNotFound      = New("llm_key_not_found", "API Key 不存在", 404)
+	ErrLLMKeyLimit         = New("llm_key_limit", "最多创建 20 个 API Key", 409)
+	ErrLLMNodeNotFound     = New("llm_node_not_found", "节点不存在", 404)
+	ErrLLMNodeInvalidState = New("llm_node_invalid_state", "节点当前状态不允许该操作", 409)
+	ErrLLMPoolMachineBusy  = New("llm_pool_machine_busy", "机器上有运行中的节点，请先下线", 409)
 	// 计划 11
 	ErrWorkflowNotFound       = New("workflow_not_found", "工作流不存在或未上架", 404)
 	ErrWorkflowUnavailable    = New("workflow_unavailable", "该工作流当前没有可用版本", 409)
@@ -113,6 +122,29 @@ func AppEnvRequired(label string) *Error { return New("app_env_required", "请�
 
 func AppVersionInvalid(path, reason string) *Error {
 	return New("app_version_invalid", path+"："+reason, 400)
+}
+
+// fieldMessage 「字段：原因」；field 为空时只有原因（如「上线前请设置至少 1 个副本」）。
+func fieldMessage(field, reason string) string {
+	if field == "" {
+		return reason
+	}
+	return field + "：" + reason
+}
+
+// LLMModelInvalid 模型字段校验失败（规格 §10.1，消息按字段）。
+func LLMModelInvalid(field, reason string) *Error {
+	return New("llm_model_invalid", fieldMessage(field, reason), 400)
+}
+
+// LLMKeyInvalid API Key 字段校验失败。
+func LLMKeyInvalid(field, reason string) *Error {
+	return New("llm_key_invalid", fieldMessage(field, reason), 400)
+}
+
+// LLMAccountInvalid Token 账户（限额 / 停用）字段校验失败。
+func LLMAccountInvalid(field, reason string) *Error {
+	return New("llm_account_invalid", fieldMessage(field, reason), 400)
 }
 
 // WorkflowVersionInvalid 工作流版本校验失败；path 为字段路径（如 manifest.models[2].repo、graph.nodes[5]）。

@@ -17,6 +17,7 @@
 - 充值：`/wallet/recharge`；
 - 实名认证：`/kyc`；
 - 邀请返利：`/invite`；
+- Token 商城：创建 / 修改 / 撤销 API Key 在 `/tokens?tab=keys`，用量与结算在 `/tokens?tab=usage`（你不能替用户创建或读取 API Key）；
 - 更详细的说明：使用帮助 `/help`。
 
 # 行为规则

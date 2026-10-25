@@ -6,11 +6,16 @@ import IdLink from '../components/IdLink.vue'
 import { usePaged } from '../composables/usePaged'
 
 /** q：完整手机号、手机尾号或用户 ID，后端只接受数字：输入时全角数字转半角，其余非数字去掉 */
-const filter = reactive({ q: '', kyc_status: '', status: '' })
-const list = usePaged<User>((page, size) => api.get<Paged<User>>('/users', { q: filter.q, kyc_status: filter.kyc_status, status: filter.status, page, page_size: size }))
+// include_system：计划 9 的平台系统账号（如 Token 商城的 system:llm）默认不列出
+const filter = reactive({ q: '', kyc_status: '', status: '', include_system: false })
+const list = usePaged<User>((page, size) =>
+  api.get<Paged<User>>('/users', {
+    q: filter.q, kyc_status: filter.kyc_status, status: filter.status, include_system: filter.include_system ? 'true' : undefined, page, page_size: size,
+  }),
+)
 onMounted(list.load)
 function resetFilter() {
-  Object.assign(filter, { q: '', kyc_status: '', status: '' })
+  Object.assign(filter, { q: '', kyc_status: '', status: '', include_system: false })
   list.reset()
 }
 </script>
@@ -30,6 +35,9 @@ function resetFilter() {
         <el-select v-model="filter.status" clearable placeholder="全部" data-testid="users-filter-status" style="width: 120px">
           <el-option v-for="(label, v) in userStatusLabel" :key="v" :label="label" :value="v" />
         </el-select>
+      </el-form-item>
+      <el-form-item label="含系统账号">
+        <el-switch v-model="filter.include_system" data-testid="users-include-system" @change="list.reset()" />
       </el-form-item>
       <el-button type="primary" native-type="submit" data-testid="users-search">查询</el-button>
       <el-button data-testid="users-reset" @click="resetFilter">重置</el-button>

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wechatpay-apiv3/wechatpay-go/utils"
 	"golang.org/x/crypto/ssh"
@@ -27,7 +28,7 @@ import (
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/butler"
-	"spark-cloud/internal/butler/llm"
+	butlerllm "spark-cloud/internal/butler/llm"
 	"spark-cloud/internal/butler/llm/anthropic"
 	"spark-cloud/internal/butler/llm/mock"
 	"spark-cloud/internal/butler/llm/openai"
@@ -37,6 +38,8 @@ import (
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
+	"spark-cloud/internal/llm"
+	"spark-cloud/internal/llmgw"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
@@ -77,10 +80,10 @@ type Options struct {
 	// 集成测试与 e2e-server 的所有实例共用一个假容器 sshd，用 AppRootFor 让每个实例各用 <Root>/<实例 ID>/root/data；生产环境设置时 Build 直接报错。
 	AppRoot    string
 	AppRootFor func(instanceID string) string
-	// LLM 是测试 / e2e 注入的 AI 管家模型提供方（通常是 *mock.Mock，钩子往它的队列里塞回复）：非 nil 时取代按 cfg.LLM 构造的提供方
-	// （cfg.LLM.Provider / BaseURL / Model 不再起作用，对话记录的 provider / model 取它的 Name / Model）；nil = 按 cfg.LLM.Provider 构造。
+	// ButlerLLM 是测试 / e2e 注入的 AI 管家模型提供方（通常是 *mock.Mock，钩子往它的队列里塞回复）：非 nil 时取代按 cfg.ButlerLLM 构造的提供方
+	// （cfg.ButlerLLM.Provider / BaseURL / Model 不再起作用，对话记录的 provider / model 取它的 Name / Model）；nil = 按 cfg.ButlerLLM.Provider 构造。
 	// 只有 cfg.Butler 为 true 时才会用到；但生产环境只要设置了就报错（不论管家开没开，与 DisableRateLimits 同款保护）。
-	LLM llm.Provider
+	ButlerLLM butlerllm.Provider
 }
 
 const noRateLimit = 1_000_000
@@ -116,13 +119,16 @@ type App struct {
 	AppCatalog *appdeploy.Catalog
 	AppRunner  *appdeploy.Runner // 部署后台执行者；由 cmd/platform 按 SPARK_APP_RUNNER 启动
 
+	LLM               *llm.Service       // Token 商城（计划 9）；Settle 挂在清扫器上，Router 由 RunAccessLoops 刷新
+	LLMController     *llm.Controller    // 节点生命周期；由 cmd/platform 按 SPARK_LLM_CONTROLLER 启动（e2e-server 不启动，用钩子驱动）
+	LLMGateway        *llmgw.Server      // /v1 网关；SPARK_LLM_GATEWAY=off 时 nil。cmd/platform 停机时与公网 http.Server.Shutdown 并发调用它的 Shutdown
 	Workflows         *comfywf.Catalog   // ComfyUI 工作流目录（计划 11）
 	WorkflowInstaller *comfywf.Installer // 部署上的工作流集合（添加 / 更新 / 移除）
 	WorkflowRuns      *comfywf.Runs      // 快速出图代理
 	// 计划 12：AI 管家；cfg.Butler 为 false（SPARK_BUTLER=off，或开发环境未配端点被自动关闭）时两者都是 nil、路由不注册。
 	// cmd/platform 把 Butler.Sweep 挂进清扫器。
-	Butler *butler.Service
-	LLM    llm.Provider
+	Butler    *butler.Service
+	ButlerLLM butlerllm.Provider
 }
 
 func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options) (*App, error) {
@@ -139,13 +145,13 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	if (opt.AppRoot != "" || opt.AppRootFor != nil) && cfg.Env == "prod" {
 		return nil, errors.New("生产环境禁止注入应用根目录")
 	}
-	if opt.LLM != nil && cfg.Env == "prod" {
+	if opt.ButlerLLM != nil && cfg.Env == "prod" {
 		return nil, errors.New("生产环境禁止注入 LLM 提供方")
 	}
-	if cfg.LLM.Provider == config.LLMMock && cfg.Env == "prod" { // config.Load 已拦；这里防配置字面量绕过
+	if cfg.ButlerLLM.Provider == config.LLMMock && cfg.Env == "prod" { // config.Load 已拦；这里防配置字面量绕过
 		return nil, errors.New("生产环境禁止使用 mock LLM 提供方")
 	}
-	if cfg.Env == "prod" && cfg.Butler && cfg.LLM.APIKey == "" { // 同上：与 config.Load 的校验一致
+	if cfg.Env == "prod" && cfg.Butler && cfg.ButlerLLM.APIKey == "" { // 同上：与 config.Load 的校验一致
 		return nil, errors.New("生产环境开启 AI 管家需要设置 SPARK_LLM_API_KEY")
 	}
 	ipHourLimit, loginLimit := 0, 0
@@ -208,6 +214,14 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		return nil, err
 	}
 	uploads := storage.NewService(pool, clk, disk)
+	// 系统账号（迁移 00022 写入）：系统实例、内部应用部署与 Token 节点都挂在它名下；缺失说明迁移没跑全，拒绝启动。
+	var systemUserID int64
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM users WHERE system AND phone = $1`, llm.SystemUserPhone).Scan(&systemUserID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("找不到系统账号（users.system，phone=%q）：请先执行数据库迁移", llm.SystemUserPhone)
+		}
+		return nil, fmt.Errorf("读取系统账号: %w", err)
+	}
 
 	// 与 `platform referral backfill-fingerprints`（cmd/platform/referral.go 的 referralKeys）相同的输入：config.Load 解出的原始密钥字节
 	fpKey, err := referral.DeriveFingerprintKey(cfg.SecretKey)
@@ -222,7 +236,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
-		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SSHBasePort: cfg.UpstreamSSHPort,
+		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SystemUserID: systemUserID, SSHBasePort: cfg.UpstreamSSHPort,
 	})
 	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r, Alerts: f})
 	ids.SetReferral(ref)
@@ -330,7 +344,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	wfCat := comfywf.NewCatalog(pool, clk, uploads, log)
 	appDeps := appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
 		Upstream: upstreamPool, PortURL: ingressAuth.PortURL, HFEndpoint: cfg.AppHFEndpoint, PipIndexURL: cfg.AppPipIndexURL, GitMirror: cfg.AppGitMirror,
-		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor}
+		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor, SystemUserID: systemUserID}
 	comfywf.NewHooks(pool, wfCat).Wire(&appDeps)
 	apps := appdeploy.NewService(appDeps)
 	r.SetAppHooks(apps)
@@ -342,10 +356,22 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	wfRuns := comfywf.NewRuns(pool, clk, wfCat, apps, comfywf.NewClient(upstreamPool), log)
 	srv.Workflows, srv.Installer, srv.Runs = wfCat, wfInst, wfRuns
 	adminSrv.Workflows, adminSrv.Installer = wfCat, wfInst
+	// Token 商城：节点即系统实例上的 vllm-node 部署，探测与转发走同一个上游连接池。网关（/v1）由 SPARK_LLM_GATEWAY 决定是否挂载；
+	// 必须在 srv.Router() 之前设置（Router 按字段是否为 nil 注册路由）。
+	llmSvc := llm.NewService(llm.Deps{Pool: pool, Clock: clk, Log: log, Box: box, Wallet: w, Users: ids, Rental: r, Apps: apps, AppCat: appCat,
+		Images: c, Fleet: f, Upstream: upstreamPool, SystemUserID: systemUserID})
+	llmCtl := llm.NewController(llmSvc)
+	srv.LLM, adminSrv.LLM = llmSvc, llmSvc
+	var llmGW *llmgw.Server
+	if cfg.LLMGateway {
+		// 401 的按 IP 限流：零值取默认（每 IP 每分钟 60 次）；DisableRateLimits 时为 noRateLimit（同其它按 IP 限流）
+		llmGW = llmgw.New(llmSvc, llmgw.Config{AuthFailLimit: authorizeLimit}, clk, log)
+		srv.LLMGateway = llmGW.Router()
+	}
 	var bt *butler.Service
-	var provider llm.Provider
+	var provider butlerllm.Provider
 	if cfg.Butler {
-		if provider, err = llmProvider(cfg.LLM, opt.LLM); err != nil {
+		if provider, err = llmProvider(cfg.ButlerLLM, opt.ButlerLLM); err != nil {
 			return nil, err
 		}
 		// 工具的数据来源与控制台完全相同：machine_label 用 api 实例视图的同一 fleet 查询、ssh_command 用同一 SSH 主机 / 端口、
@@ -359,11 +385,11 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 				return m.Label(), nil
 			},
 			PortURL: ingressAuth.PortURL, SSHHost: srv.SSHHost, SSHPort: srv.SSHPort, Clock: clk, IngressDomain: ingressAuth.IngressDomain, Box: box})
-		bt = butler.NewService(butler.Deps{Pool: pool, Clock: clk, Log: log, Provider: provider, Tools: reg, ToolsEnabled: cfg.LLM.Tools,
-			Users: ids, Wallet: w, Rental: r, Fleet: f, Box: box, MaxOutputTokens: cfg.LLM.MaxOutputTokens})
+		bt = butler.NewService(butler.Deps{Pool: pool, Clock: clk, Log: log, Provider: provider, Tools: reg, ToolsEnabled: cfg.ButlerLLM.Tools,
+			Users: ids, Wallet: w, Rental: r, Fleet: f, Box: box, MaxOutputTokens: cfg.ButlerLLM.MaxOutputTokens})
 		// 零值取默认（每用户每分钟 20 次发消息 + 确认）；DisableRateLimits 时为 noRateLimit（e2e 假时钟下窗口永不滑过）
 		srv.Butler, srv.ButlerLimit = bt, authorizeLimit
-		adminSrv.Butler, adminSrv.LLMPriceInCentsPerM, adminSrv.LLMPriceOutCentsPerM = bt, cfg.LLM.PriceInCentsPerM, cfg.LLM.PriceOutCentsPerM
+		adminSrv.Butler, adminSrv.LLMPriceInCentsPerM, adminSrv.LLMPriceOutCentsPerM = bt, cfg.ButlerLLM.PriceInCentsPerM, cfg.ButlerLLM.PriceOutCentsPerM
 	}
 	routes := ingress.NewTable(r, log)
 	ingSrv := ingress.NewServer(ingressAuth, routes, ids, upstreamPool, r, clk, log)
@@ -375,12 +401,13 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
 		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner,
-		Workflows: wfCat, WorkflowInstaller: wfInst, WorkflowRuns: wfRuns, Butler: bt, LLM: provider}, nil
+		Workflows: wfCat, WorkflowInstaller: wfInst, WorkflowRuns: wfRuns, LLM: llmSvc, LLMController: llmCtl, LLMGateway: llmGW,
+		Butler: bt, ButlerLLM: provider}, nil
 }
 
 // llmProvider 返回 AI 管家的模型提供方：注入的优先（测试 / e2e），否则按 cfg.Provider 构造。
 // 模型名为空（配置字面量）时取 provider 默认；openai 必须有端点（config.Load 已校验，这里防配置字面量绕过）。
-func llmProvider(cfg config.LLMConfig, injected llm.Provider) (llm.Provider, error) {
+func llmProvider(cfg config.ButlerLLMConfig, injected butlerllm.Provider) (butlerllm.Provider, error) {
 	if injected != nil {
 		return injected, nil
 	}
@@ -597,7 +624,7 @@ func poolKeep(routes []rental.IngressRoute) map[string]bool {
 	return keep
 }
 
-// RunAccessLoops：路由表每 2 秒刷新、活动流（WebSocket / SSE）按访问权限变化撤销、离开 running 的实例从上游连接池丢弃、
+// RunAccessLoops：路由表每 2 秒刷新、Token 节点表每 llm.RouterRefresh 刷新、活动流（WebSocket / SSE）按访问权限变化撤销、离开 running 的实例从上游连接池丢弃、
 // TLS 到期每日检查；ctx 结束后等所有子循环退出再返回。连接池不在这里关闭：停机时 HTTP / ingress 关闭之后由 cmd/platform 关。
 func (a *App) RunAccessLoops(ctx context.Context) {
 	var wg sync.WaitGroup
@@ -606,6 +633,7 @@ func (a *App) RunAccessLoops(ctx context.Context) {
 		wg.Go(func() { a.TLS.RunExpiryCheck(ctx, 24*time.Hour, 14*24*time.Hour) })
 	}
 	wg.Go(func() { a.Routes.Run(ctx, 2*time.Second) })
+	wg.Go(func() { a.LLM.Router().Run(ctx, llm.RouterRefresh) })
 	wg.Go(func() { a.Ingress.Run(ctx, accessSweepInterval) })
 	running := map[string]bool{}
 	t := time.NewTicker(2 * time.Second)

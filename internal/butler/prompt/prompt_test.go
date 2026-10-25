@@ -43,7 +43,7 @@ func TestFixedRules(t *testing.T) {
 		"以下单页为准", "list_products", // 价格来自工具
 		"只会生成一张确认卡", "绝不能", "一次只提议一个写操作", // 写操作
 		"get_app", "deploy_app", "同一轮", "get_deployment_log", // 部署 / 诊断流程
-		"`/account`", "`/account/ssh-keys`", "`/instances/<实例 ID>`", "`/wallet/recharge`", "`/kyc`", "`/invite`", // D4 页面
+		"`/account`", "`/account/ssh-keys`", "`/instances/<实例 ID>`", "`/wallet/recharge`", "`/kyc`", "`/invite`", "`/tokens?tab=keys`", // D4 页面
 		"中文", "英文",
 	} {
 		if !strings.Contains(f, must) {

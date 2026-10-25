@@ -124,8 +124,8 @@ func (s *Service) RefundRelease(ctx context.Context, actor audit.Actor, instance
 		if err != nil {
 			return err
 		}
-		if inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped {
-			return apperr.ErrInvalidState
+		if inst.System || (inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped) {
+			return apperr.ErrInvalidState // 系统实例没有订单可退，释放走 ReleaseSystem
 		}
 		chain, err := instanceChain(ctx, tx, inst.ID)
 		if err != nil {

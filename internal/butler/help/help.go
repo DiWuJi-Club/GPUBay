@@ -11,7 +11,7 @@ import (
 var files embed.FS
 
 // sections 是章节名（文件名去掉 .md），顺序与帮助页一致。
-var sections = []string{"ssh", "ssh-keys", "forward", "web", "apps", "workflows", "booking", "batch", "auto-renew", "retention", "referral", "billing", "butler"}
+var sections = []string{"ssh", "ssh-keys", "forward", "web", "apps", "workflows", "booking", "batch", "auto-renew", "retention", "tokens", "referral", "billing", "butler"}
 
 // Section 返回章节 Markdown 原文；不存在的章节返回 ok = false。
 func Section(name string) (string, bool) {

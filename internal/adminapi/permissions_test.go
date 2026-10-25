@@ -68,6 +68,16 @@ var expectedRoutes = []struct {
 	{"GET", "/apps/{id}/versions/{vid}/script", all},
 	{"GET", "/deployments", all}, {"GET", "/deployments/{dep}", all}, {"POST", "/deployments/{dep}/force-remove", ops},
 
+	// 计划 9 Token 商城（规格 §10.2，按负责人裁定修订）：模型只读全员、改动 super（上下线另要 TOTP）；机器池 / 节点 ops（移除另要 TOTP）；
+	// 账户与 Key 列表 ops + finance，改账户 / 停用 Key ops；用量、汇总、结算 finance；仪表盘卡片全员
+	{"GET", "/llm/models", all}, {"POST", "/llm/models", super}, {"PUT", "/llm/models/{id}", super},
+	{"POST", "/llm/models/{id}/status", super}, {"DELETE", "/llm/models/{id}", super},
+	{"GET", "/llm/pool", ops}, {"GET", "/llm/nodes", ops}, {"GET", "/llm/nodes/{id}", ops},
+	{"POST", "/llm/nodes/{id}/drain", ops}, {"POST", "/llm/nodes/{id}/rebuild", ops}, {"POST", "/llm/nodes/{id}/remove", ops},
+	{"GET", "/llm/accounts", all}, {"PUT", "/llm/accounts/{user_id}", ops},
+	{"GET", "/llm/keys", all}, {"POST", "/llm/keys/{id}/disable", ops},
+	{"GET", "/llm/usage", finance}, {"GET", "/llm/usage/export", finance}, {"GET", "/llm/usage/daily", finance},
+	{"GET", "/llm/settlements", finance}, {"GET", "/llm/summary", all},
 	// 计划 11 D6：全部角色可读工作流目录 / 版本详情 / 安装列表；super 维护目录与版本、上传封面；发布 = super + 动态码
 	{"GET", "/workflows", all}, {"POST", "/workflows", super}, {"GET", "/workflows/{id}", all}, {"PUT", "/workflows/{id}", super},
 	{"DELETE", "/workflows/{id}", super}, {"GET", "/workflows/{id}/cover", all}, {"POST", "/workflows/{id}/cover", super},
@@ -121,7 +131,7 @@ func TestPermissionMatrix(t *testing.T) {
 		admin.RoleOps:     e.loginAs("ops", admin.RoleOps),
 		admin.RoleFinance: e.loginAs("fin", admin.RoleFinance),
 	}
-	fill := strings.NewReplacer("{id}", "999999", "{duration}", "1d", "*", "2026/01/abcdefghijklmnopqrstuvwxyz012345.png")
+	fill := strings.NewReplacer("{id}", "999999", "{user_id}", "999999", "{duration}", "1d", "*", "2026/01/abcdefghijklmnopqrstuvwxyz012345.png")
 	for _, r := range expectedRoutes {
 		path := fill.Replace(r.path)
 		for role, c := range clients {

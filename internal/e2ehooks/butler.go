@@ -51,10 +51,10 @@ func decodeStrict[T any](body json.RawMessage) (T, error) {
 }
 
 func (s *Server) butlerMock() (*mock.Mock, error) {
-	if s.LLM == nil || s.App.Butler == nil {
+	if s.ButlerLLM == nil || s.App.Butler == nil {
 		return nil, badRequest("AI 管家未启用（e2e-server 需 cfg.Butler = true 并注入 mock LLM）")
 	}
-	return s.LLM, nil
+	return s.ButlerLLM, nil
 }
 
 func (s *Server) butlerService() (*butler.Service, error) {

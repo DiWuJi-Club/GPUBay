@@ -1,5 +1,11 @@
 <script setup lang="ts">
-import { brand } from '@spark/shared'
+import { brand, formatTokens } from '@spark/shared'
+import { DEFAULT_LLM_LIMITS, llmErrorHelp, llmErrorStatus } from '../logic/tokens'
+
+// Token 商城的常见错误码：与快速开始同一份说明（llmErrorHelp），按 HTTP 状态码排序
+const llmErrors = Object.keys(llmErrorHelp)
+  .map((code) => ({ code, status: llmErrorStatus[code], help: llmErrorHelp[code] }))
+  .sort((a, b) => a.status - b.status)
 </script>
 
 <template>
@@ -95,6 +101,26 @@ import { brand } from '@spark/shared'
       </ul>
     </el-card>
     <el-card>
+      <h2 id="tokens" data-testid="help-tokens">Token 商城</h2>
+      <ul>
+        <li data-testid="help-tokens-billing">计费：按实际 token 数计费，价格以「元 / 百万 token」标示，输入（提示词）与输出（生成内容）分别计价，向量模型只计输入；请求未指定 max_tokens 时按模型的最大输出长度处理。上游错误、上游超时（未输出内容时）、无可用节点、服务重启中断的请求不收费；流式输出已返回部分内容后因 10 分钟总时长上限被截断的，按已返回的内容计费。</li>
+        <li data-testid="help-tokens-settle">结算：费用先累计，累计到 ¥1 或最早一笔满 10 分钟时从钱包余额扣款一次，每次一条「Token 消费」流水；在「Token 商城 → 用量」可查看结算记录并跳转到对应流水。</li>
+        <li data-testid="help-tokens-limits">
+          限额（按账户，所有 Key 共享）：默认每分钟 {{ DEFAULT_LLM_LIMITS.rpm }} 次请求、每分钟 {{ formatTokens(DEFAULT_LLM_LIMITS.tpm) }} token、同时 {{ DEFAULT_LLM_LIMITS.concurrency }} 个并发请求，超出返回 429；需要更高限额请联系客服。每个 Key 还可以设置月消费上限。
+        </li>
+        <li data-testid="help-tokens-key">Key 安全：明文 Key 只在创建时显示一次，平台只保存哈希、无法找回；请勿写进前端代码或公开仓库，一旦泄露请立即在「API Keys」撤销并重新创建。</li>
+        <li data-testid="help-tokens-debt">欠费：每次调用前按余额预检，但并发请求可能让实际费用超过余额，差额记为欠费；有欠费时所有调用返回 402，充值后下一次结算自动补扣，补齐后恢复调用。</li>
+      </ul>
+      <h3>常见错误码</h3>
+      <el-table :data="llmErrors" size="small" data-testid="help-tokens-errors">
+        <el-table-column label="HTTP" prop="status" width="64" />
+        <el-table-column label="code" min-width="150">
+          <template #default="{ row }"><code>{{ row.code }}</code></template>
+        </el-table-column>
+        <el-table-column label="说明" prop="help" min-width="220" />
+      </el-table>
+    </el-card>
+    <el-card>
       <h2 id="referral" data-testid="help-referral">邀请返利</h2>
       <ul>
         <li>在「我的 → 邀请返利」获取您的邀请码与链接；好友通过链接注册（首次登录）即绑定，老用户不能再绑定。</li>
@@ -119,7 +145,7 @@ import { brand } from '@spark/shared'
       <h2 id="butler" data-testid="help-butler">AI 管家</h2>
       <ul>
         <li><b>能做什么</b>：帮您挑选套餐和可租时段、租用或续费实例、取消预订、释放实例；在实例上部署 / 重新部署 / 停止 / 启动 / 卸载应用；读取部署日志与事件帮您排查问题；查询余额、订单与计费规则，回答帮助页里的问题。</li>
-        <li><b>不能做什么</b>：查看或修改 SSH 密码、管理 SSH 公钥、开放 / 公开 / 删除端口、已有实例的自动续费开关、充值、实名认证、邀请返利相关操作。遇到这些需求，管家会告诉您在控制台的哪个页面自己操作。</li>
+        <li><b>不能做什么</b>：查看或修改 SSH 密码、管理 SSH 公钥、开放 / 公开 / 删除端口、已有实例的自动续费开关、充值、实名认证、邀请返利相关操作，以及创建或查看 Token 商城的 API Key。遇到这些需求，管家会告诉您在控制台的哪个页面自己操作。</li>
         <li><b>任何花钱或删除的操作都会先出确认卡</b>：卡片上的内容与金额由平台根据真实参数生成，您点「确认」才会执行，不点就什么都不会发生；释放实例、卸载应用、取消预订等危险操作还需要勾选确认。确认卡 10 分钟内有效。</li>
         <li><b>对话保存 90 天</b>：客服在排障时可能查看对话内容；管家生成的密钥与应用的敏感变量不会以明文保存。</li>
         <li><b>每日额度</b>：每个账号每天有一定的 AI 管家使用额度，用完后次日恢复。</li>
@@ -132,6 +158,7 @@ import { brand } from '@spark/shared'
 <style scoped>
 .help { display: grid; gap: 16px; max-width: 760px; }
 h2 { font-size: 16px; margin: 0 0 8px; }
+h3 { font-size: 14px; margin: 12px 0 8px; }
 .support { color: #909399; font-size: 12px; }
 code { word-break: break-all; }
 </style>

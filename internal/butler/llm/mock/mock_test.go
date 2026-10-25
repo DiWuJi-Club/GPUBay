@@ -353,6 +353,9 @@ func TestMockRuleTable(t *testing.T) {
 		if a := onlyCall(t, newConv("邀请返利怎么算", "").decide(), "get_help"); a["section"] != "referral" {
 			t.Fatalf("args = %v", a)
 		}
+		if a := onlyCall(t, newConv("Token 商城的 API Key 怎么创建", "").decide(), "get_help"); a["section"] != "tokens" {
+			t.Fatalf("args = %v", a)
+		}
 	})
 	t.Run("default", func(t *testing.T) {
 		wantText(t, newConv("你好", "").decide(), defaultText)

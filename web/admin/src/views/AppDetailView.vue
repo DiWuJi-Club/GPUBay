@@ -89,6 +89,7 @@ async function confirmDelete() {
             <router-link to="/apps" class="back">应用</router-link> /
             <b data-testid="app-detail-name">{{ app.name }}</b>
             <el-tag size="small" :type="statusType[app.status]" class="ml" data-testid="app-detail-status">{{ labelOf(appStatusLabel, app.status) }}</el-tag>
+            <el-tag v-if="app.internal" size="small" type="info" class="ml" data-testid="app-detail-internal">内部</el-tag>
           </span>
           <span v-if="canWrite">
             <el-button size="small" data-testid="app-detail-edit" @click="editing = true">编辑</el-button>

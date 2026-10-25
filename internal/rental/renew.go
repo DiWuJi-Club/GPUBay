@@ -60,7 +60,7 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 			if inst.UserID != userID {
 				return apperr.ErrNotFound
 			}
-			if inst.State != StateReserved && inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped {
+			if inst.System || (inst.State != StateReserved && inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped) {
 				return apperr.ErrInvalidState
 			}
 			ord, err = s.applyRenew(ctx, tx, inst, d, quantity, false, idempotencyKey, now,
@@ -125,21 +125,16 @@ func replayRenew(prev Order, instanceID string) (Order, error) {
 	return prev, nil
 }
 
-// Release 用户主动释放：立即进入洗机，已付费用不退。
+// Release 用户主动释放：立即进入洗机，已付费用不退。系统实例只能由 ReleaseSystem 释放。
 func (s *Service) Release(ctx context.Context, userID int64, instanceID string) error {
-	now := s.d.Clock.Now()
-	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		inst, err := lockInstance(ctx, tx, instanceID)
-		if err != nil {
-			return err
-		}
+	return s.release(ctx, instanceID, "user released", func(inst Instance) error {
 		if inst.UserID != userID {
 			return apperr.ErrNotFound
 		}
-		if inst.State != StateRunning && inst.State != StateStopped {
+		if inst.System || (inst.State != StateRunning && inst.State != StateStopped) {
 			return apperr.ErrInvalidState
 		}
-		return s.beginWipe(ctx, tx, inst, "user released", now)
+		return nil
 	})
 }
 
@@ -177,6 +172,9 @@ func (s *Service) addTime(ctx context.Context, tx pgx.Tx, inst Instance, secs in
 		_, err = tx.Exec(ctx, `UPDATE instances SET paused_remaining = $2, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
 			inst.ID, paused+secs, r24, r1, now)
 	case inst.State == StateRunning:
+		if inst.ExpiresAt == nil { // 系统实例（expires_at NULL）：调用方本已拒绝，防御空指针
+			return apperr.ErrInvalidState
+		}
 		base := *inst.ExpiresAt
 		if base.Before(now) {
 			base = now
@@ -297,11 +295,11 @@ func (s *Service) verifyLeaseFits(ctx context.Context, tx pgx.Tx, id string, now
 	if inst.Booked() && (inst.State == StateReserved || inst.State == StateCreating) {
 		return nil
 	}
-	var upper time.Time
-	if err := tx.QueryRow(ctx, `SELECT upper(period) FROM machine_leases WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`, id).Scan(&upper); err != nil {
+	var lower, upper time.Time
+	if err := tx.QueryRow(ctx, `SELECT lower(period), upper(period) FROM machine_leases WHERE instance_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`, id).Scan(&lower, &upper); err != nil {
 		return err
 	}
-	if upper.Before(occupiedUntil(inst, now)) {
+	if upper.Before(occupiedUntil(inst, lower, now)) {
 		return errRenewBlockedGeneric
 	}
 	return nil

@@ -64,15 +64,18 @@ type Config struct {
 	AppGitMirror   string // 计划 11：注入应用容器的 SPARK_GIT_MIRROR（GitHub 加速前缀，如 https://gh-proxy.com/）；空 = 直连
 	AppRunner      bool   // 是否在本副本启动应用部署 Runner（多副本都开时由咨询锁保证只有一个在工作）
 
+	// 计划 9：Token 商城。经 Load 默认都是 on；Config 字面量（测试、e2e-server）零值为 off，需要时显式设置。
+	LLMGateway    bool // SPARK_LLM_GATEWAY：是否在用户 API 上挂 /v1（OpenAI 兼容网关）；限额按进程各算
+	LLMController bool // SPARK_LLM_CONTROLLER：是否在本副本启动节点 Controller（多副本都开时由咨询锁保证只有一个在工作）
 	// 计划 12：AI 管家
-	LLM    LLMConfig
-	Butler bool // 部署级开关（SPARK_BUTLER）；false 时不注册管家路由、不显示入口
+	ButlerLLM ButlerLLMConfig
+	Butler    bool // 部署级开关（SPARK_BUTLER）；false 时不注册管家路由、不显示入口
 	// ButlerOffReason：开发环境未显式开启管家、openai 又没配 SPARK_LLM_BASE_URL 时自动关闭管家的原因（启动时记一条日志）；其它情况为空。
 	ButlerOffReason string
 }
 
-// LLMConfig AI 管家使用的模型后端。
-type LLMConfig struct {
+// ButlerLLMConfig AI 管家使用的模型后端（计划 12；与 Token 商城的 LLMGateway / LLMController 无关）。
+type ButlerLLMConfig struct {
 	Provider          string // openai / anthropic / mock
 	BaseURL           string // openai 必填（计划 9 内网端点，如 http://token-mall.spark.internal/v1）；anthropic 可空（SDK 默认）；已去掉结尾斜杠
 	APIKey            string // 生产环境（非 mock）必填；只放环境变量，不写日志
@@ -237,6 +240,10 @@ func Load(getenv func(string) string) (Config, error) {
 	if err := c.loadApps(or); err != nil {
 		return Config{}, err
 	}
+	if err := c.loadLLM(or); err != nil {
+		return Config{}, err
+	}
+	// 管家在 Token 商城开关之后读：默认端点取决于本进程是否挂了网关（SPARK_LLM_GATEWAY）
 	if err := c.loadButler(getenv, or); err != nil {
 		return Config{}, err
 	}
@@ -564,7 +571,7 @@ func (c *Config) loadApps(or func(key, def string) string) error {
 // loadButler 读取并校验 AI 管家（计划 12）的 LLM 配置。
 func (c *Config) loadButler(getenv func(string) string, or func(key, def string) string) error {
 	var err error
-	l := LLMConfig{
+	l := ButlerLLMConfig{
 		Provider: strings.TrimSpace(or("SPARK_LLM_PROVIDER", LLMOpenAI)),
 		BaseURL:  strings.TrimRight(strings.TrimSpace(getenv("SPARK_LLM_BASE_URL")), "/"),
 		APIKey:   strings.TrimSpace(getenv("SPARK_LLM_API_KEY")),
@@ -610,7 +617,7 @@ func (c *Config) loadButler(getenv func(string) string, or func(key, def string)
 	if c.Butler, err = onOff("SPARK_BUTLER", or("SPARK_BUTLER", "on")); err != nil {
 		return err
 	}
-	c.LLM = l
+	c.ButlerLLM = l
 	c.ButlerOffReason = ""
 	if !c.Butler {
 		return nil
@@ -626,6 +633,24 @@ func (c *Config) loadButler(getenv func(string) string, or func(key, def string)
 	}
 	if c.Env == "prod" && l.Provider != LLMMock && l.APIKey == "" {
 		return errors.New("生产环境开启 AI 管家需要设置 SPARK_LLM_API_KEY；暂不开放可设 SPARK_BUTLER=off")
+	}
+	return nil
+}
+
+// loadLLM 读取 Token 商城（计划 9）的两个开关：on / off，默认 on，其它值报错（与 SPARK_APP_RUNNER 同模式）。
+func (c *Config) loadLLM(or func(key, def string) string) error {
+	for _, v := range []struct {
+		name string
+		dst  *bool
+	}{{"SPARK_LLM_GATEWAY", &c.LLMGateway}, {"SPARK_LLM_CONTROLLER", &c.LLMController}} {
+		switch s := or(v.name, "on"); s {
+		case "on":
+			*v.dst = true
+		case "off":
+			*v.dst = false
+		default:
+			return fmt.Errorf("%s 只能是 on 或 off，当前为 %q", v.name, s)
+		}
 	}
 	return nil
 }

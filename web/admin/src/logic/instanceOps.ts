@@ -31,12 +31,13 @@ const extendable = (s: InstanceState) => s === 'reserved' || s === 'creating' ||
 /** 后端 RefundRelease 允许的状态 */
 const refundable = (s: InstanceState) => s === 'creating' || s === 'running' || s === 'stopped'
 
-export const showExtend = (r: Role, s: InstanceState) => opsRole(r) && extendable(s)
-export const showMigrate = (r: Role, s: InstanceState) => opsRole(r) && s === 'running'
+// system：平台节点（Token 商城的系统实例，规格 §4.2）——后端 RefundRelease / AdminExtend / AdminMigrate / AdminReassign / 取消预订一律 invalid_state，按钮不显示
+export const showExtend = (r: Role, s: InstanceState, system = false) => !system && opsRole(r) && extendable(s)
+export const showMigrate = (r: Role, s: InstanceState, system = false) => !system && opsRole(r) && s === 'running'
 export const showRewipe = (r: Role, s: InstanceState) => opsRole(r) && s === 'wiping'
-export const showRefund = (r: Role, s: InstanceState) => finRole(r) && refundable(s)
+export const showRefund = (r: Role, s: InstanceState, system = false) => !system && finRole(r) && refundable(s)
 /** 预订（reserved）改派 / 取消：运维与超管。 */
-export const showReassign = (r: Role, s: InstanceState) => opsRole(r) && s === 'reserved'
-export const showCancelBooking = (r: Role, s: InstanceState) => opsRole(r) && s === 'reserved'
+export const showReassign = (r: Role, s: InstanceState, system = false) => !system && opsRole(r) && s === 'reserved'
+export const showCancelBooking = (r: Role, s: InstanceState, system = false) => !system && opsRole(r) && s === 'reserved'
 /** 端口处置（强制私有 / 删除）：运维与超管。 */
 export const showPortActions = (role: Role): boolean => role === 'ops' || role === 'super'

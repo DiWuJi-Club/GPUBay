@@ -1,6 +1,7 @@
 package help_test
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"sort"
@@ -8,10 +9,11 @@ import (
 	"testing"
 
 	"spark-cloud/internal/butler/help"
+	"spark-cloud/internal/llm"
 )
 
 func TestSections(t *testing.T) {
-	want := []string{"ssh", "ssh-keys", "forward", "web", "apps", "workflows", "booking", "batch", "auto-renew", "retention", "referral", "billing", "butler"}
+	want := []string{"ssh", "ssh-keys", "forward", "web", "apps", "workflows", "booking", "batch", "auto-renew", "retention", "tokens", "referral", "billing", "butler"}
 	got := help.Sections()
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("Sections = %v, want %v", got, want)
@@ -65,6 +67,7 @@ func TestCorpusMatchesHelpView(t *testing.T) {
 		"batch":      "一单最多 8 台",
 		"auto-renew": "到期前 1 小时自动扣款续 1 个单位",
 		"retention":  "到期停机后数据保留 6 小时",
+		"tokens":     "累计到 ¥1 或最早一笔满 10 分钟时从钱包余额扣款一次",
 		"referral":   "好友退款时按比例扣回已发放的返利",
 		"billing":    "预付包时长：1 天 / 1 周 / 1 月",
 	}
@@ -80,6 +83,11 @@ func TestCorpusMatchesHelpView(t *testing.T) {
 	// 邀请返利单独成节（与帮助页一致），不在计费规则里重复
 	if body, _ := help.Section("billing"); strings.Contains(body, "返利") {
 		t.Error("billing.md 不应再包含邀请返利")
+	}
+	// Token 商城一节的限额是帮助页里的变量（DEFAULT_LLM_LIMITS）：语料写死默认值，与 llm.DefaultRPM / TPM / Concurrency 一致
+	limits := fmt.Sprintf("每分钟 %d 次请求、每分钟 %dK token、同时 %d 个并发请求", llm.DefaultRPM, llm.DefaultTPM/1000, llm.DefaultConcurrency)
+	if body, _ := help.Section("tokens"); !strings.Contains(body, limits) {
+		t.Errorf("tokens.md 的默认限额与 llm 包不一致，want %q", limits)
 	}
 	body, _ := help.Section("butler")
 	for _, p := range []string{"确认卡", "90 天", "每日额度", "以下单页为准"} {

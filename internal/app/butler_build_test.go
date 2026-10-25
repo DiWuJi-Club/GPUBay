@@ -67,8 +67,8 @@ func (c *client) sse(path string, body any) (int, string) {
 func TestBuildWiresButler(t *testing.T) {
 	cfg := butlerConfig(t, map[string]string{"SPARK_LLM_PROVIDER": "mock",
 		"SPARK_LLM_PRICE_INPUT_CENTS_PER_M": "120", "SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M": "480"})
-	if !cfg.Butler || cfg.LLM.Provider != config.LLMMock || !cfg.LLM.Tools {
-		t.Fatalf("config = butler %v llm %+v", cfg.Butler, cfg.LLM)
+	if !cfg.Butler || cfg.ButlerLLM.Provider != config.LLMMock || !cfg.ButlerLLM.Tools {
+		t.Fatalf("config = butler %v llm %+v", cfg.Butler, cfg.ButlerLLM)
 	}
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
@@ -76,12 +76,12 @@ func TestBuildWiresButler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Butler == nil || a.LLM == nil || a.LLM.Name() != "mock" {
-		t.Fatalf("Butler / LLM = %v / %v", a.Butler, a.LLM)
+	if a.Butler == nil || a.ButlerLLM == nil || a.ButlerLLM.Name() != "mock" {
+		t.Fatalf("Butler / LLM = %v / %v", a.Butler, a.ButlerLLM)
 	}
-	m, ok := a.LLM.(*mock.Mock)
+	m, ok := a.ButlerLLM.(*mock.Mock)
 	if !ok {
-		t.Fatalf("LLM = %T, want *mock.Mock", a.LLM)
+		t.Fatalf("LLM = %T, want *mock.Mock", a.ButlerLLM)
 	}
 	ts := httptest.NewServer(a.Handler)
 	t.Cleanup(ts.Close)
@@ -165,12 +165,12 @@ func TestBuildButlerOff(t *testing.T) {
 	if cfg.Butler {
 		t.Fatal("SPARK_BUTLER=off must disable the butler")
 	}
-	a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0), LLM: mock.New()})
+	a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0), ButlerLLM: mock.New()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Butler != nil || a.LLM != nil {
-		t.Fatalf("Butler / LLM = %v / %v, want nil", a.Butler, a.LLM)
+	if a.Butler != nil || a.ButlerLLM != nil {
+		t.Fatalf("Butler / LLM = %v / %v, want nil", a.Butler, a.ButlerLLM)
 	}
 	ts := httptest.NewServer(a.Handler)
 	t.Cleanup(ts.Close)
@@ -214,10 +214,10 @@ func TestBuildButlerOpenAIProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Butler == nil || a.LLM == nil || a.LLM.Name() != config.LLMOpenAI || a.LLM.Model() != config.DefaultLLMModel(config.LLMOpenAI) {
-		t.Fatalf("LLM = %v", a.LLM)
+	if a.Butler == nil || a.ButlerLLM == nil || a.ButlerLLM.Name() != config.LLMOpenAI || a.ButlerLLM.Model() != config.DefaultLLMModel(config.LLMOpenAI) {
+		t.Fatalf("LLM = %v", a.ButlerLLM)
 	}
-	cfg.LLM.BaseURL = ""
+	cfg.ButlerLLM.BaseURL = ""
 	if _, err := app.Build(cfg, pool, discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0)}); err == nil || !strings.Contains(err.Error(), "SPARK_LLM_BASE_URL") {
 		t.Fatalf("err = %v, want missing base URL", err)
 	}
@@ -226,12 +226,12 @@ func TestBuildButlerOpenAIProvider(t *testing.T) {
 func prodConfig(t *testing.T) config.Config {
 	return config.Config{Env: "prod", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "aliyun", KYCDriver: "aliyun",
 		PayDriver: "real", PDUDriver: "snmp", UploadDir: t.TempDir(), Butler: true,
-		LLM: config.LLMConfig{Provider: config.LLMOpenAI, BaseURL: "http://127.0.0.1:1/v1", APIKey: "test-key", Tools: true}}
+		ButlerLLM: config.ButlerLLMConfig{Provider: config.LLMOpenAI, BaseURL: "http://127.0.0.1:1/v1", APIKey: "test-key", Tools: true}}
 }
 
 // 测试注入的 LLM 提供方绝不能用于生产（与 DisableRateLimits 同款保护）。
 func TestBuildButlerRejectsInjectedLLMInProd(t *testing.T) {
-	if _, err := app.Build(prodConfig(t), nil, discardLog(), app.Options{LLM: mock.New()}); err == nil || !strings.Contains(err.Error(), "LLM") {
+	if _, err := app.Build(prodConfig(t), nil, discardLog(), app.Options{ButlerLLM: mock.New()}); err == nil || !strings.Contains(err.Error(), "LLM") {
 		t.Fatalf("err = %v, want injected LLM rejection", err)
 	}
 }
@@ -239,7 +239,7 @@ func TestBuildButlerRejectsInjectedLLMInProd(t *testing.T) {
 // 生产环境的 mock 提供方（配置字面量绕过 config.Load 的同一校验）同样报错。
 func TestBuildButlerRejectsMockLLMInProd(t *testing.T) {
 	cfg := prodConfig(t)
-	cfg.LLM.Provider = config.LLMMock
+	cfg.ButlerLLM.Provider = config.LLMMock
 	if _, err := app.Build(cfg, nil, discardLog(), app.Options{}); err == nil || !strings.Contains(err.Error(), "mock LLM") {
 		t.Fatalf("err = %v, want mock LLM rejection", err)
 	}
@@ -252,7 +252,7 @@ func TestBuildButlerRejectsMockLLMInProd(t *testing.T) {
 // 生产环境开启管家而没有 SPARK_LLM_API_KEY（配置字面量绕过 config.Load）→ 报错。
 func TestBuildButlerRequiresAPIKeyInProd(t *testing.T) {
 	cfg := prodConfig(t)
-	cfg.LLM.APIKey = ""
+	cfg.ButlerLLM.APIKey = ""
 	if _, err := app.Build(cfg, nil, discardLog(), app.Options{}); err == nil || !strings.Contains(err.Error(), "SPARK_LLM_API_KEY") {
 		t.Fatalf("err = %v, want missing API key", err)
 	}

@@ -30,6 +30,9 @@ func (s *Service) SetAutoRenew(ctx context.Context, userID int64, id string, ena
 		if inst.UserID != userID {
 			return apperr.ErrNotFound
 		}
+		if inst.System { // 系统实例不到期，没有续费可言
+			return apperr.ErrInvalidState
+		}
 		switch inst.State {
 		case StateReserved, StateCreating, StateRunning, StateStopped:
 		default:

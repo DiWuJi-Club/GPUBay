@@ -27,6 +27,8 @@ const (
 	// 计划 8：邀请返利发放 / 扣回（ref_type='referral'，ref_id=<订单号> / <订单号>-c<n>）
 	KindReferralRebate   Kind = "referral_rebate"
 	KindReferralClawback Kind = "referral_clawback"
+	// 计划 9：Token 消费结算（ref_type='llm_settlement'，ref_id=<结算 ID>）
+	KindLLMPay Kind = "llm_pay"
 )
 
 const MaxAdjust = 100_000_000 // 单次调账上限（分）

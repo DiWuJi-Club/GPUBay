@@ -79,6 +79,11 @@ describe('ConsoleLayout AI 管家入口', () => {
     expect($('tabbar-butler')!.textContent!.trim()).toBe('管家')
     expect($('tabbar-butler')!.getAttribute('href')).toBe('/butler')
     expect($('butler-launcher')).toBeNull()
+    // 管家开启时 7 个标签（计划 9 的 Token 商城在最后），短名最多三个汉字（320px 宽每格约 45px）
+    const tabs = [...document.querySelectorAll('[data-testid^="tabbar-"]')]
+    expect(tabs.map((t) => t.getAttribute('data-testid'))).toEqual(
+      ['tabbar-market', 'tabbar-workflows', 'tabbar-instances', 'tabbar-butler', 'tabbar-wallet', 'tabbar-account', 'tabbar-tokens'])
+    for (const t of tabs) expect(Array.from(t.textContent!.trim()).length).toBeLessThanOrEqual(5)
   })
 })
 
@@ -90,15 +95,15 @@ describe('ConsoleLayout 平台未启用 AI 管家（SPARK_BUTLER=off，规格 §
     expect($('menu-butler')).toBeNull()
     expect($('butler-launcher')).toBeNull()
     expect($('butler-drawer')).toBeNull()
-    expect(document.querySelectorAll('[data-testid^="menu-"]')).toHaveLength(5)
+    expect(document.querySelectorAll('[data-testid^="menu-"]')).toHaveLength(6) // 含计划 9 的「Token 商城」
   })
 
-  it('手机：底部 tabbar 没有「管家」，剩 5 个标签', async () => {
+  it('手机：底部 tabbar 没有「管家」，剩 6 个标签（含 Token 商城）', async () => {
     mobile = true
     butlerAvail.state = 'unavailable'
     await render('/market')
     expect($('tabbar-butler')).toBeNull()
-    expect(document.querySelectorAll('[data-testid^="tabbar-"]')).toHaveLength(5)
+    expect(document.querySelectorAll('[data-testid^="tabbar-"]')).toHaveLength(6)
   })
 
   it('探测结果未出来（unknown）先不显示入口，探测为可用后再出现', async () => {

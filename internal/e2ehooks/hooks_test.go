@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/ssh"
 
 	"spark-cloud/internal/access/sshtest"
@@ -44,7 +45,8 @@ type env struct {
 	ts    *httptest.Server
 	up    *sshtest.Server
 	comfy *comfytest.Server // 只在 newEnvWith(apps = true) 时非 nil（同 cmd/e2e-server）
-	llm   *mock.Mock        // 只在 newButlerEnv 下非 nil
+	pool  *pgxpool.Pool
+	llm   *mock.Mock // 只在 newButlerEnv 下非 nil
 }
 
 func newEnv(t *testing.T) *env { t.Helper(); return newEnvWith(t, false) }
@@ -103,13 +105,13 @@ func newEnvFull(t *testing.T, apps, withButler bool) *env {
 	}
 	cfg := config.Config{Env: "dev", Domain: "spark.test", SecretKey: dbtest.Key, SMSDriver: "mock", KYCDriver: "mock", UploadDir: t.TempDir(),
 		AgentHosts: []string{"127.0.0.1"}, AgentDataSizeGiB: 2048, AgentBandwidthMbps: 200, AgentDNSServers: []string{"223.5.5.5"}, UpstreamSSHKeyFile: keyFile,
-		UpstreamSSHPort: up.Port()}
+		UpstreamSSHPort: up.Port(), LLMGateway: true} // 与 cmd/e2e-server 相同：挂 /v1
 	var m *mock.Mock
 	if withButler {
 		m = mock.New()
 		cfg.Butler = true
-		cfg.LLM = config.LLMConfig{Provider: config.LLMMock, Model: "mock", Tools: true}
-		opt.LLM = m
+		cfg.ButlerLLM = config.ButlerLLMConfig{Provider: config.LLMMock, Model: "mock", Tools: true}
+		opt.ButlerLLM = m
 	}
 	a, err := app.Build(cfg, pool, log, opt)
 	if err != nil {
@@ -129,7 +131,7 @@ func newEnvFull(t *testing.T, apps, withButler bool) *env {
 	sshDone := make(chan struct{})
 	go func() { defer close(sshDone); _ = a.SSH.Serve(ctx, sshLis) }()
 	hooks := &e2ehooks.Server{App: a, Pool: pool, Clock: clk, KYC: k, Log: log, AgentAddr: lis.Addr().String(), SSHAddr: sshLis.Addr().String(), Upstream: up,
-		HealthAddr: healthAddr, LLM: m, Comfy: comfy}
+		HealthAddr: healthAddr, ButlerLLM: m, Comfy: comfy}
 	ts := httptest.NewServer(hooks.Handler())
 	t.Cleanup(func() {
 		ts.Close()
@@ -140,7 +142,7 @@ func newEnvFull(t *testing.T, apps, withButler bool) *env {
 		a.Upstream.Close()
 		up.Close()
 	})
-	return &env{t: t, a: a, clk: clk, ts: ts, up: up, llm: m, comfy: comfy}
+	return &env{t: t, a: a, clk: clk, ts: ts, up: up, llm: m, comfy: comfy, pool: pool}
 }
 
 func (e *env) call(method, path string, body any) (int, map[string]any) {

@@ -90,8 +90,8 @@ const { openReassign, openCancel } = bookingOps
       <el-table-column label="下单" width="150"><template #default="{ row }">{{ fmtTime(row.created_at) }}</template></el-table-column>
       <el-table-column label="操作" width="180">
         <template #default="{ row }">
-          <el-button v-if="showReassign(role, row.state)" size="small" data-testid="booking-reassign" @click="openReassign(row as AdminInstance)">改派</el-button>
-          <el-button v-if="showCancelBooking(role, row.state)" size="small" type="danger" plain data-testid="booking-cancel" @click="openCancel(row as AdminInstance)">取消预订</el-button>
+          <el-button v-if="showReassign(role, row.state, row.system)" size="small" data-testid="booking-reassign" @click="openReassign(row as AdminInstance)">改派</el-button>
+          <el-button v-if="showCancelBooking(role, row.state, row.system)" size="small" type="danger" plain data-testid="booking-cancel" @click="openCancel(row as AdminInstance)">取消预订</el-button>
         </template>
       </el-table-column>
     </el-table>

@@ -63,3 +63,27 @@ func TestReservedCountsByGroup(t *testing.T) {
 		t.Fatalf("counts = %v, %v", counts, err)
 	}
 }
+
+// 计划 9：Token 服务池不能删除；锁住机组行后先判断，池里有未终态实例时也报「Token 服务池不能删除」而不是 group_not_empty。
+func TestAdminDeleteGroupRejectsLLMPool(t *testing.T) {
+	e := newEnv(t, 1)
+	actor := audit.Actor{AdminID: 1, IP: "127.0.0.1"}
+	poolID, err := e.fleet.LLMPoolGroupID(e.ctx, e.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.AdminDeleteGroup(e.ctx, actor, poolID); !errors.Is(err, fleet.ErrPoolNotDeletable) {
+		t.Fatalf("delete empty pool = %v", err)
+	}
+	_, inst := e.place(catalog.D1d)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET group_id = $2 WHERE id = $1`, inst.ID, poolID); err != nil {
+		t.Fatal(err)
+	}
+	err = e.svc.AdminDeleteGroup(e.ctx, actor, poolID)
+	if ae := apperr.As(err); !errors.Is(err, fleet.ErrPoolNotDeletable) || ae == nil || ae.Code != "invalid_state" || ae.Message != "Token 服务池不能删除" {
+		t.Fatalf("delete busy pool = %v", err)
+	}
+	if got := e.get(inst.ID); got.GroupID == nil || *got.GroupID != poolID {
+		t.Fatalf("instance group_id changed: %v", got.GroupID)
+	}
+}

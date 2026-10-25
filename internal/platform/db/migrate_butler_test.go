@@ -167,7 +167,7 @@ func TestMigration00025RoundTrip(t *testing.T) {
 	if got := scalar(tables); got != "0" {
 		t.Fatalf("down left tables: %s", got)
 	}
-	if got := scalar(`SELECT count(*) FROM users`); got != "1" {
+	if got := scalar(`SELECT count(*) FROM users WHERE NOT system`); got != "1" { // 00022 的系统账号 system:llm 不算
 		t.Fatalf("users after down = %s", got)
 	}
 	if _, err := p.UpByOne(ctx); err != nil {

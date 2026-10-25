@@ -118,14 +118,14 @@ const (
 
 func buildTestEnv(t *testing.T, mode envMode, tweak func(*api.Server)) *testEnv {
 	t.Helper()
-	var setup func(*api.Server, *pgxpool.Pool)
+	var tw func(*api.Server, *pgxpool.Pool)
 	if tweak != nil {
-		setup = func(srv *api.Server, _ *pgxpool.Pool) { tweak(srv) }
+		tw = func(s *api.Server, _ *pgxpool.Pool) { tweak(s) }
 	}
-	return buildTestEnvPool(t, mode, setup)
+	return buildTestEnvPool(t, mode, tw)
 }
 
-// buildTestEnvPool 同 buildTestEnv，调整函数额外拿到连接池（组装需要直连数据库的服务，例如 AI 管家）。
+// buildTestEnvPool 同 buildTestEnv，但 tweak 还能拿到连接池（组装依赖数据库的可选服务，如 Token 商城）。
 func buildTestEnvPool(t *testing.T, mode envMode, tweak func(*api.Server, *pgxpool.Pool)) *testEnv {
 	t.Helper()
 	pool := dbtest.New(t)

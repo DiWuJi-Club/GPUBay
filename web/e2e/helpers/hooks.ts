@@ -107,6 +107,20 @@ export const hooks = {
   butlerSettings(opts: { defaults?: boolean; enabled?: boolean; daily_token_limit?: number; max_turns?: number; notice?: string }) {
     return post<{ enabled: boolean; daily_token_limit: number; max_turns: number; notice: string }>('/hooks/butler/settings', opts)
   },
+  /** 在假容器 sshd 的端口（缺省 8000）挂一个 FakeVLLM（替换该端口上之前的服务）。served 缺省 = 调用时全部已上线模型的 slug，
+   *  所以要先把模型上线再调用；usage 缺省 100 / 50 token；require_key 缺省 ""（接受任意节点密钥）。 */
+  llmUpstream(opts: { port?: number; served?: string[]; prompt_tokens?: number; completion_tokens?: number; chunks?: string[]; fail_first_n?: number; delay_ms?: number; require_key?: string } = {}) {
+    return post<{ ok: boolean; port: number; served: string[] }>('/hooks/llm/upstream', opts)
+  },
+  /** 在 Token 服务池内的机器（空闲、Agent 在线、没有实例）上直接造一个 ready 节点（系统实例 running，不建部署）。 */
+  llmNode(model_id: number, machine_id: number) {
+    return post<{ node_id: string; instance_id: string }>('/hooks/llm/node', { model_id, machine_id })
+  },
+  /** 跑一轮节点 Controller（probe 为真时再跑一轮探测）并刷新网关路由表。注意服务端 /hooks/llm/tick 缺省 probe=true；
+   *  本辅助函数总是显式发送 probe，缺省 false：只推进排空 / 移除，不让探测结果（上游失败时计失败、3 轮后不健康）干扰用例。 */
+  llmTick(probe = false) {
+    return post<{ provisioned: number; drained: number; failed: number; removed: number; orphans: number; error: string }>('/hooks/llm/tick', { probe })
+  },
   // ---- 计划 11：工作流与 fake ComfyUI（见 internal/e2ehooks/workflows.go）----
   /** 幂等地建并发布 fake 工作流 A（e2e-wf-a）、B（e2e-wf-b），并把所有实例的 8188 转到进程内 fake ComfyUI。 */
   workflowsSeed() {

@@ -46,8 +46,8 @@ func TestButlerHooksRequireButler(t *testing.T) {
 
 func TestButlerReplyHook(t *testing.T) {
 	e := newButlerEnv(t)
-	if e.a.Butler == nil || e.a.LLM != e.llm {
-		t.Fatalf("Butler %v, LLM %v (want the injected mock %p)", e.a.Butler, e.a.LLM, e.llm)
+	if e.a.Butler == nil || e.a.ButlerLLM != e.llm {
+		t.Fatalf("Butler %v, LLM %v (want the injected mock %p)", e.a.Butler, e.a.ButlerLLM, e.llm)
 	}
 	for name, body := range map[string]any{
 		"empty":            map[string]any{},
