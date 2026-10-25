@@ -33,6 +33,7 @@ import (
 	"spark-cloud/internal/butler/llm/openai"
 	"spark-cloud/internal/butler/tools"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
@@ -115,6 +116,9 @@ type App struct {
 	AppCatalog *appdeploy.Catalog
 	AppRunner  *appdeploy.Runner // 部署后台执行者；由 cmd/platform 按 SPARK_APP_RUNNER 启动
 
+	Workflows         *comfywf.Catalog   // ComfyUI 工作流目录（计划 11）
+	WorkflowInstaller *comfywf.Installer // 部署上的工作流集合（添加 / 更新 / 移除）
+	WorkflowRuns      *comfywf.Runs      // 快速出图代理
 	// 计划 12：AI 管家；cfg.Butler 为 false（SPARK_BUTLER=off，或开发环境未配端点被自动关闭）时两者都是 nil、路由不注册。
 	// cmd/platform 把 Butler.Sweep 挂进清扫器。
 	Butler *butler.Service
@@ -218,7 +222,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	f.ConfigurePDU(fleet.PDUConfig{Box: box, Open: pduOpener(cfg, opt.PDU), AllowMock: cfg.Env != "prod"})
 	r := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
-		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen,
+		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SSHBasePort: cfg.UpstreamSSHPort,
 	})
 	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r, Alerts: f})
 	ids.SetReferral(ref)
@@ -322,13 +326,22 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	upstreamPool := upstream.New(upstream.Config{Signer: upstreamSigner, Port: cfg.UpstreamSSHPort, Log: log}, r)
 	// 应用一键部署：服务需要上游连接池（实时日志）与入口地址；接上 rental 钩子之后带 app_id 的下单才可用（noop 钩子报 app_not_found）。
 	// 应用根目录生产用默认的容器路径 /root/data（appdeploy.DefaultAppRoot）；测试 / e2e 经 Options 注入，Runner 与「查看日志」用同一个。
-	apps := appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
-		Upstream: upstreamPool, PortURL: ingressAuth.PortURL, HFEndpoint: cfg.AppHFEndpoint, PipIndexURL: cfg.AppPipIndexURL,
-		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor})
+	// 计划 11：工作流目录与四个 appdeploy 钩子（部署包 / 状态回写 / 视图 / 下单预装解析）在 appdeploy.NewService 之前接上。
+	wfCat := comfywf.NewCatalog(pool, clk, uploads, log)
+	appDeps := appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: log, Catalog: appCat, Images: c, Rental: r, Fleet: f,
+		Upstream: upstreamPool, PortURL: ingressAuth.PortURL, HFEndpoint: cfg.AppHFEndpoint, PipIndexURL: cfg.AppPipIndexURL, GitMirror: cfg.AppGitMirror,
+		AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor}
+	comfywf.NewHooks(pool, wfCat).Wire(&appDeps)
+	apps := appdeploy.NewService(appDeps)
 	r.SetAppHooks(apps)
 	appRunner := appdeploy.NewRunner(apps, upstreamPool, appdeploy.RunnerConfig{HealthAddr: opt.AppHealthAddr, AppRoot: opt.AppRoot, AppRootFor: opt.AppRootFor})
 	srv.Apps, srv.AppsLimit = apps, authorizeLimit // 零值取默认（每用户每小时 60 次写）；DisableRateLimits 时为 noRateLimit
 	adminSrv.Apps, adminSrv.AppCatalog = apps, appCat
+	// 快速出图代理与 Runner 健康检查走同一个上游连接池（Pool.Dial 到容器内 127.0.0.1:<ComfyUI 端口>）
+	wfInst := comfywf.NewInstaller(pool, clk, wfCat, apps, appCat, log)
+	wfRuns := comfywf.NewRuns(pool, clk, wfCat, apps, comfywf.NewClient(upstreamPool), log)
+	srv.Workflows, srv.Installer, srv.Runs = wfCat, wfInst, wfRuns
+	adminSrv.Workflows, adminSrv.Installer = wfCat, wfInst
 	var bt *butler.Service
 	var provider llm.Provider
 	if cfg.Butler {
@@ -362,7 +375,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	return &App{Admins: admins, AdminHandler: adminSrv.Router(), Identity: ids, Wallet: w, Catalog: c, Fleet: f, Rental: r, Billing: bill, Referral: ref, Uploads: uploads, Handler: handler,
 		Gateway: gw, CA: ca, IngressAuth: ingressAuth, Ingress: ingSrv, Routes: routes, Upstream: upstreamPool, TLS: loader,
 		SSH: sshSrv, SSHHostKey: sshHostKey, UpstreamSigner: upstreamSigner, Apps: apps, AppCatalog: appCat, AppRunner: appRunner,
-		Butler: bt, LLM: provider}, nil
+		Workflows: wfCat, WorkflowInstaller: wfInst, WorkflowRuns: wfRuns, Butler: bt, LLM: provider}, nil
 }
 
 // llmProvider 返回 AI 管家的模型提供方：注入的优先（测试 / e2e），否则按 cfg.Provider 构造。

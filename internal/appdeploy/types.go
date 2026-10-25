@@ -35,6 +35,9 @@ type Spec struct {
 	MinDataFreeGiB int        `json:"min_data_free_gib,omitempty"`
 	Env            []EnvSpec  `json:"env,omitempty"`
 	Links          []LinkSpec `json:"links,omitempty"`
+	// SupportsWorkflows（计划 11）：该版本的 app.sh 认识部署包里的 workflows/（ComfyUI 工作流市场）；
+	// 为真时 bundleFor 经 Deps.BundleExtra 追加工作流文件。false 省略，不改变既有版本的 spec_hash。
+	SupportsWorkflows bool `json:"supports_workflows,omitempty"`
 }
 
 type App struct {
@@ -103,6 +106,12 @@ type Deployment struct {
 
 // Live 表示部署仍占用 app_deployments_live_uniq（非终态）。
 func (d Deployment) Live() bool { return d.State != StateRemoved && d.State != StateLost }
+
+// WorkflowRef 是预装 / 换机时部署「应装工作流集合」的一项（deployment_workflows 的 workflow_id + workflow_version_id）。
+// 由 Deps.ResolveWorkflows（comfywf 实现）给出，appdeploy 不解释其内容。
+type WorkflowRef struct {
+	WorkflowID, VersionID int64
+}
 
 type Event struct {
 	ID           int64     `json:"id"`

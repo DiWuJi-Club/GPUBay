@@ -129,7 +129,7 @@ func TestIngressRoutesAndMigrateCopy(t *testing.T) {
 	}
 	r := routes[0]
 	if r.InstanceID != inst.ID || r.UserID != e.userID || r.Port != 7860 || r.Visibility != "private" || r.State != rental.StateRunning || r.Suspended ||
-		r.LanIP != "10.0.0.10" || r.HostPubkey == "" {
+		r.LanIP != "10.0.0.10" || r.HostPubkey == "" || r.SSHPort != testSSHBasePort {
 		t.Fatalf("route = %+v", r)
 	}
 	moved, err := e.svc.AdminMigrate(e.ctx, audit.Actor{AdminID: 1}, inst.ID, "move")

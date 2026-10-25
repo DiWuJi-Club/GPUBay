@@ -70,6 +70,13 @@ export default defineConfig({
   // privateApp 建自己的已上架应用，结束时改为已退役，不动共享的四个 fake 应用。A-APP-04 新建一个启用的镜像，并用
   // hooks.agent({images}) 把所有在线 fake Agent 的已缓存镜像整体设为它（覆盖率断言要求全部在线机器都上报过）；
   // A-MCH-10 只设自己那台机器。
+  // 计划 11 的工作流用例（C-WF / C-MKT-13 / A-WF / A-INS-15）：fake 工作流 A（e2e-wf-a）、B（e2e-wf-b）由 /hooks/workflows/seed 幂等创建，
+  // 永远只有 1.0.0；「8 个上限」「发布新版本」用 /hooks/workflows/seed-many 的额外工作流 e2e-wf-c～i（创建后整轮保留，市场页、RentDialog、
+  // 添加工作流列表里都会多出这几项，所以用例不断言卡片总数）。C-WF-09（每个控制台 project 各一次）与 A-INS-15 都给 e2e-wf-c 发新版本，
+  // 它的最新版本号随运行递增：断言一律用钩子返回的版本号。fake ComfyUI 是全局的：/hooks/comfy/reject 打开后所有实例的 /prompt 都被拒，
+  // console/workflows.spec.ts 的 afterEach 在 try / finally 里先恢复它再卸载部署；快速出图历史按运行 ID 设置，互不影响。
+  // A-WF-06 / 07 读后台全库计数（安装数、24 小时快速出图数）：admin project 串行执行，基线在变化前一刻读取（24 小时窗口按假时钟），
+  // 不依赖别的用例留下的数据。部署都在用例自己的 ComfyUI 镜像实例上（helpers/workflows.ts comfySetup），afterEach 卸载。
   // 计划 12 的 AI 管家用例（C-BOT / A-BOT）：e2e-server 用 mock 模型。回复尽量用 hooks.butlerReply 注入确定性的一轮
   // （不依赖 mock 规则的顺序）；只有测规则流程本身的用例（推荐、部署 vLLM、续费 / 释放、日志诊断、日志注入）走关键词规则。
   // 每个用例新建用户，beforeEach（helpers/butler.ts resetButler）清空回复队列并把设置恢复默认；A-BOT-03 关闭管家后在 finally 里恢复。

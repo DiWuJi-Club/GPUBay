@@ -1,0 +1,15 @@
+{
+  "name": "FLUX.1-schnell 文生图（fp8）",
+  "summary": "FLUX.1-schnell fp8 单文件模型，4 步出图，画质与提示词理解都强于 SDXL。",
+  "description": "ComfyUI 官方「Flux Schnell fp8」工作流（单文件 checkpoint，已包含文本编码器与 VAE）。\n\n- 模型：flux1-schnell-fp8.safetensors（checkpoints，约 17.24 GB，许可 Apache-2.0）\n- schnell 是蒸馏模型：1～8 步即可（默认 4），CFG 固定 1、没有反向提示词\n- 宽高取 64 的倍数，默认 1024×1024\n- 快速出图可调：提示词、宽、高、步数、种子",
+  "category": "txt2img",
+  "tags": [
+    "FLUX",
+    "文生图",
+    "快速"
+  ],
+  "sort": 30,
+  "version": "1.0.0",
+  "changelog": "首个版本：基于 ComfyUI v0.3.60 官方模板（comfyui-workflow-templates 0.1.86），支持快速出图。",
+  "comfyui_min": "0.3.60"
+}

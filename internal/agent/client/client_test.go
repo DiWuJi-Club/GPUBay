@@ -28,6 +28,7 @@ import (
 	"spark-cloud/internal/agent/client"
 	diskfake "spark-cloud/internal/agent/disk/fake"
 	"spark-cloud/internal/agent/executor"
+	"spark-cloud/internal/agent/features"
 	"spark-cloud/internal/agent/metrics"
 	netfake "spark-cloud/internal/agent/netfilter/fake"
 	rtfake "spark-cloud/internal/agent/runtime/fake"
@@ -147,7 +148,8 @@ type harness struct {
 	ca        *pki.CA
 	key       *ecdsa.PrivateKey
 	dir       string // 最近一个 agent 的状态目录
-	collect   func(context.Context) metrics.Metrics
+	collect   client.CollectFunc
+	features  *uint32       // nil → 客户端默认（features.SharedSlots）
 	helloGate chan struct{} // 非 nil 时，构造 Hello 前等它关闭（LocalIPs 在建流之后、发送 Hello 之前被调用）
 }
 
@@ -168,7 +170,9 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(gs.Stop)
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	return &harness{t: t, gw: gw, addr: lis.Addr().String(), ca: ca, key: key,
-		collect: func(context.Context) metrics.Metrics { return metrics.Metrics{Load1: 1} }}
+		collect: func(context.Context) (metrics.Metrics, []metrics.InstanceMetrics) {
+			return metrics.Metrics{Load1: 1}, nil
+		}}
 }
 
 func (h *harness) waitHelloGate() {
@@ -206,7 +210,7 @@ func (h *harness) agentWith(stepped, noReconnect bool) (*client.Client, *executo
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, stepped)
 	c := client.New(client.Config{Addr: h.addr, TLS: tc, Version: "test", Hostname: "h", LocalIPs: func() []string { h.waitHelloGate(); return []string{"10.0.0.10"} },
 		Stepped: stepped, HeartbeatInterval: 50 * time.Millisecond, ReportInterval: 80 * time.Millisecond, Backoff: client.Backoff{Min: 10 * time.Millisecond, Max: 50 * time.Millisecond},
-		NoReconnect: noReconnect},
+		NoReconnect: noReconnect, Features: h.features},
 		ex, h.collect, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return c, ex, rt
 }
@@ -416,7 +420,11 @@ func TestHungCollectorDoesNotStallHeartbeat(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	var calls atomic.Int32
-	h.collect = func(context.Context) metrics.Metrics { calls.Add(1); <-release; return metrics.Metrics{} }
+	h.collect = func(context.Context) (metrics.Metrics, []metrics.InstanceMetrics) {
+		calls.Add(1)
+		<-release
+		return metrics.Metrics{}, nil
+	}
 	c, ex, _ := h.agent(false)
 	client.SetMetricsTimeoutForTest(c, 20*time.Millisecond)
 	ctx := h.start(c, ex, false)
@@ -656,4 +664,62 @@ func TestStateReportCarriesImages(t *testing.T) {
 	if st := h.gw.msgs()[2].GetState(); st == nil || st.GetImages() != nil {
 		t.Fatalf("state after images error = %v", h.gw.msgs()[2])
 	}
+}
+
+// Hello 带能力位图：默认 features.SharedSlots；显式 0 模拟旧 Agent。
+func TestHelloCarriesFeatures(t *testing.T) {
+	for name, tc := range map[string]struct {
+		set  *uint32
+		want uint32
+	}{"default": {nil, features.SharedSlots}, "old agent": {new(uint32), 0}} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			h.features = tc.set
+			c, ex, _ := h.agent(false)
+			ctx := h.start(c, ex, false)
+			if err := c.WaitConnected(ctx); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "hello received", func() bool { return len(h.gw.msgs()) > 0 })
+			hello := h.gw.msgs()[0].GetHello()
+			if hello == nil || hello.GetFeatures() != tc.want {
+				t.Fatalf("hello = %v, want features %d", hello, tc.want)
+			}
+		})
+	}
+}
+
+// CreateInstance.share_slots 进入执行器：按份等分配额；心跳带每实例指标。
+func TestCreateShareSlotsAndInstanceHeartbeat(t *testing.T) {
+	h := newHarness(t)
+	h.collect = func(context.Context) (metrics.Metrics, []metrics.InstanceMetrics) {
+		return metrics.Metrics{Load1: 1, DataDiskUsed: 7}, []metrics.InstanceMetrics{{InstanceID: "ins-aaaaaaaa", MemCurrent: 100, MemMax: 400, CPUPercent: 12.5, DataDiskUsed: 7}}
+	}
+	c, ex, rt := h.agent(false)
+	ctx := h.start(c, ex, true)
+	if err := c.WaitConnected(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.gw.push(&agentpb.Command{Id: "cmd-s", InstanceId: "ins-aaaaaaaa", Body: &agentpb.Command_Create{Create: &agentpb.CreateInstance{
+		ImageRef: "img:1", UpstreamPubkey: "k", BandwidthMbps: 200, SshPort: 2224, DataSizeGib: 8, ShareSlots: 4}}})
+	waitFor(t, "shared create result", func() bool { r, ok := ex.StateStore().Result("cmd-s"); return ok && r.OK })
+	sp, ok := rt.Spec("ins-aaaaaaaa")
+	if !ok || sp.SSHPort != 2224 || sp.PidsLimit != 8192 || !sp.DropNice || sp.MemoryBytes != (120<<30)/4 {
+		t.Fatalf("spec = %+v", sp)
+	}
+	if inst, _ := ex.StateStore().Instance("ins-aaaaaaaa"); inst.ShareSlots != 4 || inst.DataSizeGiB != 2 {
+		t.Fatalf("state = %+v", inst)
+	}
+	waitFor(t, "heartbeat with instance metrics", func() bool {
+		for _, m := range h.gw.msgs() {
+			hb := m.GetHeartbeat()
+			if hb == nil || len(hb.GetInstances()) != 1 {
+				continue
+			}
+			im := hb.GetInstances()[0]
+			return im.GetInstanceId() == "ins-aaaaaaaa" && im.GetMemCurrent() == 100 && im.GetMemMax() == 400 && im.GetCpuPercent() == 12.5 &&
+				im.GetDataDiskUsed() == 7 && hb.GetMetrics().GetDataDiskUsed() == 7
+		}
+		return false
+	})
 }

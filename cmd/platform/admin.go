@@ -18,6 +18,7 @@ import (
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/audit"
+	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
@@ -29,13 +30,14 @@ const adminUsage = `用法：
   platform admin reset-totp --username <用户名>
   platform admin gen-upstream-key --path <私钥文件>
   platform admin ssh-host-key
-  platform admin app import <目录>`
+  platform admin app import <目录>
+  platform admin workflow import <目录>`
 
 // prompter 读取一行输入；secret 为 true 时不回显（用于密码）。
 type prompter func(label string, secret bool) (string, error)
 
 // runAdmin 处理 `platform admin ...` 子命令。
-func runAdmin(ctx context.Context, svc *admin.Service, cat *appdeploy.Catalog, args []string, out io.Writer, prompt prompter) error {
+func runAdmin(ctx context.Context, svc *admin.Service, cat *appdeploy.Catalog, wf *comfywf.Catalog, args []string, out io.Writer, prompt prompter) error {
 	if len(args) == 0 {
 		return errors.New(adminUsage)
 	}
@@ -48,6 +50,8 @@ func runAdmin(ctx context.Context, svc *admin.Service, cat *appdeploy.Catalog, a
 		return adminGenUpstreamKey(args[1:], out)
 	case "app":
 		return appImport(ctx, cat, args[1:], out)
+	case "workflow":
+		return workflowImport(ctx, wf, args[1:], out)
 	}
 	return errors.New(adminUsage)
 }

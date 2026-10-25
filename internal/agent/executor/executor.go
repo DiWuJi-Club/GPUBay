@@ -4,6 +4,7 @@ package executor
 import (
 	"context"
 	"log/slog"
+	goruntime "runtime"
 	"slices"
 	"sync"
 	"time"
@@ -16,9 +17,13 @@ import (
 
 const (
 	ReserveBytes     = uint64(100) << 30 // 创建数据盘时根分区必须额外留出的余量
-	HostReserveBytes = uint64(8) << 30   // 容器内存上限 = 机器内存 − 8GiB
-	SSHMountDir      = "/.spark"
-	rulesInterval    = 60 * time.Second
+	HostReserveBytes = uint64(8) << 30   // 容器内存上限 = (机器内存 − 8GiB) / 份数
+	MaxPids          = 32768             // 整机容器的 --pids-limit；共享机按份等分
+	// DefaultCgroupRoot：cgroup v2 挂载点。Docker 用 systemd cgroup 驱动时容器 cgroup 为
+	// <root>/system.slice/docker-<完整 ID>.scope（cgroupfs 驱动为 <root>/docker/<完整 ID>）。
+	DefaultCgroupRoot = "/sys/fs/cgroup"
+	SSHMountDir       = "/.spark"
+	rulesInterval     = 60 * time.Second
 
 	// ReportTimeout 是一次 StateReport 采集（docker ps、挂载检查）的上限：dockerd 卡死时按本地记录报 unknown，
 	// 不能拖住与心跳共用的发送循环。
@@ -73,6 +78,7 @@ type Command struct {
 	SSHPort        int
 	DataSizeGiB    int
 	HostKeyPEM     string // 平台生成的主机私钥（敏感，不落日志）；为空则本地生成
+	ShareSlots     int    // 份数：0 / 1 = 整机；N > 1 时内存、CPU、pids、数据盘按 N 等分
 }
 
 type ResultMsg struct {
@@ -95,6 +101,8 @@ type Deps struct {
 	Bridge     string
 	LocalIPs   func() []string
 	MemTotal   func() uint64
+	NumCPU     func() int // 共享机 --cpus 的分子；nil → runtime.NumCPU
+	CgroupRoot string     // cgroup v2 挂载点，空 → DefaultCgroupRoot（测试指向临时目录）
 	HostKeyGen func(dir string) error
 	Log        *slog.Logger
 }
@@ -128,6 +136,8 @@ type Executor struct {
 	// 由 refreshRules 逐轮重试直到启动成功；只含 Recover 产生的实例，外部停止的容器不在其中。
 	// 值为首次登记的时间（RecoverGrace 宽限期从这里起算）。
 	recoverPending map[string]time.Time
+	// fullIDs：实例 → 容器完整 ID（每次 Inspect 容器时刷新，洗机时删除），供 Mounts 拼 cgroup 路径，心跳不调用 docker。
+	fullIDs map[string]string
 
 	// 两个队列各有一个唤醒通道（容量 1），入队时按类型通知；共用一个通道时 pull 消费者会抢走实例指令的唤醒。
 	wakeInstance chan struct{}
@@ -152,9 +162,15 @@ func New(d Deps, stepped bool) *Executor {
 	if d.LocalIPs == nil {
 		d.LocalIPs = func() []string { return nil }
 	}
+	if d.NumCPU == nil {
+		d.NumCPU = goruntime.NumCPU
+	}
+	if d.CgroupRoot == "" {
+		d.CgroupRoot = DefaultCgroupRoot
+	}
 	return &Executor{d: d, stepped: stepped, results: make(chan ResultMsg, 256), rulesInterval: rulesInterval,
 		reportTimeout: ReportTimeout, recoverStepTimeout: RecoverStepTimeout, recoverGrace: RecoverGrace,
-		pending: map[string]bool{}, recoverPending: map[string]time.Time{}, unpersisted: map[string]state.Result{},
+		pending: map[string]bool{}, recoverPending: map[string]time.Time{}, fullIDs: map[string]string{}, unpersisted: map[string]state.Result{},
 		wakeInstance: make(chan struct{}, 1), wakePull: make(chan struct{}, 1), rulesWake: make(chan struct{}, 1)}
 }
 
@@ -463,6 +479,7 @@ func (e *Executor) ensureLimit(ctx context.Context, inst state.Instance) error {
 	if err != nil {
 		return err
 	}
+	e.noteContainer(inst.ID, c)
 	if !c.Exists || !c.Running {
 		return nil
 	}

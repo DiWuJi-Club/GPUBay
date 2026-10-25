@@ -1,0 +1,122 @@
+{
+  "models": [
+    {
+      "name": "wan2.2_ti2v_5B_fp16.safetensors",
+      "dir": "diffusion_models",
+      "size_gb": 10.0,
+      "modelscope": {
+        "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "file": "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"
+      },
+      "hf": {
+        "repo": "Comfy-Org/Wan-2.2",
+        "file": "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"
+      },
+      "sha256": "456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e"
+    },
+    {
+      "name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "dir": "text_encoders",
+      "size_gb": 6.74,
+      "modelscope": {
+        "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "file": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+      },
+      "hf": {
+        "repo": "Comfy-Org/Wan-2.2",
+        "file": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+      },
+      "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
+    },
+    {
+      "name": "wan2.2_vae.safetensors",
+      "dir": "vae",
+      "size_gb": 1.41,
+      "modelscope": {
+        "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "file": "split_files/vae/wan2.2_vae.safetensors"
+      },
+      "hf": {
+        "repo": "Comfy-Org/Wan-2.2",
+        "file": "split_files/vae/wan2.2_vae.safetensors"
+      },
+      "sha256": "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156"
+    }
+  ],
+  "nodes": [],
+  "inputs": [
+    {
+      "key": "prompt",
+      "label": "提示词",
+      "type": "textarea",
+      "node": "6",
+      "input": "text",
+      "default": "Low contrast. In a retro 1970s-style subway station, a street musician plays in dim colors and rough textures. He wears an old jacket, playing guitar with focus. Commuters hurry by, and a small crowd gathers to listen. The camera slowly moves right, capturing the blend of music and city noise, with old subway signs and mottled walls in the background.",
+      "max_len": 2000
+    },
+    {
+      "key": "negative",
+      "label": "反向提示词",
+      "type": "textarea",
+      "node": "7",
+      "input": "text",
+      "default": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+      "max_len": 2000
+    },
+    {
+      "key": "width",
+      "label": "宽",
+      "type": "int",
+      "node": "55",
+      "input": "width",
+      "default": 1280,
+      "min": 320,
+      "max": 1280,
+      "step": 32
+    },
+    {
+      "key": "height",
+      "label": "高",
+      "type": "int",
+      "node": "55",
+      "input": "height",
+      "default": 704,
+      "min": 320,
+      "max": 1280,
+      "step": 32
+    },
+    {
+      "key": "length",
+      "label": "帧数",
+      "type": "int",
+      "node": "55",
+      "input": "length",
+      "default": 121,
+      "min": 1,
+      "max": 121,
+      "step": 4
+    },
+    {
+      "key": "steps",
+      "label": "步数",
+      "type": "int",
+      "node": "3",
+      "input": "steps",
+      "default": 20,
+      "min": 1,
+      "max": 60
+    },
+    {
+      "key": "seed",
+      "label": "种子",
+      "type": "seed",
+      "node": "3",
+      "input": "seed"
+    }
+  ],
+  "outputs": [
+    {
+      "node": "58"
+    }
+  ]
+}

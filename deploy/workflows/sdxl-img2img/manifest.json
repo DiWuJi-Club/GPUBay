@@ -1,0 +1,90 @@
+{
+  "models": [
+    {
+      "name": "sd_xl_base_1.0.safetensors",
+      "dir": "checkpoints",
+      "size_gb": 6.94,
+      "modelscope": {
+        "repo": "AI-ModelScope/stable-diffusion-xl-base-1.0",
+        "file": "sd_xl_base_1.0.safetensors"
+      },
+      "hf": {
+        "repo": "stabilityai/stable-diffusion-xl-base-1.0",
+        "file": "sd_xl_base_1.0.safetensors"
+      },
+      "sha256": "31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b"
+    }
+  ],
+  "nodes": [],
+  "inputs": [
+    {
+      "key": "image",
+      "label": "输入图片",
+      "type": "image",
+      "node": "10",
+      "input": "image"
+    },
+    {
+      "key": "prompt",
+      "label": "提示词",
+      "type": "textarea",
+      "node": "6",
+      "input": "text",
+      "default": "photograph of victorian woman with wings, sky clouds, meadow grass",
+      "max_len": 2000
+    },
+    {
+      "key": "negative",
+      "label": "反向提示词",
+      "type": "textarea",
+      "node": "7",
+      "input": "text",
+      "default": "watermark, text",
+      "max_len": 2000
+    },
+    {
+      "key": "denoise",
+      "label": "重绘强度（denoise）",
+      "type": "float",
+      "node": "3",
+      "input": "denoise",
+      "default": 0.75,
+      "min": 0.2,
+      "max": 1,
+      "step": 0.05
+    },
+    {
+      "key": "steps",
+      "label": "步数",
+      "type": "int",
+      "node": "3",
+      "input": "steps",
+      "default": 25,
+      "min": 1,
+      "max": 100
+    },
+    {
+      "key": "cfg",
+      "label": "CFG",
+      "type": "float",
+      "node": "3",
+      "input": "cfg",
+      "default": 7,
+      "min": 1,
+      "max": 30,
+      "step": 0.5
+    },
+    {
+      "key": "seed",
+      "label": "种子",
+      "type": "seed",
+      "node": "3",
+      "input": "seed"
+    }
+  ],
+  "outputs": [
+    {
+      "node": "9"
+    }
+  ]
+}

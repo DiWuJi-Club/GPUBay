@@ -17,13 +17,15 @@ type PlaceRequest struct {
 	// 计划 7：开通时预装应用（见 BatchRequest.AppID / AppEnv）
 	AppID  *int64
 	AppEnv map[string]string
+	// 计划 11：预装工作流（见 BatchRequest.AppWorkflowIDs）
+	AppWorkflowIDs []int64
 }
 
 // Place 新购一台整机（旧接口 POST /orders）：等价于一台、一个单位、立即开通、不建批次的 PlaceBatch；
 // 幂等键原样写在订单上，回放行为与计划 1 完全相同。
 func (s *Service) Place(ctx context.Context, req PlaceRequest) (Order, Instance, error) {
 	res, err := s.placeBatch(ctx, BatchRequest{UserID: req.UserID, ProductID: req.ProductID, ImageID: req.ImageID, Count: 1,
-		Duration: req.Duration, Quantity: 1, IdempotencyKey: req.IdempotencyKey, AppID: req.AppID, AppEnv: req.AppEnv}, false)
+		Duration: req.Duration, Quantity: 1, IdempotencyKey: req.IdempotencyKey, AppID: req.AppID, AppEnv: req.AppEnv, AppWorkflowIDs: req.AppWorkflowIDs}, false)
 	if err != nil {
 		return Order{}, Instance{}, err
 	}

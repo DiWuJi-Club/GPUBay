@@ -34,6 +34,91 @@ case "$1" in
 esac
 `
 
+// fakeComfyScript 是 fake comfyui（1.1.0 语义：supports_workflows）的 app.sh：install 按部署包里的 workflows/manifest.json
+// （平台生成的紧凑 JSON，按 '{' 拆行后逐行取字段，不依赖 python3）在 $SPARK_DATA_DIR/comfyui 下模拟安装——
+// 每个 wf 复制为 user/default/workflows/spark-<slug>.json（目录里不在清单中的 spark-*.json 删掉，其它文件不动）、
+// 每个模型 touch models/<dir>/<name>（名字含 fail-disk 且存在标记文件 $SPARK_DATA_DIR/.e2e-disk-full → spark_status 汇报 "disk: …"
+// 并退出 2；删掉标记后重新部署即成功）、
+// 每个节点 mkdir custom_nodes/<name> 并写 .spark-commit；已存在的模型 / commit 相同的节点跳过（日志 "skip model" / "skip node"）。
+// start 同 fakeAppScript。
+const fakeComfyScript = `#!/bin/sh
+# e2e / 集成测试用的 fake ComfyUI（不下载、不 clone、不起真服务）
+C="$SPARK_DATA_DIR/comfyui"
+M="$SPARK_APP_DIR/workflows/manifest.json"
+field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+case "$1" in
+  install)
+    if [ "${MODEL_ID:-none}" != "none" ]; then
+      spark_status download 50 "downloading $MODEL_ID"
+    fi
+    mkdir -p "$C/user/default/workflows" "$C/custom_nodes" "$C/models" || exit 1
+    keep=" "
+    n=0
+    if [ -f "$M" ]; then
+      tr '{' '\n' < "$M" > "$SPARK_APP_DIR/.manifest.lines"
+      while IFS= read -r line; do
+        case "$line" in
+          *'"slug":'*)
+            slug=$(printf '%s\n' "$line" | field slug)
+            file=$(printf '%s\n' "$line" | field file)
+            cp "$SPARK_APP_DIR/workflows/$file" "$C/user/default/workflows/spark-$slug.json" || exit 1
+            keep="$keep spark-$slug.json "
+            n=$((n + 1))
+            echo "workflow $slug"
+            ;;
+          *'"name":'*'"dir":'*)
+            name=$(printf '%s\n' "$line" | field name)
+            dir=$(printf '%s\n' "$line" | field dir)
+            case "$name" in
+              *fail-disk*)
+                if [ -e "$SPARK_DATA_DIR/.e2e-disk-full" ]; then
+                  spark_status download 10 "disk: 数据盘空间不足，无法下载模型 $name"
+                  echo "disk: no space for $name" >&2
+                  exit 2
+                fi
+                ;;
+            esac
+            if [ -e "$C/models/$dir/$name" ]; then
+              echo "skip model $dir/$name"
+            else
+              mkdir -p "$C/models/$dir" && touch "$C/models/$dir/$name" || exit 1
+              spark_status download 40 "下载模型 $name"
+              echo "model $dir/$name"
+            fi
+            ;;
+          *'"name":'*'"commit":'*)
+            name=$(printf '%s\n' "$line" | field name)
+            commit=$(printf '%s\n' "$line" | field commit)
+            if [ "$(cat "$C/custom_nodes/$name/.spark-commit" 2>/dev/null)" = "$commit" ]; then
+              echo "skip node $name"
+            else
+              mkdir -p "$C/custom_nodes/$name" && printf '%s\n' "$commit" > "$C/custom_nodes/$name/.spark-commit" || exit 1
+              spark_status install 75 "安装节点 $name"
+              echo "node $name $commit"
+            fi
+            ;;
+        esac
+      done < "$SPARK_APP_DIR/.manifest.lines"
+      rm -f "$SPARK_APP_DIR/.manifest.lines"
+    fi
+    for f in "$C/user/default/workflows"/spark-*.json; do
+      [ -e "$f" ] || continue
+      b=$(basename "$f")
+      case "$keep" in
+        *" $b "*) ;;
+        *) rm -f "$f"; echo "removed workflow file $b" ;;
+      esac
+    done
+    spark_status install 79 "工作流就绪：$n 个"
+    sleep 1
+    ;;
+  start)
+    sleep 100000 </dev/null >/dev/null 2>&1 &
+    echo $! > "$SPARK_APP_DIR/service.pid"
+    ;;
+esac
+`
+
 // 钩子另建的两个镜像（ref 只是标签：e2e 不拉镜像）。
 const (
 	ImageLLMServing = "LLM Serving"
@@ -57,6 +142,8 @@ type fakeApp struct {
 	in     appdeploy.AppInput
 	spec   appdeploy.Spec
 	images []string // 兼容镜像（名称）；"" = 默认镜像（dbtest / 迁移种子的第一个启用镜像）
+	// version / script 为空 = "1.0.0" / fakeAppScript
+	version, script string
 }
 
 func fakeApps() []fakeApp {
@@ -90,16 +177,17 @@ func fakeApps() []fakeApp {
 			images: []string{"", ImageLLMServing}},
 		{in: appdeploy.AppInput{Slug: "comfyui", Name: "ComfyUI 图像生成", Summary: "节点式工作流的文生图界面", Category: "image", Icon: "image", Sort: 30},
 			spec: appdeploy.Spec{
-				Ports:          []appdeploy.PortSpec{{Port: 8188, Label: "ComfyUI 界面", HealthPath: "/system_stats"}},
-				TimeoutMinutes: 90,
+				Ports:             []appdeploy.PortSpec{{Port: 8188, Label: "ComfyUI 界面", HealthPath: "/system_stats"}},
+				TimeoutMinutes:    90,
+				SupportsWorkflows: true, // 同 deploy/apps/comfyui 1.1.0
 				Env: []appdeploy.EnvSpec{
 					{Name: "MODEL_ID", Label: "模型", Type: "enum", Required: true,
-						Options: []string{"AI-ModelScope/stable-diffusion-xl-base-1.0", "AI-ModelScope/FLUX.1-schnell", "Qwen/Qwen-Image"},
-						Default: "AI-ModelScope/stable-diffusion-xl-base-1.0"},
+						Options: []string{"none", "AI-ModelScope/stable-diffusion-xl-base-1.0", "AI-ModelScope/FLUX.1-schnell", "Qwen/Qwen-Image"},
+						Default: "none"},
 					source,
 				},
 			},
-			images: []string{ImageComfyUI}},
+			images: []string{ImageComfyUI}, version: "1.1.0", script: fakeComfyScript},
 		{in: appdeploy.AppInput{Slug: "jupyterlab", Name: "JupyterLab", Summary: "网页版 Python 开发环境", Category: "notebook", Icon: "notebook", Sort: 40},
 			spec: appdeploy.Spec{
 				Ports:          []appdeploy.PortSpec{{Port: 8888, Label: "JupyterLab", HealthPath: "/api"}},
@@ -180,7 +268,11 @@ func SeedApps(ctx context.Context, a *app.App, up *sshtest.Server, healthAddr st
 		if err != nil {
 			return nil, fmt.Errorf("create app %s: %w", fa.in.Slug, err)
 		}
-		vin := appdeploy.VersionInput{Version: "1.0.0", Spec: fa.spec, Script: fakeAppScript, Changelog: "e2e fake"}
+		version, script := fa.version, fa.script
+		if version == "" {
+			version, script = "1.0.0", fakeAppScript
+		}
+		vin := appdeploy.VersionInput{Version: version, Spec: fa.spec, Script: script, Changelog: "e2e fake"}
 		for _, name := range fa.images {
 			vin.ImageIDs = append(vin.ImageIDs, imgIDs[name])
 		}
@@ -221,6 +313,11 @@ func (s *Server) appsSeed(ctx context.Context, _ json.RawMessage) (any, error) {
 	apps, err := SeedApps(ctx, s.App, s.Upstream, s.HealthAddr)
 	if err != nil {
 		return nil, err
+	}
+	if s.Comfy != nil { // comfyui 的 8188 改指 fake ComfyUI（它也回 /system_stats，健康检查照常）
+		if err := s.serveComfy(); err != nil {
+			return nil, err
+		}
 	}
 	return map[string]any{"apps": apps}, nil
 }

@@ -531,3 +531,33 @@ func TestLoadLLMErrors(t *testing.T) {
 		t.Fatalf("prod butler off: butler=%v err=%v", c.Butler, err)
 	}
 }
+
+// 计划 11：SPARK_APP_GIT_MIRROR 默认 https://gh-proxy.com/；off = 直连（空）；非空须 https:// 开头、/ 结尾。
+func TestLoadAppGitMirror(t *testing.T) {
+	base := func(kv ...string) map[string]string {
+		m := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	c, err := config.Load(env(base()))
+	if err != nil || c.AppGitMirror != "https://gh-proxy.com/" {
+		t.Fatalf("default = %q, %v", c.AppGitMirror, err)
+	}
+	for in, want := range map[string]string{"off": "", " https://ghproxy.internal/x/ ": "https://ghproxy.internal/x/"} {
+		c, err := config.Load(env(base("SPARK_APP_GIT_MIRROR", in)))
+		if err != nil || c.AppGitMirror != want {
+			t.Fatalf("%q → %q, %v; want %q", in, c.AppGitMirror, err, want)
+		}
+		// app.go 在 Load 之后还会调 FillAppDefaults：不得把「直连」补回默认值
+		if got := c.FillAppDefaults().AppGitMirror; got != want {
+			t.Fatalf("FillAppDefaults changed %q to %q", want, got)
+		}
+	}
+	for _, bad := range []string{"http://gh-proxy.com/", "https://gh-proxy.com", "gh-proxy.com/", "https:///", "https://a b/", "https://x/'$(id)'/", "OFF"} {
+		if _, err := config.Load(env(base("SPARK_APP_GIT_MIRROR", bad))); err == nil || !strings.Contains(err.Error(), "SPARK_APP_GIT_MIRROR") {
+			t.Fatalf("%q: err = %v", bad, err)
+		}
+	}
+}

@@ -11,7 +11,7 @@ import (
 )
 
 func TestSections(t *testing.T) {
-	want := []string{"ssh", "ssh-keys", "forward", "web", "apps", "booking", "batch", "auto-renew", "retention", "billing", "butler"}
+	want := []string{"ssh", "ssh-keys", "forward", "web", "apps", "workflows", "booking", "batch", "auto-renew", "retention", "billing", "butler"}
 	got := help.Sections()
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("Sections = %v, want %v", got, want)
@@ -60,6 +60,7 @@ func TestCorpusMatchesHelpView(t *testing.T) {
 	checks := map[string]string{
 		"ssh":        "点击「显示」查看 SSH 密码并复制",
 		"apps":       "模型缓存在",
+		"workflows":  "移除工作流只删工作流文件",
 		"booking":    "可提前 2 小时～60 天预订",
 		"batch":      "一单最多 8 台",
 		"auto-renew": "到期前 1 小时自动扣款续 1 个单位",

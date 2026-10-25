@@ -37,7 +37,7 @@ func newButlerEnv(t *testing.T, tweak func(*api.Server)) *butlerEnv {
 	t.Helper()
 	m := mock.New()
 	var svc *butler.Service
-	e := buildTestEnvPool(t, false, func(srv *api.Server, pool *pgxpool.Pool) {
+	e := buildTestEnvPool(t, envPlain, func(srv *api.Server, pool *pgxpool.Pool) {
 		box, err := secretbox.New(dbtest.Key)
 		if err != nil {
 			t.Fatal(err)

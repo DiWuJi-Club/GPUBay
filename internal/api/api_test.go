@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -19,10 +20,13 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"spark-cloud/internal/access/upstream"
 	"spark-cloud/internal/api"
 	"spark-cloud/internal/appdeploy"
 	"spark-cloud/internal/billing"
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/comfywf"
+	"spark-cloud/internal/comfywf/comfytest"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/ingress"
@@ -60,6 +64,9 @@ type testEnv struct {
 	apps    *appdeploy.Service // 只有 newAppsTestEnv 组装；其余为 nil（Server.Apps 也为 nil）
 	appCat  *appdeploy.Catalog
 	appLog  *lockedBuffer // 应用部署服务的日志（newAppsTestEnv）
+	// 计划 11：只有 newWorkflowsTestEnv 组装（Server.Workflows / Installer / Runs）；comfy 是快速出图代理连到的假 ComfyUI
+	wfCat *comfywf.Catalog
+	comfy *comfytest.Server
 }
 
 // lockedBuffer 是可并发写的日志缓冲（服务端处理请求的 goroutine 写、测试读）。
@@ -85,26 +92,41 @@ func newTestEnv(t *testing.T) *testEnv { return newTestEnvWith(t, nil) }
 // newTestEnvWith 在构建路由前允许调整 Server 字段（例如 Static）。
 func newTestEnvWith(t *testing.T, tweak func(*api.Server)) *testEnv {
 	t.Helper()
-	return buildTestEnv(t, false, tweak)
+	return buildTestEnv(t, envPlain, tweak)
 }
 
 // newAppsTestEnv 额外组装应用部署服务（Server.Apps + rental 钩子）。
 func newAppsTestEnv(t *testing.T, tweak func(*api.Server)) *testEnv {
 	t.Helper()
-	return buildTestEnv(t, true, tweak)
+	return buildTestEnv(t, envApps, tweak)
 }
 
-func buildTestEnv(t *testing.T, withApps bool, tweak func(*api.Server)) *testEnv {
+// newWorkflowsTestEnv 在应用部署之上再组装工作流市场（目录、安装、快速出图；钩子接到 appdeploy.Deps），
+// 快速出图的拨号直连一个 comfytest 假 ComfyUI。
+func newWorkflowsTestEnv(t *testing.T, tweak func(*api.Server)) *testEnv {
+	t.Helper()
+	return buildTestEnv(t, envWorkflows, tweak)
+}
+
+type envMode int
+
+const (
+	envPlain envMode = iota
+	envApps
+	envWorkflows
+)
+
+func buildTestEnv(t *testing.T, mode envMode, tweak func(*api.Server)) *testEnv {
 	t.Helper()
 	var setup func(*api.Server, *pgxpool.Pool)
 	if tweak != nil {
 		setup = func(srv *api.Server, _ *pgxpool.Pool) { tweak(srv) }
 	}
-	return buildTestEnvPool(t, withApps, setup)
+	return buildTestEnvPool(t, mode, setup)
 }
 
 // buildTestEnvPool 同 buildTestEnv，调整函数额外拿到连接池（组装需要直连数据库的服务，例如 AI 管家）。
-func buildTestEnvPool(t *testing.T, withApps bool, tweak func(*api.Server, *pgxpool.Pool)) *testEnv {
+func buildTestEnvPool(t *testing.T, mode envMode, tweak func(*api.Server, *pgxpool.Pool)) *testEnv {
 	t.Helper()
 	pool := dbtest.New(t)
 	clk := clock.NewFake(dbtest.T0)
@@ -137,20 +159,40 @@ func buildTestEnvPool(t *testing.T, withApps bool, tweak func(*api.Server, *pgxp
 	var apps *appdeploy.Service
 	var appCat *appdeploy.Catalog
 	appLog := &lockedBuffer{}
-	if withApps {
+	var wfCat *comfywf.Catalog
+	var fake *comfytest.Server
+	if mode >= envApps {
 		quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 		appCat = appdeploy.NewCatalog(pool, clk, f, c, quiet)
-		apps = appdeploy.NewService(appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: slog.New(slog.NewTextHandler(appLog, nil)), Catalog: appCat, Images: c, Rental: r, Fleet: f,
-			PortURL: auth.PortURL})
+		deps := appdeploy.Deps{Pool: pool, Clock: clk, Box: box, Log: slog.New(slog.NewTextHandler(appLog, nil)), Catalog: appCat, Images: c, Rental: r, Fleet: f,
+			PortURL: auth.PortURL}
+		if mode == envWorkflows {
+			wfCat = comfywf.NewCatalog(pool, clk, uploads, quiet)
+			comfywf.NewHooks(pool, wfCat).Wire(&deps)
+		}
+		apps = appdeploy.NewService(deps)
 		r.SetAppHooks(apps)
 		srv.Apps = apps
+		if mode == envWorkflows {
+			var fts *httptest.Server
+			fake, fts = comfytest.Start()
+			t.Cleanup(fts.Close)
+			client := comfywf.NewClientWithDialer(func(ctx context.Context, _ upstream.Target, _ int) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp", fts.Listener.Addr().String())
+			})
+			srv.Workflows = wfCat
+			srv.Installer = comfywf.NewInstaller(pool, clk, wfCat, apps, appCat, quiet)
+			srv.Runs = comfywf.NewRuns(pool, clk, wfCat, apps, client, quiet)
+		}
 	}
 	if tweak != nil {
 		tweak(srv, pool)
 	}
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
-	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, fleet: f, ingress: auth, apps: apps, appCat: appCat, appLog: appLog}
+	return &testEnv{t: t, pool: pool, ts: ts, wallet: w, pay: payMock, clk: clk, rental: r, fleet: f, ingress: auth, apps: apps, appCat: appCat, appLog: appLog,
+		wfCat: wfCat, comfy: fake}
 }
 
 type client struct {

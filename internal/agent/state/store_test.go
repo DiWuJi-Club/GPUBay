@@ -70,3 +70,29 @@ func TestStoreResultsInstancesAndReopen(t *testing.T) {
 		t.Fatalf("dir = %v", entries)
 	}
 }
+
+// 旧状态文件没有 share_slots：读出为 0；新写入的份数重开后保留。
+func TestInstanceShareSlotsBackwardCompatible(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	old := `{"results":[],"instances":{"ins-aaaaaaaa":{"id":"ins-aaaaaaaa","desired":"running","image_ref":"img:1","lan_ip":"10.0.0.10","ssh_port":2222,"bandwidth_mbps":200,"data_size_gib":2048}}}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst, ok := s.Instance("ins-aaaaaaaa"); !ok || inst.ShareSlots != 0 || inst.DataSizeGiB != 2048 {
+		t.Fatalf("old instance = %+v %v", inst, ok)
+	}
+	if err := s.PutInstance(state.Instance{ID: "ins-bbbbbbbb", Desired: "stopped", SSHPort: 2224, DataSizeGiB: 512, ShareSlots: 4}); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst, ok := s2.Instance("ins-bbbbbbbb"); !ok || inst.ShareSlots != 4 || inst.DataSizeGiB != 512 {
+		t.Fatalf("reopened = %+v %v", inst, ok)
+	}
+}

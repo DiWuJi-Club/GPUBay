@@ -514,7 +514,11 @@ func (s *Server) dialUpstream(ctx context.Context, info rental.AccessInfo, dead 
 	if net.ParseIP(info.MachineLanIP) == nil { // 不拨任何不是 IP 的地址（空值、主机名）
 		return nil, nil, nil, fmt.Errorf("机器内网地址无效 %q", info.MachineLanIP)
 	}
-	addr := net.JoinHostPort(info.MachineLanIP, strconv.Itoa(s.cfg.UpstreamPort))
+	port := info.SSHPort // 平台按实例算好的容器 sshd 端口；0（旧数据、测试替身）退回配置
+	if port <= 0 {
+		port = s.cfg.UpstreamPort
+	}
+	addr := net.JoinHostPort(info.MachineLanIP, strconv.Itoa(port))
 	timeout := s.cfg.UpstreamTimeout
 	d := net.Dialer{Timeout: timeout}
 	nc, err := d.DialContext(ctx, "tcp", addr)

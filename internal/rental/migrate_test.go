@@ -44,7 +44,8 @@ func TestAdminMigrateMovesRemainingTime(t *testing.T) {
 	}
 	cmds, _ := e.fleet.PendingCommands(e.ctx, e.machines[1])
 	var p fleet.CreateInstancePayload
-	if len(cmds) != 1 || cmds[0].Type != fleet.CmdCreateInstance || json.Unmarshal(cmds[0].Payload, &p) != nil || p.ImageRef == "" {
+	if len(cmds) != 1 || cmds[0].Type != fleet.CmdCreateInstance || json.Unmarshal(cmds[0].Payload, &p) != nil || p.ImageRef == "" ||
+		p.SSHPort != testSSHBasePort || p.ShareSlots != 1 {
 		t.Fatalf("create command = %+v", cmds)
 	}
 

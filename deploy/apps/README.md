@@ -50,6 +50,10 @@ platform admin app import deploy/apps
 - 变量：`env` 里的平台保留变量（`SPARK_APP_DIR`、`SPARK_DATA_DIR`、`SPARK_PORT`、`SPARK_MODELS_DIR`、`HF_ENDPOINT`、`MODELSCOPE_CACHE` 等）与 spec 里声明的用户变量都已导出；未填的可选变量不会出现，引用时写 `${NAME:-}`。
 - 只用 POSIX sh（Ubuntu 的 `/bin/sh` 是 dash），不要写 bash 语法。
 
+`spec.json` 的 `supports_workflows: true`（目前只有 comfyui 1.1.0 起）表示该版本能装工作流市场的工作流：平台在部署包里多放
+`workflows/manifest.json` 与 `workflows/<slug>.json`（见下文「ComfyUI 与工作流市场」），工作流集合变了 `run.sh` 会重跑 `install`。
+其它应用不写这个字段。
+
 `go test ./internal/appdeploy/ -run TestAppsDir` 校验本目录：三份文件齐全、`app.json` 字段与镜像名、`spec.json` 过 `ValidateSpec`、`app.sh` 过平台同一个 POSIX 语法检查、`start` 分支写 `service.pid`、脚本里引用的大写变量都在 spec 里声明或是保留变量 / 脚本内赋值的变量。
 
 **注意：脚本会在用户容器里以 root 执行。** 不要在脚本里拼接未加引号的用户变量，不要下载执行来路不明的脚本；密钥类变量用 `secret` 类型（平台会在日志里脱敏）。
@@ -66,4 +70,60 @@ platform admin app import deploy/apps
 | comfyui | `AI-ModelScope/FLUX.1-schnell`（hf-mirror） | `Comfy-Org/flux1-schnell` 的 fp8 单文件 checkpoint（HF 官方仓库需登录同意协议） | 17GB |
 | comfyui | `Qwen/Qwen-Image` | `Comfy-Org/Qwen-Image_ComfyUI` 的 fp8 模型 → `unet`、`qwen_2.5_vl_7b_fp8_scaled` → `clip`、VAE → `vae` | 30GB |
 
-ComfyUI 不下仓库里的 diffusers 分片格式（ComfyUI 读不了，体积也翻倍），只下它能直接加载的单文件权重，并软链进 `/opt/ComfyUI/models/<子目录>`（`start` 时重做软链，容器重建后也在）。
+comfyui 的 `MODEL_ID` 从 1.1.0 起默认 `none`（不下预置模型，只装工作流清单里的模型）。
+ComfyUI 不下仓库里的 diffusers 分片格式（ComfyUI 读不了，体积也翻倍），只下它能直接加载的单文件权重，并软链进数据盘的
+`/root/data/comfyui/models/<子目录>`（1.0.0 软链在镜像层的 `/opt/ComfyUI/models`，容器重建后要靠 `start` 重做）。
+
+## ComfyUI 与工作流市场（comfyui 1.1.0，计划 11）
+
+数据盘目录（卸载应用、移除工作流都不删）：
+
+| 路径 | 内容 |
+|---|---|
+| `/root/data/comfyui/models/<dir>/<name>` | 模型软链（指向 `/root/data/models/{modelscope,hf}/<仓库>/<文件>`）；`<dir>` ∈ `checkpoints diffusion_models unet text_encoders clip vae loras upscale_models controlnet clip_vision embeddings style_models vae_approx` |
+| `/root/data/comfyui/custom_nodes/<name>` | 自定义节点（`.spark-commit` 记录装的 commit） |
+| `/root/data/comfyui/user` | ComfyUI 用户目录（`--user-directory`）；平台放的工作流是 `user/default/workflows/spark-<slug>.json`；从 1.0.0 升级后第一次启动把镜像层的 `/opt/ComfyUI/user` 拷过来一次（`cp -Rn`，不覆盖已有文件） |
+| `/root/data/comfyui/input` | 输入图片（`--input-directory`，首次启动拷入镜像自带的 `example.png`） |
+| `/root/data/comfyui-output` | 生成结果（`--output-directory`） |
+
+`start` 每次生成 `$SPARK_APP_DIR/extra_model_paths.yaml`（`base_path: /root/data/comfyui/`、`is_default: true`，上表每个模型目录一项；
+`unet` / `clip` 是 ComfyUI 的旧名，分别并进 `diffusion_models` / `text_encoders` 的多行路径；另有 `custom_nodes`）。
+
+部署包里的 `workflows/manifest.json` 由平台生成（`comfywf.BundleFiles`，已校验、按 slug 排序）：
+
+```json
+{"workflows":[{"slug":"sdxl-txt2img","version":"1.0.0","file":"sdxl-txt2img.json",
+  "models":[{"name":"sd_xl_base_1.0.safetensors","dir":"checkpoints","size_gb":6.94,"sha256":"",
+             "modelscope":{"repo":"…","file":"…"},"hf":{"repo":"…","file":"…"}}],
+  "nodes":[{"name":"ComfyUI_UltimateSDUpscale","git":"https://github.com/…","commit":"<40 位>"}]}]}
+```
+
+`app.sh install` 用镜像的 `python3 -I` 读它，按平台规则再校验一遍（不合规整份拒绝），展开成按空白分隔的行（sh 用 `read -r` 读）：
+
+```
+model <name> <dir> <size_gb> <sha256|-> <ms_repo|-> <ms_file|-> <hf_repo|-> <hf_file|->   # 按目标 <dir>/<name> 去重
+node <name> <git> <commit>                                                                # 按 name 去重
+wf <slug> <file>
+```
+
+然后（全部幂等）：
+
+1. 模型：目标已存在（有效软链或普通文件；失效的软链不算）→ 跳过；否则按 `MODEL_SOURCE` 选来源（清单里没有该来源就用另一个；
+   所选来源下载失败而另一个来源存在时换它再试一次），下载前 `df` 预检（剩余 < 模型大小 + 5GiB → `spark_status download <pct> "disk: …"`
+   后退出 2，`run.sh` 沿用该消息，平台记错误码 `disk`），`modelscope download <仓库> <文件> --local-dir …` / `hf download … --local-dir …`
+   到 `/root/data/models/{modelscope,hf}/<仓库>`，`sha256` 非空时校验（不符删文件、失败），再 `ln -sfn`。进度 5～70；同时选了预置模型
+   （`MODEL_ID` ≠ `none`）时预置模型占 5～35、工作流模型占 35～70，进度不回退。
+2. 节点：`.spark-commit` 与清单 commit 相同 → 跳过；否则取到 `/root/data/comfyui/.tmp-nodes/<name>`（不在 `custom_nodes` 里，ComfyUI
+   不会加载半成品；上次中断留下的临时目录先清掉）：`git clone --no-checkout` → `checkout <commit>` → 有 `.gitmodules` 时
+   `submodule update --init --recursive`。GitHub 地址且配置了 `SPARK_GIT_MIRROR` 时这一整套先经镜像（子模块带
+   `url.<镜像>https://github.com/.insteadOf=https://github.com/`），任一步失败就清掉临时目录、整套直连重来。
+   之后有 `requirements.txt` 时 `python3 -m pip install -c $SPARK_APP_DIR/.pip-constraints.txt -r …`：约束文件 = 镜像 `PIP_CONSTRAINT`
+   指向的文件 + 当前已装的 `torch / torchvision / torchaudio / torchsde / triton / numpy / transformers / safetensors / xformers /
+   flash-attn / cuda-python / nvidia-*` 版本，节点依赖不能把镜像里为 GPU 编译的包换掉（冲突时 pip 报错，install 失败）。
+   最后替换旧目录、写 `.spark-commit`。任一步失败 → install 失败。清单里不再有的节点不删。进度 70～78。
+   **子模块不做主机白名单检查**：清单只校验节点仓库本身的 Git 主机（D5）；子模块的地址与 commit 由节点仓库在该 commit 上的
+   `.gitmodules` + gitlink 固定，发布工作流版本时（super + TOTP）审核的就是这个 commit。
+3. 工作流文件：复制为 `user/default/workflows/spark-<slug>.json`，目录里不在清单中的 `spark-*.json` 删除（用户自己存的文件不动）；
+   包里没有 manifest 时同样清理。最后 `spark_status install 79 "工作流就绪：N 个"`。
+
+`go test ./internal/appdeploy/ -run TestComfyApp` 用假的 `modelscope / hf / git / python3`（含 `python3 -m pip`）真跑 comfyui 的 `install` / `start`。

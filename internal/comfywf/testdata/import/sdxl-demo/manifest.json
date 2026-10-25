@@ -1,0 +1,18 @@
+{
+  "models": [
+    {"name": "sd_xl_base_1.0.safetensors", "dir": "checkpoints", "size_gb": 6.94,
+     "modelscope": {"repo": "AI-ModelScope/stable-diffusion-xl-base-1.0", "file": "sd_xl_base_1.0.safetensors"},
+     "hf": {"repo": "stabilityai/stable-diffusion-xl-base-1.0", "file": "sd_xl_base_1.0.safetensors"},
+     "sha256": ""}
+  ],
+  "nodes": [],
+  "inputs": [
+    {"key": "prompt", "label": "提示词", "type": "textarea", "node": "6", "input": "text", "default": "a photo of ...", "max_len": 2000},
+    {"key": "negative", "label": "反向提示词", "type": "textarea", "node": "7", "input": "text", "default": ""},
+    {"key": "width", "label": "宽", "type": "int", "node": "5", "input": "width", "default": 1024, "min": 512, "max": 2048, "step": 64},
+    {"key": "height", "label": "高", "type": "int", "node": "5", "input": "height", "default": 1024, "min": 512, "max": 2048, "step": 64},
+    {"key": "steps", "label": "步数", "type": "int", "node": "3", "input": "steps", "default": 25, "min": 1, "max": 100},
+    {"key": "seed", "label": "种子", "type": "seed", "node": "3", "input": "seed"}
+  ],
+  "outputs": [{"node": "9"}]
+}
