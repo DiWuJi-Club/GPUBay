@@ -204,7 +204,8 @@ const rows = computed(() =>
 .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .sel { width: 170px; }
 .range { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.native-date { height: 32px; border: 1px solid #dcdfe6; border-radius: 4px; padding: 0 8px; font-size: 14px; background: #fff; }
+/* el-input__inner 自带 width: 100% / flex-grow: 1，在可换行的 flex 里会各占一整行：固定宽度 */
+.native-date { width: 150px; flex: none; height: 32px; border: 1px solid #dcdfe6; border-radius: 4px; padding: 0 8px; font-size: 14px; background: #fff; }
 .muted { color: #909399; font-size: 12px; }
 p { margin: 0; }
 .danger { color: var(--el-color-danger); font-size: 13px; }
