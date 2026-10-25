@@ -125,20 +125,31 @@ func (s *Service) interruptApproved(ctx context.Context, tx pgx.Tx, convID strin
 		return err
 	}
 	for _, tc := range calls {
-		if _, err := tx.Exec(ctx, `UPDATE butler_tool_calls SET status = 'failed', result = $2, secret_env_enc = NULL WHERE id = $1`,
-			tc.ID, []byte(interruptedContent)); err != nil {
+		if _, err := s.interruptCall(ctx, tx, tc, audit.Actor{UserID: tc.UserID}, now); err != nil {
 			return err
 		}
-		res := Block{Type: BlockToolResult, ToolCallID: tc.ID, ProviderCallID: tc.ProviderCallID, Name: tc.Tool, OK: false, Content: interruptedContent}
-		if _, err := s.appendMessage(ctx, tx, convID, RoleTool, []Block{res}, llm.EstimateTokens(interruptedContent), now); err != nil {
-			return err
-		}
-		diff := map[string]any{"tool": tc.Tool, "args": validJSONOr(tc.Args, `{}`), "status": "unknown", "result_ref": "",
-			"conversation_id": convID, "error_code": "interrupted"}
-		if err := audit.Record(ctx, tx, now, audit.Actor{UserID: tc.UserID}.Entry(AuditToolExecute, AuditTargetCall, tc.ID, diff)); err != nil {
-			return err
-		}
-		s.log.Warn("butler: approved call interrupted", "conversation", convID, "tool_call", tc.ID, "tool", tc.Tool)
 	}
 	return nil
+}
+
+// interruptCall 把一条「已批准、没有执行结果」的写调用定为 failed（code interrupted，「执行结果未知」，清 secret_env_enc），
+// 追加事实 tool 结果并审计 status unknown。调用行已不是 approved 或已有 executed_at（真实结果已回写）→ 不动，返回 false。
+// 调用方已锁住对话行。清扫器接管与执行中 panic 共用。
+func (s *Service) interruptCall(ctx context.Context, tx pgx.Tx, tc ToolCall, actor audit.Actor, now time.Time) (bool, error) {
+	tag, err := tx.Exec(ctx, `UPDATE butler_tool_calls SET status = 'failed', result = $2, secret_env_enc = NULL
+		WHERE id = $1 AND status = 'approved' AND executed_at IS NULL`, tc.ID, []byte(interruptedContent))
+	if err != nil || tag.RowsAffected() == 0 {
+		return false, err
+	}
+	res := Block{Type: BlockToolResult, ToolCallID: tc.ID, ProviderCallID: tc.ProviderCallID, Name: tc.Tool, OK: false, Content: interruptedContent}
+	if _, err := s.appendMessage(ctx, tx, tc.ConversationID, RoleTool, []Block{res}, llm.EstimateTokens(interruptedContent), now); err != nil {
+		return false, err
+	}
+	diff := map[string]any{"tool": tc.Tool, "args": validJSONOr(tc.Args, `{}`), "status": "unknown", "result_ref": "",
+		"conversation_id": tc.ConversationID, "error_code": "interrupted"}
+	if err := audit.Record(ctx, tx, now, actor.Entry(AuditToolExecute, AuditTargetCall, tc.ID, diff)); err != nil {
+		return false, err
+	}
+	s.log.Warn("butler: approved call interrupted", "conversation", tc.ConversationID, "tool_call", tc.ID, "tool", tc.Tool)
+	return true, nil
 }

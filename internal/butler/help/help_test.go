@@ -11,7 +11,7 @@ import (
 )
 
 func TestSections(t *testing.T) {
-	want := []string{"ssh", "ssh-keys", "forward", "web", "apps", "workflows", "booking", "batch", "auto-renew", "retention", "billing", "butler"}
+	want := []string{"ssh", "ssh-keys", "forward", "web", "apps", "workflows", "booking", "batch", "auto-renew", "retention", "referral", "billing", "butler"}
 	got := help.Sections()
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("Sections = %v, want %v", got, want)
@@ -65,6 +65,7 @@ func TestCorpusMatchesHelpView(t *testing.T) {
 		"batch":      "一单最多 8 台",
 		"auto-renew": "到期前 1 小时自动扣款续 1 个单位",
 		"retention":  "到期停机后数据保留 6 小时",
+		"referral":   "好友退款时按比例扣回已发放的返利",
 		"billing":    "预付包时长：1 天 / 1 周 / 1 月",
 	}
 	for sec, phrase := range checks {
@@ -75,6 +76,10 @@ func TestCorpusMatchesHelpView(t *testing.T) {
 		if !strings.Contains(string(vue), phrase) {
 			t.Errorf("HelpView.vue no longer contains %q; resync help/%s.md", phrase, sec)
 		}
+	}
+	// 邀请返利单独成节（与帮助页一致），不在计费规则里重复
+	if body, _ := help.Section("billing"); strings.Contains(body, "返利") {
+		t.Error("billing.md 不应再包含邀请返利")
 	}
 	body, _ := help.Section("butler")
 	for _, p := range []string{"确认卡", "90 天", "每日额度", "以下单页为准"} {

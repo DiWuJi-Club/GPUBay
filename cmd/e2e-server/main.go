@@ -201,11 +201,15 @@ func run() error {
 	defer cancel()
 	ingressDone := make(chan struct{})
 	go func() { defer close(ingressDone); a.Ingress.Shutdown(shutdownCtx, time.Second) }() // 先撤销租户长连接，HTTP Shutdown 才不被拖住
+	// 与 cmd/platform 相同：先让运行中的管家轮次收尾，SSE handler 才不拖住 Shutdown；管家有自己的预算（不受 HTTP 的 10 秒限制），
+	// 但取 15 秒而不是 WriteToolTimeout + 5s：Playwright 的 gracefulShutdown 只给 20 秒（mock 写工具瞬时完成，实际不会等这么久）。
+	butlerCtx, butlerCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer butlerCancel()
 	butlerDone := make(chan struct{})
-	go func() { // 与 cmd/platform 相同：先让运行中的管家轮次收尾，SSE handler 才不拖住 Shutdown
+	go func() {
 		defer close(butlerDone)
 		if a.Butler != nil {
-			_ = a.Butler.Shutdown(shutdownCtx)
+			_ = a.Butler.Shutdown(butlerCtx)
 		}
 	}()
 	for _, s := range servers {

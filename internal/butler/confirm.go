@@ -124,11 +124,25 @@ func (s *Service) Confirm(ctx context.Context, userID int64, ip, convID, tcID st
 
 // executeCall 执行已批准的写工具并回写结果：tool_calls 行状态 + 审计 butler.tool_execute + 结果 tool 消息在一个事务里无条件提交
 // （操作已经发生；清扫器已把它标 interrupted 时以真实结果覆盖），失败重试一次，仍失败则单独更新调用行兜底。
-// 返回 false 表示本轮到此为止（run_token 已被接管、内部错误或 panic）。
+// 返回 false 表示本轮到此为止（run_token 已被接管、内部错误或 panic；panic 时调用定为 interrupted，同清扫器接管）。
 func (s *Service) executeCall(ctx context.Context, r *run, tc ToolCall) (cont bool) {
 	defer func() {
 		if p := recover(); p != nil {
-			s.internalFail(ctx, r, fmt.Errorf("panic: %v\n%s", p, debug.Stack()))
+			err := fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+			// 尽力而为：与清扫器接管相同地把调用定为「执行结果未知」（清密文、事实 tool 结果、审计 status unknown），
+			// 否则它会停在 approved（密文残留、历史缺 tool_result）。真实结果已回写（executed_at 非空）时不动。
+			wctx, cancel := dbctx(ctx)
+			if e := s.withTx(wctx, func(tx pgx.Tx) error {
+				if _, err := s.lockConversation(wctx, tx, 0, r.convID); err != nil {
+					return err
+				}
+				_, err := s.interruptCall(wctx, tx, tc, audit.Actor{UserID: r.userID, IP: r.ip}, s.d.Clock.Now())
+				return err
+			}); e != nil {
+				s.log.Error("butler: mark call interrupted after panic", "conversation", r.convID, "tool_call", tc.ID, "err", e)
+			}
+			cancel()
+			s.internalFail(ctx, r, err)
 			cont = false
 		}
 	}()

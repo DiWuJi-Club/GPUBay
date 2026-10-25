@@ -17,6 +17,7 @@ import (
 	"spark-cloud/internal/admin"
 	"spark-cloud/internal/app"
 	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/butler"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/comfywf"
 	"spark-cloud/internal/fleet"
@@ -209,7 +210,7 @@ func run(log *slog.Logger) error {
 	// 停机顺序：1) 停止 accept（ctx → SSH 网关 / Agent 网关；Shutdown → 各 HTTP 监听器）；2) SSH drain（最长 SPARK_SSH_DRAIN_TIMEOUT，
 	// 与 HTTP 关闭同时进行）；3) HTTP 与 ingress 并发关闭：ingress 立即撤销 WebSocket / SSE，普通请求给 5 秒宽限后撤销剩下的，
 	// http.Server.Shutdown 因而不被长连接拖住；4) 关上游连接池；5) 关数据库（defer）。
-	// 总耗时约 max(SSH drain 30s, HTTP 10s) + 几秒，compose / systemd 的停止超时应 ≥ 45s。
+	// 总耗时约 max(SSH drain 30s, 管家 35s, HTTP 10s) + 几秒，compose / systemd 的停止超时应 ≥ 45s（compose 为 60s）。
 	stop() // 确保清扫器、网关、访问层循环退出，SSH 网关停止 accept 并开始 drain
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -219,12 +220,16 @@ func run(log *slog.Logger) error {
 		a.Ingress.Shutdown(shutdownCtx, ingressShutdownGrace)
 	}()
 	// AI 管家：先取消运行中的轮次（落「服务正在重启」、回 idle），它们的 SSE handler 随即返回，http.Server.Shutdown 不被拖到超时；
-	// 与 HTTP 关闭并发，最多等 shutdownCtx。来不及收尾的轮次由其它副本的清扫器在 StaleRunAfter 后接管。
+	// 与 HTTP 关闭并发。已批准的写工具不随停机取消、最长跑 WriteToolTimeout，所以管家有自己的预算 WriteToolTimeout + 5s
+	// （不受 HTTP 的 10 秒限制；SSE 连接即使被 HTTP 关闭强行断开，轮次仍在后台收尾），关连接池前等它。
+	// 来不及收尾的轮次由其它副本的清扫器在 StaleRunAfter 后接管。
+	butlerCtx, butlerCancel := context.WithTimeout(context.Background(), butlerShutdownBudget)
+	defer butlerCancel()
 	butlerDone := make(chan struct{})
 	go func() {
 		defer close(butlerDone)
 		if a.Butler != nil {
-			if err := a.Butler.Shutdown(shutdownCtx); err != nil {
+			if err := a.Butler.Shutdown(butlerCtx); err != nil {
 				log.Warn("AI 管家停机时仍有未结束的轮次", "err", err)
 			}
 		}
@@ -262,6 +267,10 @@ func run(log *slog.Logger) error {
 
 // ingressShutdownGrace：停机时给进行中的普通租户请求的宽限。
 const ingressShutdownGrace = 5 * time.Second
+
+// butlerShutdownBudget：停机时等管家轮次收尾的上限——已批准的写工具最长 WriteToolTimeout，再留 5 秒回写结果与收尾文案。
+// 须小于 compose 的 stop_grace_period（60s）。
+const butlerShutdownBudget = butler.WriteToolTimeout + 5*time.Second
 
 // listensOnAllInterfaces 报告监听地址是否绑定了所有网卡（:8081、0.0.0.0:8081、[::]:8081）。
 func listensOnAllInterfaces(addr string) bool {

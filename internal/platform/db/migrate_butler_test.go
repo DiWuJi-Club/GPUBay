@@ -72,6 +72,11 @@ func TestMigration00025RoundTrip(t *testing.T) {
 	if got := scalar(tables); got != "5" {
 		t.Fatalf("tables after up = %s", got)
 	}
+	// 清扫器与级联删除依赖的索引
+	if got := scalar(`SELECT count(*) FROM pg_indexes WHERE indexname IN
+		('butler_conversations_running_idx', 'butler_tool_calls_message_idx', 'butler_tool_calls_pending_uniq')`); got != "3" {
+		t.Fatalf("butler indexes after up = %s, want 3", got)
+	}
 	// 迁移写入唯一的设置行（默认开启、30 万 token、60 轮）；id 只能是 1
 	if got := scalar(`SELECT enabled::text || '/' || daily_token_limit || '/' || max_turns || '/' || notice || '/' || (updated_by IS NULL)::text FROM butler_settings WHERE id = 1`); got != "true/300000/60//true" {
 		t.Fatalf("settings row = %s", got)

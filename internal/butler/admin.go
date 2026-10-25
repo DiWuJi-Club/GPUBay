@@ -92,20 +92,6 @@ func (s *Service) AdminConversation(ctx context.Context, id string) (Conversatio
 	return conv, msgs, calls, nil
 }
 
-// AdminConvRowOf 返回单个对话的后台列表行（详情页头部用）；不存在 → not_found。
-func (s *Service) AdminConvRowOf(ctx context.Context, id string) (AdminConvRow, error) {
-	conv, err := s.getConv(ctx, s.pool, 0, id)
-	if err != nil {
-		return AdminConvRow{}, err
-	}
-	x := AdminConvRow{Conversation: conv}
-	err = s.pool.QueryRow(ctx, `SELECT (SELECT phone FROM users WHERE id = $2),
-		(SELECT count(*) FROM butler_messages WHERE conversation_id = $1),
-		(SELECT count(*) FROM butler_tool_calls WHERE conversation_id = $1 AND kind = 'write')`, id, conv.UserID).
-		Scan(&x.Phone, &x.Messages, &x.WriteCalls)
-	return x, err
-}
-
 // Counts 返回 day 所在东八区自然日的全站请求数、token（input + output）与失败数（仪表盘）。
 func (s *Service) Counts(ctx context.Context, day time.Time) (requests int, tokens int64, failures int, err error) {
 	err = s.pool.QueryRow(ctx, `SELECT coalesce(sum(requests), 0), coalesce(sum(input_tokens + output_tokens), 0), coalesce(sum(failures), 0)

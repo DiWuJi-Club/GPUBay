@@ -112,8 +112,9 @@ func (f *fakeRental) renewN() int {
 
 type fakeApps struct {
 	mu      sync.Mutex
-	catalog []appdeploy.CatalogView
-	created []appdeploy.CreateRequest
+	catalog  []appdeploy.CatalogView
+	created  []appdeploy.CreateRequest
+	onCreate func() // 执行部署时先调用（如模拟 panic）
 }
 
 func (f *fakeApps) CatalogViews(context.Context, bool) ([]appdeploy.CatalogView, error) {
@@ -144,6 +145,9 @@ func (f *fakeApps) Log(context.Context, int64, string, string) (appdeploy.LogRes
 }
 func (f *fakeApps) Events(context.Context, string, int) ([]appdeploy.Event, error) { return nil, nil }
 func (f *fakeApps) Create(_ context.Context, req appdeploy.CreateRequest) (appdeploy.Deployment, error) {
+	if f.onCreate != nil {
+		f.onCreate()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.created = append(f.created, req)

@@ -31,6 +31,7 @@ CREATE TABLE butler_conversations (
 );
 CREATE INDEX butler_conversations_user_idx ON butler_conversations (user_id, updated_at DESC);
 CREATE INDEX butler_conversations_retention_idx ON butler_conversations (updated_at);
+CREATE INDEX butler_conversations_running_idx ON butler_conversations (run_started_at) WHERE status = 'running';  -- 清扫器找卡住的 running
 
 CREATE TABLE butler_messages (
     id              BIGSERIAL PRIMARY KEY,
@@ -65,6 +66,7 @@ CREATE TABLE butler_tool_calls (
 );
 CREATE INDEX butler_tool_calls_conv_idx ON butler_tool_calls (conversation_id, created_at);
 CREATE INDEX butler_tool_calls_user_idx ON butler_tool_calls (user_id, created_at DESC);
+CREATE INDEX butler_tool_calls_message_idx ON butler_tool_calls (message_id);  -- 删消息级联 / 按消息取调用
 CREATE UNIQUE INDEX butler_tool_calls_pending_uniq ON butler_tool_calls (conversation_id) WHERE status = 'pending';
 
 CREATE TABLE butler_usage (

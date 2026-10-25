@@ -377,3 +377,54 @@ func TestDetailStatuses(t *testing.T) {
 		t.Fatalf("other detail err = %v", err)
 	}
 }
+
+// 写工具执行中 panic：与清扫器接管相同地把调用定为 failed / interrupted（清密文、审计 status unknown、追加事实 tool 结果），
+// 对话回 idle 并推 error 事件；之后可以继续发消息（历史里 tool_use 都有对应的 tool_result）。
+func TestConfirmExecutePanicMarksInterrupted(t *testing.T) {
+	e := newEnv(t)
+	c, sink := e.send("new", "在我的实例上部署 jupyter") // mock 规则：生成密钥 → deploy_app 确认卡（带 secret_env_enc）
+	cfs := sink.find(EvConfirm)
+	if len(cfs) != 1 {
+		t.Fatalf("events = %v", sink.names())
+	}
+	cf := cfs[0].(ConfirmEvent).ToolCall
+	if n := e.count(`SELECT count(*) FROM butler_tool_calls WHERE id = $1 AND secret_env_enc IS NOT NULL`, cf.ID); n != 1 {
+		t.Fatal("确认卡没有 secret_env_enc")
+	}
+	e.apps.onCreate = func() { panic("boom") }
+	c2, sink, err := e.confirm(c.ID, cf.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Status != ConvIdle || len(sink.find(EvError)) != 1 {
+		t.Fatalf("status = %s events = %v", c2.Status, sink.names())
+	}
+	if n := e.count(`SELECT count(*) FROM butler_tool_calls WHERE id = $1 AND status = 'failed' AND result->>'code' = 'interrupted'
+		AND secret_env_enc IS NULL`, cf.ID); n != 1 {
+		t.Fatal("panic 后调用没有标 failed / interrupted 或没清密文")
+	}
+	if n := e.count(`SELECT count(*) FROM audit_logs WHERE action = 'butler.tool_execute' AND target_id = $1
+		AND diff->>'status' = 'unknown' AND diff->>'error_code' = 'interrupted'`, cf.ID); n != 1 {
+		t.Fatal("panic 后没有审计 status unknown")
+	}
+	var found bool
+	for _, m := range e.msgs(c.ID) {
+		for _, b := range m.Content {
+			if m.Role == RoleTool && b.ToolCallID == cf.ID && !b.OK && strings.Contains(b.Content, "interrupted") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("没有 interrupted 的 tool 结果消息")
+	}
+	if !strings.Contains(e.logs.String(), "panic: boom") {
+		t.Fatal("panic 没有记日志")
+	}
+	butlertest.CheckInvariants(t, e.svc.pool)
+	e.apps.onCreate = nil
+	if c3, _ := e.send(c.ID, "你好"); c3.Status != ConvIdle {
+		t.Fatalf("after panic send status = %s", c3.Status)
+	}
+	butlertest.CheckInvariants(t, e.svc.pool)
+}

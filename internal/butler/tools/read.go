@@ -89,7 +89,7 @@ func readTools(d Deps) []Tool {
 			Description: "查询取消一个未开通预订可退的金额、比例与截止时间。"},
 		{Name: "get_help", Kind: Read, Exec: h.getHelp,
 			Schema:      objSchema([]string{"section"}, `"section": {"type": "string", "enum": `+mustJSON(help.Sections())+`, "description": "帮助章节"}`),
-			Description: "查阅平台帮助文档的一个章节（SSH、公钥、端口转发、Web 访问、一键部署、预订、一次多台、自动续费、数据保留、计费与邀请返利、AI 管家）。"},
+			Description: "查阅平台帮助文档的一个章节（SSH、公钥、端口转发、Web 访问、一键部署、工作流市场、预订、一次多台、自动续费、数据保留、邀请返利、计费、AI 管家）。"},
 		{Name: "generate_secret", Kind: Read, Exec: h.generateSecret,
 			Schema:      objSchema(nil, `"length": {"type": "integer", "minimum": 8, "maximum": 64, "default": 32, "description": "长度"}`),
 			Description: "生成一个随机密钥（字母数字），用于部署应用时的访问令牌 / 接口密钥。结果只能在本轮对话里用于 deploy_app，不会被保存。"},
