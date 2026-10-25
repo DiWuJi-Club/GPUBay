@@ -3,8 +3,10 @@ package db_test
 import (
 	"context"
 	"database/sql"
+	"io/fs"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/pressly/goose/v3"
 
@@ -163,4 +165,120 @@ func TestMigration00022RoundTrip(t *testing.T) {
 	}
 	exec(`INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, created_at)
 		VALUES (1, -10, 890, 'llm_pay', 'llm_settlement', '3', now())`)
+}
+
+// 已上线计划 11 的库（00024 先于 00022 落库）升级：00022 乱序补跑；两者互不依赖，
+// 各自单独 Down / Up（ApplyVersion）都不动对方的表与约束。
+func TestMigration00022AfterComfy00024(t *testing.T) {
+	ctx := context.Background()
+	url := dbtest.EmptyURL(t)
+	without := fstest.MapFS{}
+	entries, err := fs.ReadDir(migrations.FS, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "00022_") || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		data, err := fs.ReadFile(migrations.FS, e.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		without[e.Name()] = &fstest.MapFile{Data: data}
+	}
+	if err := db.MigrateFS(ctx, url, without); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := sql.Open("pgx", url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sqlDB.Close() })
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := sqlDB.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	count := func(q string) int {
+		t.Helper()
+		var n int
+		if err := sqlDB.QueryRowContext(ctx, q).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return n
+	}
+	tables := func(names string) int {
+		t.Helper()
+		return count(`SELECT count(*) FROM information_schema.tables WHERE table_name IN (` + names + `)`)
+	}
+	const comfyTables = `'comfy_workflows', 'comfy_workflow_versions', 'deployment_workflows', 'comfy_workflow_runs'`
+	const llmTables = `'llm_models', 'llm_nodes', 'llm_node_events', 'llm_accounts', 'llm_api_keys', 'llm_settlements', 'llm_usage', 'llm_usage_daily'`
+	if n := tables(comfyTables); n != 4 {
+		t.Fatalf("comfy tables before 00022 = %d", n)
+	}
+	exec(`INSERT INTO users (phone, kind, status, created_at, updated_at) VALUES ('13800000001', 'personal', 'active', now(), now())`)
+	exec(`INSERT INTO comfy_workflows (slug, name, category, created_at, updated_at) VALUES ('sdxl-txt2img', 'SDXL 文生图', 'txt2img', now(), now())`)
+	exec(`INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at) VALUES ('2026/01/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.webp', NULL, 1, 'image/webp', 'workflow_cover', now())`)
+
+	// 升级：完整迁移集合，00022 乱序补跑
+	if err := db.MigrateFS(ctx, url, migrations.FS); err != nil {
+		t.Fatalf("out-of-order 00022: %v", err)
+	}
+	if n := count(`SELECT count(*) FROM users WHERE phone = 'system:llm' AND system`); n != 1 {
+		t.Fatalf("system user = %d", n)
+	}
+	if n := tables(llmTables); n != 8 {
+		t.Fatalf("llm tables = %d", n)
+	}
+	if n := count(`SELECT count(*) FROM comfy_workflows`) + count(`SELECT count(*) FROM uploads WHERE purpose = 'workflow_cover' AND user_id IS NULL`); n != 2 {
+		t.Fatalf("comfy rows after 00022 = %d", n)
+	}
+	exec(`INSERT INTO wallet_accounts (user_id, balance, updated_at) VALUES (2, 900, now())`)
+	exec(`INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, created_at)
+		VALUES (2, -10, 890, 'llm_pay', 'llm_settlement', '1', now()), (2, 5, 895, 'referral_rebate', 'referral', 'ord-x', now())`)
+	exec(`DELETE FROM wallet_ledger`)
+
+	p, err := goose.NewProvider(goose.DialectPostgres, sqlDB, migrations.FS, goose.WithAllowOutofOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply := func(version int64, up bool) {
+		t.Helper()
+		if _, err := p.ApplyVersion(ctx, version, up); err != nil {
+			t.Fatalf("ApplyVersion(%d, %v): %v", version, up, err)
+		}
+	}
+	// 只回滚 00022：工作流表与 uploads 约束不受影响
+	apply(22, false)
+	if n := tables(llmTables); n != 0 {
+		t.Fatalf("llm tables after 00022 down = %d", n)
+	}
+	if n := tables(comfyTables); n != 4 {
+		t.Fatalf("comfy tables after 00022 down = %d", n)
+	}
+	exec(`INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at) VALUES ('2026/01/cccccccccccccccccccccccccccccccc.webp', NULL, 1, 'image/webp', 'workflow_cover', now())`)
+	apply(22, true)
+	// 只回滚 00024：Token 商城的表、列与流水类型不受影响
+	apply(24, false)
+	if n := tables(comfyTables); n != 0 {
+		t.Fatalf("comfy tables after 00024 down = %d", n)
+	}
+	if n := tables(llmTables); n != 8 {
+		t.Fatalf("llm tables after 00024 down = %d", n)
+	}
+	if n := count(`SELECT count(*) FROM users WHERE phone = 'system:llm' AND system`); n != 1 {
+		t.Fatalf("system user after 00024 down = %d", n)
+	}
+	exec(`INSERT INTO wallet_ledger (user_id, amount, balance_after, kind, ref_type, ref_id, created_at)
+		VALUES (2, -10, 890, 'llm_pay', 'llm_settlement', '2', now())`)
+	exec(`DELETE FROM wallet_ledger`)
+	apply(24, true)
+	if n := tables(comfyTables) + tables(llmTables); n != 12 {
+		t.Fatalf("tables after re-up = %d", n)
+	}
+	if pending, err := p.HasPending(ctx); err != nil || pending {
+		t.Fatalf("pending = %v, %v", pending, err)
+	}
 }

@@ -7,7 +7,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/randx"
@@ -94,7 +93,8 @@ func (s *Service) PlaceSystem(ctx context.Context, req SystemPlaceRequest) (Inst
 			if err := recordEvent(ctx, tx, inst.ID, "", StateCreating, "system instance for "+req.Note, now); err != nil {
 				return err
 			}
-			if _, err := s.d.Fleet.Enqueue(ctx, tx, req.MachineID, inst.ID, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref}); err != nil {
+			// 与其它开通路径同一形态的 Create 指令（计划 10：显式 ssh_port、share_slots = 1）
+			if err := s.enqueueCreate(ctx, tx, inst, ref); err != nil {
 				return err
 			}
 			out = inst

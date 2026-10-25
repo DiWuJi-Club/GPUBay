@@ -55,6 +55,7 @@ type RentalOps interface {
 	ReleaseSystem(ctx context.Context, instanceID string) error
 	Get(ctx context.Context, id string) (rental.Instance, error)
 	UpstreamTarget(ctx context.Context, instanceID string) (upstream.Target, error)
+	InstanceSSHPort(instanceID string) int // 容器 sshd 端口（计划 10 按实例端口）；路由表的拨号目标与 UpstreamTarget 一致
 	ListLiveSystemInstances(ctx context.Context) ([]rental.Instance, error)
 }
 

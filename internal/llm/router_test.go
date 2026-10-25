@@ -10,6 +10,14 @@ import (
 	"spark-cloud/internal/platform/dbtest"
 )
 
+// portOnlyRental 只实现 InstanceSSHPort（Router.Refresh 只用它；其余方法调用会 panic）。
+type portOnlyRental struct {
+	RentalOps
+	port int
+}
+
+func (p portOnlyRental) InstanceSSHPort(string) int { return p.port }
+
 // 同一 Key 优先上次的节点，直到其在途达到 0.8 × max；之后换最少在途的。
 func TestRouterPrefersLastNodeUntil80Percent(t *testing.T) {
 	a, b := rtNodeID(1), rtNodeID(2)
@@ -326,6 +334,14 @@ func TestRouterRefreshDropsNonReady(t *testing.T) {
 	if got[0].MaxConcurrency != 16 || got[0].ModelID != online || got[0].Target.LanIP != "10.0.1.1" ||
 		got[0].Target.HostPubkey != "ssh-ed25519 AAAA1" || got[0].Target.InstanceID != "ins-rt000001" {
 		t.Fatalf("route node = %+v", got[0])
+	}
+	// 计划 10 按实例端口：拨号目标的端口取 Rental.InstanceSSHPort（与探测用的 UpstreamTarget 一致）
+	rp := NewRouter(NewService(Deps{Pool: pool, Rental: portOnlyRental{port: 2299}}))
+	if err := rp.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := rp.Pick(online, 1, nil); err != nil || n.Target.Port != 2299 {
+		t.Fatalf("target port = %+v, %v", n.Target, err)
 	}
 	if _, err := r.Pick(offline, 1, nil); !errors.Is(err, ErrNoNode) {
 		t.Fatalf("offline model: %v", err)

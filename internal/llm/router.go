@@ -64,8 +64,13 @@ func (r *Router) Refresh(ctx context.Context) error {
 	}
 	nodes, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (RouteNode, error) {
 		var x RouteNode
-		err := row.Scan(&x.ID, &x.ModelID, &x.MaxConcurrency, &x.Target.InstanceID, &x.Target.LanIP, &x.Target.HostPubkey)
-		return x, err
+		if err := row.Scan(&x.ID, &x.ModelID, &x.MaxConcurrency, &x.Target.InstanceID, &x.Target.LanIP, &x.Target.HostPubkey); err != nil {
+			return x, err
+		}
+		if r.s.d.Rental != nil { // 计划 10 按实例端口：与 rental.UpstreamTarget（探测用）一致
+			x.Target.Port = r.s.d.Rental.InstanceSSHPort(x.Target.InstanceID)
+		}
+		return x, nil
 	})
 	if err != nil {
 		return err

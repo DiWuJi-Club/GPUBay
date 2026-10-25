@@ -108,6 +108,8 @@ func (f *fakeRental) UpstreamTarget(ctx context.Context, id string) (upstream.Ta
 	return upstream.Target{InstanceID: id, LanIP: "10.0.0.10"}, nil
 }
 
+func (f *fakeRental) InstanceSSHPort(string) int { return 0 } // 0 = 上游池默认端口
+
 func (f *fakeRental) ListLiveSystemInstances(ctx context.Context) ([]rental.Instance, error) {
 	rows, err := f.e.pool.Query(ctx, `SELECT id FROM instances WHERE system AND state IN ('creating', 'running', 'stopped', 'wiping') ORDER BY id`)
 	if err != nil {

@@ -178,9 +178,10 @@ func (s *Service) Access(ctx context.Context, instanceID string) (AccessInfo, er
 }
 
 // UpstreamTarget 实例的拨号目标（机器 lan_ip、容器主机公钥），供 LLM 网关 / 探测经 upstream.Pool 拨号；
-// 与 ingress 路由表、appdeploy 的 readTarget 取同样的列。不看状态（调用方自己判断能否拨）；实例不存在 → ErrNotFound。
+// 与 ingress 路由表、appdeploy 的 readTarget 取同样的列；端口同 InstanceSSHPort（计划 10 按实例端口）。
+// 不看状态（调用方自己判断能否拨）；实例不存在 → ErrNotFound。
 func (s *Service) UpstreamTarget(ctx context.Context, instanceID string) (upstream.Target, error) {
-	t := upstream.Target{InstanceID: instanceID}
+	t := upstream.Target{InstanceID: instanceID, Port: s.InstanceSSHPort(instanceID)}
 	err := s.d.Pool.QueryRow(ctx, `SELECT m.lan_ip, i.ssh_host_pubkey FROM instances i JOIN machines m ON m.id = i.machine_id WHERE i.id = $1`, instanceID).
 		Scan(&t.LanIP, &t.HostPubkey)
 	if db.IsNoRows(err) {

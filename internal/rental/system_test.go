@@ -1,6 +1,7 @@
 package rental_test
 
 import (
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -128,6 +129,11 @@ func TestPlaceSystemRequiresPoolIdleOnline(t *testing.T) {
 	cmds, err := e.fleet.PendingCommands(e.ctx, m[5])
 	if err != nil || len(cmds) != 1 || cmds[0].Type != fleet.CmdCreateInstance || cmds[0].InstanceID != inst.ID {
 		t.Fatalf("commands = %+v, %v", cmds, err)
+	}
+	// 计划 10：与其它开通路径同一形态的 Create 指令（显式端口、整机一份）
+	var p fleet.CreateInstancePayload
+	if err := json.Unmarshal(cmds[0].Payload, &p); err != nil || p.ImageRef == "" || p.SSHPort != testSSHBasePort || p.ShareSlots != 1 {
+		t.Fatalf("create payload = %+v, %v", p, err)
 	}
 	if n := e.count(`SELECT count(*) FROM orders`); n != 0 {
 		t.Fatalf("orders = %d", n)
@@ -450,8 +456,9 @@ func TestUpstreamTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := upstream.Target{InstanceID: inst.ID, LanIP: mach.LanIP, HostPubkey: inst.SSHHostPubkey}
-	if got != want || got.LanIP == "" || got.HostPubkey == "" {
+	// 端口与 InstanceSSHPort / Create 指令一致（计划 10 按实例端口）
+	want := upstream.Target{InstanceID: inst.ID, LanIP: mach.LanIP, HostPubkey: inst.SSHHostPubkey, Port: testSSHBasePort}
+	if got != want || got.LanIP == "" || got.HostPubkey == "" || got.Port != e.svc.InstanceSSHPort(inst.ID) {
 		t.Fatalf("target = %+v, want %+v", got, want)
 	}
 	if _, err := e.svc.UpstreamTarget(e.ctx, "ins-nothere1"); !errors.Is(err, apperr.ErrNotFound) {
