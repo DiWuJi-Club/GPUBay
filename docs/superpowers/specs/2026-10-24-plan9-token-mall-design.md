@@ -131,6 +131,10 @@
 | I15 | 后台角色：`GET /llm/accounts`、`GET /llm/keys` 对 ops 与 finance 开放（规格表分别写 finance / ops）；改额度、停用 Key 仍只 ops；`GET /llm/accounts` 增加精确 `user_id` 筛选 | 两种角色都需要看账户 |
 | I16 | 前端：控制台底部导航 5 项都加图标（声明已是传递依赖的 `@element-plus/icons-vue`，不新增安装）；钱包流水类型以标签着色并支持 `?ledger=<id>` 定位；Key 到期日按所选北京日期的 23:59:59 提交；admin 与 console 各自有微分格式化函数 | 一致的导航；从结算记录跳到流水 |
 | I17 | e2e 覆盖表编号：计划 8 已占 `C-WAL-05`、`C-ACC-03`，本计划顺延（`C-WAL-06` 等） | 不冲突 |
+| I18 | 终审修订（输出上界）：`max_tokens / max_completion_tokens` 超过模型 `max_output_tokens` → 400；两者都没带时网关注入 `max_tokens = min(max_output_tokens, context_len − len(body))`（< 1 则不注入），这是除 `include_usage` 外唯一的请求体改写；`n / best_of` > 8 → 400，估算的输出部分乘以 `max(n, best_of, 1)` | 修正规格 T2「不改写请求」带来的预检绕过：vLLM 不带 `max_tokens` 时会生成到上下文上限 |
+| I19 | 终审修订 I12：流式请求触发 10 分钟总时限时，若已向客户端输出内容，按已输出部分计费（`status ok`、`estimated=true`）；未输出内容仍记 `upstream_timeout` 不收费；上游在首字节后断开、平台停机中断仍不收费 | 防止慢读或超长生成白嫖已交付的内容；平台过失仍不收钱 |
+| I20 | 终审其它：系统实例容器异常告警降为 warning（「平台节点容器异常，节点将自动重建」）；Token 服务池不能改名；`00022` Down 把遗留的系统账号置为 `banned`；导入时 app.json 声明 `internal` 而库里不是时只升不降；`MODEL_ID / source_id` 两段都须以字母或数字开头；仪表盘占用率不计系统实例 | 运维提示准确、回滚安全、防路径穿越 |
+| I21 | 与计划 10 / 11 合并：迁移编号保持 00022（主干已开启 goose 乱序迁移，00022 与 00024 互不依赖）；系统实例的 Create 指令与其它路径一样带 `ssh_port / share_slots=1`；上游拨号目标带实例 SSH 端口 | 共存 |
 
 ## 2. 数据模型（迁移 `00022_llm.sql`，带 `+goose Down`）
 
