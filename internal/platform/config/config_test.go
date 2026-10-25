@@ -440,8 +440,22 @@ func TestLoadLLMDefaults(t *testing.T) {
 	}
 	l := c.ButlerLLM
 	if !c.Butler || c.ButlerOffReason != "" || l.Provider != "openai" || l.BaseURL != "http://token-mall.spark.internal/v1" || l.Model != "qwen3-32b" ||
-		l.MaxOutputTokens != 1024 || l.PriceInCentsPerM != 0 || l.PriceOutCentsPerM != 0 || !l.Tools || l.APIKey != "" {
+		l.MaxOutputTokens != 1024 || l.PriceInCentsPerM != 0 || l.PriceOutCentsPerM != 0 || !l.Tools || l.APIKey != "" || l.Stream {
 		t.Fatalf("llm defaults = %+v butler=%v reason=%q", l, c.Butler, c.ButlerOffReason)
+	}
+	// SPARK_LLM_STREAM：openai 默认 off（vLLM 0.10.1 hermes 流式工具调用会丢参数片段），anthropic 默认 on，显式值优先
+	for _, tc := range []struct {
+		provider, stream string
+		want             bool
+	}{{"openai", "", false}, {"openai", "on", true}, {"anthropic", "", true}, {"anthropic", "off", false}, {"mock", "", true}} {
+		kv := []string{"SPARK_LLM_PROVIDER", tc.provider, "SPARK_LLM_BASE_URL", "http://token-mall.spark.internal/v1"}
+		if tc.stream != "" {
+			kv = append(kv, "SPARK_LLM_STREAM", tc.stream)
+		}
+		c, err := config.Load(env(base(kv...)))
+		if err != nil || c.ButlerLLM.Stream != tc.want {
+			t.Fatalf("%s stream=%q: Stream = %v err=%v", tc.provider, tc.stream, c.ButlerLLM.Stream, err)
+		}
 	}
 	// 模型默认值按 provider
 	for provider, model := range map[string]string{"anthropic": "claude-opus-5-5", "mock": "mock"} {
@@ -546,6 +560,7 @@ func TestLoadLLMErrors(t *testing.T) {
 		{"base url ftp", base("SPARK_LLM_PROVIDER", "anthropic", "SPARK_LLM_BASE_URL", "ftp://x/v1"), "SPARK_LLM_BASE_URL"},
 		{"bad butler", base("SPARK_BUTLER", "true"), "SPARK_BUTLER"},
 		{"bad tools", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_TOOLS", "yes"), "SPARK_LLM_TOOLS"},
+		{"bad stream", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_STREAM", "true"), "SPARK_LLM_STREAM"},
 		{"bad max tokens", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_MAX_OUTPUT_TOKENS", "0"), "SPARK_LLM_MAX_OUTPUT_TOKENS"},
 		{"bad price", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_PRICE_INPUT_CENTS_PER_M", "-1"), "SPARK_LLM_PRICE_INPUT_CENTS_PER_M"},
 		{"bad out price", base("SPARK_LLM_PROVIDER", "mock", "SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M", "x"), "SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M"},

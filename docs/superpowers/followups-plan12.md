@@ -46,6 +46,7 @@
 - mock 规则只覆盖 e2e 流程，不模拟模型随机性；真模型质量靠验收记录与后续调提示。
 - 历史裁剪按估算 token（字符数 / 2，无 tokenizer），给系统提示与工具定义预留 6000。
 - `openai` 适配器只实现 Chat Completions，不做 Responses API。
+- **`SPARK_LLM_STREAM` 默认 off（openai）**：真机验收（Qwen3-4B，计划 9 网关）发现节点镜像 `spark/llm-serving:25.09` 里的 vLLM 0.10.1 hermes 解析器流式输出工具调用时丢参数片段（直接请求容器内 vLLM 复现，与网关无关），所以 openai 默认非流式，一次模型调用一个 `delta`。待办：节点 vLLM 升级后用同一请求（`place_order` 带 `app_env: {}` 等嵌套参数）验证流式工具调用逐字一致，再把默认改回 on。
 - 过期的确认卡由清扫器回填「操作已过期未执行」，不再调用模型生成收尾文字。
 - 开发平台验收观察：`/butler` 刷新后不会自动打开进行中的对话（可把对话 ID 放进 URL）；管家关闭时建议 chips 仍显示；mock 启动日志的 endpoint 显示「（SDK 默认）」；没有非交互的开发种子命令（管理员 / 机器）。
 

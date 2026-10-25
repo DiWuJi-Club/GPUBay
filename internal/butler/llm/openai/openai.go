@@ -1,4 +1,4 @@
-// Package openai 是 OpenAI 兼容 Chat Completions 接口（流式）的 llm.Provider 适配器（规格 §3.2）。
+// Package openai 是 OpenAI 兼容 Chat Completions 接口（流式，或 NoStream 时非流式）的 llm.Provider 适配器（规格 §3.2）。
 // 只用 net/http，不引入 SDK：默认端点是计划 9 的内网模型网关（vLLM 等）。
 package openai
 
@@ -31,6 +31,10 @@ type Config struct {
 	Model     string
 	MaxTokens int
 	HTTP      *http.Client // nil → 无超时的 Client（超时由 ctx 控制）
+	// NoStream：发 "stream": false，整段 chat.completion 一次读回（SPARK_LLM_STREAM=off）。
+	// vLLM 0.10.1 的 hermes 解析器流式输出工具调用时会丢参数片段（{"product_id": 1, "duration": "1d"} 变成
+	// {"product_id": "1d"}、结尾的 } 丢失），非流式没有这个问题；正文只是不再逐字出现（一次模型调用一个 delta）。
+	NoStream bool
 }
 
 // Provider 实现 llm.Provider。
@@ -59,7 +63,7 @@ type reqBody struct {
 	Tools         []reqTool      `json:"tools,omitempty"`
 	ToolChoice    string         `json:"tool_choice,omitempty"`
 	Stream        bool           `json:"stream"`
-	StreamOptions map[string]any `json:"stream_options"`
+	StreamOptions map[string]any `json:"stream_options,omitempty"` // 只在流式时发（OpenAI 对非流式带它回 400）
 	MaxTokens     int            `json:"max_tokens"`
 	Temperature   float64        `json:"temperature"`
 }
@@ -107,12 +111,14 @@ func (p *Provider) buildBody(req llm.Request) ([]byte, error) {
 		maxTokens = defaultMaxToken
 	}
 	body := reqBody{
-		Model:         p.cfg.Model,
-		Stream:        true,
-		StreamOptions: map[string]any{"include_usage": true},
-		MaxTokens:     maxTokens,
-		Temperature:   temperature,
-		Messages:      []reqMessage{},
+		Model:       p.cfg.Model,
+		Stream:      !p.cfg.NoStream,
+		MaxTokens:   maxTokens,
+		Temperature: temperature,
+		Messages:    []reqMessage{},
+	}
+	if body.Stream {
+		body.StreamOptions = map[string]any{"include_usage": true}
 	}
 	// 固定前缀 + 动态快照段拼成一条 system 消息（OpenAI 兼容端点只认一条 system）
 	sys := req.System
@@ -273,7 +279,11 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 		return &llm.UnavailableError{Cause: err}
 	}
 	hreq.Header.Set("Content-Type", "application/json")
-	hreq.Header.Set("Accept", "text/event-stream")
+	if p.cfg.NoStream {
+		hreq.Header.Set("Accept", "application/json")
+	} else {
+		hreq.Header.Set("Accept", "text/event-stream")
+	}
 	if p.cfg.APIKey != "" {
 		hreq.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
 	}
@@ -291,6 +301,9 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 			return &llm.UnavailableError{Status: resp.StatusCode, Cause: errors.New(string(b))}
 		}
 		return &llm.RequestError{Status: resp.StatusCode, Body: string(b)}
+	}
+	if p.cfg.NoStream {
+		return p.readCompletion(ctx, resp.Body, emit)
 	}
 
 	sc := bufio.NewScanner(resp.Body)
@@ -393,6 +406,84 @@ func (p *Provider) Chat(ctx context.Context, req llm.Request, emit func(llm.Even
 	}
 	if usage != nil {
 		emit(llm.Event{Type: llm.EvUsage, Usage: usage})
+	}
+	emit(llm.Event{Type: llm.EvDone, StopReason: stop})
+	return nil
+}
+
+// ---- 非流式响应（NoStream）----
+
+const maxCompletionBytes = 8 << 20 // 整段响应上限 8MB（max_tokens 已限制输出长度，这里只防异常端点）
+
+type completion struct {
+	Choices []struct {
+		Message struct {
+			Content   *string `json:"content"`
+			ToolCalls []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+	} `json:"usage"`
+	Object  string          `json:"object"`
+	Message string          `json:"message"`
+	Error   json.RawMessage `json:"error"`
+}
+
+// readCompletion 解析一次性的 chat.completion，按流式同样的顺序发事件：正文（一个 delta）→ 工具调用 → usage → done。
+// 停止原因与流式一致：length 丢弃半截工具调用；有工具调用而没有 finish_reason 也算 tool_use。
+func (p *Provider) readCompletion(ctx context.Context, r io.Reader, emit func(llm.Event)) error {
+	raw, err := io.ReadAll(io.LimitReader(r, maxCompletionBytes))
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &llm.UnavailableError{Cause: err}
+	}
+	var c completion
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return &llm.UnavailableError{Cause: errors.New("模型响应不是合法 JSON")}
+	}
+	ck := chunk{Object: c.Object, Message: c.Message, Error: c.Error}
+	if msg := ck.streamError(); msg != "" {
+		return &llm.UnavailableError{Cause: errors.New(msg)}
+	}
+	if len(c.Choices) == 0 {
+		return &llm.UnavailableError{Cause: errors.New("模型响应没有 choices")}
+	}
+	ch := c.Choices[0]
+	if ch.Message.Content != nil && *ch.Message.Content != "" {
+		emit(llm.Event{Type: llm.EvText, Text: *ch.Message.Content})
+	}
+	stop := llm.StopEndTurn
+	switch ch.FinishReason {
+	case "tool_calls", "function_call":
+		stop = llm.StopToolUse
+	case "length":
+		stop = llm.StopMaxTokens
+	case "content_filter":
+		stop = llm.StopRefusal
+	}
+	if stop != llm.StopMaxTokens {
+		for i, tc := range ch.Message.ToolCalls {
+			id := tc.ID
+			if id == "" {
+				id = fmt.Sprintf("call_%d", i)
+			}
+			emit(llm.Event{Type: llm.EvTool, ToolCall: &llm.ToolCall{ProviderCallID: id, Name: tc.Function.Name, Args: validOrMarker(tc.Function.Arguments)}})
+			stop = llm.StopToolUse
+		}
+	}
+	if c.Usage != nil {
+		emit(llm.Event{Type: llm.EvUsage, Usage: &llm.Usage{InputTokens: c.Usage.PromptTokens, OutputTokens: c.Usage.CompletionTokens}})
 	}
 	emit(llm.Event{Type: llm.EvDone, StopReason: stop})
 	return nil

@@ -454,9 +454,9 @@ func llmProvider(cfg config.ButlerLLMConfig, injected butlerllm.Provider, gw *ll
 				return nil, errors.New("SPARK_LLM_PROVIDER=openai 需要设置 SPARK_LLM_BASE_URL，或开启 Token 商城网关（SPARK_LLM_GATEWAY=on）")
 			}
 			return openai.New(openai.Config{BaseURL: ButlerGatewayBaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens,
-				HTTP: butlerGatewayClient(gw, host, log)}), nil
+				HTTP: butlerGatewayClient(gw, host, log), NoStream: !cfg.Stream}), nil
 		}
-		return openai.New(openai.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens}), nil
+		return openai.New(openai.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens, NoStream: !cfg.Stream}), nil
 	case config.LLMAnthropic:
 		return anthropic.New(anthropic.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens}), nil
 	case config.LLMMock:

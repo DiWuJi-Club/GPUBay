@@ -84,6 +84,10 @@ type ButlerLLMConfig struct {
 	PriceInCentsPerM  int  // 用量页估算费用：输入每百万 token 的价格（分）
 	PriceOutCentsPerM int  // 输出每百万 token 的价格（分）
 	Tools             bool // SPARK_LLM_TOOLS=off 时不给模型工具（端点不支持工具调用时的应急开关）
+	// Stream：SPARK_LLM_STREAM，模型请求是否用流式（只对 openai 生效；anthropic 适配器总是流式，mock 不走网络）。
+	// openai 默认 off：vLLM 0.10.1（spark/llm-serving:25.09）的 hermes 解析器流式输出工具调用时会丢参数片段，
+	// 非流式没有这个问题；节点的 vLLM 升级并验证后可改回 on。anthropic / mock 默认 on。
+	Stream bool
 }
 
 // LLM 提供方与各自的默认模型。
@@ -614,6 +618,13 @@ func (c *Config) loadButler(getenv func(string) string, or func(key, def string)
 		return err
 	}
 	if l.Tools, err = onOff("SPARK_LLM_TOOLS", or("SPARK_LLM_TOOLS", "on")); err != nil {
+		return err
+	}
+	streamDef := "on"
+	if l.Provider == LLMOpenAI {
+		streamDef = "off"
+	}
+	if l.Stream, err = onOff("SPARK_LLM_STREAM", or("SPARK_LLM_STREAM", streamDef)); err != nil {
 		return err
 	}
 	explicit := getenv("SPARK_BUTLER") != ""

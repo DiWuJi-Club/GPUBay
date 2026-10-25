@@ -43,6 +43,18 @@ func (g *gatedNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.bodies = append(g.bodies, body)
 	g.auth = append(g.auth, r.Header.Get("Authorization"))
 	g.mu.Unlock()
+	if body["stream"] != true { // 非流式（SPARK_LLM_STREAM=off，openai 的默认）：放行后一次回完整段 chat.completion
+		select {
+		case <-g.release:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"`+llmSlug+
+			`","choices":[{"index":0,"message":{"role":"assistant","content":"你好，世界"},"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":1200,"completion_tokens":30,"total_tokens":1230}}`)
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
 	send := func(data string) {
@@ -90,7 +102,7 @@ type butlerGW struct {
 	node             *gatedNode
 }
 
-func newButlerGW(t *testing.T) *butlerGW {
+func newButlerGW(t *testing.T, stream bool) *butlerGW {
 	t.Helper()
 	var butlerUID, keyID int64
 	e := newLLMEnvWith(t, 1, func(pool *pgxpool.Pool, cfg *config.Config, _ *app.Options) {
@@ -105,7 +117,7 @@ func newButlerGW(t *testing.T) *butlerGW {
 			t.Fatal(err)
 		}
 		cfg.Butler = true
-		cfg.ButlerLLM = config.ButlerLLMConfig{Provider: config.LLMOpenAI, APIKey: plain, Model: llmSlug, MaxOutputTokens: 512, Tools: true}
+		cfg.ButlerLLM = config.ButlerLLMConfig{Provider: config.LLMOpenAI, APIKey: plain, Model: llmSlug, MaxOutputTokens: 512, Tools: true, Stream: stream}
 	})
 	if e.a.Butler == nil || e.a.ButlerLLM == nil || e.a.ButlerLLM.Name() != config.LLMOpenAI || e.a.ButlerLLM.Model() != llmSlug {
 		t.Fatalf("butler = %v provider = %v", e.a.Butler, e.a.ButlerLLM)
@@ -121,7 +133,7 @@ func newButlerGW(t *testing.T) *butlerGW {
 }
 
 func TestButlerUsesInProcessGateway(t *testing.T) {
-	g := newButlerGW(t)
+	g := newButlerGW(t, true) // SPARK_LLM_STREAM=on：逐块流式经网关回传
 	e, node, m, butlerUID, keyID := g.llmEnv, g.node, g.model, g.butlerUID, g.keyID
 	endUser := dbtest.CreateUser(t, e.pool, "13900008888", true)
 
@@ -235,7 +247,7 @@ func TestButlerUsesInProcessGateway(t *testing.T) {
 // 外层的 chi.RouteContext 曾经随请求 ctx 漏进进程内网关的 chi 路由 → 网关按外层路径匹配、每轮都 404（直接调 Butler.Send 测不出来）；
 // 控制台处理器返回后 chi 回收这个 RouteContext，而网关还在收尾记账 → 数据竞争（-race 下报错）。
 func TestButlerHTTPTurnThroughInProcessGateway(t *testing.T) {
-	g := newButlerGW(t)
+	g := newButlerGW(t, false) // openai 默认 SPARK_LLM_STREAM=off：非流式经网关，usage 取自整段响应
 	close(g.node.release) // 节点一口气回完
 	u := g.newUser(0)
 	for i, text := range []string{"你好", "再说一次"} {
@@ -276,6 +288,13 @@ func TestButlerHTTPTurnThroughInProcessGateway(t *testing.T) {
 	if ok != 2 {
 		t.Fatalf("ok usage rows = %d", ok)
 	}
+	var streamed int
+	g.scalar(&streamed, `SELECT count(*) FROM llm_usage WHERE user_id = $1 AND stream`, g.butlerUID)
+	g.node.mu.Lock()
+	if streamed != 0 || len(g.node.bodies) != 2 || g.node.bodies[0]["stream"] != false || g.node.bodies[0]["stream_options"] != nil {
+		t.Fatalf("non-stream: streamed rows %d, node bodies %v", streamed, g.node.bodies)
+	}
+	g.node.mu.Unlock()
 	var bOut int64
 	g.scalar(&bOut, `SELECT output_tokens FROM butler_usage WHERE user_id = $1`, u.id)
 	if bOut != 60 {
