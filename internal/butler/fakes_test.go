@@ -111,7 +111,7 @@ func (f *fakeRental) renewN() int {
 }
 
 type fakeApps struct {
-	mu      sync.Mutex
+	mu       sync.Mutex
 	catalog  []appdeploy.CatalogView
 	created  []appdeploy.CreateRequest
 	onCreate func() // 执行部署时先调用（如模拟 panic）
