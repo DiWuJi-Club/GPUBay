@@ -125,7 +125,7 @@ func (g *Server) handleCompletion(endpoint string) http.HandlerFunc {
 			return
 		}
 		if m.Kind != llm.KindEmbedding {
-			if msg := checkOutputBounds(&p, m); msg != "" {
+			if msg := checkOutputBounds(&p, m, len(body)); msg != "" {
 				writeErr(w, http.StatusBadRequest, codeInvalidRequest, msg)
 				return
 			}

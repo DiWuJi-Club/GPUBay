@@ -43,7 +43,7 @@ func Cost(m Model, promptTokens, completionTokens int) int64 {
 }
 
 // OutputBudget 一次对话 / 补全请求最多产出的输出 token（预算预检与 TPM 预占共用）：
-// min(maxTokens（nil 或 ≤ 0 时取模型 max_output_tokens——网关此时向上游注入 max_tokens = max_output_tokens）, max_output_tokens)
+// min(maxTokens（nil 或 ≤ 0 时取模型 max_output_tokens；网关注入 max_tokens 时传的是注入值）, max_output_tokens)
 // × max(fanout, 1)（fanout = max(n, best_of)，每个候选各自生成）。embedding 没有输出，返回 0。
 func OutputBudget(m Model, maxTokens *int, fanout int) int {
 	if m.Kind == KindEmbedding {

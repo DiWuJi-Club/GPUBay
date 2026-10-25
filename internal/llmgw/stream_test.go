@@ -158,11 +158,11 @@ func TestUpstreamBodyInjection(t *testing.T) {
 }
 
 func TestCheckOutputBoundsAndMaxTokensInjection(t *testing.T) {
-	m := llm.Model{Kind: llm.KindChat, MaxOutputTokens: 100}
+	m := llm.Model{Kind: llm.KindChat, MaxOutputTokens: 100, ContextLen: 1000}
 	// 都没给：注入 max_tokens，与 include_usage 注入叠加
 	body := []byte(`{"model":"m","stream":true,"n":3,"best_of":5}`)
 	p, _ := parseRequest(body)
-	if msg := checkOutputBounds(&p, m); msg != "" || p.injectMaxTokens != 100 || p.fanout != 5 {
+	if msg := checkOutputBounds(&p, m, len(body)); msg != "" || p.injectMaxTokens != 100 || p.fanout != 5 || *p.maxTokens != 100 {
 		t.Fatalf("msg %q inject %d fanout %d", msg, p.injectMaxTokens, p.fanout)
 	}
 	out, err := upstreamBody(body, p)
@@ -177,16 +177,41 @@ func TestCheckOutputBoundsAndMaxTokensInjection(t *testing.T) {
 	// 给了任一字段：不注入；null 视为未给
 	for _, b := range []string{`{"model":"m","max_tokens":100}`, `{"model":"m","max_completion_tokens":1}`, `{"model":"m","max_tokens":0}`} {
 		p, _ := parseRequest([]byte(b))
-		if msg := checkOutputBounds(&p, m); msg != "" || p.injectMaxTokens != 0 || p.fanout != 1 {
+		if msg := checkOutputBounds(&p, m, len(b)); msg != "" || p.injectMaxTokens != 0 || p.fanout != 1 {
 			t.Fatalf("%s: msg %q inject %d fanout %d", b, msg, p.injectMaxTokens, p.fanout)
 		}
 		if out, _ := upstreamBody([]byte(b), p); string(out) != b {
 			t.Fatalf("%s rewritten: %s", b, out)
 		}
 	}
-	p, _ = parseRequest([]byte(`{"model":"m","max_tokens":null,"n":null}`))
-	if msg := checkOutputBounds(&p, m); msg != "" || p.injectMaxTokens != 100 || p.fanout != 1 {
+	nullBody := `{"model":"m","max_tokens":null,"n":null}`
+	p, _ = parseRequest([]byte(nullBody))
+	if msg := checkOutputBounds(&p, m, len(nullBody)); msg != "" || p.injectMaxTokens != 100 || p.fanout != 1 {
 		t.Fatalf("null fields: msg %q inject %d fanout %d", msg, p.injectMaxTokens, p.fanout)
+	}
+	// 大请求体：注入 min(max_output, context_len − 请求体字节数)，估算按注入值
+	big := `{"model":"m","x":"` + strings.Repeat("a", 950-len(`{"model":"m","x":""}`)) + `"}` // 950 字节 → 注入 50
+	p, _ = parseRequest([]byte(big))
+	if msg := checkOutputBounds(&p, m, len(big)); msg != "" || len(big) != 950 || p.injectMaxTokens != 50 || p.maxTokens == nil || *p.maxTokens != 50 {
+		t.Fatalf("large body: msg %q len %d inject %d", msg, len(big), p.injectMaxTokens)
+	}
+	if out, _ := upstreamBody([]byte(big), p); !strings.Contains(string(out), `"max_tokens":50`) {
+		t.Fatalf("large body not patched with 50")
+	}
+	if got := llm.OutputBudget(m, p.maxTokens, p.fanout); got != 50 {
+		t.Fatalf("estimate output = %d, want 50", got)
+	}
+	// 请求体 ≥ 上下文：不注入（vLLM 自己按剩余上下文生成），估算按 max_output
+	huge := `{"model":"m","x":"` + strings.Repeat("a", 1000) + `"}`
+	p, _ = parseRequest([]byte(huge))
+	if msg := checkOutputBounds(&p, m, len(huge)); msg != "" || p.injectMaxTokens != 0 || p.maxTokens != nil {
+		t.Fatalf("huge body: msg %q inject %d", msg, p.injectMaxTokens)
+	}
+	if out, _ := upstreamBody([]byte(huge), p); string(out) != huge {
+		t.Fatal("huge body rewritten")
+	}
+	if got := llm.OutputBudget(m, p.maxTokens, p.fanout); got != 100 {
+		t.Fatalf("estimate output without injection = %d, want 100", got)
 	}
 	for b, want := range map[string]string{
 		`{"model":"m","max_tokens":101}`:                           "max_tokens 不能超过该模型的最大输出 100",
@@ -196,7 +221,7 @@ func TestCheckOutputBoundsAndMaxTokensInjection(t *testing.T) {
 		`{"model":"m","best_of":1.5}`:                              "best_of 必须是整数",
 	} {
 		p, _ := parseRequest([]byte(b))
-		if msg := checkOutputBounds(&p, m); msg != want {
+		if msg := checkOutputBounds(&p, m, len(b)); msg != want {
 			t.Fatalf("%s: msg %q, want %q", b, msg, want)
 		}
 	}

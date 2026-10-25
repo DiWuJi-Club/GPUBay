@@ -148,16 +148,23 @@ func isNull(raw json.RawMessage) bool { return strings.TrimSpace(string(raw)) ==
 const maxFanout = 8
 
 // checkOutputBounds 对话 / 补全端点的输出上界（embeddings 不调用）：max_tokens / max_completion_tokens 任一 > 模型
-// max_output_tokens → 400；两者都没给 → 上游注入 max_tokens = max_output_tokens（vLLM 不给时按上下文剩余长度生成，
-// 估算就没有上界）；n / best_of 须是整数且 ≤ 8，fanout = max(n, best_of, 1)。失败返回给用户看的中文消息。
-func checkOutputBounds(p *parsedRequest, m llm.Model) string {
+// max_output_tokens → 400；两者都没给 → 上游注入 max_tokens = min(max_output_tokens, context_len − bodyLen)
+// （vLLM 不给时按上下文剩余长度生成，估算就没有上界；prompt + max_tokens > max_model_len 时 vLLM 直接 400，
+// 请求体字节数是 prompt token 数的安全上界，所以减去它）。算出来 < 1 时不注入：vLLM 自己按剩余上下文生成，
+// 那必然 < max_output_tokens，估算按 max_output_tokens（= min(max_output_tokens, context_len)，建模型时已保证 ≤ context_len）。
+// 注入时 p.maxTokens 改为注入值，估算按实际生效的上界。
+// n / best_of 须是整数且 ≤ 8，fanout = max(n, best_of, 1)。失败返回给用户看的中文消息。
+func checkOutputBounds(p *parsedRequest, m llm.Model, bodyLen int) string {
 	for _, f := range []string{"max_tokens", "max_completion_tokens"} {
 		if n, ok := p.maxFields[f]; ok && n > m.MaxOutputTokens {
 			return fmt.Sprintf("%s 不能超过该模型的最大输出 %d", f, m.MaxOutputTokens)
 		}
 	}
 	if len(p.maxFields) == 0 {
-		p.injectMaxTokens = m.MaxOutputTokens
+		if inject := min(m.MaxOutputTokens, m.ContextLen-bodyLen); inject >= 1 {
+			p.injectMaxTokens = inject
+			p.maxTokens = &inject
+		}
 	}
 	p.fanout = 1
 	for _, f := range []string{"n", "best_of"} {
@@ -179,7 +186,8 @@ func checkOutputBounds(p *parsedRequest, m llm.Model) string {
 
 // upstreamBody 返回转发给节点的请求体。网关只做两处改写，此外请求体一律原样转发：
 //   - 流式且没带 stream_options.include_usage=true 时注入 include_usage（规格 T11）；
-//   - 客户端没给 max_tokens / max_completion_tokens 时注入 max_tokens = 模型 max_output_tokens（见 checkOutputBounds）。
+//   - 客户端没给 max_tokens / max_completion_tokens 时注入 max_tokens = min(max_output_tokens, context_len − 请求体字节数)
+//     （< 1 时不注入，见 checkOutputBounds）。
 //
 // 改写是顶层 map[string]json.RawMessage 的字段级补丁后重新编码（字段顺序变化无害）；不需要改写时原样返回。
 func upstreamBody(body []byte, p parsedRequest) ([]byte, error) {
