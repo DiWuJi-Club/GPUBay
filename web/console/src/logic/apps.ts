@@ -239,6 +239,47 @@ export function redeployVersions(d: Deployment, catalog: AppCatalogItem[]): Rede
   return out
 }
 
+export interface DeploymentParam { name: string; label: string; value: string }
+
+/**
+ * 应用行的「参数」一览：按部署 spec 的变量顺序列出当前值（没存值的显示默认值）；secret 从不回显，只显示「已设置 / 未设置」。
+ */
+export function deploymentParams(d: Pick<Deployment, 'env' | 'secret_env' | 'spec'>): DeploymentParam[] {
+  return (d.spec.env ?? []).map((e) => {
+    const label = e.label || e.name
+    if (e.type === 'secret') return { name: e.name, label, value: d.secret_env[e.name] ? '已设置' : '未设置' }
+    const v = d.env[e.name] ?? ''
+    return { name: e.name, label, value: v !== '' ? v : e.default ? `${e.default}（默认）` : '—' }
+  })
+}
+
+export interface LlmCallInfo { localBase: string; publicBase: string | null; model: string; keyed: boolean; curl: string }
+
+/**
+ * vLLM 部署的调用方式：实例内 http://127.0.0.1:{port}/v1、外部地址（主端口 URL + /v1，私有端口需登录控制台才能访问）、
+ * 模型名（= --served-model-name = MODEL_ID）、是否要带接口密钥，以及一条 curl 示例。不是 vLLM 返回 null。
+ */
+export function llmCallInfo(d: Pick<Deployment, 'app_slug' | 'env' | 'secret_env' | 'spec' | 'port' | 'url'>): LlmCallInfo | null {
+  if (d.app_slug !== 'vllm') return null
+  const model = d.env.MODEL_ID || (d.spec.env ?? []).find((e) => e.name === 'MODEL_ID')?.default || ''
+  if (!model) return null
+  const localBase = `http://127.0.0.1:${d.port}/v1`
+  let publicBase: string | null = null
+  if (d.url) {
+    const path = d.spec.ports[0]?.path ?? ''
+    const root = path && d.url.endsWith(path) ? d.url.slice(0, -path.length) : d.url
+    publicBase = `${root.replace(/\/+$/, '')}/v1`
+  }
+  const keyed = !!d.secret_env.API_KEY
+  const curl = [
+    `curl ${localBase}/chat/completions \\`,
+    `  -H 'Content-Type: application/json' \\`,
+    ...(keyed ? [`  -H 'Authorization: Bearer <接口密钥>' \\`] : []),
+    `  -d '{"model": "${model}", "messages": [{"role": "user", "content": "你好"}]}'`,
+  ].join('\n')
+  return { localBase, publicBase, model, keyed, curl }
+}
+
 export interface TimelineItem { at: string; kind: string; text: string }
 
 /** 「动态」卡片：实例事件与各部署事件合并，新到旧；部署事件 kind = app，文本前缀应用名。 */
