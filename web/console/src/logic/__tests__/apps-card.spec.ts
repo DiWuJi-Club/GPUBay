@@ -1,7 +1,7 @@
 import type { AppCatalogItem, Deployment, DeploymentEvent, UserEvent } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  addPickReason, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, instanceAppHint, mergeTimeline, redeployEnv, redeployForm,
+  addPickReason, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, deploymentParams, instanceAppHint, llmCallInfo, mergeTimeline, redeployEnv, redeployForm,
   redeployVersions, summaryTag,
 } from '../apps'
 
@@ -153,5 +153,44 @@ describe('redeployVersions', () => {
   })
   it('应用目录没加载到：「最新」不可选', () => {
     expect(redeployVersions(d, [])[1]).toEqual({ id: 11, label: 'v1.1.0（最新，应用目录加载失败，暂不可选）', env: [], disabled: true })
+  })
+})
+
+describe('应用卡片：参数与调用方式', () => {
+  const spec = {
+    ports: [{ port: 8000, label: 'API', path: '/docs' }],
+    env: [
+      { name: 'MODEL_ID', label: '模型', type: 'enum' as const, default: 'Qwen/Qwen3-8B' },
+      { name: 'MAX_MODEL_LEN', label: '最大上下文', type: 'int' as const, default: '32768' },
+      { name: 'NOTE', label: '', type: 'string' as const },
+      { name: 'API_KEY', label: '接口密钥', type: 'secret' as const },
+    ],
+  }
+  it('参数一览：当前值、缺省显示默认值、secret 不回显', () => {
+    const d = dep({ spec, env: { MODEL_ID: 'Qwen/Qwen3-4B' }, secret_env: { API_KEY: true } })
+    expect(deploymentParams(d)).toEqual([
+      { name: 'MODEL_ID', label: '模型', value: 'Qwen/Qwen3-4B' },
+      { name: 'MAX_MODEL_LEN', label: '最大上下文', value: '32768（默认）' },
+      { name: 'NOTE', label: 'NOTE', value: '—' },
+      { name: 'API_KEY', label: '接口密钥', value: '已设置' },
+    ])
+    expect(deploymentParams(dep({ spec: { ports: [] } }))).toEqual([])
+  })
+  it('vLLM 调用方式：模型名、实例内 / 外部地址、密钥与 curl 示例', () => {
+    const d = dep({ spec, env: { MODEL_ID: 'Qwen/Qwen3-8B' }, url: 'https://p8000-ins-1.example.com/docs' })
+    const c = llmCallInfo(d)!
+    expect(c.model).toBe('Qwen/Qwen3-8B')
+    expect(c.localBase).toBe('http://127.0.0.1:8000/v1')
+    expect(c.publicBase).toBe('https://p8000-ins-1.example.com/v1')
+    expect(c.keyed).toBe(false)
+    expect(c.curl).toContain('"model": "Qwen/Qwen3-8B"')
+    expect(c.curl).not.toContain('Authorization')
+    const k = llmCallInfo(dep({ spec, env: {}, secret_env: { API_KEY: true } }))!
+    expect(k.model).toBe('Qwen/Qwen3-8B')
+    expect(k.publicBase).toBeNull()
+    expect(k.curl).toContain('Authorization: Bearer <接口密钥>')
+  })
+  it('非 vLLM 不给调用方式', () => {
+    expect(llmCallInfo(dep({ app_slug: 'comfyui', spec, env: { MODEL_ID: 'x/y' } }))).toBeNull()
   })
 })

@@ -9,13 +9,13 @@ describe('coverage.json', () => {
   it('与设计 §7.5 的数量一致且无重复', () => {
     // + 计划 3 的 C-DET-11～16、C-KEY-01～05、C-ING-01～06；+ 计划 6 的 C-BKG-01～11、C-DET-17～25、C-INS-05～07；
     // + 计划 7 的 C-MKT-09～12、C-APP-01～10、C-ING-07；+ 计划 8 的 C-REF-01～08、C-ACC-03、C-WAL-05；+ 计划 11 的 C-WF-01～12、C-MKT-13；
-    // + 计划 9 的 C-TOK-01～10、C-WAL-06、C-ACC-04；+ 计划 12 的 C-BOT-01～13
-    expect(table.console).toHaveLength(156)
+    // + 计划 9 的 C-TOK-01～10、C-WAL-06、C-ACC-04；+ 计划 12 的 C-BOT-01～13；+ C-APP-11（应用行参数与调用方式）
+    expect(table.console).toHaveLength(157)
     // 计划 5 的 50 个 + 计划 2 追加 A-MCH-07～09 + 计划 3 追加 A-INS-10～12、A-USR-07；+ 计划 6 的 A-GRP-01～05、A-BKG-01～06、A-INS-13；
     // + 计划 7 的 A-APP-01～08、A-INS-14、A-MCH-10；+ 计划 8 的 A-REF-01～07、A-FIN-05；+ 计划 11 的 A-WF-01～07、A-INS-15；
     // + 计划 9 的 A-LLM-01～09、A-INS-16、A-USR-08；+ 计划 12 的 A-BOT-01～05
     expect(table.admin).toHaveLength(111)
-    expect(new Set([...table.console, ...table.admin]).size).toBe(267)
+    expect(new Set([...table.console, ...table.admin]).size).toBe(268)
   })
 })
 

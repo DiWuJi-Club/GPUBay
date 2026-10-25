@@ -9,7 +9,8 @@ import { api } from '../api'
 import { useAskButler } from '../composables/useAskButler'
 import { usePolling } from '../composables/usePolling'
 import {
-  MAX_APPS, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, instanceAppHint, isWorkflowHost,
+  MAX_APPS, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, deploymentParams, instanceAppHint, isWorkflowHost,
+  llmCallInfo,
 } from '../logic/apps'
 import { notifyError } from '../logic/notify'
 import { butlerAvailable } from '../store/butler'
@@ -62,6 +63,15 @@ const atLimit = computed(() => items.value.length >= MAX_APPS)
 
 const rowStatus = (d: Deployment) => appRowStatus(d, props.instance.state)
 const phaseText = (d: Deployment) => labelOf(deploymentPhaseLabel, d.phase)
+
+async function copy(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.warning('复制失败，请手动选择复制')
+  }
+}
 
 function open(url: string) {
   // 私有端口：实例域名没有票据 Cookie 时会自己跳到控制台的 authorize，再带票据回来
@@ -173,6 +183,33 @@ function onCommand(d: Deployment, cmd: string) {
       <p v-if="hint" class="muted small" data-testid="detail-app-instance-hint">{{ hint }}</p>
       <p v-if="d.state === 'running' && !d.url" class="warn small" data-testid="detail-app-port-deleted">端口已删除，重新部署可恢复</p>
 
+      <div v-if="deploymentParams(d).length && d.state !== 'removing'" class="params" data-testid="detail-app-params">
+        <span v-for="p in deploymentParams(d)" :key="p.name" class="param" :data-testid="`detail-app-param-${p.name}`">
+          <span class="muted">{{ p.label }}：</span>{{ p.value }}
+        </span>
+      </div>
+
+      <div v-if="llmCallInfo(d) && d.state !== 'removing'" class="call" data-testid="detail-app-call">
+        <div class="call-row">
+          <span class="muted">调用模型名：</span><code data-testid="detail-app-call-model">{{ llmCallInfo(d)!.model }}</code>
+          <el-button link type="primary" size="small" data-testid="detail-app-call-model-copy" @click="copy(llmCallInfo(d)!.model)">复制</el-button>
+        </div>
+        <div class="call-row">
+          <span class="muted">实例内地址：</span><code data-testid="detail-app-call-local">{{ llmCallInfo(d)!.localBase }}</code>
+          <el-button link type="primary" size="small" @click="copy(llmCallInfo(d)!.localBase)">复制</el-button>
+        </div>
+        <div v-if="llmCallInfo(d)!.publicBase" class="call-row">
+          <span class="muted">外部地址：</span><code data-testid="detail-app-call-public">{{ llmCallInfo(d)!.publicBase }}</code>
+          <el-button link type="primary" size="small" @click="copy(llmCallInfo(d)!.publicBase!)">复制</el-button>
+          <span class="muted small">（端口为私有时只有登录控制台的浏览器能访问；程序从外部调用请在下方「端口」里设为公开，并设置接口密钥）</span>
+        </div>
+        <div class="call-row">
+          <span class="muted">接口密钥：</span>{{ llmCallInfo(d)!.keyed ? '已设置，请求头带 Authorization: Bearer <接口密钥>' : '未设置，不需要鉴权' }}
+        </div>
+        <pre class="curl" data-testid="detail-app-call-curl">{{ llmCallInfo(d)!.curl }}</pre>
+        <el-button link type="primary" size="small" data-testid="detail-app-call-curl-copy" @click="copy(llmCallInfo(d)!.curl)">复制示例</el-button>
+      </div>
+
       <div class="row">
         <template v-if="d.state === 'running' && d.url">
           <el-button size="small" type="primary" :disabled="instance.state !== 'running'" data-testid="detail-app-open" @click="open(d.url)">打开</el-button>
@@ -185,6 +222,10 @@ function onCommand(d: Deployment, cmd: string) {
             </template>
           </el-dropdown>
         </template>
+        <el-button
+          v-if="deploymentActions(d).redeploy && d.spec.env?.length" size="small" :disabled="!!blockReason" :title="blockReason ?? ''"
+          data-testid="detail-app-edit-params" @click="openRedeploy(d)"
+        >修改参数</el-button>
         <el-dropdown trigger="click" @command="(c: string) => onCommand(d, c)">
           <el-button size="small" :loading="acting === d.id" data-testid="detail-app-actions">操作 ▾</el-button>
           <template #dropdown>
@@ -243,4 +284,10 @@ function onCommand(d: Deployment, cmd: string) {
 .warn { color: var(--el-color-warning); }
 .danger { color: var(--el-color-danger); }
 .reason { color: #c0c4cc; font-size: 12px; }
+.params { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; margin: 4px 0; }
+.param { word-break: break-all; }
+.call { font-size: 12px; margin: 6px 0; padding: 8px 10px; background: var(--el-fill-color-lighter); border-radius: 6px; }
+.call-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin: 2px 0; }
+.call code { word-break: break-all; }
+.curl { margin: 6px 0 0; padding: 8px; background: var(--el-fill-color); border-radius: 4px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
 </style>
