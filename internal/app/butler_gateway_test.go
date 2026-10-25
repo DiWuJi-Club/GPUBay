@@ -248,7 +248,7 @@ func TestButlerUsesInProcessGateway(t *testing.T) {
 // 控制台处理器返回后 chi 回收这个 RouteContext，而网关还在收尾记账 → 数据竞争（-race 下报错）。
 func TestButlerHTTPTurnThroughInProcessGateway(t *testing.T) {
 	g := newButlerGW(t, false) // openai 默认 SPARK_LLM_STREAM=off：非流式经网关，usage 取自整段响应
-	close(g.node.release) // 节点一口气回完
+	close(g.node.release)      // 节点一口气回完
 	u := g.newUser(0)
 	for i, text := range []string{"你好", "再说一次"} {
 		path := "/butler/conversations/new/messages"
