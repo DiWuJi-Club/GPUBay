@@ -167,14 +167,14 @@ func TestPlaceOrderSummary(t *testing.T) {
 		{"app_env 缺必填", `{"product_id":1,"duration":"1d","image_id":2,"app_id":12}`, "app_env_required", "请填写 访问令牌"},
 		{"未知变量", `{"product_id":1,"duration":"1d","image_id":2,"app_id":11,"app_env":{"NOPE":"x"}}`, "app_env_invalid", ""},
 		{"没选应用却填变量", `{"product_id":1,"duration":"1d","image_id":2,"app_env":{"X":"y"}}`, "bad_request", ""},
-		{"镜像下架", `{"product_id":1,"duration":"1d","image_id":9}`, "bad_request", "镜像不存在或已下架"},
+		{"镜像下架", `{"product_id":1,"duration":"1d","image_id":9}`, "bad_request", "镜像不存在或已下架：image_id 请用 list_products 返回的 images[].id"},
 		{"应用不存在", `{"product_id":1,"duration":"1d","image_id":2,"app_id":99}`, "app_not_found", ""},
 		{"非整点", `{"product_id":1,"duration":"1d","image_id":2,"start_at":"2026-10-27T10:30:00+08:00"}`, "booking_not_hour", ""},
 		{"太早", `{"product_id":1,"duration":"1d","image_id":2,"start_at":"2026-10-25T11:00:00+08:00"}`, "booking_too_soon", ""},
 		{"格式错", `{"product_id":1,"duration":"1d","image_id":2,"start_at":"明天"}`, "invalid_args", ""},
 		{"台数不够", `{"product_id":1,"duration":"1d","image_id":2,"count":4}`, "no_capacity", "现在只有 3 台可立即租用"},
 		{"租期过长", `{"product_id":1,"duration":"1w","quantity":13,"image_id":2}`, "booking_too_long", ""},
-		{"没有这个套餐", `{"product_id":5,"duration":"1d","image_id":2}`, "bad_request", ""},
+		{"没有这个套餐", `{"product_id":5,"duration":"1d","image_id":2}`, "bad_request", "套餐 5 不存在：product_id 请用 list_products 返回的 products[].id"},
 		{"secret 是占位值", `{"product_id":1,"duration":"1d","image_id":2,"app_id":11,"app_env":{"API_KEY":"***"}}`, "invalid_args", ""},
 	} {
 		_, err := card(t, r, "place_order", ownerID, tc.args)

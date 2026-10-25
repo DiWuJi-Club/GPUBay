@@ -475,11 +475,15 @@ func (h writeHandlers) placeOrderCard(ctx context.Context, c Caller, args json.R
 		}
 		start = &t
 	}
-	unit, err := h.d.Catalog.Quote(ctx, h.d.Pool, a.ProductID, d)
+	// 先查套餐是否存在：小模型常把镜像 ID 或租期填进 product_id，「该规格暂不支持此租期」会把它引向改租期
+	product, err := h.d.Catalog.ProductName(ctx, a.ProductID)
+	if errors.Is(err, apperr.ErrNotFound) {
+		return Card{}, apperr.BadRequest(fmt.Sprintf("套餐 %d 不存在：product_id 请用 list_products 返回的 products[].id", a.ProductID))
+	}
 	if err != nil {
 		return Card{}, err
 	}
-	product, err := h.d.Catalog.ProductName(ctx, a.ProductID)
+	unit, err := h.d.Catalog.Quote(ctx, h.d.Pool, a.ProductID, d)
 	if err != nil {
 		return Card{}, err
 	}
@@ -489,7 +493,7 @@ func (h writeHandlers) placeOrderCard(ctx context.Context, c Caller, args json.R
 	}
 	idx := slices.IndexFunc(images, func(im catalog.Image) bool { return im.ID == a.ImageID })
 	if idx < 0 {
-		return Card{}, apperr.BadRequest("镜像不存在或已下架")
+		return Card{}, apperr.BadRequest("镜像不存在或已下架：image_id 请用 list_products 返回的 images[].id")
 	}
 	imageName := images[idx].Name
 
