@@ -27,6 +27,21 @@ const detailOf = (ctx: APIRequestContext, id: number) => getJSON<Detail>(ctx, `/
 
 const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestId('user-id') })
 const rowOf = (page: Page, id: number) => rows(page).filter({ has: page.getByTestId('user-id').getByText(String(id), { exact: true }) })
+/** 点「查询」并拿到页面本次收到的列表响应（按 q 精确匹配，避免读到上一次的结果） */
+async function searchAndWait(page: Page, q: string) {
+  const resp = page.waitForResponse((r) => {
+    const u = new URL(r.url())
+    return r.request().method() === 'GET' && u.pathname === '/admin/api/v1/users' && u.searchParams.get('q') === q
+  })
+  await page.getByTestId('users-search').click()
+  return ((await (await resp).json()) as { items: User[] }).items
+}
+/** 一次性读出表格各行的 ID 与手机号（同一时刻的快照，不会出现 ID 与手机号来自前后两次渲染） */
+const rowPairs = (page: Page) =>
+  rows(page).evaluateAll((trs) => trs.map((tr) => ({
+    id: tr.querySelector('[data-testid="user-id"]')?.textContent?.trim() ?? '',
+    phone: tr.querySelector('[data-testid="user-phone"]')?.textContent?.trim() ?? '',
+  })))
 
 test('A-USR-01 用户搜索：手机号、尾号、ID 都命中；字母被拦截；实名 / 账号筛选与重置；超过一页翻页；首次加载失败可重试', async ({ page }) => {
   // 21 个填充用户 + u + v：同一假时钟时刻创建，列表按 created_at DESC, id DESC，本用例造的 23 人就是最新的 23 人
@@ -80,24 +95,24 @@ test('A-USR-01 用户搜索：手机号、尾号、ID 都命中；字母被拦�
   await test.step('手机尾号 4 位：q=尾号，命中 u；每一行都是尾号或 ID 匹配', async () => {
     const tail = u.phone.slice(-4)
     await page.getByTestId('users-q').fill(tail)
-    await page.getByTestId('users-search').click()
+    const got = await searchAndWait(page, tail)
     await expect.poll(() => searches().at(-1)).toBe(`?q=${tail}&page=1&page_size=20`)
+    // 上一步的表格里本来就有 u：等表格换成本次响应的内容（逐行一致）再断言，不读旧渲染
+    await expect.poll(() => rowPairs(page)).toEqual(got.map((x) => ({ id: String(x.id), phone: x.phone })))
     await expect(rowOf(page, u.id)).toHaveCount(1)
     await expect(rowOf(page, u.id).getByTestId('user-phone')).toHaveText(u.phone)
-    const phones = await page.getByTestId('user-phone').allTextContents()
-    const ids = await page.getByTestId('user-id').allTextContents()
-    expect(phones.every((p, i) => p.endsWith(tail) || ids[i] === tail)).toBe(true)
+    expect((await rowPairs(page)).every((r) => r.phone.endsWith(tail) || r.id === tail)).toBe(true)
   })
 
   await test.step('用户 ID：q=ID，命中 u；每一行都是 ID 或尾号匹配', async () => {
     await page.getByTestId('users-q').fill(String(u.id))
-    await page.getByTestId('users-search').click()
+    const got = await searchAndWait(page, String(u.id))
     await expect.poll(() => searches().at(-1)).toBe(`?q=${u.id}&page=1&page_size=20`)
+    // 上一步（尾号）的结果里也有 u：同样先等表格换成本次响应的内容
+    await expect.poll(() => rowPairs(page)).toEqual(got.map((x) => ({ id: String(x.id), phone: x.phone })))
     await expect(rowOf(page, u.id)).toHaveCount(1)
     await expect(rowOf(page, u.id).getByTestId('user-phone')).toHaveText(u.phone)
-    const phones = await page.getByTestId('user-phone').allTextContents()
-    const ids = await page.getByTestId('user-id').allTextContents()
-    expect(ids.every((id, i) => id === String(u.id) || phones[i].endsWith(String(u.id)))).toBe(true)
+    expect((await rowPairs(page)).every((r) => r.id === String(u.id) || r.phone.endsWith(String(u.id)))).toBe(true)
   })
 
   await test.step('字母被拦截：输入框只留数字，发出的 q 也只有数字', async () => {
