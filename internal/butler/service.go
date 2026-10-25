@@ -81,10 +81,10 @@ func NewService(d Deps) *Service {
 		base:     base,
 		stopBase: stop,
 		Store:    NewStore(d.Pool, d.Clock),
-		d:       d,
-		log:     d.Log,
-		running: map[int64]struct{}{},
-		sem:     make(chan struct{}, MaxConcurrentRuns),
+		d:        d,
+		log:      d.Log,
+		running:  map[int64]struct{}{},
+		sem:      make(chan struct{}, MaxConcurrentRuns),
 
 		runTimeout: RunTimeout,
 	}
