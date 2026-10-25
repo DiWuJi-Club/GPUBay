@@ -6,7 +6,7 @@ import { createMemoryHistory, createRouter, type Router } from 'vue-router'
 const mocks = vi.hoisted(() => ({ get: vi.fn() }))
 vi.mock('../../api', () => ({ api: { get: mocks.get }, onUnauthorized: vi.fn() }))
 
-import { butler, resetButler } from '../../store/butler'
+import { butler, butlerAvail, resetButler } from '../../store/butler'
 import { session } from '../../store/session'
 import ConsoleLayout from '../ConsoleLayout.vue'
 
@@ -33,6 +33,7 @@ beforeEach(() => {
   mocks.get.mockReset()
   mocks.get.mockImplementation(() => new Promise(() => {})) // 聊天区的请求挂起即可
   resetButler()
+  butlerAvail.state = 'available'
   session.status = 'authed'
 })
 afterEach(() => {
@@ -41,6 +42,7 @@ afterEach(() => {
   document.body.innerHTML = ''
   vi.unstubAllGlobals()
   session.status = 'unknown'
+  butlerAvail.state = 'unknown'
   resetButler()
 })
 
@@ -77,5 +79,36 @@ describe('ConsoleLayout AI 管家入口', () => {
     expect($('tabbar-butler')!.textContent!.trim()).toBe('管家')
     expect($('tabbar-butler')!.getAttribute('href')).toBe('/butler')
     expect($('butler-launcher')).toBeNull()
+  })
+})
+
+describe('ConsoleLayout 平台未启用 AI 管家（SPARK_BUTLER=off，规格 §13）', () => {
+  it('桌面：没有 menu-butler、浮动按钮与抽屉，其它菜单照常', async () => {
+    butlerAvail.state = 'unavailable'
+    butler.open = true
+    await render('/market')
+    expect($('menu-butler')).toBeNull()
+    expect($('butler-launcher')).toBeNull()
+    expect($('butler-drawer')).toBeNull()
+    expect(document.querySelectorAll('[data-testid^="menu-"]')).toHaveLength(5)
+  })
+
+  it('手机：底部 tabbar 没有「管家」，剩 5 个标签', async () => {
+    mobile = true
+    butlerAvail.state = 'unavailable'
+    await render('/market')
+    expect($('tabbar-butler')).toBeNull()
+    expect(document.querySelectorAll('[data-testid^="tabbar-"]')).toHaveLength(5)
+  })
+
+  it('探测结果未出来（unknown）先不显示入口，探测为可用后再出现', async () => {
+    butlerAvail.state = 'unknown'
+    await render('/market')
+    expect($('menu-butler')).toBeNull()
+    expect($('butler-launcher')).toBeNull()
+    butlerAvail.state = 'available'
+    await flushPromises()
+    expect($('menu-butler')).not.toBeNull()
+    expect($('butler-launcher')).not.toBeNull()
   })
 })

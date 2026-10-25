@@ -12,6 +12,7 @@ import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
 import { compatibleImages } from '../logic/apps'
 import { notifyError } from '../logic/notify'
+import { butlerAvailable } from '../store/butler'
 import { refreshBalance, session } from '../store/session'
 
 const route = useRoute()
@@ -121,7 +122,7 @@ async function onPlaced(r: PlacedResult) {
 
 <template>
   <div class="market">
-    <p class="ask">
+    <p v-if="butlerAvailable" class="ask">
       不知道选哪个？<el-button link type="primary" data-testid="market-ask-butler" @click="askButler({ draft: '帮我选一台机器' })">问 AI 管家</el-button>
     </p>
     <el-alert v-if="loadError" type="error" :title="loadError" show-icon :closable="false" data-testid="market-error">

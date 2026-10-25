@@ -1,6 +1,7 @@
 import { brand } from '@spark/shared'
 import { createRouter, createWebHistory } from 'vue-router'
 import { postLoginTarget } from './logic/access'
+import { butlerAvail, probeButler } from './store/butler'
 import { bindRouter, probeSession, session } from './store/session'
 
 declare module 'vue-router' {
@@ -36,8 +37,13 @@ export const router = createRouter({
 })
 
 router.beforeEach(async (to) => {
+  const butlerProbe = probeButler() // 与会话探测并行；只有 /butler 需要等它（其它页的入口在探测结果出来前隐藏）
   await probeSession()
   if (to.meta.auth && session.status !== 'authed') return { path: '/login', query: { redirect: to.fullPath } }
+  if (to.path === '/butler') {
+    await butlerProbe
+    if (butlerAvail.state === 'unavailable') return '/' // 平台未启用管家（SPARK_BUTLER=off）：没有这个页面
+  }
   if (to.path === '/login' && session.status === 'authed') {
     const next = postLoginTarget(to.query.redirect)
     if (next.kind === 'assign') {

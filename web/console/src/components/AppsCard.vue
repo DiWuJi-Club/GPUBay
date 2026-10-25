@@ -12,6 +12,7 @@ import {
   MAX_APPS, appOpBlockReason, appRowStatus, canAddApp, deploymentActions, deploymentBusy, instanceAppHint, isWorkflowHost,
 } from '../logic/apps'
 import { notifyError } from '../logic/notify'
+import { butlerAvailable } from '../store/butler'
 import AppDeployDialog from './AppDeployDialog.vue'
 import AppDialog from './AppDialog.vue'
 import AppLogDrawer from './AppLogDrawer.vue'
@@ -139,7 +140,7 @@ function onCommand(d: Deployment, cmd: string) {
     <template #header>
       <div class="card-head">
         <span>应用</span>
-        <el-button link type="primary" size="small" data-testid="detail-ask-butler" @click="askButler({ instanceId: instance.id })">问问管家</el-button>
+        <el-button v-if="butlerAvailable" link type="primary" size="small" data-testid="detail-ask-butler" @click="askButler({ instanceId: instance.id })">问问管家</el-button>
       </div>
     </template>
     <p class="muted">一键部署常用 AI 应用到这台实例（在实例里以进程运行，不另收费）；部署完成后点「打开」访问，默认只有您登录控制台后能打开。</p>
@@ -167,7 +168,7 @@ function onCommand(d: Deployment, cmd: string) {
       <p v-if="d.state === 'failed'" class="danger small" data-testid="detail-app-error">
         {{ deploymentErrorText(d.error_code, d.message, '部署失败') }}
         <el-button link type="primary" size="small" data-testid="detail-app-error-log" @click="openLog(d)">查看日志</el-button>
-        <el-button link type="primary" size="small" data-testid="detail-app-ask-butler" @click="askButler({ instanceId: instance.id, draft: FAILED_QUESTION })">问问管家</el-button>
+        <el-button v-if="butlerAvailable" link type="primary" size="small" data-testid="detail-app-ask-butler" @click="askButler({ instanceId: instance.id, draft: FAILED_QUESTION })">问问管家</el-button>
       </p>
       <p v-if="hint" class="muted small" data-testid="detail-app-instance-hint">{{ hint }}</p>
       <p v-if="d.state === 'running' && !d.url" class="warn small" data-testid="detail-app-port-deleted">端口已删除，重新部署可恢复</p>

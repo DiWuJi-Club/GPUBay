@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { auditActions, fmtTime, type AuditEntry, type Paged } from '@spark/shared'
 import { onMounted, reactive } from 'vue'
+import { useRoute } from 'vue-router'
 import { api } from '../api'
 import DateRange from '../components/DateRange.vue'
 import IdLink from '../components/IdLink.vue'
@@ -8,7 +9,10 @@ import { usePaged } from '../composables/usePaged'
 import { OPS_ROLES } from '../menu'
 import { hasRole } from '../store/session'
 
-const filter = reactive({ actor_id: '', action: '', target_type: '', target_id: '', range: { from: '', to: '' } })
+// 地址栏 ?actor_id= / action= / target_type= / target_id= 预填筛选（如 AI 管家工具调用表的「审计」链接）
+const route = useRoute()
+const q = (k: string) => (typeof route.query[k] === 'string' ? (route.query[k] as string) : '')
+const filter = reactive({ actor_id: q('actor_id'), action: q('action'), target_type: q('target_type'), target_id: q('target_id'), range: { from: '', to: '' } })
 const list = usePaged<AuditEntry>((page, size) =>
   api.get<Paged<AuditEntry>>('/audit', {
     actor_id: filter.actor_id, action: filter.action, target_type: filter.target_type, target_id: filter.target_id,

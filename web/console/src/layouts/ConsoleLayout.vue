@@ -5,12 +5,13 @@ import { useRoute } from 'vue-router'
 import ButlerDrawer from '../components/ButlerDrawer.vue'
 import ButlerLauncher from '../components/ButlerLauncher.vue'
 import { maskPhone } from '../logic/login'
+import { butlerAvailable } from '../store/butler'
 import { session } from '../store/session'
 
 const mobile = useMobile()
 const route = useRoute()
 /** short：手机底部标签的短名（缺省同 label） */
-const tabs: readonly { key: string; path: string; label: string; short?: string }[] = [
+const allTabs: readonly { key: string; path: string; label: string; short?: string }[] = [
   // 手机底栏 6 个标签，320px 宽每格约 53px：四个字以上的用短名
   { key: 'market', path: '/market', label: '算力市场', short: '市场' },
   { key: 'workflows', path: '/workflows', label: '工作流市场', short: '工作流' },
@@ -19,9 +20,11 @@ const tabs: readonly { key: string; path: string; label: string; short?: string 
   { key: 'wallet', path: '/wallet', label: '钱包' },
   { key: 'account', path: '/account', label: '我的' },
 ]
-/** AI 管家浮动按钮与抽屉只在桌面端、且不在 /butler 全页时出现（D13） */
-const showButler = computed(() => !mobile.value && route.path !== '/butler')
-const active = computed(() => tabs.find((t) => route.path === t.path || route.path.startsWith(t.path + '/'))?.key ?? '')
+/** 平台未启用管家（或探测结果未出来）时不显示「AI 管家」标签 */
+const tabs = computed(() => (butlerAvailable.value ? allTabs : allTabs.filter((t) => t.key !== 'butler')))
+/** AI 管家浮动按钮与抽屉只在平台启用了管家、桌面端、且不在 /butler 全页时出现（D13） */
+const showButler = computed(() => butlerAvailable.value && !mobile.value && route.path !== '/butler')
+const active = computed(() => tabs.value.find((t) => route.path === t.path || route.path.startsWith(t.path + '/'))?.key ?? '')
 const logo = import.meta.env.BASE_URL + brand.logoUrl
 </script>
 

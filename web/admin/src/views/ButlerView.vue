@@ -436,7 +436,9 @@ const callType = (s: string) => labelOf(toolCallStatusType, s) as 'success'
                 <div v-if="c.result_ref" class="mono">产生：{{ c.result_ref }}</div>
                 <details v-if="c.result_summary"><summary>结果摘要</summary><pre class="pre">{{ c.result_summary }}</pre></details>
                 <span v-if="!c.error_code && !c.result_ref && !c.result_summary" class="muted">—</span>
-                <div v-if="hasAudit(c.kind, c.status)" class="muted">审计：butler_tool_call / {{ c.id }}</div>
+                <div v-if="hasAudit(c.kind, c.status)" class="muted">
+                  审计：<router-link :to="{ path: '/audit', query: { target_type: 'butler_tool_call', target_id: c.id } }" data-testid="admin-butler-call-audit">butler_tool_call / {{ c.id }}</router-link>
+                </div>
               </td>
             </tr>
             <tr v-if="!detail.data.tool_calls.length"><td colspan="6" class="muted empty">没有工具调用</td></tr>

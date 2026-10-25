@@ -165,4 +165,14 @@ describe('后台 AI 管家页', () => {
     expect(one('admin-butler-call-args')!.textContent).toContain('"API_KEY": "***"')
     expect(call.textContent).not.toContain('审计：') // 未执行的调用没有审计
   })
+
+  it('已执行的写调用：「审计」链到审计日志并按对象筛选', async () => {
+    const executed = { ...detail, tool_calls: [{ ...detail.tool_calls[0], status: 'executed' as const, executed_at: '2026-10-25T00:00:04Z', result_ref: 'dep-1' }] }
+    await render('ops', '/butler?tab=conversations', (path) => (path.startsWith('/butler/conversations/') ? Promise.resolve(executed) : route(path)))
+    one('admin-butler-conv-row')!.click()
+    await flushPromises()
+    const link = w!.findAllComponents(RouterLinkStub).find((c) => c.attributes('data-testid') === 'admin-butler-call-audit')!
+    expect(link.props('to')).toEqual({ path: '/audit', query: { target_type: 'butler_tool_call', target_id: 'tc-2' } })
+    expect(link.text()).toBe('butler_tool_call / tc-2')
+  })
 })
