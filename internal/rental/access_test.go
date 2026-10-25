@@ -148,7 +148,7 @@ func TestAccessInfoAndTOFU(t *testing.T) {
 	e.ack(true)
 	info, err := e.svc.Access(e.ctx, inst.ID)
 	if err != nil || info.Instance.State != rental.StateRunning || len(info.Password) != 16 || info.MachineLanIP != "10.0.0.10" ||
-		!info.AgentOnline || info.MachineSerial != "SN000" || info.RetainUntil != nil || info.Instance.SSHHostPubkey == "" {
+		!info.AgentOnline || info.MachineSerial != "SN000" || info.RetainUntil != nil || info.Instance.SSHHostPubkey == "" || info.SSHPort != testSSHBasePort {
 		t.Fatalf("access = %+v %v", info, err)
 	}
 	if _, err := e.svc.Access(e.ctx, "ins-nope0000"); !errors.Is(err, apperr.ErrNotFound) {

@@ -240,3 +240,12 @@ func TestHasAnyOpenCommandAndPullBroadcast(t *testing.T) {
 		t.Fatalf("online ids = %v", ids)
 	}
 }
+
+// 零值载荷（计划 10 之前入队、尚未下发的 Create 指令）序列化与以前逐字节一致：ssh_port / share_slots 为 0 时省略。
+// 平台现在入队时总是写 ssh_port 与 share_slots = 1，这里只保证存量待下发指令的形态不变。
+func TestWholeMachineCreatePayloadJSONUnchanged(t *testing.T) {
+	b, err := json.Marshal(fleet.CreateInstancePayload{ImageRef: "img:1"})
+	if err != nil || string(b) != `{"image_ref":"img:1"}` {
+		t.Fatalf("payload = %s, %v", b, err)
+	}
+}

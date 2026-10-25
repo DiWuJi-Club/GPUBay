@@ -141,6 +141,5 @@ func (s *Service) startProvision(ctx context.Context, tx pgx.Tx, inst Instance, 
 	if err := recordEvent(ctx, tx, inst.ID, StateReserved, StateCreating, "scheduled start "+tz.Format(*inst.ScheduledStartAt), now); err != nil {
 		return err
 	}
-	_, err = s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: ref})
-	return err
+	return s.enqueueCreate(ctx, tx, inst, ref)
 }

@@ -223,6 +223,7 @@ type IngressRoute struct {
 	Suspended  bool
 	LanIP      string
 	HostPubkey string
+	SSHPort    int // 容器 sshd 在机器上的端口（Instance.SSHPort(Deps.SSHBasePort)）
 	// ScheduledStartAt 仅预订（reserved）实例有值，入口状态页用来显示开始时间。
 	ScheduledStartAt *time.Time
 }
@@ -237,6 +238,7 @@ func (s *Service) ListIngressRoutes(ctx context.Context) ([]IngressRoute, error)
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (IngressRoute, error) {
 		var x IngressRoute
 		err := r.Scan(&x.InstanceID, &x.UserID, &x.Port, &x.Visibility, &x.State, &x.Suspended, &x.LanIP, &x.HostPubkey, &x.ScheduledStartAt)
+		x.SSHPort = Instance{ID: x.InstanceID}.SSHPort(s.d.SSHBasePort) // 共享机落地后从实例槽位算
 		return x, err
 	})
 }

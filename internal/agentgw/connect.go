@@ -371,7 +371,7 @@ func (s *Server) handleHeartbeat(ctx context.Context, c *conn, h *agentpb.Heartb
 	}
 	m := h.GetMetrics()
 	if m != nil {
-		if doc, err := metricsJSON(m); err == nil {
+		if doc, err := metricsJSON(m, h.GetInstances()); err == nil {
 			if err := s.d.Fleet.RecordMetrics(ctx, c.machineID, "", doc); err != nil {
 				s.d.Log.Error("record metrics", "machine", c.machineID, "err", err)
 			}

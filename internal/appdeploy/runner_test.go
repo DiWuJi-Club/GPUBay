@@ -79,7 +79,8 @@ func newRunnerEnv(t *testing.T, machines int, tweak ...func(*appdeploy.RunnerCon
 		t.Fatal(err)
 	}
 	t.Cleanup(srv.Close)
-	up := upstream.New(upstream.Config{Signer: signer, Port: srv.Port(), DialTimeout: 500 * time.Millisecond}, e.rental)
+	e.setSSHBasePort(srv.Port()) // 按实例端口拨号；池默认端口是死的
+	up := upstream.New(upstream.Config{Signer: signer, Port: deadPort(t), DialTimeout: 500 * time.Millisecond}, e.rental)
 	t.Cleanup(up.Close)
 	re := &runnerEnv{env: e, srv: srv, up: up, logs: &syncBuf{}}
 	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

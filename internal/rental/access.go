@@ -127,6 +127,7 @@ type AccessInfo struct {
 	Instance      Instance
 	Password      string // 明文（只在认证时比较）
 	MachineLanIP  string
+	SSHPort       int // 容器 sshd 在机器上的端口（Instance.SSHPort(Deps.SSHBasePort)）
 	MachineSerial string
 	AgentOnline   bool
 	RetainUntil   *time.Time // stopped 时的数据保留截止
@@ -148,6 +149,7 @@ func (s *Service) Access(ctx context.Context, instanceID string) (AccessInfo, er
 		return AccessInfo{}, err
 	}
 	info.Instance = inst
+	info.SSHPort = inst.SSHPort(s.d.SSHBasePort)
 	i := &info.Instance
 	if err := s.d.Pool.QueryRow(ctx, `SELECT ssh_password_enc FROM instances WHERE id = $1`, instanceID).Scan(&enc); err != nil {
 		if db.IsNoRows(err) {

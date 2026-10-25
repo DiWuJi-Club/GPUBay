@@ -3,6 +3,8 @@ package fake
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"sort"
@@ -14,6 +16,8 @@ import (
 type Runtime struct {
 	mu         sync.Mutex
 	containers map[string]*entry
+	specs      map[string]runtime.Spec // 每个容器最近一次 Create 的完整 Spec（供断言配额）
+	created    int                     // Create 次数，参与生成 FullID：重建的容器 ID 不同
 	pulled     []string
 	images     []string // Images 的返回值（SetImages 设置；nil 表示不上报）
 	failNext   map[string]error
@@ -27,7 +31,7 @@ type entry struct {
 }
 
 func New() *Runtime {
-	return &Runtime{containers: map[string]*entry{}, failNext: map[string]error{}, blocked: map[string]bool{}, Veth: "veth0abc"}
+	return &Runtime{containers: map[string]*entry{}, specs: map[string]runtime.Spec{}, failNext: map[string]error{}, blocked: map[string]bool{}, Veth: "veth0abc"}
 }
 
 func (r *Runtime) FailNext(op string, err error) {
@@ -108,7 +112,10 @@ func (r *Runtime) Create(ctx context.Context, s runtime.Spec) error {
 	if _, ok := r.containers[s.InstanceID]; ok {
 		return fmt.Errorf("Conflict. The container name %q is already in use", s.InstanceID)
 	}
-	r.containers[s.InstanceID] = &entry{c: runtime.Container{Exists: true, Image: s.ImageRef, Label: s.InstanceID, DataMounted: s.DataDir != "", DataSource: s.DataDir, Pid: 4242, Networks: []string{"spark0"}, PublishIPs: publishIPs(s.LanIP)}}
+	r.created++
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s#%d", s.InstanceID, r.created))
+	r.specs[s.InstanceID] = s
+	r.containers[s.InstanceID] = &entry{c: runtime.Container{Exists: true, FullID: hex.EncodeToString(sum[:]), Image: s.ImageRef, Label: s.InstanceID, DataMounted: s.DataDir != "", DataSource: s.DataDir, Pid: 4242, Networks: []string{"spark0"}, PublishIPs: publishIPs(s.LanIP)}}
 	return nil
 }
 
@@ -315,6 +322,14 @@ func (r *Runtime) Images(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return slices.Clone(r.images), nil
+}
+
+// Spec 返回该容器最近一次 Create 收到的 Spec（容器删除后仍保留，便于断言）。
+func (r *Runtime) Spec(id string) (runtime.Spec, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.specs[id]
+	return s, ok
 }
 
 func (r *Runtime) Pulled() []string {

@@ -191,10 +191,11 @@ type target struct {
 	LanIP      string
 	HostPubkey string
 	MachineID  int64
+	SSHPort    int // 容器 sshd 端口（rental.Service.InstanceSSHPort）；0 → 上游池默认端口
 }
 
 func (t target) upstream(id string) upstream.Target {
-	return upstream.Target{InstanceID: id, LanIP: t.LanIP, HostPubkey: t.HostPubkey}
+	return upstream.Target{InstanceID: id, LanIP: t.LanIP, HostPubkey: t.HostPubkey, Port: t.SSHPort}
 }
 
 func readTarget(ctx context.Context, q db.Querier, instanceID string) (target, error) {
@@ -295,6 +296,7 @@ func (r *Runner) step(ctx context.Context, id string, now time.Time) (bool, erro
 	if err != nil {
 		return false, err
 	}
+	tg.SSHPort = r.s.instanceSSHPort(d.InstanceID)
 	ut := tg.upstream(d.InstanceID)
 	switch act {
 	case actWait:

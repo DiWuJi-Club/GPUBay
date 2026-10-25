@@ -289,7 +289,7 @@ func TestEnsureLimitsContinuesAfterInstanceError(t *testing.T) {
 	e := newEnv(t)
 	a, b := create("ins-aaaaaaaa"), create("ins-bbbbbbbb")
 	a.DataSizeGiB, b.DataSizeGiB = 100, 100
-	b.BandwidthMbps = 70
+	b.BandwidthMbps, b.SSHPort = 70, 2223 // 同机两个实例的端口不能相同
 	if res := e.run(a, b); !res[0].OK || !res[1].OK {
 		t.Fatalf("create = %+v", res)
 	}

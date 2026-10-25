@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/catalog"
-	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 	"spark-cloud/internal/platform/randx"
@@ -214,7 +213,7 @@ func (s *Service) placeBatch(ctx context.Context, req BatchRequest, withBatch bo
 					return err
 				}
 				if spec.Immediate {
-					if _, err := s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdCreateInstance, fleet.CreateInstancePayload{ImageRef: img.Ref}); err != nil {
+					if err := s.enqueueCreate(ctx, tx, inst, img.Ref); err != nil {
 						return err
 					}
 				}

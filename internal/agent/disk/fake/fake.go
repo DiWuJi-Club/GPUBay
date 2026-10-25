@@ -37,6 +37,16 @@ func (d *Disk) fail(op string) error {
 	return nil
 }
 
+// SizeGiB 返回已创建数据盘镜像的大小（未创建为 0），供断言等分。
+func (d *Disk) SizeGiB(id string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if img, ok := d.images[id]; ok {
+		return img.sizeGiB
+	}
+	return 0
+}
+
 func (d *Disk) MountDir(id string) string { return "/fake/mnt/" + id }
 
 func (d *Disk) Create(_ context.Context, id string, sizeGiB int) error {

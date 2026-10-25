@@ -74,6 +74,9 @@ type env struct {
 	machines  []int64
 }
 
+// testSSHBasePort 是测试环境的上游 SSH 基准端口；故意不用默认的 2222，验证 Create 指令按配置取端口。
+const testSSHBasePort = 2300
+
 func newEnv(t *testing.T, machines int) *env {
 	t.Helper()
 	pool := dbtest.New(t)
@@ -89,7 +92,7 @@ func newEnv(t *testing.T, machines int) *env {
 	keys := &fakeKeys{}
 	svc := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Users: ids, Wallet: w,
-		Catalog: catalog.NewService(pool), Fleet: f, Notifier: n, Keys: keys,
+		Catalog: catalog.NewService(pool), Fleet: f, Notifier: n, Keys: keys, SSHBasePort: testSSHBasePort,
 	})
 	e := &env{t: t, ctx: context.Background(), pool: pool, clock: clk, svc: svc, wallet: w, fleet: f, notifier: n, keys: keys,
 		productID: dbtest.ProductID(t, pool), imageID: dbtest.ImageID(t, pool)}

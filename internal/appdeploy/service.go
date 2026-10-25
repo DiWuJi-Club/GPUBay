@@ -55,6 +55,14 @@ type Service struct {
 	d Deps
 }
 
+// instanceSSHPort 是实例容器 sshd 的端口，与接入层（sshgw / ingress）同源：rental 按实例算；无 Rental（单测）→ 0 = 上游池默认端口。
+func (s *Service) instanceSSHPort(instanceID string) int {
+	if s.d.Rental == nil {
+		return 0
+	}
+	return s.d.Rental.InstanceSSHPort(instanceID)
+}
+
 func NewService(d Deps) *Service {
 	if d.AppRoot == "" {
 		d.AppRoot = DefaultAppRoot
@@ -610,7 +618,7 @@ func (s *Service) Log(ctx context.Context, userID int64, instanceID, depID strin
 	}
 	var state, slug string
 	var suspended bool
-	t := upstream.Target{InstanceID: d.InstanceID}
+	t := upstream.Target{InstanceID: d.InstanceID, Port: s.instanceSSHPort(d.InstanceID)}
 	if err := s.d.Pool.QueryRow(ctx, `SELECT i.state, i.suspended_at IS NOT NULL, m.lan_ip, i.ssh_host_pubkey, a.slug
 		FROM instances i JOIN machines m ON m.id = i.machine_id JOIN apps a ON a.id = $2 WHERE i.id = $1`, d.InstanceID, d.AppID).
 		Scan(&state, &suspended, &t.LanIP, &t.HostPubkey, &slug); err != nil {
