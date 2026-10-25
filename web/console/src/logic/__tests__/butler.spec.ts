@@ -68,6 +68,22 @@ describe('applyEvent', () => {
     })
   })
 
+  it('只有空白的助手文本（如 Qwen3 工具调用前的「\\n\\n」）在步骤 / 卡片 / 结束时去掉，不留空气泡', () => {
+    let s = run(appendUser(emptyState(), '租一台'), [
+      ev('start', { conversation_id: 'cv-1', message_id: 1 }),
+      ev('delta', { text: '\n\n' }),
+      ev('tool', { id: 'tc-1', name: 'list_products', label: '查询套餐', status: 'ok' }),
+      ev('delta', { text: '\n\n' }),
+      ev('confirm', { tool_call: card }),
+    ])
+    expect(s.items.map((it) => it.kind)).toEqual(['user', 'tool', 'confirm'])
+    s = run(s, [ev('delta', { text: ' \n' }), ev('done', { reason: 'end_turn' })])
+    expect(s.items.map((it) => it.kind)).toEqual(['user', 'tool', 'confirm'])
+    // 有实际内容的文本保留原样（含开头的换行）
+    s = run(s, [ev('delta', { text: '\n\n好的' }), ev('done', { reason: 'end_turn' })])
+    expect(s.items[s.items.length - 1]).toEqual({ kind: 'assistant', text: '\n\n好的', streaming: false })
+  })
+
   it('流式中最后一个助手气泡 streaming = true', () => {
     const s = run(emptyState(), [ev('start', { conversation_id: 'cv-1', message_id: 1 }), ev('delta', { text: 'a' })])
     expect(s.items).toEqual([{ kind: 'assistant', text: 'a', streaming: true }])
@@ -263,6 +279,21 @@ describe('fromDetail', () => {
       ],
     })
     expect(s.items).toEqual([{ kind: 'assistant', text: '第一段\n\n第二段\n\n第三段', streaming: false }])
+  })
+
+  it('只有空白的助手文本块不生成气泡', () => {
+    const s = fromDetail({
+      ...detail,
+      pending_tool_call: null,
+      messages: [
+        { id: 1, seq: 1, role: 'assistant', content: [{ type: 'text', text: '\n\n' }, { type: 'tool', id: 'tc-1', name: 'list_products', label: '查询套餐', status: 'ok' }] },
+        { id: 2, seq: 2, role: 'assistant', content: [{ type: 'text', text: '\n\n有 1 台' }] },
+      ],
+    })
+    expect(s.items).toEqual([
+      { kind: 'tool', id: 'tc-1', name: 'list_products', label: '查询套餐', status: 'ok' },
+      { kind: 'assistant', text: '\n\n有 1 台', streaming: false },
+    ])
   })
 
   it('error 状态的步骤保留 error', () => {

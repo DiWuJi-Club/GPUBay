@@ -44,9 +44,15 @@ export function isDanger(tool: string): boolean {
   return DANGER_TOOLS.has(tool)
 }
 
-/** 结束所有流式中的助手气泡（新的步骤 / 卡片 / 错误出现时，之前的文本就不会再续写）。 */
+/**
+ * 结束所有流式中的助手气泡（新的步骤 / 卡片 / 错误出现时，之前的文本就不会再续写）。
+ * 只有空白的气泡直接去掉：Qwen3 等模型在工具调用前会先输出「\n\n」，留着就是一个空气泡。
+ */
 function endStreaming(items: ChatItem[]): ChatItem[] {
-  return items.map((it) => (it.kind === 'assistant' && it.streaming ? { ...it, streaming: false } : it))
+  return items.flatMap((it) => {
+    if (it.kind !== 'assistant' || !it.streaming) return [it]
+    return it.text.trim() ? [{ ...it, streaming: false }] : []
+  })
 }
 
 /** 步骤的中文名：没有工具名时显示「工具」。 */
@@ -204,7 +210,7 @@ export function fromDetail(d: ConversationDetail, prev?: Pick<ChatState, 'dayUse
     for (const b of m.content ?? []) {
       if (b.type === 'text') {
         if (m.role === 'user') userText += b.text
-        else if (m.role === 'assistant' && b.text) {
+        else if (m.role === 'assistant' && b.text?.trim()) {
           const last = items[items.length - 1]
           if (last?.kind === 'assistant') items[items.length - 1] = { ...last, text: `${last.text}\n\n${b.text}` }
           else items.push({ kind: 'assistant', text: b.text, streaming: false })
