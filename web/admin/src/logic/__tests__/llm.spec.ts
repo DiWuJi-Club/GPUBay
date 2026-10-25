@@ -1,9 +1,9 @@
-import { fmtTime, type AdminAppVersion, type AdminImage, type AppEnvSpec, type LLMModelAdmin, type LLMNodeState } from '@spark/shared'
+import { fmtTime, llmFeatureLabel, type AdminAppVersion, type AdminImage, type AppEnvSpec, type LLMModelAdmin, type LLMNodeState } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  compatibleImages, emptyModelForm, extraEnvKeys, fenToYuanInput, fmtPrice, imageNote, latestPublished, modelToForm, nodeEnvSpec, nodeParamsChanged, staleNodesWarning,
+  compatibleImages, emptyModelForm, extraEnvKeys, fenToYuanInput, fmtPrice, imageNote, latestPublished, LLM_FEATURES, modelToForm, nodeEnvSpec, nodeParamsChanged, staleNodesWarning,
   tabFromQuery, validateEnvValue, validateModelForm, visibleTabs, wantedReplicas, yuanInputToFen, type ModelForm,
-  canDrainNode, canRebuildNode, canRemoveNode, isPoolGroup, nodeDeployText, poolCandidateQuery, poolLeaseText, validateNodeRemoveReason,
+  canDrainNode, canRebuildNode, dashLlmNodesBad, canRemoveNode, isPoolGroup, nodeDeployText, poolCandidateQuery, poolLeaseText, validateNodeRemoveReason,
 } from '../llm'
 
 const model = (over: Partial<LLMModelAdmin> = {}): LLMModelAdmin => ({
@@ -54,10 +54,32 @@ describe('元 ↔ 分换算（价格：分 / 百万 token）', () => {
   })
 })
 
+describe('dashLlmNodesBad', () => {
+  it('有 nodes_unhealthy 时只看它；没有时退回「有节点但零就绪」', () => {
+    expect(dashLlmNodesBad({ nodes_ready: 1, nodes_total: 3, nodes_unhealthy: 0 })).toBe(false)
+    expect(dashLlmNodesBad({ nodes_ready: 2, nodes_total: 3, nodes_unhealthy: 1 })).toBe(true)
+    expect(dashLlmNodesBad({ nodes_ready: 1, nodes_total: 3 })).toBe(false)
+    expect(dashLlmNodesBad({ nodes_ready: 0, nodes_total: 3 })).toBe(true)
+    expect(dashLlmNodesBad({ nodes_ready: 0, nodes_total: 0 })).toBe(false)
+  })
+})
+
+describe('模型特性', () => {
+  it('每个可选特性在 shared 的 llmFeatureLabel 里都有中文名（与控制台一致：reasoning = 深度思考）', () => {
+    for (const f of LLM_FEATURES) expect(llmFeatureLabel[f], f).toBeTruthy()
+    expect(llmFeatureLabel.reasoning).toBe('深度思考')
+  })
+})
+
 describe('nodeEnvSpec', () => {
   it('去掉平台保留变量（MODEL_ID / MODEL_SOURCE / SERVED_MODEL_NAME / MAX_MODEL_LEN / API_KEY / TASK）', () => {
     expect(nodeEnvSpec(vllmEnv).map((e) => e.name)).toEqual(['GPU_MEMORY_UTILIZATION', 'MAX_NUM_SEQS', 'QUANTIZATION'])
     expect(nodeEnvSpec(undefined)).toEqual([])
+  })
+
+  it('去掉 secret 类型变量（不在模型上配置密钥）', () => {
+    const withSecret = [...vllmEnv, env({ name: 'HF_TOKEN', type: 'secret' }), env({ name: 'EXTRA_ARGS', type: 'string' })]
+    expect(nodeEnvSpec(withSecret).map((e) => e.name)).toEqual(['GPU_MEMORY_UTILIZATION', 'MAX_NUM_SEQS', 'QUANTIZATION', 'EXTRA_ARGS'])
   })
 })
 

@@ -358,7 +358,7 @@ export interface Dashboard {
   apps_running: number
   apps_failed_24h: number
   /** 计划 9：Token 商城卡片（= /llm/summary 的子集，金额为分）；后端未提供时缺省 */
-  llm?: { nodes_ready: number; nodes_total: number; today_requests: number; today_settled_amount: number }
+  llm?: { nodes_ready: number; nodes_total: number; today_requests: number; today_settled_amount: number; nodes_unhealthy?: number }
 }
 
 // ---- 邀请返利（计划 8，金额单位：分）。手机号为原文，页面显示前须脱敏；后端从不返回实名指纹 / 证件号 ----

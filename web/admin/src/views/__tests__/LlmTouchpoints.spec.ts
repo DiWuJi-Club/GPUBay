@@ -112,6 +112,13 @@ describe('仪表盘 Token 商城卡片', () => {
     expect(byId('dash-llm-nodes-total').text()).toBe('2')
     expect(byId('dash-llm-requests').text()).toBe('12,345')
     expect(byId('dash-llm-income').text()).toBe('¥9.90')
+    // 部分就绪（如部署中）不标红
+    expect(byId('dash-llm-nodes-ready').classes()).not.toContain('bad')
+  })
+  it('有节点却一个都没就绪时标红', async () => {
+    dashLLM = { nodes_ready: 0, nodes_total: 2, today_requests: 0, today_settled_amount: 0 }
+    await mountAt('/')
+    expect(byId('dash-llm-nodes-ready').classes()).toContain('bad')
   })
   it('没有 llm 时不显示', async () => {
     dashLLM = undefined

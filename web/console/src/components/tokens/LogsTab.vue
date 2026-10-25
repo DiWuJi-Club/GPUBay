@@ -4,7 +4,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
 import { copyText } from '../../logic/clipboard'
 import { notifyError } from '../../logic/notify'
-import { addDays, beijingToday, defaultUsageRange, keyHintMask, latencyLabel, tokenCount, usageStatusTag, USAGE_MAX_DAYS, validateUsageRange } from '../../logic/tokens'
+import { addDays, beijingToday, defaultUsageRange, keyHintMask, latencyLabel, logModelOptions, tokenCount, usageStatusTag, USAGE_MAX_DAYS, validateUsageRange } from '../../logic/tokens'
 
 // 请求日志 Tab（规格 §9.2 第 4 项）：筛选（模型、Key、日期，最长 90 天，默认最近 7 天）+ GET /llm/usage 分页。
 const props = defineProps<{ models: LLMModelPublic[] }>()
@@ -39,7 +39,15 @@ const loadError = ref('')
 let gen = 0
 async function load() {
   refreshToday()
-  if (rangeError.value) return
+  if (rangeError.value) {
+    // 范围不合法：清空旧结果（不再显示上一个范围的数据），并作废进行中的请求
+    gen++
+    items.value = []
+    total.value = 0
+    loading.value = false
+    loadError.value = ''
+    return
+  }
   const my = ++gen
   loading.value = true
   loadError.value = ''
@@ -76,6 +84,9 @@ function resetRange() {
   Object.assign(filter, defaultUsageRange(new Date()))
 }
 
+// 模型下拉：在线模型 ∪ 已加载日志里的模型（含已下线的）∪ 当前选中的
+const modelOptions = computed(() => logModelOptions(props.models.map((m) => m.slug), items.value.map((u) => u.model), filter.model))
+
 /** Key 显示：名称 + 提示（有提示时），区分同名 Key */
 const keyLabel = (name: string, hint?: string) => (hint ? `${name}（${keyHintMask(hint)}）` : name)
 const rows = computed(() =>
@@ -97,7 +108,7 @@ const rows = computed(() =>
   <div class="logs">
     <div class="filters">
       <el-select v-model="filter.model" clearable placeholder="全部模型" class="sel" data-testid="tokens-logs-model">
-        <el-option v-for="m in props.models" :key="m.slug" :label="m.slug" :value="m.slug" :data-testid="`tokens-logs-model-option-${m.slug}`" />
+        <el-option v-for="m in modelOptions" :key="m" :label="m" :value="m" :data-testid="`tokens-logs-model-option-${m}`" />
       </el-select>
       <el-select v-model="filter.keyId" clearable placeholder="全部 Key" class="sel" data-testid="tokens-logs-key">
         <el-option v-for="k in keys" :key="k.id" :label="keyLabel(k.name, k.key_hint)" :value="k.id" :data-testid="`tokens-logs-key-option-${k.id}`" />

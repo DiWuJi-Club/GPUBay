@@ -92,7 +92,7 @@ const llmErrors = Object.keys(llmErrorHelp)
     <el-card>
       <h2 data-testid="help-tokens">Token 商城</h2>
       <ul>
-        <li data-testid="help-tokens-billing">计费：按实际 token 数计费，价格以「元 / 百万 token」标示，输入（提示词）与输出（生成内容）分别计价，向量模型只计输入；请求失败（上游错误、无可用节点）不收费。</li>
+        <li data-testid="help-tokens-billing">计费：按实际 token 数计费，价格以「元 / 百万 token」标示，输入（提示词）与输出（生成内容）分别计价，向量模型只计输入；请求未指定 max_tokens 时按模型的最大输出长度处理。上游错误、上游超时（未输出内容时）、无可用节点、服务重启中断的请求不收费；流式输出已返回部分内容后因 10 分钟总时长上限被截断的，按已返回的内容计费。</li>
         <li data-testid="help-tokens-settle">结算：费用先累计，累计到 ¥1 或最早一笔满 10 分钟时从钱包余额扣款一次，每次一条「Token 消费」流水；在「Token 商城 → 用量」可查看结算记录并跳转到对应流水。</li>
         <li data-testid="help-tokens-limits">
           限额（按账户，所有 Key 共享）：默认每分钟 {{ DEFAULT_LLM_LIMITS.rpm }} 次请求、每分钟 {{ formatTokens(DEFAULT_LLM_LIMITS.tpm) }} token、同时 {{ DEFAULT_LLM_LIMITS.concurrency }} 个并发请求，超出返回 429；需要更高限额请联系客服。每个 Key 还可以设置月消费上限。

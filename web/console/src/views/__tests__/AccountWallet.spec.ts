@@ -124,6 +124,10 @@ describe('帮助：Token 商城一节', () => {
     await mountAt('/help')
     expect(byId('help-tokens')!.textContent).toBe('Token 商城')
     expect(byId('help-tokens-billing')!.textContent).toContain('百万 token')
+    const billing = byId('help-tokens-billing')!.textContent!
+    expect(billing).toContain('上游错误、上游超时（未输出内容时）、无可用节点、服务重启中断的请求不收费')
+    expect(billing).toContain('按已返回的内容计费')
+    expect(billing).toContain('未指定 max_tokens')
     expect(byId('help-tokens-settle')!.textContent).toContain('¥1 或最早一笔满 10 分钟')
     expect(byId('help-tokens-limits')!.textContent).toMatch(/60 次.*200K token.*8 个并发/s)
     expect(byId('help-tokens-key')!.textContent).toContain('只在创建时显示一次')
@@ -131,5 +135,7 @@ describe('帮助：Token 商城一节', () => {
     const errors = byId('help-tokens-errors')!.textContent!
     expect(errors).toContain('insufficient_quota')
     expect(errors).toContain('rate_limit_exceeded')
+    expect(errors).toContain('upstream_timeout')
+    expect(errors).toContain('504')
   })
 })

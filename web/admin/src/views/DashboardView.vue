@@ -3,6 +3,7 @@ import { fmtYuan, instanceStateLabel, machineStateLabel, messageOf, type Dashboa
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { barsOf, CHART } from '../logic/chart'
+import { dashLlmNodesBad } from '../logic/llm'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
 
@@ -91,7 +92,7 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
       </el-card>
       <el-card v-if="data.llm" header="Token 商城" data-testid="dash-llm">
         <ul class="kv">
-          <li><span>节点就绪 / 总数</span><b><span data-testid="dash-llm-nodes-ready" :class="{ bad: data.llm.nodes_ready < data.llm.nodes_total }">{{ data.llm.nodes_ready }}</span> / <span data-testid="dash-llm-nodes-total">{{ data.llm.nodes_total }}</span></b></li>
+          <li><span>节点就绪 / 总数</span><b><span data-testid="dash-llm-nodes-ready" :class="{ bad: dashLlmNodesBad(data.llm) }">{{ data.llm.nodes_ready }}</span> / <span data-testid="dash-llm-nodes-total">{{ data.llm.nodes_total }}</span></b></li>
           <li><span>今日请求</span><b data-testid="dash-llm-requests">{{ data.llm.today_requests.toLocaleString('en-US') }}</b></li>
           <li><span>今日收入（已结算）</span><b data-testid="dash-llm-income">{{ fmtYuan(data.llm.today_settled_amount) }}</b></li>
         </ul>

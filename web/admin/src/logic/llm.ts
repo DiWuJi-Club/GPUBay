@@ -1,5 +1,5 @@
 import {
-  centsToYuanInput, digitsOnly, fmtDate, fmtYuan, toHalfWidthDigits, yuanToCents,
+  centsToYuanInput, digitsOnly, fmtDate, fmtYuan, formatMicroFen, toHalfWidthDigits, yuanToCents,
   deploymentPhaseLabel, deploymentStateLabel, fmtTime, labelOf,
   type AdminAppVersion, type AdminGroup, type AdminGroupBrief, type AdminImage, type AppEnvSpec, type LLMAccountAdmin, type LLMAccountUpdate, type LLMDailyAdminRow, type LLMKeyAdmin, type LLMModelAdmin, type LLMModelInput, type LLMModelKind, type LLMModelSource,
   type LLMNode, type LLMNodeState, type LLMPoolMachine, type Role,
@@ -43,7 +43,7 @@ export const fmtPrice = (fen: number): string => fmtYuan(fen)
 // ---- 模型表单 ----
 
 export const LLM_FEATURES = ['tools', 'reasoning', 'vision', 'long-context'] as const
-export const llmFeatureLabel: Record<string, string> = { tools: '工具调用', reasoning: '推理', vision: '视觉', 'long-context': '长上下文' }
+// 特性的中文名用 @spark/shared 的 llmFeatureLabel（与控制台一致）
 export const llmSourceLabel: Record<string, string> = { modelscope: 'ModelScope', 'hf-mirror': 'HF 镜像' }
 
 /** 由平台在建节点时填写的 vllm-node 变量（规格 §3.1 五个 + 按 kind 填的 TASK），表单不展示、不提交。 */
@@ -60,9 +60,9 @@ export const LIMITS = {
   max_concurrency: [1, 512],
 } as const
 
-/** vllm-node spec 里可由模型覆盖的变量。 */
+/** vllm-node spec 里可由模型覆盖的变量：去掉平台保留变量与 secret 类型（node_env 按明文保存、在表单里回显，不承载密钥）。 */
 export function nodeEnvSpec(env: AppEnvSpec[] | undefined): AppEnvSpec[] {
-  return (env ?? []).filter((e) => !RESERVED_NODE_ENV.includes(e.name))
+  return (env ?? []).filter((e) => !RESERVED_NODE_ENV.includes(e.name) && e.type !== 'secret')
 }
 
 export interface ModelForm {
@@ -322,23 +322,17 @@ export function poolCandidateQuery(source: PoolCandidateSource, rack: string, pa
   return { group_id: source, rack: rack.trim() || undefined, page, page_size: POOL_CANDIDATE_PAGE }
 }
 
-// ---- 费用与数字 ----
-
 /**
- * 费用（微分，1 分 = 10^6 微分）→ 元：0「¥0.00」；不足 1 分「< ¥0.01」；其余最多 6 位小数（四舍五入到 10^-6 元），
- * 去掉末尾的 0 但至少两位：1_250_000 →「¥0.0125」。全程整数运算。
- * 与控制台分支 shared/format.ts 的 formatMicroFen 规则相同；为避免两个分支同改 shared/format.ts，后台先放在这里。
+ * 仪表盘 Token 卡片的「节点就绪」是否标红：有不健康节点时标红（后端给了 nodes_unhealthy 时）；
+ * 没有这个字段时退回「有节点却一个都没就绪」。部署中 / 下线中的节点不算异常（就绪数小于总数很常见）。
  */
-export function fmtCostMicro(micro: number): string {
-  const sign = micro < 0 ? '-' : ''
-  const abs = Math.abs(Math.trunc(micro))
-  if (abs === 0) return '¥0.00'
-  if (abs < 1_000_000) return '< ¥0.01'
-  const units = String(Math.round(abs / 100)).padStart(7, '0') // 10^-6 元
-  const frac = units.slice(-6).replace(/0+$/, '').padEnd(2, '0')
-  const yuan = units.slice(0, -6).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
-  return `${sign}¥${yuan}.${frac}`
+export function dashLlmNodesBad(l: { nodes_ready: number; nodes_total: number; nodes_unhealthy?: number }): boolean {
+  if (typeof l.nodes_unhealthy === 'number') return l.nodes_unhealthy > 0
+  return l.nodes_total > 0 && l.nodes_ready === 0
 }
+
+// ---- 数字 ----
+// 费用（微分）统一用 @spark/shared 的 formatMicroFen。
 
 /** 整数千分位：1234567 →「1,234,567」。 */
 export const fmtCount = (n: number): string => Math.trunc(n).toLocaleString('en-US')
@@ -436,7 +430,7 @@ export const currentYM = (now: Date = new Date()): string => fmtDate(now).slice(
  */
 export function keyMonthCostText(k: Pick<LLMKeyAdmin, 'month_ym' | 'month_cost_micro' | 'month_cost'>, now: Date = new Date()): string {
   if (typeof k.month_cost === 'number') return fmtYuan(k.month_cost)
-  return k.month_ym === currentYM(now) ? fmtCostMicro(k.month_cost_micro) : fmtCostMicro(0)
+  return k.month_ym === currentYM(now) ? formatMicroFen(k.month_cost_micro) : formatMicroFen(0)
 }
 
 // ---- 用量 / 汇总 / 结算（规格 §10.2）----

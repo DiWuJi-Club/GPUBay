@@ -268,6 +268,25 @@ describe('请求日志 Tab', () => {
     expect(get).toHaveBeenLastCalledWith('/llm/usage', expect.objectContaining({ from: addDays(today, -89), to: today, page: 1 }))
   })
 
+  it('日期范围不合法时清空旧结果与总数', async () => {
+    await mountAt('/tokens?tab=logs')
+    expect(byId('tokens-log-row-req-aaaaaaaaaaaaaaaa')).not.toBeNull()
+    await setDate('tokens-logs-from', addDays(today, 1))
+    expect(byId('tokens-logs-range-error')).not.toBeNull()
+    expect(byId('tokens-log-row-req-aaaaaaaaaaaaaaaa')).toBeNull()
+    expect(byId('tokens-logs-total')).toBeNull()
+  })
+
+  it('模型下拉：在线模型 + 日志里出现的已下线模型', async () => {
+    logs = { items: [usage('req-cccccccccccccccc', { model: 'old-model' }), usage('req-aaaaaaaaaaaaaaaa')], total: 2 }
+    await mountAt('/tokens?tab=logs')
+    expect(byId('tokens-logs-model-option-qwen3-4b')).not.toBeNull()
+    expect(byId('tokens-logs-model-option-glm-4')).not.toBeNull()
+    byId('tokens-logs-model-option-old-model')!.click()
+    await flushPromises()
+    expect(get).toHaveBeenLastCalledWith('/llm/usage', expect.objectContaining({ page: 1, model: 'old-model' }))
+  })
+
   it('手机：卡片列表', async () => {
     vi.stubGlobal('matchMedia', (q: string) => ({ matches: true, media: q, addEventListener: () => {}, removeEventListener: () => {} }))
     await mountAt('/tokens?tab=logs')

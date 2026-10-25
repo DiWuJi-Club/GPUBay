@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  digitsOnly, fmtTime, fmtTimeSec, fmtYuan, labelOf, llmEndpointLabel, llmUsageStatusLabel, messageOf,
+  digitsOnly, fmtTime, fmtTimeSec, fmtYuan, formatMicroFen, labelOf, llmEndpointLabel, llmUsageStatusLabel, messageOf,
   type LLMDailyAdminRow, type LLMModelAdmin, type LLMSettlementAdmin, type LLMUsageAdminRow, type Listed, type Paged,
 } from '@spark/shared'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -10,7 +10,7 @@ import { usePaged } from '../../composables/usePaged'
 import { downloadBlob } from '../../logic/csv'
 import { firstOf } from '../../logic/deployments'
 import {
-  dailyGroupLabel, dailyQuery, emptyUsageFilter, fmtCostMicro, fmtCount, fmtPrice, settlementsQuery, sumDaily, summarizeDaily, usageQuery, validateUsageRange,
+  dailyGroupLabel, dailyQuery, emptyUsageFilter, fmtCount, fmtPrice, settlementsQuery, sumDaily, summarizeDaily, usageQuery, validateUsageRange,
   type DailyGroup, type DailySummaryRow, type UsageFilter,
 } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'
@@ -191,7 +191,7 @@ const ms = (n: number | null | undefined) => (n == null ? '—' : `${fmtCount(n)
           <template #default="{ row }"><span data-testid="llm-usage-tokens">{{ tokens(row as LLMUsageAdminRow) }}</span><el-tag v-if="row.estimated" size="small" type="warning" class="tag">估算</el-tag></template>
         </el-table-column>
         <el-table-column label="单价（元 / 百万）" width="140"><template #default="{ row }">{{ fmtPrice(row.input_price) }} / {{ fmtPrice(row.output_price) }}</template></el-table-column>
-        <el-table-column label="费用" width="110"><template #default="{ row }"><span data-testid="llm-usage-cost">{{ fmtCostMicro(row.cost_micro) }}</span></template></el-table-column>
+        <el-table-column label="费用" width="110"><template #default="{ row }"><span data-testid="llm-usage-cost">{{ formatMicroFen(row.cost_micro) }}</span></template></el-table-column>
         <el-table-column label="状态" width="120">
           <template #default="{ row }"><span data-testid="llm-usage-row-status" :class="{ bad: row.status !== 'ok' }">{{ labelOf(llmUsageStatusLabel, row.status) }}</span> <span class="muted">{{ row.http_status }}</span></template>
         </el-table-column>
@@ -220,10 +220,10 @@ const ms = (n: number | null | undefined) => (n == null ? '—' : `${fmtCount(n)
         <el-table-column label="请求数" width="110"><template #default="{ row }"><span data-testid="llm-daily-requests">{{ fmtCount(row.requests) }}</span></template></el-table-column>
         <el-table-column label="输入 token" width="140"><template #default="{ row }">{{ fmtCount(row.prompt_tokens) }}</template></el-table-column>
         <el-table-column label="输出 token" width="140"><template #default="{ row }">{{ fmtCount(row.completion_tokens) }}</template></el-table-column>
-        <el-table-column label="费用" min-width="120"><template #default="{ row }"><span data-testid="llm-daily-cost">{{ fmtCostMicro(row.cost_micro) }}</span></template></el-table-column>
+        <el-table-column label="费用" min-width="120"><template #default="{ row }"><span data-testid="llm-daily-cost">{{ formatMicroFen(row.cost_micro) }}</span></template></el-table-column>
       </el-table>
       <div v-if="summary.length" class="sum" data-testid="llm-daily-total">
-        合计：{{ fmtCount(total.requests) }} 次请求 · 输入 {{ fmtCount(total.prompt_tokens) }} · 输出 {{ fmtCount(total.completion_tokens) }} token · {{ fmtCostMicro(total.cost_micro) }}
+        合计：{{ fmtCount(total.requests) }} 次请求 · 输入 {{ fmtCount(total.prompt_tokens) }} · 输出 {{ fmtCount(total.completion_tokens) }} token · {{ formatMicroFen(total.cost_micro) }}
       </div>
     </template>
 
