@@ -185,7 +185,7 @@ test('C-BOT-07 实例详情失败部署旁「问问管家」带上下文 → 回
   await expect(c).toBeVisible()
   if (isMobile(info)) await expect(page).toHaveURL(/\/butler$/)
   await expect(c.getByTestId('butler-context')).toHaveText(`将带上实例 ${id} 的信息`)
-  await expect(c.getByTestId('butler-input').locator('textarea')).toHaveValue('这个实例上的应用为什么失败了？')
+  await expect(c.getByTestId('butler-input')).toHaveValue('这个实例上的应用为什么失败了？')
   await c.getByTestId('butler-send').click()
   await expect(lastStep(page, 'list_instance_apps')).toHaveText('✓ 查询实例上的应用')
   await expect(lastStep(page, 'get_deployment_log')).toHaveText('✓ 读取部署日志')
@@ -230,12 +230,12 @@ test('C-BOT-09 今日额度用完：横幅与 429 文案；次日恢复', async 
   const c = await openDrawer(page, info)
   await expect(c.getByTestId('butler-quota')).toHaveText('今日已用 100%')
   const resp = page.waitForResponse((r) => r.url().endsWith('/api/v1/butler/conversations/new/messages'))
-  await c.getByTestId('butler-input').locator('textarea').fill('你好')
+  await c.getByTestId('butler-input').fill('你好')
   await c.getByTestId('butler-send').click()
   expect((await resp).status()).toBe(429)
   await expect(c.getByTestId('butler-banner')).toContainText('今日 AI 管家额度已用完，明天再来')
   await expect(c.getByTestId('butler-msg-user')).toHaveCount(0) // 服务端没收下：不留气泡，原文放回输入框
-  await expect(c.getByTestId('butler-input').locator('textarea')).toHaveValue('你好')
+  await expect(c.getByTestId('butler-input')).toHaveValue('你好')
 
   await hooks.advance(86400)
   await page.reload()
@@ -273,6 +273,7 @@ test('C-BOT-11 历史列表：两段对话切换、删除对话', async ({ page 
   await expectAssistantContains(page, '第一段的回复')
   await c.getByTestId('butler-new').click()
   await expect(c.getByTestId('butler-welcome')).toBeVisible()
+  await hooks.advance(1) // 假时钟不走：两段对话的最后消息时间相同时列表顺序不确定
   await replyText('第二段的回复')
   await send(page, '第二段对话')
   await expectAssistantContains(page, '第二段的回复')
@@ -302,15 +303,21 @@ test('C-BOT-11 历史列表：两段对话切换、删除对话', async ({ page 
   expect(items.map((i) => i.title)).toEqual(['第二段对话'])
 })
 
-test('C-BOT-12 手机底部「管家」标签进入 /butler，Enter 发送成功', async ({ page }, info) => {
-  test.skip(!isMobile(info), '仅手机端：底部标签栏')
+test('C-BOT-12 手机底部「管家」标签进入 /butler，Enter 发送成功（电脑端走侧栏「AI 管家」）', async ({ page }, info) => {
+  // 规格只要求手机端；覆盖表禁止 test.skip，电脑端同一用例改走侧栏入口
   const u = await seedUser()
   await loginConsole(page, u.phone)
-  await expect(page.getByTestId('tabbar-butler')).toHaveText('管家')
-  await expect(page.getByTestId('butler-launcher')).toHaveCount(0) // 手机没有浮动按钮
+  if (isMobile(info)) {
+    await expect(page.getByTestId('tabbar-butler')).toHaveText('管家')
+    await expect(page.getByTestId('butler-launcher')).toHaveCount(0) // 手机没有浮动按钮
+  } else {
+    await expect(page.getByTestId('menu-butler')).toHaveText('AI 管家')
+    await expect(page.getByTestId('butler-launcher')).toBeVisible()
+  }
   await gotoButlerPage(page, info)
-  await expect(page.getByTestId('butler-history')).toBeVisible()
-  const input = chat(page).getByTestId('butler-input').locator('textarea')
+  await expect(page.getByTestId('butler-launcher')).toHaveCount(0) // /butler 全页不显示浮动按钮
+  await expect(page.getByTestId(isMobile(info) ? 'butler-history' : 'butler-list')).toBeVisible()
+  const input = chat(page).getByTestId('butler-input')
   await input.fill('你好')
   await input.press('Shift+Enter') // 换行，不发送
   await expect(input).toHaveValue('你好\n')

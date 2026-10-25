@@ -52,7 +52,7 @@ export async function closeDrawer(page: Page, info: TestInfo, mobileBackTo: stri
 export async function send(page: Page, text: string) {
   const c = chat(page)
   const before = await c.getByTestId('butler-msg-user').count()
-  await c.getByTestId('butler-input').locator('textarea').fill(text)
+  await c.getByTestId('butler-input').fill(text)
   await c.getByTestId('butler-send').click()
   await expect(c.getByTestId('butler-msg-user')).toHaveCount(before + 1)
   await expect(c.getByTestId('butler-msg-user').last()).toHaveText(text)
