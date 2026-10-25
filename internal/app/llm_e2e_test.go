@@ -100,6 +100,12 @@ type llmEnv struct {
 
 func newLLMEnv(t *testing.T, machines int) *llmEnv {
 	t.Helper()
+	return newLLMEnvWith(t, machines, nil)
+}
+
+// newLLMEnvWith 同 newLLMEnv；setup 在 app.Build 之前调用，可先往库里写数据（如 AI 管家用的 API Key）并改配置 / 选项。
+func newLLMEnvWith(t *testing.T, machines int, setup func(pool *pgxpool.Pool, cfg *config.Config, opt *app.Options)) *llmEnv {
+	t.Helper()
 	ctx := context.Background()
 	pool := dbtest.New(t)
 	t.Cleanup(func() { assertConsistent(t, pool) })
@@ -130,10 +136,14 @@ func newLLMEnv(t *testing.T, machines int) *llmEnv {
 	healthAddr := strings.TrimPrefix(health.URL, "http://")
 	cfg := config.Config{UpstreamSSHKeyFile: keyFile, Env: "dev", UploadDir: t.TempDir(), Domain: "spark.test", SecretKey: dbtest.Key,
 		SMSDriver: "mock", KYCDriver: "mock", UpstreamSSHPort: up.Port(), LLMGateway: true}
-	a, err := app.Build(cfg, pool, discardLog(), app.Options{Clock: clk, SMS: &sms.Mock{}, DisableRateLimits: true,
+	opt := app.Options{Clock: clk, SMS: &sms.Mock{}, DisableRateLimits: true,
 		HostKeyGen:    func() (string, []byte, error) { return hostPub, hostPEM, nil },
 		AppHealthAddr: func(int) string { return healthAddr },
-		AppRootFor:    func(id string) string { return filepath.Join(root, id, "root", "data") }})
+		AppRootFor:    func(id string) string { return filepath.Join(root, id, "root", "data") }}
+	if setup != nil {
+		setup(pool, &cfg, &opt)
+	}
+	a, err := app.Build(cfg, pool, discardLog(), opt)
 	if err != nil {
 		t.Fatal(err)
 	}

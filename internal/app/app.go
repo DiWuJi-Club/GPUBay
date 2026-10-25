@@ -43,6 +43,7 @@ import (
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/config"
+	"spark-cloud/internal/platform/inproc"
 	"spark-cloud/internal/platform/randx"
 	"spark-cloud/internal/platform/secretbox"
 	"spark-cloud/internal/platform/tlsfile"
@@ -368,10 +369,12 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		llmGW = llmgw.New(llmSvc, llmgw.Config{AuthFailLimit: authorizeLimit}, clk, log)
 		srv.LLMGateway = llmGW.Router()
 	}
+	// AI 管家（计划 12）：openai 且没配 SPARK_LLM_BASE_URL 时默认走上面的 /v1 网关（进程内调用，SPARK_LLM_API_KEY 是平台管家账号的
+	// Token 商城 API Key，用量按该账号与模型单价记账，见 README「AI 管家」）。
 	var bt *butler.Service
 	var provider butlerllm.Provider
 	if cfg.Butler {
-		if provider, err = llmProvider(cfg.ButlerLLM, opt.ButlerLLM); err != nil {
+		if provider, err = llmProvider(cfg.ButlerLLM, opt.ButlerLLM, llmGW, cfg.Domain, log); err != nil {
 			return nil, err
 		}
 		// 工具的数据来源与控制台完全相同：machine_label 用 api 实例视图的同一 fleet 查询、ssh_command 用同一 SSH 主机 / 端口、
@@ -405,9 +408,24 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		Butler: bt, ButlerLLM: provider}, nil
 }
 
+// ButlerGatewayBaseURL 是 AI 管家经进程内传输调用本进程 Token 商城网关时用的基地址（不解析、不出网；只决定请求路径 /v1/...）。
+const ButlerGatewayBaseURL = "http://llmgw.internal/v1"
+
+// butlerGatewayClient 返回进程内调用 Token 商城网关的 HTTP 客户端：请求直接交给网关的处理器（流式逐块回传、ctx 取消即客户端断开），
+// 对网关而言与一个来自 127.0.0.1、Host 为平台域名的外部请求相同——同样鉴权（SPARK_LLM_API_KEY）、限流、预检与计费。
+// 不经过公网 http.Server：没有它的读写超时，期限由管家自己的 ctx（LLMTimeout）与网关的总超时约束。
+func butlerGatewayClient(gw *llmgw.Server, host string, log *slog.Logger) *http.Client {
+	if host == "" {
+		host = "llmgw.internal"
+	}
+	h := http.StripPrefix("/v1", gw.Router()) // 与 api.Server 的 r.Mount("/v1", …) 等价
+	return &http.Client{Transport: &inproc.Transport{Handler: h, Host: host, Log: log}}
+}
+
 // llmProvider 返回 AI 管家的模型提供方：注入的优先（测试 / e2e），否则按 cfg.Provider 构造。
-// 模型名为空（配置字面量）时取 provider 默认；openai 必须有端点（config.Load 已校验，这里防配置字面量绕过）。
-func llmProvider(cfg config.ButlerLLMConfig, injected butlerllm.Provider) (butlerllm.Provider, error) {
+// 模型名为空（配置字面量）时取 provider 默认；openai 的 BaseURL 为空时走本进程的 Token 商城网关（gw 非 nil，即 SPARK_LLM_GATEWAY=on），
+// 网关也没开则报错（config.Load 已校验，这里防配置字面量绕过）。
+func llmProvider(cfg config.ButlerLLMConfig, injected butlerllm.Provider, gw *llmgw.Server, host string, log *slog.Logger) (butlerllm.Provider, error) {
 	if injected != nil {
 		return injected, nil
 	}
@@ -418,7 +436,11 @@ func llmProvider(cfg config.ButlerLLMConfig, injected butlerllm.Provider) (butle
 	switch cfg.Provider {
 	case config.LLMOpenAI:
 		if cfg.BaseURL == "" {
-			return nil, errors.New("SPARK_LLM_PROVIDER=openai 需要设置 SPARK_LLM_BASE_URL")
+			if gw == nil {
+				return nil, errors.New("SPARK_LLM_PROVIDER=openai 需要设置 SPARK_LLM_BASE_URL，或开启 Token 商城网关（SPARK_LLM_GATEWAY=on）")
+			}
+			return openai.New(openai.Config{BaseURL: ButlerGatewayBaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens,
+				HTTP: butlerGatewayClient(gw, host, log)}), nil
 		}
 		return openai.New(openai.Config{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: model, MaxTokens: cfg.MaxOutputTokens}), nil
 	case config.LLMAnthropic:

@@ -118,6 +118,8 @@ func run(log *slog.Logger) error {
 		endpoint := "（SDK 默认）"
 		if u, err := url.Parse(cfg.ButlerLLM.BaseURL); err == nil && u.Host != "" {
 			endpoint = u.Host
+		} else if cfg.ButlerLLM.Provider == config.LLMOpenAI {
+			endpoint = "本进程 Token 商城网关 /v1（进程内调用）"
 		}
 		log.Info("AI 管家已开启", "provider", a.ButlerLLM.Name(), "model", a.ButlerLLM.Model(), "endpoint", endpoint, "tools", cfg.ButlerLLM.Tools)
 	case cfg.ButlerOffReason == "":

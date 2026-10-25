@@ -478,7 +478,7 @@ token 估算（无 provider 用量时，如 mock 或端点不回 usage）：`len
 | 项 | 值 | 说明 |
 |---|---|---|
 | `SPARK_LLM_PROVIDER` | `openai` / `anthropic` / `mock` | 默认 `openai`；`prod` 禁 `mock` |
-| `SPARK_LLM_BASE_URL` | URL | `openai` 必填（计划 9 端点，如 `http://token-mall.spark.internal/v1`）；`anthropic` 可空（SDK 默认） |
+| `SPARK_LLM_BASE_URL` | URL | `openai`：空 = 本进程的计划 9 网关（进程内调用，需 `SPARK_LLM_GATEWAY=on`；计划 9 合入后的实现裁定）；填写 = 外部 OpenAI 兼容端点；`anthropic` 可空（SDK 默认） |
 | `SPARK_LLM_API_KEY` | 字符串 | `openai` / `anthropic` 必填（`prod`），dev 可空 |
 | `SPARK_LLM_MODEL` | 模型名 | 默认：openai `qwen3-32b`、anthropic `claude-opus-5-5` |
 | `SPARK_LLM_MAX_OUTPUT_TOKENS` | 2048 | |

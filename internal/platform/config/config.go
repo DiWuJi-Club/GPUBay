@@ -70,16 +70,16 @@ type Config struct {
 	// 计划 12：AI 管家
 	ButlerLLM ButlerLLMConfig
 	Butler    bool // 部署级开关（SPARK_BUTLER）；false 时不注册管家路由、不显示入口
-	// ButlerOffReason：开发环境未显式开启管家、openai 又没配 SPARK_LLM_BASE_URL 时自动关闭管家的原因（启动时记一条日志）；其它情况为空。
+	// ButlerOffReason：开发环境未显式开启管家、openai 又没有可用端点（没配 SPARK_LLM_BASE_URL 且网关关闭，或走本进程网关却没有 SPARK_LLM_API_KEY）时自动关闭管家的原因（启动时记一条日志）；其它情况为空。
 	ButlerOffReason string
 }
 
 // ButlerLLMConfig AI 管家使用的模型后端（计划 12；与 Token 商城的 LLMGateway / LLMController 无关）。
 type ButlerLLMConfig struct {
 	Provider          string // openai / anthropic / mock
-	BaseURL           string // openai 必填（计划 9 内网端点，如 http://token-mall.spark.internal/v1）；anthropic 可空（SDK 默认）；已去掉结尾斜杠
-	APIKey            string // 生产环境（非 mock）必填；只放环境变量，不写日志
-	Model             string // 为空时按 provider 取默认值
+	BaseURL           string // openai 为空 = 本进程的 Token 商城网关（进程内调用，需 SPARK_LLM_GATEWAY=on）；非空 = 外部 OpenAI 兼容端点（写到 /v1）；anthropic 可空（SDK 默认）；已去掉结尾斜杠
+	APIKey            string // 生产环境（非 mock）必填；默认端点时是一把 Token 商城 API Key（sk-spark-…，平台管家账号的）；只放环境变量，不写日志
+	Model             string // 为空时按 provider 取默认值；接 Token 商城时是模型的 slug（llm_models.slug，如 qwen3-32b）
 	MaxOutputTokens   int
 	PriceInCentsPerM  int  // 用量页估算费用：输入每百万 token 的价格（分）
 	PriceOutCentsPerM int  // 输出每百万 token 的价格（分）
@@ -623,13 +623,24 @@ func (c *Config) loadButler(getenv func(string) string, or func(key, def string)
 		return nil
 	}
 	if l.Provider == LLMOpenAI && l.BaseURL == "" {
-		// 开发环境没显式要求开启管家：自动关闭而不是拒绝启动，免得 make run / platform admin 开箱即失败
-		if c.Env == "dev" && !explicit {
-			c.Butler = false
-			c.ButlerOffReason = "未设置 SPARK_LLM_BASE_URL，开发环境已自动关闭 AI 管家（设置 SPARK_LLM_PROVIDER=mock 或 SPARK_LLM_BASE_URL 即可开启）"
-			return nil
+		if c.LLMGateway {
+			// 默认端点：本进程挂载的 Token 商城网关（计划 9 的 /v1），进程内调用；SPARK_LLM_API_KEY 是一把 Token 商城 API Key（sk-spark-…）。
+			// 开发环境没显式开启、又没有 Key：自动关闭（否则每轮都 401），与没有端点时同理
+			if c.Env == "dev" && !explicit && l.APIKey == "" {
+				c.Butler = false
+				c.ButlerOffReason = "未设置 SPARK_LLM_API_KEY（Token 商城 API Key），开发环境已自动关闭 AI 管家（设置 SPARK_LLM_PROVIDER=mock、或在 Token 商城为平台管家账号创建 API Key 填入 SPARK_LLM_API_KEY 即可开启）"
+				return nil
+			}
+		} else {
+			// 开发环境没显式要求开启管家：自动关闭而不是拒绝启动，免得 make run / platform admin 开箱即失败
+			if c.Env == "dev" && !explicit {
+				c.Butler = false
+				c.ButlerOffReason = "未设置 SPARK_LLM_BASE_URL 且未开启 Token 商城网关（SPARK_LLM_GATEWAY=off），开发环境已自动关闭 AI 管家（设置 SPARK_LLM_PROVIDER=mock 或 SPARK_LLM_BASE_URL 即可开启）"
+				return nil
+			}
+			return errors.New("SPARK_LLM_PROVIDER=openai 且 SPARK_LLM_BASE_URL 为空时，AI 管家走本进程的 Token 商城网关，需要 SPARK_LLM_GATEWAY=on；" +
+				"或设置 SPARK_LLM_BASE_URL（外部 OpenAI 兼容端点，写到 /v1 为止）；暂不开放 AI 管家可设 SPARK_BUTLER=off")
 		}
-		return errors.New("SPARK_LLM_PROVIDER=openai 需要设置 SPARK_LLM_BASE_URL（OpenAI 兼容端点，如 http://token-mall.spark.internal/v1）；暂不开放 AI 管家可设 SPARK_BUTLER=off")
 	}
 	if c.Env == "prod" && l.Provider != LLMMock && l.APIKey == "" {
 		return errors.New("生产环境开启 AI 管家需要设置 SPARK_LLM_API_KEY；暂不开放可设 SPARK_BUTLER=off")

@@ -1,8 +1,10 @@
 package app_test
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -194,7 +196,8 @@ func TestBuildButlerOff(t *testing.T) {
 	}
 }
 
-// 开发环境 openai 没配 SPARK_LLM_BASE_URL（也没显式 SPARK_BUTLER=on）：config 自动关闭管家，Build 正常、不注册路由。
+// 开发环境 openai 没配 SPARK_LLM_BASE_URL、默认走本进程网关却没有 SPARK_LLM_API_KEY（也没显式 SPARK_BUTLER=on）：
+// config 自动关闭管家，Build 正常、不注册路由。
 func TestBuildButlerDevWithoutBaseURL(t *testing.T) {
 	cfg := butlerConfig(t, nil)
 	if cfg.Butler || cfg.ButlerOffReason == "" {
@@ -217,9 +220,33 @@ func TestBuildButlerOpenAIProvider(t *testing.T) {
 	if a.Butler == nil || a.ButlerLLM == nil || a.ButlerLLM.Name() != config.LLMOpenAI || a.ButlerLLM.Model() != config.DefaultLLMModel(config.LLMOpenAI) {
 		t.Fatalf("LLM = %v", a.ButlerLLM)
 	}
-	cfg.ButlerLLM.BaseURL = ""
+	cfg.ButlerLLM.BaseURL, cfg.LLMGateway = "", false // 既没有外部端点也没开网关
 	if _, err := app.Build(cfg, pool, discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0)}); err == nil || !strings.Contains(err.Error(), "SPARK_LLM_BASE_URL") {
 		t.Fatalf("err = %v, want missing base URL", err)
+	}
+}
+
+// 默认端点：openai + SPARK_LLM_BASE_URL 空 + SPARK_LLM_GATEWAY on（默认）→ 管家经进程内传输调用本进程的 /v1 网关。
+// 用一把格式不对的 Key 发一次请求：回来的是网关自己的 401（OpenAI 错误体 invalid_api_key），没有任何网络连接。
+func TestBuildButlerDefaultsToInProcessGateway(t *testing.T) {
+	cfg := butlerConfig(t, map[string]string{"SPARK_LLM_API_KEY": "sk-spark-not-a-real-key", "SPARK_LLM_MODEL": "qwen3-4b"})
+	if !cfg.Butler || cfg.ButlerLLM.BaseURL != "" || !cfg.LLMGateway {
+		t.Fatalf("config: butler %v base %q gateway %v reason %q", cfg.Butler, cfg.ButlerLLM.BaseURL, cfg.LLMGateway, cfg.ButlerOffReason)
+	}
+	a, err := app.Build(cfg, dbtest.New(t), discardLog(), app.Options{Clock: clock.NewFake(dbtest.T0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Butler == nil || a.LLMGateway == nil || a.ButlerLLM == nil || a.ButlerLLM.Name() != config.LLMOpenAI || a.ButlerLLM.Model() != "qwen3-4b" {
+		t.Fatalf("butler %v gateway %v provider %v", a.Butler, a.LLMGateway, a.ButlerLLM)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = a.ButlerLLM.Chat(ctx, llm.Request{System: "s", Messages: []llm.Message{{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "hi"}}}}},
+		func(llm.Event) {})
+	var re *llm.RequestError
+	if !errors.As(err, &re) || re.Status != http.StatusUnauthorized || !strings.Contains(re.Body, "invalid_api_key") {
+		t.Fatalf("Chat err = %v, want the gateway's 401 invalid_api_key", err)
 	}
 }
 

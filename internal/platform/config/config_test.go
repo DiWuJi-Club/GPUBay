@@ -465,10 +465,41 @@ func TestLoadLLMDefaults(t *testing.T) {
 	if err != nil || c.Butler || c.ButlerOffReason != "" {
 		t.Fatalf("SPARK_BUTLER=off: butler=%v reason=%q err=%v", c.Butler, c.ButlerOffReason, err)
 	}
-	// 开发环境未显式开启管家、openai 又没配 BaseURL：不报错，管家按配置关闭并给出原因（make run / 后台 CLI 开箱可用）
+	// 开发环境未显式开启管家、openai 又没有可用端点：不报错，管家按配置关闭并给出原因（make run / 后台 CLI 开箱可用）。
+	// 网关默认 on：BaseURL 空 = 走本进程网关，缺的是 Token 商城 API Key
 	c, err = config.Load(env(base()))
+	if err != nil || c.Butler || !strings.Contains(c.ButlerOffReason, "SPARK_LLM_API_KEY") {
+		t.Fatalf("dev without key: butler=%v reason=%q err=%v", c.Butler, c.ButlerOffReason, err)
+	}
+	// 网关关闭、又没有 BaseURL：原因是缺端点
+	c, err = config.Load(env(base("SPARK_LLM_GATEWAY", "off")))
 	if err != nil || c.Butler || !strings.Contains(c.ButlerOffReason, "SPARK_LLM_BASE_URL") {
-		t.Fatalf("dev without base url: butler=%v reason=%q err=%v", c.Butler, c.ButlerOffReason, err)
+		t.Fatalf("dev gateway off without base url: butler=%v reason=%q err=%v", c.Butler, c.ButlerOffReason, err)
+	}
+	// 默认端点（计划 9 网关，进程内）：BaseURL 空 + 网关 on + Key → 管家开启，BaseURL 保持空
+	for _, kv := range [][]string{
+		{"SPARK_LLM_API_KEY", "sk-spark-test"},
+		{"SPARK_ENV", "staging"},                                   // 非生产不强制 Key
+		{"SPARK_BUTLER", "on"},                                     // 开发环境显式开启：没 Key 也开（请求会 401，由使用者负责）
+		{"SPARK_LLM_GATEWAY", "on", "SPARK_LLM_MODEL", "qwen3-4b"}, // 模型 = Token 商城的模型 slug
+	} {
+		if kv[0] == "SPARK_LLM_GATEWAY" {
+			kv = append(kv, "SPARK_LLM_API_KEY", "sk-spark-test")
+		}
+		c, err := config.Load(env(base(kv...)))
+		if err != nil || !c.Butler || c.ButlerOffReason != "" || c.ButlerLLM.BaseURL != "" || !c.LLMGateway {
+			t.Fatalf("%v: butler=%v reason=%q base=%q err=%v", kv, c.Butler, c.ButlerOffReason, c.ButlerLLM.BaseURL, err)
+		}
+		if kv[0] == "SPARK_LLM_GATEWAY" && c.ButlerLLM.Model != "qwen3-4b" {
+			t.Fatalf("model = %q", c.ButlerLLM.Model)
+		}
+	}
+	// 生产：BaseURL 空 + 网关 on + Key → 进程内网关
+	pm := prodEnv()
+	pm["SPARK_LLM_BASE_URL"] = ""
+	c, err = config.Load(env(pm))
+	if err != nil || !c.Butler || c.ButlerLLM.BaseURL != "" || c.ButlerLLM.APIKey != "test-key" {
+		t.Fatalf("prod in-process: butler=%v base=%q err=%v", c.Butler, c.ButlerLLM.BaseURL, err)
 	}
 	// 生产环境配齐：BaseURL + APIKey
 	c, err = config.Load(env(prodEnv()))
@@ -500,10 +531,11 @@ func TestLoadLLMErrors(t *testing.T) {
 		{"bad provider", base("SPARK_LLM_PROVIDER", "gemini"), "SPARK_LLM_PROVIDER"},
 		{"prod mock", prod("SPARK_LLM_PROVIDER", "mock"), "生产环境禁止使用 mock LLM 提供方"},
 		{"prod mock butler off", prod("SPARK_LLM_PROVIDER", "mock", "SPARK_BUTLER", "off"), "生产环境禁止使用 mock LLM 提供方"},
-		{"dev openai explicit on without base url", base("SPARK_BUTLER", "on"), "SPARK_LLM_BASE_URL"},
-		{"staging openai without base url", base("SPARK_ENV", "staging"), "SPARK_LLM_BASE_URL"},
-		{"prod openai without base url", prod("SPARK_LLM_BASE_URL", ""), "SPARK_LLM_BASE_URL"},
+		{"dev openai explicit on without base url, gateway off", base("SPARK_BUTLER", "on", "SPARK_LLM_GATEWAY", "off"), "SPARK_LLM_GATEWAY=on"},
+		{"staging openai without base url, gateway off", base("SPARK_ENV", "staging", "SPARK_LLM_GATEWAY", "off"), "SPARK_LLM_BASE_URL"},
+		{"prod openai without base url, gateway off", prod("SPARK_LLM_BASE_URL", "", "SPARK_LLM_GATEWAY", "off"), "SPARK_LLM_BASE_URL"},
 		{"prod without api key", prod("SPARK_LLM_API_KEY", ""), "SPARK_LLM_API_KEY"},
+		{"prod in-process gateway without api key", prod("SPARK_LLM_API_KEY", "", "SPARK_LLM_BASE_URL", ""), "SPARK_LLM_API_KEY"},
 		{"prod anthropic without api key", prod("SPARK_LLM_PROVIDER", "anthropic", "SPARK_LLM_API_KEY", ""), "SPARK_LLM_API_KEY"},
 		{"base url not http", base("SPARK_LLM_BASE_URL", "token-mall:8000/v1"), "SPARK_LLM_BASE_URL"},
 		{"base url ftp", base("SPARK_LLM_PROVIDER", "anthropic", "SPARK_LLM_BASE_URL", "ftp://x/v1"), "SPARK_LLM_BASE_URL"},
