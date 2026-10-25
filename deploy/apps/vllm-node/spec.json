@@ -3,7 +3,7 @@
   "timeout_minutes": 120,
   "min_data_free_gib": 80,
   "env": [
-    {"name": "MODEL_ID", "label": "模型", "type": "string", "required": true, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "help": "仓库 ID（平台按模型目录的 source_id 填写）"},
+    {"name": "MODEL_ID", "label": "模型", "type": "string", "required": true, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$", "help": "仓库 ID（平台按模型目录的 source_id 填写）"},
     {"name": "MODEL_SOURCE", "label": "下载源", "type": "enum", "options": ["modelscope", "hf-mirror"], "default": "modelscope"},
     {"name": "SERVED_MODEL_NAME", "label": "对外模型名", "type": "string", "required": true, "pattern": "^[a-z0-9][a-z0-9.-]{1,63}$", "help": "vLLM --served-model-name（平台按模型 slug 填写）"},
     {"name": "MAX_MODEL_LEN", "label": "最大上下文", "type": "int", "min": 1024, "max": 1048576, "default": "32768"},
