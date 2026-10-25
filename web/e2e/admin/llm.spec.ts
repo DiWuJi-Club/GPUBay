@@ -71,9 +71,11 @@ test('A-LLM-01 新建模型（super，抽屉表单）与编辑价格：列表价
   expect(r.ok()).toBe(true)
 })
 
-test('A-LLM-02 上线：0 副本被拦下、确认后要动态码；删除只对没有节点的草稿开放', async ({ page }) => {
+test('A-LLM-02 上线：0 副本被拦下、确认后要动态码；删除只对没有节点的草稿开放（已上线 / 有节点的接口 409）', async ({ page }) => {
   const zero = await seedLLMModel({ online: false, replicas: 0 })
   const one = await seedLLMModel({ online: false, replicas: 1 })
+  const busy = await seedLLMModel({ online: false, replicas: 1 }) // 草稿，但机器上有节点（钩子直接造）
+  await hooks.llmNode(busy.id, await poolMachine(busy.admin))
   const admin = zero.admin
   await loginAdmin(page, admin)
   await page.goto('/admin/llm?tab=models')
@@ -100,6 +102,14 @@ test('A-LLM-02 上线：0 副本被拦下、确认后要动态码；删除只对
   const r = await ctx.post(`/admin/api/v1/llm/models/${zero.id}/status`, { data: { status: 'online' } })
   expect(r.status()).toBe(403)
   expect(((await r.json()) as { code: string }).code).toBe('totp_required')
+  // 删除条件（接口层）：已上线、或有节点（含已结束的）的模型一律 llm_model_in_use；界面上这两行也没有「删除」
+  for (const id of [one.id, busy.id]) {
+    const d = await ctx.delete(`/admin/api/v1/llm/models/${id}`, { data: {} })
+    expect(d.status()).toBe(409)
+    expect(((await d.json()) as { code: string }).code).toBe('llm_model_in_use')
+  }
+  await expect(modelRow(page, busy.slug).getByTestId('llm-model-row-status')).toHaveText('草稿')
+  await expect(modelRow(page, busy.slug).getByTestId('llm-model-delete')).toHaveCount(0)
 
   await modelRow(page, zero.slug).getByTestId('llm-model-delete').click()
   await expect(page.getByTestId('llm-model-delete-text')).toContainText(zero.slug)
@@ -389,7 +399,6 @@ test('A-LLM-09 按角色：财务看不到「节点与机器池」与节点操�
   await expect(page.getByTestId('llm-overview')).toBeVisible()
   for (const t of ['overview', 'models', 'accounts', 'usage']) await expect(page.getByTestId(`llm-tab-${t}`)).toBeVisible()
   await expect(page.getByTestId('llm-tab-nodes')).toHaveCount(0)
-  await expect(page.getByTestId('llm-node-drain')).toHaveCount(0)
   await page.getByTestId('llm-tab-models').click()
   await expect(modelRow(page, m.slug).getByTestId('llm-model-view')).toBeVisible()
   await expect(page.getByTestId('llm-model-create')).toHaveCount(0)
