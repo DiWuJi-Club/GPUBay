@@ -1,5 +1,7 @@
 # Spark Cloud 计划 12：AI 管家 Implementation Plan
 
+> **合并计划 9 之后的更名与修订（以代码为准）：** 本文中的 `config.Config.LLM`、`config.LLMConfig`、`app.Options.LLM` 在合并计划 9（Token 商城，自带 `Config.LLMGateway` / `LLMController` 与 `App.LLM`）之后分别更名为 `Config.ButlerLLM`、`config.ButlerLLMConfig`、`Options.ButlerLLM`（`App.ButlerLLM` 同理）。默认端点改为本进程的计划 9 网关（进程内调用，`internal/platform/inproc`）。常量修订：`LLMTimeout = 90s`（原 60s）、`DefaultMaxOutputTokens = 1024`（原 2048，`SPARK_LLM_MAX_OUTPUT_TOKENS` 默认同步）。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 控制台内的对话助手「AI 管家」：帮用户选套餐 / 机器、经计划 7 的部署接口部署应用、用日志 / 事件 / 状态诊断问题、回答计费与帮助问题。助手只能通过 23 个服务端工具以用户自己的权限行事；所有写操作（下单、续费、释放、取消、部署、重新部署、停 / 启、卸载）先生成服务端渲染的确认卡，用户点确认才执行。LLM 后端可配置：默认计划 9 的内网 OpenAI 兼容端点，可选 Claude API（`claude-opus-5-5`），测试用确定性 mock。提示注入按「结构层（工具 + 确认）+ 数据层（不可信包裹）+ 提示层 + 输出层（链接白名单）」四层防御；每用户每日 token 预算、对话 90 天保留、后台用量 / 对话查看 / 总开关 / 审计。

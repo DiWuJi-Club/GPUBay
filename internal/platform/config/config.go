@@ -92,7 +92,10 @@ const (
 	LLMAnthropic = "anthropic"
 	LLMMock      = "mock"
 
-	DefaultLLMMaxOutputTokens = 2048
+	DefaultLLMMaxOutputTokens = 1024
+
+	// LLMGatewayKeyPrefix 是 Token 商城 API Key 的前缀（与 llm.KeyPrefix 相同；config 不导入 internal/llm，测试断言两者一致）。
+	LLMGatewayKeyPrefix = "sk-spark-"
 )
 
 // DefaultLLMModel 返回 provider 的默认模型名；未知 provider 返回空串。
@@ -630,6 +633,16 @@ func (c *Config) loadButler(getenv func(string) string, or func(key, def string)
 				c.Butler = false
 				c.ButlerOffReason = "未设置 SPARK_LLM_API_KEY（Token 商城 API Key），开发环境已自动关闭 AI 管家（设置 SPARK_LLM_PROVIDER=mock、或在 Token 商城为平台管家账号创建 API Key 填入 SPARK_LLM_API_KEY 即可开启）"
 				return nil
+			}
+			// 任何环境：设了 Key 就必须是 Token 商城 Key（常见误配：填了外部端点的密钥却忘了 SPARK_LLM_BASE_URL，每轮都 401）。错误信息不回显 Key
+			if l.APIKey != "" && !strings.HasPrefix(l.APIKey, LLMGatewayKeyPrefix) {
+				return errors.New("AI 管家走本进程的 Token 商城网关（SPARK_LLM_BASE_URL 为空）时，SPARK_LLM_API_KEY 必须是 Token 商城 API Key（" +
+					LLMGatewayKeyPrefix + " 开头）；外部端点的密钥请同时设置 SPARK_LLM_BASE_URL")
+			}
+			// 开发环境之外（staging / prod）必须有 Key：没有 Key 每轮都 401
+			if c.Env != "dev" && l.APIKey == "" {
+				return errors.New("AI 管家走本进程的 Token 商城网关时需要设置 SPARK_LLM_API_KEY（平台管家账号的 Token 商城 API Key，" +
+					LLMGatewayKeyPrefix + "…）；暂不开放可设 SPARK_BUTLER=off")
 			}
 		} else {
 			// 开发环境没显式要求开启管家：自动关闭而不是拒绝启动，免得 make run / platform admin 开箱即失败

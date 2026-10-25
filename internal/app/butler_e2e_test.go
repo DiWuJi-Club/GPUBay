@@ -549,14 +549,16 @@ func TestButlerRenewTwiceOneOrder(t *testing.T) {
 		t.Fatalf("after approve: orders %d→%d, payments %d→%d, balance %d→%d (price %d)",
 			ordersBefore, orders(), paysBefore, payments(), before, e.balance(), dayPrice)
 	}
-	var kind, idem string
+	// 假时钟下开通单与续费单的 created_at 相同，不能按时间取「最新」：按 kind 取唯一的续费单
+	var idem string
 	var amount int64
-	if err := e.pool.QueryRow(e.ctx, `SELECT kind, amount, coalesce(idempotency_key, '') FROM orders WHERE instance_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1`, id).
-		Scan(&kind, &amount, &idem); err != nil {
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) OVER (), amount, coalesce(idempotency_key, '') FROM orders
+		WHERE instance_id = $1 AND kind = 'renew'`, id).Scan(&n, &amount, &idem); err != nil {
 		t.Fatal(err)
 	}
-	if kind != "renew" || amount != dayPrice || idem != "butler:"+tcID {
-		t.Fatalf("renew order = %s %d idempotency_key %q, want butler:%s", kind, amount, idem, tcID)
+	if n != 1 || amount != dayPrice || idem != "butler:"+tcID {
+		t.Fatalf("renew orders = %d, amount %d idempotency_key %q, want 1 × %d butler:%s", n, amount, idem, dayPrice, tcID)
 	}
 	var ref string
 	if err := e.pool.QueryRow(e.ctx, `SELECT result_ref FROM butler_tool_calls WHERE id = $1 AND status = 'executed'`, tcID).Scan(&ref); err != nil || ref != id {

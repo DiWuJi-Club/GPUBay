@@ -159,7 +159,7 @@ func (s *Service) Send(ctx context.Context, req SendRequest, sink Sink) (Convers
 	s.log.Info("butler: send", "conversation", conv.ID, "user", req.UserID, "chars", utf8.RuneCountInString(text))
 	sink.Emit(EvStart, StartEvent{ConversationID: conv.ID, MessageID: userMsg.ID})
 
-	runCtx, cancel := s.runContext(ctx)
+	runCtx, cancel := s.runContext()
 	defer cancel()
 	s.runLoop(runCtx, &run{userID: req.UserID, convID: conv.ID, instanceID: req.Context.InstanceID, token: token, ip: req.IP,
 		sink: sink, used: used, limit: st.DailyTokenLimit, secrets: map[string]string{}})

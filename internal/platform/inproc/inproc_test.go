@@ -8,10 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 
 	"spark-cloud/internal/platform/inproc"
 )
@@ -276,5 +279,87 @@ func TestDefaults(t *testing.T) {
 	}
 	if _, err := (&http.Client{Transport: &inproc.Transport{}}).Get("http://x/"); err == nil {
 		t.Fatal("nil handler should fail")
+	}
+}
+
+// 调用方的 ctx 带着外层路由（chi）的请求级值：处理器拿到的请求 ctx 不继承任何调用方的值（与 net/http 服务端一致），
+// 只继承取消与期限。否则外层 chi 的 RouteContext 会让内层 chi 路由按外层路径匹配（404），且外层处理器返回后 chi 回收它 → 数据竞争。
+func TestHandlerCtxHasNoCallerValues(t *testing.T) {
+	gw := chi.NewRouter()
+	type seen struct {
+		val      any
+		deadline time.Time
+		hasDL    bool
+	}
+	got := make(chan seen, 1)
+	gw.Post("/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		dl, ok := r.Context().Deadline()
+		got <- seen{val: r.Context().Value(callerKey{}), deadline: dl, hasDL: ok}
+		_, _ = io.WriteString(w, "gateway ok")
+	})
+	gw.NotFound(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	c := client(http.StripPrefix("/v1", gw))
+
+	api := chi.NewRouter()
+	var status int
+	var text string
+	want := time.Now().Add(time.Minute)
+	api.Route("/api/v1", func(r chi.Router) {
+		r.Post("/butler/conversations/{id}/messages", func(_ http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithDeadline(context.WithValue(r.Context(), callerKey{}, "leak"), want)
+			defer cancel()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://llmgw.internal/v1/chat/completions", nil)
+			resp, err := c.Do(req)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			status, text = resp.StatusCode, string(b)
+		})
+	})
+	rec := httptest.NewRecorder()
+	api.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/butler/conversations/c-1/messages", nil))
+	if status != http.StatusOK || text != "gateway ok" {
+		t.Fatalf("inner router = %d %q, want 200 gateway ok", status, text)
+	}
+	s := recv(t, got, "handler")
+	if s.val != nil || !s.hasDL || !s.deadline.Equal(want) {
+		t.Fatalf("handler ctx: value %v deadline %v %v", s.val, s.deadline, s.hasDL)
+	}
+}
+
+type callerKey struct{}
+
+// 调用方读到最后一段就关闭响应体、处理器还在收尾（网关 [DONE] 之后读掉上游剩余字节、记账）：之后的 Write 失败，
+// 但请求 ctx 在 CloseGrace 内不取消，处理器收尾看到的是未取消的 ctx。
+func TestBodyCloseGraceForCleanup(t *testing.T) {
+	result := make(chan error, 1)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		time.Sleep(100 * time.Millisecond) // 收尾
+		_, werr := io.WriteString(w, "late")
+		if werr == nil {
+			werr = errors.New("write after close succeeded")
+		} else {
+			werr = nil
+		}
+		result <- errors.Join(werr, r.Context().Err())
+	})
+	resp, err := client(h).Get("http://x/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 64)
+	if n, err := resp.Body.Read(b); err != nil || string(b[:n]) != "data: [DONE]\n\n" {
+		t.Fatalf("read = %q %v", b[:n], err)
+	}
+	resp.Body.Close()
+	if err := recv(t, result, "handler cleanup"); err != nil {
+		t.Fatalf("handler cleanup saw %v", err)
+	}
+	if _, err := resp.Body.Read(b); err == nil {
+		t.Fatal("read after close succeeded")
 	}
 }

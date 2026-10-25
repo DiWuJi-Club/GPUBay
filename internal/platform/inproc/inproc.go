@@ -6,11 +6,18 @@
 //
 // 语义尽量贴近 net/http 服务端：
 //   - 处理器看到的请求：RemoteAddr = Transport.RemoteAddr（缺省 127.0.0.1:0）、Host = Transport.Host（缺省请求 URL 的主机）、
-//     URL 只有 Path / RawQuery、RequestURI 已填、Proto HTTP/1.1；请求 ctx 派生自调用方请求的 ctx。
-//   - 调用方取消 ctx 或提前关闭响应体 = 客户端断开：处理器的请求 ctx 被取消，之后的 Write 返回错误。
+//     URL 只有 Path / RawQuery、RequestURI 已填、Proto HTTP/1.1。
+//   - 处理器的请求 ctx 不带调用方 ctx 的任何值（与 net/http 服务端一样；调用方的 chi 路由状态等不会漏进处理器），
+//     只继承取消与期限：调用方 ctx 取消 = 客户端断开，处理器的请求 ctx 随之取消，之后的 Write 返回错误。
+//   - 调用方在处理器返回之前关闭响应体（如读到 SSE 的 [DONE] 就关）：处理器之后的 Write 立即失败；请求 ctx 再保留 CloseGrace，
+//     处理器在此之前返回则不取消——网关在 [DONE] 之后读掉上游剩余字节、记账的收尾不被打断（与真实网络上服务端已写出的字节进了
+//     内核缓冲、不会立刻发现断开相同）；期满仍未返回则取消。
 //   - 处理器第一次 WriteHeader / Write（或返回）时 RoundTrip 返回响应头；之后再改 Header 不影响已返回的响应（与 net/http 相同）。
 //   - 处理器返回时响应体读到 EOF；处理器 panic 时响应体读到错误（http.ErrAbortHandler 之外的 panic 记一条错误日志），进程不崩溃。
 //   - 不支持 Hijack、读写期限（http.ResponseController 的 SetReadDeadline / SetWriteDeadline 返回 http.ErrNotSupported）。
+//   - 管道无缓冲：处理器的 Write 阻塞到调用方读走为止。调用方不读（卡住）也不取消时，处理器一直阻塞在 Write 上——
+//     没有 net/http 的写超时，处理器自己的停机（如网关 Shutdown 取消在途转发后写错误事件）也打断不了它；
+//     只能靠调用方 ctx 的期限 / 取消解除（管家每次模型请求都有 LLMTimeout）。
 package inproc
 
 import (
@@ -24,6 +31,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // Transport 把请求交给 Handler 处理的 http.RoundTripper。零值不可用：Handler 必填。并发安全。
@@ -52,7 +60,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		closeBody(req)
 		return nil, errors.New("inproc: nil Request.URL")
 	}
-	ctx, cancel := context.WithCancel(req.Context())
+	ctx, cancel := handlerContext(req.Context())
 	sreq := req.Clone(ctx)
 	sreq.URL = &url.URL{Path: req.URL.Path, RawPath: req.URL.RawPath, RawQuery: req.URL.RawQuery}
 	sreq.RequestURI = req.URL.RequestURI()
@@ -101,8 +109,10 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 处理器阻塞中的 Write 返回错误（处理器同时从请求 ctx 看到取消）。处理器返回后这个 goroutine 退出。
 	go func() {
 		select {
+		case <-req.Context().Done():
+			_ = pw.CloseWithError(req.Context().Err()) // 写端关闭：调用方读完已写出的内容后得到 ctx 错误，处理器的 Write 得到 io.ErrClosedPipe
 		case <-ctx.Done():
-			_ = pw.CloseWithError(ctx.Err()) // 写端关闭：调用方读完已写出的内容后得到 ctx 错误，处理器的 Write 得到 io.ErrClosedPipe
+			_ = pw.CloseWithError(ctx.Err())
 		case <-done:
 		}
 	}()
@@ -139,6 +149,20 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		_ = pr.Close()
 	}
 	return resp, nil
+}
+
+// handlerContext 返回处理器的请求 ctx：与 net/http 服务端一样不继承调用方 ctx 的任何值，只继承取消（context.AfterFunc）
+// 与期限（调用方 ctx 有 deadline 时照搬）。调用方的值不能漏进处理器：调用方常常本身就在一个 chi 处理器里（管家的控制台 SSE），
+// 它 ctx 里的 chi.RouteContext 会让处理器里的 chi 路由按外层的路由状态匹配（全部 404），外层处理器返回后 chi 还会回收复用
+// 这个 RouteContext，而处理器（如网关收尾记账）可能仍在用它 → 数据竞争。返回的 cancel 取消处理器 ctx 并解除与调用方 ctx 的关联。
+func handlerContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base, cancelDeadline := context.Background(), context.CancelFunc(func() {})
+	if dl, ok := parent.Deadline(); ok {
+		base, cancelDeadline = context.WithDeadline(base, dl)
+	}
+	ctx, cancel := context.WithCancel(base)
+	stop := context.AfterFunc(parent, cancel)
+	return ctx, func() { stop(); cancel(); cancelDeadline() }
 }
 
 func closeBody(req *http.Request) {
@@ -235,7 +259,16 @@ func (w *writer) finish(err error) {
 	_ = w.pw.Close()
 }
 
-// body 是返回给调用方的响应体。Close 早于 EOF = 客户端断开：取消处理器的请求 ctx、让它之后的 Write 失败。
+// CloseGrace：调用方在处理器返回之前关闭响应体后，处理器的请求 ctx 最多再保持这么久才取消（处理器先返回则不取消）。
+// 真实网络上客户端读到 [DONE] 就关连接时，服务端已写出的字节进了内核缓冲、ctx 不会立刻取消，网关得以在 [DONE] 之后
+// 读掉上游剩余字节（llmgw 的 drainTimeout 2 秒）、让节点连接复用；这里给同样的余量。之后处理器再 Write 立即失败
+// （管道读端已关），所以仍在生成的流照样马上发现客户端断开、取消上游。
+const CloseGrace = 2 * time.Second
+
+// errClientClosed 调用方关闭响应体之后处理器再 Write 得到的错误（相当于连接已断开）。
+var errClientClosed = errors.New("inproc: client closed the response body")
+
+// body 是返回给调用方的响应体。Close 早于 EOF = 客户端断开：处理器之后的 Write 失败，请求 ctx 在 CloseGrace 内随处理器返回释放、否则取消。
 type body struct {
 	pr     *io.PipeReader
 	cancel context.CancelFunc
@@ -247,14 +280,24 @@ func (b *body) Read(p []byte) (int, error) { return b.pr.Read(p) }
 
 func (b *body) Close() error {
 	b.once.Do(func() {
+		_ = b.pr.CloseWithError(errClientClosed) // 处理器之后的 Write 返回 errClientClosed；调用方之后的 Read 返回 io.ErrClosedPipe
 		select {
 		case <-b.done: // 处理器已返回：正常读完（或没读完但内容已全部写出）
+			b.cancel()
+			return
 		default:
-			b.cancel() // 处理器还在写：按客户端断开处理
 		}
-		_ = b.pr.Close()
-		// 处理器返回后再释放 ctx（正常路径不提前取消，处理器收尾——如记账——看到的仍是未取消的 ctx）
-		go func() { <-b.done; b.cancel() }()
+		// 处理器还没返回：已写出的内容调用方都读到了（管道无缓冲），处理器多半在收尾（如网关在 [DONE] 后读掉上游剩余字节、记账）。
+		// 给它 CloseGrace 自然结束，期满仍未返回按客户端断开取消 ctx。
+		go func() {
+			t := time.NewTimer(CloseGrace)
+			defer t.Stop()
+			select {
+			case <-b.done:
+			case <-t.C:
+			}
+			b.cancel()
+		}()
 	})
 	return nil
 }

@@ -121,8 +121,11 @@ func (s *Service) release(userID int64) {
 }
 
 // runContext 返回一轮的 ctx：脱离请求 ctx（客户端断开不中断），RunTimeout 后或 Shutdown 时取消。
-func (s *Service) runContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.runTimeout)
+// 不继承请求 ctx 的取消，也不继承它的值：轮次里用到的请求信息（用户、IP、对话）都经 run 显式传递，下游（工具、模型提供方、
+// 进程内网关）不读请求级的 ctx 值；而控制台 chi 处理器的 RouteContext 等值在处理器返回后会被 chi 回收复用，不能带进
+// 可能比处理器活得久的 goroutine（如进程内网关的收尾）。
+func (s *Service) runContext() (context.Context, context.CancelFunc) {
+	c, cancel := context.WithTimeout(context.Background(), s.runTimeout)
 	stop := context.AfterFunc(s.base, cancel)
 	return c, func() { stop(); cancel() }
 }

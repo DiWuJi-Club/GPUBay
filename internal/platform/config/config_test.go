@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"spark-cloud/internal/llm"
 	"spark-cloud/internal/platform/config"
 )
 
@@ -432,14 +433,14 @@ func TestLoadLLMDefaults(t *testing.T) {
 		}
 		return m
 	}
-	// 默认 provider openai；配了 BaseURL 时管家开启、模型 qwen3-32b、输出 2048、价格 0、工具开
+	// 默认 provider openai；配了 BaseURL 时管家开启、模型 qwen3-32b、输出 1024、价格 0、工具开
 	c, err := config.Load(env(base("SPARK_LLM_BASE_URL", "http://token-mall.spark.internal/v1/")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	l := c.ButlerLLM
 	if !c.Butler || c.ButlerOffReason != "" || l.Provider != "openai" || l.BaseURL != "http://token-mall.spark.internal/v1" || l.Model != "qwen3-32b" ||
-		l.MaxOutputTokens != 2048 || l.PriceInCentsPerM != 0 || l.PriceOutCentsPerM != 0 || !l.Tools || l.APIKey != "" {
+		l.MaxOutputTokens != 1024 || l.PriceInCentsPerM != 0 || l.PriceOutCentsPerM != 0 || !l.Tools || l.APIKey != "" {
 		t.Fatalf("llm defaults = %+v butler=%v reason=%q", l, c.Butler, c.ButlerOffReason)
 	}
 	// 模型默认值按 provider
@@ -479,9 +480,9 @@ func TestLoadLLMDefaults(t *testing.T) {
 	// 默认端点（计划 9 网关，进程内）：BaseURL 空 + 网关 on + Key → 管家开启，BaseURL 保持空
 	for _, kv := range [][]string{
 		{"SPARK_LLM_API_KEY", "sk-spark-test"},
-		{"SPARK_ENV", "staging"},                                   // 非生产不强制 Key
-		{"SPARK_BUTLER", "on"},                                     // 开发环境显式开启：没 Key 也开（请求会 401，由使用者负责）
-		{"SPARK_LLM_GATEWAY", "on", "SPARK_LLM_MODEL", "qwen3-4b"}, // 模型 = Token 商城的模型 slug
+		{"SPARK_ENV", "staging", "SPARK_LLM_API_KEY", "sk-spark-test"}, // 开发环境之外必须有 Token 商城 Key
+		{"SPARK_BUTLER", "on"},                                         // 开发环境显式开启：没 Key 也开（请求会 401，由使用者负责）
+		{"SPARK_LLM_GATEWAY", "on", "SPARK_LLM_MODEL", "qwen3-4b"},     // 模型 = Token 商城的模型 slug
 	} {
 		if kv[0] == "SPARK_LLM_GATEWAY" {
 			kv = append(kv, "SPARK_LLM_API_KEY", "sk-spark-test")
@@ -496,9 +497,9 @@ func TestLoadLLMDefaults(t *testing.T) {
 	}
 	// 生产：BaseURL 空 + 网关 on + Key → 进程内网关
 	pm := prodEnv()
-	pm["SPARK_LLM_BASE_URL"] = ""
+	pm["SPARK_LLM_BASE_URL"], pm["SPARK_LLM_API_KEY"] = "", "sk-spark-test"
 	c, err = config.Load(env(pm))
-	if err != nil || !c.Butler || c.ButlerLLM.BaseURL != "" || c.ButlerLLM.APIKey != "test-key" {
+	if err != nil || !c.Butler || c.ButlerLLM.BaseURL != "" || c.ButlerLLM.APIKey != "sk-spark-test" {
 		t.Fatalf("prod in-process: butler=%v base=%q err=%v", c.Butler, c.ButlerLLM.BaseURL, err)
 	}
 	// 生产环境配齐：BaseURL + APIKey
@@ -536,6 +537,10 @@ func TestLoadLLMErrors(t *testing.T) {
 		{"prod openai without base url, gateway off", prod("SPARK_LLM_BASE_URL", "", "SPARK_LLM_GATEWAY", "off"), "SPARK_LLM_BASE_URL"},
 		{"prod without api key", prod("SPARK_LLM_API_KEY", ""), "SPARK_LLM_API_KEY"},
 		{"prod in-process gateway without api key", prod("SPARK_LLM_API_KEY", "", "SPARK_LLM_BASE_URL", ""), "SPARK_LLM_API_KEY"},
+		{"staging in-process gateway without api key", base("SPARK_ENV", "staging"), "SPARK_LLM_API_KEY"},
+		{"staging in-process gateway explicit on without api key", base("SPARK_ENV", "staging", "SPARK_BUTLER", "on"), "SPARK_LLM_API_KEY"},
+		{"dev in-process gateway non token-mall key", base("SPARK_LLM_API_KEY", "sk-ant-secret-value"), "sk-spark-"},
+		{"prod in-process gateway non token-mall key", prod("SPARK_LLM_BASE_URL", "", "SPARK_LLM_API_KEY", "test-key"), "sk-spark-"},
 		{"prod anthropic without api key", prod("SPARK_LLM_PROVIDER", "anthropic", "SPARK_LLM_API_KEY", ""), "SPARK_LLM_API_KEY"},
 		{"base url not http", base("SPARK_LLM_BASE_URL", "token-mall:8000/v1"), "SPARK_LLM_BASE_URL"},
 		{"base url ftp", base("SPARK_LLM_PROVIDER", "anthropic", "SPARK_LLM_BASE_URL", "ftp://x/v1"), "SPARK_LLM_BASE_URL"},
@@ -557,6 +562,14 @@ func TestLoadLLMErrors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "SPARK_LLM_BASE_URL") || strings.Contains(err.Error(), "s3cret-pw") {
 			t.Errorf("%s: err = %v, want SPARK_LLM_BASE_URL error without password", v, err)
 		}
+	}
+	// Key 前缀不对：错误信息不回显 Key
+	if _, err := config.Load(env(base("SPARK_LLM_API_KEY", "sk-ant-secret-value"))); err == nil || strings.Contains(err.Error(), "secret-value") {
+		t.Fatalf("bad prefix err = %v", err)
+	}
+	// 外部端点（BaseURL 非空）不校验前缀
+	if c, err := config.Load(env(base("SPARK_LLM_BASE_URL", "http://x/v1", "SPARK_LLM_API_KEY", "test-key"))); err != nil || !c.Butler {
+		t.Fatalf("external endpoint key: butler=%v err=%v", c.Butler, err)
 	}
 	// prod 关闭管家时不要求 BaseURL / APIKey
 	if c, err := config.Load(env(prod("SPARK_BUTLER", "off", "SPARK_LLM_BASE_URL", "", "SPARK_LLM_API_KEY", ""))); err != nil || c.Butler {
@@ -631,5 +644,12 @@ func TestLoadAppGitMirror(t *testing.T) {
 		if _, err := config.Load(env(base("SPARK_APP_GIT_MIRROR", bad))); err == nil || !strings.Contains(err.Error(), "SPARK_APP_GIT_MIRROR") {
 			t.Fatalf("%q: err = %v", bad, err)
 		}
+	}
+}
+
+// config 不导入 internal/llm，复制了 Token 商城 API Key 的前缀：两者必须一致。
+func TestLLMGatewayKeyPrefixMatchesLLM(t *testing.T) {
+	if config.LLMGatewayKeyPrefix != llm.KeyPrefix {
+		t.Fatalf("config.LLMGatewayKeyPrefix = %q, llm.KeyPrefix = %q", config.LLMGatewayKeyPrefix, llm.KeyPrefix)
 	}
 }

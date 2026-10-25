@@ -52,13 +52,17 @@ func TestBlockJSON(t *testing.T) {
 func TestConstants(t *testing.T) {
 	if MaxUserChars != 2000 || MaxIterations != 8 || MaxToolResultBytes != 16384 || MaxSmallResultBytes != 4096 ||
 		MaxHistoryMessages != 40 || MaxPromptTokens != 60000 || MaxConcurrentRuns != 32 || RetentionDays != 90 ||
-		UsageRetentionDays != 400 || SweepDeleteBatch != 200 || DefaultMaxOutputTokens != 2048 || SendRatePerMinute != 20 ||
+		UsageRetentionDays != 400 || SweepDeleteBatch != 200 || DefaultMaxOutputTokens != 1024 || SendRatePerMinute != 20 ||
 		ListLimit != 50 || TitleRunes != 30 || LLMFailAlertAfter != 5 {
 		t.Fatal("limit constants changed")
 	}
-	if LLMTimeout != 60*time.Second || RunTimeout != 120*time.Second || ReadToolTimeout != 15*time.Second ||
+	if LLMTimeout != 90*time.Second || RunTimeout != 120*time.Second || ReadToolTimeout != 15*time.Second ||
 		WriteToolTimeout != 30*time.Second || ConfirmTTL != 10*time.Minute || StaleRunAfter != 3*time.Minute {
 		t.Fatal("timeouts changed")
+	}
+	// 单次模型请求在整轮之内；清扫器接管运行中轮次的时长 > 整轮 + 已批准写工具（正常收尾的轮次不会被误判为崩溃）
+	if LLMTimeout >= RunTimeout || StaleRunAfter <= RunTimeout+WriteToolTimeout {
+		t.Fatalf("timeout ordering: LLM %v run %v write %v stale %v", LLMTimeout, RunTimeout, WriteToolTimeout, StaleRunAfter)
 	}
 	if s := DefaultSettings(); !s.Enabled || s.DailyTokenLimit != 300000 || s.MaxTurns != 60 || s.Notice != "" || s.UpdatedBy != nil {
 		t.Fatalf("default settings = %+v", s)

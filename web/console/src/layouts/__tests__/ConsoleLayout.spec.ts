@@ -79,11 +79,16 @@ describe('ConsoleLayout AI 管家入口', () => {
     expect($('tabbar-butler')!.textContent!.trim()).toBe('管家')
     expect($('tabbar-butler')!.getAttribute('href')).toBe('/butler')
     expect($('butler-launcher')).toBeNull()
-    // 管家开启时 7 个标签（计划 9 的 Token 商城在最后），短名最多三个汉字（320px 宽每格约 45px）
+    // 管家开启时 7 个标签（计划 9 的 Token 商城在最后），短名最多三个汉字（320px 宽每格约 45px）：
+    // 按半角宽度算（汉字 2、其它 1）不超过 6，即 ≤ 3 个汉字或 ≤ 6 个半角字符（「Token」= 5）
     const tabs = [...document.querySelectorAll('[data-testid^="tabbar-"]')]
     expect(tabs.map((t) => t.getAttribute('data-testid'))).toEqual(
       ['tabbar-market', 'tabbar-workflows', 'tabbar-instances', 'tabbar-butler', 'tabbar-wallet', 'tabbar-account', 'tabbar-tokens'])
-    for (const t of tabs) expect(Array.from(t.textContent!.trim()).length).toBeLessThanOrEqual(5)
+    for (const t of tabs) {
+      const chars = Array.from(t.textContent!.trim())
+      const width = chars.reduce((w, c) => w + (/\p{Script=Han}/u.test(c) ? 2 : 1), 0)
+      expect(width, t.textContent!).toBeLessThanOrEqual(6)
+    }
   })
 })
 

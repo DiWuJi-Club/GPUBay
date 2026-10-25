@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wechatpay-apiv3/wechatpay-go/utils"
@@ -414,11 +415,24 @@ const ButlerGatewayBaseURL = "http://llmgw.internal/v1"
 // butlerGatewayClient 返回进程内调用 Token 商城网关的 HTTP 客户端：请求直接交给网关的处理器（流式逐块回传、ctx 取消即客户端断开），
 // 对网关而言与一个来自 127.0.0.1、Host 为平台域名的外部请求相同——同样鉴权（SPARK_LLM_API_KEY）、限流、预检与计费。
 // 不经过公网 http.Server：没有它的读写超时，期限由管家自己的 ctx（LLMTimeout）与网关的总超时约束。
+// 网关的请求 ctx 不带管家请求 ctx 的值（inproc 保证；这里再把 chi 的路由状态清掉作双保险）：管家的轮次在控制台
+// POST /api/v1/butler/... 的 chi 处理器里跑，外层的 chi.RouteContext 漏进网关的 chi 路由会让它按外层路径匹配（全部 404），
+// 控制台处理器返回后 chi 还会回收它，而网关的收尾（记账）可能仍在用 → 数据竞争。
+// 停机：网关 Shutdown 取消在途转发后要往管家写错误事件，进程内管道无缓冲，管家若此时不读（卡住），网关的这次 Write 就一直阻塞、
+// Shutdown 等不到它记完账——Shutdown 打断不了一个卡住的进程内读者；上限是管家这次模型请求的 LLMTimeout（到期管家取消 ctx，
+// 网关的 Write 随即失败）。cmd/platform 停机时 Butler.Shutdown 与网关 Shutdown 并发，前者立即取消所有轮次（管家的模型请求 ctx
+// 随之取消、管道关闭），所以通常不会遇到。
 func butlerGatewayClient(gw *llmgw.Server, host string, log *slog.Logger) *http.Client {
 	if host == "" {
 		host = "llmgw.internal"
 	}
-	h := http.StripPrefix("/v1", gw.Router()) // 与 api.Server 的 r.Mount("/v1", …) 等价
+	strip := http.StripPrefix("/v1", gw.Router()) // 与 api.Server 的 r.Mount("/v1", …) 等价
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(chi.RouteCtxKey) != nil {
+			r = r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, nil))
+		}
+		strip.ServeHTTP(w, r)
+	})
 	return &http.Client{Transport: &inproc.Transport{Handler: h, Host: host, Log: log}}
 }
 

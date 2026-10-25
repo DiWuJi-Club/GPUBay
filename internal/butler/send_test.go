@@ -607,3 +607,34 @@ func TestDeleteAndList(t *testing.T) {
 		t.Fatalf("status = %+v err = %v", st, err)
 	}
 }
+
+// ctxProvider 记下模型请求 ctx 里有没有请求级的值，以及有没有期限。
+type ctxProvider struct {
+	funcProvider
+	sawValue, hasDeadline bool
+}
+
+type reqKey struct{}
+
+func (p *ctxProvider) Chat(ctx context.Context, req llm.Request, emit func(llm.Event)) error {
+	p.sawValue = ctx.Value(reqKey{}) != nil
+	_, p.hasDeadline = ctx.Deadline()
+	emitText(emit, "好的")
+	return nil
+}
+
+// 轮次 ctx 不继承请求 ctx 的值（控制台 chi 处理器的 RouteContext 等会在处理器返回后被回收，且会让进程内网关的路由按外层路径匹配），
+// 模型请求的 ctx 有期限（LLMTimeout）。
+func TestRunContextDropsRequestValues(t *testing.T) {
+	e := newEnv(t)
+	p := &ctxProvider{}
+	e.svc.d.Provider = p
+	ctx := context.WithValue(context.Background(), reqKey{}, "chi-route-ctx")
+	sink := &sliceSink{}
+	if _, err := e.svc.Send(ctx, SendRequest{UserID: e.owner, IP: "1.2.3.4", ConversationID: "new", Text: "你好"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if p.sawValue || !p.hasDeadline || sink.text() != "好的" {
+		t.Fatalf("provider ctx: value %v deadline %v; text %q", p.sawValue, p.hasDeadline, sink.text())
+	}
+}

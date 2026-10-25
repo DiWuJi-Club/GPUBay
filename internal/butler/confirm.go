@@ -112,7 +112,7 @@ func (s *Service) Confirm(ctx context.Context, userID int64, ip, convID, tcID st
 	sink.Emit(EvStart, StartEvent{ConversationID: conv.ID})
 
 	// 续跑不检查每日预算（预算只在 Send 开始时判断，一轮内允许超出）。
-	runCtx, cancel := s.runContext(ctx)
+	runCtx, cancel := s.runContext()
 	defer cancel()
 	r := &run{userID: userID, convID: conv.ID, instanceID: conv.Context.InstanceID, token: token, ip: ip, sink: sink,
 		used: used, limit: st.DailyTokenLimit, secrets: map[string]string{}}

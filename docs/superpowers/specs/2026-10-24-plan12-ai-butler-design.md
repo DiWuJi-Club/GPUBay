@@ -85,7 +85,7 @@
 | # | 裁定 | 理由 |
 |---|---|---|
 | D1 | 默认 LLM 提供方 `openai`（计划 9 内网端点），默认模型名 `qwen3-32b`（以计划 9 实际服务的模型名为准，配置项覆盖）；`anthropic` 模式默认 `claude-opus-5-5`、`effort = low`、不开 `fallbacks`；`SPARK_LLM_PROVIDER=mock` 在 `prod` 启动报错 | 见 §1.1 第 3 条；Claude Opus 5.5 是当前默认模型，低 effort 足够做对话 + 工具调度 |
-| D2 | 每用户每日预算 **300,000 token**（输入 + 输出合计，含工具结果）；每对话 ≤ 60 条用户消息；用户消息 ≤ 2000 字符；每轮工具迭代 ≤ 8；LLM 单次请求超时 60 秒、整轮 120 秒；每用户同时 1 轮，全局 32 轮；全部写在 `butler_settings`（预算、轮数、总开关）或常量里 | 32B 模型一轮带工具结果约 5～15k token，300k ≈ 每天 20～60 轮，够正常用、刷不出事；Claude 模式 300k ≈ ¥10/天的上限 |
+| D2 | 每用户每日预算 **300,000 token**（输入 + 输出合计，含工具结果）；每对话 ≤ 60 条用户消息；用户消息 ≤ 2000 字符；每轮工具迭代 ≤ 8；LLM 单次请求超时 90 秒（修订：原 60 秒，真实节点流式约 20～30 token/s）、整轮 120 秒；每用户同时 1 轮，全局 32 轮；全部写在 `butler_settings`（预算、轮数、总开关）或常量里 | 32B 模型一轮带工具结果约 5～15k token，300k ≈ 每天 20～60 轮，够正常用、刷不出事；Claude 模式 300k ≈ ¥10/天的上限 |
 | D3 | 工具集 23 个（§4）：15 个读工具（含辅助的 `generate_secret`）自动执行；8 个写工具（下单、续费、释放、取消预订、部署、重新部署、停止 / 启动、卸载）全部走确认卡 | 见 §1.1 第 2 条 |
 | D4 | 管家**不做**：改密码 / 查看密码、SSH 公钥、端口公开 / 删除、自动续费开关、充值、实名、邀请返利操作；遇到这些需求给出对应页面链接 | 见 §1.2 最后一条 |
 | D5 | 确认卡 **10 分钟**过期；同一对话同时只能有 1 个待确认；用户拒绝时把「用户已拒绝」作为工具结果回给模型让它收尾；过期同理 | 防止用户几小时后误点旧卡；模型需要知道结果才能给出合理的下一步 |
@@ -235,13 +235,13 @@ type Provider interface {
 
 - 工具参数在 `tool_use` 事件里是**完整**的 JSON（适配器自己拼接增量），`Run` 不处理半截参数。
 - `Chat` 返回的 `error` 分类：`*llm.UnavailableError`（连接 / 5xx / 超时 → D16）、`*llm.RequestError`（4xx，配置错误，记日志 + 当作不可用）、`ctx.Err()`。
-- 每次请求的 `MaxTokens` = 2048（`SPARK_LLM_MAX_OUTPUT_TOKENS`）。
+- 每次请求的 `MaxTokens` = 1024（`SPARK_LLM_MAX_OUTPUT_TOKENS`；修订：原 2048，按真实节点输出速度与 90 秒请求超时下调）。
 
 ### 3.2 `openai` 适配器（默认）
 - `POST {base}/chat/completions`，`Authorization: Bearer <SPARK_LLM_API_KEY>`，body：`model, messages, tools: [{type: function, function: {name, description, parameters}}], tool_choice: "auto", stream: true, stream_options: {include_usage: true}, max_tokens, temperature: 0.2`。
 - 消息映射：`System` → `{role: system}`；`tool_use` 块 → assistant `tool_calls[{id, type: function, function: {name, arguments: <JSON 字符串>}}]`；`tool_result` 块 → `{role: tool, tool_call_id, content}`。
 - SSE 解析：按行 `data: {...}`，`[DONE]` 结束；`choices[0].delta.content` → `text_delta`；`delta.tool_calls[i]` 按 `index` 累积 `id / function.name / function.arguments`，在 `finish_reason` 出现时逐个发 `tool_use`（参数 `json.Valid` 不过 → 该调用以错误结果回填「参数不是合法 JSON」，不中断）；`usage` 字段（最后一个 chunk）→ `usage`；`finish_reason: tool_calls → tool_use`，`stop → end_turn`，`length → max_tokens`。
-- 响应体单行 ≤ 1MB、总时长 ≤ 60 秒（ctx）；非 2xx：读 ≤ 4KB 错误体记日志，5xx / 连接错误 → `UnavailableError`，4xx → `RequestError`。
+- 响应体单行 ≤ 1MB、总时长 ≤ 90 秒（ctx，LLMTimeout）；非 2xx：读 ≤ 4KB 错误体记日志，5xx / 连接错误 → `UnavailableError`，4xx → `RequestError`。
 - 使用 `net/http`，不引入 SDK（端点是我们自己的）。
 
 ### 3.3 `anthropic` 适配器（可选）
@@ -383,11 +383,11 @@ event: error      data: {"code":"butler_llm_unavailable","message":"…"}
 | 每轮工具迭代 | 8 | `MaxIterations` |
 | 工具结果上限 | 16KB（日志）/ 4KB（其它） | `MaxToolResultBytes` |
 | 历史窗口 | 40 条 / 60k token 估算 | `MaxHistoryMessages / MaxPromptTokens` |
-| LLM 请求 / 整轮 / 读工具 / 写工具超时 | 60s / 120s / 15s / 30s | 常量 |
+| LLM 请求 / 整轮 / 读工具 / 写工具超时 | 90s / 120s / 15s / 30s | 常量（LLM < 整轮；StaleRunAfter 3 分钟 > 整轮 + 写工具） |
 | 每用户并发 / 全局并发 | 1 / 32 | 进程内 |
 | 确认卡过期 | 10 分钟 | `ConfirmTTL` |
 | 保留 | 90 天 | `RetentionDays` |
-| 单次输出 token | 2048 | `SPARK_LLM_MAX_OUTPUT_TOKENS` |
+| 单次输出 token | 1024 | `SPARK_LLM_MAX_OUTPUT_TOKENS` |
 
 token 估算（无 provider 用量时，如 mock 或端点不回 usage）：`len([]rune(text)) / 2 + 常数`；有 `usage` 以 usage 为准。后台用量页同时显示 token 与「估算费用」（`SPARK_LLM_PRICE_INPUT_CENTS_PER_M / SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M`，默认 0 / 0；Claude 模式按实际价填）。
 
@@ -481,7 +481,7 @@ token 估算（无 provider 用量时，如 mock 或端点不回 usage）：`len
 | `SPARK_LLM_BASE_URL` | URL | `openai`：空 = 本进程的计划 9 网关（进程内调用，需 `SPARK_LLM_GATEWAY=on`；计划 9 合入后的实现裁定）；填写 = 外部 OpenAI 兼容端点；`anthropic` 可空（SDK 默认） |
 | `SPARK_LLM_API_KEY` | 字符串 | `openai` / `anthropic` 必填（`prod`），dev 可空 |
 | `SPARK_LLM_MODEL` | 模型名 | 默认：openai `qwen3-32b`、anthropic `claude-opus-5-5` |
-| `SPARK_LLM_MAX_OUTPUT_TOKENS` | 2048 | |
+| `SPARK_LLM_MAX_OUTPUT_TOKENS` | 1024 | |
 | `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` | 0 / 0 | 用量页估算费用（分 / 百万 token） |
 | `SPARK_BUTLER` | `on` / `off` | 默认 on；off 时不注册路由、不显示入口（与 `butler_settings.enabled` 不同：这是部署级开关） |
 

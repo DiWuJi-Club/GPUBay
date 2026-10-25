@@ -82,7 +82,16 @@ type sinkEvent struct {
 
 func (s chanSink) Emit(name string, v any) { s.ch <- sinkEvent{name, v} }
 
-func TestButlerUsesInProcessGateway(t *testing.T) {
+// butlerGW 是 AI 管家走进程内网关的测试环境：平台管家账号（有 Key、有余额）、上线的模型与一个假节点。
+type butlerGW struct {
+	*llmEnv
+	butlerUID, keyID int64
+	model            llm.Model
+	node             *gatedNode
+}
+
+func newButlerGW(t *testing.T) *butlerGW {
+	t.Helper()
 	var butlerUID, keyID int64
 	e := newLLMEnvWith(t, 1, func(pool *pgxpool.Pool, cfg *config.Config, _ *app.Options) {
 		// 运维事先准备的「平台管家账号」：已实名、有 Token 商城账户与一把 API Key（这里直接写库，等价于控制台创建）
@@ -108,6 +117,12 @@ func TestButlerUsesInProcessGateway(t *testing.T) {
 	e.setDefault(node)
 	e.seedNode(m.ID, e.machines[0])
 	e.refresh()
+	return &butlerGW{llmEnv: e, butlerUID: butlerUID, keyID: keyID, model: m, node: node}
+}
+
+func TestButlerUsesInProcessGateway(t *testing.T) {
+	g := newButlerGW(t)
+	e, node, m, butlerUID, keyID := g.llmEnv, g.node, g.model, g.butlerUID, g.keyID
 	endUser := dbtest.CreateUser(t, e.pool, "13900008888", true)
 
 	sink := chanSink{ch: make(chan sinkEvent, 64)}
@@ -213,5 +228,57 @@ func TestButlerUsesInProcessGateway(t *testing.T) {
 	}
 	if bIn != 1200 || bOut != 30 {
 		t.Fatalf("butler_usage = %d / %d", bIn, bOut)
+	}
+}
+
+// 回归（真机验收发现）：经控制台 HTTP 接口 POST /api/v1/butler/conversations/new/messages 发一轮。轮次在控制台 chi 处理器里跑，
+// 外层的 chi.RouteContext 曾经随请求 ctx 漏进进程内网关的 chi 路由 → 网关按外层路径匹配、每轮都 404（直接调 Butler.Send 测不出来）；
+// 控制台处理器返回后 chi 回收这个 RouteContext，而网关还在收尾记账 → 数据竞争（-race 下报错）。
+func TestButlerHTTPTurnThroughInProcessGateway(t *testing.T) {
+	g := newButlerGW(t)
+	close(g.node.release) // 节点一口气回完
+	u := g.newUser(0)
+	for i, text := range []string{"你好", "再说一次"} {
+		path := "/butler/conversations/new/messages"
+		if i > 0 {
+			// 第二轮在同一对话里：路径参数 {id} 是真实的对话 ID
+			var conv string
+			g.scalar(&conv, `SELECT id FROM butler_conversations WHERE user_id = $1`, u.id)
+			path = "/butler/conversations/" + conv + "/messages"
+		}
+		code, raw := u.c.sse(path, map[string]any{"text": text})
+		if code != http.StatusOK {
+			t.Fatalf("turn %d = %d %s", i, code, raw)
+		}
+		evs, err := parseSSE(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var deltas strings.Builder
+		var done bool
+		for _, ev := range evs {
+			switch ev.name {
+			case butler.EvDelta:
+				deltas.WriteString(ev.data["text"].(string))
+			case butler.EvError:
+				t.Fatalf("turn %d: error event %v", i, ev.data)
+			case butler.EvDone:
+				done = true
+			}
+		}
+		if deltas.String() != "你好，世界" || !done {
+			t.Fatalf("turn %d: text %q done %v; raw %s", i, deltas.String(), done, raw)
+		}
+		g.waitUsage(g.butlerUID, i+1) // 网关照常鉴权、转发、记账（管家账号的 Key）
+	}
+	var ok int
+	g.scalar(&ok, `SELECT count(*) FROM llm_usage WHERE user_id = $1 AND key_id = $2 AND status = $3`, g.butlerUID, g.keyID, llm.UsageOK)
+	if ok != 2 {
+		t.Fatalf("ok usage rows = %d", ok)
+	}
+	var bOut int64
+	g.scalar(&bOut, `SELECT output_tokens FROM butler_usage WHERE user_id = $1`, u.id)
+	if bOut != 60 {
+		t.Fatalf("butler_usage output = %d", bOut)
 	}
 }

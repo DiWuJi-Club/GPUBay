@@ -29,7 +29,7 @@ import (
 // 请求体按字段严格解析：未知字段（拼错的键）→ 400，免得用例静默地没生效。
 
 // maxChunkDelayMS 是 reply.chunk_delay_ms 的上限；mock 每 8 个字符（rune）一段、每段后停一次，
-// 所以还限制整条回复的总停顿 ≤ maxTotalDelay（远小于单次模型请求超时 LLMTimeout 60 秒，否则这一轮会按模型超时失败）。
+// 所以还限制整条回复的总停顿 ≤ maxTotalDelay（远小于单次模型请求超时 LLMTimeout 90 秒，否则这一轮会按模型超时失败）。
 const (
 	maxChunkDelayMS = 5000
 	maxTotalDelay   = 30 * time.Second

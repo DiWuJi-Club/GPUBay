@@ -14,13 +14,13 @@ const (
 	RetentionDays          = 90    // 对话保留天数（按 updated_at）
 	UsageRetentionDays     = 400   // butler_usage 保留天数
 	SweepDeleteBatch       = 200   // 清扫器每批删除的对话数
-	DefaultMaxOutputTokens = 2048  // 单次输出 token（SPARK_LLM_MAX_OUTPUT_TOKENS 的默认值）
+	DefaultMaxOutputTokens = 1024  // 单次输出 token（SPARK_LLM_MAX_OUTPUT_TOKENS 的默认值）
 	SendRatePerMinute      = 20    // 每用户每分钟发消息次数
 	ListLimit              = 50    // 对话列表默认条数
 	TitleRunes             = 30    // 对话标题取首条用户消息的前 N 个字
 	LLMFailAlertAfter      = 5     // 连续 LLM 失败次数达到后告警 butler_llm_unavailable
 
-	LLMTimeout       = 60 * time.Second  // 单次模型请求
+	LLMTimeout       = 90 * time.Second  // 单次模型请求（真实节点流式约 20～30 token/s：1024 token 约 35～50 秒，留余量；须 < RunTimeout）
 	RunTimeout       = 120 * time.Second // 整轮（脱离请求 ctx）
 	ReadToolTimeout  = 15 * time.Second
 	WriteToolTimeout = 30 * time.Second
