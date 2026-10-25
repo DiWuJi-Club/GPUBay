@@ -70,6 +70,11 @@ export default defineConfig({
   // privateApp 建自己的已上架应用，结束时改为已退役，不动共享的四个 fake 应用。A-APP-04 新建一个启用的镜像，并用
   // hooks.agent({images}) 把所有在线 fake Agent 的已缓存镜像整体设为它（覆盖率断言要求全部在线机器都上报过）；
   // A-MCH-10 只设自己那台机器。
+  // 计划 12 的 AI 管家用例（C-BOT / A-BOT）：e2e-server 用 mock 模型。回复尽量用 hooks.butlerReply 注入确定性的一轮
+  // （不依赖 mock 规则的顺序）；只有测规则流程本身的用例（推荐、部署 vLLM、续费 / 释放、日志诊断、日志注入）走关键词规则。
+  // 每个用例新建用户，beforeEach（helpers/butler.ts resetButler）清空回复队列并把设置恢复默认；A-BOT-03 关闭管家后在 finally 里恢复。
+  // C-BOT-06 / C-BOT-08 推进 11 分钟（确认卡过期），C-BOT-09 推进 1 天（额度次日恢复）；C-BOT-07 / 08、A-BOT-02 的失败部署
+  // 用 helpers/apps.ts privateApp 的私有应用，由 cleanupApps 卸载并退役。按日合计 / 仪表盘是全站数字，只与接口值或增量比对。
   projects: [
     {
       name: 'console-desktop',

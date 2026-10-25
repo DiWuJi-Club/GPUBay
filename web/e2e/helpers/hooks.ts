@@ -89,4 +89,26 @@ export const hooks = {
   appsTick(n = 1) {
     return post<{ rounds: number; processed: number }>('/hooks/apps/tick', { n })
   },
+  /** AI 管家（计划 12）：把一轮确定性回复放进 mock 提供方的队列（队列优先于 mock 规则，一条用一次）。
+   *  error: true → 下一次模型调用返回「不可用」（不能再带其它字段）；usage 缺省 → mock 默认 1000 / 100；
+   *  chunk_delay_ms：每 8 个字符停顿一次（0～5000），用来观察流式输出。 */
+  butlerReply(reply: ButlerReply) {
+    return post<{ queued: number }>('/hooks/butler/reply', reply)
+  },
+  /** 清空尚未用掉的 mock 回复队列（每个用例开始前调用，免得上一个用例剩下的回复串过来）。 */
+  butlerReset() {
+    return post<{ queued: number }>('/hooks/butler/reset', {})
+  },
+  /** 直接累加某用户某天（缺省假时钟的今天，北京时间）的管家用量，返回累加后的行。 */
+  butlerUsage(opts: { user_id: number; day?: string; input_tokens?: number; output_tokens?: number; requests?: number; tool_calls?: number; failures?: number }) {
+    return post<{ day: string; input_tokens: number; output_tokens: number; requests: number; tool_calls: number; failures: number }>('/hooks/butler/usage', opts)
+  },
+  /** 改管家设置（与后台保存同一校验，系统审计）并让设置缓存失效；{defaults: true} 先回到默认设置再合并其余字段。 */
+  butlerSettings(opts: { defaults?: boolean; enabled?: boolean; daily_token_limit?: number; max_turns?: number; notice?: string }) {
+    return post<{ enabled: boolean; daily_token_limit: number; max_turns: number; notice: string }>('/hooks/butler/settings', opts)
+  },
 }
+
+export type ButlerReply =
+  | { text?: string; tool_calls?: { name: string; args?: Record<string, unknown> }[]; usage?: { input_tokens: number; output_tokens: number }; chunk_delay_ms?: number }
+  | { error: true }
