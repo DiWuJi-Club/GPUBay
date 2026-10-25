@@ -6,6 +6,11 @@ import "fmt"
 func AlertContainerDown(serial, instanceID string) string {
 	return fmt.Sprintf("机器 %s 上实例 %s 的容器未在运行", serial, instanceID)
 }
+
+// AlertSystemContainerDown 系统实例（Token 服务节点）的容器未在运行：llm Controller 会自动重建节点，不需要换机或退款。
+func AlertSystemContainerDown(serial, instanceID string) string {
+	return fmt.Sprintf("机器 %s 上实例 %s：平台节点容器异常，节点将自动重建", serial, instanceID)
+}
 func AlertContainerMissing(serial, instanceID string) string {
 	return fmt.Sprintf("机器 %s 上实例 %s 的容器已不存在", serial, instanceID)
 }

@@ -243,7 +243,7 @@ func (s *Service) FailTimedOutCommands(ctx context.Context) (int, error) {
 
 // ResumeMachine 机器恢复在线后，只对容器确实在运行（runningIDs）的暂停实例补回时长并重算提醒标记
 // （到期 = resumeBase + 冻结的剩余时长：预订实例在开始时刻前恢复，仍到 S + 已付时长）；
-// 其余暂停实例保持暂停并告警 container_down，由管理员换机或退款。
+// 其余暂停实例保持暂停并告警 container_down，由管理员换机或退款（系统实例只 warning，由 llm Controller 重建节点）。
 func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs []string) (int, error) {
 	now := s.d.Clock.Now()
 	n := 0
@@ -259,8 +259,7 @@ func (s *Service) ResumeMachine(ctx context.Context, machineID int64, runningIDs
 		}
 		for _, inst := range list {
 			if !slices.Contains(runningIDs, inst.ID) {
-				if err := s.d.Fleet.RaiseAlertOnce(ctx, tx, fleet.Alert{Level: "critical", Kind: "container_down",
-					MachineID: machineID, InstanceID: inst.ID, Message: AlertContainerDown(m.Serial, inst.ID)}); err != nil {
+				if err := s.d.Fleet.RaiseAlertOnce(ctx, tx, containerDownAlert(m.Serial, machineID, inst.ID, inst.System)); err != nil {
 					return err
 				}
 				continue
