@@ -3,7 +3,7 @@
 -- 内部应用（apps.internal）、模型 / 节点 / 账户 / API Key / 结算 / 用量明细 / 按天汇总、钱包流水类型 llm_pay。
 -- Down 在以下情况拒绝：仍有 Token 消费流水（wallet_ledger kind='llm_pay'，流水只追加）；仍有非终态节点（请先在后台下线）；
 -- 仍有未结束的系统实例（节点已 failed / removed 但 ReleaseSystem 尚未洗完）。
--- Down 保留系统账号行与池机组行（前者仍无法登录，后者变成普通不可见机组）；因此 Up 对这两行按唯一键 upsert，往返可重放。
+-- Down 保留系统账号行与池机组行（前者封禁且仍无法登录，后者变成普通不可见机组）；因此 Up 对这两行按唯一键 upsert，往返可重放。
 -- 注意：若运营此前恰好手工建过名为「Token 服务池」的机组，Up 会把它接管为池（purpose='llm'、不可见）。
 
 -- 系统账号与系统实例
@@ -215,5 +215,6 @@ ALTER TABLE machine_groups DROP COLUMN purpose;
 -- 系统实例若仍存在，前面已因节点检查拒绝
 DROP INDEX instances_system_live_idx;
 ALTER TABLE instances DROP COLUMN system;
--- 系统账号行保留（phone 不满足登录正则，仍无法登录）
+-- 系统账号行保留（phone 不满足登录正则，仍无法登录）；先封禁，去掉 system 列后它就是一个惰性的普通行（再 Up 时 upsert 回 active）
+UPDATE users SET status = 'banned', updated_at = now() WHERE system;
 ALTER TABLE users DROP COLUMN system;

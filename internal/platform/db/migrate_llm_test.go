@@ -146,8 +146,11 @@ func TestMigration00022RoundTrip(t *testing.T) {
 		t.Fatalf("old ledger after down = %d", n)
 	}
 	// 系统账号与池机组行保留
-	if n := count(`SELECT count(*) FROM users WHERE phone = 'system:llm'`); n != 1 {
-		t.Fatalf("system user row after down = %d", n)
+	if n := count(`SELECT count(*) FROM users WHERE phone = 'system:llm' AND status = 'banned'`); n != 1 {
+		t.Fatalf("banned system user row after down = %d", n)
+	}
+	if n := count(`SELECT count(*) FROM users WHERE phone = '13800000001' AND status = 'active'`); n != 1 {
+		t.Fatalf("ordinary user touched by down = %d", n)
 	}
 	if n := count(`SELECT count(*) FROM machine_groups WHERE name = 'Token 服务池' AND NOT visible`); n != 1 {
 		t.Fatalf("pool group row after down = %d", n)
@@ -155,7 +158,7 @@ func TestMigration00022RoundTrip(t *testing.T) {
 
 	// 再 Up：两行按唯一键 upsert，不重复
 	upByOne()
-	if n := count(`SELECT count(*) FROM users WHERE phone = 'system:llm' AND system`); n != 1 {
+	if n := count(`SELECT count(*) FROM users WHERE phone = 'system:llm' AND system AND status = 'active'`); n != 1 {
 		t.Fatalf("system user after re-up = %d", n)
 	}
 	if n := count(`SELECT count(*) FROM machine_groups WHERE purpose = 'llm' AND NOT visible`); n != 1 {
