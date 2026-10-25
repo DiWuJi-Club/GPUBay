@@ -7,7 +7,7 @@ import { ElMessage } from 'element-plus'
  */
 export async function writeClipboard(text: string, doc: Document = document): Promise<boolean> {
   const nav = doc.defaultView?.navigator
-  if (nav?.clipboard && doc.defaultView?.isSecureContext) {
+  if (nav?.clipboard) {
     try {
       await nav.clipboard.writeText(text)
       return true
