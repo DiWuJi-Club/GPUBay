@@ -65,3 +65,10 @@
 - 计划 7 观察 O-6（容器内 vLLM 日志打印 `api_key`）：节点 vLLM 的密钥经环境变量 `VLLM_API_KEY` 传入，不进 argv（I6），检查点 A 在 `/proc/<pid>/cmdline` 与部署日志尾部都查不到节点密钥。
 - 计划 8 返利基数只含 `order_pay`：Token 消费不产生返利，见上。
 - 计划 8「没有 `TestInvariantsAgainstDevDB`」：计划 9 实现了 `internal/llm` 的 `TestInvariantsAgainstDevDB`（设 `SPARK_DATABASE_URL` 时连库只读核对，不设时跳过），检查点 A / B 都用它核对过真机数据。计划 8 的返利不变量仍可照此补一个。
+
+## 终审之后（2026-10-25）
+
+- 终审两条重要问题已修（规格 §1.4 I18、I19）：网关强制 `max_output_tokens` 上界、不带 `max_tokens` 时注入、`n / best_of` 计入估算；流式总时限触发时按已输出部分计费。上线前在真机上复核一次：长提示词 + 不带 `max_tokens` 的请求在 vLLM 0.10.1 上不被拒（注入值已按 `context_len − 请求字节数` 封顶）。
+- `vllm-node` 的 `spec.json`（`MODEL_ID` 格式收紧）在终审中改过但版本号仍是 1.0.0：本计划尚未上线，生产首次导入不受影响；验收用的 `spark_p9` 克隆库若要重新导入需提版本号。
+- 与计划 10 / 11 合并时发现（不属本计划、未改）：`internal/comfywf` 的 `runs.go` 构造上游拨号目标时没带实例 SSH 端口，目前默认端口相同所以无影响，真正启用按实例端口后需要补上。
+- e2e：控制台钱包页没有流水类型筛选，`C-WAL-06` 校验的是「Token 消费」标签，筛选在后台流水页（A-LLM-07）覆盖；10 分钟定时结算只在 Go 集成测试里覆盖（e2e 用 ¥1 阈值触发）。
