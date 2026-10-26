@@ -38,59 +38,8 @@ func (s *Service) PlaceSystem(ctx context.Context, req SystemPlaceRequest) (Inst
 	var out Instance
 	err := withRetry(func() error {
 		return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-			now := s.d.Clock.Now()
-			var productID int64
-			// 机组必须就是 Token 服务池（purpose='llm'）：调用方传错机组也不能把普通机组的机器拿去建节点
-			err := tx.QueryRow(ctx, `SELECT product_id FROM machines WHERE id = $1 AND group_id = $2 AND state = 'idle' AND agent_online
-				AND EXISTS (SELECT 1 FROM machine_groups g WHERE g.id = $2 AND g.purpose = 'llm')
-				FOR NO KEY UPDATE`, req.MachineID, req.GroupID).Scan(&productID)
-			if db.IsNoRows(err) {
-				return apperr.ErrMachineUnavailable
-			}
+			inst, ref, err := s.placeSystemOn(ctx, tx, req, s.d.Clock.Now(), nil)
 			if err != nil {
-				return err
-			}
-			// 加锁之后单独一条语句复核（读已提交：新语句的快照能看到等锁期间别人提交的实例 / lease）
-			lower, upper := now, now.Add(SystemLeaseHorizon)
-			var busy bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM instances
-					WHERE machine_id = $1 AND state IN ('creating', 'running', 'stopped', 'wiping'))
-				OR EXISTS (SELECT 1 FROM machine_leases
-					WHERE machine_id = $1 AND status IN ('reserved', 'active') AND period && tstzrange($2::timestamptz, $3::timestamptz))`,
-				req.MachineID, lower, upper).Scan(&busy); err != nil {
-				return err
-			}
-			if busy {
-				return apperr.ErrMachineUnavailable
-			}
-			ref, err := s.d.Catalog.ImageRef(ctx, tx, req.ImageID)
-			if err != nil {
-				return err
-			}
-			hostPub, hostPEM, err := s.d.HostKeyGen()
-			if err != nil {
-				return err
-			}
-			if _, err := s.d.Fleet.MarkAllocated(ctx, tx, req.MachineID); err != nil {
-				return err
-			}
-			id := randx.ID("ins-", 8)
-			inst, err := scanInstance(tx.QueryRow(ctx, `INSERT INTO instances
-				(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, password_auth, ssh_host_pubkey, ssh_host_key_enc,
-				 group_id, system, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, 'creating', 0, $6, false, $7, $8, $9, true, $10, $10) RETURNING `+instanceCols,
-				id, s.d.SystemUserID, req.MachineID, productID, req.ImageID, s.d.Box.Seal([]byte(randx.Password(16))), hostPub, s.d.Box.Seal(hostPEM),
-				req.GroupID, now))
-			if err != nil {
-				return err
-			}
-			if _, err := insertLease(ctx, tx, req.MachineID, inst.ID, lower, upper, "active", now); err != nil {
-				if db.IsExclusionViolation(err) { // 复核之后别的事务才提交的时段（理论上被机器行锁挡住，兜底）
-					return apperr.ErrMachineUnavailable
-				}
-				return err
-			}
-			if err := recordEvent(ctx, tx, inst.ID, "", StateCreating, "system instance for "+req.Note, now); err != nil {
 				return err
 			}
 			// 与其它开通路径同一形态的 Create 指令（计划 10：显式 ssh_port、share_slots = 1）
@@ -102,6 +51,78 @@ func (s *Service) PlaceSystem(ctx context.Context, req SystemPlaceRequest) (Inst
 		})
 	})
 	return out, err
+}
+
+// clusterRef 是系统集群成员的集群归属（PlaceSystemCluster 插实例时直接写 cluster_id / cluster_rank）。
+type clusterRef struct {
+	ID   string
+	Rank int
+}
+
+// placeSystemOn 是 PlaceSystem 与 PlaceSystemCluster 共用的单机开通（不入队 Create：集群成员的 Spec 要等全员插好才能构造）：
+// 锁机器行并复核条件 → 插系统实例（cluster 非空时带 cluster_id / cluster_rank）→ lease → allocated → 事件。
+// 返回实例与镜像地址。条件不满足 → ErrMachineUnavailable。
+func (s *Service) placeSystemOn(ctx context.Context, tx pgx.Tx, req SystemPlaceRequest, now time.Time, cluster *clusterRef) (Instance, string, error) {
+	var productID int64
+	// 机组必须就是 Token 服务池（purpose='llm'）：调用方传错机组也不能把普通机组的机器拿去建节点
+	err := tx.QueryRow(ctx, `SELECT product_id FROM machines WHERE id = $1 AND group_id = $2 AND state = 'idle' AND agent_online
+		AND EXISTS (SELECT 1 FROM machine_groups g WHERE g.id = $2 AND g.purpose = 'llm')
+		FOR NO KEY UPDATE`, req.MachineID, req.GroupID).Scan(&productID)
+	if db.IsNoRows(err) {
+		return Instance{}, "", apperr.ErrMachineUnavailable
+	}
+	if err != nil {
+		return Instance{}, "", err
+	}
+	// 加锁之后单独一条语句复核（读已提交：新语句的快照能看到等锁期间别人提交的实例 / lease）
+	lower, upper := now, now.Add(SystemLeaseHorizon)
+	var busy bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM instances
+			WHERE machine_id = $1 AND state IN ('creating', 'running', 'stopped', 'wiping'))
+		OR EXISTS (SELECT 1 FROM machine_leases
+			WHERE machine_id = $1 AND status IN ('reserved', 'active') AND period && tstzrange($2::timestamptz, $3::timestamptz))`,
+		req.MachineID, lower, upper).Scan(&busy); err != nil {
+		return Instance{}, "", err
+	}
+	if busy {
+		return Instance{}, "", apperr.ErrMachineUnavailable
+	}
+	ref, err := s.d.Catalog.ImageRef(ctx, tx, req.ImageID)
+	if err != nil {
+		return Instance{}, "", err
+	}
+	hostPub, hostPEM, err := s.d.HostKeyGen()
+	if err != nil {
+		return Instance{}, "", err
+	}
+	if _, err := s.d.Fleet.MarkAllocated(ctx, tx, req.MachineID); err != nil {
+		return Instance{}, "", err
+	}
+	var clusterID *string
+	var clusterRank *int
+	if cluster != nil {
+		clusterID, clusterRank = &cluster.ID, &cluster.Rank
+	}
+	id := randx.ID("ins-", 8)
+	inst, err := scanInstance(tx.QueryRow(ctx, `INSERT INTO instances
+		(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, password_auth, ssh_host_pubkey, ssh_host_key_enc,
+		 group_id, system, cluster_id, cluster_rank, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, 'creating', 0, $6, false, $7, $8, $9, true, $10, $11, $12, $12) RETURNING `+instanceCols,
+		id, s.d.SystemUserID, req.MachineID, productID, req.ImageID, s.d.Box.Seal([]byte(randx.Password(16))), hostPub, s.d.Box.Seal(hostPEM),
+		req.GroupID, clusterID, clusterRank, now))
+	if err != nil {
+		return Instance{}, "", err
+	}
+	if _, err := insertLease(ctx, tx, req.MachineID, inst.ID, lower, upper, "active", now); err != nil {
+		if db.IsExclusionViolation(err) { // 复核之后别的事务才提交的时段（理论上被机器行锁挡住，兜底）
+			return Instance{}, "", apperr.ErrMachineUnavailable
+		}
+		return Instance{}, "", err
+	}
+	if err := recordEvent(ctx, tx, inst.ID, "", StateCreating, "system instance for "+req.Note, now); err != nil {
+		return Instance{}, "", err
+	}
+	return inst, ref, nil
 }
 
 // ListLiveSystemInstances 全部未结束（creating / running / stopped / wiping）的系统实例，按 id 排序；
