@@ -21,9 +21,8 @@ const controllerLockName = "llm-controller"
 
 // 告警文案（稳定，不含数值）。
 const (
-	poolShortMessage    = "Token 服务池没有空闲机器，模型节点缺额"
-	nodeAppNotInternal  = "内部应用 " + NodeAppSlug + " 未标记为平台内部应用，已暂停创建节点部署"
-	provisionTimeoutMsg = "建节点超时（超过 150 分钟）"
+	poolShortMessage   = "Token 服务池没有空闲机器，模型节点缺额"
+	nodeAppNotInternal = "内部应用 " + NodeAppSlug + " 未标记为平台内部应用，已暂停创建节点部署"
 )
 
 // Controller 节点生命周期控制循环（规格 §5.2）。对 rental / appdeploy 的调用都在事务外；节点回写只锁 llm_nodes 一行。
@@ -119,9 +118,7 @@ type ctlNode struct {
 }
 
 func (c *Controller) liveNodes(ctx context.Context) ([]ctlNode, error) {
-	rows, err := c.s.d.Pool.Query(ctx, `SELECT n.id, n.model_id, n.machine_id, n.instance_id, n.deployment_id, n.state, n.api_key_enc,
-		n.probe_fail_count, n.rebuild_count, n.unhealthy_since, n.drain_since, n.last_probe_at, n.last_ready_at, n.error, n.created_at,
-		n.updated_at, md.slug,
+	rows, err := c.s.d.Pool.Query(ctx, `SELECT `+nodeColsN+`, md.slug,
 		COALESCE((SELECT max(e.at) FROM llm_node_events e WHERE e.node_id = n.id AND e.to_state = $2), n.created_at)
 		FROM llm_nodes n JOIN llm_models md ON md.id = n.model_id
 		WHERE n.state <> ALL($1) ORDER BY n.id`, NodeTerminalStates, NodeProvisioning)
@@ -130,10 +127,7 @@ func (c *Controller) liveNodes(ctx context.Context) ([]ctlNode, error) {
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (ctlNode, error) {
 		var x ctlNode
-		n := &x.Node
-		err := r.Scan(&n.ID, &n.ModelID, &n.MachineID, &n.InstanceID, &n.DeploymentID, &n.State, &n.APIKeyEnc, &n.ProbeFailCount,
-			&n.RebuildCount, &n.UnhealthySince, &n.DrainSince, &n.LastProbeAt, &n.LastReadyAt, &n.Error, &n.CreatedAt, &n.UpdatedAt,
-			&x.slug, &x.since)
+		err := r.Scan(nodeDest(&x.Node, &x.slug, &x.since)...)
 		return x, err
 	})
 }
@@ -185,14 +179,21 @@ func (c *Controller) Tick(ctx context.Context, now time.Time) (TickReport, error
 	}
 	for _, n := range nodes {
 		m := modelByID[n.ModelID]
-		switch n.State {
-		case NodeProvisioning:
+		group := n.Size > 1
+		switch {
+		case n.State == NodeProvisioning && group:
+			note("advance group "+n.ID, c.advanceGroup(ctx, now, n, m, &rep))
+		case n.State == NodeProvisioning:
 			note("advance "+n.ID, c.advance(ctx, now, n, m, &rep))
-		case NodeUnhealthy:
+		case n.State == NodeUnhealthy && group:
+			note("unhealthy group "+n.ID, c.handleUnhealthyGroup(ctx, now, n, m, &rep))
+		case n.State == NodeUnhealthy:
 			note("unhealthy "+n.ID, c.handleUnhealthy(ctx, now, n, m, &rep))
-		case NodeDraining:
+		case n.State == NodeDraining:
 			note("drain "+n.ID, c.handleDraining(ctx, now, n, routerFresh))
-		case NodeRemoving:
+		case n.State == NodeRemoving && group:
+			note("remove group "+n.ID, c.handleRemovingGroup(ctx, n, &rep))
+		case n.State == NodeRemoving:
 			note("remove "+n.ID, c.handleRemoving(ctx, n, &rep))
 		}
 	}
@@ -247,6 +248,8 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time, models []Mode
 		}
 	}
 	if len(deficits) > 0 {
+		// 先补每副本机器数大的模型（计划 13 §7.3：整块的同 fabric 机器先给组，单机节点再用剩下的）
+		sort.SliceStable(deficits, func(i, j int) bool { return deficits[i].m.NodesPerReplica > deficits[j].m.NodesPerReplica })
 		note("provision", c.provision(ctx, now, deficits, poolID, rep, note))
 	}
 }
@@ -283,8 +286,9 @@ func drainVictims(nodes []ctlNode, k int) []ctlNode {
 	return out[:k]
 }
 
-// provision 补缺额：只读选候选机器（ORDER BY id），逐台 createNode（PlaceSystem 在锁下复核，不可用就跳过）；
-// 一轮最多 MaxProvisionPerRound 个。候选用完仍有缺额（不是被每轮上限截住）→ RaiseAlertOnce(llm_pool_short)。
+// provision 补缺额（deficits 已按每副本机器数降序）：N > 1 的模型走 provisionGroups；N = 1 只读选候选机器
+// （非 fabric 机器优先、ORDER BY id），逐台 createNode（PlaceSystem 在锁下复核，不可用就跳过）。
+// 一轮最多 MaxProvisionPerRound 个节点（组算一个）。候选用完仍有缺额（不是被每轮上限截住）→ RaiseAlertOnce(llm_pool_short)。
 func (c *Controller) provision(ctx context.Context, now time.Time, deficits []deficit, poolID int64, rep *TickReport,
 	note func(string, error)) error {
 	total := 0
@@ -292,9 +296,38 @@ func (c *Controller) provision(ctx context.Context, now time.Time, deficits []de
 		total += d.n
 	}
 	budget := min(total, MaxProvisionPerRound)
+	short := false
+	var singles []deficit
+	for _, d := range deficits {
+		if d.m.NodesPerReplica > 1 {
+			if c.provisionGroups(ctx, now, d, poolID, &budget, rep, note) {
+				short = true
+			}
+			continue
+		}
+		singles = append(singles, d)
+	}
+	if len(singles) > 0 && budget > 0 {
+		s, err := c.provisionSingles(ctx, now, singles, poolID, &budget, rep, note)
+		if err != nil {
+			return err
+		}
+		short = short || s
+	}
+	if short {
+		return c.s.d.Fleet.RaiseAlertOnce(ctx, c.s.d.Pool, fleet.Alert{Level: "warning", Kind: AlertPoolShort, Message: poolShortMessage})
+	}
+	return nil
+}
+
+// provisionSingles 是计划 9 的单机补缺额（budget 由 provision 传入、就地扣减）；返回 short。
+func (c *Controller) provisionSingles(ctx context.Context, now time.Time, deficits []deficit, poolID int64, budgetp *int, rep *TickReport,
+	note func(string, error)) (bool, error) {
+	budget := *budgetp
+	defer func() { *budgetp = budget }()
 	cands, err := c.s.candidateMachines(ctx, poolID, now, budget+MaxProvisionPerRound) // 多取几台，抵消并发被占的
 	if err != nil {
-		return err
+		return false, err
 	}
 	ci, short := 0, false
 models:
@@ -328,10 +361,7 @@ models:
 			}
 		}
 	}
-	if short {
-		return c.s.d.Fleet.RaiseAlertOnce(ctx, c.s.d.Pool, fleet.Alert{Level: "warning", Kind: AlertPoolShort, Message: poolShortMessage})
-	}
-	return nil
+	return short, nil
 }
 
 // ---- 失败 ----
@@ -355,7 +385,7 @@ func (c *Controller) failNode(ctx context.Context, n Node, expectState, detail s
 		return err
 	}
 	rep.Failed++
-	return c.s.releaseInstance(ctx, n.InstanceID)
+	return c.s.releaseNode(ctx, n) // 组节点：释放全部成员
 }
 
 // firstFailAlert 首次建节点失败的告警（文案稳定；同类未处理前只一条）。
@@ -422,8 +452,12 @@ func (c *Controller) advance(ctx context.Context, now time.Time, cn ctlNode, m M
 			return c.failProvisioning(ctx, n, deploymentError(d), false, rep)
 		}
 	}
-	if now.Sub(cn.since) > ProvisionTimeout {
-		return c.failProvisioning(ctx, n, provisionTimeoutMsg, true, rep)
+	var verID int64
+	if dep != nil {
+		verID = dep.AppVersionID
+	}
+	if timeout := c.s.provisionTimeout(ctx, m, verID); now.Sub(cn.since) > timeout {
+		return c.failProvisioning(ctx, n, provisionTimeoutText(timeout), true, rep)
 	}
 	if inst.State != rental.StateRunning {
 		return nil // creating：等 Agent 建好容器
@@ -574,7 +608,7 @@ func (c *Controller) handleUnhealthy(ctx context.Context, now time.Time, cn ctlN
 
 // ---- 第 4、5 步：排空与移除 ----
 
-// handleDraining 在途归零或 drain_since + DrainTimeout ≤ now → ReleaseSystem → removing。
+// handleDraining 在途归零或 drain_since + DrainTimeout ≤ now → ReleaseSystem（组节点 ReleaseSystemCluster）→ removing。
 // 「在途归零」只在本轮已刷新路由表（routerFresh）且 drain_since + 2 × RouterRefresh ≤ now 时才可信：
 // 否则网关的路由表（或一次在排空提交之前开始的后台刷新）可能仍含该节点，刚选中它的请求还没计入在途。
 func (c *Controller) handleDraining(ctx context.Context, now time.Time, cn ctlNode, routerFresh bool) error {
@@ -585,7 +619,7 @@ func (c *Controller) handleDraining(ctx context.Context, now time.Time, cn ctlNo
 	if !timedOut && (inflight > 0 || !settled) {
 		return nil
 	}
-	if err := c.s.releaseInstance(ctx, n.InstanceID); err != nil {
+	if err := c.s.releaseNode(ctx, n); err != nil {
 		return err
 	}
 	detail := "在途请求已归零，释放机器"
@@ -635,14 +669,15 @@ func (c *Controller) handleRemoving(ctx context.Context, cn ctlNode, rep *TickRe
 	return err
 }
 
-// releaseOrphans 没有非终态节点引用、建立超过 orphanGrace 的系统实例（节点 failed 后释放失败、建节点插行失败后释放失败等）→ ReleaseSystem。
+// releaseOrphans 没有非终态节点（含组节点的 live 成员）引用、建立超过 orphanGrace 的系统实例（节点 failed 后释放失败、建节点插行失败后释放失败等）→ ReleaseSystem。
 // 先列实例再读引用：列表之后才插入的节点行一定能在引用集里看到。
 func (c *Controller) releaseOrphans(ctx context.Context, now time.Time, rep *TickReport) error {
 	insts, err := c.s.d.Rental.ListLiveSystemInstances(ctx)
 	if err != nil || len(insts) == 0 {
 		return err
 	}
-	rows, err := c.s.d.Pool.Query(ctx, `SELECT instance_id FROM llm_nodes WHERE state <> ALL($1) AND instance_id IS NOT NULL`, NodeTerminalStates)
+	rows, err := c.s.d.Pool.Query(ctx, `SELECT instance_id FROM llm_nodes WHERE state <> ALL($1) AND instance_id IS NOT NULL
+		UNION SELECT instance_id FROM llm_node_members WHERE live`, NodeTerminalStates)
 	if err != nil {
 		return err
 	}

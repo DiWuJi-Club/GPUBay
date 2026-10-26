@@ -30,11 +30,16 @@ type ModelInput struct {
 	NodeEnv                                         map[string]string
 	Replicas, MaxConcurrency, Sort                  int
 	Features                                        []string
+	// 计划 13（M11）：每副本机器数 ∈ {1, 2, 4}（0 → 1）；TensorParallel × PipelineParallel = NodesPerReplica（0 → TP = N / PP、PP = 1）。
+	// 当前镜像缺 cupy，PipelineParallel 只接受 1（> 1 → llm_model_invalid）。
+	NodesPerReplica, TensorParallel, PipelineParallel int
 }
 
 // NodeReservedEnv 是 vllm-node 中由平台在建节点时填写的变量，node_env 不接受（规格 §3.1）。
 // 规格列了五个；TASK 也由平台按 kind 填（embedding → embed），否则 kind 与 TASK 可能矛盾，故一并保留。
-var NodeReservedEnv = []string{"MODEL_ID", "MODEL_SOURCE", "SERVED_MODEL_NAME", "MAX_MODEL_LEN", "API_KEY", "TASK"}
+// 计划 13：TENSOR_PARALLEL_SIZE / PIPELINE_PARALLEL_SIZE 由模型的 tensor_parallel / pipeline_parallel 决定（只在 N > 1 时填写）。
+var NodeReservedEnv = []string{"MODEL_ID", "MODEL_SOURCE", "SERVED_MODEL_NAME", "MAX_MODEL_LEN", "API_KEY", "TASK",
+	"TENSOR_PARALLEL_SIZE", "PIPELINE_PARALLEL_SIZE"}
 
 // ModelSources / ModelFeatures 是 source 与展示标签的取值集合。
 var (
@@ -57,13 +62,15 @@ const (
 )
 
 const modelCols = `id, slug, name, description, kind, source, source_id, image_id, app_version_id, context_len, max_output_tokens,
-	default_max_tokens, input_price, output_price, node_env, replicas, max_concurrency, features, status, sort, created_at, updated_at`
+	default_max_tokens, input_price, output_price, node_env, replicas, max_concurrency, features, status, sort, created_at, updated_at,
+	nodes_per_replica, tensor_parallel, pipeline_parallel`
 
 func scanModel(row pgx.Row) (Model, error) {
 	var m Model
 	err := row.Scan(&m.ID, &m.Slug, &m.Name, &m.Description, &m.Kind, &m.Source, &m.SourceID, &m.ImageID, &m.AppVersionID,
 		&m.ContextLen, &m.MaxOutputTokens, &m.DefaultMaxTokens, &m.InputPrice, &m.OutputPrice, &m.NodeEnv, &m.Replicas,
-		&m.MaxConcurrency, &m.Features, &m.Status, &m.Sort, &m.CreatedAt, &m.UpdatedAt)
+		&m.MaxConcurrency, &m.Features, &m.Status, &m.Sort, &m.CreatedAt, &m.UpdatedAt,
+		&m.NodesPerReplica, &m.TensorParallel, &m.PipelineParallel)
 	if db.IsNoRows(err) {
 		return Model{}, apperr.ErrLLMModelNotFound
 	}
@@ -103,6 +110,18 @@ func validateModelInput(in *ModelInput, create bool) error {
 	}
 	if in.MaxConcurrency == 0 {
 		in.MaxConcurrency = DefaultNodeConcurrency
+	}
+	if in.NodesPerReplica == 0 {
+		in.NodesPerReplica = 1
+	}
+	if in.PipelineParallel == 0 {
+		in.PipelineParallel = 1
+	}
+	if in.TensorParallel == 0 {
+		in.TensorParallel = in.NodesPerReplica
+		if in.PipelineParallel > 0 && in.NodesPerReplica%in.PipelineParallel == 0 {
+			in.TensorParallel = in.NodesPerReplica / in.PipelineParallel
+		}
 	}
 	features := []string{}
 	for _, f := range in.Features {
@@ -154,6 +173,17 @@ func validateModelInput(in *ModelInput, create bool) error {
 		return apperr.LLMModelInvalid("max_concurrency", "需在 1～512 之间")
 	case in.Sort < -10000 || in.Sort > 10000:
 		return apperr.LLMModelInvalid("sort", "需在 -10000～10000 之间")
+	case !slices.Contains(NodesPerReplicaOptions, in.NodesPerReplica):
+		return apperr.LLMModelInvalid("nodes_per_replica", "每副本机器数只能是 1、2 或 4")
+	case in.TensorParallel < 1 || in.TensorParallel > 8 || in.PipelineParallel < 1 || in.PipelineParallel > 8:
+		return apperr.LLMModelInvalid("tensor_parallel", "张量并行与流水线并行需在 1～8 之间")
+	case in.TensorParallel*in.PipelineParallel != in.NodesPerReplica:
+		return apperr.LLMModelInvalid("tensor_parallel", "张量并行 × 流水线并行必须等于每副本机器数")
+	case in.PipelineParallel > 1:
+		// 221 实测：LLM Serving 镜像没有 cupy，vLLM 的 Ray 流水线并行（Compiled Graph）起不来；镜像补齐前只开放 TP = N、PP = 1
+		return apperr.LLMModelInvalid("pipeline_parallel", "当前节点镜像不支持流水线并行（缺少 cupy），请设为 1（张量并行 = 每副本机器数）")
+	case in.Kind == KindEmbedding && in.NodesPerReplica != 1:
+		return apperr.LLMModelInvalid("nodes_per_replica", "向量模型只能单机部署")
 	}
 	if in.ImageID <= 0 {
 		return apperr.LLMModelInvalid("image_id", "请选择节点镜像")
@@ -204,18 +234,24 @@ func (s *Service) checkNodeParams(ctx context.Context, q db.Querier, in ModelInp
 	if !slices.Contains(ver.ImageIDs, in.ImageID) {
 		return apperr.LLMModelInvalid("image_id", "不在 "+NodeAppSlug+" "+ver.Version+" 的兼容镜像内")
 	}
+	if n := in.NodesPerReplica; n > 1 {
+		if c := ver.Spec.Cluster; c == nil || c.MaxSize < n || c.MinSize > n {
+			return apperr.LLMModelInvalid("nodes_per_replica", NodeAppSlug+" "+ver.Version+" 不支持 "+strconv.Itoa(n)+" 台多机部署")
+		}
+	}
 	return validateNodeEnv(ver.Spec, in.NodeEnv)
 }
 
 // PlatformNodeEnv 是建节点时平台填写的 vllm-node 变量（NodeReservedEnv 全部）：
 // MODEL_ID = source_id、MODEL_SOURCE = source、SERVED_MODEL_NAME = slug、MAX_MODEL_LEN = context_len、API_KEY = 节点密钥、
-// TASK = embed（kind = embedding）/ generate。
+// TASK = embed（kind = embedding）/ generate。计划 13：只有 NodesPerReplica > 1 时才填 TENSOR_PARALLEL_SIZE / PIPELINE_PARALLEL_SIZE
+// （N = 1 的输出与计划 9 逐项相同，存量节点的部署变量不变）。
 func PlatformNodeEnv(m Model, apiKey string) map[string]string {
 	task := "generate"
 	if m.Kind == KindEmbedding {
 		task = "embed"
 	}
-	return map[string]string{
+	out := map[string]string{
 		"MODEL_ID":          m.SourceID,
 		"MODEL_SOURCE":      m.Source,
 		"SERVED_MODEL_NAME": m.Slug,
@@ -223,6 +259,11 @@ func PlatformNodeEnv(m Model, apiKey string) map[string]string {
 		"API_KEY":           apiKey,
 		"TASK":              task,
 	}
+	if m.NodesPerReplica > 1 {
+		out["TENSOR_PARALLEL_SIZE"] = strconv.Itoa(m.TensorParallel)
+		out["PIPELINE_PARALLEL_SIZE"] = strconv.Itoa(m.PipelineParallel)
+	}
+	return out
 }
 
 // NodeEnv 是传给 appdeploy 的完整变量表 = 模型 node_env ∪ PlatformNodeEnv（同名时平台值优先）。
@@ -281,11 +322,11 @@ func (s *Service) CreateModel(ctx context.Context, actor audit.Actor, in ModelIn
 		now := s.d.Clock.Now()
 		m, err := scanModel(tx.QueryRow(ctx, `INSERT INTO llm_models (slug, name, description, kind, source, source_id, image_id, app_version_id,
 			context_len, max_output_tokens, default_max_tokens, input_price, output_price, node_env, replicas, max_concurrency, features,
-			status, sort, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $20) RETURNING `+modelCols,
+			status, sort, created_at, updated_at, nodes_per_replica, tensor_parallel, pipeline_parallel)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $20, $21, $22, $23) RETURNING `+modelCols,
 			in.Slug, in.Name, in.Description, in.Kind, in.Source, in.SourceID, in.ImageID, in.AppVersionID,
 			in.ContextLen, in.MaxOutputTokens, in.DefaultMaxTokens, in.InputPrice, in.OutputPrice, in.NodeEnv, in.Replicas, in.MaxConcurrency,
-			in.Features, ModelDraft, in.Sort, now))
+			in.Features, ModelDraft, in.Sort, now, in.NodesPerReplica, in.TensorParallel, in.PipelineParallel))
 		if db.IsUniqueViolation(err) {
 			return apperr.ErrLLMModelSlugExists
 		}
@@ -317,7 +358,18 @@ func (s *Service) UpdateModel(ctx context.Context, actor audit.Actor, id int64, 
 		if before.Status == ModelOnline && in.Replicas < 1 {
 			return apperr.LLMModelInvalid("replicas", "在线模型至少 1 个副本（要停止服务请下线）")
 		}
-		nodeChanged := before.ImageID != in.ImageID || !equalInt64Ptr(before.AppVersionID, in.AppVersionID) || !maps.Equal(before.NodeEnv, in.NodeEnv)
+		if in.NodesPerReplica != before.NodesPerReplica {
+			var live bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM llm_nodes WHERE model_id = $1 AND state <> ALL($2))`,
+				id, NodeTerminalStates).Scan(&live); err != nil {
+				return err
+			}
+			if live {
+				return apperr.LLMModelInvalid("nodes_per_replica", "请先把副本数调为 0 并等节点全部释放，再修改每副本机器数")
+			}
+		}
+		nodeChanged := before.ImageID != in.ImageID || !equalInt64Ptr(before.AppVersionID, in.AppVersionID) || !maps.Equal(before.NodeEnv, in.NodeEnv) ||
+			before.NodesPerReplica != in.NodesPerReplica
 		if nodeChanged {
 			if err := s.checkNodeParams(ctx, tx, in); err != nil {
 				return err
@@ -326,10 +378,12 @@ func (s *Service) UpdateModel(ctx context.Context, actor audit.Actor, id int64, 
 		now := s.d.Clock.Now()
 		m, err := scanModel(tx.QueryRow(ctx, `UPDATE llm_models SET name = $2, description = $3, kind = $4, source = $5, source_id = $6,
 			image_id = $7, app_version_id = $8, context_len = $9, max_output_tokens = $10, default_max_tokens = $11, input_price = $12,
-			output_price = $13, node_env = $14, replicas = $15, max_concurrency = $16, features = $17, sort = $18, updated_at = $19
+			output_price = $13, node_env = $14, replicas = $15, max_concurrency = $16, features = $17, sort = $18, updated_at = $19,
+			nodes_per_replica = $20, tensor_parallel = $21, pipeline_parallel = $22
 			WHERE id = $1 RETURNING `+modelCols,
 			id, in.Name, in.Description, in.Kind, in.Source, in.SourceID, in.ImageID, in.AppVersionID, in.ContextLen, in.MaxOutputTokens,
-			in.DefaultMaxTokens, in.InputPrice, in.OutputPrice, in.NodeEnv, in.Replicas, in.MaxConcurrency, in.Features, in.Sort, now))
+			in.DefaultMaxTokens, in.InputPrice, in.OutputPrice, in.NodeEnv, in.Replicas, in.MaxConcurrency, in.Features, in.Sort, now,
+			in.NodesPerReplica, in.TensorParallel, in.PipelineParallel))
 		if err != nil {
 			return err
 		}

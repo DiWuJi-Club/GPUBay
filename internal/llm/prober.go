@@ -29,7 +29,7 @@ const MaxProbeConcurrency = 16
 // maxProbeBody /v1/models 响应体读取上限。
 const maxProbeBody = 1 << 20
 
-// Prober 节点健康探测（规格 §5.3）：对 ready / unhealthy / provisioning（部署 running）节点经 upstream 拨号
+// Prober 节点健康探测（规格 §5.3；组节点见 observeGroup）：对 ready / unhealthy / provisioning（部署 running）节点经 upstream 拨号
 // GET /v1/models。探测在事务外；回写只锁该节点行（mutateNode）。
 type Prober struct {
 	s     *Service
@@ -110,6 +110,9 @@ type observation struct {
 
 // observe 读实例 / 部署状态并（必要时）探测。provisioning 只在部署 running 且 health = ok 时才探测，其余 vSkip。
 func (p *Prober) observe(ctx context.Context, n Node, slug string) observation {
+	if n.Size > 1 {
+		return p.observeGroup(ctx, n, slug)
+	}
 	s := p.s
 	prov := n.State == NodeProvisioning
 	if n.InstanceID == nil {
@@ -228,19 +231,16 @@ type probeNode struct {
 
 // Tick 一轮探测（规格 §5.3），并发 ≤ MaxProbeConcurrency。单节点的读写失败记日志、合并进返回的错误。
 func (p *Prober) Tick(ctx context.Context, now time.Time) error {
-	rows, err := p.s.d.Pool.Query(ctx, `SELECT n.id, n.model_id, n.machine_id, n.instance_id, n.deployment_id, n.state, n.api_key_enc,
-		n.probe_fail_count, n.rebuild_count, n.unhealthy_since, n.drain_since, n.last_probe_at, n.last_ready_at, n.error, n.created_at,
-		n.updated_at, md.slug
+	rows, err := p.s.d.Pool.Query(ctx, `SELECT `+nodeColsN+`, md.slug
 		FROM llm_nodes n JOIN llm_models md ON md.id = n.model_id
-		WHERE n.state IN ($1, $2) OR (n.state = $3 AND n.deployment_id IS NOT NULL) ORDER BY n.id`, NodeReady, NodeUnhealthy, NodeProvisioning)
+		WHERE n.state IN ($1, $2) OR (n.state = $3 AND (n.deployment_id IS NOT NULL OR n.app_cluster_id IS NOT NULL)) ORDER BY n.id`,
+		NodeReady, NodeUnhealthy, NodeProvisioning)
 	if err != nil {
 		return err
 	}
 	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (probeNode, error) {
 		var x probeNode
-		n := &x.Node
-		err := r.Scan(&n.ID, &n.ModelID, &n.MachineID, &n.InstanceID, &n.DeploymentID, &n.State, &n.APIKeyEnc, &n.ProbeFailCount,
-			&n.RebuildCount, &n.UnhealthySince, &n.DrainSince, &n.LastProbeAt, &n.LastReadyAt, &n.Error, &n.CreatedAt, &n.UpdatedAt, &x.slug)
+		err := r.Scan(nodeDest(&x.Node, &x.slug)...)
 		return x, err
 	})
 	if err != nil {

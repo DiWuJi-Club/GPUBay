@@ -26,6 +26,10 @@ type Model struct {
 	Sort             int               `json:"sort"`
 	CreatedAt        time.Time         `json:"created_at"`
 	UpdatedAt        time.Time         `json:"updated_at"`
+	// 计划 13：每副本机器数（1 / 2 / 4）与并行切分（TensorParallel × PipelineParallel = NodesPerReplica）。
+	NodesPerReplica  int `json:"nodes_per_replica"`
+	TensorParallel   int `json:"tensor_parallel"`
+	PipelineParallel int `json:"pipeline_parallel"`
 }
 
 // Node 是 llm_nodes 一行。APIKeyEnc 是节点 vLLM --api-key 的 secretbox 密文，永不序列化。
@@ -46,6 +50,20 @@ type Node struct {
 	Error          string     `json:"error"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
+	// 计划 13：Size = 每副本机器数（1 = 单机节点，与计划 9 相同）；组节点的 MachineID / InstanceID / DeploymentID 指向 rank0（head），
+	// ClusterID = 系统集群（instance_clusters），AppClusterID = 集群部署（app_cluster_deployments）。
+	Size         int     `json:"size"`
+	ClusterID    *string `json:"cluster_id"`
+	AppClusterID *string `json:"app_cluster_id"`
+}
+
+// NodeMember 是 llm_node_members 一行（组节点的成员，含 rank0）。Live 在节点进入终态的同一事务里置 false。
+type NodeMember struct {
+	NodeID     string
+	Rank       int
+	MachineID  int64
+	InstanceID string
+	Live       bool
 }
 
 // NodeEvent 是 llm_node_events 一行（每次节点状态变化一条）。
