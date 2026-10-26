@@ -39,6 +39,7 @@ type fakeRental struct {
 	clusterPlaced     []rental.SystemClusterRequest
 	clustersReleased  []string
 	placeClusterErr   error                  // 非 nil：PlaceSystemCluster 直接返回它
+	placeClusterErrFn func(call int) error   // 非 nil 且返回非 nil：第 call 次（从 1 起）PlaceSystemCluster 直接返回它
 	afterPlaceCluster func(clusterID string) // 非 nil：PlaceSystemCluster 成功返回前调用（模拟插节点行前的并发）
 	releaseClusterErr error                  // 非 nil：ReleaseSystemCluster 记录调用后返回它
 }

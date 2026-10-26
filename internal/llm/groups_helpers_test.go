@@ -32,6 +32,9 @@ func (f *fakeRental) PlaceSystemCluster(ctx context.Context, req rental.SystemCl
 	f.mu.Lock()
 	f.clusterPlaced = append(f.clusterPlaced, req)
 	perr, after := f.placeClusterErr, f.afterPlaceCluster
+	if fn := f.placeClusterErrFn; perr == nil && fn != nil {
+		perr = fn(len(f.clusterPlaced))
+	}
 	f.mu.Unlock()
 	if perr != nil {
 		return rental.SystemClusterResult{}, perr
