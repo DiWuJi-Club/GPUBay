@@ -2,7 +2,7 @@ import {
   centsToYuanInput, digitsOnly, fmtDate, fmtYuan, formatMicroFen, toHalfWidthDigits, yuanToCents,
   deploymentPhaseLabel, deploymentStateLabel, fmtTime, labelOf,
   type AdminAppVersion, type AdminGroup, type AdminGroupBrief, type AdminImage, type AppEnvSpec, type LLMAccountAdmin, type LLMAccountUpdate, type LLMDailyAdminRow, type LLMKeyAdmin, type LLMModelAdmin, type LLMModelInput, type LLMModelKind, type LLMModelSource,
-  type LLMNode, type LLMNodeState, type LLMPoolMachine, type Role,
+  type LLMNode, type LLMNodeState, type LLMPoolFabric, type LLMPoolMachine, type Role,
 } from '@spark/shared'
 import { ALL_ROLES, FIN_ROLES, OPS_ROLES } from '../menu'
 
@@ -46,8 +46,11 @@ export const LLM_FEATURES = ['tools', 'reasoning', 'vision', 'long-context'] as 
 // 特性的中文名用 @spark/shared 的 llmFeatureLabel（与控制台一致）
 export const llmSourceLabel: Record<string, string> = { modelscope: 'ModelScope', 'hf-mirror': 'HF 镜像' }
 
-/** 由平台在建节点时填写的 vllm-node 变量（规格 §3.1 五个 + 按 kind 填的 TASK），表单不展示、不提交。 */
-export const RESERVED_NODE_ENV: readonly string[] = ['MODEL_ID', 'MODEL_SOURCE', 'SERVED_MODEL_NAME', 'MAX_MODEL_LEN', 'API_KEY', 'TASK']
+/**
+ * 由平台在建节点时填写的 vllm-node 变量（规格 §3.1 五个 + 按 kind 填的 TASK），表单不展示、不提交。
+ * 计划 13：TENSOR_PARALLEL_SIZE / PIPELINE_PARALLEL_SIZE 由模型的 tensor_parallel / pipeline_parallel 决定（与 llm.NodeReservedEnv 一致）。
+ */
+export const RESERVED_NODE_ENV: readonly string[] = ['MODEL_ID', 'MODEL_SOURCE', 'SERVED_MODEL_NAME', 'MAX_MODEL_LEN', 'API_KEY', 'TASK', 'TENSOR_PARALLEL_SIZE', 'PIPELINE_PARALLEL_SIZE']
 
 export const SLUG_RE = /^[a-z0-9][a-z0-9.-]{1,63}$/
 export const SOURCE_ID_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
@@ -91,6 +94,10 @@ export interface ModelForm {
   max_concurrency: number | undefined
   features: string[]
   sort: number | undefined
+  /** 计划 13：每副本机器数（1 / 2 / 4）；tensor_parallel × pipeline_parallel 必须等于它 */
+  nodes_per_replica: number
+  tensor_parallel: number | undefined
+  pipeline_parallel: number | undefined
 }
 
 export function emptyModelForm(envSpec: AppEnvSpec[] = []): ModelForm {
@@ -98,6 +105,7 @@ export function emptyModelForm(envSpec: AppEnvSpec[] = []): ModelForm {
     slug: '', name: '', description: '', kind: 'chat', source: 'modelscope', source_id: '', image_id: undefined, app_version_id: null,
     context_len: 32768, max_output_tokens: 8192, default_max_tokens: 4096, input_price: '', output_price: '',
     node_env: Object.fromEntries(envSpec.map((e) => [e.name, ''])), drop_extra_env: false, replicas: 0, max_concurrency: 32, features: [], sort: 0,
+    nodes_per_replica: 1, tensor_parallel: 1, pipeline_parallel: 1,
   }
 }
 
@@ -109,8 +117,50 @@ export function modelToForm(m: LLMModelAdmin, envSpec: AppEnvSpec[]): ModelForm 
     node_env: { ...Object.fromEntries(envSpec.map((e) => [e.name, ''])), ...(m.node_env ?? {}) },
     drop_extra_env: false,
     replicas: m.replicas, max_concurrency: m.max_concurrency, features: [...m.features], sort: m.sort,
+    // 旧后端缺字段：N = 1、TP = N、PP = 1（与 llm 的零值规则一致）
+    nodes_per_replica: m.nodes_per_replica || 1,
+    tensor_parallel: m.tensor_parallel || m.nodes_per_replica || 1,
+    pipeline_parallel: m.pipeline_parallel || 1,
   }
 }
+
+// ---- 计划 13：多机副本（M11，规格 §7.1）----
+
+export const NODES_PER_REPLICA_OPTIONS = [1, 2, 4] as const
+export const PP_UNSUPPORTED = '当前节点镜像不支持流水线并行（缺少 cupy），请设为 1（张量并行 = 每副本机器数）'
+
+/** 改每副本机器数：TP 默认 = 台数、PP = 1（镜像没有 cupy，流水线并行暂不可用）。 */
+export function withNodesPerReplica<T extends Pick<ModelForm, 'nodes_per_replica' | 'tensor_parallel' | 'pipeline_parallel'>>(f: T, n: number): T {
+  return { ...f, nodes_per_replica: n, tensor_parallel: n, pipeline_parallel: 1 }
+}
+
+/** TP × PP 联动校验（与 llm.validateModel 同序同文案）；'' = 通过。 */
+export function parallelError(f: Pick<ModelForm, 'kind' | 'nodes_per_replica' | 'tensor_parallel' | 'pipeline_parallel'>): string {
+  const n = f.nodes_per_replica
+  const tp = f.tensor_parallel
+  const pp = f.pipeline_parallel
+  if (!(NODES_PER_REPLICA_OPTIONS as readonly number[]).includes(n)) return '每副本机器数只能是 1、2 或 4'
+  if (!isInt(tp) || !isInt(pp) || tp < 1 || tp > 8 || pp < 1 || pp > 8) return '张量并行与流水线并行需在 1～8 之间'
+  if (tp * pp !== n) return '张量并行 × 流水线并行必须等于每副本机器数'
+  if (pp > 1) return PP_UNSUPPORTED
+  if (f.kind === 'embedding' && n !== 1) return '向量模型只能单机部署'
+  return ''
+}
+
+/** 所选 vllm-node 版本的 spec.cluster 允许的台数（没有 cluster 段只能单机）。 */
+export function nodesOptionsFor(spec: { cluster?: { mode?: string; min_size: number; max_size: number } | null } | undefined): number[] {
+  const c = spec?.cluster
+  return NODES_PER_REPLICA_OPTIONS.filter((n) => n === 1 || (!!c && n >= c.min_size && n <= c.max_size))
+}
+
+/** 机器池 fabric 行「可组副本」：2 台 × 3 · 4 台 × 1。 */
+export function poolFabricGroupsText(f: Pick<LLMPoolFabric, 'groups'>): string {
+  const parts = (['2', '4'] as const).filter((k) => (f.groups?.[k] ?? 0) > 0).map((k) => `${k} 台 × ${f.groups[k]}`)
+  return parts.length ? parts.join(' · ') : '不能组副本'
+}
+
+/** 组节点徽标（size > 1）。 */
+export const nodeSizeBadge = (n: { size?: number }): string => ((n.size ?? 1) > 1 ? `${n.size} 台` : '')
 
 // 与 internal/appdeploy ValidateEnv 一致：max_len 缺省 256、secret 至少 8 字符、pattern 全匹配
 const DEFAULT_MAX_LEN = 256
@@ -198,6 +248,8 @@ export function validateModelForm(
   if (!inRange(f.max_concurrency, LIMITS.max_concurrency)) errors.max_concurrency = '单节点并发需在 1～512 之间'
   if (f.features.some((x) => !(LLM_FEATURES as readonly string[]).includes(x))) errors.features = '标签不在可选项内'
   if (f.sort !== undefined && f.sort !== null && !isInt(f.sort)) errors.sort = '排序需为整数'
+  const par = parallelError(f)
+  if (par) errors[par === '每副本机器数只能是 1、2 或 4' || par === '向量模型只能单机部署' ? 'nodes_per_replica' : par === PP_UNSUPPORTED ? 'pipeline_parallel' : 'tensor_parallel'] = par
 
   const nodeEnv: Record<string, string> = {}
   for (const e of opt.envSpec) {
@@ -216,6 +268,7 @@ export function validateModelForm(
       image_id: f.image_id!, app_version_id: f.app_version_id ?? null, context_len: f.context_len!, max_output_tokens: f.max_output_tokens!,
       default_max_tokens: f.default_max_tokens!, input_price: input!, output_price: output!, node_env: nodeEnv,
       replicas: f.replicas!, max_concurrency: f.max_concurrency!, features: [...f.features], sort: f.sort ?? 0,
+      nodes_per_replica: f.nodes_per_replica, tensor_parallel: f.tensor_parallel!, pipeline_parallel: f.pipeline_parallel!,
     },
   }
 }
@@ -235,7 +288,10 @@ export function nodeParamsChanged(before: LLMModelAdmin, after: LLMModelInput): 
     (before.app_version_id ?? null) !== (after.app_version_id ?? null) ||
     before.context_len !== after.context_len ||
     before.max_output_tokens !== after.max_output_tokens ||
-    !sameEnv(before.node_env, after.node_env)
+    !sameEnv(before.node_env, after.node_env) ||
+    (before.nodes_per_replica || 1) !== (after.nodes_per_replica || 1) ||
+    (before.tensor_parallel || before.nodes_per_replica || 1) !== (after.tensor_parallel || after.nodes_per_replica || 1) ||
+    (before.pipeline_parallel || 1) !== (after.pipeline_parallel || 1)
   )
 }
 

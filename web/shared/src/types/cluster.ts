@@ -119,8 +119,8 @@ export interface Fabric {
   created_at: string
   updated_at: string
 }
-/** GET /admin/api/v1/fabrics 的条目。 */
-export interface FabricRow extends Fabric { machine_count: number; active_clusters: number }
+/** GET /admin/api/v1/fabrics 的条目。cluster_nets：已就绪成员机器的集群网段（去重升序；lan 出现多个网段时后台标黄）。 */
+export interface FabricRow extends Fabric { machine_count: number; active_clusters: number; cluster_nets: string[] }
 /** POST / PUT /fabrics */
 export type FabricInput = Pick<Fabric, 'name' | 'kind' | 'isolation' | 'rdma' | 'mtu' | 'vlan_min' | 'vlan_max' | 'description'>
 
@@ -176,12 +176,13 @@ export interface AdminCluster extends ClusterView {
   events?: { at: string; instance_id: string; detail: string }[]
 }
 
-/** Token 商城节点组成员（GET /admin/api/v1/llm/nodes* 的 members）。 */
+/** Token 商城节点组成员（GET /admin/api/v1/llm/nodes* 的 members；后端 llm.NodeMemberRow）。 */
 export interface LLMNodeMember {
   rank: number
-  machine: { id: number; serial: string; display_name: string; state: string; agent_online: boolean }
+  machine_id: number
+  machine_name: string
   instance_id: string
   instance_state: InstanceState
   suspended: boolean
-  deployment: { state: DeploymentState; health: DeploymentHealth; progress: number } | null
+  deployment: { state: DeploymentState; health: DeploymentHealth; phase?: string; progress: number } | null
 }

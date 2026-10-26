@@ -4,9 +4,9 @@ import { routes } from '../router'
 
 describe('menuFor (U-12)', () => {
   it.each([
-    ['super', 21, []],
-    ['ops', 15, ['orders', 'ledger', 'recharges', 'catalog', 'admins', 'referral']],
-    ['finance', 15, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
+    ['super', 23, []],
+    ['ops', 17, ['orders', 'ledger', 'recharges', 'catalog', 'admins', 'referral']],
+    ['finance', 17, ['machines', 'pdus', 'kyc', 'catalog', 'admins', 'groups']],
   ] as const)('%s 有 %d 项', (role, count, missing) => {
     const items = menuFor(role)
     expect(items).toHaveLength(count)
@@ -59,5 +59,20 @@ describe('menuFor (U-12)', () => {
     expect(item).toMatchObject({ path: '/llm', label: 'Token 商城' })
     expect([...item!.roles].sort()).toEqual(['finance', 'ops', 'super'])
     for (const role of ['super', 'ops', 'finance'] as const) expect(menuFor(role).some((m) => m.key === 'llm')).toBe(true)
+  })
+
+  it('计划 13：「集群网络」「集群」紧跟「机器」，所有角色可看（写操作在页内按角色显示）', () => {
+    const keys = menu.map((m) => m.key)
+    expect(keys.indexOf('fabrics')).toBe(keys.indexOf('machines') + 1)
+    expect(keys.indexOf('clusters')).toBe(keys.indexOf('fabrics') + 1)
+    expect(menu.find((m) => m.key === 'fabrics')).toMatchObject({ path: '/fabrics', label: '集群网络' })
+    expect(menu.find((m) => m.key === 'clusters')).toMatchObject({ path: '/clusters', label: '集群' })
+    for (const role of ['super', 'ops', 'finance'] as const) {
+      expect(menuFor(role).some((m) => m.key === 'fabrics')).toBe(true)
+      expect(menuFor(role).some((m) => m.key === 'clusters')).toBe(true)
+    }
+    const detail = routes.find((r) => r.path === '/clusters/:id')
+    expect(detail).toBeDefined()
+    expect([...(detail!.meta?.roles ?? [])].sort()).toEqual(['finance', 'ops', 'super'])
   })
 })

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  deploymentErrorText, deploymentStateLabel, deploymentStateType, fmtTime, fmtTimeSec, labelOf, llmNodeStateLabel, llmNodeStateType, messageOf,
+  clusterAppStatusLabel, clusterAppStatusType, deploymentErrorText, deploymentStateLabel, instanceStateLabel, deploymentStateType, fmtTime, fmtTimeSec, labelOf, llmNodeStateLabel, llmNodeStateType, messageOf,
   type AdminDeploymentDetail, type LLMNodeDetail,
 } from '@spark/shared'
 import { computed, reactive, watch } from 'vue'
@@ -79,6 +79,7 @@ function close() {
   emit('close')
 }
 
+const isGroup = computed(() => (node.value?.size ?? 1) > 1)
 const nodeEvent = (e: { from_state: string; to_state: string }) => `${labelOf(llmNodeStateLabel, e.from_state) || '—'} → ${labelOf(llmNodeStateLabel, e.to_state)}`
 
 defineExpose({ load })
@@ -111,6 +112,30 @@ defineExpose({ load })
         <el-descriptions-item label="更新">{{ fmtTime(node.updated_at) }}</el-descriptions-item>
         <el-descriptions-item label="最近错误" :span="2"><span class="error-text" data-testid="llm-node-error">{{ node.error || '—' }}</span></el-descriptions-item>
       </el-descriptions>
+
+      <!-- 计划 13：组节点（N 台一个副本）：成员与集群部署聚合 -->
+      <template v-if="isGroup">
+        <h4>组成员（{{ node.size }} 台）
+          <router-link v-if="node.cluster_id" :to="`/clusters/${node.cluster_id}`" class="gap small" data-testid="llm-node-cluster-link">集群 {{ node.cluster_id }}</router-link>
+        </h4>
+        <div v-if="node.app_cluster" class="small" data-testid="llm-node-app-cluster">
+          集群部署
+          <el-tag size="small" :type="labelOf(clusterAppStatusType, node.app_cluster.status) as 'primary'">{{ labelOf(clusterAppStatusLabel, node.app_cluster.status) }}</el-tag>
+          <span class="gap">健康 {{ labelOf(deploymentHealthLabel, node.app_cluster.health) }} · 进度 {{ node.app_cluster.progress }}%</span>
+        </div>
+        <p v-else class="muted" data-testid="llm-node-app-cluster-none">还没有集群部署（成员实例开通完成后由平台创建）</p>
+        <table class="grid" data-testid="llm-node-drawer-members">
+          <tbody>
+            <tr v-for="m in node.members ?? []" :key="m.rank" data-testid="llm-node-drawer-member" :data-rank="m.rank">
+              <td>rank {{ m.rank }}{{ m.rank === 0 ? '（head）' : '' }}</td>
+              <td>{{ m.machine_name }}（<IdLink kind="machine" :id="m.machine_id" />）</td>
+              <td><IdLink kind="instance" :id="m.instance_id" /> · {{ labelOf(instanceStateLabel, m.instance_state) }}</td>
+              <td>{{ m.deployment ? `${labelOf(deploymentStateLabel, m.deployment.state)} · ${labelOf(deploymentHealthLabel, m.deployment.health)} · ${m.deployment.progress}%` : '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="muted">下方「部署」为 head（rank 0）的成员部署。</p>
+      </template>
 
       <h4>节点事件（最近 50 条）</h4>
       <el-timeline v-if="st.data.events.length" data-testid="llm-node-events">
@@ -164,6 +189,7 @@ defineExpose({ load })
 .drawer h4 { margin: 8px 0 0; }
 .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .gap { margin-left: 8px; }
+.small { font-size: 13px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; font-size: 13px; }
 .error-text { color: var(--el-color-danger); }

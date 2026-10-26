@@ -16,7 +16,7 @@ const base: Dashboard = {
 }
 
 let w: VueWrapper | null = null
-async function render(d: Dashboard & DashboardButler) {
+async function render(d: Dashboard & DashboardButler & { clusters?: { active: number; forming: number; ready: number; degraded: number } }) {
   session.admin = { id: 1, username: 'a', role: 'finance', status: 'active', totp_confirmed: true, last_login_at: null, last_login_ip: '', created_at: '' }
   get.mockResolvedValue(d)
   w = mount(DashboardView, { global: { plugins: [ElementPlus], stubs: { RouterLink: RouterLinkStub } } })
@@ -43,5 +43,19 @@ describe('仪表盘 AI 管家数字', () => {
   it('平台未启用管家（无字段）不显示', async () => {
     await render(base)
     expect(t('dash-butler-requests').exists()).toBe(false)
+  })
+})
+
+describe('仪表盘集群卡片（计划 13）', () => {
+  it('活动集群数与就绪 / 组建中 / 降级；降级标红', async () => {
+    await render({ ...base, clusters: { active: 5, forming: 1, ready: 3, degraded: 1 } })
+    expect(t('dash-clusters-active').text()).toBe('5')
+    expect(t('dash-clusters-ready').text()).toBe('3')
+    expect(t('dash-clusters-forming').text()).toBe('1')
+    expect(t('dash-clusters-degraded').classes()).toContain('bad')
+  })
+  it('后端没有 clusters 字段时不显示', async () => {
+    await render(base)
+    expect(t('dash-clusters').exists()).toBe(false)
   })
 })

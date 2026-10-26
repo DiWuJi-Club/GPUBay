@@ -1,3 +1,5 @@
+import type { FabricKind, LLMNodeMember } from './cluster'
+
 // 计划 9：Token 商城（规格 §10）。金额单位：价格「分 / 百万 token」，费用 cost_micro「微分」（1 分 = 10^6 微分），其余金额「分」。
 
 export type LLMModelKind = 'chat' | 'embedding'
@@ -142,6 +144,10 @@ export interface LLMModelAdmin {
   created_at: string
   updated_at: string
   nodes: { ready: number; total: number }
+  /** 计划 13：每副本机器数（1 / 2 / 4）与并行切分（tensor_parallel × pipeline_parallel = nodes_per_replica）；旧后端缺省 = 1 / 1 / 1 */
+  nodes_per_replica?: number
+  tensor_parallel?: number
+  pipeline_parallel?: number
 }
 /** POST /llm/models（PUT 不含 slug）。 */
 export type LLMModelInput = Omit<LLMModelAdmin, 'id' | 'status' | 'created_at' | 'updated_at' | 'nodes'>
@@ -167,6 +173,14 @@ export interface LLMNode {
   error: string
   created_at: string
   updated_at: string
+  /** 计划 13：每副本机器数（1 = 单机节点）；组节点的 machine / instance / deployment 指向 rank0（head） */
+  size?: number
+  cluster_id?: string | null
+  app_cluster_id?: string | null
+  /** 组节点的成员（按 rank，含 rank0）；单机节点为空数组 */
+  members?: LLMNodeMember[]
+  /** 组节点的集群部署聚合；读不到 / 还没建为 null */
+  app_cluster?: { id: string; status: string; health: string; progress: number } | null
 }
 export interface LLMNodeEvent {
   id: number
@@ -186,11 +200,17 @@ export interface LLMNodeDetail {
 /** GET /llm/pool 的机器行。 */
 export interface LLMPoolMachine {
   machine: { id: number; serial: string; display_name: string; state: string; agent_online: boolean }
-  node?: { id: string; model_slug: string; state: LLMNodeState }
+  /** 计划 13：组节点时 rank 为本机的 rank、size 为组的台数（单机节点 0 / 1） */
+  node?: { id: string; model_slug: string; state: LLMNodeState; rank?: number; size?: number }
   /** 机器上仍有租约时的到期时间（「等待租约结束」） */
   lease_until?: string
+  /** 计划 13：所属集群网络（无 → null / ''） */
+  fabric_id?: number | null
+  fabric_name?: string
 }
-export interface LLMPool { group_id: number; machines: LLMPoolMachine[]; free: number; total: number }
+/** 计划 13：机器池按集群网络汇总；groups["2"] / groups["4"] = 用空闲且集群就绪的机器能组出的副本数。 */
+export interface LLMPoolFabric { fabric_id: number; name: string; kind: FabricKind; rdma: boolean; total: number; free: number; groups: Partial<Record<'2' | '4', number>> }
+export interface LLMPool { group_id: number; machines: LLMPoolMachine[]; free: number; total: number; fabrics?: LLMPoolFabric[] }
 
 export interface LLMLimits { rpm: number; tpm: number; concurrency: number }
 
