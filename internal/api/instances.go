@@ -54,6 +54,8 @@ type instanceView struct {
 	CreatedAt             time.Time            `json:"created_at"`
 	// 计划 7：非终态部署摘要（列表页一行显示）；无部署为空数组
 	AppsSummary []appdeploy.Summary `json:"apps_summary"`
+	// 计划 13：集群成员的所属集群 {id, size, rank, status}；非成员为 null
+	Cluster *instanceClusterView `json:"cluster"`
 }
 
 func (s *Server) view(i rental.Instance) instanceView {
@@ -199,6 +201,10 @@ func (s *Server) views(ctx context.Context, insts []rental.Instance) ([]instance
 			return nil, err
 		}
 	}
+	clusters, err := s.instanceClusters(ctx, insts)
+	if err != nil {
+		return nil, err
+	}
 	nc := newNameCache()
 	out := make([]instanceView, 0, len(insts))
 	for _, i := range insts {
@@ -210,6 +216,10 @@ func (s *Server) views(ctx context.Context, insts []rental.Instance) ([]instance
 		v.AppsSummary = summaries[i.ID]
 		if v.AppsSummary == nil {
 			v.AppsSummary = []appdeploy.Summary{}
+		}
+		if i.ClusterID != nil && i.ClusterRank != nil {
+			cv := clusters[*i.ClusterID]
+			v.Cluster = &instanceClusterView{ID: cv.ID, Size: cv.Size, Rank: *i.ClusterRank, Status: cv.Status}
 		}
 		out = append(out, v)
 	}
