@@ -51,6 +51,7 @@ func NewRouter(s *Service) *Router {
 }
 
 // Refresh 从库里重建节点表：ready 节点 JOIN 模型（online、max_concurrency）JOIN 系统实例（running、未挂起）/ 机器（lan_ip、主机公钥）。
+// 组节点（计划 13 §7.5）只拨 head（instance_id = rank0），且任一 live 成员非 running 或已暂停时整组不进表。
 func (r *Router) Refresh(ctx context.Context) error {
 	rows, err := r.s.d.Pool.Query(ctx, `SELECT n.id, n.model_id, md.max_concurrency, i.id, m.lan_ip, i.ssh_host_pubkey
 		FROM llm_nodes n
@@ -58,6 +59,8 @@ func (r *Router) Refresh(ctx context.Context) error {
 		JOIN instances i ON i.id = n.instance_id
 		JOIN machines m ON m.id = i.machine_id
 		WHERE n.state = $1 AND md.status = $2 AND i.state = 'running' AND i.suspended_at IS NULL
+			AND NOT EXISTS (SELECT 1 FROM llm_node_members mm JOIN instances mi ON mi.id = mm.instance_id
+				WHERE mm.node_id = n.id AND mm.live AND (mi.state <> 'running' OR mi.suspended_at IS NOT NULL))
 		ORDER BY n.model_id, n.id`, NodeReady, ModelOnline)
 	if err != nil {
 		return err

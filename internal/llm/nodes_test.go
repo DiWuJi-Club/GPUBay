@@ -202,7 +202,7 @@ func TestPoolViewAndNodeDetail(t *testing.T) {
 		t.Fatalf("free %+v", pm)
 	}
 	b, _ := json.Marshal(byID[free])
-	if string(b) != `{"machine":{"id":`+itoa(free)+`,"serial":"V3","display_name":"","state":"idle","agent_online":true}}` {
+	if string(b) != `{"machine":{"id":`+itoa(free)+`,"serial":"V3","display_name":"","state":"idle","agent_online":true},"fabric_id":null,"fabric_name":""}` {
 		t.Fatalf("pool machine json %s", b)
 	}
 

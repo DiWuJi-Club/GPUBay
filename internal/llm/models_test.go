@@ -446,8 +446,12 @@ func TestPlatformNodeEnv(t *testing.T) {
 	if !maps.Equal(p, want) {
 		t.Fatalf("PlatformNodeEnv = %v", p)
 	}
+	// N = 1：平台填写除 TENSOR_PARALLEL_SIZE / PIPELINE_PARALLEL_SIZE（只在多机时填）外的全部保留变量
 	keys := slices.Sorted(maps.Keys(p))
-	if !slices.Equal(keys, slices.Sorted(slices.Values(llm.NodeReservedEnv))) {
+	single := slices.DeleteFunc(slices.Clone(llm.NodeReservedEnv), func(k string) bool {
+		return k == "TENSOR_PARALLEL_SIZE" || k == "PIPELINE_PARALLEL_SIZE"
+	})
+	if !slices.Equal(keys, slices.Sorted(slices.Values(single))) {
 		t.Fatalf("platform keys %v != NodeReservedEnv %v", keys, llm.NodeReservedEnv)
 	}
 	all := llm.NodeEnv(chat, key)

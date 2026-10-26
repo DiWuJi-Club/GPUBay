@@ -1,6 +1,10 @@
 package llm
 
-import "time"
+import (
+	"time"
+
+	"spark-cloud/internal/appdeploy"
+)
 
 // 规格 §13。价格、限额、副本数是数据库里的运营参数，这里只有默认值与机制常量。
 const (
@@ -30,7 +34,7 @@ const (
 	ProbeFailThreshold    = 3
 	UnhealthyRebuildAfter = 10 * time.Minute
 	MaxRebuilds           = 3
-	ProvisionTimeout      = 150 * time.Minute // 含 vllm-node 的 120 分钟部署超时
+	ProvisionTimeout      = 150 * time.Minute // vllm-node 1.0.0（120 分钟部署超时）的建节点超时；版本相关的取值见 ProvisionTimeoutFor
 	DrainTimeout          = 60 * time.Second
 	MaxProvisionPerRound  = 4
 	SystemLeaseHorizon    = 10 * 365 * 24 * time.Hour // 系统实例 lease [now, now + 10 年)
@@ -41,6 +45,25 @@ const (
 	SystemUserPhone = "system:llm"
 	MicroPerFen     = 1_000_000 // 1 分 = 10^6 微分
 )
+
+// 计划 13：多机节点组（规格 §7、裁定 M12 / M20）。
+const (
+	GroupRebuildAfter     = 2 * time.Minute  // 组 unhealthy（成员进程崩溃 / 不健康）持续这么久 → 整组 RedeployCluster
+	GroupSuspendFailAfter = 10 * time.Minute // 组有成员暂停（机器失联）持续这么久仍未恢复 → failed
+	provisionSlack        = 30 * time.Minute // ProvisionTimeoutFor = 版本 timeout_minutes + 它
+)
+
+// NodesPerReplicaOptions 是模型 nodes_per_replica 的取值（M11）。
+var NodesPerReplicaOptions = []int{1, 2, 4}
+
+// ProvisionTimeoutFor 建节点（单机与组）的超时 = 该 vllm-node 版本的 timeout_minutes + 30 分钟（0 → appdeploy.DefaultTimeoutMinutes）。
+func ProvisionTimeoutFor(v appdeploy.Version) time.Duration {
+	m := v.Spec.TimeoutMinutes
+	if m <= 0 {
+		m = appdeploy.DefaultTimeoutMinutes
+	}
+	return time.Duration(m)*time.Minute + provisionSlack
+}
 
 // 节点状态（llm_nodes.state）。
 const (
