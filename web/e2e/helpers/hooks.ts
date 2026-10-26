@@ -21,6 +21,9 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 
 export type Role = 'super' | 'ops' | 'finance'
 
+/** /hooks/machines 的计划 13 参数（见 internal/e2ehooks/clusters.go）。 */
+export type MachineClusterOpts = { fabric_id?: number; net?: '' | 'lan' | 'cx7' | 'cx7-rdma'; old_agent?: boolean }
+
 export const hooks = {
   async clock(): Promise<Date> {
     const r = await (await api()).get('/hooks/clock')
@@ -40,9 +43,24 @@ export const hooks = {
   agent(opts: { machine_id?: number; fail?: boolean; result?: string; images?: string[] } = {}) {
     return post<{ completed: number }>('/hooks/agent', opts)
   },
-  /** 造已接入并连上 fake Agent 的空闲机器；rack 缺省为 E2E；group_id 指定时登记后加入机组。 */
-  async machines(count = 1, serial_prefix?: string, rack?: string, group_id?: number): Promise<number[]> {
-    return (await post<{ ids: number[] }>('/hooks/machines', { count, serial_prefix, rack, group_id })).ids
+  /** 造已接入并连上 fake Agent 的空闲机器；rack 缺省为 E2E；group_id 指定时登记后加入机组。
+   *  cluster（计划 13）：fabric_id 加入集群网络、net 网卡预设（lan / cx7 / cx7-rdma，决定 fake Agent 上报的网卡）、
+   *  old_agent 模拟不支持集群的旧 Agent（能力位不含 Cluster）。要就绪判定结果用 clusterMachines。 */
+  async machines(count = 1, serial_prefix?: string, rack?: string, group_id?: number, cluster: MachineClusterOpts = {}): Promise<number[]> {
+    return (await post<{ ids: number[] }>('/hooks/machines', { count, serial_prefix, rack, group_id, ...cluster })).ids
+  },
+  /** 同 machines，返回 {ids, cluster_ready}（与 ids 一一对应，返回时 fleet 已按网卡与 fabric 算好就绪判定）。 */
+  clusterMachines(opts: { count: number; group_id?: number; rack?: string } & MachineClusterOpts) {
+    return post<{ ids: number[]; cluster_ready: boolean[] }>('/hooks/machines', opts)
+  },
+  /** 建集群网络（计划 13）：kind lan（isolation 缺省 routed）/ cx7（缺省 direct）；name 缺省自动唯一；vlan 未给范围取 100～199。 */
+  fabrics(opts: { kind: 'lan' | 'cx7'; name?: string; isolation?: 'routed' | 'direct' | 'vlan'; rdma?: boolean; mtu?: number; vlan_min?: number; vlan_max?: number; description?: string }) {
+    return post<{ id: number; name: string }>('/hooks/fabrics', opts)
+  },
+  /** 改某台机器 fake Agent 的集群数据面：fail_apply 非空 → 之后的集群 Apply 失败（"" 恢复）；check_ok=false → 立即巡检并上报
+   *  「spc0 缺失」（成员网络异常、集群降级），true 恢复。给了 check_ok 时返回前状态已落库。 */
+  async agentClusterNet(opts: { machine_id: number; fail_apply?: string; check_ok?: boolean }): Promise<void> {
+    await post('/hooks/agent/cluster-net', opts)
   },
   /** 建一个机组（visible 缺省 true）。 */
   groups(name: string, visible = true) {

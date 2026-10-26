@@ -48,7 +48,7 @@ async function servingImage(ctx: APIRequestContext): Promise<number> {
  * 经后台 API 建一个模型（super 管理员），缺省上线（动态码由 adminPost 补）、1 个副本、价格 ¥0.50 / ¥1.50 每百万 token。
  * 先调 /hooks/apps/seed（幂等）：建模型要求内部应用 vllm-node 已发布。模型登记到 cleanupLLM。
  */
-export async function seedLLMModel(opts: { slug?: string; name?: string; input_price?: number; output_price?: number; online?: boolean; replicas?: number; sort?: number; kind?: 'chat' | 'embedding'; features?: string[] } = {}): Promise<SeededModel> {
+export async function seedLLMModel(opts: { slug?: string; name?: string; input_price?: number; output_price?: number; online?: boolean; replicas?: number; sort?: number; kind?: 'chat' | 'embedding'; features?: string[]; nodes_per_replica?: 1 | 2 | 4 } = {}): Promise<SeededModel> {
   await hooks.appsSeed()
   const admin = await createAdmin('super')
   const ctx = await adminApi(admin)
@@ -58,6 +58,8 @@ export async function seedLLMModel(opts: { slug?: string; name?: string; input_p
     image_id: await servingImage(ctx), context_len: 32768, max_output_tokens: 8192, default_max_tokens: 1024,
     input_price: opts.input_price ?? 50, output_price: opts.output_price ?? 150, replicas: opts.replicas ?? 1, max_concurrency: 32,
     features: opts.features ?? [], sort: opts.sort ?? 0, node_env: {},
+    // 计划 13：每副本机器数（TP 缺省 = 台数、PP = 1，由后端补）
+    ...(opts.nodes_per_replica ? { nodes_per_replica: opts.nodes_per_replica } : {}),
   }
   let m = await adminPost<LLMModelJSON>(ctx, admin, '/admin/api/v1/llm/models', body)
   const seeded: SeededModel = { ...m, admin }
@@ -101,7 +103,7 @@ export async function createPoolMachineAndNode(model: SeededModel, upstream: Par
   return { machineId, nodeId: node_id, instanceId: instance_id }
 }
 
-export type NodeJSON = { id: string; model_id: number; machine_id: number; instance_id: string | null; state: string }
+export type NodeJSON = { id: string; model_id: number; machine_id: number; instance_id: string | null; state: string; size?: number }
 
 export async function nodesOf(ctx: APIRequestContext, modelId: number): Promise<NodeJSON[]> {
   return (await getJSON<{ items: NodeJSON[] }>(ctx, `/admin/api/v1/llm/nodes?model_id=${modelId}`)).items
@@ -119,7 +121,8 @@ export async function settleNodes(ctx: APIRequestContext, modelId: number, round
     await hooks.advance(5)
     const rep = await hooks.llmTick()
     if (rep.error) throw new Error(`llm tick: ${rep.error}`)
-    for (const n of live) await hooks.agent({ machine_id: n.machine_id })
+    // 组节点（size > 1，计划 13）的成员分布在多台机器上：让全部 fake Agent 执行（rank 1… 的洗机也要完成）
+    for (const n of live) await hooks.agent((n.size ?? 1) > 1 ? {} : { machine_id: n.machine_id })
   }
 }
 

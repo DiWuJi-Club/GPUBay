@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import {
   adminApi, adminPost, clickTwiceSync, createAdmin, createPDU, drainIdleMachines, drainTasks, enterTotpDialog, expectAdminUrl, fail500, getJSON, loginAdmin, nextSerial, pick, recordRequests, registerMachine, trackToasts,
 } from '../helpers/admin'
+import { seedClusterMachines, seedFabric } from '../helpers/clusters'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { CONSOLE_URL, hooks } from '../helpers/hooks'
 import { runStamp } from '../helpers/phone'
@@ -789,4 +790,129 @@ test('A-MCH-10 机器详情「已缓存镜像」：Agent 上报后列出镜像�
   await expect(page.getByTestId('machine-cached-images-at')).toHaveText(`上报于 ${cstTime(m.cached_images_at)}`)
   await expect(page.getByTestId('machine-cached-images-none')).toHaveCount(0)
   await expect(page.getByTestId('machine-cached-images-note')).toContainText('只统计在线机器')
+})
+
+// ---- 计划 13：机器的集群网络（fabric、网卡表、就绪判定）----
+
+type NetDetail = { machine: { serial: string; fabric_id: number | null; cluster_iface: string; cluster_ready: boolean; cluster_rdma: boolean; cluster_net: string } }
+
+test('A-MCH-11 机器详情「集群网络」卡：网卡表（含 RDMA）与就绪判定；修改集群网络 / 集群网卡（CX-7 下管理网卡不可选）后重新判定，移出后未就绪', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const ctx = await adminApi(admin)
+  const cx7 = await seedFabric('cx7', { isolation: 'vlan', rdma: true })
+  const lan = await seedFabric('lan')
+  const [rdmaM] = await seedClusterMachines(1, cx7.id, 'cx7-rdma')
+  const [plain] = await hooks.machines(1, undefined, undefined, undefined, { net: 'cx7' }) // 有 CX-7 口（无 RDMA），未加入集群网络
+  await loginAdmin(page, admin)
+
+  await test.step('CX-7 RDMA 机器：所属网络、就绪（二层 + RDMA）、能力位、网卡表', async () => {
+    await page.goto(`/admin/machines/${rdmaM}`)
+    await expect(page.getByTestId('machine-net-card')).toBeVisible()
+    await expect(page.getByTestId('machine-fabric')).toHaveText(`${cx7.name}（ConnectX-7 · VLAN 隔离 · RDMA）`)
+    await expect(page.getByTestId('machine-cluster-iface')).toHaveText('自动（第一块已连接的 CX-7 网卡）')
+    const ready = page.getByTestId('machine-cluster-ready')
+    await expect(ready).toHaveAttribute('data-ready', 'true')
+    await expect(ready).toHaveAttribute('data-rdma', 'true')
+    await expect(ready).toHaveText('就绪（二层直连 / VLAN） · RDMA 可用')
+    await expect(page.getByTestId('machine-agent-features')).toHaveText('共享实例、多机集群')
+    await expect(page.getByTestId('machine-net-at')).not.toHaveText('从未上报')
+    await expect(page.getByTestId('machine-net-iface')).toHaveCount(2)
+    const eth0 = page.locator('[data-testid="machine-net-iface"][data-name="eth0"]')
+    await expect(eth0).toContainText('管理网卡')
+    await expect(eth0).toContainText('127.0.0.1/24')
+    await expect(eth0).toContainText('1 Gb/s')
+    const port = page.locator('[data-testid="machine-net-iface"][data-name="enp1s0f1np1"]')
+    await expect(port).toContainText('mlx5_core')
+    await expect(port).toContainText('200 Gb/s')
+    await expect(port).toContainText('9000')
+    await expect(port).toContainText('rocep1s0f1 · ACTIVE · Ethernet · uverbs0')
+  })
+
+  await test.step('未加入的机器：未就绪；加入 CX-7 网络并指定集群网卡（管理网卡不可选）→ 就绪（无 RDMA）、只提交变化的键、审计带 diff', async () => {
+    const puts = recordRequests(page, 'PUT', `/machines/${plain}`)
+    await page.goto(`/admin/machines/${plain}`)
+    await expect(page.getByTestId('machine-fabric')).toHaveText('未加入')
+    await expect(page.getByTestId('machine-cluster-ready')).toHaveAttribute('data-ready', 'false')
+    await expect(page.getByTestId('machine-cluster-ready')).toHaveText('未就绪：未加入集群网络')
+    await page.getByTestId('machine-net-edit').click()
+    await expect(page.getByTestId('machine-net-dialog')).toBeVisible()
+    await expect(page.getByTestId('machine-iface-select').getByRole('combobox')).toBeDisabled() // 未选集群网络时不能选网卡
+    await page.getByTestId('machine-net-save').click()
+    await toast(page, '没有改动')
+    expect(puts).toHaveLength(0)
+
+    await page.getByTestId('machine-net-edit').click()
+    await page.getByTestId('machine-fabric-select').click()
+    await page.getByRole('option', { name: `${cx7.name}（ConnectX-7 · VLAN 隔离）`, exact: true }).click()
+    await page.getByTestId('machine-iface-select').click()
+    const opts = page.locator('.el-select-dropdown:visible [data-testid="machine-iface-option"]')
+    await expect(opts).toHaveText(['自动（第一块已连接的 CX-7 网卡）', 'eth0（管理网卡）', 'enp1s0f1np1（CX-7）'])
+    await expect(opts.filter({ hasText: 'eth0' })).toHaveClass(/is-disabled/)
+    await opts.filter({ hasText: 'enp1s0f1np1' }).click()
+    await page.getByTestId('machine-net-save').click()
+    await toast(page, '已保存，就绪判定按新设置重新计算')
+    expect(puts.map((p) => p.body)).toEqual([{ fabric_id: cx7.id, cluster_iface: 'enp1s0f1np1' }])
+    await expect(page.getByTestId('machine-fabric')).toContainText(cx7.name)
+    await expect(page.getByTestId('machine-cluster-iface')).toHaveText('enp1s0f1np1')
+    await expect(page.getByTestId('machine-cluster-ready')).toHaveAttribute('data-ready', 'true')
+    await expect(page.getByTestId('machine-cluster-ready')).toHaveAttribute('data-rdma', 'false')
+    await expect(page.getByTestId('machine-cluster-ready')).toHaveText('就绪（二层直连 / VLAN）')
+    await expect(page.locator('[data-testid="machine-net-iface"][data-name="enp1s0f1np1"]')).toContainText('集群网卡')
+    const audit = await getJSON<{ total: number; items: { diff: Record<string, unknown> }[] }>(ctx, `/admin/api/v1/audit?action=machine.update&target_type=machine&target_id=${plain}`)
+    expect(audit.total).toBe(1)
+    expect(JSON.stringify(audit.items[0].diff)).toContain('enp1s0f1np1')
+  })
+
+  await test.step('换到普通以太网、集群网卡改回自动 → 就绪（网段）；移出 → 未就绪', async () => {
+    await page.getByTestId('machine-net-edit').click()
+    await page.getByTestId('machine-fabric-select').click()
+    await page.getByRole('option', { name: `${lan.name}（普通以太网 · 三层路由）`, exact: true }).click()
+    await page.getByTestId('machine-iface-select').click()
+    await page.locator('.el-select-dropdown:visible [data-testid="machine-iface-option"]').filter({ hasText: '自动（管理网卡）' }).click()
+    await page.getByTestId('machine-net-save').click()
+    await toast(page, '已保存，就绪判定按新设置重新计算')
+    await expect(page.getByTestId('machine-cluster-iface')).toHaveText('自动（管理网卡 eth0）')
+    await expect(page.getByTestId('machine-cluster-ready')).toHaveText('就绪（127.0.0.0/24）')
+    expect((await getJSON<NetDetail>(ctx, `/admin/api/v1/machines/${plain}`)).machine).toMatchObject({ fabric_id: lan.id, cluster_iface: '', cluster_ready: true, cluster_net: '127.0.0.0/24' })
+
+    await page.getByTestId('machine-net-edit').click()
+    await page.getByTestId('machine-fabric-select').hover()
+    await page.locator('[data-testid="machine-fabric-select"] .el-select__clear').click()
+    await page.getByTestId('machine-net-save').click()
+    await toast(page, '已保存，就绪判定按新设置重新计算')
+    await expect(page.getByTestId('machine-fabric')).toHaveText('未加入')
+    await expect(page.getByTestId('machine-cluster-ready')).toHaveText('未就绪：未加入集群网络')
+    expect((await getJSON<NetDetail>(ctx, `/admin/api/v1/machines/${plain}`)).machine.fabric_id).toBeNull()
+  })
+})
+
+test('A-MCH-12 旧 Agent 机器：就绪判定显示「Agent 不支持集群」、能力位提示升级；机器列表按集群网络筛选（?fabric_id= 预填）与就绪 / RDMA 标记', async ({ page }) => {
+  const admin = await createAdmin('ops')
+  const ctx = await adminApi(admin)
+  const fab = await seedFabric('cx7', { isolation: 'vlan', rdma: true })
+  const [old] = await seedClusterMachines(1, fab.id, 'cx7-rdma', { oldAgent: true })
+  const [fresh] = await seedClusterMachines(1, fab.id, 'cx7-rdma')
+  await loginAdmin(page, admin)
+  await page.goto(`/admin/machines/${old}`)
+  await expect(page.getByTestId('machine-fabric')).toContainText(fab.name)
+  await expect(page.getByTestId('machine-cluster-ready')).toHaveAttribute('data-ready', 'false')
+  await expect(page.getByTestId('machine-cluster-ready')).toHaveText('未就绪：Agent 不支持集群（请升级）')
+  await expect(page.getByTestId('machine-agent-features')).toHaveText('共享实例（不支持多机集群，请升级 Agent）')
+
+  const serial = async (id: number) => (await getJSON<NetDetail>(ctx, `/admin/api/v1/machines/${id}`)).machine.serial
+  const [oldSerial, freshSerial] = [await serial(old), await serial(fresh)]
+  await page.goto(`/admin/machines?fabric_id=${fab.id}`)
+  await expect(page.getByTestId('machines-filter-fabric')).toContainText(fab.name)
+  await expect(machineRows(page)).toHaveCount(2)
+  const oldRow = rowBySerial(page, oldSerial)
+  await expect(oldRow.getByTestId('machine-fabric')).toHaveText(fab.name)
+  await expect(oldRow.getByTestId('machine-cluster-badge')).toHaveAttribute('data-ready', 'false')
+  await expect(oldRow.getByTestId('machine-cluster-badge')).toHaveText('未就绪')
+  await expect(oldRow.getByTestId('machine-cluster-badge')).toHaveAttribute('title', 'Agent 不支持集群（请升级）')
+  await expect(oldRow.getByTestId('machine-rdma-badge')).toHaveCount(0)
+  const freshRow = rowBySerial(page, freshSerial)
+  await expect(freshRow.getByTestId('machine-cluster-badge')).toHaveText('就绪')
+  await expect(freshRow.getByTestId('machine-rdma-badge')).toHaveText('RDMA')
+  const listed = await getJSON<{ items: { id: number }[]; total: number }>(ctx, `/admin/api/v1/machines?fabric_id=${fab.id}`)
+  expect(listed.items.map((m) => m.id).sort()).toEqual([old, fresh].sort())
 })

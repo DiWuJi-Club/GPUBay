@@ -88,6 +88,10 @@ export default defineConfig({
   // 每个用例新建用户，beforeEach（helpers/butler.ts resetButler）清空回复队列并把设置恢复默认；A-BOT-03 关闭管家后在 finally 里恢复。
   // C-BOT-06 / C-BOT-08 推进 11 分钟（确认卡过期），C-BOT-09 推进 1 天（额度次日恢复）；C-BOT-07 / 08、A-BOT-02 的失败部署
   // 用 helpers/apps.ts privateApp 的私有应用，由 cleanupApps 卸载并退役。按日合计 / 仪表盘是全站数字，只与接口值或增量比对。
+  // 计划 13 的多机集群用例（C-CLU / A-FAB / A-CLU / A-MCH-11～12 / A-INS-17 / A-LLM-10～12）不推进假时钟：集群都开在用例自己的可见机组
+  // （helpers/clusters.ts clusterGroup）里的新 fabric 机器上，「可开 X 个」按机组查询；afterEach 的 cleanupClusters 卸载集群应用、释放集群并洗完机。
+  // fabric 机器（用完回到空闲）留在共享池里，单机分配优先非 fabric 机器，不影响其它用例；fabric 列表是全站的，只按自己的 ID / 名称定位。
+  // A-LLM-12 用 /hooks/llm/tick（probe=true）推进真实的 2 台组节点，cleanupLLM 结束时整组排空、释放。
   projects: [
     {
       name: 'console-desktop',

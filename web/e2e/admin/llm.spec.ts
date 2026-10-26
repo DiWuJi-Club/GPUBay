@@ -3,8 +3,9 @@ import { expect, test, type Page } from '@playwright/test'
 import { adminApi, adminPost, createAdmin, enterTotpDialog, expectAdminUrl, expectStillOpen, getJSON, loginAdmin, logout, pick } from '../helpers/admin'
 import { seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
+import { seedClusterMachines, seedFabric } from '../helpers/clusters'
 import {
-  callChat, cleanupLLM, createKey, createPoolMachineAndNode, nodesOf, ownPoolMachine, poolGroupId, poolMachine, seedLLMModel, settleNodes, sweep, uniqueSlug, waitGatewayModel,
+  callChat, cleanupLLM, createKey, createPoolMachineAndNode, nodesOf, ownPoolMachine, poolGroupId, poolMachine, seedLLMModel, settleNodes, sweep, uniqueSlug, waitGatewayModel, type NodeJSON,
 } from '../helpers/llm'
 import { yuan } from '../helpers/money'
 import { runStamp } from '../helpers/phone'
@@ -424,4 +425,169 @@ test('A-LLM-09 按角色：财务看不到「节点与机器池」与节点操�
   const put = await opsCtx.put(`/admin/api/v1/llm/models/${m.id}`, { data: { name: 'x' } })
   expect(put.status()).toBe(403)
   expect((await opsCtx.get('/admin/api/v1/llm/usage')).status()).toBe(403)
+})
+
+// ---- 计划 13：多机副本（每副本 N 台、机器池按集群网络、组节点）----
+
+/** el-input-number：填值后失焦（失焦才提交）。force：Element Plus 2.14 的 el-input-number 只在值变化时同步内层 input 的
+ *  aria-disabled，从禁用（单机）切到可用（2 台）后它仍是 "true"（input 本身已可编辑），Playwright 会据此判为不可编辑。 */
+async function setNumber(page: Page, testid: string, v: number) {
+  await expect(page.getByTestId(testid)).not.toHaveClass(/is-disabled/)
+  const input = page.getByTestId(testid).locator('input')
+  await expect(input).not.toHaveAttribute('disabled')
+  await input.fill(String(v), { force: true })
+  await input.blur()
+}
+
+test('A-LLM-10 模型多机字段：每副本机器数单机 / 2 台 / 4 台，TP 默认 = 台数、TP × PP 校验与 PP > 1 提示（保存禁用），保存后接口带三项', async ({ page }) => {
+  await hooks.appsSeed() // vllm-node 1.1.0（spec.cluster optional 2～4）已发布：2 / 4 台可选
+  const admin = await createAdmin('super')
+  await loginAdmin(page, admin)
+  await page.goto('/admin/llm?tab=models')
+  const slug = uniqueSlug()
+  await page.getByTestId('llm-model-create').click()
+  await page.getByTestId('llm-model-slug').fill(slug)
+  await page.getByTestId('llm-model-name').fill('E2E 多机模型')
+  await page.getByTestId('llm-model-source-id').fill('Qwen/Qwen3-32B')
+  await page.getByTestId('llm-model-input-price').fill('1.00')
+  await page.getByTestId('llm-model-output-price').fill('4.00')
+  const nodes = (text: string) => page.getByTestId('llm-model-nodes-per-replica').locator('label').filter({ hasText: text })
+  await expect(page.getByTestId('llm-model-nodes-per-replica').locator('label')).toHaveText(['单机', '2 台', '4 台'])
+  await expect(nodes('单机').locator('input')).toBeChecked()
+  await expect(nodes('2 台').locator('input')).toBeEnabled()
+  await expect(page.getByTestId('llm-model-tp')).toHaveClass(/is-disabled/)
+  await expect(page.getByTestId('llm-model-pp')).toHaveClass(/is-disabled/)
+
+  await nodes('2 台').click()
+  await expect(page.getByTestId('llm-model-tp').locator('input')).toHaveValue('2')
+  await expect(page.getByTestId('llm-model-pp').locator('input')).toHaveValue('1')
+  await expect(page.getByTestId('llm-model-tp')).not.toHaveClass(/is-disabled/)
+  await expect(page.getByTestId('llm-model-parallel-error')).toHaveCount(0)
+
+  await setNumber(page, 'llm-model-tp', 1)
+  await expect(page.getByTestId('llm-model-parallel-error')).toHaveText('张量并行 × 流水线并行必须等于每副本机器数')
+  await expect(page.getByTestId('llm-model-save')).toBeDisabled()
+  await setNumber(page, 'llm-model-pp', 2)
+  await expect(page.getByTestId('llm-model-parallel-error')).toContainText('cupy')
+  await expect(page.getByTestId('llm-model-save')).toBeDisabled()
+
+  await nodes('4 台').click() // 切换台数：TP = 台数、PP = 1
+  await expect(page.getByTestId('llm-model-tp').locator('input')).toHaveValue('4')
+  await expect(page.getByTestId('llm-model-pp').locator('input')).toHaveValue('1')
+  await expect(page.getByTestId('llm-model-parallel-error')).toHaveCount(0)
+  await nodes('2 台').click()
+  await expect(page.getByTestId('llm-model-tp').locator('input')).toHaveValue('2')
+  await expect(page.getByTestId('llm-model-save')).toBeEnabled()
+  await page.getByTestId('llm-model-save').click()
+  await toast(page, '模型已创建')
+
+  const ctx = await adminApi(admin)
+  const created = (await getJSON<{ items: { id: number; slug: string; nodes_per_replica: number; tensor_parallel: number; pipeline_parallel: number }[] }>(ctx, '/admin/api/v1/llm/models')).items.find((m) => m.slug === slug)!
+  expect(created).toMatchObject({ nodes_per_replica: 2, tensor_parallel: 2, pipeline_parallel: 1 })
+  await modelRow(page, slug).getByTestId('llm-model-edit').click()
+  await expect(nodes('2 台').locator('input')).toBeChecked()
+  await expect(page.getByTestId('llm-model-tp').locator('input')).toHaveValue('2')
+  await expect(page.getByTestId('llm-model-nodes-locked')).toHaveCount(0) // 没有节点：可改
+  await page.getByTestId('llm-model-cancel').click()
+  const r = await ctx.delete(`/admin/api/v1/llm/models/${created.id}`, { data: {} })
+  expect(r.ok()).toBe(true)
+})
+
+test('A-LLM-11 机器池按集群网络分组：空闲 / 池内与可组副本数（2 台 × a · 4 台 × b / 不能组副本），机器行显示集群网络；加入机器对话框显示候选机器的集群网络', async ({ page }) => {
+  const ops = await createAdmin('ops')
+  const ctx = await adminApi(ops)
+  const pool = await poolGroupId(ctx)
+  const big = await seedFabric('lan')
+  const small = await seedFabric('cx7')
+  const bigIds = await seedClusterMachines(4, big.id, 'lan', { groupId: pool })
+  const smallIds = await seedClusterMachines(1, small.id, 'cx7', { groupId: pool })
+  for (const id of [...bigIds, ...smallIds]) ownPoolMachine(id)
+  const rack = uniqueRack()
+  const [cand] = await hooks.machines(1, undefined, rack, undefined, { fabric_id: big.id, net: 'lan' }) // 池外候选机器
+  await loginAdmin(page, ops)
+  await page.goto('/admin/llm?tab=nodes')
+  const fabRow = (id: number) => page.locator(`[data-testid="llm-pool-fabric"][data-id="${id}"]`)
+  await expect(fabRow(big.id)).toContainText(big.name)
+  await expect(fabRow(big.id).getByTestId('llm-pool-fabric-free')).toHaveText('4 / 4')
+  await expect(fabRow(big.id).getByTestId('llm-pool-fabric-groups')).toHaveText('2 台 × 2 · 4 台 × 1')
+  await expect(fabRow(small.id)).toContainText('ConnectX-7')
+  await expect(fabRow(small.id).getByTestId('llm-pool-fabric-free')).toHaveText('1 / 1')
+  await expect(fabRow(small.id).getByTestId('llm-pool-fabric-groups')).toHaveText('不能组副本')
+  for (const id of bigIds) await expect(poolRow(page, id).getByTestId('llm-pool-fabric-name')).toHaveText(big.name)
+  await expect(poolRow(page, smallIds[0]).getByTestId('llm-pool-fabric-name')).toHaveText(small.name)
+
+  // 一台进维护：空闲 3 / 4、只能组 1 个 2 台副本
+  await adminPost(ctx, ops, `/admin/api/v1/machines/${bigIds[3]}/maintenance`, { on: true })
+  await page.getByTestId('llm-nodes-refresh').click()
+  await expect(fabRow(big.id).getByTestId('llm-pool-fabric-free')).toHaveText('3 / 4')
+  await expect(fabRow(big.id).getByTestId('llm-pool-fabric-groups')).toHaveText('2 台 × 1')
+  await adminPost(ctx, ops, `/admin/api/v1/machines/${bigIds[3]}/maintenance`, { on: false })
+
+  await page.getByTestId('llm-pool-add').click()
+  await page.getByTestId('llm-pool-add-rack').fill(rack)
+  await page.getByTestId('llm-pool-add-search').click()
+  const row = page.locator(`[data-testid="llm-pool-add-row"][data-id="${cand}"]`)
+  await expect(row.getByTestId('llm-pool-add-fabric')).toContainText(big.name)
+})
+
+test('A-LLM-12 多机节点组：Controller 在同一集群网络的 2 台上组副本并就绪；节点行「2 台」徽标、成员展开与集群链接、详情抽屉成员与集群部署；排空提示整组', async ({ page }) => {
+  const ops = await createAdmin('ops')
+  const ctx = await adminApi(ops)
+  const pool = await poolGroupId(ctx)
+  const fab = await seedFabric('lan')
+  const mids = await seedClusterMachines(2, fab.id, 'lan', { groupId: pool })
+  for (const id of mids) ownPoolMachine(id)
+  const m = await seedLLMModel({ nodes_per_replica: 2 })
+  await hooks.llmUpstream() // head 的 8000 端口：FakeVLLM（served 含刚上线的模型）
+  let node: NodeJSON | undefined
+  for (let round = 0; round < 60 && node?.state !== 'ready'; round++) {
+    const rep = await hooks.llmTick(true)
+    if (rep.error) throw new Error(`llm tick: ${rep.error}`)
+    await hooks.agent()
+    node = (await nodesOf(ctx, m.id)).find((n) => n.state !== 'removed' && n.state !== 'failed')
+    if (node?.state !== 'ready') await hooks.appsTick(1)
+  }
+  expect(node?.state).toBe('ready')
+  const detail = await getJSON<{ node: NodeJSON & { cluster_id: string; members: { rank: number; machine_id: number; instance_id: string }[] } }>(ctx, `/admin/api/v1/llm/nodes/${node!.id}`)
+  const members = detail.node.members
+  expect(detail.node.size).toBe(2)
+  expect(members.map((x) => x.machine_id).sort()).toEqual([...mids].sort())
+
+  await loginAdmin(page, ops)
+  await page.goto('/admin/llm?tab=nodes')
+  const row = nodeRow(page, node!.id)
+  await expect(row).toHaveAttribute('data-size', '2')
+  await expect(row).toHaveAttribute('data-state', 'ready')
+  await expect(row.getByTestId('llm-node-size')).toHaveText('2 台')
+  await expect(row.getByTestId('llm-node-row-state')).toHaveText('就绪')
+  for (const mb of members) await expect(poolRow(page, mb.machine_id).getByTestId('llm-pool-node')).toContainText(`${m.slug} · rank ${mb.rank} / 2`)
+  await expect(page.locator(`[data-testid="llm-pool-fabric"][data-id="${fab.id}"]`).getByTestId('llm-pool-fabric-free')).toHaveText('0 / 2')
+
+  await row.getByTestId('llm-node-members-toggle').click()
+  await expect(page.getByTestId('llm-node-member')).toHaveCount(2)
+  const head = page.locator('[data-testid="llm-node-member"][data-rank="0"]')
+  await expect(head).toContainText('（head）')
+  await expect(head).toContainText(members[0].instance_id)
+  await expect(head).toContainText('运行中')
+  await expect(page.locator('[data-testid="llm-node-member"][data-rank="1"]')).toContainText(members[1].instance_id)
+  await expect(page.getByTestId('llm-node-row-cluster')).toHaveText(`集群 ${detail.node.cluster_id}`)
+
+  await row.getByTestId('llm-node-open').click()
+  await expect(page.getByTestId('llm-node-drawer')).toBeVisible()
+  await expect(page.getByTestId('llm-node-drawer-member')).toHaveCount(2)
+  await expect(page.getByTestId('llm-node-app-cluster')).toBeVisible()
+  await expect(page.getByTestId('llm-node-cluster-link')).toHaveText(`集群 ${detail.node.cluster_id}`)
+  await page.getByTestId('llm-node-cluster-link').click()
+  await expectAdminUrl(page, `/clusters/${detail.node.cluster_id}`)
+  await expect(page.getByTestId('cluster-detail-system')).toHaveText('平台节点组')
+  await expect(page.getByTestId('cluster-detail-owner')).toContainText('平台（Token 商城节点组）')
+  await expect(page.getByTestId('cluster-extend')).toHaveCount(0) // 系统集群不能延长
+  await expect(page.getByTestId('cluster-member-migrate')).toHaveCount(0)
+
+  await page.goto('/admin/llm?tab=nodes')
+  await nodeRow(page, node!.id).getByTestId('llm-node-drain').click()
+  await expect(page.getByTestId('llm-node-op-text')).toContainText('整组 2 台')
+  await page.getByTestId('llm-node-op-ok').click()
+  await toast(page, '节点开始排空')
+  await expect(nodeRow(page, node!.id)).toHaveAttribute('data-state', 'draining')
 })

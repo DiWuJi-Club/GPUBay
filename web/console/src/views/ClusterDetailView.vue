@@ -88,7 +88,8 @@ watch(id, () => {
 const fast = () => {
   const v = view.value
   if (!v) return false
-  return v.status === 'forming' || v.members.some((m) => m.state === 'creating' || m.state === 'wiping') || clusterAppBusy(v.app)
+  // 活动集群的在位成员不足 size（释放 / 换机后旧成员在洗机，不再列在 members 里）：同样快刷，洗完即显示已释放
+  return v.status === 'forming' || v.members.some((m) => m.state === 'creating' || m.state === 'wiping') || (isClusterActive(v) && v.members.length < v.size) || clusterAppBusy(v.app)
 }
 usePolling(load, 5_000, { enabled: fast })
 usePolling(load, 30_000, { enabled: () => !!view.value && isClusterActive(view.value) && !fast() })
