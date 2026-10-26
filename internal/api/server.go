@@ -219,6 +219,12 @@ func (s *Server) Router() http.Handler {
 			r.Put("/instances/{id}/ports/{port}", s.handleUpdatePort)
 			r.Delete("/instances/{id}/ports/{port}", s.handleDeletePort)
 			r.Get("/instances/{id}/ssh-sessions", s.handleSSHSessions)
+			// 计划 13：集群（规格 §10.1）
+			r.Get("/clusters", s.handleClusters)
+			r.Get("/clusters/{id}", s.handleCluster)
+			r.Post("/clusters/{id}/renew", s.handleRenewCluster)
+			r.Put("/clusters/{id}/auto-renew", s.handleClusterAutoRenew)
+			r.Post("/clusters/{id}/release", s.handleReleaseCluster)
 			if s.Apps != nil {
 				r.Get("/instances/{id}/apps", s.handleInstanceApps)
 				r.Post("/instances/{id}/apps", s.handleCreateApp)
@@ -229,6 +235,12 @@ func (s *Server) Router() http.Handler {
 				r.Delete("/instances/{id}/apps/{dep}", s.handleRemoveApp)
 				r.Get("/instances/{id}/apps/{dep}/log", s.handleAppLog)
 				r.Get("/instances/{id}/apps/{dep}/events", s.handleAppEvents)
+				r.Get("/clusters/{id}/apps", s.handleClusterApp)
+				r.Post("/clusters/{id}/apps", s.handleCreateClusterApp)
+				r.Post("/clusters/{id}/apps/{cd}/redeploy", s.handleRedeployClusterApp)
+				r.Post("/clusters/{id}/apps/{cd}/stop", s.handleStopClusterApp)
+				r.Post("/clusters/{id}/apps/{cd}/start", s.handleStartClusterApp)
+				r.Delete("/clusters/{id}/apps/{cd}", s.handleRemoveClusterApp)
 			}
 			if s.Apps != nil && s.Installer != nil {
 				r.Get("/instances/{id}/apps/{dep}/workflows", s.handleDeploymentWorkflows)
