@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -260,6 +261,38 @@ func TestNoGIDFallsBackToTCP(t *testing.T) {
 	}
 	if len(e.cn.Teardowns()) != 0 || !e.rt.Containers()["ins-aaaaaaaa"].Running {
 		t.Fatal("no-GID is a fallback, not a failure")
+	}
+}
+
+// linux 实现把「设备编号变化 / 网卡无 RDMA / 未找到 GID」都包装成 ErrNoGID：同样退回 TCP，状态文案取错误本身。
+func TestNoGIDStatusUsesApplyError(t *testing.T) {
+	e := newClusterEnv(t)
+	e.cn.SetDevices([]string{"/dev/infiniband/rdma_cm", "/dev/infiniband/uverbs1"})
+	e.cn.SetRuntime(clusterspec.Runtime{HCA: "rocep1s0f1"})
+	e.cn.SetFailApply(fmt.Errorf("%sRDMA 设备编号变化，需重建实例：%w", clusterspec.ErrPrefix, clusternet.ErrNoGID))
+	e.mustOK(createCluster("ins-aaaaaaaa", 2222, macvlanSpec(true, 1)))
+	if cs := e.clusterStates(); cs["ins-aaaaaaaa"] != "error: RDMA 设备编号变化，需重建实例" {
+		t.Fatalf("cluster states = %v", cs)
+	}
+	if env := e.file("ins-aaaaaaaa", "cluster.env"); !strings.Contains(env, "export NCCL_IB_DISABLE='1'\n") {
+		t.Fatalf("env = %s", env)
+	}
+}
+
+// macvlan 成员运行中退出集群：拒绝（容器内 spc0 删不掉），state 不变；停机后可以退出。
+func TestLeaveClusterMacvlanRunningRefused(t *testing.T) {
+	e := newClusterEnv(t)
+	e.mustOK(createCluster("ins-aaaaaaaa", 2222, macvlanSpec(false, 1)))
+	res := e.run(configure("ins-aaaaaaaa", "cfg-leave", clusterspec.Spec{}))
+	if res[0].OK || !strings.HasPrefix(res[0].Message, clusterspec.ErrPrefix) {
+		t.Fatalf("leave while running = %+v", res)
+	}
+	if inst, _ := e.st.Instance("ins-aaaaaaaa"); inst.Cluster == nil || len(e.cn.Teardowns()) != 0 {
+		t.Fatalf("state changed: %+v teardowns=%v", inst.Cluster, e.cn.Teardowns())
+	}
+	e.mustOK(executor.Command{ID: "stop-1", InstanceID: "ins-aaaaaaaa", Type: "stop_instance"}, configure("ins-aaaaaaaa", "cfg-leave-2", clusterspec.Spec{}))
+	if inst, _ := e.st.Instance("ins-aaaaaaaa"); inst.Cluster != nil || !slices.Equal(e.cn.Teardowns(), []string{"ins-aaaaaaaa"}) {
+		t.Fatalf("after stop: %+v teardowns=%v", inst.Cluster, e.cn.Teardowns())
 	}
 }
 

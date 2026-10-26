@@ -36,8 +36,21 @@ const (
 
 	noteModeChanged = "集群网络模式变更需重建实例"
 	noteRDMAChanged = "RDMA 变更需重建实例"
-	statusNoGID     = "error: 未找到 RoCE GID，已退回 TCP"
+	msgNoGID        = "未找到 RoCE GID，已退回 TCP" // Apply 只返回裸 ErrNoGID 时的文案
 )
+
+// noGIDStatus：RDMA 退回 TCP 的状态文案取 Apply 错误本身（未找到 GID / 网卡无 RDMA 设备 / 设备编号变化需重建），
+// 去掉末尾包装的 ErrNoGID 文本。
+func noGIDStatus(err error) string {
+	msg := strings.TrimPrefix(err.Error(), clusterspec.ErrPrefix)
+	for _, sep := range []string{"：", ": "} {
+		msg = strings.TrimSuffix(msg, sep+clusternet.ErrNoGID.Error())
+	}
+	if msg == "" || msg == clusternet.ErrNoGID.Error() {
+		msg = msgNoGID
+	}
+	return statusError(msg)
+}
 
 // clusterErr 给集群网络相关的失败加 clusterspec.ErrPrefix（平台据此走集群失败路径、不判机器故障）。
 func clusterErr(err error) error {
@@ -259,7 +272,7 @@ func (e *Executor) applyCluster(ctx context.Context, inst state.Instance, creati
 	case cur.ClusterNote != "":
 		e.setClusterStatus(id, statusError(cur.ClusterNote))
 	case noGID:
-		e.setClusterStatus(id, statusNoGID)
+		e.setClusterStatus(id, noGIDStatus(applyErr))
 	default:
 		e.setClusterStatus(id, clusterStatusOK)
 	}
@@ -378,9 +391,20 @@ func (e *Executor) configureCluster(ctx context.Context, c Command) error {
 }
 
 // leaveCluster：ConfigureCluster 的 cluster_id 为空——清理网络（Teardown 删 spc0 与对端路由）、删文件、清 state、同步规则。
+// macvlan 成员的容器在运行时拒绝（失败、state 不变）：容器内的 spc0 由 netns 持有，Teardown 拿不到 pid 删不掉
+// （direct 口 / 仍有人用的 VLAN 上它会继续留在原二层里，之后同 fabric 的新集群会与它同网），只有停容器才会消失。
 func (e *Executor) leaveCluster(ctx context.Context, inst state.Instance) error {
 	id := inst.ID
 	var errs []error
+	if inst.Cluster != nil && inst.Cluster.Mode == clusterspec.ModeMacvlan {
+		cur, err := e.d.Runtime.Inspect(ctx, id)
+		if err != nil {
+			return err
+		}
+		if cur.Exists && cur.Running {
+			return clusterErrf("macvlan 集群成员运行中不能退出集群（容器内 spc0 只能随容器停止移除），请先停止实例")
+		}
+	}
 	if inst.Cluster != nil && e.d.Cluster != nil {
 		if err := e.d.Cluster.Teardown(ctx, id, *inst.Cluster, e.otherClusterSpecs(id)); err != nil {
 			return clusterErr(fmt.Errorf("清理集群网络失败：%w", err)) // state 保留，平台重发时再清
