@@ -30,12 +30,12 @@
 
 - 所有命令前置 `export PATH=$HOME/.local/go/bin:$HOME/.local/bin:$PATH`；Go 模块名 `spark-cloud`；开发 Mac 没有 Docker，Go 测试用 embedded-postgres。
 - **迁移编号固定 `migrations/00026_multinode.sql`**（00023 保留未用，goose 已允许乱序）；表 / 列 / 约束 / 索引名照抄规格 §2。
-- **集群网络常量**（`internal/clusterspec`）：`ModeRouted = "routed"`、`ModeMacvlan = "macvlan"`、`IfName = "spc0"`、`DefaultPool = "10.210.0.0/16"`、`MemberOffset = 11`（成员 IP = 子网第 `11 + rank` 个地址）、网关 = 子网 `.1`、`MaxSize = 8`、`MasterPort = 29500`。宿主机侧网卡名：veth `sch` + 实例 ID 后 8 位、容器侧临时名 `scc` + 后 8 位、macvlan `scm` + 后 8 位、VLAN 子接口 `scv<vlan>`。iptables 链 `SPARK-CLU`；跳转 `DOCKER-USER -i sch+ -j SPARK-CLU`、`DOCKER-USER -o sch+ -j SPARK-CLU`、`INPUT -i sch+ -j SPARK-IN`。
+- **集群网络常量**（`internal/clusterspec`）：`ModeRouted = "routed"`、`ModeMacvlan = "macvlan"`、`IfName = "spc0"`、`DefaultPool = "10.210.0.0/16"`、`MemberOffset = 11`（成员 IP = 子网第 `11 + rank` 个地址）、网关 = 子网 `.1`、`MaxSize = 8`、`MasterPort = 29500`。宿主机侧网卡名：veth `sch` + 实例 ID 后 8 位、容器侧临时名 `scc` + 后 8 位、macvlan `scm` + 后 8 位、VLAN 子接口 `scv<vlan>`。iptables 链 `SPARK-CLU`（期望规则按 `iptables -S` 打印顺序 `-s -d -i -o … -j` 书写）；**跳转组**：`DOCKER-USER` 前 3 条恰为 `-i spark0 -j SPARK-FWD`、`-i sch+ -j SPARK-CLU`、`-o sch+ -j SPARK-CLU`，`INPUT` 前 2 条恰为 `-i spark0 -j SPARK-IN`、`-i sch+ -j SPARK-IN`（由 `netfilter/iptables.ensureJumpGroup` 维护，不再各自争第 1 位）。`cluster.env` **每行 `export KEY='value'`**。`Iface.IPv4` 为 CIDR。Agent 集群网络失败的错误消息前缀 `clusterspec.ErrPrefix = "cluster-net: "`。**Agent 的 `Apply` 必须差量、非破坏性**：容器内已有 `spc0` 时绝不 `ip link del / add`。
 - **集群规模**：服务层只接受 `{2, 4}`（`rental.ClusterSizes`）；表约束 `2..8`；`direct` fabric 只能组 2 台、最多挂 2 台机器。
 - **fabric**：`kind ∈ lan | cx7`、`isolation ∈ routed | direct | vlan`、`lan ⇔ routed`、`rdma` 只能在 `cx7`；集群 `mode = routed`（lan）/ `macvlan`（cx7）；有效 RDMA = `fabric.rdma ∧ 全员 machines.cluster_rdma`。
 - **能力位**：`features.SharedSlots = 1 << 0`（已有）、`features.Cluster = 1 << 1`（新）；机器入选集群要求 `machines.cluster_ready`（fleet 计算，已含能力位判断）。
 - **集群容器参数**：`--cap-drop NET_RAW`、`--sysctl net.ipv4.ping_group_range=0 2147483647`；RDMA 时 `--device /dev/infiniband/rdma_cm --device /dev/infiniband/uverbsN`。
-- **集群状态**：表 `active | released | failed`；派生 `forming | ready | degraded`（规格 §5.4）。集群部署表 `active | removed`；派生 `installing | running | failed | stopped | stale | removing | removed`（规格 §6.4）。角色 `head`（rank0）/ `worker`。
+- **集群状态**：表 `active | released | failed`；派生 `forming | ready | degraded`（规格 §5.4）。**在位成员** = `state IN (creating, running, stopped)`（`rental.ClusterMemberStates`，ClusterSpec / rank / 成员数都按它），**未结束成员** = 在位 ∪ `wiping`（集群结束判定按它）。`rental.ClusterFormTimeout = 30 * time.Minute`（组建期从 `created_at` 起未就绪 → 整组中止）；到期只在首次就绪时对齐。集群部署表 `active | removed`；派生 `installing | running | failed | stopped | stale | removing | removed`（规格 §6.4）。角色 `head`（rank0）/ `worker`。
 - **锁序**（规格 §14）：多成员路径一律「`instance_clusters` 行 `FOR UPDATE` → 成员实例按 ID 升序」；单实例路径不读写 `instance_clusters` 行；集群创建在机器行锁之后取 `pg_advisory_xact_lock(hashtext('cluster-alloc'))` 分配子网 / VLAN。
 - **错误码**（`apperr`，规格 §10 文案原文）：`ErrClusterNotFound`（`cluster_not_found` 404）、`ErrClusterMember`（`cluster_member` 409）、`ErrClusterSizeInvalid`（`cluster_size_invalid` 400）、`ErrClusterBookingUnsupported`（`cluster_booking_unsupported` 400）、`ErrFabricNotFound`（404）、`ErrFabricInUse`（409）、`ErrFabricFull`（409）、`FabricInvalid(field, reason string) *Error`（`fabric_invalid` 400）、`ErrAppClusterRequired`（400）、`ErrAppClusterUnsupported`（400）、`AppClusterSize(min, max int) *Error`（`app_cluster_size` 400，「该应用支持 X～Y 台的集群」）、`ErrAppClusterExists`（409）、`ErrAppClusterManaged`（409）；`ClusterNoCapacity(n int) *Error`（`no_capacity` 409，「暂无可组成 N 台集群的空闲机器（需同一高速网络）」）。
 - **告警种类**（文案稳定，不含数值）：`cluster_failed`（warning「集群 <id> 开通失败，已全额退款」）、`cluster_rdma_degraded`（warning「集群 <id> 的 RDMA 不可用，已退回以太网」）、`cluster_net_error`（warning「实例 <id> 的集群网络异常」）。**审计动作**：`fabric.create / update / delete`、`cluster.extend`、`cluster.resync`（admin）；`cluster.release`、`cluster.auto_renew`、`cluster.app_deploy / app_redeploy / app_stop / app_start / app_remove`（user / 系统）。全部加进 `web/shared/src/labels.ts` 的 `auditActions` / `alertKindLabel`。
@@ -51,7 +51,8 @@
 2. **同 fabric 原子分配、没有半个集群**：两个并发的 4 台集群订单抢同一个 6 台 fabric → 恰一个成功（另一个换 fabric 或 `no_capacity`），任何时刻不存在成员跨 fabric 或成员数 ≠ size 的 active 集群 → Task 6 `TestClusterPlaceAtomicSameFabric`、`TestClusterPlaceConcurrent`。
 3. **开通期中止的钱账**：rank1 Create 失败 → rank0 洗机且两单全额退、机器 0 不判故障、告警一条；`CheckClusterInvariants` 通过 → Task 10 `TestClusterAbortRefundsAll`、Task 13 `TestClusterAbortE2E`。
 4. **Token 商城组语义**：成员实例没了 → 立即 failed 且释放全部成员；成员崩溃 → 2 分钟后整组 Redeploy；成员暂停 10 分钟 → failed；Router 不收成员暂停的组 → Task 9 `TestGroupMemberGoneFailsWholeGroup`、`TestGroupCrashRedeploysAll`、`TestRouterExcludesGroupWithSuspendedMember`。
-5. **存量零扰动**：非集群部署的 `env` 字节不变（不触发重装）、`N = 1` 节点 `NodeEnv` 字节不变、单机分配在无 fabric 时与现状完全一致、旧 Agent 机器永不入选集群 → Task 7 `TestReservedEnvUnchangedForNonCluster`、Task 9 `TestPlatformNodeEnvSingleUnchanged`、Task 6 `TestOldAgentExcluded`。
+5. **Agent 重启不打断分布式任务**：对已配好的 netns 再次 `Apply` 不产生任何 `ip link add / del`；连续多次 `EnsureRules` / `SyncRules` 只有第一次有写操作 → Task 2 `TestApplyIdempotentNoLinkChurn`、`TestJumpGroupRepeatedRunsStable`、`TestSyncRulesNoopWhenMatching`，真机 CP-1 第 5 项（长跑 NCCL 期间重启 Agent）。
+6. **存量零扰动**：非集群部署的 `env` 字节不变（不触发重装）、`N = 1` 节点 `NodeEnv` 字节不变、单机分配在无 fabric 时与现状完全一致、旧 Agent 机器永不入选集群 → Task 7 `TestReservedEnvUnchangedForNonCluster`、Task 9 `TestPlatformNodeEnvSingleUnchanged`、Task 6 `TestOldAgentExcluded`。
 
 ## 已做出的裁定（规格未写明或与代码核对后确定的细节）
 
@@ -77,7 +78,7 @@
 | `internal/platform/apperr/apperr.go` | 1 | 之后只读（新错误码全部在 Task 1 加） |
 | `web/shared/src/types/cluster.ts`、`web/shared/src/labels.ts`、`web/shared/src/types/index.ts` | 1 | 14 / 15 只追加组件私有类型到各自目录 |
 | `internal/agent/clusternet/clusternet.go`、`internal/agent/clusternet/fake/**` | 1 | |
-| `internal/agent/clusternet/linux/**` | 2 | |
+| `internal/agent/clusternet/linux/**`、`internal/agent/netfilter/iptables/**` | 2 | 跳转组改动在 `netfilter/iptables` |
 | `internal/agent/{executor,runtime,state,client,fakeagent}/**`、`internal/agent/netfilter/fake/**` | 3 | |
 | `cmd/spark-agent/**`、`deploy/agent/**` | 4 | |
 | `internal/fleet/**`（除 `commands.go` 的类型，见 1）、`internal/agentgw/**` | 5 | `fleet/commands.go`、`fleet/agent.go` 的 `InstanceState` 字段由 1 加 |
@@ -118,7 +119,7 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 - Modify: `api/proto/agent/v1/agent.proto`（`make proto` 重新生成 `internal/agentpb/*.pb.go`）、`internal/agentpb/agentpb_test.go`、`internal/agent/features/features.go`、`internal/platform/apperr/apperr.go`、`internal/fleet/commands.go`、`internal/fleet/agent.go`（`InstanceState.Cluster`、`StateReport.Net`）、`internal/rental/service.go`（`Instance.ClusterID / ClusterRank`、`instanceCols`、`scanInstance`）、`internal/appdeploy/types.go`（`Spec.Cluster`）、`internal/appdeploy/spec.go`（`ValidateSpec` 的 cluster 规则）、`internal/appdeploy/consts.go`（`MaxTimeoutMinutes = 480`）、`internal/appdeploy/spec_test.go`、`web/shared/src/labels.ts`、`web/shared/src/types/index.ts`、`web/shared/src/__tests__/labels.spec.ts`
 
 **Interfaces:**
-- Produces（迁移）：规格 §2 全部 SQL 原文 + Down（三条 `RAISE EXCEPTION`：「仍有运行中的集群，请先释放」「仍有多机节点组，请先把副本数调为 0」「仍有集群应用，请先卸载」，再逆序删除）。
+- Produces（迁移）：规格 §2 全部 SQL 原文（含 `machines.cluster_net TEXT NOT NULL DEFAULT ''`，machines 共 8 个新列）+ Down（三条 `RAISE EXCEPTION`：「仍有运行中的集群，请先释放」「仍有多机节点组，请先把副本数调为 0」「仍有集群应用，请先卸载」，再逆序删除）。
 - Produces（`internal/clusterspec`，纯包）：
   ```go
   const (ModeRouted = "routed"; ModeMacvlan = "macvlan"; IfName = "spc0"; DefaultPool = "10.210.0.0/16"; MemberOffset = 11; MaxSize = 8; MasterPort = 29500)
@@ -143,7 +144,7 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   }
   type Iface struct {
       Name string `json:"name"`; MAC string `json:"mac"`; Up bool `json:"up"`; SpeedMbps int `json:"speed_mbps"`; MTU int `json:"mtu"`
-      IPv4 []string `json:"ipv4"`; Driver string `json:"driver"`; PCI string `json:"pci"`; Wireless bool `json:"wireless"`
+      IPv4 []string `json:"ipv4"` /* CIDR，如 "192.168.1.221/24" */; Driver string `json:"driver"`; PCI string `json:"pci"`; Wireless bool `json:"wireless"`
       RDMADevice string `json:"rdma_device,omitempty"`; RDMAActive bool `json:"rdma_active,omitempty"`; Uverbs string `json:"uverbs,omitempty"`; LinkLayer string `json:"link_layer,omitempty"`
   }
   type NetInfo struct { LanIface string `json:"lan_iface"`; Ifaces []Iface `json:"ifaces"` }
@@ -154,11 +155,14 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   func (s Spec) Validate() error  // ClusterID ^clu-[a-z0-9]{10}$、Version ≥ 1、2 ≤ Size ≤ MaxSize、0 ≤ Rank < Size、Mode 合法、Iface ^[A-Za-z0-9_.-]{1,15}$、VLAN 0 或 2..4094、MTU 0 或 1280..9216、Subnet 是 /24、
                                   // Members 按 rank 升序且唯一、每个 IP == MemberIP(subnet, rank)、含自己（rank == s.Rank）、routed 时每个对端 HostIP 是 IPv4、macvlan 时 HostIP 为空
   func (s Spec) Self() Member; func (s Spec) Head() (Member, bool); func (s Spec) Peers() []Member
-  // ResolveIface 规格 §3.2：kind "lan" → configured 或 n.LanIface，须存在、Up、有 IPv4；hostIP = 该网卡是 LanIface 时取 lanIP，否则取其第一个 IPv4。
-  // kind "cx7" → configured 或第一个 Driver == "mlx5_core" 且 Up 的网卡；须存在、Up、!Wireless、Name != n.LanIface；hostIP 为空。错误为中文可展示原因。
+  // ResolveIface 规格 §3.2。管理网卡 = IPv4（CIDR）里含 lanIP 的网卡；lanIP 为空或找不到时才退回 n.LanIface（Hello 在 AgentConfig 之前发出，LanIface 可能为空）。
+  // kind "lan" → configured 或管理网卡，须存在、Up、有 IPv4；hostIP = 该网卡是管理网卡时取 lanIP，否则取其第一个 IPv4 的地址部分（不带前缀长度）。
+  // kind "cx7" → configured 或第一个 Driver == "mlx5_core" 且 Up 的网卡；须存在、Up、!Wireless、≠ 管理网卡；hostIP 为空。错误为中文可展示原因。
   func ResolveIface(n NetInfo, kind, configured, lanIP string) (Iface, string, error)
   func RenderJSON(s Spec, rt Runtime) []byte  // 规格 §3.6 的 /etc/spark-cluster.json（network = rdma 当 s.RDMA && rt.RDMAActive，否则 ethernet；rdma 为 null 或 {hca, gid_index}）
-  func RenderEnv(s Spec, rt Runtime) []byte   // 规格 §3.6 的 KEY='value' 行，固定顺序，单引号按 ' → '\'' 转义，末尾换行
+  func RenderEnv(s Spec, rt Runtime) []byte   // 规格 §3.6：每行 export KEY='value'，固定顺序，单引号按 ' → '\'' 转义，末尾换行
+  func NetPrefix(cidr string) string          // "192.168.1.221/24" → "192.168.1.0/24"；非法 → ""
+  const ErrPrefix = "cluster-net: "            // Agent 因集群网络失败的 create / Devices 错误前缀（平台据此不判机器故障）
   func HostVeth(instanceID string) string     // "sch" + 实例 ID 后 8 位
   func TempName(instanceID string) string     // "scc" + 后 8 位
   func MacvlanName(instanceID string) string  // "scm" + 后 8 位
@@ -178,8 +182,10 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   ```go
   const (ClusterActive = "active"; ClusterReleased = "released"; ClusterFailed = "failed"; ClusterForming = "forming"; ClusterReady = "ready"; ClusterDegraded = "degraded")
   var ClusterSizes = []int{2, 4}
-  const ClusterAlignSlack = 60 * time.Second
+  const ClusterAlignSlack = 60 * time.Second       // 只用于「到期不一致」提示与不变量
+  const ClusterFormTimeout = 30 * time.Minute      // 组建期未就绪 → 整组中止
   const ConfigureClusterCommandTimeout = 2 * time.Minute
+  var ClusterMemberStates = []string{StateCreating, StateRunning, StateStopped}   // 在位成员
   type Cluster struct {
       ID string `json:"id"`; UserID int64 `json:"user_id"`; System bool `json:"system"`; Size int `json:"size"`; FabricID int64 `json:"fabric_id"`
       Mode string `json:"mode"`; VLAN *int `json:"vlan"`; RDMA bool `json:"rdma"`; MTU int `json:"mtu"`; SubnetIndex int `json:"subnet_index"`; Version int `json:"version"`
@@ -245,13 +251,13 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 
 - [ ] **Step 1: 写失败的测试**
   - `TestMigration00026RoundTrip`（仿 `migrate_llm_test.go`）：`UpTo(25)` → `UpByOne` → 断言约束：`cluster_fabrics` 的 kind / isolation / rdma / vlan 组合（`lan+direct`、`lan+rdma`、`vlan` 缺范围都失败）；两个 active 集群同 `subnet_index` 失败、一个改 `released` 后成功；同 fabric 同 vlan 两个 active 失败；`instances_cluster_pair`；`llm_models_parallel`（2 × 2 = 4 成功、2 × 1 ≠ 4 失败）；`llm_nodes_group`；`llm_node_members_machine_live_uniq`；Down 在有 active 集群时失败（消息含「运行中的集群」），清掉后成功；再 Up 成功。
-  - `clusterspec`：`TestSubnetAndIPs`（index 0 → `10.210.0.0/24`、`MemberIP(·,3)` = `.14`、`GatewayIP` = `.1`、index 256 报错、非 /16 池报错）；`TestSpecValidate` 表驱动（每条规则一正一反）；`TestResolveIface` 表驱动（lan 默认 / lan 指定 / lan 网卡 down / cx7 自动选 mlx5 / cx7 指定无线被拒 / cx7 等于 lan 网卡被拒 / hostIP 取值）；`TestRenderGolden`（四个黄金文件；`-update` 旗标重写）；`TestRenderEnvQuoting`（成员 ID 含单引号时转义正确）；`TestNames`（长度 ≤ 15）。
+  - `clusterspec`：`TestSubnetAndIPs`（index 0 → `10.210.0.0/24`、`MemberIP(·,3)` = `.14`、`GatewayIP` = `.1`、index 256 报错、非 /16 池报错）；`TestSpecValidate` 表驱动（每条规则一正一反）；`TestResolveIface` 表驱动（lan 默认 / lan 指定 / lan 网卡 down / `LanIface` 为空靠 lanIP 找到管理网卡 / cx7 自动选 mlx5 / cx7 指定无线被拒 / cx7 等于管理网卡被拒 / hostIP 取值不带前缀）；`TestNetPrefix`；`TestRenderGolden`（四个黄金文件，env 每行以 `export ` 开头；`-update` 旗标重写）；`TestRenderEnvSourcedExports`（把 env 写临时文件，`sh -c '. f; sh -c "printf %s \$NCCL_SOCKET_IFNAME"'` 输出 `spc0`）；`TestRenderEnvQuoting`（成员 ID 含单引号时转义正确）；`TestNames`（长度 ≤ 15）。
   - `agentpb_test.go`：新消息 Marshal / Unmarshal 往返。
   - `appdeploy/spec_test.go`：`TestValidateSpecCluster`（合法 / mode 错 / min > max / max > 8 / 无 cluster 的 spec_hash 与改动前相同）、`TestValidateSpecTimeout480`。
   - `fake_test.go`：记录与失败注入。
   - `labels.spec.ts`：新映射齐全。
 - [ ] **Step 2: 运行确认失败**
-  Run: `go test ./internal/platform/db/ -run TestMigration00026 ./internal/clusterspec/ ./internal/appdeploy/ -run 'TestValidateSpec' 2>&1 | tail -5`
+  Run: `go test -run TestMigration00026 ./internal/platform/db/ 2>&1 | tail -3; go test ./internal/clusterspec/ 2>&1 | tail -3; go test -run TestValidateSpec ./internal/appdeploy/ 2>&1 | tail -3`（`-run` 写在包路径之前，否则包路径会被当成测试参数）
   Expected: 编译失败 / 测试失败。
 - [ ] **Step 3: 实现**（迁移按规格原文；`make proto`；`rental.scanInstance` 增两个字段并核对所有 `instanceCols` 用法编译通过；`appdeploy` 的 deployment 列表与 scan 增两列）
 - [ ] **Step 4: 运行测试并提交**
@@ -265,14 +271,15 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   ```
 
 ---
-### Task 2: Agent 宿主机网络实现（`clusternet/linux`：探测、routed、macvlan / VLAN、`SPARK-CLU`、RDMA GID）
+### Task 2: Agent 宿主机网络实现（`clusternet/linux`：探测、差量 Apply、routed、macvlan / VLAN、`SPARK-CLU` 与跳转组、巡检 Check、RDMA）
 
 **Files:**
-- Create: `internal/agent/clusternet/linux/{linux.go,probe.go,routed.go,macvlan.go,rules.go,rdma.go,linux_test.go,probe_test.go,routed_test.go,macvlan_test.go,rules_test.go,rdma_test.go}`、`internal/agent/clusternet/linux/testdata/sysfs-221/**`（221 实况：`enP7s7`（r8169，down）、`wlP9s9`（wireless，up，`192.168.1.221`）、无 infiniband）、`testdata/sysfs-spark/**`（标准 Spark：`enP7s7` 有线 lan、4 个 mlx5 netdev `enp1s0f0np0 / enp1s0f1np1 / enP2p1s0f0np0 / enP2p1s0f1np1`，其中两个 carrier=1、对应 `rocep1s0f1` 等 RDMA 设备 `ports/1/state = 4: ACTIVE`、`link_layer = Ethernet`、`infiniband_verbs/uverbs0..3/ibdev`、`gids/0..5` 与 `gid_attrs/types/*`）
+- Create: `internal/agent/clusternet/linux/{linux.go,probe.go,routed.go,macvlan.go,rules.go,rdma.go,check.go,linux_test.go,probe_test.go,routed_test.go,macvlan_test.go,rules_test.go,rdma_test.go,check_test.go}`、`internal/agent/clusternet/linux/testdata/sysfs-221/**`（221 实况：`enP7s7`（r8169，down）、`wlP9s9`（wireless，up，`192.168.1.221/24`）、无 infiniband）、`testdata/sysfs-spark/**`（标准 Spark：`enP7s7` 有线 lan、4 个 mlx5 netdev `enp1s0f0np0 / enp1s0f1np1 / enP2p1s0f0np0 / enP2p1s0f1np1`，其中两个 carrier=1、对应 `rocep1s0f1` 等 RDMA 设备 `ports/1/state = 4: ACTIVE`、`link_layer = Ethernet`、`infiniband_verbs/uverbs0..3/ibdev`、`gids/0..5` 与 `gid_attrs/types/*`）
+- Modify: `internal/agent/netfilter/iptables/iptables.go`、`internal/agent/netfilter/iptables/iptables_test.go`（`ensureFirstJump` → `ensureJumpGroup`；保证 `SPARK-CLU` 存在）
 - Test: 上述 `_test.go`
 
 **Interfaces:**
-- Consumes: Task 1 的 `clusterspec.*`、`clusternet.Net`；现有 `cmdrun.Runner`、`cmdrun.Recorder`（`Stub(prefix, out, err)`、`Calls`、`Inputs`、`Lines()`）。
+- Consumes: Task 1 的 `clusterspec.*`、`clusternet.Net`、`clusternet.ErrNoGID`；现有 `cmdrun.Runner`、`cmdrun.Recorder`（`Stub(prefix, out, err)`、`Calls`、`Inputs`、`Lines()`）。
 - Produces：
   ```go
   package linux
@@ -284,33 +291,42 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   }
   type Net struct{ /* run cmdrun.Runner; opt Options */ }
   func New(run cmdrun.Runner, opt Options) *Net        // 实现 clusternet.Net
-  func ExpectedCluRules(routed map[string]clusterspec.Spec) []string // `iptables -S SPARK-CLU` 的期望输出（含 -N 行），按实例 ID、对端 rank 排序
+  func ExpectedCluRules(routed map[string]clusterspec.Spec) []string // `iptables -S SPARK-CLU` 的期望输出（含 -N 行），按实例 ID、对端 rank 排序，规则按打印顺序 -s -d -i -o … -j
   const ChainClu = "SPARK-CLU"
+  // netfilter/iptables
+  var DockerUserJumps = [][]string{{"-i", "spark0", "-j", "SPARK-FWD"}, {"-i", "sch+", "-j", "SPARK-CLU"}, {"-o", "sch+", "-j", "SPARK-CLU"}}
+  var InputJumps      = [][]string{{"-i", "spark0", "-j", "SPARK-IN"}, {"-i", "sch+", "-j", "SPARK-IN"}}
+  // ensureJumpGroup(ctx, chain, jumps)：链的前 len(jumps) 条恰为 jumps（按序）→ 不动；否则逐条把缺的 -I 到应在的位置、再删掉链里别处的重复（先插后删，任何时刻隔离跳转都在）；列不出链 → 错误（fail closed）
   ```
-- 行为（规格 §3.2～§3.4 的命令原文，每步幂等）：
-  - `Probe`：只读 sysfs（`<SysRoot>/class/net/*`），网卡筛选与字段见规格 §3.2；`lan_iface` = IPv4 含 `lanIP` 的网卡（IPv4 用 `ip -4 -o addr show` 解析，命令输出可 stub）；`uverbs` 由 `<SysRoot>/class/infiniband_verbs/uverbs*/ibdev` 反查。
-  - `Devices`：`s.RDMA` 时按 `s.Iface` 的探测结果返回 `[<DevRoot>/infiniband/rdma_cm, <DevRoot>/infiniband/<uverbs>]`，任一不存在 → 错误「RDMA 设备不可用」。
-  - `Apply`：先校验 `s.Validate()`；`ModeRouted` 按规格 §3.3（veth、地址、容器路由、宿主机 /32、对端路由、`rp_filter=1`、关 IPv6）；`ModeMacvlan` 按 §3.4（VLAN 子接口 `scv<vlan>` 不存在才建、父接口 `ip -4 addr flush`、关 IPv6、MTU、macvlan bridge、移入 netns、改名 `spc0`、`A_r/24`、up）；**若 `s.Iface` 是持有本机 lan IP 的网卡且 mode = macvlan → 返回错误「集群网卡不能是管理网卡」，不执行任何命令**；RDMA 时查 GID（`<SysRoot>/class/infiniband/<hca>/ports/1/gids/<i>` 等于 `0000:0000:0000:0000:0000:ffff:<hex(A_r)>` 且 `gid_attrs/types/<i>` 为 `RoCE v2`），每 200ms 一次直到 `GIDWait`，找不到 → `Runtime{RDMAActive: false}` 与错误 `clusternet.ErrNoGID`（Task 1 定义；调用方据此写 `NCCL_IB_DISABLE=1`，状态 error 但不当失败处理）。
-  - `Check`：`nsenter -t <pid> -n ip -o -4 addr show dev spc0` 含 `A_r`；routed 再查 `ip route show A_r/32` 指向 `sch<x>`。
-  - `Teardown`：删对端 `/32` 路由（`ip route del A_k/32 via H_k`，不存在忽略）、`ip link del sch<x> / scm<x>`（不存在忽略）；`remaining` 里没有同一 `scv<vlan>` 的使用者时 `ip link del scv<vlan>`。
-  - `SyncRules`：`iptables -S SPARK-CLU` 与 `ExpectedCluRules` 比对，不同则 `iptables-restore --noflush -w` 一次事务重建（同 `netfilter/iptables.syncChains` 的做法）；再保证三条跳转在各自链的第 1 位（同 `ensureFirstJump`；`DOCKER-USER`、`INPUT` 列不出 → 返回错误）。`ExpectedCluRules` 内容按规格 §3.3。
+- 行为（规格 §3.2～§3.4 原文；**Apply 必须差量、非破坏性**：Agent 重启后 `Recover` 会对所有 running 实例再调一次）：
+  - `Probe(ctx, lanIP)`：只读 sysfs（`<SysRoot>/class/net/*`）+ `ip -4 -o addr show`（命令输出可 stub），网卡筛选与字段见规格 §3.2；`IPv4` 存 CIDR；`lanIP` 为空时 `LanIface = ""`、其它照常；`uverbs` 由 `<SysRoot>/class/infiniband_verbs/uverbs*/ibdev` 反查。
+  - `Devices`：`s.RDMA` 时按 `s.Iface` 的探测结果返回 `[<DevRoot>/infiniband/rdma_cm, <DevRoot>/infiniband/<uverbs>]`，任一不存在 → 错误（消息以 `clusterspec.ErrPrefix` 开头）。
+  - `Apply`：先 `s.Validate()`；**若 `s.Iface` 持有本机任一 IPv4 默认路由或 `ip -4 -o addr` 里的管理地址且 mode = macvlan → 返回错误「集群网卡不能是管理网卡」，不执行任何命令**。先观察（`nsenter -t <pid> -n ip -o -4 addr show dev spc0`、`ip -o link show sch<x>|scm<x>|scv<vlan>`），**容器内已有 `spc0` 时绝不 `ip link del / add`**，只执行规格 §3.3 / §3.4 里标为幂等的 `replace` 步骤；没有 `spc0` 时先删宿主机残留的 `sch<x> / scm<x>` 再建。routed 对端路由差量：列 `ip -4 route show 10.210.C.0/24 dev <iface>`，删多余、补缺失。macvlan 父接口卫生（`nmcli device set <iface> managed no`（`nmcli` 不存在或失败忽略）、`ip -4 addr flush`、关 IPv6、MTU）每次执行。容器内 `spc0` 一律 `sysctl -w net.ipv6.conf.spc0.disable_ipv6=1`。RDMA：先核对 `<SysRoot>/class/infiniband_verbs/<Devices 给出的 uverbsN>/ibdev` 仍是该 HCA，不是 → `Runtime{RDMAActive:false}` + 错误「RDMA 设备编号变化，需重建实例」；再查 GID（`gids/<i>` 等于 `0000:0000:0000:0000:0000:ffff:<hex(A_r)>` 且 `gid_attrs/types/<i>` 为 `RoCE v2`），每 200ms 一次直到 `GIDWait`，找不到 → `Runtime{RDMAActive: false}` 与 `clusternet.ErrNoGID`。
+  - `Check`：返回 `(ok, err)`，`ok = false` 时 `err` 是可展示的问题描述：容器内 `spc0` 存在、有 `A_r`、IPv6 关；routed：宿主机 `A_r/32 dev sch<x>`、对端路由集合与期望相同、`iptables -S SPARK-CLU` 与期望相同、跳转组在位；macvlan：VLAN 子接口存在且 up、父接口无 IPv4 / IPv6 地址（**发现即清除**并在 err 里注明「父接口出现地址，已清除」）、IPv6 关；RDMA：uverbs 映射未变。
+  - `Teardown`：删对端 `/32` 路由（不存在忽略）、`ip link del sch<x> / scm<x>`（不存在忽略）；`remaining` 里没有同一 `scv<vlan>` 的使用者时 `ip link del scv<vlan>`。
+  - `SyncRules`：`iptables -S SPARK-CLU` 与 `ExpectedCluRules` 比对，不同则 `iptables-restore --noflush -w` 一次事务重建（同 `netfilter/iptables.syncChains`）。跳转组由 `netfilter/iptables.EnsureRules` 维护（它在 60 秒刷新与 create / start 前都会跑）：`EnsureRules` 改用 `ensureJumpGroup(DOCKER-USER, DockerUserJumps)` 与 `ensureJumpGroup(INPUT, InputJumps)`，并在链不存在时 `iptables -N SPARK-CLU` + `-A SPARK-CLU -j DROP`（存在时不碰内容）。
+  - `ExpectedCluRules`：规格 §3.3 的四类行（`-N`、conntrack、每对端出向 `-s A_r/32 -d A_k/32 -i sch<x> -o <iface> -j ACCEPT` 与入向 `-s A_k/32 -d A_r/32 -i <iface> -o sch<x> -j ACCEPT`、`-j DROP`）。
 
 - [ ] **Step 1: 写失败的测试**
-  - `TestProbe221`：夹具 → `LanIface = "wlP9s9"`、两块网卡（`enP7s7` `Up=false`、`wlP9s9` `Wireless=true`）、无 RDMA。
+  - `TestProbe221`：夹具 → `LanIface = "wlP9s9"`（`lanIP = 192.168.1.221`）、两块网卡（`enP7s7` `Up=false`、`wlP9s9` `Wireless=true`、`IPv4 = ["192.168.1.221/24"]`）、无 RDMA；`TestProbeNoLanIP`（`lanIP = ""` → `LanIface = ""`，其余相同）。
   - `TestProbeSparkCX7`：4 个 mlx5 网卡、`Driver = "mlx5_core"`、两个 `RDMAActive`、`Uverbs` 映射正确、`LinkLayer = "Ethernet"`；`lo / docker0 / veth* / spark0 / sch* / scm* / scv*` 被排除。
-  - `TestApplyRoutedCommands`：`cmdrun.Recorder` 快照（`Lines()` 与期望多行字符串逐行相等），rank 1 / size 4 的对端路由 3 条。
-  - `TestApplyMacvlanDirect`、`TestApplyMacvlanVLAN`（VLAN 子接口已存在时不重建：stub `ip link show scv120` 成功）、`TestApplyRefusesLanIface`（无任何 `ip link add` 调用）。
-  - `TestExpectedCluRules`（两个本机实例 × 各自对端）、`TestSyncRulesNoopWhenMatching`、`TestSyncRulesRebuildsOnDrift`（`Inputs[0]` 是完整 restore 事务）、`TestJumpsFirst`。
+  - `TestApplyRoutedFirstTime`：`cmdrun.Recorder` 快照（`Lines()` 与期望多行字符串逐行相等），rank 1 / size 4 的对端路由 3 条、容器 `spc0` 关 IPv6。
+  - **`TestApplyIdempotentNoLinkChurn`**：stub 容器里已有 `spc0`（带 `A_r`）、宿主机已有 `sch<x>` 与对端路由 → 再次 `Apply`（routed 与 macvlan 各一）→ `Calls` 里**没有任何** `ip link add`、`ip link del`、`ip link set … netns`、`… name spc0`。
+  - `TestApplyPeerRouteDiff`（对端从 3 个变 2 个 → 只删 1 条、不动其余）、`TestApplyRemovesStaleHostLink`（容器无 `spc0`、宿主机有残留 `sch<x>` → 先 del 再建）。
+  - `TestApplyMacvlanDirect`、`TestApplyMacvlanVLAN`（VLAN 子接口已存在时不重建）、`TestApplyRefusesLanIface`（无任何 `ip link add` 调用）、`TestApplyRDMAUverbsChanged`。
+  - `TestExpectedCluRulesPrintOrder`（两个本机实例 × 各自对端；字符串与 `iptables -S` 真实打印格式一致：`-A SPARK-CLU -s 10.210.3.11/32 -d 10.210.3.12/32 -i sch1234abcd -o eth0 -j ACCEPT`）、`TestSyncRulesNoopWhenMatching`（stub 的 `-S` 输出 = 期望 → 没有 `iptables-restore` 调用）、`TestSyncRulesRebuildsOnDrift`（`Inputs[0]` 是完整 restore 事务）。
+  - `netfilter/iptables`：`TestJumpGroupNoopWhenInPlace`、`TestJumpGroupCoexists`（`DOCKER-USER` 现有只有 `SPARK-FWD` 跳转 → 结果前 3 条按序、调用序列先 `-I` 后 `-D`）、`TestJumpGroupRepeatedRunsStable`（连续三次 `EnsureRules` 只有第一次有写操作——防 `SPARK-FWD / SPARK-CLU / SPARK-IN` 互抢第 1 位）、`TestEnsureRulesCreatesCluChain`、现有 `iptables_test.go` 的期望按新跳转组更新后全部通过。
+  - `TestCheckDetectsEachProblem`（表驱动：缺 `spc0` / 缺对端路由 / 规则漂移 / 缺 VLAN 子接口 / 父接口出现 `169.254.x` 地址（并断言执行了 `addr flush`）/ IPv6 未关 / uverbs 映射变化，各返回 `ok=false` 与对应描述；全部正常 `ok=true`）。
   - `TestTeardownKeepsSharedVLAN`（remaining 里还有用 `scv120` 的 Spec → 不删）、`TestTeardownIgnoresMissing`。
-  - `TestFindGID`（夹具 `gids/3` 匹配 → 3）、`TestGIDTimeout`（`GIDWait = 50ms` → `errors.Is(err, clusternet.ErrNoGID)`、`RDMAActive=false`）、`TestDevices`（RDMA / 非 RDMA / 设备缺失）、`TestCheck`。
+  - `TestFindGID`（夹具 `gids/3` 匹配 → 3）、`TestGIDTimeout`（`GIDWait = 50ms` → `errors.Is(err, clusternet.ErrNoGID)`、`RDMAActive=false`）、`TestDevices`（RDMA / 非 RDMA / 设备缺失）。
 - [ ] **Step 2: 运行确认失败**
-  Run: `go test ./internal/agent/clusternet/linux/ 2>&1 | head -5`
+  Run: `go test ./internal/agent/clusternet/linux/ ./internal/agent/netfilter/... 2>&1 | head -5`
 - [ ] **Step 3: 实现**（`sysfs` 读取全部经 `filepath.Join(opt.SysRoot, …)`；命令全部经 `cmdrun.Runner`；不 import `executor`）
 - [ ] **Step 4: 运行测试并提交**
   Run: `go vet ./... && go test ./internal/agent/... 2>&1 | tail -5 && GOOS=linux GOARCH=arm64 go build ./internal/agent/...`
   ```bash
-  git add internal/agent/clusternet/linux
-  git commit -m "feat(agent): cluster data plane on linux (sysfs probe, routed veth + SPARK-CLU, macvlan/VLAN on CX-7, RDMA devices and RoCE GID)
+  git add internal/agent/clusternet/linux internal/agent/netfilter/iptables
+  git commit -m "feat(agent): cluster data plane on linux (sysfs probe, diff-based non-destructive apply, routed veth + SPARK-CLU, ordered jump group, macvlan/VLAN on CX-7 with parent hygiene, RDMA devices and RoCE GID)
 
   Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
   ```
@@ -335,32 +351,32 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   type Deps struct{ …; Cluster clusternet.Net }             // nil = 不支持集群
   type InstanceState struct{ InstanceID, Phase, Cluster string }   // Cluster：""、"ok"、"pending"、"error: …"（≤ 200 字节，合法 UTF-8）
   func (e *Executor) ClusterCapable() bool                  // Deps.Cluster != nil
-  func (e *Executor) NetInfo(ctx context.Context) *clusterspec.NetInfo   // Deps.Cluster.Probe(ctx, cfg.LanIP)；出错或不支持 → nil；受 reportTimeout 约束
+  func (e *Executor) NetInfo(ctx context.Context) *clusterspec.NetInfo   // Deps.Cluster.Probe(ctx, cfg.LanIP)——cfg.LanIP 在 AgentConfig 到达前为空，照样探测（LanIface 为空）；出错或不支持 → nil；受 reportTimeout 约束
   const configureClusterTimeout = 2 * time.Minute           // commandTimeout("configure_cluster")
   // client
   // Hello.Features 默认：SharedSlots | (Cluster 当 ex.ClusterCapable())；Config.Features 非 nil 时照用（测试模拟旧 Agent）
   // Hello.Net 与每份 StateReport.Net = ex.NetInfo(ctx)（nil 不发）；InstanceState.Cluster 原样转发
   // toCommand：Create 的 cluster → executor.Command.Cluster；ConfigureCluster → Type "configure_cluster"、Cluster
   // fakeagent
-  type Options struct{ …; Net *clusterspec.NetInfo; ClusterNet *clusternetfake.Net }   // ClusterNet nil → 新建一个；Net nil → 一块 eth0（IPv4 = IPs[0] 或 10.0.0.10，Up，有线）
+  type Options struct{ …; Net *clusterspec.NetInfo; ClusterNet *clusternetfake.Net }   // ClusterNet nil → 新建一个；Net nil → 一块 eth0（IPv4 = IPs[0] + "/24" 或 10.0.0.10/24，Up，有线）
   func (a *Agent) ClusterNet() *clusternetfake.Net
   ```
 - 行为（规格 §4.3）：
   - `create`：`Cluster != nil` → `Spec.Validate()` 失败或 `Deps.Cluster == nil` → 失败；`runtime.Spec.CapDrop = ["NET_RAW"]`、`Sysctls = {"net.ipv4.ping_group_range": "0 2147483647"}`、`Devices = Net.Devices(spec)`（出错 → 失败）；写 `cluster.json / cluster.env`（`clusterspec.RenderJSON / RenderEnv`，`Runtime{}`）到 `ssh/<id>/`（`writeFileAtomic`，0644）；`state.Instance.Cluster = spec`；容器已存在但缺少期望的 cap-drop / 设备（`Inspect` 不比较这些，**以 state 里有无 Cluster 判定**：首次带集群的 create 若容器已存在且 state 无 Cluster → 删掉重建）。
-  - `startChecked` 末尾（`Limit` 成功之后）：`inst.Cluster != nil` → `Net.Apply` → 成功：`ClusterRuntime = rt`、按 rt 重写 `cluster.env`、`clusterStatus[id] = ok`；`errors.Is(err, clusternet.ErrNoGID)`（Task 1 定义，Task 2 的 linux 实现返回）→ 写 `NCCL_IB_DISABLE=1`、状态 `error: 未找到 RoCE GID，已退回 TCP`、不算失败；其它错误：**create 调用链**（`e.creating[id]` 标记）→ 停容器并返回错误；**其它调用链** → 状态 `error: …`、返回 nil。routed 实例 Apply 后 `Net.SyncRules(本机全部 routed 且 Desired=running 的 Spec)`。
+  - `startChecked` 末尾（`Limit` 成功之后）：`inst.Cluster != nil` → `Net.Apply`（Task 2 保证差量、对已配好的 netns 不重建网卡——Recover 对所有 running 实例都会走到这里）→ 成功：`ClusterRuntime = rt`、按 rt 重写 `cluster.env`、`clusterStatus[id] = ok`；`errors.Is(err, clusternet.ErrNoGID)`（Task 1 定义，Task 2 的 linux 实现返回）→ 写 `NCCL_IB_DISABLE=1`、状态 `error: 未找到 RoCE GID，已退回 TCP`、不算失败；其它错误：**create 调用链**（`e.creating[id]` 标记）→ 本地清理（`Net.Teardown(id, spec, 其余实例 Spec)` + `Net.SyncRules`）、停容器、返回错误，错误消息以 `clusterspec.ErrPrefix` 开头（`Devices` 失败同样处理），平台据此不判机器故障；**其它调用链** → 状态 `error: …`、返回 nil。routed 实例 Apply 后 `Net.SyncRules(本机全部 routed 且 Desired=running 的 Spec)`。
   - `configure_cluster`：`checkID`；本地无该实例 → 成功（忽略）；`spec.ClusterID == ""` → `Net.Teardown` + 删两个文件 + 清 `Cluster / ClusterRuntime` + `SyncRules`；`spec.Version < 本地 Version` → 成功（忽略）；否则存 state、重写文件；容器运行中 → `Net.Apply`（同上的状态处理）+ `SyncRules`；`spec.RDMA && !old.RDMA` → 状态 `error: RDMA 变更需重建实例`（文件按 `RDMA=false` 渲染）。
-  - `refreshRules` 内新增 `ensureClusters`（`opMu.TryLock`，同 `ensureLimits`）：对 Desired=running 且有 Cluster 的实例 `Inspect` 拿 pid → `Net.Check` 为 false → 重新 Apply；之后 `SyncRules`。
-  - `wipe`：删容器之后 `Net.Teardown(id, spec, 其余实例的 Spec)`（失败计入洗机校验失败），删 ssh 目录（文件随之删除）。
+  - `refreshRules` 内新增 `ensureClusters`（`opMu.TryLock`，同 `ensureLimits`）：对 Desired=running 且有 Cluster 的实例 `Inspect` 拿 pid → `Net.Check`；`ok = false` **或上一轮状态为 `error`** → 重新 Apply；**每轮都回写** `clusterStatus[id]`（Apply 成功 → `ok`，否则 `error: <Check / Apply 的描述>`）；之后 `SyncRules`。
+  - `wipe`：删容器之后 `Net.Teardown(id, spec, 其余实例的 Spec)` → `Net.SyncRules(其余 routed 实例)`（两者失败都计入洗机校验失败），删 ssh 目录（文件随之删除）。
   - `Report`：`InstanceState.Cluster`：无 Cluster `""`；容器未运行 `pending`；`clusterStatus[id]`（内存，Agent 重启后为空 → 视为 `pending` 直到第一次 Apply）。
   - `initScript`：规格 §3.6 的片段插在 `exec /usr/sbin/sshd` 之前。
 
 - [ ] **Step 1: 写失败的测试**（fake runtime + fake disk + fake netfilter + `clusternetfake.Net`）
   - `TestCreateClusterDropsNetRaw`：fake runtime 记录的 `Spec.CapDrop == ["NET_RAW"]`、sysctl、RDMA 时 `Devices`；非集群 create 三项为空（`docker_test` 另断言命令行快照：非集群命令行与改动前逐字相同）。
   - `TestCreateClusterWritesFilesAndApplies`：`ssh/<id>/cluster.json / cluster.env` 内容 = `RenderJSON / RenderEnv`；`Applies()` 一次；`Rules()` 含该实例（routed）。
-  - `TestCreateClusterApplyFailureFailsCreate`（`FailApply` → create 失败、容器被停）、`TestStartApplyFailureKeepsRunning`（start 指令路径 → 成功、`Report` 为 `error: …`）、`TestNoGIDFallsBackToTCP`（env 含 `NCCL_IB_DISABLE='1'`）。
+  - `TestCreateClusterApplyFailureFailsCreate`（`FailApply` → create 失败、消息以 `cluster-net: ` 开头、`Teardowns()` 与 `Rules()` 不再含该实例、容器被停）、`TestStartApplyFailureKeepsRunning`（start 指令路径 → 成功、`Report` 为 `error: …`）、`TestNoGIDFallsBackToTCP`（env 含 `NCCL_IB_DISABLE='1'`）。
   - `TestConfigureClusterVersioning`（旧版本忽略、新版本 Apply、清空 Teardown + 删文件）、`TestConfigureClusterStoppedInstance`（只写文件不 Apply）、`TestConfigureClusterRDMAFlip`。
-  - `TestEnsureClustersReapplies`（`CheckResult=false` → 下一轮巡检 Apply）、`TestWipeTearsDownCluster`、`TestRecoverReappliesCluster`、`TestReportClusterField`、`TestInitScriptHasClusterSnippet`、`TestStateRoundTripCluster`（旧状态文件无字段读出 nil）。
-  - client：`TestHelloCarriesNetAndClusterFeature`（`ClusterCapable` 为真时 features = 3）、`TestOldAgentFeatures`（`Config.Features = new(uint32)` → 0）、`TestToCommandConfigureCluster`、`TestStateReportNetAndCluster`。
+  - `TestEnsureClustersReapplies`（`CheckResult=false` → 下一轮巡检 Apply）、`TestEnsureClustersRetriesAfterError`（上轮 Apply 失败、本轮 Check 为 true → 仍重跑 Apply；成功后 Report 变 `ok`）、`TestRecoverDoesNotRebuildLink`（Recover 后 fake 记录的 Apply 收到同一 Spec，executor 不调用任何 runtime 层的网卡操作）、`TestWipeTearsDownCluster`（Teardown 后 SyncRules 不再含该实例）、`TestRecoverReappliesCluster`、`TestReportClusterField`、`TestInitScriptHasClusterSnippet`、`TestStateRoundTripCluster`（旧状态文件无字段读出 nil）。
+  - client：`TestHelloCarriesNetAndClusterFeature`（`ClusterCapable` 为真时 features = 3；AgentConfig 之前发出的 Hello 也带 `net`，`lan_iface` 为空）、`TestOldAgentFeatures`（`Config.Features = new(uint32)` → 0）、`TestToCommandConfigureCluster`、`TestStateReportNetAndCluster`。
   - fakeagent：`TestFakeAgentReportsNetInfo`。
 - [ ] **Step 2: 运行确认失败**
   Run: `go test ./internal/agent/... 2>&1 | grep -E 'FAIL|cannot' | head`
@@ -379,14 +395,14 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 ### Task 4: Agent 装配与自检
 
 **Files:**
-- Modify: `cmd/spark-agent/main.go`（`clusternet/linux` 装配进 `executor.Deps.Cluster`）、`cmd/spark-agent/selfcheck.go`（「集群网卡」一节）、`cmd/spark-agent/main_test.go`、`deploy/agent/install.sh`（安装后提示：CX-7 口勿配 IP、`ip_forward`）、`deploy/agent/install_test.sh`（如有断言则同步）
+- Modify: `cmd/spark-agent/main.go`（`clusternet/linux` 装配进 `executor.Deps.Cluster`）、`cmd/spark-agent/selfcheck.go`（「集群网卡」一节）、`cmd/spark-agent/main_test.go`、`deploy/agent/install.sh`（新参数 `--cluster-iface <name>`，可重复：写 `/etc/NetworkManager/conf.d/99-spark-cluster.conf` 的 `[keyfile] unmanaged-devices=interface-name:<a>;interface-name:<b>` 并 `nmcli general reload`（无 nmcli 跳过并提示）；安装后提示 CX-7 口勿配 IP、`ip_forward`）、`deploy/agent/install_test.sh`（断言生成的 conf 内容）
 - Test: `cmd/spark-agent/main_test.go`
 
 **Interfaces:**
 - Consumes: Task 2 `linux.New(cmdrun.Runner, linux.Options{Log})`；Task 3 `executor.Deps.Cluster`。
-- Produces：`--fake` 时 `Deps.Cluster = clusternetfake.New()`，否则 `linux.New(runner, linux.Options{Log: log})`。`selfcheck` 新增输出行（`ok:` / `warn:` 前缀与现有一致）：每块物理网卡 `iface <name> up=<bool> speed=<n> driver=<d> rdma=<dev|-> active=<bool>`；`warn: 未发现 ConnectX-7 网卡，集群将只能使用普通以太网`；CX-7 口有 IPv4 → `warn: <iface> 上有地址 <ip>，作为集群网卡时 Agent 会清除`；`/proc/sys/net/ipv4/ip_forward != 1` → `warn`；本机地址或路由落在 `10.210.0.0/16` → `warn: 与集群网段冲突`。selfcheck 不因这些 warn 失败（集群是可选能力）。
+- Produces：`--fake` 时 `Deps.Cluster = clusternetfake.New()`，否则 `linux.New(runner, linux.Options{Log: log})`。`selfcheck` 新增输出行（`ok:` / `warn:` 前缀与现有一致）：每块物理网卡 `iface <name> up=<bool> speed=<n> driver=<d> rdma=<dev|-> active=<bool>`；`warn: 未发现 ConnectX-7 网卡，集群将只能使用普通以太网`；CX-7 口有 IPv4 / IPv6 → `warn: <iface> 上有地址 <ip>，作为集群网卡时 Agent 会清除`；CX-7 口受 NetworkManager 管理（`nmcli -t -f DEVICE,STATE device` 不是 `unmanaged`）→ `warn: <iface> 受 NetworkManager 管理，NM 可能重新加地址；请执行 install.sh --cluster-iface <iface>`；`/proc/sys/net/ipv4/ip_forward != 1` → `warn`；本机地址或路由落在 `10.210.0.0/16` → `warn: 与集群网段冲突`。selfcheck 不因这些 warn 失败（集群是可选能力）。
 
-- [ ] **Step 1: 写失败的测试**：`TestSelfcheckClusterSection`（`cmdrun.Recorder` + 临时 sysroot 拷贝 Task 2 的 `sysfs-221` 夹具 → 输出含「未发现 ConnectX-7」）；`TestRunAgentWiresCluster`（`--fake` 下 Hello features = 3）。
+- [ ] **Step 1: 写失败的测试**：`TestSelfcheckClusterSection`（`cmdrun.Recorder` + 临时 sysroot 拷贝 Task 2 的 `sysfs-221` 夹具 → 输出含「未发现 ConnectX-7」）；`TestRunAgentWiresCluster`（`--fake` 下 Hello features = 3）；`TestSelfcheckNMManagedWarn`；`install_test.sh` 的 `--cluster-iface` 用例。
 - [ ] **Step 2: 运行确认失败**：`go test ./cmd/spark-agent/ 2>&1 | tail -3`
 - [ ] **Step 3: 实现**
 - [ ] **Step 4: 运行并提交**
@@ -422,19 +438,20 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   func (s *Service) UpdateFabric(ctx context.Context, actor audit.Actor, id int64, in FabricInput) (Fabric, error) // 有 active 集群时 kind/isolation/vlan 变化 → ErrFabricInUse；之后重算该 fabric 全部机器的 cluster_ready/rdma；审计 fabric.update（before/after）
   func (s *Service) DeleteFabric(ctx context.Context, actor audit.Actor, id int64) error   // 有机器或 active 集群 → ErrFabricInUse；审计 fabric.delete
   // Machine 增：FabricID *int64 `json:"fabric_id"`; ClusterIface string `json:"cluster_iface"`; AgentFeatures uint32 `json:"agent_features"`;
-  //            NetInfo *clusterspec.NetInfo `json:"net_info"`; NetInfoAt *time.Time `json:"net_info_at"`; ClusterReady bool `json:"cluster_ready"`; ClusterRDMA bool `json:"cluster_rdma"`; ClusterReason string `json:"cluster_reason"`（不是列：scan 后用 evalClusterNet 现算）
+  //            NetInfo *clusterspec.NetInfo `json:"net_info"`; NetInfoAt *time.Time `json:"net_info_at"`; ClusterReady bool `json:"cluster_ready"`; ClusterRDMA bool `json:"cluster_rdma"`; ClusterNet string `json:"cluster_net"`; ClusterReason string `json:"cluster_reason"`（最后一项不是列：scan 后用 evalClusterNet 现算）
   type MachineUpdate struct{ …; SetFabric bool; FabricID *int64; ClusterIface *string }
   // UpdateMachine：SetFabric / ClusterIface 变化时，机器上有 cluster_id 非空的活动实例（creating/running/stopped/wiping）→ ErrInvalidState（「机器上有集群成员，不能修改集群网络」）；
-  //   加入 direct fabric 后该 fabric 机器数 > 2 → ErrFabricFull；FabricID 不存在 → ErrFabricNotFound；同事务重算 cluster_ready / cluster_rdma；审计 diff 带 fabric_id / cluster_iface
+  //   加入 direct fabric 后该 fabric 机器数 > 2 → ErrFabricFull；FabricID 不存在 → ErrFabricNotFound；同事务重算 cluster_ready / cluster_rdma / cluster_net；审计 diff 带 fabric_id / cluster_iface
   func (s *Service) RecordHello(ctx context.Context, machineID int64, features uint32, net *clusterspec.NetInfo) error  // 写 agent_features（与 net_info，若非 nil）并重算
   func (s *Service) RecordNetInfo(ctx context.Context, machineID int64, net clusterspec.NetInfo) error   // 写 net_info / net_info_at 并重算（JSON 与现值相同只更新 net_info_at）
-  // evalClusterNet（未导出，规格 §3.2）：(ready, rdma bool, reason string)，reason 中文：「未加入集群网络」「Agent 不支持集群（请升级）」「尚未上报网卡」「<ResolveIface 的错误>」
+  // evalClusterNet（未导出，规格 §3.2）：(ready, rdma bool, clusterNet, reason string)。管理网卡一律按 machines.lan_ip 在 net.Ifaces 的 CIDR 里找（Hello 在 AgentConfig 之前发出，net.LanIface 可能为空，不能据此翻转就绪）；
+  //   lan → clusterNet = clusterspec.NetPrefix(集群网卡第一个 IPv4)；cx7 → "l2"；未就绪 → ""。reason 中文：「未加入集群网络」「Agent 不支持集群（请升级）」「尚未上报网卡」「<ResolveIface 的错误>」
   ```
 - agentgw：`Connect` 收到 Hello 后调 `Fleet.RecordHello(ctx, m.ID, hello.GetFeatures(), toNetInfo(hello.GetNet()))`（替代此前不读 features 的现状；`Fleet` 依赖接口加该方法）；`handleReport`：`rep.Net != nil` → `RecordNetInfo`；`toStateReport` 带 `InstanceState.Cluster`；`toProtoCommand`：Create 载荷 `Cluster != nil` → `CreateInstance.Cluster = toProtoSpec(*p.Cluster)`；`CmdConfigureCluster` → `Command_ConfigureCluster{ConfigureCluster: {Cluster: toProtoSpec(p.Cluster)}}`（`Cluster.ClusterID == ""` 时发空 Spec）。转换函数 `toProtoSpec / fromProtoNet` 放 `convert.go`，表驱动测试往返。
 
 - [ ] **Step 1: 写失败的测试**
   - `TestFabricCRUDValidation`（kind/isolation 组合、vlan 范围、名称唯一、删除占用 → in_use）、`TestDirectFabricMaxTwo`、`TestUpdateFabricRecomputesMachines`、`TestUpdateFabricBlockedByActiveCluster`（直接 SQL 插一个 active 集群）。
-  - `TestEvalClusterNetMatrix`（无 fabric / 旧 Agent / 无 net / lan 正常 / lan 网卡 down / cx7 自动 / cx7 指定无线 / cx7 = lan 网卡 / rdma 判定 fabric.rdma × rdma_active × uverbs）。
+  - `TestEvalClusterNetMatrix`（无 fabric / 旧 Agent / 无 net / `LanIface` 为空但 `lan_ip` 能匹配（仍就绪）/ lan 正常且 `cluster_net = 192.168.1.0/24` / lan 网卡 down / cx7 自动 / cx7 指定无线 / cx7 = lan 网卡 / rdma 判定 fabric.rdma × rdma_active × uverbs）。
   - `TestRecordHelloAndNetInfo`（就绪列随之变化；相同 JSON 只刷时间）、`TestUpdateMachineFabricGuard`（有集群成员 → invalid_state）。
   - agentgw：`TestConvertClusterSpecRoundTrip`、`TestConfigureClusterCommandToProto`、`TestHelloRecordsFeaturesAndNet`、`TestReportRecordsNetAndClusterState`（`last_state_report` JSON 含 `"cluster":"ok"`）。
 - [ ] **Step 2: 运行确认失败**：`go test ./internal/fleet/ ./internal/agentgw/ 2>&1 | tail -5`
@@ -464,7 +481,7 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   type BatchResult struct{ …; Cluster *ClusterView }
   // pickSpec 增 FabricID *int64; ClusterOnly bool（ClusterOnly：m.fabric_id IS NOT NULL AND m.cluster_ready）
   func (s *Service) PlaceSystemCluster(ctx context.Context, req SystemClusterRequest) (SystemClusterResult, error)
-  func (s *Service) ReleaseSystemCluster(ctx context.Context, clusterID string) error   // 非系统集群 → ErrInvalidState；已无活动成员 → nil
+  func (s *Service) ReleaseSystemCluster(ctx context.Context, clusterID string) error   // 非系统集群 → ErrInvalidState；已无在位成员 → nil
   func (s *Service) ClusterSpecFor(ctx context.Context, q db.Querier, clusterID string, rank int) (clusterspec.Spec, error)
   func (s *Service) GetClusterView(ctx context.Context, id string) (ClusterView, error)                 // 不存在 → ErrClusterNotFound
   func (s *Service) ClusterForUser(ctx context.Context, userID int64, id string) (ClusterView, error)  // 别人的 / 系统集群 → ErrClusterNotFound
@@ -475,16 +492,17 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   // Deps 增 ClusterSubnetPool netip.Prefix
   ```
 - 行为：规格 §5.1～§5.4。要点：
-  - `validateBatch`：`Cluster` 时 `Count ∉ ClusterSizes` → `ErrClusterSizeInvalid`；`StartAt != nil` → `ErrClusterBookingUnsupported`；`MachineID != nil` → `BadRequest("集群不能指定机器")`。
-  - 集群分支：fabric 候选 SQL（规格 §5.1，基于 `pickWhereSQL` 的即时分支 + `ClusterOnly`）→ 逐 fabric savepoint + `placeOnMachines(spec{FabricID}, N, 原回调)`；都失败 → `apperr.ClusterNoCapacity(N)`；成功 → `createCluster(ctx, tx, …)`（`cluster-alloc` 咨询锁、最小空闲 `subnet_index`、`vlan` fabric 取最小空闲 VLAN、`mode`、`rdma`、`mtu`、`batch_id`、按机器 ID 升序 `UPDATE instances SET cluster_id, cluster_rank`）→ 原流程 charge / 事件；`enqueueCreateSpec(…, ClusterSpecFor(…, rank))`。有效 RDMA 为假而 fabric.rdma 为真 → 同事务 `RaiseAlertOnce(warning, cluster_rdma_degraded, …)`。
-  - `PlaceSystemCluster`：规格 §5.2；`MachineIDs` 长度 ∉ ClusterSizes → `ErrClusterSizeInvalid`；任一台条件不满足 / fabric 不同 / `cluster_ready=false` → `ErrMachineUnavailable`。
-  - `ClusterSpecFor`：规格 §5.3；成员 `HostIP` 用 `clusterspec.ResolveIface(net_info, fabric.kind, machines.cluster_iface, machines.lan_ip)`；`Spec.Validate()` 失败 → 返回错误（不下发坏 Spec）。
+  - `validateBatch`：`Cluster` 时 `Count ∉ ClusterSizes` → `ErrClusterSizeInvalid`；`StartAt != nil` → `ErrClusterBookingUnsupported`；`MachineID != nil` → `BadRequest("集群不能指定机器")`；`AppID != nil` → `BadRequest("集群请在开通后到集群页部署应用")`。
+  - `alloc.go`：把 `pickWhereSQL` 的 WHERE 条件抽成 `pickCondSQL` 常量（`pickWhereSQL` 由它拼出，生成的 SQL 与现状等价），`pickSpec` 增 `FabricID *int64`、`ClusterNet *string`、`ClusterOnly bool` 三个条件参数。
+  - 集群分支：**单独的** fabric 候选 SQL（规格 §5.1 原文：`FROM machines m JOIN cluster_fabrics f … WHERE <pickCondSQL> AND m.cluster_ready GROUP BY m.fabric_id, m.cluster_net …`——不能把只选 `m.id` 的 `pickWhereSQL` 当子查询）→ 逐 `(fabric, cluster_net)` savepoint，**每次尝试前清空回调追加的实例切片**，`placeOnMachines(spec{FabricID, ClusterNet, ClusterOnly}, N, 原回调)`；都失败 → `apperr.ClusterNoCapacity(N)`；成功 → `createCluster(ctx, tx, …)`（`cluster-alloc` 咨询锁、最小空闲 `subnet_index`、`vlan` fabric 取最小空闲 VLAN、`mode`、`rdma`、`mtu`、`batch_id`、按机器 ID 升序 `UPDATE instances SET cluster_id, cluster_rank`）→ 原流程 charge / 事件；`enqueueCreateSpec(…, ClusterSpecFor(…, rank))`。有效 RDMA 为假而 fabric.rdma 为真 → 同事务 `RaiseAlertOnce(warning, cluster_rdma_degraded, …)`。
+  - `PlaceSystemCluster`：规格 §5.2；`MachineIDs` 长度 ∉ ClusterSizes → `ErrClusterSizeInvalid`；任一台条件不满足 / fabric 或 `cluster_net` 不同 / `cluster_ready=false` → `ErrMachineUnavailable`。
+  - `ClusterSpecFor`：规格 §5.3（只取在位成员 `rental.ClusterMemberStates`）；成员 `HostIP` 用 `clusterspec.ResolveIface(net_info, fabric.kind, machines.cluster_iface, machines.lan_ip)`；`Spec.Validate()` 失败 → 返回错误（不下发坏 Spec）。
   - 视图：`Status` 按规格 §5.4（`NetStatus` 从 `machines.last_state_report` 的 `instances[].cluster` 取）；`Network`：`rdma` / `ethernet` / `rdma_degraded`（fabric.rdma 且集群 rdma 为假）；`HeadIP` = `MemberIP(subnet, 0)`。
   - 单机即时分配排序首键 `(m.fabric_id IS NOT NULL)`；无 fabric 时与现状一致。
 
 - [ ] **Step 1: 写失败的测试**
   - `TestClusterPlaceAtomicSameFabric`：fabric A 3 台、fabric B 4 台（lan）、零散 2 台无 fabric → 4 台集群全部落在 B，rank 按机器 ID，四张订单同一 `batch_id`、钱包扣 4 × 单价、四条 Create 载荷的 Spec 互为对端（routed、`host_ip` = 各机 lan_ip）。
-  - `TestClusterPlacePrefersRDMAThenTightest`、`TestClusterPlaceDirectOnlyTwo`、`TestClusterPlaceNoCapacity`（消息为 `ClusterNoCapacity(4)`）、`TestOldAgentExcluded`（`cluster_ready=false` 不入选）、`TestClusterPlaceValidation`（count 3、预订、指定机器）。
+  - `TestClusterPlacePrefersRDMAThenTightest`、`TestClusterPlaceDirectOnlyTwo`、`TestClusterPlaceNoCapacity`（消息为 `ClusterNoCapacity(4)`）、`TestOldAgentExcluded`（`cluster_ready=false` 不入选）、`TestClusterPlaceValidation`（count 3、预订、指定机器、带 `AppID`）、`TestClusterPlaceSplitsByNetwork`（同一 lan fabric 两个网段各 2 台 → 2 台集群落在同一网段；要 4 台 → `no_capacity`）、`TestClusterPlaceRetryResetsInstances`（第一个候选 fabric 被并发锁走一台后第二个成功 → 结果恰 N 个实例、无第一个 fabric 的残留）、`TestPickWhereSQLUnchanged`（非集群 spec 生成的 SQL / 结果与改动前相同）。
   - `TestClusterPlaceConcurrent`：6 台的 fabric，两个 goroutine 同时下 4 台集群 → 恰一个成功、另一个 `no_capacity`，任何 active 集群成员数 = size、同 fabric。
   - `TestClusterSubnetAndVLANAllocation`（顺序分配、释放后复用、并发 20 个 2 台集群子网互不相同）。
   - `TestSingleOrdersAvoidFabricMachines`（有非 fabric 空闲机时单机订单不选 fabric 机器；全是 fabric 机器时照常选）。
@@ -508,7 +526,7 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 
 **Files:**
 - Create: `internal/appdeploy/cluster.go`、`internal/appdeploy/cluster_status.go`、`internal/appdeploy/cluster_test.go`、`internal/appdeploy/cluster_status_test.go`
-- Modify: `internal/appdeploy/service.go`（`Create` 对 `required` 应用 → `ErrAppClusterRequired`；成员部署的 `Redeploy / Stop / Start / Remove` 用户入口 → `ErrAppClusterManaged`，内部集群操作走未导出路径）、`internal/appdeploy/bundle.go`（`BundleInput.ClusterRole / ClusterDeploymentID`，`ReservedEnv` 只在非空时追加两行）、`internal/appdeploy/runner.go`（worker 且 `!Spec.Cluster.WorkerPorts` 时 running 不登记端口；bundle 传角色）、`internal/appdeploy/hooks.go`（`OnInstanceMigrated` 保留 `cluster_deployment_id / cluster_role`）、`internal/appdeploy/view.go`（视图 `cluster_role`、应用目录视图 `cluster`）、`internal/appdeploy/catalog.go`（`ListPublished` 结果带 `Spec.Cluster` 摘要，供控制台区分）
+- Modify: `internal/appdeploy/hooks.go` 的 `PrepareInstall`（`required` 应用 → `ErrAppClusterRequired`，下单预装不能绕过）、`internal/appdeploy/service.go`（`Create` 对 `required` 应用 → `ErrAppClusterRequired`；成员部署的 `Redeploy / Stop / Start / Remove` 用户入口 → `ErrAppClusterManaged`，内部集群操作走未导出路径）、`internal/appdeploy/bundle.go`（`BundleInput.ClusterRole / ClusterDeploymentID`，`ReservedEnv` 只在非空时追加两行）、`internal/appdeploy/runner.go`（worker 且 `!Spec.Cluster.WorkerPorts` 时 running 不登记端口；bundle 传角色）、`internal/appdeploy/hooks.go`（`OnInstanceMigrated` 保留 `cluster_deployment_id / cluster_role`）、`internal/appdeploy/view.go`（视图 `cluster_role`、应用目录视图 `cluster`）、`internal/appdeploy/catalog.go`（`ListPublished` 结果带 `Spec.Cluster` 摘要，供控制台区分）
 - Test: 上述 + `bundle_test.go`、`runner_test.go`、`service_test.go`（追加）
 
 **Interfaces:**
@@ -529,7 +547,7 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 
 - [ ] **Step 1: 写失败的测试**
   - `TestCreateClusterValidation`（不是 owner、集群非 active、成员数 ≠ size、size 越界 → `AppClusterSize`、已有集群部署 → exists、`mode` 无 → unsupported、镜像不兼容、某成员已有该应用）、`TestCreateClusterRoles`（N 条部署、rank0 head、env 相同、事件 / 审计各一）、`TestCreateClusterConcurrent`（两个并发 → 一个 exists）。
-  - `TestRequiredAppRejectsSingleCreate`、`TestMemberDeploymentUserOpsManaged`（`Redeploy / Stop / Start / Remove` → `app_cluster_managed`；`Get / Log / Events` 正常）。
+  - `TestRequiredAppRejectsSingleCreate`、`TestRequiredAppRejectsPrepareInstall`、`TestMemberDeploymentUserOpsManaged`（`Redeploy / Stop / Start / Remove` → `app_cluster_managed`；`Get / Log / Events` 正常）。
   - `TestReservedEnvUnchangedForNonCluster`（`ReservedEnv` 对 `ClusterRole == ""` 的输入与改动前的硬编码期望逐项相同；`RenderEnv` 字节相同）、`TestReservedEnvClusterRole`。
   - `TestWorkerPortsNotRegistered`（runner 把 worker 推到 running → `instance_ports` 无该部署端口；head 有）。
   - `TestAggregateClusterTable`（规格 §6.4 每一行一个用例）。
@@ -572,9 +590,10 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
     PY
     }
     ```
+    head 在 `wait_nodes` 通过后、`vllm serve` 之前 `export RAY_ADDRESS="$SPARK_CLUSTER_HEAD_IP:6379"`（双网卡容器里显式指定，避免 driver 自动选到 `10.200.0.x`）；`PIPELINE_PARALLEL_SIZE > 1` 时 start 第一步 `python3 -c 'import cupy, ray.dag'`，失败 → `spark_status install 0 "流水线并行需要镜像内 cupy，请改用 TP = 台数"` 并退出 2。
     worker 健康服务（`health.py`，heredoc 生成）：`http.server` 监听 `127.0.0.1:$SPARK_PORT`，`GET /health` → 遍历 `/proc/*/comm` 有 `raylet` 时 200，否则 503；其它路径 404。
   - `vllm-cluster` 的 `TENSOR_PARALLEL_SIZE` 为空时取 `$SPARK_CLUSTER_SIZE`；`TP × PP != SPARK_CLUSTER_SIZE` → `spark_status install 0 "TP×PP 必须等于集群台数"` 并退出 2。
-- 测试（`apps_dir_test.go` 追加）：`TestVLLMNodeClusterSpec`（1.1.0、cluster optional、两个新变量、internal 仍为 true）、`TestVLLMClusterSpec`（required、min 2 max 4、8000 健康 `/health`）、`TestClusterRaySectionIdentical`（两段逐字相同）、`TestClusterScriptsReferenceClusterEnv`（脚本含 `. /.spark/cluster.env`、`--distributed-executor-backend ray`、`--object-store-memory`）。现有 `TestAppsDir` 自动覆盖新目录（POSIX 语法、变量声明检查）。
+- 测试（`apps_dir_test.go` 追加）：`TestVLLMNodeClusterSpec`（1.1.0、cluster optional、两个新变量、internal 仍为 true）、`TestVLLMClusterSpec`（required、min 2 max 4、8000 健康 `/health`）、`TestClusterRaySectionIdentical`（两段逐字相同）、`TestClusterScriptsReferenceClusterEnv`（脚本含 `. /.spark/cluster.env`、`export RAY_ADDRESS=`、`import cupy`（PP 检查）、`--distributed-executor-backend ray`、`--object-store-memory`；并用 `clusterspec.RenderEnv` 渲染一份 env 写临时文件，`sh -c '. <file>; sh -c "echo \$VLLM_HOST_IP \$NCCL_SOCKET_IFNAME"'` 在**子进程**里能读到值——验证每行 `export`）。现有 `TestAppsDir` 自动覆盖新目录（POSIX 语法、变量声明检查）。
 
 - [ ] **Step 1: 写失败的测试**（先只改 `app.json` 版本号，跑 `TestAppsDir` 看到新断言失败）
 - [ ] **Step 2: 写 / 改三份文件 ×2**
@@ -621,7 +640,7 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   ```
 - 行为：规格 §7.1～§7.7。要点：
   - 模型校验与零值补齐（`TensorParallel` 默认 = N、`PipelineParallel` 默认 1）；修改 N 时有非终态节点 → `LLMModelInvalid("nodes_per_replica", "请先把副本数调为 0 并等节点全部释放，再修改每副本机器数")`；`checkNodeParams` 对 N > 1 校验版本 `Spec.Cluster != nil && MaxSize >= N`。
-  - Controller：`reconcile` 的缺额按 N 降序处理；`candidateMachines` 排序 `(m.fabric_id IS NOT NULL), m.id`；`candidateFabrics` SQL（`candidateCond` + `m.cluster_ready` + 能力位 + 排除 `llm_node_members WHERE live` 的机器，`GROUP BY m.fabric_id HAVING count(*) >= N`，`direct` 只给 2）；`createGroupNode`、组推进 / unhealthy / draining / removing / 孤儿 / `failNode` 按规格 §7.3；`ProvisionTimeoutFor`（组与单机都改用它，单机按 `vllm-node` 版本取）。
+  - Controller：`reconcile` 的缺额按 N 降序处理；`candidateMachines` 排序 `(m.fabric_id IS NOT NULL), m.id`；`candidateFabrics` SQL（`candidateCond` + `m.cluster_ready` + 能力位 + 排除 `llm_node_members WHERE live` 的机器，`GROUP BY m.fabric_id, m.cluster_net HAVING count(*) >= N`，`direct` 只给 2）；`createGroupNode`、组推进 / unhealthy / draining / removing / 孤儿 / `failNode` 按规格 §7.3；`ProvisionTimeoutFor`（组与单机都改用它，单机按 `vllm-node` 版本取）。
   - `mutateNode`：状态进入 `NodeTerminalStates` 时同事务 `UPDATE llm_node_members SET live = false WHERE node_id = $1`。
   - Prober / Router：规格 §7.4 / §7.5。
   - 后台：`AdminDrainNode / AdminRemoveNode` 对组释放全部成员；`AdminRebuildNode` 组 `ready / unhealthy` → `RedeployCluster`，组 `failed` → `ErrLLMNodeInvalidState`；`MachineHasLiveNode` 含成员；`ListNodes / GetNode` 带成员与集群部署聚合；`PoolView` 按 fabric。
@@ -672,26 +691,27 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
   ```
 - 行为：规格 §5.5～§5.8。要点：
   - 守卫：`Renew / RenewQuantity / SetAutoRenew / Release`（用户）与 `AdminExtend` 对 `inst.ClusterID != nil` → `ErrClusterMember`（在锁实例之后判断）。
-  - `SweepClusters` 三步（`sweepEach` 模式、每集群独立事务、锁序 集群 → 成员）；中止时退款用 `refundAll`、`beginWipe`，机器不 `MarkFaulty`；对齐时 `refreshLease`。
+  - `SweepClusters` 四步（规格 §5.5；`sweepEach` 模式、每集群独立事务、锁序 集群 → 成员）：中止条件 = 有成员 `failed / cancelled` **或** `now ≥ created_at + ClusterFormTimeout` 仍未就绪；中止时退款用 `refundAll`、`beginWipe`，机器不 `MarkFaulty`；`ready_at` 对系统集群也置（不对齐）；**只在首次就绪时对齐**（`refreshLease`），之后暂停恢复不再对齐；结束按「未结束成员」（在位 ∪ wiping）判定，`ready_at` 为空 → `failed`，否则 `released`。
+  - `HandleCommandResult`：集群成员 Create 失败且消息以 `clusterspec.ErrPrefix` 开头 → `failCreatingClusterNet`（与 `failCreating` 相同但**不** `MarkFaulty`、告警 `cluster_net_error` 而非 `create_failed`）；容器由现有对账 `wipeOrphan` 清理。
   - `RenewCluster`：幂等前缀 `key#`；全员 `renewFits` 后再逐个 `charge + addTime`；任何一个失败整笔回滚。
-  - `AutoRenewClustersDue`：规格 §5.7；短信只发 rank 最小成员。
-  - `SendReminders`：成员只对 rank 最小的活动成员发，其余成员同一事务置 `reminded_*`。
-  - `AdminMigrate`：成员 → 先锁集群行（读实例拿 `cluster_id`，锁集群，再 `lockInstance` 并复核 `cluster_id` 未变）；候选 `pickSpec{Immediate, FabricID: 集群.fabric_id, ClusterOnly: true}`；新实例 `cluster_id / cluster_rank` 继承；集群 `version + 1`；新实例 `enqueueCreateSpec`（新 Spec）；其余活动成员 `Enqueue(CmdConfigureCluster, ConfigureClusterPayload{ClusterSpecFor(rank)})`。非成员路径不变。
-  - `RefundRelease`：成员 → 锁序 集群 → 实例；释放后 `version + 1` 并对其余活动成员下发 ConfigureCluster。
+  - `AutoRenewClustersDue`：规格 §5.7（在位成员全 running、**允许有成员暂停**、触发看未暂停成员的最早到期；暂停成员走 `addTime` 的「running 暂停」分支）；短信只发 rank 最小成员。
+  - `SendReminders`：成员只对 rank 最小的在位成员发，其余成员同一事务置 `reminded_*`。
+  - `AdminMigrate`：成员 → 先锁集群行（读实例拿 `cluster_id`，锁集群，再 `lockInstance` 并复核 `cluster_id` 未变）；候选 `pickSpec{Immediate, FabricID: 集群.fabric_id, ClusterOnly: true}`；新实例 `cluster_id / cluster_rank` 继承；集群 `version + 1`；新实例 `enqueueCreateSpec`（新 Spec）；其余在位成员 `Enqueue(CmdConfigureCluster, ConfigureClusterPayload{ClusterSpecFor(rank)})`。非成员路径不变。
+  - `RefundRelease`：成员 → 锁序 集群 → 实例；释放后 `version + 1` 并对其余在位成员下发 ConfigureCluster。
   - `HandleCommandResult`：`configure_cluster` 成功 → 只完成指令；失败 → `RaiseAlertOnce(warning, cluster_net_error, machine, instance, "实例 <id> 的集群网络异常")`。`FailTimedOutCommands` 的超时表加 `configure_cluster → ConfigureClusterCommandTimeout`。
   - `Reconcile`：报告里实例 `Cluster` 以 `error:` 开头 → 同一告警（一次）。
   - Sweep 顺序：`… → AutoRenewDue → AutoRenewClustersDue → ExpireDue → WipeStale → FailStuckCreating → FailTimedOutCommands → SweepClusters → ReapSSHSessions → SendReminders`。
 
 - [ ] **Step 1: 写失败的测试**（用 Task 6 的辅助函数造 2 / 4 台集群）
   - `TestClusterAbortRefundsAll`：rank1 Create 失败（`HandleCommandResult(false)`）→ `SweepClusters` → rank0 `wiping`、两张订单 `refunded_amount = amount`、rank1 机器 faulty、rank0 机器不 faulty、集群 `failed`、告警 `cluster_failed` 一条；再跑一轮无副作用。
-  - `TestClusterReadyAndAlign`（两成员相差 3 分钟 running → 对齐到晚的、`ready_at` 置位）、`TestClusterRealignAfterSuspend`、`TestClusterEndsWhenAllReleased`（子网可被新集群复用）。
+  - `TestClusterReadyAndAlign`（两成员相差 3 分钟 running → 对齐到晚的、`ready_at` 置位）、`TestClusterNoRealignAfterSuspend`（就绪后一个成员暂停 2 小时再恢复 → 其余成员到期不变）、`TestClusterFormTimeoutAborts`（一个成员一直暂停 / 被退款释放，30 分钟后整组中止全额退）、`TestClusterNetCreateFailureNotFaulty`（`cluster-net: ` 前缀 → 机器不 faulty、告警 `cluster_net_error`、集群中止）、`TestSystemClusterReadyAndEnd`（系统集群全员 running → `ready_at` 置位；全部释放后 `released`）、`TestClusterEndsWhenAllReleased`（wiping 成员仍算未结束；子网可被新集群复用）。
   - `TestClusterMemberGuards`（四个用户操作 + `AdminExtend` → `cluster_member`；改密码 / 端口仍可）。
   - `TestRenewClusterAllOrNothing`（余额只够一台 → 两台都没续、无订单）、`TestRenewClusterIdempotent`（同键重放返回同两单）、`TestRenewClusterBlocked`（一个成员被后续预订挡住 → `renew_blocked`）。
-  - `TestAutoRenewClustersDue`（成功：全员到期同时后移、一条事件；失败：全员标失败、短信一条）、`TestAutoRenewDueSkipsMembers`、`TestRemindersOncePerCluster`。
-  - `TestReleaseCluster`、`TestAdminExtendCluster`、`TestAdminResyncCluster`（版本 + 1、每个活动成员一条 `configure_cluster`）。
+  - `TestAutoRenewClustersDue`（成功：全员到期同时后移、一条事件；失败：全员标失败、短信一条；一个成员暂停时仍续全员）、`TestAutoRenewDueSkipsMembers`、`TestRemindersOncePerCluster`。
+  - `TestReleaseCluster`、`TestAdminExtendCluster`、`TestAdminResyncCluster`（版本 + 1、每个在位成员一条 `configure_cluster`）。
   - `TestMigrateClusterMember`（新机器同 fabric、rank 不变、版本 2、新 Create 带新 Spec、对端收到 ConfigureCluster；fabric 内无空闲 → `no_capacity`）、`TestRefundReleaseClusterMember`。
-  - `TestConfigureClusterResultAndTimeout`、`TestReconcileClusterErrorAlert`、`TestCheckClusterInvariants`（每条一个反例）。
-- [ ] **Step 2: 运行确认失败**：`go test ./internal/rental/ -run 'TestCluster|TestRenewCluster|TestAutoRenewCluster|TestReleaseCluster|TestAdmin.*Cluster|TestMigrateClusterMember|TestRefundReleaseClusterMember|TestConfigureCluster|TestReconcileCluster|TestReminders|TestAutoRenewDueSkips|TestCheckCluster' 2>&1 | head -5`
+  - `TestConfigureClusterResultAndTimeout`、`TestReconcileClusterErrorAlert`、`TestCheckClusterInvariants`（每条一个反例；③ 对换机后的新成员经 `instance_transfers` 成立、④ 系统集群无订单成立）。
+- [ ] **Step 2: 运行确认失败**：`go test ./internal/rental/ -run 'TestCluster|TestSystemCluster|TestRenewCluster|TestAutoRenewCluster|TestReleaseCluster|TestAdmin.*Cluster|TestMigrateClusterMember|TestRefundReleaseClusterMember|TestConfigureCluster|TestReconcileCluster|TestReminders|TestAutoRenewDueSkips|TestCheckCluster' 2>&1 | head -5`
 - [ ] **Step 3: 实现**
 - [ ] **Step 4: 运行并提交**
   Run: `go vet ./... && go test ./internal/rental/ ./internal/app/ ./internal/billing/ 2>&1 | tail -5`
@@ -757,7 +777,7 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 
 **Interfaces:**
 - Consumes: 全部后端任务；`fakeagent.Options.Net / ClusterNet`（Task 3）。
-- Produces：钩子 `/hooks/machines` 新参数：`fabric_id`（登记后 `UpdateMachine{SetFabric}`）、`net`（`"lan"`：一块 `eth0` 有线；`"cx7"`：`eth0` + `enp1s0f1np1`（mlx5_core，up，无 RDMA）；`"cx7-rdma"`：同上且 `rdma_device=rocep1s0f1, rdma_active, uverbs=uverbs0`）、`old_agent`（Features = SharedSlots）。集成测试名（规格 §16.2）：`TestClusterOrderE2E`、`TestClusterAbortE2E`、`TestClusterMemberMigrateE2E`、`TestLLMTwoNodeGroupE2E`、`TestLLMGroupCrashRebuildE2E`；每个用例结束调用 `rental.CheckClusterInvariants` 与（llm 用例）`llm.CheckInvariants`。
+- Produces：钩子 `/hooks/machines` 新参数：`fabric_id`（登记后 `UpdateMachine{SetFabric}`）、`net`（IPv4 一律 CIDR，与 `lan_ip` 同网段；`"lan"`：一块 `eth0` 有线；`"cx7"`：`eth0` + `enp1s0f1np1`（mlx5_core，up，无 RDMA）；`"cx7-rdma"`：同上且 `rdma_device=rocep1s0f1, rdma_active, uverbs=uverbs0`）、`old_agent`（Features = SharedSlots）。集成测试名（规格 §16.2）：`TestClusterOrderE2E`、`TestClusterAbortE2E`、`TestClusterMemberMigrateE2E`、`TestLLMTwoNodeGroupE2E`、`TestLLMGroupCrashRebuildE2E`；每个用例结束调用 `rental.CheckClusterInvariants` 与（llm 用例）`llm.CheckInvariants`。
 
 - [ ] **Step 1: 写失败的测试**（集成测试与 config 测试）
 - [ ] **Step 2: 运行确认失败**：`go test ./internal/app/ -run 'Cluster|MultiNode|TwoNode|GroupCrash' 2>&1 | head -5`
@@ -781,9 +801,9 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 
 **Interfaces:**
 - Consumes: Task 1 前端类型 / 文案；Task 11 的 API（字段照规格 §10.1）。
-- Produces：`logic/cluster.ts`：`clusterTotalPrice(unit, size, quantity)`、`clusterStatusBadge(view)`、`connectSnippets(view) → {env, torchrun, ray}`（示例文本，含 `. /.spark/cluster.env`、`torchrun --nnodes $NNODES --node-rank $NODE_RANK --master-addr $MASTER_ADDR --master-port 29500`）、`defaultTP(size)`、`groupInstancesByCluster(instances)`。`data-testid`：`rent-mode`、`rent-cluster-network`、`rent-cluster-available`、`instances-cluster-card`、`cluster-status`、`cluster-members`、`cluster-connect`、`cluster-renew`、`cluster-auto-renew`、`cluster-release`、`cluster-app-deploy`、`cluster-app-status`、`cluster-app-members`、`instance-cluster-banner`。
+- Produces：`logic/cluster.ts`：`clusterTotalPrice(unit, size, quantity)`、`clusterStatusBadge(view)`、`connectSnippets(view) → {env, torchrun, ray}`（示例文本，含 `. /.spark/cluster.env`（说明文件每行 `export`，非登录会话也只需 source 一次）、`torchrun --nnodes $NNODES --node-rank $NODE_RANK --master-addr $MASTER_ADDR --master-port 29500`、Ray：head `ray start --head --node-ip-address=$SPARK_CLUSTER_IP --port=6379`、worker `ray start --address=$SPARK_CLUSTER_HEAD_IP:6379 --node-ip-address=$SPARK_CLUSTER_IP`、driver 前 `export RAY_ADDRESS=$SPARK_CLUSTER_HEAD_IP:6379`）、`defaultTP(size)`、`groupInstancesByCluster(instances)`。`data-testid`：`rent-mode`、`rent-cluster-network`、`rent-cluster-available`、`instances-cluster-card`、`cluster-status`、`cluster-members`、`cluster-connect`、`cluster-renew`、`cluster-auto-renew`、`cluster-release`、`cluster-app-deploy`、`cluster-app-status`、`cluster-app-members`、`instance-cluster-banner`。
 
-- [ ] **Step 1: 写失败的单测**：`cluster.spec.ts`（总价、分组、片段含关键变量、TP 默认）、`ClusterDetailView.spec.ts`（mock http：成员表、降级提示、stale 提示、按钮状态）、`RentDialog` 的集群模式测试（追加到现有 `__tests__`）。
+- [ ] **Step 1: 写失败的单测**：`cluster.spec.ts`（总价、分组、片段含关键变量与 `RAY_ADDRESS`、TP 默认）、`ClusterDetailView.spec.ts`（mock http：成员表、降级提示、stale 提示、按钮状态）、`RentDialog` 的集群模式测试（追加到现有 `__tests__`）。
 - [ ] **Step 2: 运行确认失败**：`cd web && npx vitest run console 2>&1 | tail -5`
 - [ ] **Step 3: 实现**
 - [ ] **Step 4: 运行并提交**
@@ -847,10 +867,11 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 **Files:**
 - Create: `docs/superpowers/acceptance-plan13.md`（格式同 `acceptance-plan9.md`：环境、版本、每项步骤 / 命令 / 实际输出摘录 / 结论）、`deploy/image/tests/nccl_allreduce.py`（torch.distributed NCCL all-reduce，参数 `--size-mb`、`--iters`，打印 algbw / busbw；CP-1 起使用）
 
-**步骤**（规格 §16.4 CP-0 全部 4 项）：
-- [ ] `make agent` → 拷到 221 → 协调人 `sudo` 安装（`deploy/agent/install.sh` 同计划 2 的升级流程）→ `sudo spark-agent selfcheck` 输出存档。
+**步骤**（规格 §16.4 CP-0 全部 5 项）：
+- [ ] `make agent` → 拷到 221 → 协调人 `sudo` 安装（`deploy/agent/install.sh` 同计划 2 的升级流程）→ `sudo spark-agent selfcheck` 输出存档；`sudo systemctl restart spark-agent` 后后台 `cluster_ready` 判定不翻转。
+- [ ] 镜像前置：`docker run --rm spark/llm-serving:25.09 python3 -c "import cupy, ray.dag"`、`which ping ibv_devinfo` 结果存档（cupy 不可用 → PP > 1 在 CP-1 不测，记 followups）；在 221 上起一个普通实例，容器里 `python3 -c "import ray; ray.init(); print(ray.util.get_node_ip_address())"` 记录默认选中的 IP（单网卡基线，CP-1 对照双网卡）。
 - [ ] 平台（开发 Mac，`make run` 配置同计划 9 验收）迁移到 00026；后台机器详情网卡表、能力位截图 / 文本存档。
-- [ ] 普通实例全流程、`sudo iptables -S SPARK-FWD`、`SPARK-IN`、`SPARK-CLU` 存档；N = 1 Token 商城节点抽查（模型 Qwen3-4B 已在 221 上缓存则复用）。
+- [ ] 普通实例全流程、`sudo iptables -S DOCKER-USER`、`INPUT`（前几条是跳转组）、`SPARK-FWD`、`SPARK-IN`、`SPARK-CLU` 存档，3 分钟内 Agent 日志无 `iptables chain rebuilt`；N = 1 Token 商城节点抽查（模型 Qwen3-4B 已在 221 上缓存则复用）。
 - [ ] 单台 fabric 下的集群选项「不可用」、cx7 判定「未找到 CX-7 网卡」。
 - [ ] 发现的问题：在集成分支修复（派子代理，按文件归属）、回归后再记录通过。
 - [ ] 提交：`git add docs/superpowers/acceptance-plan13.md deploy/image/tests && git commit -m "docs(acceptance): plan 13 CP-0 single-machine regression on 221 …"`
@@ -858,14 +879,14 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 ---
 ### Task 18: 真机检查点 CP-1——两台以太网（`lan` fabric）
 
-**前置**：负责人准备清单第 1、2、5、6、8 项完成（2 台在同一内网、Agent 已装、镜像已 load、后台已登记）。协调人先 `ssh` 两台核对：`docker images | grep llm-serving`、`ip -br addr`、`sudo spark-agent selfcheck`。
+**前置**：负责人准备清单第 1、2、3（CP-1 部分：同一网段、AP / 交换机不做客户端隔离与源地址防护）、5、6、8 项完成（2 台在同一内网、Agent 已装、镜像已 load、后台已登记）。协调人先 `ssh` 两台核对：`docker images | grep llm-serving`、`ip -br addr`（两台集群网卡同前缀）、`sudo spark-agent selfcheck`；并在宿主机上做一次转发预检：A 上 `sudo ip route add 10.210.255.12/32 via <B 的 IP>`，B 上 `sudo ip addr add 10.210.255.12/32 dev lo` + `python3 -m http.server --bind 10.210.255.12 34999`，A 上 `curl -m3 10.210.255.12:34999` 通（不通 → 网络设备在丢 10.210.x 包，先让负责人处理），测完删掉。
 
 **步骤**（规格 §16.4 CP-1 全部 9 项，逐项记录命令与输出）：
 - [ ] 1～2 建 fabric、下单、扣款与到期对齐。
-- [ ] 3 集群信息与互通（`ping`、任意端口 HTTP）。
+- [ ] 3 集群信息与互通（curl / python 任意端口 HTTP；子进程里能读到 `VLLM_HOST_IP` 等导出变量；不用 ping）。
 - [ ] 4 隔离四项（宿主 22、网关、raw socket、第三方实例）+ 宿主机 `iptables -S SPARK-CLU`、`ip route | grep 10.210`。
-- [ ] 5 `nccl_allreduce.py` 两节点（`NCCL_DEBUG=INFO`），记录 busbw。
-- [ ] 6 `vllm-cluster`（`Qwen/Qwen3-8B` TP 2；再 PP 2）——模型在两台 DGX 上从 ModelScope 下载；`ray status`；吞吐。
+- [ ] 5 `nccl_allreduce.py` 两节点（`NCCL_DEBUG=INFO`），记录 busbw；长跑期间两台各 `sudo systemctl restart spark-agent`，测试不中断、`ip -o link show` 里 `sch*` 的 ifindex 不变。
+- [ ] 6 `vllm-cluster`（`Qwen/Qwen3-8B` TP 2；CP-0 确认 cupy 可用时再 PP 2）——模型在两台 DGX 上从 ModelScope 下载；`ray status`；vLLM 日志里 driver 节点 IP 是 `10.210.x.11`；吞吐。
 - [ ] 7 失联恢复与 `spc0` 自愈。
 - [ ] 8 续费 / 成员 409 / 释放与宿主机清理。
 - [ ] 9 Token 商城 2 台组全套（含杀 raylet、停 Agent 10 分钟、`llm_pool_short`、恢复后新组）、两个不变量函数（`go test ./internal/llm -run TestInvariantsAgainstDevDB` 与对应的 rental 只读检查，连开发库）。
@@ -880,7 +901,7 @@ G8  : T18 真机 CP-1 两台以太网（T16、T17 + 负责人 2 台到位）→ 
 - [ ] 1 网卡表 RDMA 判定、建 fabric。
 - [ ] 2 容器内 `/dev/infiniband`、`ibv_devinfo`、GID 核对（镜像缺 rdma-core 用户态 → 在 `deploy/image` 的 LLM Serving Dockerfile 加 `rdma-core ibverbs-utils`，**在 DGX 上**重建镜像、两台各自 load，记录到验收文档与 followups）。
 - [ ] 3 NCCL `NET/IB … RoCE` 与 busbw 对比 CP-1。
-- [ ] 4 隔离（父接口无地址、访问不到宿主、raw socket 失败）。
+- [ ] 4 隔离（父接口无地址、`nmcli device status` 显示 unmanaged、手工给父接口加 `169.254.9.9/16` 一分钟内被巡检清除并告警一次、访问不到宿主、容器只见 `spc0` 的 GID、raw socket 失败）；4b 重启一台宿主机后核对 `uverbsN → HCA` 映射与集群状态（变化时应显示「RDMA 设备编号变化」并退回 TCP）。
 - [ ] 5 `vllm-cluster` 更大模型与 Token 商城 2 台组走 RDMA。
 - [ ] 6（可选）拔线测试。
 - [ ] 问题修复、回归、记录、提交。
