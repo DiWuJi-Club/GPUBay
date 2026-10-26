@@ -276,7 +276,7 @@ func runAgent(ctx context.Context, args []string, out io.Writer) error {
 		rt = &docker.Runtime{Run: runner, Bridge: "spark0", Subnet: "10.200.0.0/24"}
 		dk = &loop.Disk{Run: runner, Stat: os.Stat, StateDir: *stateDir, Log: log}
 		nf = &iptables.Netfilter{Run: runner, Log: log}
-		cn = clusterlinux.New(runner, clusterlinux.Options{Log: log})
+		cn = clusterlinux.New(runner, clusterlinux.Options{Log: log, LanIPs: st.LanIPs}) // 重启后 Probe 之前靠状态文件认管理网卡
 	}
 	ex := executor.New(executor.Deps{Runtime: rt, Disk: dk, Net: nf, Cluster: cn, State: st, StateDir: *stateDir, Bridge: "spark0", LocalIPs: localIPs, Log: log}, false)
 	if err := ex.Recover(ctx); err != nil {

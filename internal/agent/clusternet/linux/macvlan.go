@@ -8,7 +8,8 @@ import (
 	"spark-cloud/internal/clusterspec"
 )
 
-// refuseMgmt：macvlan 父接口卫生会清掉网卡上的地址——若 iface 持有本机 IPv4 默认路由或管理地址（Probe 记下的 lanIP），
+// refuseMgmt：macvlan 父接口卫生会清掉网卡上的地址——若 iface 持有本机 IPv4 默认路由或管理地址（Probe 记下的 lanIP；
+// 尚未 Probe 时为 Options.LanIPs，即状态文件里实例记录的 LanIP），
 // 那就是管理网卡，清掉会让机器失联。只读两条命令，不执行任何写操作。
 func (n *Net) refuseMgmt(ctx context.Context, iface string) error {
 	out, err := n.ip(ctx, "-4", "route", "show", "default")
@@ -27,13 +28,32 @@ func (n *Net) refuseMgmt(ctx context.Context, iface string) error {
 		}
 		return cerr("%w", err)
 	}
+	for _, lan := range n.mgmtIPs() {
+		if strings.Contains(string(addrs), " inet "+lan+"/") {
+			return cerr("集群网卡不能是管理网卡（%s 持有管理地址 %s）", iface, lan)
+		}
+	}
+	return nil
+}
+
+// mgmtIPs：Probe 记下的 lanIP；为空（Agent 重启后尚未 Probe）时退回 Options.LanIPs。
+func (n *Net) mgmtIPs() []string {
 	n.mu.Lock()
 	lan := n.lanIP
 	n.mu.Unlock()
-	if lan != "" && strings.Contains(string(addrs), " inet "+lan+"/") {
-		return cerr("集群网卡不能是管理网卡（%s 持有管理地址 %s）", iface, lan)
+	if lan != "" {
+		return []string{lan}
 	}
-	return nil
+	if n.opt.LanIPs == nil {
+		return nil
+	}
+	var out []string
+	for _, ip := range n.opt.LanIPs() {
+		if ip != "" {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 // routeDevs 取 `ip route` 输出里每行 "dev X" 的 X。

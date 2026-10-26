@@ -160,7 +160,8 @@ func TestMachineFabricUpdate(t *testing.T) {
 	if code, out := ops.do("PUT", "/machines/"+itoa(m3), map[string]any{"fabric_id": 999999}); code != 404 || codeOf(out) != "fabric_not_found" {
 		t.Fatalf("missing fabric = %d %v", code, out)
 	}
-	for _, bad := range []map[string]any{{"fabric_id": "1"}, {"fabric_id": 1.5}, {"fabric_id": -1}, {"cluster_iface": 3}, {"cluster_iface": "bad name!"}} {
+	for _, bad := range []map[string]any{{"fabric_id": "1"}, {"fabric_id": 1.5}, {"fabric_id": -1}, {"cluster_iface": 3}, {"cluster_iface": "bad name!"},
+		{"cluster_iface": "-eth0"}, {"cluster_iface": ".eth0"}} {
 		if code, out := ops.do("PUT", "/machines/"+itoa(m3), bad); code != 400 {
 			t.Fatalf("bad body %v = %d %v", bad, code, out)
 		}
