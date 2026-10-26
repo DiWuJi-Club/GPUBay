@@ -17,6 +17,7 @@ import (
 	"spark-cloud/internal/agent/metrics"
 	"spark-cloud/internal/agent/runtime"
 	"spark-cloud/internal/agent/state"
+	"spark-cloud/internal/clusterspec"
 )
 
 // instanceIDRe 与 disk/loop 的校验一致；实例 ID 会拼进 ssh 目录路径，必须先校验（防路径穿越）。
@@ -93,6 +94,19 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 	if err := checkSlots(c.ShareSlots); err != nil {
 		return err
 	}
+	prev, hadPrev := e.d.State.Instance(c.InstanceID)
+	if c.Cluster != nil {
+		if err := e.checkClusterSpec(c.InstanceID, *c.Cluster); err != nil {
+			return err
+		}
+		if c.ShareSlots > 1 {
+			return clusterErrf("集群成员必须是整机实例")
+		}
+		// 指令重跑（结果未落盘）时，本地若已有同一集群更新的版本（ConfigureCluster 已到），保留新的。
+		if hadPrev && prev.Cluster != nil && prev.Cluster.ClusterID == c.Cluster.ClusterID && prev.Cluster.Version > c.Cluster.Version {
+			c.Cluster = prev.Cluster
+		}
+	}
 	cfg := e.Config()
 	if c.DataSizeGiB <= 0 {
 		c.DataSizeGiB = cfg.DataSizeGiB
@@ -139,6 +153,13 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 	if err := e.writeSSHDir(c.InstanceID, c.UpstreamPubKey, c.HostKeyPEM); err != nil {
 		return err
 	}
+	if c.Cluster != nil {
+		if err := e.writeClusterFiles(c.InstanceID, *c.Cluster, clusterspec.Runtime{}); err != nil {
+			return clusterErr(fmt.Errorf("写集群信息文件失败：%w", err))
+		}
+	} else if err := e.removeClusterFiles(c.InstanceID); err != nil {
+		return err
+	}
 	if err := e.d.Runtime.EnsureNetwork(ctx); err != nil {
 		return err
 	}
@@ -149,12 +170,24 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 	if err != nil {
 		return err
 	}
+	if c.Cluster != nil {
+		if spec.CapDrop, spec.Sysctls, spec.Devices, err = e.clusterCreateArgs(*c.Cluster); err != nil {
+			e.clusterCreateCleanup(ctx, c.InstanceID)
+			return err
+		}
+	}
 	// docker create 遇到同名容器会报冲突，所以先 inspect：一致则复用，不一致删掉重建。
+	// 集群参数（cap-drop、RDMA 设备）Inspect 不比较，以本地记录为准：与上次记录不同（含首次带集群、上次记录不存在）→ 重建。
 	cur, err := e.d.Runtime.Inspect(ctx, c.InstanceID)
 	if err != nil {
 		return err
 	}
-	if cur.Exists && !(cur.Label == c.InstanceID && cur.Image == c.ImageRef && e.ownDataBind(cur, c.InstanceID)) {
+	var prevCluster *clusterspec.Spec
+	if hadPrev {
+		prevCluster = prev.Cluster
+	}
+	if cur.Exists && (!(cur.Label == c.InstanceID && cur.Image == c.ImageRef && e.ownDataBind(cur, c.InstanceID)) ||
+		(c.Cluster != nil && (!hadPrev || !sameClusterArgs(prevCluster, c.Cluster)))) {
 		if err := e.d.Runtime.Remove(ctx, c.InstanceID); err != nil {
 			return err
 		}
@@ -166,16 +199,21 @@ func (e *Executor) create(ctx context.Context, c Command) error {
 		}
 	}
 	inst := state.Instance{ID: c.InstanceID, Desired: "stopped", ImageRef: c.ImageRef, LanIP: cfg.LanIP, SSHPort: c.SSHPort, BandwidthMbps: c.BandwidthMbps,
-		DataSizeGiB: c.DataSizeGiB, ShareSlots: c.ShareSlots}
+		DataSizeGiB: c.DataSizeGiB, ShareSlots: c.ShareSlots, Cluster: c.Cluster}
 	if err := e.d.State.PutInstance(inst); err != nil {
 		return err
 	}
-	return e.startChecked(ctx, inst)
+	return e.startInstance(ctx, inst, true)
 }
 
 // startChecked：docker start 前校验数据盘已挂载且挂载源是该实例自己的 loop 设备（disk.Mounted 负责），
 // 并且容器确实把 /root/data 绑定了进来；绝不以未挂载状态启动容器。校验出错按失败处理，不当成「未挂载」也不当成「已挂载」。
 func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error {
+	return e.startInstance(ctx, inst, false)
+}
+
+// startInstance 是 startChecked 的实现；creating 表示 create 调用链（集群网络失败时 create 失败并本地清理）。
+func (e *Executor) startInstance(ctx context.Context, inst state.Instance, creating bool) error {
 	mounted, err := e.d.Disk.Mounted(ctx, inst.ID)
 	if err != nil {
 		return fmt.Errorf("检查数据盘挂载失败：%w", err)
@@ -230,6 +268,10 @@ func (e *Executor) startChecked(ctx context.Context, inst state.Instance) error 
 		e.stopAfterFailure(ctx, inst.ID)
 		return err
 	}
+	// 集群第二网卡 spc0（计划 13）：限速之后；Apply 差量，对已配好的 netns 不重建网卡（Recover 对运行中的实例也会走到这里）。
+	if inst.Cluster != nil {
+		return e.applyCluster(ctx, inst, creating)
+	}
 	return nil
 }
 
@@ -262,6 +304,11 @@ func (e *Executor) start(ctx context.Context, id string) error {
 	if err := e.writeInitScript(id); err != nil {
 		return fmt.Errorf("更新 init.sh 失败：%w", err)
 	}
+	if inst.Cluster != nil {
+		if err := e.writeClusterFiles(id, *inst.Cluster, runtimeOf(inst)); err != nil {
+			return fmt.Errorf("更新集群信息文件失败：%w", err)
+		}
+	}
 	if err := e.d.Disk.Mount(ctx, id); err != nil {
 		return fmt.Errorf("数据盘未挂载：%w", err)
 	}
@@ -279,7 +326,7 @@ func (e *Executor) stop(ctx context.Context, id string) error {
 	return nil
 }
 
-// wipe：删容器（含匿名卷）→ 销毁数据盘 → 删 ssh 目录 → 校验全部消失 → 删本地记录。
+// wipe：删容器（含匿名卷）→ 清理集群网络 → 销毁数据盘 → 删 ssh 目录 → 校验全部消失 → 删本地记录。
 func (e *Executor) wipe(ctx context.Context, id string) error {
 	if err := checkID(id); err != nil {
 		return err
@@ -288,13 +335,17 @@ func (e *Executor) wipe(ctx context.Context, id string) error {
 		return err
 	}
 	e.noteContainer(id, runtime.Container{})
+	// 集群网络在删容器之后清理（netns 已随容器销毁）；失败计入校验失败，本地记录保留，平台重试洗机时再清。
+	var problems []string
+	if inst, ok := e.d.State.Instance(id); ok {
+		problems = append(problems, e.wipeCluster(ctx, inst)...)
+	}
 	if err := e.d.Disk.Destroy(ctx, id); err != nil {
 		return err
 	}
 	if err := os.RemoveAll(e.sshDir(id)); err != nil {
 		return err
 	}
-	var problems []string
 	if c, err := e.d.Runtime.Inspect(ctx, id); err != nil {
 		problems = append(problems, "无法确认容器状态: "+err.Error())
 	} else if c.Exists {
@@ -365,12 +416,16 @@ func (e *Executor) report(ctx context.Context) []InstanceState {
 		}
 	}
 	e.mu.Unlock()
+	insts := map[string]state.Instance{}
+	for _, inst := range e.d.State.Instances() {
+		insts[inst.ID] = inst
+	}
 	list, err := e.d.Runtime.List(ctx)
 	if err != nil {
 		e.d.Log.Error("list containers", "err", err)
 		var out []InstanceState
 		for _, inst := range e.d.State.Instances() {
-			out = append(out, InstanceState{InstanceID: inst.ID, Phase: "unknown"})
+			out = append(out, InstanceState{InstanceID: inst.ID, Phase: "unknown", Cluster: e.reportedClusterStatus(inst, true)})
 		}
 		return out
 	}
@@ -393,7 +448,7 @@ func (e *Executor) report(ctx context.Context) []InstanceState {
 		case phase == "stopped" && recovering[c.Label]:
 			phase = "unknown"
 		}
-		out = append(out, InstanceState{InstanceID: c.Label, Phase: phase})
+		out = append(out, InstanceState{InstanceID: c.Label, Phase: phase, Cluster: e.reportedClusterStatus(insts[c.Label], c.Running)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].InstanceID < out[j].InstanceID })
 	return out
@@ -475,6 +530,11 @@ func (e *Executor) Recover(ctx context.Context) error {
 		}
 		if err := e.writeInitScript(inst.ID); err != nil {
 			errs = append(errs, fmt.Errorf("instance %s: 更新 init.sh 失败：%w", inst.ID, err))
+		}
+		if inst.Cluster != nil {
+			if err := e.writeClusterFiles(inst.ID, *inst.Cluster, runtimeOf(inst)); err != nil {
+				errs = append(errs, fmt.Errorf("instance %s: 更新集群信息文件失败：%w", inst.ID, err))
+			}
 		}
 		if inst.Desired != "running" {
 			continue
