@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"spark-cloud/internal/agentpb"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/rental"
 )
@@ -16,10 +17,36 @@ const maxMetricsInstances = 16
 func toStateReport(r *agentpb.StateReport) fleet.StateReport {
 	out := fleet.StateReport{Instances: []fleet.InstanceState{}}
 	for _, s := range r.GetInstances() {
-		out.Instances = append(out.Instances, fleet.InstanceState{InstanceID: s.GetInstanceId(), Phase: s.GetPhase()})
+		out.Instances = append(out.Instances, fleet.InstanceState{InstanceID: s.GetInstanceId(), Phase: s.GetPhase(), Cluster: s.GetCluster()})
 	}
 	// proto3 的 repeated 空列表在线上不编码：没有镜像的新 Agent 与旧 Agent 一样收到 nil，都不覆盖已有记录。
 	out.Images = r.GetImages()
+	out.Net = fromProtoNet(r.GetNet())
+	return out
+}
+
+// fromProtoNet 把网卡探测转成 clusterspec.NetInfo；nil（旧 Agent 不发）→ nil。
+func fromProtoNet(n *agentpb.NetInfo) *clusterspec.NetInfo {
+	if n == nil {
+		return nil
+	}
+	out := &clusterspec.NetInfo{LanIface: n.GetLanIface(), Ifaces: make([]clusterspec.Iface, 0, len(n.GetIfaces()))}
+	for _, f := range n.GetIfaces() {
+		ipv4 := append([]string{}, f.GetIpv4()...)
+		out.Ifaces = append(out.Ifaces, clusterspec.Iface{Name: f.GetName(), MAC: f.GetMac(), Up: f.GetUp(), SpeedMbps: int(max(0, f.GetSpeedMbps())),
+			MTU: int(f.GetMtu()), IPv4: ipv4, Driver: f.GetDriver(), PCI: f.GetPci(), Wireless: f.GetWireless(), RDMADevice: f.GetRdmaDevice(),
+			RDMAActive: f.GetRdmaActive(), Uverbs: f.GetUverbs(), LinkLayer: f.GetLinkLayer()})
+	}
+	return out
+}
+
+// toProtoSpec 把 ClusterSpec 转成协议消息（CreateInstance.cluster / ConfigureCluster.cluster）。ClusterID 为空（退出集群）照样转：得到空 Spec。
+func toProtoSpec(s clusterspec.Spec) *agentpb.ClusterSpec {
+	out := &agentpb.ClusterSpec{ClusterId: s.ClusterID, Version: uint32(max(0, s.Version)), Size: uint32(max(0, s.Size)), Rank: uint32(max(0, s.Rank)),
+		Mode: s.Mode, Iface: s.Iface, Vlan: uint32(max(0, s.VLAN)), Mtu: uint32(max(0, s.MTU)), Subnet: s.Subnet, Rdma: s.RDMA}
+	for _, m := range s.Members {
+		out.Members = append(out.Members, &agentpb.ClusterMember{Rank: uint32(max(0, m.Rank)), InstanceId: m.InstanceID, Ip: m.IP, HostIp: m.HostIP})
+	}
 	return out
 }
 
@@ -90,6 +117,9 @@ func toProtoCommand(cmd fleet.Command, cfg Config, hostKeyPEM string) (*agentpb.
 		out.Body = &agentpb.Command_Create{Create: &agentpb.CreateInstance{ImageRef: p.ImageRef, UpstreamPubkey: cfg.UpstreamPubKey,
 			BandwidthMbps: uint32(cfg.BandwidthMbps), SshPort: uint32(port), DataSizeGib: uint32(cfg.DataSizeGiB), HostKeyPem: hostKeyPEM,
 			ShareSlots: uint32(max(0, p.ShareSlots))}}
+		if p.Cluster != nil {
+			out.GetCreate().Cluster = toProtoSpec(*p.Cluster)
+		}
 	case fleet.CmdStartInstance:
 		out.Body = &agentpb.Command_Start{Start: &agentpb.StartInstance{}}
 	case fleet.CmdStopInstance:
@@ -102,6 +132,12 @@ func toProtoCommand(cmd fleet.Command, cfg Config, hostKeyPEM string) (*agentpb.
 			return nil, err
 		}
 		out.Body = &agentpb.Command_Pull{Pull: &agentpb.PullImage{ImageRef: p.ImageRef}}
+	case fleet.CmdConfigureCluster:
+		var p fleet.ConfigureClusterPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return nil, err
+		}
+		out.Body = &agentpb.Command_ConfigureCluster{ConfigureCluster: &agentpb.ConfigureCluster{Cluster: toProtoSpec(p.Cluster)}}
 	default:
 		return nil, fmt.Errorf("unknown command type %q", cmd.Type)
 	}
