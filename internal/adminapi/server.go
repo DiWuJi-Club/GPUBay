@@ -130,6 +130,8 @@ func (s *Server) Router() http.Handler {
 			g.Use(s.requireAdmin)
 			s.accountRoutes(g)
 			s.machineRoutes(g)
+			s.fabricRoutes(g)  // 计划 13：集群网络
+			s.clusterRoutes(g) // 计划 13：实例集群
 			s.groupRoutes(g)
 			s.bookingRoutes(g)
 			s.instanceRoutes(g)

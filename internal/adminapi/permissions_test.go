@@ -89,6 +89,10 @@ var expectedRoutes = []struct {
 	{"GET", "/butler/settings", all}, {"PUT", "/butler/settings", super},
 	{"GET", "/butler/usage", all}, {"GET", "/butler/usage/users", all},
 	{"GET", "/butler/conversations", ops}, {"GET", "/butler/conversations/{id}", ops},
+	// 计划 13 §10.2：集群网络（fabric）与集群全员可看；改 fabric、延长 / 重新下发集群 ops（不要求动态码，与实例 extend 一致）
+	{"GET", "/fabrics", all}, {"POST", "/fabrics", ops}, {"PUT", "/fabrics/{id}", ops}, {"DELETE", "/fabrics/{id}", ops},
+	{"GET", "/clusters", all}, {"GET", "/clusters/{id}", all},
+	{"POST", "/clusters/{id}/extend", ops}, {"POST", "/clusters/{id}/resync", ops},
 }
 
 func roleKey(roles []admin.Role) string {

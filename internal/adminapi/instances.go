@@ -102,7 +102,12 @@ func (s *Server) handleInstance(w http.ResponseWriter, r *http.Request) {
 	if events == nil {
 		events = []rental.Event{}
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+	cluster, err := s.instanceCluster(r.Context(), inst) // 计划 13：集群成员的 cluster 区块（非成员 null）
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"cluster": cluster,
 		"instance": s.instanceView(inst), "events": events, "orders": orderViews(orders), "commands": commandViews(cmds),
 		"ports": s.portViews(id, ports), "ssh_host_pubkey_fingerprint": hostKeyFingerprint(inst.SSHHostPubkey), "apps": apps,
 	})

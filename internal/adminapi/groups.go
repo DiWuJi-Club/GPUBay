@@ -147,7 +147,8 @@ func (s *Server) handleUnassignMachines(w http.ResponseWriter, r *http.Request) 
 	httpx.OK(w)
 }
 
-// handleUpdateMachine 只认 group_id（键存在即改组，null = 移出）与 display_name 两个字段。
+// handleUpdateMachine 认 group_id（键存在即改组，null = 移出）、display_name，以及计划 13 的 fabric_id（键存在即改集群网络，
+// null = 移出）与 cluster_iface（"" = 自动）。机器上有集群成员时改后两项 → 409 invalid_state；direct fabric 已满 → 409 fabric_full。
 func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -180,8 +181,28 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 		}
 		in.DisplayName = &str
 	}
-	if !in.SetGroup && in.DisplayName == nil {
-		s.writeError(w, r, apperr.BadRequest("请提供 group_id 或 display_name"))
+	if v, ok := raw["fabric_id"]; ok {
+		in.SetFabric = true
+		if v != nil {
+			f, isNum := v.(float64)
+			if !isNum || f <= 0 || f != float64(int64(f)) {
+				s.writeError(w, r, apperr.BadRequest("fabric_id 必须是正整数或 null"))
+				return
+			}
+			fid := int64(f)
+			in.FabricID = &fid
+		}
+	}
+	if v, ok := raw["cluster_iface"]; ok {
+		str, isStr := v.(string)
+		if !isStr {
+			s.writeError(w, r, apperr.BadRequest("cluster_iface 必须是字符串"))
+			return
+		}
+		in.ClusterIface = &str
+	}
+	if !in.SetGroup && in.DisplayName == nil && !in.SetFabric && in.ClusterIface == nil {
+		s.writeError(w, r, apperr.BadRequest("请提供 group_id、display_name、fabric_id 或 cluster_iface"))
 		return
 	}
 	m, err := s.Fleet.UpdateMachine(r.Context(), s.actor(r), id, in)
