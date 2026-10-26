@@ -19,6 +19,7 @@ const (
 	reasonOldAgent     = "Agent 不支持集群（请升级）"
 	reasonNoNetInfo    = "尚未上报网卡"
 	reasonBadIPv4      = "集群网卡的 IPv4 地址无效"
+	reasonNetFailed    = "上次集群网络开通失败，等待 Agent 重新上报网卡" // SuspendClusterReady 之后、下次重算之前
 	clusterNetL2       = "l2" // cx7 fabric 的 cluster_net：由物理接线保证同一二层
 	maxNetIfaces       = 64
 	maxNetIfaceAddress = 16
@@ -79,6 +80,15 @@ func (s *Service) recomputeClusterNet(ctx context.Context, tx pgx.Tx, machineID 
 	}
 	_, err = tx.Exec(ctx, `UPDATE machines SET cluster_ready = $2, cluster_rdma = $3, cluster_net = $4, updated_at = $5 WHERE id = $1`,
 		machineID, ready, rdma, cnet, s.clock.Now())
+	return err
+}
+
+// SuspendClusterReady 集群网络导致开通失败的机器暂不参与集群分配：cluster_ready / cluster_rdma / cluster_net 清空，
+// 直到下一次重算（Agent 重连 Hello、上报的网卡变化、后台改 fabric / 集群网卡）。机器仍可单机出租。
+// 调用方持实例行锁（与 MarkFaulty 同位置更新机器行）。
+func (s *Service) SuspendClusterReady(ctx context.Context, q db.Querier, machineID int64) error {
+	_, err := q.Exec(ctx, `UPDATE machines SET cluster_ready = false, cluster_rdma = false, cluster_net = '', updated_at = $2
+		WHERE id = $1 AND cluster_ready`, machineID, s.clock.Now())
 	return err
 }
 

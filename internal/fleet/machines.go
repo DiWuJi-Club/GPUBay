@@ -134,6 +134,9 @@ func scanMachine(row pgx.Row) (Machine, error) {
 		m.fabric = &Fabric{ID: *m.FabricID, Name: *fName, Kind: *fKind, RDMA: fRDMA != nil && *fRDMA}
 	}
 	_, _, _, m.ClusterReason = evalClusterNet(m, m.fabric, m.NetInfo)
+	if m.ClusterReason == "" && !m.ClusterReady { // 判定通过但缓存列是 false：SuspendClusterReady 之后尚未重算
+		m.ClusterReason = reasonNetFailed
+	}
 	m.Enrolled = m.CertFingerprint != ""
 	if len(m.CertFingerprint) >= 16 {
 		m.FingerprintPrefix = m.CertFingerprint[:16]

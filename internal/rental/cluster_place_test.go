@@ -406,6 +406,10 @@ func TestClusterSubnetAndVLANAllocation(t *testing.T) {
 		if _, err := e.pool.Exec(e.ctx, `UPDATE instance_clusters SET state = 'released', ended_at = $2 WHERE id = $1`, ids[1], e.clock.Now()); err != nil {
 			t.Fatal(err)
 		}
+		// 子网要等成员全部结束才释放（中止的集群可能还有成员在洗机）
+		if _, err := e.pool.Exec(e.ctx, `UPDATE instances SET state = 'released' WHERE cluster_id = $1`, ids[1]); err != nil {
+			t.Fatal(err)
+		}
 		e.lanMachines(f, "192.168.1", 2)
 		if res := e.placeCluster(2); res.Cluster.SubnetIndex != 1 {
 			t.Fatalf("reuse subnet = %d", res.Cluster.SubnetIndex)

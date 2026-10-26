@@ -11,10 +11,14 @@ import (
 // CheckClusterInvariants 核对实例集群的不变量（规格 §5.9；集成测试与真机验收后执行），违背返回 "cluster invariant N: …"：
 //
 //	① 每个 active 集群：在位成员 rank 互不相同且 < size、成员 system = 集群 system、成员都在集群 fabric 的机器上；
-//	② active 集群的 subnet_index 唯一，vlan fabric 上 (fabric, vlan) 唯一；
+//	② 仍占用网络的集群（active，或已结束但还有未结束成员）的 subnet_index 唯一，vlan fabric 上 (fabric, vlan) 唯一；
 //	③ 非系统集群：batch_id 下 kind='new' 的订单恰有 size 张，每张订单的实例要么是本集群成员，要么经 instance_transfers（可多跳）连到本集群成员；
 //	④ 系统集群的成员（cluster_id 指向它的全部实例）没有任何订单；
 //	⑤ failed 的非系统集群：全部成员（含换机前的旧实例）的订单都已全额退款。
+// liveClusterCheckSQL 同 clusterLiveSQL（不带参数）：集群 c 仍占用子网 / VLAN。
+const liveClusterCheckSQL = `(c.state = 'active' OR EXISTS (SELECT 1 FROM instances i WHERE i.cluster_id = c.id
+	AND i.state IN ('creating', 'running', 'stopped', 'wiping')))`
+
 func CheckClusterInvariants(ctx context.Context, pool *pgxpool.Pool) error {
 	type check struct {
 		n   int
@@ -27,8 +31,8 @@ func CheckClusterInvariants(ctx context.Context, pool *pgxpool.Pool) error {
 		{1, `SELECT i.id || ' in ' || c.id FROM instances i JOIN instance_clusters c ON c.id = i.cluster_id JOIN machines m ON m.id = i.machine_id
 			WHERE c.state = 'active' AND i.state IN ('creating', 'running', 'stopped')
 			  AND (i.system <> c.system OR m.fabric_id IS DISTINCT FROM c.fabric_id)`},
-		{2, `SELECT 'subnet ' || subnet_index FROM instance_clusters WHERE state = 'active' GROUP BY subnet_index HAVING count(*) > 1`},
-		{2, `SELECT 'fabric ' || fabric_id || ' vlan ' || vlan FROM instance_clusters WHERE state = 'active' AND vlan IS NOT NULL
+		{2, `SELECT 'subnet ' || subnet_index FROM instance_clusters c WHERE ` + liveClusterCheckSQL + ` GROUP BY subnet_index HAVING count(*) > 1`},
+		{2, `SELECT 'fabric ' || fabric_id || ' vlan ' || vlan FROM instance_clusters c WHERE ` + liveClusterCheckSQL + ` AND vlan IS NOT NULL
 			GROUP BY fabric_id, vlan HAVING count(*) > 1`},
 		{3, `SELECT c.id || ' has ' || (SELECT count(*) FROM orders o WHERE o.batch_id = c.batch_id AND o.kind = 'new') || ' new orders, size ' || c.size
 			FROM instance_clusters c

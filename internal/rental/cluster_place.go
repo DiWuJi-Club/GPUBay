@@ -73,7 +73,12 @@ func (s *Service) placeCluster(ctx context.Context, tx pgx.Tx, spec pickSpec, n 
 		*insts = (*insts)[:0]
 		s2 := spec
 		s2.FabricID, s2.ClusterNet, s2.ClusterOnly = &cand.FabricID, &cand.ClusterNet, true
-		ids, err := placeOnMachines(ctx, sp, s2, n, place)
+		// 锁序 fabric → machine（与 UpdateFabric / UpdateMachine 一致）：先 FOR SHARE 锁 fabric 行，改 fabric 与开通串行化
+		err = shareLockFabric(ctx, sp, cand.FabricID)
+		var ids []int64
+		if err == nil {
+			ids, err = placeOnMachines(ctx, sp, s2, n, place)
+		}
 		if err == nil && len(ids) != n {
 			err = fmt.Errorf("placeOnMachines returned %d machines, want %d", len(ids), n)
 		}
@@ -86,7 +91,7 @@ func (s *Service) placeCluster(ctx context.Context, tx pgx.Tx, spec pickSpec, n 
 		}
 		if err != nil {
 			_ = sp.Rollback(ctx)
-			if codeIs(err, "no_capacity") || errors.Is(err, errClusterVLANExhausted) {
+			if codeIs(err, "no_capacity") || errors.Is(err, errClusterVLANExhausted) || errors.Is(err, apperr.ErrFabricNotFound) {
 				continue
 			}
 			if errors.Is(err, errClusterSubnetExhausted) {
@@ -103,6 +108,17 @@ func (s *Service) placeCluster(ctx context.Context, tx pgx.Tx, spec pickSpec, n 
 	return Cluster{}, apperr.ClusterNoCapacity(n)
 }
 
+// shareLockFabric FOR SHARE 锁 fabric 行（开通集群在锁机器之前调用）：与 UpdateFabric / UpdateMachine 的 FOR NO KEY UPDATE 互斥，
+// 多个开通之间不互斥。fabric 已被删除 → ErrFabricNotFound。全部路径的锁序都是 fabric → machine（fleet 里重算就绪只读 fabric、不加锁）。
+func shareLockFabric(ctx context.Context, tx pgx.Tx, fabricID int64) error {
+	var id int64
+	err := tx.QueryRow(ctx, `SELECT id FROM cluster_fabrics WHERE id = $1 FOR SHARE`, fabricID).Scan(&id)
+	if db.IsNoRows(err) {
+		return apperr.ErrFabricNotFound
+	}
+	return err
+}
+
 type clusterParams struct {
 	UserID     int64
 	System     bool
@@ -112,8 +128,13 @@ type clusterParams struct {
 	Now        time.Time
 }
 
+// clusterLiveSQL：集群 c 仍占用子网 / VLAN——active，或已结束（开通期中止置 failed）但仍有未结束成员（含 wiping）：
+// 离线成员重连后 Agent 会按旧 Spec 恢复 spc0 / VLAN，直到洗机完成才拆掉（规格 §5.5 第 4 步）。$1 / $4 = clusterUnfinishedStates。
+const clusterLiveSQL = `(c.state = 'active' OR EXISTS (SELECT 1 FROM instances i WHERE i.cluster_id = c.id AND i.state = ANY($1)))`
+const clusterLiveSQL4 = `(c.state = 'active' OR EXISTS (SELECT 1 FROM instances i WHERE i.cluster_id = c.id AND i.state = ANY($4)))`
+
 // createCluster 插一行 active 的 instance_clusters（规格 §5.1）：在机器行锁之后取 cluster-alloc 咨询锁（串行化子网 / VLAN 分配），
-// subnet_index = 最小的未被 active 集群占用的 0..255；vlan fabric 取 [vlan_min, vlan_max] 中本 fabric 最小未占用的 VLAN；
+// subnet_index = 最小的未被占用（clusterLiveSQL）的 0..255；vlan fabric 取 [vlan_min, vlan_max] 中本 fabric 最小未占用的 VLAN；
 // mode = routed（lan）/ macvlan（cx7）；rdma = fabric.rdma ∧ 全员 cluster_rdma；mtu = fabric.mtu。
 // fabric 要 RDMA 而有效 RDMA 为假 → 同事务告警 cluster_rdma_degraded（一次）。
 func (s *Service) createCluster(ctx context.Context, tx pgx.Tx, p clusterParams) (Cluster, error) {
@@ -142,7 +163,8 @@ func (s *Service) createCluster(ctx context.Context, tx pgx.Tx, p clusterParams)
 	}
 	var subnet int
 	err := tx.QueryRow(ctx, `SELECT g FROM generate_series(0, 255) g
-		WHERE NOT EXISTS (SELECT 1 FROM instance_clusters c WHERE c.state = 'active' AND c.subnet_index = g) ORDER BY g LIMIT 1`).Scan(&subnet)
+		WHERE NOT EXISTS (SELECT 1 FROM instance_clusters c WHERE c.subnet_index = g AND `+clusterLiveSQL+`) ORDER BY g LIMIT 1`,
+		clusterUnfinishedStates).Scan(&subnet)
 	if db.IsNoRows(err) {
 		return Cluster{}, errClusterSubnetExhausted
 	}
@@ -153,8 +175,8 @@ func (s *Service) createCluster(ctx context.Context, tx pgx.Tx, p clusterParams)
 	if isolation == "vlan" && vlanMin != nil && vlanMax != nil {
 		var v int
 		err := tx.QueryRow(ctx, `SELECT v FROM generate_series($1::int, $2::int) v
-			WHERE NOT EXISTS (SELECT 1 FROM instance_clusters c WHERE c.state = 'active' AND c.fabric_id = $3 AND c.vlan = v) ORDER BY v LIMIT 1`,
-			*vlanMin, *vlanMax, p.FabricID).Scan(&v)
+			WHERE NOT EXISTS (SELECT 1 FROM instance_clusters c WHERE c.fabric_id = $3 AND c.vlan = v AND `+clusterLiveSQL4+`) ORDER BY v LIMIT 1`,
+			*vlanMin, *vlanMax, p.FabricID, clusterUnfinishedStates).Scan(&v)
 		if db.IsNoRows(err) {
 			return Cluster{}, errClusterVLANExhausted
 		}
@@ -240,6 +262,23 @@ func (s *Service) PlaceSystemCluster(ctx context.Context, req SystemClusterReque
 			now := s.d.Clock.Now()
 			var fabricID int64
 			var clusterNet string
+			// 锁序 fabric → machine：先按（未加锁读到的）首台机器的 fabric FOR SHARE，下面锁机器后复核每台都在这个 fabric
+			var want *int64
+			if err := tx.QueryRow(ctx, `SELECT fabric_id FROM machines WHERE id = $1`, ids[0]).Scan(&want); err != nil {
+				if db.IsNoRows(err) {
+					return apperr.ErrMachineUnavailable
+				}
+				return err
+			}
+			if want == nil {
+				return apperr.ErrMachineUnavailable
+			}
+			if err := shareLockFabric(ctx, tx, *want); err != nil {
+				if errors.Is(err, apperr.ErrFabricNotFound) {
+					return apperr.ErrMachineUnavailable
+				}
+				return err
+			}
 			for i, mid := range ids {
 				var fid int64
 				var cnet string
@@ -255,7 +294,8 @@ func (s *Service) PlaceSystemCluster(ctx context.Context, req SystemClusterReque
 				}
 				if i == 0 {
 					fabricID, clusterNet = fid, cnet
-				} else if fid != fabricID || cnet != clusterNet {
+				}
+				if fid != *want || fid != fabricID || cnet != clusterNet { // 首台在加锁前被移到别的 fabric：不在已锁的 fabric 上
 					return apperr.ErrMachineUnavailable
 				}
 			}

@@ -475,12 +475,16 @@ func (s *Service) SetClusterAutoRenew(ctx context.Context, userID int64, cluster
 
 // ReleaseCluster 用户整组释放：全员走 Release 的同一链路（立即洗机，已付费用不退），审计 cluster.release。
 // 与单实例 Release 一致，只能释放 running / stopped 的成员：有成员仍在开通 → ErrInvalidState。
+// 集群尚未就绪（组建中）同样 → ErrInvalidState：否则 SweepClusters 会以「没有成员」按开通期中止全额退款，违背「已付不退」。
 func (s *Service) ReleaseCluster(ctx context.Context, userID int64, clusterID, ip string) error {
 	now := s.d.Clock.Now()
 	return db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		_, members, err := lockUserCluster(ctx, tx, userID, clusterID)
+		c, members, err := lockUserCluster(ctx, tx, userID, clusterID)
 		if err != nil {
 			return err
+		}
+		if c.ReadyAt == nil {
+			return apperr.ErrInvalidState
 		}
 		ids := make([]string, 0, len(members))
 		for _, m := range members {
