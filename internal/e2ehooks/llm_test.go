@@ -25,7 +25,7 @@ func TestLLMHooks(t *testing.T) {
 	e := newEnvWith(t, true)
 	ctx := context.Background()
 	apps := e.must("POST", "/hooks/apps/seed", map[string]any{})["apps"].([]any)
-	if len(apps) != 5 {
+	if len(apps) != 6 { // 四个用户应用 + vllm-node + vllm-cluster（计划 13）
 		t.Fatalf("seed = %v", apps)
 	}
 	var img int64
