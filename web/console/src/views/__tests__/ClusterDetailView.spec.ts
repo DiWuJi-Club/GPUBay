@@ -189,6 +189,23 @@ describe('ClusterDetailView', () => {
     expect(post).toHaveBeenCalledWith('/clusters/clu-1/release', {})
   })
 
+  it('释放后在位成员不足（旧成员洗机中不再列出）：每 5 秒刷新，洗完即显示已释放', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    try {
+      current = view({ status: 'degraded', members: [] })
+      await mountAt()
+      const calls = () => get.mock.calls.filter(([p]) => p === '/clusters/clu-1').length
+      const before = calls()
+      current = view({ status: 'released', members: [], ended_at: '2026-10-26T11:00:00Z', renew_options: [] })
+      vi.advanceTimersByTime(5_000)
+      await flushPromises()
+      expect(calls()).toBe(before + 1)
+      expect(q('cluster-status')!.dataset.status).toBe('released')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('续费：总价 = 单价 × 台数 × 数量，带 Idempotency-Key', async () => {
     await mountAt()
     q('cluster-renew')!.click()
