@@ -107,6 +107,24 @@ describe('RentDialog 集群模式', () => {
     expect(placed).toEqual([{ instances: [{ id: 'ins-1' }, { id: 'ins-2' }], batchId: 'bat-1', immediate: true, clusterId: 'clu-1' }])
   })
 
+  it('切到集群再切回单机：开始方式与数量恢复原值（终审 B-12）', async () => {
+    await open({ '2': { available: 1, rdma: true }, '4': { available: 1, rdma: false } })
+    await clickRadio('rent-start-later')
+    const count = q('rent-count')!.querySelector('input') as HTMLInputElement
+    count.value = '3'
+    count.dispatchEvent(new Event('input'))
+    count.dispatchEvent(new Event('change'))
+    await flushPromises()
+    expect(q('rent-day')).not.toBeNull()
+    await clickRadio('rent-mode-cluster-2')
+    await clickRadio('rent-mode-cluster-4')
+    expect(q('rent-day')).toBeNull()
+    await clickRadio('rent-mode-single')
+    expect(q('rent-day')).not.toBeNull()
+    expect((q('rent-start-later')!.querySelector('input') as HTMLInputElement).checked).toBe(true)
+    expect((q('rent-count')!.querySelector('input') as HTMLInputElement).value).toBe('3')
+  })
+
   it('实时查询无可用集群：下一步禁用并说明', async () => {
     await open(undefined) // 旧后端没有 clusters：不预先禁用
     await clickRadio('rent-mode-cluster-4')

@@ -21,7 +21,7 @@ const role = (rank: number) => (rank === 0 ? 'head' : 'worker')
         </div>
         <div class="line">
           <el-tag size="small" :type="labelOf(instanceStateType, m.state) as 'primary'" data-testid="cluster-member-state">{{ labelOf(instanceStateLabel, m.state) }}</el-tag>
-          <el-tag size="small" :type="netStatusText(m.net_status).type as 'primary'" data-testid="cluster-member-net">网络{{ netStatusText(m.net_status).text }}</el-tag>
+          <el-tag size="small" :type="netStatusText(m.net_status, m.net_reason).type as 'primary'" data-testid="cluster-member-net">网络{{ netStatusText(m.net_status, m.net_reason).text }}</el-tag>
           <el-tag v-if="m.suspended" size="small" type="warning" data-testid="cluster-member-suspended">计时暂停</el-tag>
         </div>
         <div class="line muted"><span data-testid="cluster-member-machine">{{ m.machine_label || '—' }}</span><template v-if="showExpires && m.expires_at"> · 到期 {{ fmtTime(m.expires_at) }}</template></div>
@@ -44,7 +44,7 @@ const role = (rank: number) => (rank === 0 ? 'head' : 'worker')
         </template>
       </el-table-column>
       <el-table-column label="集群网络" min-width="130">
-        <template #default="{ row }"><el-tag size="small" :type="netStatusText(row.net_status).type as 'primary'" data-testid="cluster-member-net">{{ netStatusText(row.net_status).text }}</el-tag></template>
+        <template #default="{ row }"><el-tag size="small" :type="netStatusText(row.net_status, row.net_reason).type as 'primary'" data-testid="cluster-member-net">{{ netStatusText(row.net_status, row.net_reason).text }}</el-tag></template>
       </el-table-column>
       <el-table-column label="机器" min-width="110">
         <template #default="{ row }">

@@ -140,7 +140,7 @@ func TestBookingsClusterFlag(t *testing.T) {
 		}
 	}
 	m0 := cv["members"].([]any)[0].(map[string]any)
-	if m0["rank"].(float64) != 0 || m0["state"] != "creating" || m0["machine_label"] == "" || m0["ip"] != cv["head_ip"] || m0["net_status"] != "" {
+	if m0["rank"].(float64) != 0 || m0["state"] != "creating" || m0["machine_label"] == "" || m0["ip"] != cv["head_ip"] || m0["net_status"] != "pending" {
 		t.Fatalf("member 0 = %v", m0)
 	}
 	// 同键重放：同一个集群
@@ -618,5 +618,77 @@ func TestClusterAppsFlow(t *testing.T) {
 	}
 	if n := e.countRows(`SELECT count(*) FROM audit_logs WHERE action LIKE 'cluster.app_%' AND target_id = $1`, id); n < 5 {
 		t.Fatalf("cluster app audits = %d", n)
+	}
+}
+
+// 终审 B-2：成员集群网络状态在控制台归一为 ok / pending / error + 固定原因；Agent 原始错误（命令行、VLAN、网卡名、地址）不出控制台。
+func TestClusterNetStatusConsoleNormalized(t *testing.T) {
+	e := newTestEnv(t)
+	e.clusterMachines(e.clusterFabric("L1"), 2)
+	c, _ := e.fundedClient("13800001171")
+	cv := e.orderCluster(c, 2)
+	id := cv["id"].(string)
+	// 开通中（机器未上报）：pending
+	for _, m := range cv["members"].([]any) {
+		if mm := m.(map[string]any); mm["net_status"] != "pending" || mm["net_reason"] != "" {
+			t.Fatalf("creating member = %v", mm)
+		}
+	}
+	e.runCluster(cv)
+	ids := memberIDs(cv)
+	raw := "error: ip link add link enP7s7 name scv1234 type vlan id 1234: exit status 2: RTNETLINK answers: File exists; " +
+		"iptables -w -A SPARK-CLU -s 10.210.3.12/32 -d 192.168.7.10 -j ACCEPT"
+	if err := e.fleet.RecordStateReport(context.Background(), e.machineOf(ids[1]), fleet.StateReport{Instances: []fleet.InstanceState{
+		{InstanceID: ids[1], Phase: "running", Cluster: raw}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.fleet.RecordStateReport(context.Background(), e.machineOf(ids[0]), fleet.StateReport{Instances: []fleet.InstanceState{
+		{InstanceID: ids[0], Phase: "running", Cluster: "pending"}}}); err != nil {
+		t.Fatal(err)
+	}
+	_, list := c.do("GET", "/clusters", nil)
+	_, detail := c.do("GET", "/clusters/"+id, nil)
+	_, inst := c.do("GET", "/instances/"+ids[1], nil)
+	_, insts := c.do("GET", "/instances", nil)
+	for name, v := range map[string]any{"list": list, "detail": detail, "instance": inst, "instances": insts} {
+		s := rawJSON(v)
+		for _, leak := range []string{"ip link", "vlan", "scv1234", "enP7s7", "iptables", "SPARK-CLU", "192.168.7.", "RTNETLINK", "exit status"} {
+			if strings.Contains(s, leak) {
+				t.Fatalf("%s leaks %q: %s", name, leak, s)
+			}
+		}
+	}
+	if detail["status"] != "degraded" {
+		t.Fatalf("status = %v", detail["status"])
+	}
+	ms := detail["members"].([]any)
+	m0, m1 := ms[0].(map[string]any), ms[1].(map[string]any)
+	if m0["net_status"] != "pending" || m0["net_reason"] != "" {
+		t.Fatalf("member 0 = %v", m0)
+	}
+	if m1["net_status"] != "error" || m1["net_reason"] != "集群网络异常，平台已告警处理" {
+		t.Fatalf("member 1 = %v", m1)
+	}
+}
+
+// 终审 B-12：/clusters 列表里某个集群组装失败只跳过该项（记日志），不让整表 500。
+func TestClustersListSkipsBrokenItem(t *testing.T) {
+	e := newTestEnv(t)
+	e.clusterMachines(e.clusterFabric("L1"), 4)
+	c, _ := e.fundedClient("13800001181")
+	good := e.orderCluster(c, 2)
+	bad := e.orderCluster(c, 2)
+	e.runCluster(good)
+	e.runCluster(bad)
+	// 让 bad 的一个成员实例读不到（归属错乱）：控制台视图组装失败
+	_, otherUID := e.fundedClient("13800001182")
+	e.exec(`UPDATE instances SET user_id = $2 WHERE id = $1`, memberIDs(bad)[1], otherUID)
+	code, out := c.do("GET", "/clusters", nil)
+	if code != 200 {
+		t.Fatalf("list = %d %v", code, out)
+	}
+	items := out["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["id"] != good["id"] {
+		t.Fatalf("items = %v", items)
 	}
 }

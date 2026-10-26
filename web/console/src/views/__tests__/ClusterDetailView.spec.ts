@@ -13,7 +13,7 @@ import ClusterDetailView from '../ClusterDetailView.vue'
 
 const member = (rank: number, over = {}) => ({
   rank, instance_id: `ins-${'abcdefgh'[rank].repeat(8)}`, state: 'running', suspended: false, ip: `10.210.7.${11 + rank}`, machine_label: `A-0${rank + 1}`,
-  net_status: 'ok', expires_at: '2026-10-27T10:00:00Z', ...over,
+  net_status: 'ok', net_reason: '', expires_at: '2026-10-27T10:00:00Z', ...over,
 })
 const view = (over: Partial<ConsoleClusterView> = {}): ConsoleClusterView => ({
   id: 'clu-1', size: 2, status: 'ready', network: 'rdma', fabric_kind: 'cx7', subnet: '10.210.7.0/24', head_ip: '10.210.7.11', batch_id: 'bat-1',
@@ -106,14 +106,14 @@ describe('ClusterDetailView', () => {
   })
 
   it('降级 + RDMA 退回 + 成员网络异常 + 到期不一致：各自提示', async () => {
-    current = view({ status: 'degraded', network: 'rdma_degraded', expires_mismatch: true, members: [member(0), member(1, { net_status: 'error: no route', suspended: true })] as ConsoleClusterView['members'] })
+    current = view({ status: 'degraded', network: 'rdma_degraded', expires_mismatch: true, members: [member(0), member(1, { net_status: 'error', net_reason: '集群网络异常，平台已告警处理', suspended: true })] as ConsoleClusterView['members'] })
     await mountAt()
     expect(q('cluster-status')!.textContent).toBe('降级')
     expect(q('cluster-notice-degraded')).not.toBeNull()
     expect(q('cluster-notice-rdma_degraded')).not.toBeNull()
     expect(q('cluster-notice-expires_mismatch')!.textContent).toContain('成员到期时间不一致')
     expect(q('cluster-expires-mismatch')).not.toBeNull()
-    expect(qa('cluster-member-net')[1].textContent).toContain('异常：no route')
+    expect(qa('cluster-member-net')[1].textContent).toContain('异常：集群网络异常，平台已告警处理')
     expect(q('cluster-member-suspended')).not.toBeNull()
   })
 
@@ -187,6 +187,45 @@ describe('ClusterDetailView', () => {
     q('cluster-release-ok')!.click()
     await flushPromises()
     expect(post).toHaveBeenCalledWith('/clusters/clu-1/release', {})
+  })
+
+  it('自动续费时长：商品没加载时用集群现有时长，不硬写 1d；都没有则开关禁用（终审 B-12）', async () => {
+    const base = get.getMockImplementation()!
+    get.mockImplementation(async (path: string, params?: unknown) => {
+      if (path === '/products') throw new Error('products down')
+      return base(path, params)
+    })
+    current = view({ auto_renew_duration: '1w' })
+    await mountAt()
+    put.mockResolvedValueOnce(view({ auto_renew: true, auto_renew_duration: '1w' }))
+    q('cluster-auto-renew')!.click()
+    await flushPromises()
+    expect(put).toHaveBeenCalledWith('/clusters/clu-1/auto-renew', { enabled: true, duration: '1w' })
+    wrapper?.unmount()
+    wrapper = undefined
+    document.body.innerHTML = ''
+    put.mockReset()
+
+    current = view({ auto_renew_duration: '' })
+    await mountAt()
+    const sw = q('cluster-auto-renew')!
+    expect(sw.classList.contains('is-disabled')).toBe(true)
+    sw.click()
+    await flushPromises()
+    expect(put).not.toHaveBeenCalled()
+  })
+
+  it('自动续费时长：集群没有现有时长时取商品第一个档位；关闭不带时长', async () => {
+    current = view({ auto_renew_duration: '' })
+    await mountAt()
+    put.mockResolvedValueOnce(view({ auto_renew: true }))
+    q('cluster-auto-renew')!.click()
+    await flushPromises()
+    expect(put).toHaveBeenCalledWith('/clusters/clu-1/auto-renew', { enabled: true, duration: '1d' })
+    put.mockResolvedValueOnce(view({ auto_renew: false }))
+    q('cluster-auto-renew')!.click()
+    await flushPromises()
+    expect(put).toHaveBeenLastCalledWith('/clusters/clu-1/auto-renew', { enabled: false })
   })
 
   it('释放后在位成员不足（旧成员洗机中不再列出）：每 5 秒刷新，洗完即显示已释放', async () => {

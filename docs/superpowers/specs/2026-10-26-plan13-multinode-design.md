@@ -575,7 +575,7 @@ provisioning ──(全员 running → 集群部署聚合 running/ok → 探测 
 | GET | `/products` | 每个商品增 `clusters: {"2": {available, rdma}, "4": {…}}` |
 | POST | `/bookings` | body 增 `cluster: bool`；响应增 `cluster: ClusterView` |
 | GET | `/clusters` | 我的集群（`active` + 最近 30 天结束的）`{items:[ClusterView]}` |
-| GET | `/clusters/{id}` | `ClusterView{id, size, status, network: rdma\|ethernet\|rdma_degraded, fabric_kind, subnet, head_ip, expires_at, auto_renew, auto_renew_duration, renew_options, members:[{rank, instance_id, state, ip, machine_label, net_status}], app?: ClusterAppView, created_at}` |
+| GET | `/clusters/{id}` | `ClusterView{id, size, status, network: rdma\|ethernet\|rdma_degraded, fabric_kind, subnet, head_ip, expires_at, auto_renew, auto_renew_duration, renew_options, members:[{rank, instance_id, state, ip, machine_label, net_status: ok\|pending\|error, net_reason}]（net_status 为归一化值，error 时 net_reason 为固定文案「集群网络异常，平台已告警处理」；Agent 原始错误只在后台视图）, app?: ClusterAppView, created_at}` |
 | POST | `/clusters/{id}/renew` | `{duration, quantity}` + `Idempotency-Key` → `{orders:[…], cluster}` |
 | PUT | `/clusters/{id}/auto-renew` | `{enabled, duration}` |
 | POST | `/clusters/{id}/release` | 全员释放 |
