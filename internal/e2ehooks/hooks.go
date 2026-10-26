@@ -68,7 +68,8 @@ type Server struct {
 	mu            sync.Mutex
 	comfyTS       *httptest.Server
 	agents        map[int64]*fakeagent.Agent
-	upstreamStops map[int]func() // ingress-upstream 起的回显服务 / llm/upstream 起的 FakeVLLM，按端口
+	profiles      map[int64]agentProfile // 计划 13：/hooks/machines 给的网卡预设 / 旧 Agent；重新接入时沿用
+	upstreamStops map[int]func()         // ingress-upstream 起的回显服务 / llm/upstream 起的 FakeVLLM，按端口
 }
 
 // Close 停掉全部 fake Agent。
@@ -97,8 +98,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/sweep", s.handle(s.sweep))
 	mux.HandleFunc("POST /hooks/agent", s.handle(s.agent))
 	mux.HandleFunc("GET /hooks/agent/status", s.agentStatus)
+	mux.HandleFunc("POST /hooks/agent/cluster-net", s.handle(s.agentClusterNet))
 	mux.HandleFunc("POST /hooks/machines", s.handle(s.machines))
 	mux.HandleFunc("POST /hooks/groups", s.handle(s.groups))
+	mux.HandleFunc("POST /hooks/fabrics", s.handle(s.fabrics))
 	mux.HandleFunc("POST /hooks/users", s.handle(s.users))
 	mux.HandleFunc("POST /hooks/admins", s.handle(s.admins))
 	mux.HandleFunc("POST /hooks/referral/config", s.handle(s.referralConfig))
@@ -221,8 +224,10 @@ func (s *Server) agentFor(ctx context.Context, machineID int64) (*fakeagent.Agen
 	if err != nil {
 		return nil, err
 	}
-	ag, err = fakeagent.Start(ctx, fakeagent.Options{Addr: s.AgentAddr, CAPEM: s.App.Gateway.CAPEM(), Token: tok.Plain, Stepped: true,
-		IPs: []string{m.LanIP}, Metrics: fakeMetrics, Log: s.Log})
+	opts := fakeagent.Options{Addr: s.AgentAddr, CAPEM: s.App.Gateway.CAPEM(), Token: tok.Plain, Stepped: true,
+		IPs: []string{m.LanIP}, Metrics: fakeMetrics, Log: s.Log}
+	applyProfile(s.profile(machineID), m.LanIP, &opts.Net, &opts.Features, &opts.ClusterNet)
+	ag, err = fakeagent.Start(ctx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("fake agent for machine %d: %w", machineID, err)
 	}
@@ -431,18 +436,32 @@ func (s *Server) agentStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"connected": connected})
 }
 
+// machines 登记 count 台机器并接入 fake Agent：{count, serial_prefix?, rack?, group_id?, fabric_id?, net?, old_agent?} →
+// {ids, cluster_ready: [与 ids 对应]}。计划 13：net 是网卡预设（lan / cx7 / cx7-rdma，见 NetPreset；缺省 = 默认 eth0）、
+// old_agent 让 fake Agent 的能力位只有 SharedSlots（不支持集群）、fabric_id 在接入后把机器加入该 fabric（fleet 同事务重算 cluster_ready）。
 func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := decode[struct {
 		Count        int    `json:"count"`
 		SerialPrefix string `json:"serial_prefix"`
 		Rack         string `json:"rack"`
 		GroupID      *int64 `json:"group_id"`
+		FabricID     *int64 `json:"fabric_id"`
+		Net          string `json:"net"`
+		OldAgent     bool   `json:"old_agent"`
 	}](body)
 	if err != nil {
 		return nil, err
 	}
 	if req.Count <= 0 || req.Count > 50 {
 		return nil, badRequest("count 必须在 1～50 之间")
+	}
+	if _, err := NetPreset(req.Net, "127.0.0.1"); err != nil {
+		return nil, err
+	}
+	if req.FabricID != nil {
+		if _, err := s.App.Fleet.GetFabric(ctx, s.Pool, *req.FabricID); err != nil {
+			return nil, asBadRequest(err)
+		}
 	}
 	if req.Rack == "" {
 		req.Rack = "E2E"
@@ -457,6 +476,7 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 		return nil, err
 	}
 	ids := make([]int64, 0, req.Count)
+	ready := make([]bool, 0, req.Count)
 	for i := 1; i <= req.Count; i++ {
 		m, err := s.App.Fleet.Register(ctx, fleet.NewMachine{Serial: fmt.Sprintf("%s%d", prefix, i), Rack: req.Rack, Slot: fmt.Sprint(i),
 			LanIP: "127.0.0.1", ProductID: pid}) // 网关与 Web 入口拨 lan_ip:UpstreamSSHPort，即进程内的假容器 sshd
@@ -467,6 +487,7 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 		if err := s.App.Fleet.SetMaintenance(ctx, m.ID, false); err != nil {
 			return nil, err
 		}
+		s.setProfile(m.ID, agentProfile{net: req.Net, oldAgent: req.OldAgent})
 		if _, err := s.agentFor(ctx, m.ID); err != nil { // 真实接入并建流（首个 StateReport 处理完才返回）
 			return nil, err
 		}
@@ -475,9 +496,15 @@ func (s *Server) machines(ctx context.Context, body json.RawMessage) (any, error
 				return nil, err
 			}
 		}
+		if req.FabricID != nil {
+			if m, err = s.joinFabric(ctx, m.ID, *req.FabricID); err != nil {
+				return nil, err
+			}
+		}
 		ids = append(ids, m.ID)
+		ready = append(ready, m.ClusterReady)
 	}
-	return map[string]any{"ids": ids}, nil
+	return map[string]any{"ids": ids, "cluster_ready": ready}, nil
 }
 
 // groups 建一个机组（visible 缺省 true）。

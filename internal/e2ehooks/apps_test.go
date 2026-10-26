@@ -2,6 +2,10 @@ package e2ehooks_test
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -12,7 +16,7 @@ import (
 	"spark-cloud/internal/rental"
 )
 
-// /hooks/apps/seed 幂等地建四个 fake 用户应用与平台内部应用 vllm-node（另建 LLM Serving / ComfyUI 镜像，默认镜像不改名）；/hooks/apps/tick 每轮推进假时钟 5 秒
+// /hooks/apps/seed 幂等地建四个 fake 用户应用、集群应用 vllm-cluster 与平台内部应用 vllm-node（另建 LLM Serving / ComfyUI 镜像，默认镜像不改名）；/hooks/apps/tick 每轮推进假时钟 5 秒
 // 并驱动 Runner 把预装的应用部署到 running；/hooks/agent 的 images 写进机器的已缓存镜像。
 func TestAppsSeedTickAndAgentImages(t *testing.T) {
 	e := newEnvWith(t, true)
@@ -35,8 +39,8 @@ func TestAppsSeedTickAndAgentImages(t *testing.T) {
 		return out
 	}
 	first := seed()
-	wantPorts := map[string]float64{"vllm": 8000, "open-webui": 3000, "comfyui": 8188, "jupyterlab": 8888, "vllm-node": 8000}
-	if len(first) != 5 {
+	wantPorts := map[string]float64{"vllm": 8000, "open-webui": 3000, "comfyui": 8188, "jupyterlab": 8888, "vllm-node": 8000, "vllm-cluster": 8000}
+	if len(first) != 6 {
 		t.Fatalf("seed = %v", first)
 	}
 	for slug, port := range wantPorts {
@@ -74,6 +78,14 @@ func TestAppsSeedTickAndAgentImages(t *testing.T) {
 	}
 	if ids := vers("jupyterlab").ImageIDs; len(ids) != 3 || !slices.Contains(ids, defaultImg) {
 		t.Fatalf("jupyterlab images = %v", ids)
+	}
+	// 计划 13：vllm-node 1.1.0（cluster optional 2～4）、vllm-cluster 1.0.0（cluster required 2～4）
+	if v := vers("vllm-node"); v.Version != "1.1.0" || v.Spec.Cluster == nil || v.Spec.Cluster.Mode != "optional" || v.Spec.TimeoutMinutes != 360 {
+		t.Fatalf("vllm-node version = %s spec cluster %+v timeout %d", v.Version, v.Spec.Cluster, v.Spec.TimeoutMinutes)
+	}
+	if v := vers("vllm-cluster"); v.Version != "1.0.0" || v.Spec.Cluster == nil || v.Spec.Cluster.Mode != "required" ||
+		v.Spec.Cluster.MinSize != 2 || v.Spec.Cluster.MaxSize != 4 {
+		t.Fatalf("vllm-cluster version = %s spec cluster %+v", v.Version, v.Spec.Cluster)
 	}
 
 	// 预装 vLLM → 开通 → tick 直到 running
@@ -136,4 +148,26 @@ func mapsEqual(a, b map[string]map[string]any) bool {
 		}
 	}
 	return true
+}
+
+// fake 的 vllm-node / vllm-cluster spec 与 deploy/apps 里的真实 spec.json 相同（只去掉 min_data_free_gib）。
+func TestFakeClusterSpecsMatchDeploy(t *testing.T) {
+	for _, slug := range []string{"vllm-node", "vllm-cluster"} {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "apps", slug, "spec.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var want appdeploy.Spec
+		if err := json.Unmarshal(raw, &want); err != nil {
+			t.Fatal(err)
+		}
+		want.MinDataFreeGiB = 0
+		got, ok := e2ehooks.FakeSpec(slug)
+		if !ok || !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s fake spec differs from deploy/apps:\n got %+v\nwant %+v", slug, got, want)
+		}
+		if err := appdeploy.ValidateSpec(&got); err != nil {
+			t.Fatalf("%s: %v", slug, err)
+		}
+	}
 }

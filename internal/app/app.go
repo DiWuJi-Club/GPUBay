@@ -239,6 +239,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	r := rental.NewService(rental.Deps{
 		Pool: pool, Clock: clk, Box: box, Log: log, Users: ids, Wallet: w, Catalog: c, Fleet: f, Keys: ids,
 		Notifier: expiryNotifier{ids: ids, sms: smsSender}, HostKeyGen: opt.HostKeyGen, SystemUserID: systemUserID, SSHBasePort: cfg.UpstreamSSHPort,
+		ClusterSubnetPool: cfg.ClusterSubnetPool, // 计划 13：零值（Config 字面量）时 rental 取 clusterspec.DefaultPool
 	})
 	ref := referral.NewService(referral.Deps{Pool: pool, Clock: clk, Log: log, Wallet: w, Users: ids, Orders: r, Alerts: f})
 	ids.SetReferral(ref)
@@ -360,8 +361,9 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 	adminSrv.Workflows, adminSrv.Installer = wfCat, wfInst
 	// Token 商城：节点即系统实例上的 vllm-node 部署，探测与转发走同一个上游连接池。网关（/v1）由 SPARK_LLM_GATEWAY 决定是否挂载；
 	// 必须在 srv.Router() 之前设置（Router 按字段是否为 nil 注册路由）。
+	// 计划 13：多机节点组的 rental / appdeploy 操作显式传入（同时是 *rental.Service / *appdeploy.Service 满足 ClusterRentalOps / ClusterAppOps 的编译期校验）。
 	llmSvc := llm.NewService(llm.Deps{Pool: pool, Clock: clk, Log: log, Box: box, Wallet: w, Users: ids, Rental: r, Apps: apps, AppCat: appCat,
-		Images: c, Fleet: f, Upstream: upstreamPool, SystemUserID: systemUserID})
+		Images: c, Fleet: f, Upstream: upstreamPool, SystemUserID: systemUserID, ClusterRental: r, ClusterApps: apps})
 	llmCtl := llm.NewController(llmSvc)
 	srv.LLM, adminSrv.LLM = llmSvc, llmSvc
 	var llmGW *llmgw.Server

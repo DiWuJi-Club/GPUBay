@@ -936,3 +936,23 @@ func TestGroupRedeployInvalidStateRetries(t *testing.T) {
 		t.Fatalf("retry %+v", got)
 	}
 }
+
+// 计划 13 Task 13 集成中发现：成员进程刚崩溃时成员部署仍是 running + unhealthy（Runner 连续 CrashedAfter 次才置 failed），聚合是
+// installing（规格 §6.4「其余」）。这不是「已在重新安装」：GroupRebuildAfter 后仍须整组 RedeployCluster（rebuild_count + 1）。
+func TestGroupCrashWhileRunningUnhealthyRedeploys(t *testing.T) {
+	ne := newNodeEnv(t)
+	_, n := ne.readyGroup(2)
+	worker := ne.memberDeployment(*n.AppClusterID, ne.members(n.ID)[1].InstanceID)
+	ne.setDeployment(worker, appdeploy.StateRunning, appdeploy.HealthUnhealthy, "")
+	for i := 0; i < llm.ProbeFailThreshold && ne.node(n.ID).State != llm.NodeUnhealthy; i++ {
+		ne.probeTick()
+	}
+	if got := ne.node(n.ID); got.State != llm.NodeUnhealthy {
+		t.Fatalf("after crash %+v", got)
+	}
+	ne.clk.Advance(llm.GroupRebuildAfter + time.Second)
+	ne.tick()
+	if got := ne.node(n.ID); got.State != llm.NodeProvisioning || got.RebuildCount != 1 || len(ne.apps.clusterRedeployCalls()) != 1 {
+		t.Fatalf("after GroupRebuildAfter %+v redeploys %d", got, len(ne.apps.clusterRedeployCalls()))
+	}
+}

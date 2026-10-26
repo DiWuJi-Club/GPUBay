@@ -146,6 +146,21 @@ func clusterDeploymentError(cd appdeploy.ClusterDeployment) string {
 	return "集群部署" + cd.Status
 }
 
+// clusterReinstalling 集群部署聚合 installing 且有当前成员的部署处于 queued / installing（已在重新安装，同单机节点按部署状态判断）。
+// 不能只看聚合 installing：成员进程刚崩溃时部署仍是 running + unhealthy（Runner 连续 CrashedAfter 次才置 failed），
+// 聚合也落在「其余 → installing」，那时须整组 RedeployCluster（计划 13 Task 13 集成测试 TestLLMGroupCrashRebuildE2E 发现）。
+func clusterReinstalling(cd appdeploy.ClusterDeployment) bool {
+	if cd.Status != appdeploy.ClusterStatusInstalling {
+		return false
+	}
+	for _, m := range cd.Members {
+		if m.Current && (m.Deployment.State == appdeploy.StateQueued || m.Deployment.State == appdeploy.StateInstalling) {
+			return true
+		}
+	}
+	return false
+}
+
 // clusterDeploymentGone 集群部署已无法恢复（卸载中 / 已卸载 / 成员已换，需要重新部署）。
 func clusterDeploymentGone(status string) bool {
 	return status == appdeploy.ClusterStatusRemoving || status == appdeploy.ClusterStatusRemoved || status == appdeploy.ClusterStatusStale
@@ -404,7 +419,7 @@ func (c *Controller) handleUnhealthyGroup(ctx context.Context, now time.Time, cn
 	if n.RebuildCount >= MaxRebuilds {
 		return critical("多次重建仍不健康", "多次重建失败")
 	}
-	if cd.Status == appdeploy.ClusterStatusInstalling {
+	if clusterReinstalling(cd) {
 		// 集群部署已在（重新）安装：不再 Redeploy，按 provisioning 等待（超时兜底）；规则同单机节点
 		_, _, err := c.s.mutateNode(ctx, n.ID, func(_ pgx.Tx, x *Node, _ time.Time) (string, error) {
 			if err := expect(x, NodeUnhealthy); err != nil {
