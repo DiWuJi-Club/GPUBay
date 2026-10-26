@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -114,6 +115,7 @@ func (r *Runtime) Create(ctx context.Context, s runtime.Spec) error {
 	}
 	r.created++
 	sum := sha256.Sum256(fmt.Appendf(nil, "%s#%d", s.InstanceID, r.created))
+	s.DNS, s.CapDrop, s.Devices, s.Sysctls = slices.Clone(s.DNS), slices.Clone(s.CapDrop), slices.Clone(s.Devices), maps.Clone(s.Sysctls)
 	r.specs[s.InstanceID] = s
 	r.containers[s.InstanceID] = &entry{c: runtime.Container{Exists: true, FullID: hex.EncodeToString(sum[:]), Image: s.ImageRef, Label: s.InstanceID, DataMounted: s.DataDir != "", DataSource: s.DataDir, Pid: 4242, Networks: []string{"spark0"}, PublishIPs: publishIPs(s.LanIP)}}
 	return nil

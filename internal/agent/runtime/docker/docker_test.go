@@ -77,6 +77,49 @@ func TestCreateCommandSnapshotShared(t *testing.T) {
 	}
 }
 
+// 集群成员（计划 13）：--cap-drop、--sysctl（按 key 排序）、--device 在 --cap-add 之后、--network 之前；
+// 非集群命令行见 TestCreateCommandSnapshot（与改动前逐字相同）。
+func TestCreateCommandSnapshotCluster(t *testing.T) {
+	rt, r := newRT()
+	spec := runtime.Spec{InstanceID: "ins-abcdefgh", ImageRef: "img:1", LanIP: "192.168.1.221", SSHPort: 2222,
+		SSHDir: "/s", DataDir: "/d", MemoryBytes: 1 << 30, ShmBytes: 1 << 29, PidsLimit: 32768,
+		CapDrop: []string{"NET_RAW"}, Sysctls: map[string]string{"net.ipv4.ping_group_range": "0 2147483647", "net.core.somaxconn": "1024"},
+		Devices: []string{"/dev/infiniband/rdma_cm", "/dev/infiniband/uverbs1"}}
+	if err := rt.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	want := "docker create --name ins-abcdefgh --label spark.instance=ins-abcdefgh --gpus all " +
+		"--shm-size 536870912 --memory 1073741824 --memory-swap 1073741824 --pids-limit 32768 --oom-score-adj 500 " +
+		"--cap-add IPC_LOCK --cap-add SYS_NICE --cap-add SYS_PTRACE --cap-drop NET_RAW " +
+		"--sysctl net.core.somaxconn=1024 --sysctl net.ipv4.ping_group_range=0 2147483647 " +
+		"--device /dev/infiniband/rdma_cm --device /dev/infiniband/uverbs1 " +
+		"--ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 " +
+		"--network spark0 --dns-search . --restart no " +
+		"-p 192.168.1.221:2222:22/tcp -v /s:/.spark:ro -v /d:/root/data --entrypoint /.spark/init.sh img:1"
+	if r.Lines() != want {
+		t.Fatalf("create:\n got %s\nwant %s", r.Lines(), want)
+	}
+}
+
+func TestCreateRejectsBadClusterArgs(t *testing.T) {
+	base := runtime.Spec{InstanceID: "ins-abcdefgh", ImageRef: "img:1", LanIP: "192.168.1.221", SSHPort: 2222,
+		SSHDir: "/s", DataDir: "/d", MemoryBytes: 1 << 30, ShmBytes: 1 << 29, PidsLimit: 1}
+	for name, mut := range map[string]func(*runtime.Spec){
+		"cap flag":     func(s *runtime.Spec) { s.CapDrop = []string{"--privileged"} },
+		"sysctl key":   func(s *runtime.Spec) { s.Sysctls = map[string]string{"--privileged": "1"} },
+		"sysctl value": func(s *runtime.Spec) { s.Sysctls = map[string]string{"net.ipv4.x": "1\n2"} },
+		"device":       func(s *runtime.Spec) { s.Devices = []string{"/etc/shadow"} },
+		"device dots":  func(s *runtime.Spec) { s.Devices = []string{"/dev/../etc/shadow"} },
+	} {
+		rt, r := newRT()
+		s := base
+		mut(&s)
+		if err := rt.Create(context.Background(), s); err == nil || r.Lines() != "" {
+			t.Fatalf("%s: err=%v calls=%q", name, err, r.Lines())
+		}
+	}
+}
+
 func TestStartStopRemovePull(t *testing.T) {
 	rt, r := newRT()
 	ctx := context.Background()

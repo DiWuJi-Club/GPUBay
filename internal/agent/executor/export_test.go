@@ -47,3 +47,6 @@ func RecoverPendingForTest(e *Executor) []string {
 	}
 	return ids
 }
+
+// EnsureClustersForTest 直接跑一轮集群网络巡检。
+func EnsureClustersForTest(e *Executor, ctx context.Context) { e.ensureClusters(ctx) }
