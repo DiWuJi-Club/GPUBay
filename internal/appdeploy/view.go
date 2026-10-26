@@ -55,6 +55,10 @@ type View struct {
 	// Workflows（计划 11）：已装 / 应装的工作流（comfywf 的视图，appdeploy 不解释）。只对 comfyui 或版本支持工作流的部署给出，
 	// 此时恒为数组（没有工作流 = []）；其它部署为 nil，omitzero 省略该字段。
 	Workflows []json.RawMessage `json:"workflows,omitzero"`
+	// 计划 13：集群应用的成员部署（head / worker 与所属集群部署 ID）；非集群部署省略这两个字段（输出与改动前相同）。
+	// 控制台据此把单实例的重新部署 / 停止 / 启动 / 卸载按钮换成「到集群页操作」（这些接口对成员部署返回 app_cluster_managed）。
+	ClusterRole         string  `json:"cluster_role,omitempty"`
+	ClusterDeploymentID *string `json:"cluster_deployment_id,omitempty"`
 }
 
 // Summary 是实例列表 / 详情里 apps_summary 的一项。
@@ -214,7 +218,8 @@ func (s *Service) views(ctx context.Context, deps []Deployment, withSecrets bool
 			VersionID: d.AppVersionID, Version: ver.version, State: d.State, Desired: d.Desired, Phase: d.Phase, Progress: d.Progress,
 			Message: d.Message, Health: d.Health, ErrorCode: d.ErrorCode, Env: map[string]string{}, SecretEnv: map[string]bool{},
 			Spec: normalizeSpec(ver.spec), Port: d.Port, Links: []LinkView{}, Attempt: d.Attempt, CleanupPending: d.CleanupPending,
-			StartedAt: d.StartedAt, FinishedAt: d.FinishedAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt}
+			StartedAt: d.StartedAt, FinishedAt: d.FinishedAt, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
+			ClusterRole: d.ClusterRole, ClusterDeploymentID: d.ClusterDeploymentID}
 		for k, val := range d.Env {
 			v.Env[k] = val
 		}
@@ -334,6 +339,9 @@ type CatalogVersionView struct {
 	TimeoutMinutes int        `json:"timeout_minutes"`
 	// SupportsWorkflows（计划 11）：控制台据此决定是否显示「预装工作流」。
 	SupportsWorkflows bool `json:"supports_workflows"`
+	// Cluster（计划 13）：版本支持集群部署时的 spec.cluster（mode optional / required、台数范围）；不支持集群省略。
+	// 控制台据此把 required 应用只放在集群页的「部署应用」里，单实例部署 / 下单预装不提供。
+	Cluster *ClusterSupport `json:"cluster,omitempty"`
 }
 
 // CatalogView 与前端 AppCatalogItem 对应；Description 只在单个应用接口里给。
@@ -352,7 +360,7 @@ type CatalogView struct {
 func catalogView(a App, v Version, images []ImageBrief, withDescription bool) CatalogView {
 	cv := CatalogView{ID: a.ID, Slug: a.Slug, Name: a.Name, Summary: a.Summary, Category: a.Category, Icon: a.Icon,
 		Version: CatalogVersionView{ID: v.ID, Version: v.Version, Ports: v.Spec.Ports, Env: v.Spec.Env, Links: v.Spec.Links,
-			TimeoutMinutes: v.Spec.TimeoutMinutes, SupportsWorkflows: v.Spec.SupportsWorkflows},
+			TimeoutMinutes: v.Spec.TimeoutMinutes, SupportsWorkflows: v.Spec.SupportsWorkflows, Cluster: v.Spec.Cluster},
 		Images: images}
 	if withDescription {
 		cv.Description = a.Description
