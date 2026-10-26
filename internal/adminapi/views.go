@@ -38,6 +38,9 @@ type instanceView struct {
 	CancelledAt           *time.Time `json:"cancelled_at"`
 	// 计划 9：Token 商城的系统实例（平台节点）：不计费、不到期
 	System bool `json:"system"`
+	// 计划 13：集群成员的集群 ID 与 rank（非成员为 null）
+	ClusterID   *string `json:"cluster_id"`
+	ClusterRank *int    `json:"cluster_rank"`
 }
 
 func (s *Server) instanceView(i rental.Instance) instanceView {
@@ -48,6 +51,7 @@ func (s *Server) instanceView(i rental.Instance) instanceView {
 	v.ScheduledStartAt, v.GroupID, v.BatchID, v.ReassignCount = i.ScheduledStartAt, i.GroupID, i.BatchID, i.ReassignCount
 	v.AutoRenew, v.AutoRenewDuration, v.AutoRenewFailedReason = i.AutoRenew, string(i.AutoRenewDuration), i.AutoRenewFailedReason
 	v.ProvisionedAt, v.CancelledAt, v.System = i.ProvisionedAt, i.CancelledAt, i.System
+	v.ClusterID, v.ClusterRank = i.ClusterID, i.ClusterRank
 	if i.ScheduledStartAt != nil {
 		switch i.State {
 		case rental.StateReserved, rental.StateCreating, rental.StateCancelled:

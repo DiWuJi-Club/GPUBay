@@ -66,13 +66,41 @@ type modelRequest struct {
 	MaxConcurrency   int               `json:"max_concurrency"`
 	Features         []string          `json:"features"`
 	Sort             int               `json:"sort"`
+	// 计划 13：每副本机器数（1 / 2 / 4）与并行切分（TP × PP = N）。缺省（null / 不给）时：创建按默认（N = 1、TP = N、PP = 1）；
+	// 修改时 nodes_per_replica 缺省 → 三项都沿用模型现值（不会被当成 N = 1）；给了 nodes_per_replica 而缺 TP / PP → 按默认推导。
+	NodesPerReplica  *int `json:"nodes_per_replica"`
+	TensorParallel   *int `json:"tensor_parallel"`
+	PipelineParallel *int `json:"pipeline_parallel"`
+}
+
+func derefInt(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 func (q modelRequest) input() llm.ModelInput {
 	return llm.ModelInput{Slug: q.Slug, Name: q.Name, Description: q.Description, Kind: q.Kind, Source: q.Source, SourceID: q.SourceID,
 		ImageID: q.ImageID, AppVersionID: q.AppVersionID, ContextLen: q.ContextLen, MaxOutputTokens: q.MaxOutputTokens,
 		DefaultMaxTokens: q.DefaultMaxTokens, InputPrice: q.InputPrice, OutputPrice: q.OutputPrice, NodeEnv: q.NodeEnv,
-		Replicas: q.Replicas, MaxConcurrency: q.MaxConcurrency, Sort: q.Sort, Features: q.Features}
+		Replicas: q.Replicas, MaxConcurrency: q.MaxConcurrency, Sort: q.Sort, Features: q.Features,
+		NodesPerReplica: derefInt(q.NodesPerReplica), TensorParallel: derefInt(q.TensorParallel), PipelineParallel: derefInt(q.PipelineParallel)}
+}
+
+// updateInput PUT 的输入：nodes_per_replica 缺省时三项并行字段沿用 cur（只缺 TP / PP 的那项也沿用）。
+func (q modelRequest) updateInput(cur llm.Model) llm.ModelInput {
+	in := q.input()
+	if q.NodesPerReplica == nil {
+		in.NodesPerReplica = cur.NodesPerReplica
+		if q.TensorParallel == nil {
+			in.TensorParallel = cur.TensorParallel
+		}
+		if q.PipelineParallel == nil {
+			in.PipelineParallel = cur.PipelineParallel
+		}
+	}
+	return in
 }
 
 func (s *Server) handleLLMModels(w http.ResponseWriter, r *http.Request) {
@@ -109,7 +137,12 @@ func (s *Server) handleLLMUpdateModel(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	m, err := s.LLM.UpdateModel(r.Context(), s.actor(r), id, req.input())
+	cur, err := s.LLM.GetModel(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	m, err := s.LLM.UpdateModel(r.Context(), s.actor(r), id, req.updateInput(cur))
 	if err != nil {
 		s.writeError(w, r, err)
 		return
