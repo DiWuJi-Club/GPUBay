@@ -22,6 +22,7 @@ type MachineFilter struct {
 	Rack      string
 	GroupID   int64 // > 0：只看该机组
 	Ungrouped bool  // 只看未分组机器（与 GroupID 互斥）
+	FabricID  int64 // > 0：只看该集群网络（计划 13）
 }
 
 var machineStates = []string{StateIdle, StateAllocated, StateMaintenance, StateFaulty}
@@ -46,6 +47,9 @@ func (s *Service) ListMachines(ctx context.Context, f MachineFilter, p paging.Pa
 	}
 	if f.Ungrouped {
 		w.Add("group_id IS NULL")
+	}
+	if f.FabricID > 0 {
+		w.Add("fabric_id = ?", f.FabricID)
 	}
 	var total int
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM machines WHERE `+w.SQL(), w.Args...).Scan(&total); err != nil {
