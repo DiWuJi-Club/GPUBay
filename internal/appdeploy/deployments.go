@@ -312,6 +312,9 @@ func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, h
 	}
 	in := BundleInput{Slug: app.Slug, InstanceID: d.InstanceID, AppRoot: appRoot, SpecHash: d.SpecHash, Spec: ver.Spec, Script: ver.Script,
 		Env: d.Env, Secret: secret, HFEndpoint: s.d.HFEndpoint, PipIndexURL: s.d.PipIndexURL, GitMirror: s.d.GitMirror, ImageEnv: imageEnv}
+	if d.ClusterDeploymentID != nil {
+		in.ClusterRole, in.ClusterDeploymentID = d.ClusterRole, *d.ClusterDeploymentID
+	}
 	if ver.Spec.SupportsWorkflows && s.d.BundleExtra != nil {
 		if in.Extra, err = s.d.BundleExtra(ctx, d, ver); err != nil {
 			var ae *apperr.Error

@@ -129,6 +129,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Deployment, er
 		if err != nil {
 			return err
 		}
+		if clusterOnly(ver.Spec) { // 计划 13 §6.1：只能 CreateCluster
+			return apperr.ErrAppClusterRequired
+		}
 		if err := s.checkImage(ctx, tx, ver, inst.ImageID); err != nil {
 			return err
 		}
@@ -216,6 +219,7 @@ func (s *Service) checkPorts(ctx context.Context, q db.Querier, instanceID strin
 // ---- 用户对已有部署的操作 ----
 
 // userOp 先锁实例（校验归属）再锁部署行（须在该实例上，否则 not_found），在同一事务里执行 fn。
+// 集群应用的成员部署（cluster_deployment_id 非空）→ app_cluster_managed（只读接口不经这里，照常可用）。
 func (s *Service) userOp(ctx context.Context, userID int64, instanceID, depID string,
 	fn func(tx pgx.Tx, inst rental.Instance, d Deployment, now time.Time) (Deployment, error)) (Deployment, error) {
 	now := s.d.Clock.Now()
@@ -231,6 +235,9 @@ func (s *Service) userOp(ctx context.Context, userID int64, instanceID, depID st
 		}
 		if d.InstanceID != inst.ID {
 			return apperr.ErrNotFound
+		}
+		if d.ClusterDeploymentID != nil { // 计划 13 §6.5：集群应用的成员部署只能在集群页整组操作
+			return apperr.ErrAppClusterManaged
 		}
 		out, err = fn(tx, inst, d, now)
 		return err
@@ -322,6 +329,9 @@ func (s *Service) Redeploy(ctx context.Context, req RedeployRequest) (Deployment
 func (s *Service) RedeployInTx(ctx context.Context, tx pgx.Tx, inst rental.Instance, d Deployment, req RedeployRequest, now time.Time) (Deployment, error) {
 	if d.InstanceID != inst.ID {
 		return Deployment{}, apperr.ErrNotFound
+	}
+	if d.ClusterDeploymentID != nil { // 集群成员部署走 RedeployCluster（整组）
+		return Deployment{}, apperr.ErrAppClusterManaged
 	}
 	actor := audit.Actor{UserID: req.UserID, IP: req.IP}
 	oldSecret, err := openSecrets(s.d.Box, d.SecretEnvEnc)

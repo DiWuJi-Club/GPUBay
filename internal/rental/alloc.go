@@ -21,22 +21,40 @@ type pickSpec struct {
 	Upper     time.Time
 	Immediate bool // 即时分支：要求 idle AND agent_online；预订分支允许 allocated 与离线
 	Exclude   []int64
+	// 计划 13：集群分配（规格 §5.1）。FabricID / ClusterNet 非空 = 只取该 fabric / 该集群网段；
+	// ClusterOnly = 只取已加入 fabric 且 cluster_ready 的机器。三者为零值时候选集与改动前完全相同。
+	FabricID    *int64
+	ClusterNet  *string
+	ClusterOnly bool
 }
 
-// pickWhereSQL：候选 = 商品匹配 ∩ 机组条件 ∩ 状态允许 ∩ 与 reserved / active 时段无重叠。
-const pickWhereSQL = `SELECT m.id FROM machines m
-	LEFT JOIN machine_groups g ON g.id = m.group_id
-	WHERE m.product_id = $1
+// pickCondSQL：候选 = 商品匹配 ∩ 机组条件 ∩ 状态允许 ∩ 与 reserved / active 时段无重叠 [∩ 集群条件]。
+// 要求 FROM 里有 machines m 与 LEFT JOIN machine_groups g（pickWhereSQL 与集群的 fabric 候选 SQL 共用）。
+// $8 / $9 / $10 是计划 13 的集群条件：为 NULL / NULL / false 时恒真，非集群分配的结果与改动前相同。
+const pickCondSQL = `m.product_id = $1
 	  AND (($2::bigint IS NULL AND (m.group_id IS NULL OR g.visible)) OR m.group_id = $2::bigint)
 	  AND ($3::bigint IS NULL OR m.id = $3::bigint)
 	  AND NOT (m.id = ANY($6::bigint[]))
 	  AND (CASE WHEN $7::boolean THEN m.state = 'idle' AND m.agent_online ELSE m.state IN ('idle', 'allocated') END)
 	  AND NOT EXISTS (SELECT 1 FROM machine_leases l
-	                  WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND l.period && tstzrange($4::timestamptz, $5::timestamptz))`
+	                  WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND l.period && tstzrange($4::timestamptz, $5::timestamptz))
+	  AND ($8::bigint IS NULL OR m.fabric_id = $8::bigint)
+	  AND ($9::text IS NULL OR m.cluster_net = $9::text)
+	  AND (NOT $10::boolean OR (m.fabric_id IS NOT NULL AND m.cluster_ready))`
 
-// pickOrderSQL：「最紧贴前一档期的机器优先」（减少碎片），再按 id。计数不需要排序，countAvailable 不带它。
+// pickArgCount 是 pickArgs 的参数个数；拼在 pickWhereSQL 之后的参数从 $<pickArgCount+1> 起编号。
+const pickArgCount = 10
+
+// pickWhereSQL：只选 m.id 的候选查询（挑机器与计数用）。
+const pickWhereSQL = `SELECT m.id FROM machines m
+	LEFT JOIN machine_groups g ON g.id = m.group_id
+	WHERE ` + pickCondSQL
+
+// pickOrderSQL：不属于 fabric 的机器优先（计划 13：单机订单给集群留整块；无 fabric 时恒为 false，与改动前一致）
+// → 「最紧贴前一档期的机器优先」（减少碎片）→ id。计数不需要排序，countAvailable 不带它。
 const pickOrderSQL = `
-	ORDER BY (SELECT max(upper(l.period)) FROM machine_leases l
+	ORDER BY (m.fabric_id IS NOT NULL),
+	         (SELECT max(upper(l.period)) FROM machine_leases l
 	          WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active', 'ended') AND upper(l.period) <= $4::timestamptz) DESC NULLS LAST,
 	         m.id`
 
@@ -45,12 +63,13 @@ func pickArgs(spec pickSpec) []any {
 	if exclude == nil {
 		exclude = []int64{}
 	}
-	return []any{spec.ProductID, spec.GroupID, spec.MachineID, spec.Lower, spec.Upper, exclude, spec.Immediate}
+	return []any{spec.ProductID, spec.GroupID, spec.MachineID, spec.Lower, spec.Upper, exclude, spec.Immediate,
+		spec.FabricID, spec.ClusterNet, spec.ClusterOnly}
 }
 
 // pickMachines 返回最多 limit 台候选机器；lock 为 true 时锁行（SKIP LOCKED：并发分配互不等待；跳过的机器可能其实空闲，分配走 pickLocked 重挑）。
 func pickMachines(ctx context.Context, q db.Querier, spec pickSpec, limit int, lock bool) ([]int64, error) {
-	sql := pickWhereSQL + pickOrderSQL + ` LIMIT $8`
+	sql := pickWhereSQL + pickOrderSQL + fmt.Sprintf(` LIMIT $%d`, pickArgCount+1)
 	if lock {
 		sql += ` FOR NO KEY UPDATE OF m SKIP LOCKED` // 不用 FOR UPDATE：与外键插入的 KEY SHARE 互斥
 	}

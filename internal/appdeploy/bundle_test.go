@@ -362,3 +362,106 @@ func TestUploadCommandReplacesWorkflows(t *testing.T) {
 		t.Fatal("workflows/ kept after a bundle without workflows")
 	}
 }
+
+// ---- 计划 13：集群保留变量 ----
+
+// clusterEnvInput 是固定的部署包输入（与计划 13 改动前生成黄金值时相同）。
+func clusterEnvInput(t *testing.T) appdeploy.BundleInput {
+	t.Helper()
+	s := goodSpec()
+	if err := appdeploy.ValidateSpec(&s); err != nil {
+		t.Fatal(err)
+	}
+	return appdeploy.BundleInput{Slug: "vllm", InstanceID: "ins-aaaaaaaa", AppRoot: "/root/data", SpecHash: "abc", Spec: s, Script: "echo hi\n",
+		Env: map[string]string{"MODEL_ID": "Qwen/Qwen3-8B"}, Secret: map[string]string{"API_KEY": "abcdefgh"},
+		HFEndpoint: "https://hf-mirror.com", PipIndexURL: "https://pypi.tuna.tsinghua.edu.cn/simple", GitMirror: "https://gh-proxy.com/"}
+}
+
+// 存量零扰动（Review Focus 6）：非集群部署的 env 与计划 13 之前逐字节相同（env 的 cksum 是 run.sh install_key 的一部分，
+// 多一行就会让存量部署在升级后重装）；不写 cluster 段的 spec 的 spec_hash 也不变。黄金值取自改动前的 ReservedEnv / SpecHash。
+func TestReservedEnvUnchangedForNonCluster(t *testing.T) {
+	const golden = "export SPARK_APP='vllm'\nexport SPARK_APP_DIR='/root/data/.spark-apps/vllm'\nexport SPARK_DATA_DIR='/root/data'\nexport SPARK_PORT='8000'\n" +
+		"export SPARK_PORT_2=''\nexport SPARK_INSTANCE_ID='ins-aaaaaaaa'\nexport SPARK_MODELS_DIR='/root/data/models'\nexport SPARK_SPEC_HASH='abc'\n" +
+		"export SPARK_TIMEOUT_S='3600'\nexport SPARK_HEALTH_PATH='/health'\nexport SPARK_MIN_FREE_GIB='0'\nexport SPARK_HEALTH_ADDR='127.0.0.1:8000'\n" +
+		"export HF_ENDPOINT='https://hf-mirror.com'\nexport MODELSCOPE_CACHE='/root/data/models/modelscope'\nexport HF_HOME='/root/data/models/hf'\n" +
+		"export PIP_INDEX_URL='https://pypi.tuna.tsinghua.edu.cn/simple'\n"
+	const goldenWorkflows = golden + "export SPARK_GIT_MIRROR='https://gh-proxy.com/'\n"
+	in := clusterEnvInput(t)
+	wantNames := []string{"SPARK_APP", "SPARK_APP_DIR", "SPARK_DATA_DIR", "SPARK_PORT", "SPARK_PORT_2", "SPARK_INSTANCE_ID", "SPARK_MODELS_DIR",
+		"SPARK_SPEC_HASH", "SPARK_TIMEOUT_S", "SPARK_HEALTH_PATH", "SPARK_MIN_FREE_GIB", "SPARK_HEALTH_ADDR", "HF_ENDPOINT", "MODELSCOPE_CACHE", "HF_HOME", "PIP_INDEX_URL"}
+	var names []string
+	for _, kv := range appdeploy.ReservedEnv(in) {
+		names = append(names, kv.Name)
+	}
+	if !slices.Equal(names, wantNames) {
+		t.Fatalf("reserved names = %v", names)
+	}
+	if got := string(appdeploy.RenderEnv(appdeploy.ReservedEnv(in), nil)); got != golden {
+		t.Fatalf("env changed for non-cluster deployment:\n%q\nwant\n%q", got, golden)
+	}
+	// 角色单独给出但没有集群部署 ID（不会发生）也不加行：只按 ClusterDeploymentID 判断
+	in.ClusterRole = "head"
+	if got := string(appdeploy.RenderEnv(appdeploy.ReservedEnv(in), nil)); got != golden {
+		t.Fatalf("role without deployment changed env: %q", got)
+	}
+	in.ClusterRole = ""
+	wf := in
+	wf.Spec.SupportsWorkflows = true
+	if got := string(appdeploy.RenderEnv(appdeploy.ReservedEnv(wf), nil)); got != goldenWorkflows {
+		t.Fatalf("env changed for workflow deployment:\n%q", got)
+	}
+	// 整个部署包里的 env 文件同样（用户变量在后）
+	b, err := appdeploy.Bundle(in, []byte("#!/bin/sh\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, files, _ := readTar(t, b)
+	if files["env"] != golden+"export MODEL_ID='Qwen/Qwen3-8B'\nexport API_KEY='abcdefgh'\n" {
+		t.Fatalf("bundle env = %q", files["env"])
+	}
+	if strings.Contains(files["spec.json"], "cluster") {
+		t.Fatalf("spec.json mentions cluster: %s", files["spec.json"])
+	}
+	// spec_hash：不写 cluster 段的 spec 与改动前相同（存量版本不会因 spec 结构变化被判为「有更新」）
+	sp := goodSpec()
+	if err := appdeploy.ValidateSpec(&sp); err != nil {
+		t.Fatal(err)
+	}
+	if h := appdeploy.SpecHash(sp, goodScript); h != "9b57c4255f77beeb846cd21a82c4878e2d00559bec31437de46acfec28cf040c" {
+		t.Fatalf("spec_hash changed: %s", h)
+	}
+	sp.SupportsWorkflows = true
+	if h := appdeploy.SpecHash(sp, goodScript); h != "c607fb6156014bae66f7f373437185ba876d111eab1a7b114f87af662e419296" {
+		t.Fatalf("workflow spec_hash changed: %s", h)
+	}
+}
+
+func TestReservedEnvClusterRole(t *testing.T) {
+	in := clusterEnvInput(t)
+	base := string(appdeploy.RenderEnv(appdeploy.ReservedEnv(in), nil))
+	for _, role := range []string{appdeploy.RoleHead, appdeploy.RoleWorker} {
+		in.ClusterRole, in.ClusterDeploymentID = role, "acd-abcdefabcdef"
+		kvs := appdeploy.ReservedEnv(in)
+		n := len(kvs)
+		if kvs[n-2] != (appdeploy.EnvKV{Name: "SPARK_CLUSTER_ROLE", Value: role}) || kvs[n-1] != (appdeploy.EnvKV{Name: "SPARK_CLUSTER_DEPLOYMENT", Value: "acd-abcdefabcdef"}) {
+			t.Fatalf("%s: tail = %v", role, kvs[n-2:])
+		}
+		got := string(appdeploy.RenderEnv(kvs, nil))
+		if got != base+"export SPARK_CLUSTER_ROLE='"+role+"'\nexport SPARK_CLUSTER_DEPLOYMENT='acd-abcdefabcdef'\n" {
+			t.Fatalf("%s env = %q", role, got)
+		}
+	}
+	// 支持工作流的集群部署：顺序 SPARK_GIT_MIRROR、SPARK_CLUSTER_ROLE、SPARK_CLUSTER_DEPLOYMENT
+	in.Spec.SupportsWorkflows = true
+	kvs := appdeploy.ReservedEnv(in)
+	n := len(kvs)
+	if kvs[n-3].Name != "SPARK_GIT_MIRROR" || kvs[n-2].Name != "SPARK_CLUSTER_ROLE" || kvs[n-1].Name != "SPARK_CLUSTER_DEPLOYMENT" {
+		t.Fatalf("order = %v", kvs[n-3:])
+	}
+	// 用户不能自己声明这两个变量（SPARK_ 前缀保留）
+	in.Spec.SupportsWorkflows = false
+	in.Env = map[string]string{"SPARK_CLUSTER_ROLE": "head"}
+	if _, err := appdeploy.Bundle(in, []byte("#!/bin/sh\n")); err == nil {
+		t.Fatal("user SPARK_CLUSTER_ROLE accepted")
+	}
+}
