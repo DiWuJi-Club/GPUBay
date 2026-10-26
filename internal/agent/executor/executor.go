@@ -9,10 +9,12 @@ import (
 	"sync"
 	"time"
 
+	"spark-cloud/internal/agent/clusternet"
 	"spark-cloud/internal/agent/disk"
 	"spark-cloud/internal/agent/netfilter"
 	"spark-cloud/internal/agent/runtime"
 	"spark-cloud/internal/agent/state"
+	"spark-cloud/internal/clusterspec"
 )
 
 const (
@@ -56,6 +58,8 @@ func commandTimeout(typ string) time.Duration {
 		return stopTimeout
 	case "wipe_instance":
 		return wipeTimeout
+	case "configure_cluster":
+		return configureClusterTimeout
 	}
 	return pullTimeout
 }
@@ -71,7 +75,7 @@ type Config struct {
 type Command struct {
 	ID             string
 	InstanceID     string
-	Type           string // create_instance / start_instance / stop_instance / wipe_instance / pull_image
+	Type           string // create_instance / start_instance / stop_instance / wipe_instance / configure_cluster / pull_image
 	ImageRef       string
 	UpstreamPubKey string
 	BandwidthMbps  int
@@ -79,6 +83,9 @@ type Command struct {
 	DataSizeGiB    int
 	HostKeyPEM     string // 平台生成的主机私钥（敏感，不落日志）；为空则本地生成
 	ShareSlots     int    // 份数：0 / 1 = 整机；N > 1 时内存、CPU、pids、数据盘按 N 等分
+	// Cluster（计划 13）：create_instance 时非 nil = 集群成员（决定 cap-drop / RDMA 设备）；
+	// configure_cluster 的目标 Spec（ClusterID 为空 = 退出集群）。
+	Cluster *clusterspec.Spec
 }
 
 type ResultMsg struct {
@@ -90,12 +97,14 @@ type ResultMsg struct {
 type InstanceState struct {
 	InstanceID string
 	Phase      string // running / stopped / missing_data / unknown
+	Cluster    string // 计划 13：""（非集群）/ "ok" / "pending"（容器未运行）/ "error: …"（≤ 200 字节）
 }
 
 type Deps struct {
 	Runtime    runtime.Runtime
 	Disk       disk.Disk
 	Net        netfilter.Netfilter
+	Cluster    clusternet.Net // 集群数据面（计划 13）；nil = 不支持集群
 	State      *state.Store
 	StateDir   string
 	Bridge     string
@@ -138,6 +147,9 @@ type Executor struct {
 	recoverPending map[string]time.Time
 	// fullIDs：实例 → 容器完整 ID（每次 Inspect 容器时刷新，洗机时删除），供 Mounts 拼 cgroup 路径，心跳不调用 docker。
 	fullIDs map[string]string
+	// clusterStatus：集群实例最近一次 Apply / Check 的结果（InstanceState.cluster），内存态；
+	// Agent 重启后为空，Report 视为 pending 直到第一次 Apply（Recover 或巡检）。
+	clusterStatus map[string]string
 
 	// 两个队列各有一个唤醒通道（容量 1），入队时按类型通知；共用一个通道时 pull 消费者会抢走实例指令的唤醒。
 	wakeInstance chan struct{}
@@ -170,7 +182,7 @@ func New(d Deps, stepped bool) *Executor {
 	}
 	return &Executor{d: d, stepped: stepped, results: make(chan ResultMsg, 256), rulesInterval: rulesInterval,
 		reportTimeout: ReportTimeout, recoverStepTimeout: RecoverStepTimeout, recoverGrace: RecoverGrace,
-		pending: map[string]bool{}, recoverPending: map[string]time.Time{}, fullIDs: map[string]string{}, unpersisted: map[string]state.Result{},
+		pending: map[string]bool{}, recoverPending: map[string]time.Time{}, fullIDs: map[string]string{}, clusterStatus: map[string]string{}, unpersisted: map[string]state.Result{},
 		wakeInstance: make(chan struct{}, 1), wakePull: make(chan struct{}, 1), rulesWake: make(chan struct{}, 1)}
 }
 
@@ -291,9 +303,12 @@ func (e *Executor) dispatch(ctx context.Context, c Command) error {
 	ctx, cancel := context.WithTimeout(ctx, commandTimeout(c.Type))
 	defer cancel()
 	// 指令接管该实例的状态：不再由恢复重试处理（在 opMu 内移除，此时没有重试在跑）。
-	e.mu.Lock()
-	delete(e.recoverPending, c.InstanceID)
-	e.mu.Unlock()
+	// configure_cluster 不启动容器，不接管。
+	if c.Type != "configure_cluster" {
+		e.mu.Lock()
+		delete(e.recoverPending, c.InstanceID)
+		e.mu.Unlock()
+	}
 	switch c.Type {
 	case "create_instance":
 		return e.create(ctx, c)
@@ -303,6 +318,8 @@ func (e *Executor) dispatch(ctx context.Context, c Command) error {
 		return e.stop(ctx, c.InstanceID)
 	case "wipe_instance":
 		return e.wipe(ctx, c.InstanceID)
+	case "configure_cluster":
+		return e.configureCluster(ctx, c)
 	}
 	return &unknownType{c.Type}
 }
@@ -351,7 +368,7 @@ func (e *Executor) Run(ctx context.Context) {
 	}
 }
 
-// refreshRules 是定时器与白名单变化共用的一轮：刷新规则 → 必要时重试 Recover → 巡检限速。
+// refreshRules 是定时器与白名单变化共用的一轮：刷新规则 → 必要时重试 Recover → 巡检限速 → 巡检集群网络。
 func (e *Executor) refreshRules(ctx context.Context) {
 	if err := e.EnsureRules(ctx); err != nil {
 		e.d.Log.Error("ensure rules", "err", err)
@@ -368,6 +385,7 @@ func (e *Executor) refreshRules(ctx context.Context) {
 	}
 	e.retryRecoverPending(ctx)
 	e.ensureLimits(ctx)
+	e.ensureClusters(ctx)
 }
 
 func (e *Executor) consume(ctx context.Context, pull bool) {

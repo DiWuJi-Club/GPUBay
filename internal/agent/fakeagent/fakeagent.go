@@ -19,12 +19,14 @@ import (
 	"time"
 
 	"spark-cloud/internal/agent/client"
+	clusternetfake "spark-cloud/internal/agent/clusternet/fake"
 	diskfake "spark-cloud/internal/agent/disk/fake"
 	"spark-cloud/internal/agent/executor"
 	"spark-cloud/internal/agent/metrics"
 	netfake "spark-cloud/internal/agent/netfilter/fake"
 	rtfake "spark-cloud/internal/agent/runtime/fake"
 	"spark-cloud/internal/agent/state"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/pki"
 )
 
@@ -49,9 +51,15 @@ type Options struct {
 	Metrics           metrics.Metrics
 	HeartbeatInterval time.Duration // 自动模式心跳间隔，零值 100ms（测试里推进假时钟后很快就能同步）
 	Images            []string      // StateReport.images（本机已缓存镜像）；nil 时不上报，同旧 Agent
-	// Features 是 Hello.features；nil → features.SharedSlots。new(uint32)（即 0）模拟不支持共享机的旧 Agent。
+	// Features 是 Hello.features；nil → features.SharedSlots | features.Cluster（本版本全部能力）。
+	// new(uint32)（即 0）模拟旧 Agent；只给 SharedSlots 模拟不支持集群的 Agent（平台不把集群分给它）。
 	Features *uint32
-	Log      *slog.Logger
+	// Net 是网卡探测结果（Hello.net / StateReport.net）；nil → 一块有线 eth0（IPv4 = IPs[0]/24，up）。
+	Net *clusterspec.NetInfo
+	// ClusterNet 是执行器的集群数据面（记录 Apply / Teardown / SyncRules，可注入失败）；nil → 新建一个。
+	// 传入的 ClusterNet 已 SetInfo 过（有网卡）且 Net 为 nil 时保留其探测结果；否则按 Net / 默认 eth0 设置。
+	ClusterNet *clusternetfake.Net
+	Log        *slog.Logger
 }
 
 type Agent struct {
@@ -60,6 +68,7 @@ type Agent struct {
 	Runtime *rtfake.Runtime
 	Disk    *diskfake.Disk
 	Net     *netfake.Netfilter
+	Cluster *clusternetfake.Net
 	Dir     string
 	tempDir bool // Dir 由 Start 创建，Stop 时删除
 	creds   *Creds
@@ -111,6 +120,15 @@ func (a *Agent) instanceMetrics() []metrics.InstanceMetrics {
 }
 
 func (a *Agent) Creds() *Creds { return a.creds }
+
+// ClusterNet 返回执行器的 fake 集群数据面（断言 Apply / Teardown / SyncRules，注入失败，改网卡探测结果）。
+func (a *Agent) ClusterNet() *clusternetfake.Net { return a.Cluster }
+
+// DefaultNetInfo 是 Options.Net 为 nil 时的探测结果：一块有线 eth0，IPv4 = ip/24（CIDR），up。
+func DefaultNetInfo(ip string) clusterspec.NetInfo {
+	return clusterspec.NetInfo{Ifaces: []clusterspec.Iface{{Name: "eth0", MAC: "02:00:00:00:00:01", Up: true, SpeedMbps: 1000, MTU: 1500,
+		IPv4: []string{ip + "/24"}, Driver: "r8169", PCI: "0000:01:00.0"}}}
+}
 
 // SetImages 设置之后的 StateReport 上报的已缓存镜像；nil 时不带 images（同旧 Agent）。
 func (a *Agent) SetImages(imgs []string) { a.Runtime.SetImages(imgs) }
@@ -180,11 +198,21 @@ func start(ctx context.Context, o Options, dir string) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &Agent{Runtime: rtfake.New(), Disk: diskfake.New(o.FreeBytes), Net: netfake.New(), Dir: dir, creds: creds, done: make(chan struct{}),
+	cn := o.ClusterNet
+	if cn == nil {
+		cn = clusternetfake.New()
+	}
+	switch {
+	case o.Net != nil:
+		cn.SetInfo(*o.Net)
+	case o.ClusterNet == nil || len(cn.Info().Ifaces) == 0:
+		cn.SetInfo(DefaultNetInfo(o.IPs[0]))
+	}
+	a := &Agent{Runtime: rtfake.New(), Disk: diskfake.New(o.FreeBytes), Net: netfake.New(), Cluster: cn, Dir: dir, creds: creds, done: make(chan struct{}),
 		instMets: map[string]metrics.InstanceMetrics{}}
 	a.Runtime.SetImages(o.Images)
 	ips := o.IPs
-	a.Exec = executor.New(executor.Deps{Runtime: a.Runtime, Disk: a.Disk, Net: a.Net, State: st, StateDir: dir, Bridge: "spark0",
+	a.Exec = executor.New(executor.Deps{Runtime: a.Runtime, Disk: a.Disk, Net: a.Net, Cluster: a.Cluster, State: st, StateDir: dir, Bridge: "spark0",
 		LocalIPs: func() []string { return ips }, MemTotal: func() uint64 { return 128 << 30 }, NumCPU: func() int { return 20 }, // DGX Spark：128 GiB、20 核
 		CgroupRoot: filepath.Join(dir, "cgroup"), Log: o.Log}, o.Stepped)
 	m := o.Metrics

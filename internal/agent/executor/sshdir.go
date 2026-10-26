@@ -18,6 +18,8 @@ import (
 // 平台经 SSH 执行的应用部署（run.sh）拿不到 CUDA_HOME / LD_LIBRARY_PATH 等，部署前读这个文件生成 image.env
 // （appdeploy.DefaultImageEnviron，计划 7 验收缺陷 A-1）。不能事后读 /proc/1/environ：sshd 的 setproctitle 会覆盖那块内存。
 // 拷贝失败不影响启动（|| true）。
+// 计划 13 集群成员：/.spark/cluster.json 存在时软链到 /etc/spark-cluster.json，并让登录 shell 经 /etc/profile.d 导入
+// /.spark/cluster.env（每行 export）；不存在（非集群 / 已退出集群）时删掉两者。失败不影响 sshd 启动。
 // sftp 用 sshd 内置实现（镜像不需要 openssh-sftp-server）；X11、Unix socket 转发关闭；TCP 转发与 agent 转发放开（网关侧另有白名单）。
 const initScript = `#!/bin/sh
 set -e
@@ -44,6 +46,13 @@ ClientAliveCountMax 3
 MaxStartups 50:30:200
 MaxSessions 32
 EOF
+if [ -f /.spark/cluster.json ]; then
+  mkdir -p /etc/profile.d || true
+  ln -sfn /.spark/cluster.json /etc/spark-cluster.json || true
+  printf '%s\n' '[ -f /.spark/cluster.env ] && . /.spark/cluster.env' > /etc/profile.d/spark-cluster.sh || true
+else
+  rm -f /etc/spark-cluster.json /etc/profile.d/spark-cluster.sh || true
+fi
 exec /usr/sbin/sshd -D -e -f /run/spark-sshd.conf
 `
 

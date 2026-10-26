@@ -20,6 +20,7 @@ import (
 	"spark-cloud/internal/agent/features"
 	"spark-cloud/internal/agent/metrics"
 	"spark-cloud/internal/agentpb"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
@@ -35,7 +36,9 @@ type gateway struct {
 	mu      sync.Mutex
 	enrolls int
 	hellos  int
-	feats   []uint32 // 每次 Hello 的 features
+	feats   []uint32               // 每次 Hello 的 features
+	hnets   []*agentpb.NetInfo     // 每次 Hello 的 net
+	states  []*agentpb.StateReport // 收到的 StateReport
 	beats   []*agentpb.Heartbeat
 	results []string
 	refuse  bool
@@ -78,6 +81,9 @@ func (g *gateway) Connect(stream agentpb.AgentGateway_ConnectServer) error {
 		case m.GetHello() != nil:
 			g.hellos++
 			g.feats = append(g.feats, m.GetHello().GetFeatures())
+			g.hnets = append(g.hnets, m.GetHello().GetNet())
+		case m.GetState() != nil:
+			g.states = append(g.states, m.GetState())
 		case m.GetHeartbeat() != nil:
 			g.beats = append(g.beats, m.GetHeartbeat())
 		case m.GetResult() != nil:
@@ -252,7 +258,7 @@ func TestFeaturesAndInstanceMetrics(t *testing.T) {
 	g.mu.Lock()
 	feats := append([]uint32(nil), g.feats...)
 	g.mu.Unlock()
-	if feats[0] != 0 || feats[1] != features.SharedSlots {
+	if feats[0] != 0 || feats[1] != features.SharedSlots|features.Cluster {
 		t.Fatalf("features = %v", feats)
 	}
 	if err := g.push(&agentpb.Command{Id: "c-create", InstanceId: "ins-aaaaaaaa", Body: &agentpb.Command_Create{Create: &agentpb.CreateInstance{
@@ -286,5 +292,70 @@ func TestFeaturesAndInstanceMetrics(t *testing.T) {
 	}
 	if len(b2) != 1 || b2[0].GetInstanceId() != "ins-aaaaaaaa" || b2[0].GetMemCurrent() != 0 {
 		t.Fatalf("second heartbeat instances = %v", b2)
+	}
+}
+
+// fake Agent 默认带集群能力与一块 eth0（IPv4 = IPs[0]/24）；Options.Net 覆盖探测结果；
+// 集群 Create 走 fake 集群数据面，StateReport 带成员网络状态。
+func TestFakeAgentReportsNetInfo(t *testing.T) {
+	g, addr := newGateway(t)
+	ctx := context.Background()
+	ag, err := fakeagent.Start(ctx, fakeagent.Options{Addr: addr, CAPEM: g.ca.CertPEM(), Token: "spk1_x", Stepped: true, IPs: []string{"10.0.0.10"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "hello", func() bool { _, h, _ := g.count(); return h == 1 })
+	g.mu.Lock()
+	hn := g.hnets[0]
+	g.mu.Unlock()
+	if hn == nil || len(hn.GetIfaces()) != 1 || hn.GetIfaces()[0].GetName() != "eth0" || !hn.GetIfaces()[0].GetUp() || hn.GetIfaces()[0].GetIpv4()[0] != "10.0.0.10/24" || hn.GetIfaces()[0].GetWireless() {
+		t.Fatalf("default hello net = %v", hn)
+	}
+	if ag.ClusterNet() == nil || ag.ClusterNet() != ag.Cluster {
+		t.Fatal("ClusterNet accessor")
+	}
+	spec := &agentpb.ClusterSpec{ClusterId: "clu-abcdefghij", Version: 1, Size: 2, Rank: 0, Mode: "routed", Iface: "eth0", Subnet: "10.210.3.0/24",
+		Members: []*agentpb.ClusterMember{{Rank: 0, InstanceId: "ins-aaaaaaaa", Ip: "10.210.3.11", HostIp: "10.0.0.10"}, {Rank: 1, InstanceId: "ins-bbbbbbbb", Ip: "10.210.3.12", HostIp: "10.0.0.11"}}}
+	if err := g.push(&agentpb.Command{Id: "c-clu", InstanceId: "ins-aaaaaaaa", Body: &agentpb.Command_Create{Create: &agentpb.CreateInstance{
+		ImageRef: "img:1", UpstreamPubkey: "ssh-ed25519 AAAA", SshPort: 2223, DataSizeGib: 8, Cluster: spec}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "create received", func() bool { return ag.Client.Received("c-clu") })
+	if _, err := ag.Client.Step(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if sp, _ := ag.Runtime.Spec("ins-aaaaaaaa"); len(sp.CapDrop) != 1 || sp.CapDrop[0] != "NET_RAW" {
+		t.Fatalf("spec = %+v", sp)
+	}
+	if ap := ag.ClusterNet().Applies(); len(ap) != 1 || ap[0].InstanceID != "ins-aaaaaaaa" {
+		t.Fatalf("applies = %+v", ap)
+	}
+	waitFor(t, "state with cluster ok", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		for _, st := range g.states {
+			if len(st.GetInstances()) == 1 && st.GetInstances()[0].GetCluster() == "ok" && st.GetNet() != nil {
+				return true
+			}
+		}
+		return false
+	})
+	creds := ag.Creds()
+	ag.Stop()
+
+	// 自定义网卡（cx7 预设之类）
+	custom := clusterspec.NetInfo{Ifaces: []clusterspec.Iface{{Name: "eth0", Up: true, IPv4: []string{"10.0.0.10/24"}},
+		{Name: "enp1s0f1np1", Up: true, Driver: "mlx5_core", RDMADevice: "rocep1s0f1", RDMAActive: true, Uverbs: "uverbs0", LinkLayer: "Ethernet"}}}
+	ag2, err := fakeagent.Start(ctx, fakeagent.Options{Addr: addr, Creds: creds, Stepped: true, Net: &custom})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag2.Stop()
+	waitFor(t, "second hello", func() bool { _, h, _ := g.count(); return h == 2 })
+	g.mu.Lock()
+	hn = g.hnets[1]
+	g.mu.Unlock()
+	if len(hn.GetIfaces()) != 2 || hn.GetIfaces()[1].GetRdmaDevice() != "rocep1s0f1" || hn.GetIfaces()[1].GetUverbs() != "uverbs0" {
+		t.Fatalf("custom hello net = %v", hn)
 	}
 }
