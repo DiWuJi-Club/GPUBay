@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,20 +75,45 @@ func TestRenderEnvQuoting(t *testing.T) {
 	s := validRouted()
 	s.ClusterID = "clu-it's"
 	got := string(RenderEnv(s, Runtime{}))
-	if !strings.Contains(got, `SPARK_CLUSTER_ID='clu-it'\''s'`+"\n") {
+	if !strings.Contains(got, `export SPARK_CLUSTER_ID='clu-it'\''s'`+"\n") {
 		t.Fatalf("quoting:\n%s", got)
 	}
 	got = string(RenderEnv(validMacvlan(), Runtime{HCA: "a'b", RDMAActive: true}))
-	if !strings.Contains(got, `NCCL_IB_HCA='a'\''b'`+"\n") {
+	if !strings.Contains(got, `export NCCL_IB_HCA='a'\''b'`+"\n") {
 		t.Fatalf("hca quoting:\n%s", got)
 	}
 	if !strings.HasSuffix(got, "\n") {
 		t.Fatal("no trailing newline")
 	}
 	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
-		k, v, ok := strings.Cut(line, "=")
+		rest, ok := strings.CutPrefix(line, "export ")
+		if !ok {
+			t.Fatalf("line without export: %q", line)
+		}
+		k, v, ok := strings.Cut(rest, "=")
 		if !ok || k == "" || !strings.HasPrefix(v, "'") || !strings.HasSuffix(v, "'") {
 			t.Fatalf("bad line %q", line)
 		}
+	}
+}
+
+// 每行都是 export：. 之后子进程（ray start、vllm serve、torchrun）读得到变量；含单引号的值原样还原。
+func TestRenderEnvSourcedExports(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	s := validMacvlan()
+	rt := Runtime{HCA: "a'b c", GIDIndex: 3, RDMAActive: true}
+	f := filepath.Join(t.TempDir(), "cluster.env")
+	if err := os.WriteFile(f, RenderEnv(s, rt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(sh, "-c", `. "$1"; sh -c 'printf "%s|%s|%s|%s" "$NCCL_SOCKET_IFNAME" "$VLLM_HOST_IP" "$NCCL_IB_HCA" "$MASTER_ADDR"'`, "sh", f).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if got := string(out); got != "spc0|10.210.0.11|a'b c|10.210.0.11" {
+		t.Fatalf("child env = %q", got)
 	}
 }

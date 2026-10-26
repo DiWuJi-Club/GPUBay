@@ -9,7 +9,7 @@ import (
 )
 
 // 容器内集群信息（规格 §3.6）：Agent 写 ssh/<id>/cluster.json 与 cluster.env（容器内 /.spark/），
-// init.sh 把前者软链到 /etc/spark-cluster.json、后者在登录 shell 里 set -a 导入。
+// init.sh 把前者软链到 /etc/spark-cluster.json、后者在登录 shell 里导入（每行 export）。
 // 两份文件都不含宿主机 IP（members[].host_ip 只给 Agent 配路由用）。
 
 const (
@@ -82,7 +82,8 @@ func RenderJSON(s Spec, rt Runtime) []byte {
 	return buf.Bytes()
 }
 
-// RenderEnv 渲染 /.spark/cluster.env：固定顺序的 KEY='value' 行，末尾换行。
+// RenderEnv 渲染 /.spark/cluster.env：固定顺序的 export KEY='value' 行，末尾换行；
+// 每行都 export，任何 `. /.spark/cluster.env` 都把变量导出给子进程（ray start、vllm serve、torchrun）。
 // 值里的单引号按 POSIX sh 惯例转义：先结束引号，写反斜杠加单引号，再重新开引号。
 func RenderEnv(s Spec, rt Runtime) []byte {
 	ips := make([]string, 0, len(s.Members))
@@ -118,6 +119,7 @@ func RenderEnv(s Spec, rt Runtime) []byte {
 	}
 	var b strings.Builder
 	for _, p := range kv {
+		b.WriteString("export ")
 		b.WriteString(p[0])
 		b.WriteString("='")
 		b.WriteString(strings.ReplaceAll(p[1], "'", `'\''`))

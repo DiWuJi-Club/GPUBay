@@ -1142,7 +1142,7 @@ func (x *ClusterMember) GetHostIp() string {
 // NetInfo / NetIface 与 internal/clusterspec.NetInfo / Iface 一一对应（规格 §3.2）。
 type NetInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	LanIface      string                 `protobuf:"bytes,1,opt,name=lan_iface,json=lanIface,proto3" json:"lan_iface,omitempty"`
+	LanIface      string                 `protobuf:"bytes,1,opt,name=lan_iface,json=lanIface,proto3" json:"lan_iface,omitempty"` // 仅供参考：持有 AgentConfig.lan_ip 的网卡；收到 AgentConfig 之前为空，平台按 machines.lan_ip 认管理网卡
 	Ifaces        []*NetIface            `protobuf:"bytes,2,rep,name=ifaces,proto3" json:"ifaces,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1199,7 +1199,7 @@ type NetIface struct {
 	Up            bool                   `protobuf:"varint,3,opt,name=up,proto3" json:"up,omitempty"`
 	SpeedMbps     int32                  `protobuf:"varint,4,opt,name=speed_mbps,json=speedMbps,proto3" json:"speed_mbps,omitempty"`
 	Mtu           uint32                 `protobuf:"varint,5,opt,name=mtu,proto3" json:"mtu,omitempty"`
-	Ipv4          []string               `protobuf:"bytes,6,rep,name=ipv4,proto3" json:"ipv4,omitempty"`
+	Ipv4          []string               `protobuf:"bytes,6,rep,name=ipv4,proto3" json:"ipv4,omitempty"` // CIDR，如 192.168.1.221/24
 	Driver        string                 `protobuf:"bytes,7,opt,name=driver,proto3" json:"driver,omitempty"`
 	Pci           string                 `protobuf:"bytes,8,opt,name=pci,proto3" json:"pci,omitempty"`
 	Wireless      bool                   `protobuf:"varint,9,opt,name=wireless,proto3" json:"wireless,omitempty"`

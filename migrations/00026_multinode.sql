@@ -36,7 +36,8 @@ ALTER TABLE machines
     ADD COLUMN net_info       JSONB,                        -- 最近一次网卡探测（clusterspec.NetInfo）
     ADD COLUMN net_info_at    TIMESTAMPTZ,
     ADD COLUMN cluster_ready  BOOLEAN NOT NULL DEFAULT false,   -- fleet 按 fabric + 网卡 + 能力位计算，分配只看它
-    ADD COLUMN cluster_rdma   BOOLEAN NOT NULL DEFAULT false;   -- 本机在该 fabric 上 RDMA 可用
+    ADD COLUMN cluster_rdma   BOOLEAN NOT NULL DEFAULT false,   -- 本机在该 fabric 上 RDMA 可用
+    ADD COLUMN cluster_net    TEXT NOT NULL DEFAULT '';         -- 集群网段：lan = 集群网卡 IPv4 前缀（如 192.168.1.0/24），cx7 = 'l2'，未就绪 = ''；分配按 (fabric_id, cluster_net) 分组
 CREATE INDEX machines_fabric_idx ON machines (fabric_id, id) WHERE fabric_id IS NOT NULL;
 
 -- 实例集群（用户集群与 Token 商城节点组共用）
@@ -149,6 +150,7 @@ ALTER TABLE instances
 DROP TABLE instance_clusters;
 DROP INDEX machines_fabric_idx;
 ALTER TABLE machines
+    DROP COLUMN cluster_net,
     DROP COLUMN cluster_rdma,
     DROP COLUMN cluster_ready,
     DROP COLUMN net_info_at,

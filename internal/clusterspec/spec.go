@@ -19,6 +19,9 @@ const (
 	MemberOffset = 11              // 成员 IP = 子网起始 + MemberOffset + rank
 	MaxSize      = 8               // 表约束上限；产品只开放 2 / 4（rental.ClusterSizes）
 	MasterPort   = 29500           // MASTER_PORT
+
+	// ErrPrefix：Agent 因集群网络失败的 create / Devices 错误消息前缀；平台据此走集群网络失败路径、不判机器故障。
+	ErrPrefix = "cluster-net: "
 )
 
 // Member 是集群的一个成员。

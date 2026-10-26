@@ -33,7 +33,8 @@ func TestInstanceClusterColumns(t *testing.T) {
 	}
 
 	if !slices.Equal(rental.ClusterSizes, []int{2, 4}) || rental.ClusterAlignSlack != 60*time.Second ||
-		rental.ConfigureClusterCommandTimeout != 2*time.Minute {
+		rental.ConfigureClusterCommandTimeout != 2*time.Minute || rental.ClusterFormTimeout != 30*time.Minute ||
+		!slices.Equal(rental.ClusterMemberStates, []string{"creating", "running", "stopped"}) {
 		t.Fatal("cluster constants")
 	}
 	for _, s := range []string{rental.ClusterActive, rental.ClusterReleased, rental.ClusterFailed, rental.ClusterForming, rental.ClusterReady, rental.ClusterDegraded} {
