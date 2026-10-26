@@ -19,6 +19,7 @@ import { mergeTimeline } from '../logic/apps'
 import { describeDuration } from '../logic/booking'
 import { autoRenewFailureText, canCancel, canRelease, canRenew, canSetAutoRenew, releaseWarning, renewQuantityMax } from '../logic/instance'
 import { copyText as copy } from '../logic/clipboard'
+import { MEMBER_GUARD_REASON, memberGuardText, type ClusterInstance } from '../logic/cluster'
 import { notifyError } from '../logic/notify'
 import { refreshBalance, session } from '../store/session'
 
@@ -26,7 +27,7 @@ const route = useRoute()
 const router = useRouter()
 const guide = useGuide()
 const id = computed(() => String(route.params.id))
-const inst = ref<Instance | null>(null)
+const inst = ref<ClusterInstance | null>(null)
 const fetchedAt = ref(0) // 拿到 inst 的本地时刻：cancellable_seconds 从这里起递减
 const loadError = ref('')
 // 运行中倒计时归零：后端此时已（或即将）停机，刷新一次显示新状态
@@ -43,7 +44,7 @@ let failing = false
 async function load() {
   const mine = ++seq
   try {
-    const next = await api.get<Instance>(`/instances/${id.value}`)
+    const next = await api.get<ClusterInstance>(`/instances/${id.value}`)
     if (mine !== seq) return // 之后又发出过查询（轮询 / 操作后刷新 / 换实例）：丢弃迟到的旧响应
     const prevState = inst.value?.state
     inst.value = next
@@ -87,6 +88,9 @@ const awaitingExpiry = () => inst.value?.state === 'running' && !inst.value.susp
 usePolling(load, 10_000, {
   enabled: () => inst.value?.state === 'reserved' || inst.value?.state === 'creating' || inst.value?.state === 'wiping' || awaitingExpiry(),
 })
+
+// ---- 计划 13：集群成员——续费 / 自动续费 / 释放只能在集群页整组操作（后端 409 cluster_member）----
+const clusterRef = computed(() => inst.value?.cluster ?? null)
 
 // ---- SSH 密码：只在点击时请求，只放内存，离开页面即丢弃 ----
 const password = ref('')
@@ -464,6 +468,13 @@ watch(id, () => {
             <el-tag :type="labelOf(instanceStateType, inst.state) as 'primary'" data-testid="detail-state">{{ labelOf(instanceStateLabel, inst.state) }}</el-tag>
           </div>
         </template>
+        <el-alert v-if="clusterRef" type="info" :closable="false" show-icon class="cluster-banner" data-testid="instance-cluster-banner" :data-cluster="clusterRef.id">
+          <template #title>
+            {{ memberGuardText(clusterRef) }}
+            <router-link :to="`/clusters/${clusterRef.id}`" data-testid="instance-cluster-link">进入集群页</router-link>
+          </template>
+          <div>{{ MEMBER_GUARD_REASON }}；SSH、端口与密码仍按本实例单独管理。</div>
+        </el-alert>
         <el-alert v-if="inst.state === 'failed'" type="error" title="开通失败，费用已原路退回余额" show-icon :closable="false" data-testid="detail-failed-hint" />
         <el-alert v-if="inst.auto_renew_failed_reason" type="error" :title="autoRenewFailureText(inst)" show-icon :closable="false" data-testid="detail-auto-renew-failed">
           <router-link v-if="inst.auto_renew_failed_reason === 'insufficient_balance'" to="/wallet/recharge">去充值</router-link>
@@ -496,10 +507,13 @@ watch(id, () => {
           </el-descriptions-item>
         </el-descriptions>
         <div class="actions">
-          <el-button v-if="canRenew(inst.state)" type="primary" data-testid="detail-renew-btn" @click="openRenew">{{ inst.state === 'reserved' ? '续费（加时）' : '续费' }}</el-button>
+          <el-button v-if="canRenew(inst.state)" type="primary" :disabled="!!clusterRef" :title="clusterRef ? MEMBER_GUARD_REASON : ''" data-testid="detail-renew-btn" @click="openRenew">{{ inst.state === 'reserved' ? '续费（加时）' : '续费' }}</el-button>
           <el-button v-if="canCancel(inst, fetchedAt, nowMs)" type="danger" plain data-testid="detail-cancel-btn" @click="openCancel">取消预订</el-button>
-          <el-button v-if="canRelease(inst.state)" type="danger" plain data-testid="detail-release-btn" @click="releaseVisible = true">释放</el-button>
+          <el-button v-if="canRelease(inst.state)" type="danger" plain :disabled="!!clusterRef" :title="clusterRef ? MEMBER_GUARD_REASON : ''" data-testid="detail-release-btn" @click="releaseVisible = true">释放</el-button>
         </div>
+        <p v-if="clusterRef && (canRenew(inst.state) || canRelease(inst.state))" class="muted small" data-testid="detail-cluster-guard">
+          续费、释放已置灰：{{ MEMBER_GUARD_REASON }}（<router-link :to="`/clusters/${clusterRef.id}`">去集群页</router-link>）
+        </p>
       </el-card>
 
       <el-card header="SSH 连接">
@@ -567,10 +581,10 @@ watch(id, () => {
 
       <el-card v-if="canSetAutoRenew(inst.state)" header="自动续费" data-testid="detail-auto-renew-card">
         <div class="row">
-          <el-switch :model-value="inst.auto_renew" :loading="togglingAutoRenew" data-testid="detail-auto-renew" @change="(v: string | number | boolean) => setAutoRenew(v === true)" />
+          <el-switch :model-value="inst.auto_renew" :loading="togglingAutoRenew" :disabled="!!clusterRef" data-testid="detail-auto-renew" @change="(v: string | number | boolean) => setAutoRenew(v === true)" />
           <el-select
             :model-value="inst.auto_renew_duration"
-            :disabled="!inst.auto_renew || togglingAutoRenew || !product"
+            :disabled="!inst.auto_renew || togglingAutoRenew || !product || !!clusterRef"
             data-testid="detail-auto-renew-duration"
             style="width: 110px"
             @change="(d: Duration) => setAutoRenew(true, d)"
@@ -578,6 +592,7 @@ watch(id, () => {
             <el-option v-for="d in autoRenewDurations" :key="d" :value="d" :label="labelOf(durationLabel, d)" />
           </el-select>
         </div>
+        <p v-if="clusterRef" class="muted small" data-testid="detail-auto-renew-cluster">集群成员的自动续费在<router-link :to="`/clusters/${clusterRef.id}`">集群页</router-link>为全部成员统一设置。</p>
         <p v-if="productError" class="warn small" data-testid="detail-auto-renew-product-error">档位价格加载失败，暂时只能开关自动续费，刷新页面后可修改档位。</p>
         <p class="muted small">到期前 1 小时自动扣款续 1 个单位；余额不足会重试到到期，被后续预订挡住时按能放下的档位办理；停机后不自动续。</p>
       </el-card>
@@ -694,4 +709,5 @@ watch(id, () => {
 .port .row { margin: 4px 0; }
 .warn { color: var(--el-color-warning); }
 .danger { color: var(--el-color-danger); }
+.cluster-banner { margin-bottom: 12px; }
 </style>
