@@ -215,7 +215,11 @@ func clusterNICs(ctx context.Context, run cmdrun.Runner, sysRoot string, out io.
 			if rdma == "" {
 				rdma = "-"
 			}
-			ok("iface %s up=%t speed=%d driver=%s rdma=%s active=%t", f.Name, f.Up, f.SpeedMbps, f.Driver, rdma, f.RDMAActive)
+			wireless := ""
+			if f.Wireless { // 无线网卡不能做 CX-7 集群网卡（lan fabric 可用但很慢），自检里直接标出来
+				wireless = " wireless=true"
+			}
+			ok("iface %s up=%t speed=%d driver=%s rdma=%s active=%t%s", f.Name, f.Up, f.SpeedMbps, f.Driver, rdma, f.RDMAActive, wireless)
 		}
 		cx7NICs(ctx, run, info, defaultDevs(string(routes)), ok, warn)
 	}
