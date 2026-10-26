@@ -78,7 +78,7 @@ func ValidateSpec(s *Spec) error {
 		s.TimeoutMinutes = DefaultTimeoutMinutes
 	}
 	if s.TimeoutMinutes < 1 || s.TimeoutMinutes > MaxTimeoutMinutes {
-		return invalid("timeout_minutes", "需在 1～180 之间")
+		return invalid("timeout_minutes", fmt.Sprintf("需在 1～%d 之间", MaxTimeoutMinutes))
 	}
 	if s.MinDataFreeGiB < 0 || s.MinDataFreeGiB > 2048 {
 		return invalid("min_data_free_gib", "需在 0～2048 之间")
@@ -107,6 +107,14 @@ func ValidateSpec(s *Spec) error {
 		}
 		if !validPath(l.Path) {
 			return invalid(fmt.Sprintf("links[%d].path", i), "必须以 / 开头、不含空白，最多 128 个字符")
+		}
+	}
+	if c := s.Cluster; c != nil {
+		if c.Mode != ClusterModeOptional && c.Mode != ClusterModeRequired {
+			return invalid("cluster.mode", "须为 optional 或 required")
+		}
+		if c.MinSize < 2 || c.MinSize > c.MaxSize || c.MaxSize > ClusterMaxSize {
+			return invalid("cluster.min_size", fmt.Sprintf("需满足 2 ≤ min_size ≤ max_size ≤ %d", ClusterMaxSize))
 		}
 	}
 	return nil

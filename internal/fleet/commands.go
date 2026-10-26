@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
 )
@@ -22,6 +23,8 @@ const (
 	CmdStopInstance   CommandType = "stop_instance"
 	CmdWipeInstance   CommandType = "wipe_instance"
 	CmdPullImage      CommandType = "pull_image" // 镜像预拉取，instance_id 为空
+	// CmdConfigureCluster 计划 13：成员变更后向集群成员推送新的 ClusterSpec（载荷 ConfigureClusterPayload）。
+	CmdConfigureCluster CommandType = "configure_cluster"
 )
 
 type PullImagePayload struct {
@@ -34,6 +37,13 @@ type CreateInstancePayload struct {
 	SSHPort int `json:"ssh_port,omitempty"`
 	// ShareSlots 为商品份数；0 / 1 = 整机。
 	ShareSlots int `json:"share_slots,omitempty"`
+	// Cluster 计划 13：非空 = 集群成员（agentgw 转 proto 的 CreateInstance.cluster）。
+	Cluster *clusterspec.Spec `json:"cluster,omitempty"`
+}
+
+// ConfigureClusterPayload 是 configure_cluster 指令的载荷；Cluster.ClusterID 为空 = 退出集群。
+type ConfigureClusterPayload struct {
+	Cluster clusterspec.Spec `json:"cluster"`
 }
 
 type Command struct {

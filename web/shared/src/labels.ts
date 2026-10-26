@@ -40,6 +40,7 @@ export const alertKindLabel: LabelMap = {
   app_deploy_unreachable: '应用部署无法连接容器',
   butler_llm_unavailable: 'AI 管家模型不可用',
   llm_pool_short: 'Token 服务池机器不足', llm_node_unhealthy: '模型节点健康检查失败', llm_node_failed: '模型节点多次重建失败', llm_usage_record_failed: 'Token 用量记账失败',
+  cluster_failed: '集群开通失败', cluster_rdma_degraded: '集群 RDMA 不可用', cluster_net_error: '集群网络异常',
 }
 export const roleLabel: LabelMap = { super: '超级管理员', ops: '运维', finance: '财务' }
 export const adminStatusLabel: LabelMap = { active: '正常', disabled: '已停用' }
@@ -50,6 +51,7 @@ export const kycResultLabel: LabelMap = { pending: '审核中', verified: '已�
 export const durationLabel: LabelMap = { '1d': '1 天', '1w': '1 周', '1m': '1 月' }
 export const commandTypeLabel: LabelMap = {
   create_instance: '开通实例', start_instance: '启动实例', stop_instance: '停止实例', wipe_instance: '洗机', pull_image: '预拉取镜像',
+  configure_cluster: '配置集群网络',
 }
 export const portVisibilityLabel: LabelMap = { private: '私有', public: '公开' }
 export const commandStatusLabel: LabelMap = { pending: '待执行', sent: '已下发', done: '已完成', failed: '失败' }
@@ -81,6 +83,8 @@ export const auditActions: readonly string[] = [
   'workflow.create', 'workflow.update', 'workflow.delete', 'workflow.version.create', 'workflow.version.update', 'workflow.version.publish',
   'instance.workflow_add', 'instance.workflow_update', 'instance.workflow_remove',
   'butler.tool_execute', 'butler.settings',
+  'fabric.create', 'fabric.update', 'fabric.delete', 'cluster.extend', 'cluster.resync',
+  'cluster.release', 'cluster.auto_renew', 'cluster.app_deploy', 'cluster.app_redeploy', 'cluster.app_stop', 'cluster.app_start', 'cluster.app_remove',
 ]
 
 export const deploymentStateLabel: LabelMap = {
@@ -155,3 +159,18 @@ export const butlerToolLabel: LabelMap = {
   place_order: '租用实例', renew_instance: '续费实例', release_instance: '释放实例', cancel_booking: '取消预订',
   deploy_app: '部署应用', redeploy_app: '重新部署应用', set_app_state: '停止 / 启动应用', remove_app: '卸载应用',
 }
+
+// 计划 13：多机集群
+export const clusterStatusLabel: LabelMap = { forming: '组建中', ready: '就绪', degraded: '降级', released: '已释放', failed: '开通失败' }
+/** el-tag 的 type：组建中蓝、就绪绿、降级橙、已释放灰、开通失败红。 */
+export const clusterStatusType: LabelMap = { forming: 'primary', ready: 'success', degraded: 'warning', released: 'info', failed: 'danger' }
+export const clusterNetworkLabel: LabelMap = { rdma: 'RDMA 高速互联', ethernet: '普通网络', rdma_degraded: 'RDMA 不可用' }
+export const fabricKindLabel: LabelMap = { lan: '普通以太网', cx7: 'ConnectX-7' }
+export const fabricIsolationLabel: LabelMap = { routed: '三层路由', direct: '直连', vlan: 'VLAN 隔离' }
+export const clusterAppStatusLabel: LabelMap = {
+  installing: '部署中', running: '运行中', failed: '失败', stopped: '已停止', stale: '需要重新部署', removing: '卸载中', removed: '已卸载',
+}
+export const clusterAppStatusType: LabelMap = {
+  installing: 'primary', running: 'success', failed: 'danger', stopped: 'info', stale: 'warning', removing: 'warning', removed: 'info',
+}
+export const clusterRoleLabel: LabelMap = { head: '主节点', worker: '工作节点' }

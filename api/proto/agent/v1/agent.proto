@@ -42,6 +42,8 @@ message Hello {
   repeated string ips = 3;    // 本机全部 IPv4 地址
   // 能力位图（internal/agent/features）：bit0 = 支持 CreateInstance.share_slots。计划 10 新增，旧 Agent 为 0；平台目前不读取（共享机已搁置）。
   uint32 features = 4;
+  // 网卡探测（计划 13）：建流时一次，此后随每份 StateReport；旧 Agent 不发。
+  NetInfo net = 5;
 }
 
 message AgentConfig {
@@ -62,6 +64,7 @@ message Command {
     StopInstance stop = 12;
     WipeInstance wipe = 13;
     PullImage pull = 14;
+    ConfigureCluster configure_cluster = 15;   // 计划 13：成员变更后推给集群全部成员
   }
 }
 
@@ -76,11 +79,58 @@ message CreateInstance {
   string host_key_pem = 6;
   // 份数：0 / 1 = 整机；2 / 4 = 按份等分内存、CPU、数据盘（Agent 侧计算）。计划 10 新增，旧 Agent 忽略。
   uint32 share_slots = 7;
+  // 计划 13：非空 = 集群成员（create 时决定 RDMA 设备与 cap-drop NET_RAW）。旧 Agent 会静默忽略，平台按 features bit1 门控。
+  ClusterSpec cluster = 8;
 }
 message StartInstance {}
 message StopInstance {}
 message WipeInstance {}
 message PullImage { string image_ref = 1; }
+
+// ConfigureCluster：按 version 取新（小于本地 version 的忽略）；cluster.cluster_id 为空 = 退出集群（清理网络与文件）。
+message ConfigureCluster { ClusterSpec cluster = 1; }
+
+// ClusterSpec 与 internal/clusterspec.Spec 一一对应（规格 §4.1）。
+message ClusterSpec {
+  string cluster_id = 1;
+  uint32 version = 2;
+  uint32 size = 3;
+  uint32 rank = 4;
+  string mode = 5;          // routed / macvlan
+  string iface = 6;         // 宿主机集群网卡（routed 出口 / macvlan 父接口）
+  uint32 vlan = 7;          // 0 = 不打标签
+  uint32 mtu = 8;           // 0 = 继承
+  string subnet = 9;        // 10.210.C.0/24
+  bool rdma = 10;
+  repeated ClusterMember members = 11;   // 含自己，按 rank
+}
+message ClusterMember {
+  uint32 rank = 1;
+  string instance_id = 2;
+  string ip = 3;
+  string host_ip = 4;       // 只在 routed 有
+}
+
+// NetInfo / NetIface 与 internal/clusterspec.NetInfo / Iface 一一对应（规格 §3.2）。
+message NetInfo {
+  string lan_iface = 1;
+  repeated NetIface ifaces = 2;
+}
+message NetIface {
+  string name = 1;
+  string mac = 2;
+  bool up = 3;
+  int32 speed_mbps = 4;
+  uint32 mtu = 5;
+  repeated string ipv4 = 6;
+  string driver = 7;
+  string pci = 8;
+  bool wireless = 9;
+  string rdma_device = 10;
+  bool rdma_active = 11;
+  string uverbs = 12;
+  string link_layer = 13;
+}
 
 message CommandResult {
   string command_id = 1;
@@ -92,11 +142,14 @@ message StateReport {
   repeated InstanceState instances = 1;
   // 已缓存镜像的 repository:tag 列表（docker image ls，≤ 200 项）；计划 7 新增，旧 Agent 不发该字段，平台不覆盖已有记录。
   repeated string images = 2;
+  // 网卡探测（计划 13，链路变化可见）；旧 Agent 不发，平台不覆盖已有记录。
+  NetInfo net = 3;
 }
 
 message InstanceState {
   string instance_id = 1;
   string phase = 2;   // running / stopped / missing_data / unknown
+  string cluster = 3; // 计划 13：集群网络状态 "" 非集群 / "ok" / "pending"（容器未运行）/ "error: <原因>"
 }
 
 message Heartbeat {
