@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  centsToYuanInput, commandStatusLabel, commandTypeLabel, deploymentErrorText, deploymentStateLabel, deploymentStateType, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
+  centsToYuanInput, clusterNetworkLabel, clusterStatusLabel, clusterStatusType, commandStatusLabel, commandTypeLabel, deploymentErrorText, deploymentStateLabel, deploymentStateType, durationLabel, fmtDuration, fmtTime, fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf,
   orderKindLabel, orderStatusLabel, type AdminDeployment, type AdminImage, type AdminInstance, type AdminInstanceDetail, type AdminProduct, type AdminSshSession, type InstancePort, type Listed, type Paged, type RefundQuote,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
@@ -12,6 +12,7 @@ import BookingOpsDialogs from '../components/BookingOpsDialogs.vue'
 import ForceRemoveDialog from '../components/ForceRemoveDialog.vue'
 import IdLink from '../components/IdLink.vue'
 import { useBookingOps } from '../composables/useBookingOps'
+import { MEMBER_EXTEND_HINT, MIGRATE_MEMBER_HINT, netStatusBad, netStatusText, type InstanceClusterBlock } from '../logic/clusters'
 import { progressText, showForceRemove } from '../logic/deployments'
 import { extendSeconds, isZeroRefund, showCancelBooking, showExtend, showMigrate, showPortActions, showReassign, showRefund, showRewipe, validateExtend, validateRefund } from '../logic/instanceOps'
 import { notifyError } from '../logic/notify'
@@ -20,7 +21,8 @@ import { session } from '../store/session'
 
 const route = useRoute()
 const id = computed(() => String(route.params.id))
-const data = ref<AdminInstanceDetail | null>(null)
+/** 计划 13：cluster = 所属集群视图 + 本实例 rank（非成员 null） */
+const data = ref<(AdminInstanceDetail & { cluster?: InstanceClusterBlock | null }) | null>(null)
 const loading = ref(false)
 const error = ref('')
 const images = ref<AdminImage[]>([])
@@ -31,6 +33,8 @@ const imageName = computed(() => images.value.find((i) => i.id === inst.value?.i
 const productName = computed(() => products.value.find((p) => p.id === inst.value?.product_id)?.name ?? inst.value?.product_id)
 const isFinance = computed(() => role.value === 'finance')
 const canSeeOrders = computed(() => FIN_ROLES.includes(role.value))
+/** 计划 13：集群成员（延长在集群页统一做；换机只能换到同一集群网络） */
+const cluster = computed(() => data.value?.cluster ?? null)
 
 let seq = 0
 /**
@@ -41,7 +45,7 @@ async function load(target = id.value) {
   const mine = ++seq
   loading.value = true
   try {
-    const d = await api.get<AdminInstanceDetail>(`/instances/${target}`)
+    const d = await api.get<AdminInstanceDetail & { cluster?: InstanceClusterBlock | null }>(`/instances/${target}`)
     if (mine !== seq) return
     data.value = d
     error.value = ''
@@ -277,13 +281,44 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
           <el-descriptions-item label="自动续费"><span data-testid="adetail-auto-renew">{{ inst.auto_renew ? `开启（${labelOf(durationLabel, inst.auto_renew_duration)}）` : '关闭' }}{{ inst.auto_renew_failed_reason ? ` · 最近失败：${inst.auto_renew_failed_reason}` : '' }}</span></el-descriptions-item>
         </el-descriptions>
         <div class="actions">
-          <el-button v-if="showExtend(role, inst.state, inst.system)" data-testid="adetail-extend-btn" @click="openExtend">免费延长</el-button>
+          <el-button v-if="showExtend(role, inst.state, inst.system) && !cluster" data-testid="adetail-extend-btn" @click="openExtend">免费延长</el-button>
+          <el-tooltip v-else-if="showExtend(role, inst.state, inst.system) && cluster" :content="MEMBER_EXTEND_HINT" placement="top">
+            <el-button data-testid="adetail-extend-cluster-btn" @click="$router.push(`/clusters/${cluster.id}`)">免费延长（到集群页）</el-button>
+          </el-tooltip>
           <el-button v-if="showMigrate(role, inst.state, inst.system)" data-testid="adetail-migrate-btn" @click="openMigrate">换机</el-button>
           <el-button v-if="showRewipe(role, inst.state)" data-testid="adetail-rewipe-btn" @click="rewipe.visible = true">重新洗机</el-button>
           <el-button v-if="showRefund(role, inst.state, inst.system)" type="danger" plain :loading="refund.quoting" data-testid="adetail-refund-btn" @click="openRefund">退款并释放</el-button>
           <el-button v-if="showReassign(role, inst.state, inst.system)" data-testid="adetail-reassign-btn" @click="openReassign">改派</el-button>
           <el-button v-if="showCancelBooking(role, inst.state, inst.system)" type="danger" plain data-testid="adetail-cancel-booking-btn" @click="openCancelBooking">取消预订</el-button>
         </div>
+      </el-card>
+
+      <!-- 计划 13：集群成员 -->
+      <el-card v-if="cluster" data-testid="instance-cluster-block">
+        <template #header>
+          <div class="head">
+            <span>属于集群 <router-link :to="`/clusters/${cluster.id}`" class="mono" data-testid="instance-cluster-link">{{ cluster.id }}</router-link>
+              <span data-testid="instance-cluster-rank">（rank {{ cluster.rank }} / {{ cluster.size }} 台{{ cluster.rank === 0 ? '，head' : '' }}）</span></span>
+            <span>
+              <el-tag size="small" :type="labelOf(clusterStatusType, cluster.status) as 'primary'" data-testid="instance-cluster-status">{{ labelOf(clusterStatusLabel, cluster.status) }}</el-tag>
+              <span class="muted tag-gap">{{ labelOf(clusterNetworkLabel, cluster.network) }} · {{ cluster.fabric_name }} · {{ cluster.subnet }}</span>
+            </span>
+          </div>
+        </template>
+        <p class="muted" data-testid="instance-cluster-hint">{{ cluster.system ? '平台节点组的成员由 Token 商城管理。' : '集群成员的续费、自动续费、释放与延长在集群页统一操作；' }}{{ cluster.system ? '' : MIGRATE_MEMBER_HINT }}</p>
+        <table class="grid">
+          <thead><tr><th>rank</th><th>实例</th><th>机器</th><th>集群 IP</th><th>状态</th><th>网络状态</th></tr></thead>
+          <tbody>
+            <tr v-for="m in cluster.members" :key="m.rank" data-testid="instance-cluster-member" :data-rank="m.rank" :class="{ self: m.instance_id === inst.id }">
+              <td>{{ m.rank }}</td>
+              <td><IdLink kind="instance" :id="m.instance_id" /></td>
+              <td>{{ m.machine_label }}（<IdLink kind="machine" :id="m.machine_id" :disabled="isFinance" />）</td>
+              <td class="mono">{{ m.ip }}</td>
+              <td>{{ labelOf(instanceStateLabel, m.state) }}</td>
+              <td :class="{ error: netStatusBad(m.net_status) }">{{ netStatusText(m.net_status) }}</td>
+            </tr>
+          </tbody>
+        </table>
       </el-card>
 
       <div class="two">
@@ -426,6 +461,7 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
 
       <el-dialog v-model="migrate.visible" title="换机" width="460" align-center data-testid="migrate-dialog">
         <p>将在另一台空闲机器上用相同镜像重建实例，剩余时长转移；原实例进入洗机。</p>
+        <p v-if="cluster" class="warn" data-testid="migrate-cluster-hint">集群成员：{{ MIGRATE_MEMBER_HINT }}</p>
         <el-form label-position="top" @submit.prevent="submitMigrate">
           <el-form-item label="原因（必填）"><el-input v-model="migrate.reason" data-testid="migrate-reason" /></el-form-item>
           <el-button type="primary" native-type="submit" :loading="migrate.busy" data-testid="migrate-submit">确定换机</el-button>
@@ -474,4 +510,6 @@ const eventText = (e: { from_state: string; to_state: string; reason: string; at
 .grid th { color: #909399; font-weight: 500; }
 .empty { text-align: center; }
 .tag-gap { margin-left: 8px; }
+.warn { color: var(--el-color-warning); font-size: 13px; }
+.self td { background: var(--el-color-primary-light-9); }
 </style>

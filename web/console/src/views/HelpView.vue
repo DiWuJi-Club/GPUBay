@@ -86,6 +86,20 @@ const llmErrors = Object.keys(llmErrorHelp)
       </ul>
     </el-card>
     <el-card>
+      <h2 id="cluster" data-testid="help-cluster">多机集群</h2>
+      <ul>
+        <li>下单时「租用方式」选「集群 2 台」或「集群 4 台」：几台机器组成一个集群，成员之间走专用的集群网络互通，适合多机训练、多机推理（如把大模型按张量并行切到多台上）。集群只能立即开通，暂不支持预订、指定机器与下单预装应用。</li>
+        <li>网络类型：<b>同一高速网络（RDMA）</b>走 ConnectX-7 直连 / 交换机，NCCL 自动用 RDMA；<b>普通网络</b>走以太网（性能有限）；集群页显示「RDMA 不可用」时表示已自动退回以太网（<code>NCCL_IB_DISABLE=1</code>）。</li>
+        <li>每个成员在容器里多一块网卡 <code>spc0</code>，有自己的<b>集群 IP</b>（如 <code>10.210.7.11</code>，rank 0 为 head）；集群页「成员」表列出各成员的集群 IP 与网络状态。</li>
+        <li>环境变量在 <code>/.spark/cluster.env</code>（每行都是 <code>export</code>，登录 shell 自动加载）：<code>SPARK_CLUSTER_RANK / SIZE / IP / HEAD_IP / IPS</code>、<code>MASTER_ADDR</code>、<code>MASTER_PORT=29500</code>、<code>NNODES</code>、<code>NODE_RANK</code>、<code>NCCL_SOCKET_IFNAME=spc0</code> 等；完整拓扑在 <code>/etc/spark-cluster.json</code>。用 <code>ssh 实例 命令</code>、脚本、cron 等非登录会话运行时，请先执行 <code>. /.spark/cluster.env</code>。</li>
+        <li>示例：<code>torchrun --nnodes $NNODES --node-rank $NODE_RANK --master-addr $MASTER_ADDR --master-port 29500 train.py</code>（每台各执行一次）；Ray 的 head 用 <code>ray start --head --node-ip-address=$SPARK_CLUSTER_IP --port=6379</code>，worker 用 <code>ray start --address=$SPARK_CLUSTER_HEAD_IP:6379 --node-ip-address=$SPARK_CLUSTER_IP</code>，运行 driver 前先 <code>export RAY_ADDRESS=$SPARK_CLUSTER_HEAD_IP:6379</code>。集群页「连接信息」有可复制的完整示例。</li>
+        <li>成员之间<b>没有</b>预配的 SSH 互信；每个成员照常有自己的 SSH、密码与 Web 访问端口，需要互相 SSH 时请自行把公钥放进各成员。</li>
+        <li>集群应用：在集群页「集群应用」里部署（如「vLLM 集群」），平台在每台成员上各装一份，rank 0 为主节点（head，对外提供接口），其余为工作节点；张量并行（TP）默认等于台数。部署后成员实例的应用列表里只读显示，重新部署、停止、卸载在集群页操作；成员更换机器后显示「需要重新部署」。</li>
+        <li>计费与到期：价格 = 单价 × 台数，按台分别下单；全部成员开通后到期时间对齐到最晚的一台。续费、自动续费、释放都在集群页对全部成员统一操作（成员实例页这些按钮置灰）；续费为每台加同样的时长。</li>
+        <li>故障：开通后 30 分钟内未组建成功（任一成员开通失败、集群网络不通）会整组中止并全额退款；运行中有成员停机、维护暂停、换机或网络异常时集群显示「降级」，分布式任务可能中断，恢复后需要重新启动任务；成员机器维护暂停计时导致的到期差不会补齐，集群页会提示「成员到期时间不一致」。</li>
+      </ul>
+    </el-card>
+    <el-card>
       <h2 id="auto-renew" data-testid="help-auto-renew">自动续费</h2>
       <ul>
         <li>到期前 1 小时自动扣款续 1 个单位；余额不足会每分钟重试到到期，首次失败发短信提醒。</li>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  labelOf, llmNodeStateLabel, llmNodeStateType, machineStateLabel, messageOf,
+  deploymentStateLabel, fabricKindLabel, instanceStateLabel, labelOf, llmNodeStateLabel, llmNodeStateType, machineStateLabel, messageOf,
   type LLMModelAdmin, type LLMNode, type LLMNodeState, type LLMPool, type LLMPoolMachine, type Listed,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
@@ -8,7 +8,7 @@ import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api'
 import { deploymentHealthLabel, firstOf } from '../../logic/deployments'
-import { canDrainNode, canRebuildNode, canRemoveNode, NODES_REFRESH_MS, nodeDeployText, poolLeaseText, validateNodeRemoveReason } from '../../logic/llm'
+import { canDrainNode, canRebuildNode, canRemoveNode, NODES_REFRESH_MS, nodeDeployText, nodeSizeBadge, poolFabricGroupsText, poolLeaseText, validateNodeRemoveReason } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'
 import { OPS_ROLES } from '../../menu'
 import { hasRole } from '../../store/session'
@@ -156,10 +156,13 @@ function openOp(kind: NodeOp, n: LLMNode) {
 const opText = computed(() => {
   const n = op.node
   if (!n) return ''
+  return ((n.size ?? 1) > 1 ? `组节点：操作作用于整组 ${n.size} 台机器（集群部署与系统集群一起处理）。` : '') + opBaseText(n)
+})
+function opBaseText(n: LLMNode): string {
   if (op.kind === 'drain') return '节点不再接新请求，在途请求完成（最多 60 秒）后释放机器；模型缺额时平台会在其它空闲机器上补建节点。'
   if (op.kind === 'rebuild') return n.state === 'failed' ? '将在同一台机器上新建一个节点（机器仍可用时）。' : '将用当前模型参数重新部署该节点，期间节点不接请求。'
   return '立即释放机器（不等在途请求），节点进入移除。需要填写原因并验证动态码。'
-})
+}
 async function submitOp() {
   const n = op.node
   if (!n || op.busy) return // 同步守卫：连点只发一次
@@ -183,6 +186,17 @@ async function submitOp() {
 }
 
 const nodeStateTag = (s: string) => labelOf(llmNodeStateType, s) as 'primary'
+// ---- 计划 13：组节点成员展开 ----
+const expanded = ref<Set<string>>(new Set())
+function toggleMembers(id: string) {
+  const s = new Set(expanded.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  expanded.value = s
+}
+const isGroup = (n: LLMNode) => (n.size ?? 1) > 1
+const memberDeployText = (d: { state: string; progress: number } | null) =>
+  !d ? '—' : d.state === 'installing' ? `${labelOf(deploymentStateLabel, d.state)} ${d.progress}%` : labelOf(deploymentStateLabel, d.state)
 const healthText = (n: LLMNode) => (n.deployment ? labelOf(deploymentHealthLabel, n.deployment.health) : '—')
 </script>
 
@@ -201,17 +215,31 @@ const healthText = (n: LLMNode) => (n.deployment ? labelOf(deploymentHealthLabel
     </div>
     <p class="hint">加入池的机器不再对外出租；移出前请先下线机器上的节点。自动每 10 秒刷新。</p>
     <el-alert v-if="st.poolError" type="error" :title="st.poolError" show-icon :closable="false" data-testid="llm-pool-error" />
+    <!-- 计划 13：按集群网络汇总（多机副本只在同一集群网络、同一网段内组队） -->
+    <table v-if="pool?.fabrics?.length" class="grid" data-testid="llm-pool-fabrics">
+      <thead><tr><th>集群网络</th><th>类型</th><th>RDMA</th><th>空闲 / 池内</th><th>可组副本（空闲且集群就绪）</th></tr></thead>
+      <tbody>
+        <tr v-for="f in pool.fabrics" :key="f.fabric_id" data-testid="llm-pool-fabric" :data-id="f.fabric_id">
+          <td>{{ f.name }}</td>
+          <td>{{ labelOf(fabricKindLabel, f.kind) }}</td>
+          <td>{{ f.rdma ? '是' : '否' }}</td>
+          <td data-testid="llm-pool-fabric-free">{{ f.free }} / {{ f.total }}</td>
+          <td data-testid="llm-pool-fabric-groups">{{ poolFabricGroupsText(f) }}</td>
+        </tr>
+      </tbody>
+    </table>
     <table class="grid" data-testid="llm-pool-table">
-      <thead><tr><th>机器展示名</th><th>序列号</th><th>状态</th><th>在线</th><th>节点</th><th>租约到期</th><th v-if="canOperate">操作</th></tr></thead>
+      <thead><tr><th>机器展示名</th><th>序列号</th><th>状态</th><th>在线</th><th>集群网络</th><th>节点</th><th>租约到期</th><th v-if="canOperate">操作</th></tr></thead>
       <tbody>
         <tr v-for="m in pool?.machines ?? []" :key="m.machine.id" data-testid="llm-pool-row" :data-id="m.machine.id">
           <td><router-link :to="`/machines/${m.machine.id}`" data-testid="llm-pool-name">{{ machineName(m.machine) }}</router-link></td>
           <td class="mono" data-testid="llm-pool-serial">{{ m.machine.serial }}</td>
           <td data-testid="llm-pool-state">{{ labelOf(machineStateLabel, m.machine.state) }}</td>
           <td data-testid="llm-pool-online"><span :class="{ bad: !m.machine.agent_online }">{{ m.machine.agent_online ? '在线' : '离线' }}</span></td>
+          <td data-testid="llm-pool-fabric-name">{{ m.fabric_name || '—' }}</td>
           <td data-testid="llm-pool-node">
             <el-button v-if="m.node" link type="primary" data-testid="llm-pool-node-open" @click="openNode(m.node.id)">
-              {{ m.node.model_slug }}<el-tag size="small" :type="nodeStateTag(m.node.state)" class="gap">{{ labelOf(llmNodeStateLabel, m.node.state) }}</el-tag>
+              {{ m.node.model_slug }}<template v-if="(m.node.size ?? 1) > 1"> · rank {{ m.node.rank ?? 0 }} / {{ m.node.size }}</template><el-tag size="small" :type="nodeStateTag(m.node.state)" class="gap">{{ labelOf(llmNodeStateLabel, m.node.state) }}</el-tag>
             </el-button>
             <span v-else class="muted">—</span>
           </td>
@@ -223,7 +251,7 @@ const healthText = (n: LLMNode) => (n.deployment ? labelOf(deploymentHealthLabel
             </el-tooltip>
           </td>
         </tr>
-        <tr v-if="pool && !pool.machines.length"><td :colspan="canOperate ? 7 : 6" class="muted empty" data-testid="llm-pool-empty">池里还没有机器，点「加入机器」</td></tr>
+        <tr v-if="pool && !pool.machines.length"><td :colspan="canOperate ? 8 : 7" class="muted empty" data-testid="llm-pool-empty">池里还没有机器，点「加入机器」</td></tr>
       </tbody>
     </table>
 
@@ -247,9 +275,16 @@ const healthText = (n: LLMNode) => (n.deployment ? labelOf(deploymentHealthLabel
     <table class="grid" data-testid="llm-nodes-table">
       <thead><tr><th>模型</th><th>机器</th><th>状态</th><th>健康</th><th>在途</th><th>部署进度</th><th>最近错误</th><th>重建次数</th><th>操作</th></tr></thead>
       <tbody>
-        <tr v-for="n in nodes" :key="n.id" data-testid="llm-node-row" :data-id="n.id" :data-state="n.state">
-          <td><el-button link type="primary" data-testid="llm-node-open" @click="openNode(n.id)">{{ n.model_slug }}</el-button></td>
-          <td data-testid="llm-node-row-machine">{{ n.machine_name }}（<IdLink kind="machine" :id="n.machine_id" />）</td>
+        <template v-for="n in nodes" :key="n.id">
+        <tr data-testid="llm-node-row" :data-id="n.id" :data-state="n.state" :data-size="n.size ?? 1">
+          <td>
+            <el-button link type="primary" data-testid="llm-node-open" @click="openNode(n.id)">{{ n.model_slug }}</el-button>
+            <el-tag v-if="isGroup(n)" size="small" type="warning" class="gap" data-testid="llm-node-size">{{ nodeSizeBadge(n) }}</el-tag>
+          </td>
+          <td data-testid="llm-node-row-machine">
+            {{ n.machine_name }}（<IdLink kind="machine" :id="n.machine_id" />）
+            <el-button v-if="isGroup(n)" link size="small" class="gap" data-testid="llm-node-members-toggle" @click="toggleMembers(n.id)">{{ expanded.has(n.id) ? '收起成员' : `成员 ${n.members?.length ?? 0}` }}</el-button>
+          </td>
           <td><el-tag size="small" :type="nodeStateTag(n.state)" data-testid="llm-node-row-state">{{ labelOf(llmNodeStateLabel, n.state) }}</el-tag></td>
           <td data-testid="llm-node-row-health">{{ healthText(n) }}<span v-if="n.probe_fail_count > 0" class="bad">（探测失败 {{ n.probe_fail_count }}）</span></td>
           <td data-testid="llm-node-row-inflight">{{ n.inflight }}</td>
@@ -264,6 +299,24 @@ const healthText = (n: LLMNode) => (n.deployment ? labelOf(deploymentHealthLabel
             </template>
           </td>
         </tr>
+        <tr v-if="isGroup(n) && expanded.has(n.id)" class="members-row">
+          <td colspan="9">
+            <table class="grid sub" data-testid="llm-node-members">
+              <thead><tr><th>rank</th><th>机器</th><th>实例</th><th>实例状态</th><th>成员部署</th></tr></thead>
+              <tbody>
+                <tr v-for="mb in n.members ?? []" :key="mb.rank" data-testid="llm-node-member" :data-rank="mb.rank">
+                  <td>{{ mb.rank }}{{ mb.rank === 0 ? '（head）' : '' }}</td>
+                  <td>{{ mb.machine_name }}（<IdLink kind="machine" :id="mb.machine_id" />）</td>
+                  <td><IdLink kind="instance" :id="mb.instance_id" /></td>
+                  <td>{{ labelOf(instanceStateLabel, mb.instance_state) }}<span v-if="mb.suspended" class="muted">（暂停计时）</span></td>
+                  <td>{{ memberDeployText(mb.deployment) }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <router-link v-if="n.cluster_id" :to="`/clusters/${n.cluster_id}`" class="sub-link" data-testid="llm-node-row-cluster">集群 {{ n.cluster_id }}</router-link>
+          </td>
+        </tr>
+        </template>
         <tr v-if="!nodes.length && !st.nodesError"><td colspan="9" class="muted empty" data-testid="llm-nodes-empty">没有节点</td></tr>
       </tbody>
     </table>
@@ -311,5 +364,8 @@ h4 { margin: 0; font-size: 14px; }
 .err { color: var(--el-color-danger); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ops { white-space: nowrap; }
 .gap { margin-left: 6px; }
+.members-row > td { background: var(--el-fill-color-lighter); }
+.sub th, .sub td { padding: 4px 8px; }
+.sub-link { display: inline-block; margin-top: 6px; font-size: 12px; }
 .error { color: var(--el-color-danger); font-size: 13px; }
 </style>

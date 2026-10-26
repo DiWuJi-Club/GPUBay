@@ -13,6 +13,7 @@ import {
   llmCallInfo,
 } from '../logic/apps'
 import { copyText as copy } from '../logic/clipboard'
+import { isClusterManaged, singleInstanceApps, type ClusterAwareDeployment, type ClusterInstance } from '../logic/cluster'
 import { notifyError } from '../logic/notify'
 import { butlerAvailable } from '../store/butler'
 import AppDeployDialog from './AppDeployDialog.vue'
@@ -28,7 +29,7 @@ import WorkflowsPanel from './WorkflowsPanel.vue'
 const props = defineProps<{ instance: Instance; apps: AppCatalogItem[] }>()
 const emit = defineEmits<{ deployments: [items: Deployment[]] }>()
 
-const items = ref<Deployment[]>([])
+const items = ref<ClusterAwareDeployment[]>([])
 const loaded = ref(false)
 const loadError = ref('')
 let seq = 0
@@ -36,7 +37,7 @@ let seq = 0
 async function load() {
   const mine = ++seq
   try {
-    const res = await api.get<Listed<Deployment>>(`/instances/${props.instance.id}/apps`)
+    const res = await api.get<Listed<ClusterAwareDeployment>>(`/instances/${props.instance.id}/apps`)
     if (mine !== seq) return // 操作后的刷新 / 轮询交错：只采用最后发出的那次
     items.value = res.items
     loaded.value = true
@@ -61,6 +62,12 @@ const blockReason = computed(() => appOpBlockReason(props.instance.state))
 const hint = computed(() => instanceAppHint(props.instance.state))
 const canAdd = computed(() => canAddApp(props.instance.state))
 const atLimit = computed(() => items.value.length >= MAX_APPS)
+
+// 计划 13：集群部署在成员上只读（单实例操作 409 app_cluster_managed，改到集群页）；required 集群应用不出现在「添加应用」里
+const clusterRef = computed(() => (props.instance as ClusterInstance).cluster ?? null)
+const addableApps = computed(() => singleInstanceApps(props.apps))
+const managed = (d: ClusterAwareDeployment) => isClusterManaged(d)
+const roleText = (d: ClusterAwareDeployment) => (d.cluster_role === 'head' ? '主节点 head' : d.cluster_role === 'worker' ? '工作节点 worker' : '')
 
 const rowStatus = (d: Deployment) => appRowStatus(d, props.instance.state)
 const phaseText = (d: Deployment) => labelOf(deploymentPhaseLabel, d.phase)
@@ -157,7 +164,11 @@ function onCommand(d: Deployment, cmd: string) {
         <el-tag v-if="d.update_available" type="warning" size="small" data-testid="detail-app-update">有新版本 v{{ d.latest_version }}</el-tag>
         <el-tag :type="rowStatus(d).type as 'primary'" size="small" data-testid="detail-app-state">{{ rowStatus(d).text }}</el-tag>
         <el-tag v-if="d.state === 'running' && d.health === 'unhealthy'" type="warning" size="small" data-testid="detail-app-health">健康检查异常</el-tag>
+        <el-tag v-if="managed(d)" type="primary" size="small" effect="plain" data-testid="detail-app-cluster" :data-role="d.cluster_role">集群应用（{{ roleText(d) }}）</el-tag>
       </div>
+      <p v-if="managed(d)" class="muted small" data-testid="detail-app-cluster-hint">
+        该部署属于集群应用，只读；重新部署、停止、启动、卸载请到<router-link v-if="clusterRef" :to="`/clusters/${clusterRef.id}`" data-testid="detail-app-cluster-link">集群页</router-link><template v-else>集群页</template>操作。
+      </p>
 
       <div v-if="d.state === 'installing'" class="progress">
         <el-progress :percentage="d.progress" :stroke-width="10" data-testid="detail-app-progress" />
@@ -202,7 +213,11 @@ function onCommand(d: Deployment, cmd: string) {
         <el-button link type="primary" size="small" data-testid="detail-app-call-curl-copy" @click="copy(llmCallInfo(d)!.curl)">复制示例</el-button>
       </div>
 
-      <div class="row">
+      <div v-if="managed(d)" class="row">
+        <el-button v-if="d.state === 'running' && d.url" size="small" type="primary" :disabled="instance.state !== 'running'" data-testid="detail-app-open" @click="open(d.url)">打开</el-button>
+        <el-button size="small" data-testid="detail-app-log" @click="openLog(d)">查看日志</el-button>
+      </div>
+      <div v-else class="row">
         <template v-if="d.state === 'running' && d.url">
           <el-button size="small" type="primary" :disabled="instance.state !== 'running'" data-testid="detail-app-open" @click="open(d.url)">打开</el-button>
           <el-dropdown v-if="d.links.length" trigger="click" @command="(u: string) => open(u)">
@@ -238,7 +253,7 @@ function onCommand(d: Deployment, cmd: string) {
         </el-dropdown>
       </div>
 
-      <WorkflowsPanel v-if="isWorkflowHost(d) && d.state !== 'removing'" :instance="instance" :deployment="d" @refresh="load" />
+      <WorkflowsPanel v-if="isWorkflowHost(d) && d.state !== 'removing' && !managed(d)" :instance="instance" :deployment="d" @refresh="load" />
     </div>
 
     <template v-if="canAdd && loaded">
@@ -250,7 +265,7 @@ function onCommand(d: Deployment, cmd: string) {
     </template>
 
     <AppDeployDialog
-      v-model="deployVisible" :mode="deployMode" :instance="instance" :apps="apps" :deployments="items" :deployment="deployTarget"
+      v-model="deployVisible" :mode="deployMode" :instance="instance" :apps="addableApps" :deployments="items" :deployment="deployTarget"
       @done="load"
     />
     <AppLogDrawer v-model="logVisible" :instance-id="instance.id" :deployment="logTarget" />
