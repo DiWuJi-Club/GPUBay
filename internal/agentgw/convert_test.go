@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"testing"
 
 	"spark-cloud/internal/agentpb"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/fleet"
 )
 
@@ -115,5 +117,110 @@ func TestMetricsJSONInstancesBounded(t *testing.T) {
 		if x.InstanceID != fmt.Sprintf("ins-%08d", i) || x.MemCurrent != uint64(i) {
 			t.Fatalf("instances[%d] = %+v", i, x)
 		}
+	}
+}
+
+// fromProtoSpec / toProtoNet 是测试用的反向转换（Agent 侧另有自己的实现），只为往返断言。
+func fromProtoSpec(p *agentpb.ClusterSpec) clusterspec.Spec {
+	s := clusterspec.Spec{ClusterID: p.GetClusterId(), Version: int(p.GetVersion()), Size: int(p.GetSize()), Rank: int(p.GetRank()), Mode: p.GetMode(),
+		Iface: p.GetIface(), VLAN: int(p.GetVlan()), MTU: int(p.GetMtu()), Subnet: p.GetSubnet(), RDMA: p.GetRdma()}
+	for _, m := range p.GetMembers() {
+		s.Members = append(s.Members, clusterspec.Member{Rank: int(m.GetRank()), InstanceID: m.GetInstanceId(), IP: m.GetIp(), HostIP: m.GetHostIp()})
+	}
+	return s
+}
+
+func toProtoNet(n clusterspec.NetInfo) *agentpb.NetInfo {
+	out := &agentpb.NetInfo{LanIface: n.LanIface}
+	for _, f := range n.Ifaces {
+		out.Ifaces = append(out.Ifaces, &agentpb.NetIface{Name: f.Name, Mac: f.MAC, Up: f.Up, SpeedMbps: int32(f.SpeedMbps), Mtu: uint32(f.MTU), Ipv4: f.IPv4,
+			Driver: f.Driver, Pci: f.PCI, Wireless: f.Wireless, RdmaDevice: f.RDMADevice, RdmaActive: f.RDMAActive, Uverbs: f.Uverbs, LinkLayer: f.LinkLayer})
+	}
+	return out
+}
+
+func TestConvertClusterSpecRoundTrip(t *testing.T) {
+	specs := map[string]clusterspec.Spec{
+		"routed 两台": {ClusterID: "clu-aaaaaaaaaa", Version: 3, Size: 2, Rank: 1, Mode: clusterspec.ModeRouted, Iface: "enP7s7", Subnet: "10.210.4.0/24",
+			Members: []clusterspec.Member{{Rank: 0, InstanceID: "ins-aaaaaaaa", IP: "10.210.4.11", HostIP: "192.168.1.221"},
+				{Rank: 1, InstanceID: "ins-bbbbbbbb", IP: "10.210.4.12", HostIP: "192.168.1.222"}}},
+		"macvlan vlan + rdma": {ClusterID: "clu-bbbbbbbbbb", Version: 1, Size: 4, Rank: 0, Mode: clusterspec.ModeMacvlan, Iface: "enp1s0f0np0", VLAN: 120, MTU: 9000,
+			Subnet: "10.210.9.0/24", RDMA: true, Members: []clusterspec.Member{{Rank: 0, InstanceID: "ins-cccccccc", IP: "10.210.9.11"},
+				{Rank: 1, InstanceID: "ins-dddddddd", IP: "10.210.9.12"}, {Rank: 3, InstanceID: "ins-eeeeeeee", IP: "10.210.9.14"}}},
+		"退出集群（空 Spec）": {},
+	}
+	for name, s := range specs {
+		t.Run(name, func(t *testing.T) {
+			if got := fromProtoSpec(toProtoSpec(s)); !reflect.DeepEqual(got, s) {
+				t.Fatalf("round trip:\n got %+v\nwant %+v", got, s)
+			}
+		})
+	}
+	nets := map[string]clusterspec.NetInfo{
+		"全字段": {LanIface: "enP7s7", Ifaces: []clusterspec.Iface{
+			{Name: "enP7s7", MAC: "aa:bb:cc:dd:ee:01", Up: true, SpeedMbps: 10000, MTU: 1500, IPv4: []string{"192.168.1.221/24", "10.0.0.5/8"}, Driver: "r8127", PCI: "0007:01:00.0"},
+			{Name: "wlP9s9", MAC: "aa:bb:cc:dd:ee:02", MTU: 1500, IPv4: []string{}, Driver: "mt7925e", PCI: "0009:01:00.0", Wireless: true},
+			{Name: "enp1s0f0np0", MAC: "aa:bb:cc:dd:ee:03", Up: true, SpeedMbps: 200000, MTU: 9000, IPv4: []string{}, Driver: "mlx5_core", PCI: "0000:01:00.0",
+				RDMADevice: "rocep1s0f0", RDMAActive: true, Uverbs: "uverbs0", LinkLayer: "Ethernet"}}},
+		"无网卡（LanIface 为空）": {Ifaces: []clusterspec.Iface{}},
+	}
+	for name, n := range nets {
+		t.Run(name, func(t *testing.T) {
+			got := fromProtoNet(toProtoNet(n))
+			if got == nil || !reflect.DeepEqual(*got, n) {
+				t.Fatalf("net round trip:\n got %+v\nwant %+v", got, n)
+			}
+		})
+	}
+	if fromProtoNet(nil) != nil {
+		t.Fatal("nil net must stay nil (old agent)")
+	}
+	if n := fromProtoNet(&agentpb.NetInfo{Ifaces: []*agentpb.NetIface{{Name: "x", SpeedMbps: -1}}}); n.Ifaces[0].SpeedMbps != 0 || n.Ifaces[0].IPv4 == nil {
+		t.Fatalf("negative speed / nil ipv4 = %+v", n.Ifaces[0])
+	}
+}
+
+func TestConfigureClusterCommandToProto(t *testing.T) {
+	spec := clusterspec.Spec{ClusterID: "clu-aaaaaaaaaa", Version: 2, Size: 2, Rank: 0, Mode: clusterspec.ModeRouted, Iface: "enP7s7", Subnet: "10.210.0.0/24",
+		Members: []clusterspec.Member{{Rank: 0, InstanceID: "ins-aaaaaaaa", IP: "10.210.0.11"}, {Rank: 1, InstanceID: "ins-bbbbbbbb", IP: "10.210.0.12", HostIP: "10.0.0.2"}}}
+	cfg := Config{SSHPort: 2222}
+	for name, payload := range map[string]fleet.ConfigureClusterPayload{"新版本": {Cluster: spec}, "退出集群": {}} {
+		t.Run(name, func(t *testing.T) {
+			b, _ := json.Marshal(payload)
+			msg, err := toProtoCommand(fleet.Command{ID: "c9", InstanceID: "ins-aaaaaaaa", Type: fleet.CmdConfigureCluster, Payload: b}, cfg, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cc := msg.GetConfigureCluster()
+			if msg.GetId() != "c9" || msg.GetInstanceId() != "ins-aaaaaaaa" || cc == nil || cc.GetCluster() == nil {
+				t.Fatalf("msg = %v", msg)
+			}
+			if got := fromProtoSpec(cc.GetCluster()); !reflect.DeepEqual(got, payload.Cluster) {
+				t.Fatalf("spec = %+v", got)
+			}
+		})
+	}
+	// Create：集群成员带 cluster，非集群不带
+	msg, err := toProtoCommand(createCmd(t, fleet.CreateInstancePayload{ImageRef: "img:1", SSHPort: 2222, Cluster: &spec}), cfg, "PEM")
+	if err != nil || msg.GetCreate().GetCluster() == nil || !reflect.DeepEqual(fromProtoSpec(msg.GetCreate().GetCluster()), spec) {
+		t.Fatalf("create with cluster = %v, %v", msg, err)
+	}
+	msg, _ = toProtoCommand(createCmd(t, fleet.CreateInstancePayload{ImageRef: "img:1", SSHPort: 2222}), cfg, "PEM")
+	if msg.GetCreate().GetCluster() != nil {
+		t.Fatalf("non-cluster create carries cluster: %v", msg.GetCreate())
+	}
+	if _, err := toProtoCommand(fleet.Command{ID: "c", Type: fleet.CmdConfigureCluster, Payload: []byte("{")}, cfg, ""); err == nil {
+		t.Fatal("bad payload must fail")
+	}
+}
+
+func TestToStateReportClusterAndNet(t *testing.T) {
+	r := toStateReport(&agentpb.StateReport{Instances: []*agentpb.InstanceState{{InstanceId: "ins-aaaaaaaa", Phase: "running", Cluster: "ok"},
+		{InstanceId: "ins-bbbbbbbb", Phase: "running"}}, Net: &agentpb.NetInfo{LanIface: "eth0"}})
+	if r.Instances[0].Cluster != "ok" || r.Instances[1].Cluster != "" || r.Net == nil || r.Net.LanIface != "eth0" {
+		t.Fatalf("report = %+v", r)
+	}
+	if old := toStateReport(&agentpb.StateReport{}); old.Net != nil {
+		t.Fatal("old agent report must have nil Net")
 	}
 }
