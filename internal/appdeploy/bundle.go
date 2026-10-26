@@ -25,6 +25,8 @@ type BundleInput struct {
 	ImageEnv []EnvKV
 	// Extra 调用方追加的文件（计划 11：comfywf 生成的 workflows/…），按给定顺序写在固定文件之后；名字规则见 extraNames.check。
 	Extra []BundleFile
+	// 计划 13：集群部署的成员（head / worker 与 acd-…）；非集群部署为空，env 与改动前逐字节相同。
+	ClusterRole, ClusterDeploymentID string
 }
 
 // BundleFile 是部署包里由调用方追加的额外文件（如 comfywf 生成的 workflows/manifest.json 与 workflows/<slug>.json）。
@@ -37,7 +39,8 @@ type BundleFile struct {
 
 func AppDir(appRoot, slug string) string { return path.Join(appRoot, AppDirName, slug) }
 
-// ReservedEnv 平台注入的保留变量（顺序固定，写在用户变量之前；SPARK_GIT_MIRROR 只对 Spec.SupportsWorkflows 的版本，在最后）。
+// ReservedEnv 平台注入的保留变量（顺序固定，写在用户变量之前；SPARK_GIT_MIRROR 只对 Spec.SupportsWorkflows 的版本；
+// SPARK_CLUSTER_ROLE / SPARK_CLUSTER_DEPLOYMENT 只对集群部署（ClusterDeploymentID 非空），在最后）。
 func ReservedEnv(in BundleInput) []EnvKV {
 	models := path.Join(in.AppRoot, ModelsDirName)
 	port2 := ""
@@ -59,6 +62,10 @@ func ReservedEnv(in BundleInput) []EnvKV {
 	// 多一行会让所有存量部署在升级 platform 后的第一次恢复里重跑 install。
 	if in.Spec.SupportsWorkflows {
 		kvs = append(kvs, EnvKV{"SPARK_GIT_MIRROR", in.GitMirror})
+	}
+	// 计划 13 §6.3：只对集群部署（同样的理由：非集群部署多一行就会触发存量重装）。集群拓扑由 app.sh 读 /.spark/cluster.env。
+	if in.ClusterDeploymentID != "" {
+		kvs = append(kvs, EnvKV{"SPARK_CLUSTER_ROLE", in.ClusterRole}, EnvKV{"SPARK_CLUSTER_DEPLOYMENT", in.ClusterDeploymentID})
 	}
 	return kvs
 }

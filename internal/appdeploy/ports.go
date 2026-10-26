@@ -72,6 +72,12 @@ func registerPorts(ctx context.Context, q db.Querier, d Deployment, ports []Port
 	return "", nil
 }
 
+// registersPorts：集群部署的 worker 在版本未声明 worker_ports 时不登记端口（计划 13 §6.3：端口只出现在 head 实例上；
+// 健康检查仍按 Ports[0]，由应用自己的回环健康服务响应）。其余部署照常登记。
+func registersPorts(d Deployment, spec Spec) bool {
+	return d.ClusterRole != RoleWorker || (spec.Cluster != nil && spec.Cluster.WorkerPorts)
+}
+
 // deletePorts 卸载时删除部署登记的全部端口；每删一个以 actor（部署主人）审计 instance.port_delete，原因「卸载应用 <name>」。
 func deletePorts(ctx context.Context, q db.Querier, d Deployment, appName string, now time.Time, actor audit.Actor) error {
 	return deletePortsBecause(ctx, q, d, "卸载应用 "+appName, now, actor)
