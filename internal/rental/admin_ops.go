@@ -38,6 +38,9 @@ func (s *Service) AdminExtend(ctx context.Context, actor audit.Actor, instanceID
 		if inst.System { // 系统实例不计时（expires_at NULL），补偿时长无意义
 			return apperr.ErrInvalidState
 		}
+		if inst.ClusterID != nil { // 集群成员整组延长（AdminExtendCluster）
+			return apperr.ErrClusterMember
+		}
 		if err := s.renewFits(ctx, tx, inst, seconds, now); err != nil {
 			return err
 		}

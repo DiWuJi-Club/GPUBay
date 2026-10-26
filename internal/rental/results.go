@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
@@ -67,10 +69,20 @@ func (s *Service) handleCommandResult(ctx context.Context, commandID string, ok 
 			if ok {
 				return s.startLease(ctx, tx, inst, StateCreating, "agent: created", now)
 			}
+			// 计划 13：集群成员因集群网络失败（Agent 已在本地清理）→ 不判机器故障（规格 §5.5 第 2 步）；集群由 SweepClusters 中止
+			if inst.ClusterID != nil && strings.HasPrefix(result, clusterspec.ErrPrefix) {
+				return s.failCreatingClusterNet(ctx, tx, inst, "开通失败: "+result, now)
+			}
 			if inst.Booked() {
 				return s.reassignAfterCreateFailure(ctx, tx, inst, "开通失败: "+result, now, after)
 			}
 			return s.failCreating(ctx, tx, inst, "开通失败: "+result, now)
+		case fleet.CmdConfigureCluster:
+			// 成功无副作用；失败 → 告警（一次）。成员已不在位（洗机 / 释放）的结果忽略。
+			if ok || !slices.Contains(ClusterMemberStates, inst.State) {
+				return nil
+			}
+			return s.d.Fleet.RaiseAlertOnce(ctx, tx, clusterNetAlert(inst.MachineID, inst.ID))
 		case fleet.CmdStartInstance:
 			if inst.State != StateStopped {
 				return nil
@@ -89,6 +101,10 @@ func (s *Service) handleCommandResult(ctx context.Context, commandID string, ok 
 			// 非 wiping，或者指令不在实例所属机器上（别的机器上报了该实例的容器）：都是孤儿清理，
 			// 不改实例状态、不释放机器——否则原机器没洗就会被放给下一个租户。
 			if inst.State != StateWiping || cmd.MachineID != inst.MachineID {
+				if ok && inst.State == StateFailed && cmd.MachineID == inst.MachineID {
+					// 计划 13：集群网络导致开通失败的实例（failCreatingClusterNet）机器未判故障，洗完后放回库存
+					return s.releaseIfVacant(ctx, tx, inst.MachineID)
+				}
 				if ok {
 					return nil
 				}
@@ -228,6 +244,31 @@ func (s *Service) compensateShortfall(ctx context.Context, tx pgx.Tx, inst Insta
 
 // failCreating 开通失败：实例失败、退款、机器隔离为故障、取消剩余指令并告警。
 func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, reason string, now time.Time) error {
+	return s.failCreatingAs(ctx, tx, inst, reason, true, now)
+}
+
+// failCreatingClusterNet 集群成员因集群网络（消息以 clusterspec.ErrPrefix 开头）开通失败：与 failCreating 相同，
+// 但机器不判故障、告警 cluster_net_error（一次）而非 create_failed。容器由对账（failed 实例的容器 → wipeOrphan）清理。
+func (s *Service) failCreatingClusterNet(ctx context.Context, tx pgx.Tx, inst Instance, reason string, now time.Time) error {
+	if err := s.failCreatingAs(ctx, tx, inst, reason, false, now); err != nil {
+		return err
+	}
+	// 机器没判故障：直接下发洗机（数据盘与残留容器），洗完由 releaseIfVacant 放回库存；对账的 wipeOrphan 见到在途指令不会重复入队
+	_, err := s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdWipeInstance, nil)
+	return err
+}
+
+// releaseIfVacant 机器上已没有未结束的实例时把 allocated 的机器放回 idle（faulty / 维护中的机器不受影响）。
+func (s *Service) releaseIfVacant(ctx context.Context, tx pgx.Tx, machineID int64) error {
+	var busy bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM instances WHERE machine_id = $1 AND state IN ('creating', 'running', 'stopped', 'wiping'))`,
+		machineID).Scan(&busy); err != nil || busy {
+		return err
+	}
+	return s.d.Fleet.Release(ctx, tx, machineID)
+}
+
+func (s *Service) failCreatingAs(ctx context.Context, tx pgx.Tx, inst Instance, reason string, faulty bool, now time.Time) error {
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'failed', pending_seconds = 0, ssh_host_key_enc = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 		return err
 	}
@@ -243,11 +284,16 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 	if err := s.refundAll(ctx, tx, inst, now); err != nil {
 		return err
 	}
-	if err := s.d.Fleet.MarkFaulty(ctx, tx, inst.MachineID); err != nil {
-		return err
+	if faulty {
+		if err := s.d.Fleet.MarkFaulty(ctx, tx, inst.MachineID); err != nil {
+			return err
+		}
 	}
 	if err := s.d.Fleet.CancelCommands(ctx, tx, inst.ID, "instance failed"); err != nil {
 		return err
+	}
+	if !faulty {
+		return s.d.Fleet.RaiseAlertOnce(ctx, tx, clusterNetAlert(inst.MachineID, inst.ID))
 	}
 	return s.d.Fleet.RaiseAlert(ctx, tx, fleet.Alert{Level: "critical", Kind: "create_failed",
 		MachineID: inst.MachineID, InstanceID: inst.ID, Message: reason})

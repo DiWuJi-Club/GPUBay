@@ -214,6 +214,8 @@ func CommandTimeout(t fleet.CommandType) time.Duration {
 		return StopCommandTimeout
 	case fleet.CmdWipeInstance:
 		return WipeCommandTimeout
+	case fleet.CmdConfigureCluster:
+		return ConfigureClusterCommandTimeout
 	}
 	return PullCommandTimeout
 }
@@ -221,7 +223,7 @@ func CommandTimeout(t fleet.CommandType) time.Duration {
 // FailTimedOutCommands 把在线机器上超过类型超时仍未回报的 sent 指令判为失败，交给状态机。
 func (s *Service) FailTimedOutCommands(ctx context.Context) (int, error) {
 	now := s.d.Clock.Now()
-	cmds, err := s.d.Fleet.SentBefore(ctx, now.Add(-StartCommandTimeout)) // 最短的超时值
+	cmds, err := s.d.Fleet.SentBefore(ctx, now.Add(-min(StartCommandTimeout, ConfigureClusterCommandTimeout))) // 最短的超时值
 	if err != nil {
 		return 0, err
 	}
@@ -354,6 +356,16 @@ func (s *Service) SendReminders(ctx context.Context) (int, error) {
 				WHERE id = $1`, inst.ID, remaining <= time.Hour, now); err != nil {
 				return err
 			}
+			if inst.ClusterID != nil {
+				// 计划 13：一个集群一条短信——只对 rank 最小的（运行中未暂停的）在位成员发，并同时给其余在位成员置标记
+				send, err := clusterReminderLead(ctx, tx, inst, remaining <= time.Hour, now)
+				if err != nil {
+					return err
+				}
+				if !send {
+					continue
+				}
+			}
 			due = append(due, reminder{userID: inst.UserID, id: inst.ID, remaining: remaining})
 		}
 		return nil
@@ -369,9 +381,26 @@ func (s *Service) SendReminders(ctx context.Context) (int, error) {
 	return len(due), nil
 }
 
+// clusterReminderLead 集群成员 inst 到了提醒时刻：inst 是 rank 最小的运行中未暂停在位成员时返回 true（由它发短信），
+// 并把其余在位成员的同档提醒标记一并置上（别的事务锁着的成员跳过：它们不是发送者，到点时自己置标记）。
+func clusterReminderLead(ctx context.Context, tx pgx.Tx, inst Instance, oneHour bool, now time.Time) (bool, error) {
+	var lead string
+	if err := tx.QueryRow(ctx, `SELECT id FROM instances WHERE cluster_id = $1 AND state = 'running' AND suspended_at IS NULL
+		ORDER BY cluster_rank, id LIMIT 1`, *inst.ClusterID).Scan(&lead); err != nil && !db.IsNoRows(err) {
+		return false, err
+	}
+	if lead != inst.ID {
+		return false, nil
+	}
+	_, err := tx.Exec(ctx, `UPDATE instances SET reminded_24h = true, reminded_1h = reminded_1h OR $3, updated_at = $4
+		WHERE id IN (SELECT id FROM instances WHERE cluster_id = $1 AND id <> $2 AND state = ANY($5) FOR UPDATE SKIP LOCKED)`,
+		*inst.ClusterID, inst.ID, oneHour, now, ClusterMemberStates)
+	return true, err
+}
+
 // Sweep 执行一轮完整清扫，按顺序（规格 §9）：离线检测与暂停 → 恢复计时 → 推进停机 / 洗机 / 暂停实例的占用上界（RefreshCappedLeases）→
-// 到点预订开通（ProvisionDue）→ 自动续费（AutoRenewDue，须在到期停机之前）→ 到期停机 → 保留期洗机 → 开通超时 →
-// 指令超时 → 回收 SSH 会话 → 到期提醒。各步互不阻断，错误合并返回。
+// 到点预订开通（ProvisionDue）→ 自动续费（AutoRenewDue → AutoRenewClustersDue，须在到期停机之前）→ 到期停机 → 保留期洗机 → 开通超时 →
+// 指令超时 → 集群（SweepClusters：中止 / 就绪对齐 / 结束）→ 回收 SSH 会话 → 到期提醒。各步互不阻断，错误合并返回。
 func (s *Service) Sweep(ctx context.Context) error {
 	var errs []error
 	offline, err := s.d.Fleet.MarkOfflineStale(ctx, OfflineTimeout)
@@ -402,6 +431,9 @@ func (s *Service) Sweep(ctx context.Context) error {
 	if _, err := s.AutoRenewDue(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("auto renew: %w", err))
 	}
+	if _, err := s.AutoRenewClustersDue(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("auto renew clusters: %w", err))
+	}
 	if _, err := s.ExpireDue(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("expire: %w", err))
 	}
@@ -413,6 +445,9 @@ func (s *Service) Sweep(ctx context.Context) error {
 	}
 	if _, err := s.FailTimedOutCommands(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("command timeout: %w", err))
+	}
+	if _, err := s.SweepClusters(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("clusters: %w", err))
 	}
 	if _, _, err := s.ReapSSHSessions(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("ssh sessions: %w", err))
