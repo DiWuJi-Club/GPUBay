@@ -256,6 +256,10 @@ func (s *Server) Connect(stream agentpb.AgentGateway_ConnectServer) error {
 	if err := s.d.Fleet.RecordMetrics(ctx, m.ID, hello.GetAgentVersion(), nil); err != nil {
 		s.d.Log.Error("record agent version", "machine", m.ID, "err", err)
 	}
+	// 计划 13：能力位（features.Cluster 决定能否入选集群）与网卡探测；旧 Agent features = 0、无 net。
+	if err := s.d.Fleet.RecordHello(ctx, m.ID, hello.GetFeatures(), fromProtoNet(hello.GetNet())); err != nil {
+		s.d.Log.Error("record hello", "machine", m.ID, "err", err)
+	}
 	if err := c.send(&agentpb.PlatformMessage{Msg: &agentpb.PlatformMessage_Config{Config: s.agentConfig(m)}}); err != nil {
 		return err
 	}
@@ -351,6 +355,11 @@ func (s *Server) handleReport(ctx context.Context, c *conn, r *agentpb.StateRepo
 	if rep.Images != nil {
 		if err := s.d.Fleet.RecordCachedImages(ctx, c.machineID, rep.Images); err != nil {
 			s.d.Log.Warn("record cached images", "machine", c.machineID, "err", err)
+		}
+	}
+	if rep.Net != nil { // 旧 Agent 不发：不覆盖已有探测
+		if err := s.d.Fleet.RecordNetInfo(ctx, c.machineID, *rep.Net); err != nil {
+			s.d.Log.Warn("record net info", "machine", c.machineID, "err", err)
 		}
 	}
 	if err := s.d.Rental.Reconcile(ctx, c.machineID, rep); err != nil {
