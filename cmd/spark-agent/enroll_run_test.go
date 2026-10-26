@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"spark-cloud/internal/agent/features"
 	"spark-cloud/internal/agentpb"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
@@ -67,7 +68,9 @@ func (g *gateway) helloCount() int {
 	return len(g.hellos)
 }
 
-func TestEnrollThenRunFake(t *testing.T) {
+// startGateway 起一个 TLS 网关（签发证书、记录 Hello），返回网关、地址与 CA 指纹。
+func startGateway(t *testing.T) (*gateway, string, string) {
+	t.Helper()
 	pool := dbtest.New(t)
 	box, _ := secretbox.New(dbtest.Key)
 	ca, err := pki.EnsureCA(context.Background(), pool, box, clock.Real{})
@@ -87,8 +90,11 @@ func TestEnrollThenRunFake(t *testing.T) {
 	}
 	go gs.Serve(lis) //nolint:errcheck
 	t.Cleanup(gs.Stop)
-	addr := lis.Addr().String()
+	return g, lis.Addr().String(), ca.Fingerprint()
+}
 
+func TestEnrollThenRunFake(t *testing.T) {
+	g, addr, fp := startGateway(t)
 	root := t.TempDir()
 	confDir := filepath.Join(root, "etc", "spark-agent") // 首次运行时目录不存在
 	stateDir := filepath.Join(root, "var", "lib", "spark-agent")
@@ -98,7 +104,7 @@ func TestEnrollThenRunFake(t *testing.T) {
 		t.Fatalf("run before enroll = %v", err)
 	}
 	// 指纹带空白和大写、令牌带换行（从终端粘贴）也能接入。
-	if err := run([]string{"enroll", "--platform", addr, "--token", " spk1_x\n", "--ca-sha256", " " + strings.ToUpper(ca.Fingerprint()) + " ", "--dir", confDir}, &out); err != nil {
+	if err := run([]string{"enroll", "--platform", addr, "--token", " spk1_x\n", "--ca-sha256", " " + strings.ToUpper(fp) + " ", "--dir", confDir}, &out); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
 	if fi, err := os.Stat(confDir); err != nil || fi.Mode().Perm() != 0o700 {
@@ -147,6 +153,41 @@ func TestEnrollThenRunFake(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("run did not stop on cancel")
+	}
+}
+
+// --fake 下执行器接 clusternet fake：Hello 带 features = SharedSlots|Cluster 与（空的）网卡探测结果。
+func TestRunAgentWiresCluster(t *testing.T) {
+	g, addr, fp := startGateway(t)
+	root := t.TempDir()
+	confDir, stateDir := filepath.Join(root, "etc"), filepath.Join(root, "var")
+	if err := run([]string{"enroll", "--platform", addr, "--token", "spk1_x", "--ca-sha256", fp, "--dir", confDir}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runAgent(ctx, []string{"--dir", confDir, "--state-dir", stateDir, "--fake"}, &bytes.Buffer{})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for g.helloCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run returned %v", err)
+	}
+	if g.helloCount() == 0 {
+		t.Fatal("agent never connected")
+	}
+	g.mu.Lock()
+	h := g.hellos[0]
+	g.mu.Unlock()
+	if want := features.SharedSlots | features.Cluster; h.GetFeatures() != want || want != 3 {
+		t.Fatalf("hello features = %d, want %d", h.GetFeatures(), want)
+	}
+	if h.GetNet() == nil {
+		t.Fatal("hello without net info")
 	}
 }
 
