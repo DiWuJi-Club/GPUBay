@@ -330,6 +330,7 @@ func fieldAfter(f []string, key string) string {
 
 // poolConflicts 找落在集群网段（clusterspec.DefaultPool）里的本机地址与路由（Agent 自建的网卡除外）。
 // 包住整个网段的更大路由（如 10.0.0.0/8）不算：集群的 /32 路由更具体。与地址重复的直连路由（proto kernel）只报地址。
+// 网段内的 /32 via 路由是 Agent 自建的跨机对端路由，也不算。
 func poolConflicts(addrs, routes string) []string {
 	pool := netip.MustParsePrefix(clusterspec.DefaultPool)
 	var hits []string
@@ -356,6 +357,10 @@ func poolConflicts(addrs, routes string) []string {
 		dst := f[0]
 		if !strings.Contains(dst, "/") {
 			dst += "/32"
+		}
+		// Agent 自建的 routed 对端路由：<对端成员>/32 via <对端宿主机> dev <管理网卡>（clusternet/linux syncPeerRoutes）
+		if strings.HasSuffix(dst, "/32") && fieldAfter(f, "via") != "" {
+			continue
 		}
 		if p, err := netip.ParsePrefix(dst); err == nil && p.Overlaps(pool) && p.Bits() >= pool.Bits() {
 			hits = append(hits, fmt.Sprintf("路由 %s（%s）", f[0], dev))

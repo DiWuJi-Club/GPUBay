@@ -25,10 +25,10 @@ CLUSTER_IFACES=""
 
 die() { echo "错误: $*" >&2; exit 1; }
 
-# add_cluster_iface 校验网卡名（Linux 网卡名 ≤15 字节；只允许字母数字 . _ -，不能以 - 开头）并去重追加。
+# add_cluster_iface 校验网卡名（Linux 网卡名 ≤15 字节；只允许字母数字 . _ -，首字符必须是字母数字）并去重追加。
 add_cluster_iface() {
   case "$1" in
-    ""|-*|*[!A-Za-z0-9._-]*) die "--cluster-iface 网卡名不合法: $1" ;;
+    ""|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) die "--cluster-iface 网卡名不合法: $1" ;;
   esac
   [ "${#1}" -le 15 ] || die "--cluster-iface 网卡名过长: $1"
   case " $CLUSTER_IFACES " in

@@ -57,7 +57,7 @@ type Runtime struct {
 
 var (
 	clusterIDRe  = regexp.MustCompile(`^clu-[a-z0-9]{10}$`)
-	ifaceRe      = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,15}$`)
+	ifaceRe      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$`) // 首字符必须字母数字（拒绝 -x 被当成命令行选项）
 	instanceIDRe = regexp.MustCompile(`^ins-[a-z0-9]{8}$`)
 )
 

@@ -18,6 +18,8 @@ export const RAY_PORT = 6379
 export interface InstanceClusterRef { id: string; size: number; rank: number; status: ClusterStatus }
 export type ClusterInstance = Instance & { cluster?: InstanceClusterRef | null }
 
+export type ConsoleNetStatus = 'ok' | 'pending' | 'error'
+
 /** GET /clusters/{id} 的成员（活动集群只列在位成员，按 rank）。 */
 export interface ConsoleClusterMember {
   rank: number
@@ -26,8 +28,10 @@ export interface ConsoleClusterMember {
   suspended: boolean
   ip: string
   machine_label: string
-  /** '' 未上报 / ok / pending / `error: …` */
-  net_status: string
+  /** 后端归一化（终审 B-2）：ok / pending（未上报或容器未运行）/ error；Agent 原始错误只在后台显示 */
+  net_status: ConsoleNetStatus
+  /** error 时的固定说明（「集群网络异常，平台已告警处理」）；其余为 '' */
+  net_reason: string
   expires_at: string | null
 }
 
@@ -137,12 +141,11 @@ export function clusterNotices(v: ConsoleClusterView): ClusterNotice[] {
   return out
 }
 
-/** 成员网络状态（Agent 上报）。 */
-export function netStatusText(s: string): { text: string; type: string } {
+/** 成员网络状态（后端已归一为 ok / pending / error + 固定原因）；未知值按异常显示，但绝不展示原始文本。 */
+export function netStatusText(s: ConsoleNetStatus, reason = ''): { text: string; type: string } {
   if (s === 'ok') return { text: '正常', type: 'success' }
   if (s === 'pending') return { text: '等待中', type: 'primary' }
-  if (s.startsWith('error')) return { text: `异常：${s.replace(/^error:\s*/, '')}`, type: 'danger' }
-  return { text: '未上报', type: 'info' }
+  return { text: reason ? `异常：${reason}` : '异常', type: 'danger' }
 }
 
 export interface ClusterActions { active: boolean; renew: boolean; autoRenew: boolean; release: boolean; releaseReason: string | null }

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -27,8 +28,30 @@ type clusterMemberView struct {
 	Suspended    bool       `json:"suspended"`
 	IP           string     `json:"ip"`
 	MachineLabel string     `json:"machine_label"`
-	NetStatus    string     `json:"net_status"` // "" 未上报 / ok / pending / error: …
+	NetStatus    string     `json:"net_status"` // 归一化：ok / pending / error（见 consoleNetStatus）
+	NetReason    string     `json:"net_reason"` // error 时的固定文案；其余为 ""
 	ExpiresAt    *time.Time `json:"expires_at"`
+}
+
+// 控制台的成员集群网络状态（终审 B-2）：Agent 上报的原始 "error: …" 含宿主命令行、VLAN、网卡名与地址，
+// 只在后台视图保留；控制台归一为三个值 + 固定原因（平台已对 error 告警，见 rental.AlertClusterNetError）。
+const (
+	netStatusPending = "pending"
+	netStatusError   = "error"
+	netErrorReason   = "集群网络异常，平台已告警处理"
+)
+
+// consoleNetStatus 把 Agent 原始状态归一：ok → ok；error / error: … → error + 固定原因；
+// 未上报（""）、pending 与其它未知值 → pending。
+func consoleNetStatus(raw string) (status, reason string) {
+	switch {
+	case raw == rental.NetStatusOK:
+		return rental.NetStatusOK, ""
+	case raw == netStatusError || strings.HasPrefix(raw, netStatusError+":"):
+		return netStatusError, netErrorReason
+	default:
+		return netStatusPending, ""
+	}
 }
 
 // clusterView 是控制台的集群视图。
@@ -112,8 +135,9 @@ func (s *Server) clusterConsoleView(ctx context.Context, userID int64, cv rental
 		Members: make([]clusterMemberView, 0, len(cv.Members)), RenewOptions: []rental.RenewOption{}}
 	var earliest, latest *time.Time
 	for _, m := range cv.Members {
+		net, reason := consoleNetStatus(m.NetStatus)
 		v.Members = append(v.Members, clusterMemberView{Rank: m.Rank, InstanceID: m.InstanceID, State: m.State, Suspended: m.Suspended, IP: m.IP,
-			MachineLabel: m.MachineLabel, NetStatus: m.NetStatus, ExpiresAt: m.ExpiresAt})
+			MachineLabel: m.MachineLabel, NetStatus: net, NetReason: reason, ExpiresAt: m.ExpiresAt})
 		if m.ExpiresAt == nil || cv.State != rental.ClusterActive {
 			continue
 		}
@@ -308,8 +332,13 @@ func (s *Server) handleClusters(w http.ResponseWriter, r *http.Request) {
 	for _, cv := range cvs {
 		v, err := s.clusterConsoleView(r.Context(), uid, cv)
 		if err != nil {
-			s.writeError(w, r, err)
-			return
+			// 单个集群组装失败（成员实例 / 续费信息 / 集群应用读不到）只跳过该项：列表其余集群照常显示，详情页会给出具体错误
+			if r.Context().Err() != nil {
+				s.writeError(w, r, err)
+				return
+			}
+			s.Log.Warn("cluster list: skip cluster view", "cluster_id", cv.ID, "user_id", uid, "err", err)
+			continue
 		}
 		out = append(out, v)
 	}

@@ -388,7 +388,7 @@ type MachineUpdate struct {
 var errClusterMemberOnMachine = apperr.New(apperr.ErrInvalidState.Code, "机器上有集群成员，不能修改集群网络", apperr.ErrInvalidState.Status)
 
 // clusterIfaceRe 集群网卡名：Linux 网卡名规则（≤ 15 字符）。
-var clusterIfaceRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,15}$`)
+var clusterIfaceRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$`)
 
 func eqInt64Ptr(a, b *int64) bool {
 	if a == nil || b == nil {
