@@ -1,7 +1,7 @@
 import type { NetInfo } from '@spark/shared'
 import { describe, expect, it } from 'vitest'
 import {
-  agentFeatureLabels, canExtendCluster, canMigrateMember, canResyncCluster, clusterListQuery, emptyClusterFilter, emptyFabricForm, fabricDeleteBlocker, fabricNetsWarning,
+  agentFeatureLabels, canExtendCluster, canForceRemoveClusterApp, canMigrateMember, canResyncCluster, clusterListQuery, emptyClusterFilter, emptyFabricForm, fabricDeleteBlocker, fabricNetsWarning,
   fmtSpeed, ifaceChoices, isolationOptions, machineNetPatch, mgmtIface, netStatusText, normalizeFabricForm, rdmaText, readinessText, supportsCluster, validateFabricForm, vlanRangeText,
 } from '../clusters'
 
@@ -122,6 +122,14 @@ describe('集群', () => {
     expect(canMigrateMember('ops', user, 'running')).toBe(true)
     expect(canMigrateMember('ops', user, 'creating')).toBe(false)
     expect(canMigrateMember('ops', sys, 'running')).toBe(false)
+  })
+  it('强制卸载集群应用：ops / super，且应用未卸载', () => {
+    expect(canForceRemoveClusterApp('ops', { state: 'active' })).toBe(true)
+    expect(canForceRemoveClusterApp('super', { state: 'active' })).toBe(true)
+    expect(canForceRemoveClusterApp('finance', { state: 'active' })).toBe(false)
+    expect(canForceRemoveClusterApp('ops', { state: 'removed' })).toBe(false)
+    expect(canForceRemoveClusterApp('ops', { state: 'removing' })).toBe(false)
+    expect(canForceRemoveClusterApp('ops', null)).toBe(false)
   })
   it('成员网络状态', () => {
     expect(netStatusText('')).toBe('未上报')

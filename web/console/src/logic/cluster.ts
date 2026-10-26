@@ -154,12 +154,14 @@ export interface ClusterActions { active: boolean; renew: boolean; autoRenew: bo
 export function clusterActions(v: ConsoleClusterView): ClusterActions {
   if (!isClusterActive(v)) return { active: false, renew: false, autoRenew: false, release: false, releaseReason: null }
   const creating = v.members.some((m) => m.state === 'creating')
+  // 未就绪（组建中）时后端拒绝整组释放（已付费用不退，组建超时由平台中止并全额退款）
+  const reason = creating ? '有成员正在开通，开通完成后才能释放' : !v.ready_at ? '集群组建完成后才能释放' : null
   return {
     active: true,
     renew: v.renew_options.some((o) => o.quantity_max > 0),
     autoRenew: true,
-    release: !creating,
-    releaseReason: creating ? '有成员正在开通，开通完成后才能释放' : null,
+    release: reason == null,
+    releaseReason: reason,
   }
 }
 

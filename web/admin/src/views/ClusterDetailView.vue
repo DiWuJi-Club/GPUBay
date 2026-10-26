@@ -10,7 +10,7 @@ import { api } from '../api'
 import BatchLink from '../components/BatchLink.vue'
 import IdLink from '../components/IdLink.vue'
 import {
-  canExtendCluster, canMigrateMember, canResyncCluster, MIGRATE_MEMBER_HINT, netStatusBad, netStatusText, type AdminClusterDetail, type AdminClusterView,
+  canExtendCluster, canForceRemoveClusterApp, canMigrateMember, canResyncCluster, MIGRATE_MEMBER_HINT, netStatusBad, netStatusText, type AdminClusterDetail, type AdminClusterView,
 } from '../logic/clusters'
 import { deploymentHealthLabel } from '../logic/deployments'
 import { extendSeconds, validateExtend } from '../logic/instanceOps'
@@ -57,6 +57,7 @@ onBeforeRouteUpdate((to) => {
   resync.visible = false
   migrate.visible = false
   migrate.result = null
+  forceRemove.visible = false
   void load(String(to.params.id))
 })
 /** 操作接口返回新的 ClusterView：先就地替换，再整体刷新（事件 / 集群应用） */
@@ -104,6 +105,27 @@ async function submitResync() {
     notifyError(e)
   } finally {
     resync.busy = false
+  }
+}
+
+// ---- 强制卸载集群应用（ops；成员部署只能整组卸载，审计 cluster.app_force_remove）----
+const forceRemove = reactive({ visible: false, reason: '', busy: false })
+function openForceRemove() {
+  Object.assign(forceRemove, { visible: true, reason: '' })
+}
+async function submitForceRemove() {
+  if (forceRemove.busy) return
+  if (!forceRemove.reason.trim()) return void ElMessage.warning('请填写卸载原因')
+  forceRemove.busy = true
+  try {
+    await api.post(`/clusters/${encodeURIComponent(id.value)}/app/force-remove`, { reason: forceRemove.reason.trim() })
+    ElMessage.success('已强制卸载集群应用')
+    forceRemove.visible = false
+    await load()
+  } catch (e) {
+    notifyError(e) // not_found（已无在用集群应用）等原文；弹窗保留
+  } finally {
+    forceRemove.busy = false
   }
 }
 
@@ -202,7 +224,10 @@ const eventText = (e: { from_state: string; to_state: string }) => `${labelOf(in
         <template #header>
           <div class="head">
             <span>集群应用</span>
-            <router-link v-if="app" :to="{ path: '/deployments', query: { instance_id: c.members[0]?.instance_id } }" data-testid="cluster-app-deployments">在部署列表中查看</router-link>
+            <span>
+              <router-link v-if="app" :to="{ path: '/deployments', query: { instance_id: c.members[0]?.instance_id } }" data-testid="cluster-app-deployments">在部署列表中查看</router-link>
+              <el-button v-if="canForceRemoveClusterApp(role, app)" size="small" type="danger" plain class="gap" data-testid="cluster-app-force-remove" @click="openForceRemove">强制卸载</el-button>
+            </span>
           </div>
         </template>
         <p v-if="!app" class="muted" data-testid="cluster-app-none">没有集群应用</p>
@@ -269,6 +294,14 @@ const eventText = (e: { from_state: string; to_state: string }) => `${labelOf(in
           <el-button data-testid="cluster-resync-cancel" @click="resync.visible = false">取消</el-button>
           <el-button type="primary" :loading="resync.busy" data-testid="cluster-resync-ok" @click="submitResync">确定下发</el-button>
         </template>
+      </el-dialog>
+
+      <el-dialog v-model="forceRemove.visible" title="强制卸载集群应用" width="460" align-center data-testid="cluster-app-force-remove-dialog">
+        <p>将卸载全部成员上的 {{ app?.app_name }}（整组卸载），应用目录会删除，模型缓存保留；用户会看到应用被平台卸载。</p>
+        <el-form label-position="top" @submit.prevent="submitForceRemove">
+          <el-form-item label="原因（必填）"><el-input v-model="forceRemove.reason" data-testid="cluster-app-force-remove-reason" /></el-form-item>
+          <el-button type="danger" native-type="submit" :loading="forceRemove.busy" data-testid="cluster-app-force-remove-submit">确定卸载</el-button>
+        </el-form>
       </el-dialog>
 
       <el-dialog v-model="migrate.visible" :title="`成员换机（rank ${migrate.rank}）`" width="480" align-center data-testid="cluster-migrate-dialog">
