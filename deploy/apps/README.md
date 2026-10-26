@@ -27,7 +27,7 @@
 
 | 名称 | 镜像 | 用到它的应用 |
 |---|---|---|
-| `LLM Serving` | `spark/llm-serving:25.09` | vllm、vllm-node、open-webui、jupyterlab |
+| `LLM Serving` | `spark/llm-serving:25.09` | vllm、vllm-node、vllm-cluster、open-webui、jupyterlab |
 | `ComfyUI` | `spark/comfyui:25.09` | comfyui、jupyterlab |
 | `PyTorch` | `spark/pytorch:25.09` | jupyterlab |
 
@@ -35,7 +35,36 @@
 
 | 应用 | 用途 |
 |---|---|
-| `vllm-node` | Token 商城推理节点（计划 9）：`llm.Controller` 在「Token 服务池」机器的系统实例上自动部署。`MODEL_ID / MODEL_SOURCE / SERVED_MODEL_NAME / MAX_MODEL_LEN / API_KEY` 由平台按后台模型目录填写（`API_KEY` 是平台生成的节点密钥，必填，`^[A-Za-z0-9_-]{32,128}$`）；`GPU_MEMORY_UTILIZATION / MAX_NUM_SEQS / QUANTIZATION / REASONING_PARSER / TOOL_CALL_PARSER / TASK / MODEL_SIZE_GB` 可经模型的 `node_env` 覆盖。vLLM 只监听 `127.0.0.1:$SPARK_PORT` 并用节点密钥鉴权；下载进度按 `MODEL_SIZE_GB`（缺省 20）估算。导入后同样要在后台发布（目录页显示「内部」标签） |
+| `vllm-node` | Token 商城推理节点（计划 9）：`llm.Controller` 在「Token 服务池」机器的系统实例上自动部署。`MODEL_ID / MODEL_SOURCE / SERVED_MODEL_NAME / MAX_MODEL_LEN / API_KEY` 由平台按后台模型目录填写（`API_KEY` 是平台生成的节点密钥，必填，`^[A-Za-z0-9_-]{32,128}$`）；`GPU_MEMORY_UTILIZATION / MAX_NUM_SEQS / QUANTIZATION / REASONING_PARSER / TOOL_CALL_PARSER / TASK / MODEL_SIZE_GB` 可经模型的 `node_env` 覆盖。vLLM 只监听 `127.0.0.1:$SPARK_PORT` 并用节点密钥鉴权；下载进度按 `MODEL_SIZE_GB`（缺省 20）估算。1.1.0 起支持多机节点（`cluster.mode = optional`，见下文「集群应用」），`TENSOR_PARALLEL_SIZE / PIPELINE_PARALLEL_SIZE`（默认 1）由平台在每副本 N > 1 台时填写。导入后同样要在后台发布（目录页显示「内部」标签） |
+
+## 集群应用（计划 13）
+
+`spec.json` 写了 `cluster` 段的版本可以部署在实例集群上（`"cluster": {"mode": "optional|required", "min_size": 2, "max_size": 4}`，
+`worker_ports` 缺省 false = 端口只在 head 实例上登记）。集群部署时平台给每个成员建一条部署，env 相同，另加
+`SPARK_CLUSTER_ROLE`（rank0 = `head`，其余 = `worker`）与 `SPARK_CLUSTER_DEPLOYMENT`；集群拓扑由脚本自己读 Agent 维护的
+`/.spark/cluster.env`（每行 `export KEY='value'`：`SPARK_CLUSTER_SIZE / RANK / IP / HEAD_IP / IPS`、`VLLM_HOST_IP`、
+`NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME = spc0`、`NCCL_IB_*` 等，换机后自动更新）。
+
+| 应用 | 模式 | 说明 |
+|---|---|---|
+| `vllm-node` 1.1.0 | optional（内部） | Token 商城多机节点；`SPARK_CLUSTER_ROLE` 为空时与 1.0.0 相同（单机） |
+| `vllm-cluster` 1.0.0 | required（公开） | 用户在集群页部署的多机 vLLM；`MODEL_ID` 任意仓库（必填），`TENSOR_PARALLEL_SIZE` 留空 = 集群台数，`API_KEY` 可选（经 `VLLM_API_KEY` 传入，不进命令行） |
+
+两份 `app.sh` 的 `# ---- spark-cluster-ray begin ----` 到 `# ---- spark-cluster-ray end ----` 之间逐字相同（`apps_dir_test` 断言，改一处要同步另一处）：
+
+- 共同：`install` 每个成员都下载同一份模型（先校验集群信息与并行参数，配错不白下）；`start` 先 `. /.spark/cluster.env`
+  （缺失 → 退出 2「集群信息缺失」），`TP = ${TENSOR_PARALLEL_SIZE:-台数}`、`PP = ${PIPELINE_PARALLEL_SIZE:-1}`，`TP × PP ≠ 台数` → 退出 2；
+  `PP > 1` 时先 `python3 -c 'import cupy, ray.dag'`（vLLM 0.10 的 Ray 流水线并行走 Compiled Graph，`spark/llm-serving:25.09` **没有 cupy**），
+  失败 → 退出 2「流水线并行需要镜像内 cupy，请改用 TP = 台数」。这些消息经 `spark_status install 0 …` 记进部署日志（状态消息是 run.sh 的「… 失败，退出码 2」）。
+- head：`ray stop --force` → `ray start --head --node-ip-address=$SPARK_CLUSTER_IP --port=6379 --num-gpus=1 --object-store-memory=2000000000
+  --dashboard-host=127.0.0.1 --disable-usage-stats` → 后台：等 Ray 里存活且带 GPU 的节点数达到台数（超时 `SPARK_TIMEOUT_S`，
+  超时 → 「worker 未加入」，服务进程退出、部署 failed）→ `export RAY_ADDRESS="$SPARK_CLUSTER_HEAD_IP:6379"` →
+  `exec vllm serve … --distributed-executor-backend ray --tensor-parallel-size TP --pipeline-parallel-size PP`（输出 `vllm.log`，尾部并入部署日志）。
+- worker：回环健康服务 `$SPARK_APP_DIR/health.py`（脚本里 heredoc 生成；`GET /health` 在 `raylet` 进程存在时 200，否则 503，其它路径 404）
+  + 后台循环 `ray start --address=<head>:6379 --node-ip-address=$SPARK_CLUSTER_IP --num-gpus=1 --object-store-memory=2000000000 --block`
+  （退出后 `ray stop --force`、10 秒后重连；head 重新部署后自动加入；连通性用 python3 TCP 探测记日志，镜像里没有 ping）。
+- `stop`：停健康服务 / 日志尾巴，`ray stop --force`。
+- 对象存储固定 2GB：GB10 是统一内存，Ray 默认按 30% 内存预留会挤占显存。
 
 ## 导入
 
@@ -73,6 +102,7 @@ platform admin app import deploy/apps
 |---|---|---|---|
 | vllm | `Qwen/Qwen3-4B` / `Qwen3-8B` / `Qwen2.5-7B-Instruct` / `Qwen3-14B` | 整个仓库 | 8 / 16 / 15 / 29GB |
 | vllm-node | 后台模型目录的 `source_id`（任意仓库） | 整个仓库 | 按模型的 `MODEL_SIZE_GB` |
+| vllm-cluster | 用户填的仓库 ID（任意仓库），每个成员各下一份 | 整个仓库 | 按 `MODEL_SIZE_GB`（缺省 60） |
 | comfyui | `AI-ModelScope/stable-diffusion-xl-base-1.0` | `sd_xl_base_1.0.safetensors` → `checkpoints` | 7GB |
 | comfyui | `AI-ModelScope/FLUX.1-schnell`（ModelScope） | `flux1-schnell.safetensors` → `unet`、`ae.safetensors` → `vae`，`AI-ModelScope/flux_text_encoders` 的 `clip_l` + `t5xxl_fp16` → `clip` | 34GB |
 | comfyui | `AI-ModelScope/FLUX.1-schnell`（hf-mirror） | `Comfy-Org/flux1-schnell` 的 fp8 单文件 checkpoint（HF 官方仓库需登录同意协议） | 17GB |
