@@ -282,7 +282,7 @@ func (s *Service) CreateCluster(ctx context.Context, req ClusterCreateRequest) (
 // clusterOpState 是整组操作在事务里拿到的、已按锁序加锁的数据。
 type clusterOpState struct {
 	cluster clusterRow
-	acd     ClusterDeployment         // 不含成员（fillClusterDeployment 之前的行）
+	acd     ClusterDeployment          // 不含成员（fillClusterDeployment 之前的行）
 	locked  map[string]rental.Instance // 在位成员 ∪ 该集群部署非终态 / lost 成员部署所在的实例
 	members []member                   // 在位成员（rank、ID 序）
 	deps    []Deployment               // 该集群部署的非终态与 lost 成员部署（已加锁，按 ID）

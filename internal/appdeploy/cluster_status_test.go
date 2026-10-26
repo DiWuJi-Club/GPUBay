@@ -22,10 +22,10 @@ func TestAggregateClusterTable(t *testing.T) {
 		ok, bad, unk = appdeploy.HealthOK, appdeploy.HealthUnhealthy, appdeploy.HealthUnknown
 	)
 	cases := []struct {
-		name                 string
-		members              []appdeploy.ClusterMemberDeployment
+		name                  string
+		members               []appdeploy.ClusterMemberDeployment
 		status, health, phase string
-		progress             int
+		progress              int
 	}{
 		{"任一 failed → failed（优先于 removing）",
 			[]appdeploy.ClusterMemberDeployment{mem(0, appdeploy.StateRunning, ok, 100, "serve", true), mem(1, appdeploy.StateFailed, unk, 30, "download", true),

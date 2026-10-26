@@ -88,7 +88,11 @@ func TestCreateClusterValidation(t *testing.T) {
 	none, _ := e.publishedApp("webui", specPorts(8080), goodScript, []int64{e.imageID})
 	big, _ := e.publishedApp("big", clusterSpec(appdeploy.ClusterModeRequired, 4, 4), goodScript, []int64{e.imageID})
 	mismatch, _ := e.publishedApp("other", clusterSpec(appdeploy.ClusterModeOptional, 2, 4), goodScript, []int64{e.otherImage()})
-	dup, _ := e.publishedApp("dup", func() appdeploy.Spec { s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4); s.Ports[0].Port = 9000; return s }(), goodScript, []int64{e.imageID})
+	dup, _ := e.publishedApp("dup", func() appdeploy.Spec {
+		s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4)
+		s.Ports[0].Port = 9000
+		return s
+	}(), goodScript, []int64{e.imageID})
 	cid, insts := e.newCluster(2)
 	other := dbtest.CreateUser(t, e.pool, "13800000001", true)
 
@@ -135,7 +139,11 @@ func TestCreateClusterValidation(t *testing.T) {
 	sysInst2 := e.runningInstance()
 	sys := e.clusterOf(true, sysInst, sysInst2)
 	wantCode(t, "user on system cluster", try(e.userID, sys, opt.ID), "cluster_not_found")
-	internal, _ := e.publishedApp("vllm-int", func() appdeploy.Spec { s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4); s.Ports[0].Port = 8100; return s }(), goodScript, []int64{e.imageID})
+	internal, _ := e.publishedApp("vllm-int", func() appdeploy.Spec {
+		s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4)
+		s.Ports[0].Port = 8100
+		return s
+	}(), goodScript, []int64{e.imageID})
 	e.exec(`UPDATE apps SET internal = true WHERE id = $1`, internal.ID)
 	if _, err := e.svc.CreateCluster(e.ctx, appdeploy.ClusterCreateRequest{UserID: e.systemID, ClusterID: sys, AppID: internal.ID}); err != nil {
 		t.Fatalf("system CreateCluster internal app: %v", err)
@@ -215,7 +223,11 @@ func TestCreateClusterRoles(t *testing.T) {
 func TestCreateClusterConcurrent(t *testing.T) {
 	e := newEnv(t, 2)
 	a, _ := e.publishedApp("vllm-cluster", clusterSpec(appdeploy.ClusterModeRequired, 2, 4), goodScript, []int64{e.imageID})
-	b, _ := e.publishedApp("vllm-node", func() appdeploy.Spec { s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4); s.Ports[0].Port = 9000; return s }(), goodScript, []int64{e.imageID})
+	b, _ := e.publishedApp("vllm-node", func() appdeploy.Spec {
+		s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4)
+		s.Ports[0].Port = 9000
+		return s
+	}(), goodScript, []int64{e.imageID})
 	cid, _ := e.newCluster(2)
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
@@ -248,7 +260,11 @@ func TestCreateClusterConcurrent(t *testing.T) {
 func TestRequiredAppRejectsSingleCreate(t *testing.T) {
 	e := newEnv(t, 2)
 	req, _ := e.publishedApp("vllm-cluster", clusterSpec(appdeploy.ClusterModeRequired, 2, 4), goodScript, []int64{e.imageID})
-	opt, _ := e.publishedApp("vllm-node", func() appdeploy.Spec { s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4); s.Ports[0].Port = 9000; return s }(), goodScript, []int64{e.imageID})
+	opt, _ := e.publishedApp("vllm-node", func() appdeploy.Spec {
+		s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4)
+		s.Ports[0].Port = 9000
+		return s
+	}(), goodScript, []int64{e.imageID})
 	inst := e.runningInstance()
 	_, err := e.svc.Create(e.ctx, appdeploy.CreateRequest{UserID: e.userID, InstanceID: inst.ID, AppID: req.ID})
 	wantCode(t, "single create required", err, "app_cluster_required")
@@ -274,7 +290,11 @@ func TestRequiredAppRejectsPrepareInstall(t *testing.T) {
 	if e.count(`SELECT count(*) FROM instances`) != insts || e.count(`SELECT count(*) FROM app_deployments`) != 0 {
 		t.Fatal("rejected order left side effects")
 	}
-	opt, _ := e.publishedApp("vllm-node", func() appdeploy.Spec { s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4); s.Ports[0].Port = 9000; return s }(), goodScript, []int64{e.imageID})
+	opt, _ := e.publishedApp("vllm-node", func() appdeploy.Spec {
+		s := clusterSpec(appdeploy.ClusterModeOptional, 2, 4)
+		s.Ports[0].Port = 9000
+		return s
+	}(), goodScript, []int64{e.imageID})
 	if _, err := e.svc.PrepareInstall(e.ctx, e.pool, opt.ID, e.imageID, nil, nil); err != nil {
 		t.Fatalf("optional PrepareInstall: %v", err)
 	}
@@ -509,12 +529,16 @@ func TestClusterDeploymentFinalizedWhenMembersGone(t *testing.T) {
 	a, _ := e.publishedApp("vllm-cluster", clusterSpec(appdeploy.ClusterModeRequired, 2, 4), goodScript, []int64{e.imageID})
 	cid, insts := e.newCluster(2)
 	cd := e.createCluster(cid, a.ID, nil)
-	e.hookTx(insts[0].ID, func(tx pgx.Tx) error { return e.svc.OnInstanceGone(e.ctx, tx, insts[0].ID, "开通失败", e.clk.Now()) })
+	e.hookTx(insts[0].ID, func(tx pgx.Tx) error {
+		return e.svc.OnInstanceGone(e.ctx, tx, insts[0].ID, "开通失败", e.clk.Now())
+	})
 	e.exec(`UPDATE instances SET state = 'wiping' WHERE id = $1`, insts[0].ID)
 	if got := e.clusterDep(cd.ID); got.State != appdeploy.ClusterDepActive || got.Status != appdeploy.ClusterStatusStale {
 		t.Fatalf("one member gone = %+v", got)
 	}
-	e.hookTx(insts[1].ID, func(tx pgx.Tx) error { return e.svc.OnInstanceGone(e.ctx, tx, insts[1].ID, "开通失败", e.clk.Now()) })
+	e.hookTx(insts[1].ID, func(tx pgx.Tx) error {
+		return e.svc.OnInstanceGone(e.ctx, tx, insts[1].ID, "开通失败", e.clk.Now())
+	})
 	if got := e.clusterDep(cd.ID); got.State != appdeploy.ClusterDepRemoved || got.Status != appdeploy.ClusterStatusRemoved {
 		t.Fatalf("all members gone = %+v", got)
 	}
