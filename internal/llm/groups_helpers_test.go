@@ -343,22 +343,25 @@ func (e *env) fabricMachine(serial string, fabricID int64, net string) int64 {
 	return id
 }
 
-// clusterVersion 给 vllm-node 插一个支持 2～maxSize 台集群的已发布版本（timeout_minutes = timeout，变量含 TP / PP）。
+// clusterVersion 给 vllm-node 插一个支持 2～maxSize 台集群的已发布版本（仓库 spec，cluster.max_size = maxSize、timeout_minutes = timeout）。
 func (e *env) clusterVersion(version string, maxSize, timeout int) int64 {
 	e.t.Helper()
 	spec := vllmNodeSpec(e.t)
 	spec.Cluster = &appdeploy.ClusterSupport{Mode: appdeploy.ClusterModeOptional, MinSize: 2, MaxSize: maxSize}
 	spec.TimeoutMinutes = timeout
-	spec.Env = append(spec.Env,
-		appdeploy.EnvSpec{Name: "TENSOR_PARALLEL_SIZE", Label: "张量并行", Type: "int", Min: ptr[int64](1), Max: ptr[int64](8), Default: "1"},
-		appdeploy.EnvSpec{Name: "PIPELINE_PARALLEL_SIZE", Label: "流水线并行", Type: "int", Min: ptr[int64](1), Max: ptr[int64](8), Default: "1"})
 	if err := appdeploy.ValidateSpec(&spec); err != nil {
 		e.t.Fatalf("cluster spec: %v", err)
 	}
 	return e.addNodeVersionSpec(version, appdeploy.StatusPublished, spec, e.imageID)
 }
 
-func ptr[T any](v T) *T { return &v }
+// plainVersion 给 vllm-node 插一个不支持集群的已发布版本（仓库 spec 去掉 cluster 段，模拟 1.0.0）。
+func (e *env) plainVersion(version string) int64 {
+	e.t.Helper()
+	spec := vllmNodeSpec(e.t)
+	spec.Cluster = nil
+	return e.addNodeVersionSpec(version, appdeploy.StatusPublished, spec, e.imageID)
+}
 
 // groupModel 建一个 nodes_per_replica = n、钉住 versionID、replicas 个副本的在线模型。
 func (e *env) groupModel(slug string, n, replicas int, versionID int64, mods ...func(*llm.ModelInput)) llm.Model {

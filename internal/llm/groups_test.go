@@ -20,6 +20,7 @@ func TestModelParallelValidation(t *testing.T) {
 	e := newEnv(t)
 	v4 := e.clusterVersion("1.1.0", 4, 360)
 	v2 := e.clusterVersion("1.1.1", 2, 360)
+	plain := e.plainVersion("1.0.9")
 	pin := func(id int64) func(*llm.ModelInput) { return func(in *llm.ModelInput) { in.AppVersionID = &id } }
 	bad := []struct {
 		name, field string
@@ -33,8 +34,9 @@ func TestModelParallelValidation(t *testing.T) {
 		{"pp-not-divisor", "tensor_parallel", func(in *llm.ModelInput) { in.NodesPerReplica, in.PipelineParallel, in.AppVersionID = 4, 3, &v4 }},
 		{"tp-on-single", "tensor_parallel", func(in *llm.ModelInput) { in.TensorParallel = 2 }},
 		{"embedding-n2", "nodes_per_replica", func(in *llm.ModelInput) { in.Kind, in.NodesPerReplica, in.AppVersionID = llm.KindEmbedding, 2, &v4 }},
-		{"version-no-cluster", "nodes_per_replica", func(in *llm.ModelInput) { in.NodesPerReplica, in.AppVersionID = 2, &e.versionID }},
+		{"version-no-cluster", "nodes_per_replica", func(in *llm.ModelInput) { in.NodesPerReplica, in.AppVersionID = 2, &plain }},
 		{"version-max-2", "nodes_per_replica", func(in *llm.ModelInput) { in.NodesPerReplica, in.AppVersionID = 4, &v2 }},
+		{"pp-unsupported", "pipeline_parallel", func(in *llm.ModelInput) { in.NodesPerReplica, in.PipelineParallel, in.AppVersionID = 4, 2, &v4 }},
 		{"reserved-tp", "node_env", func(in *llm.ModelInput) {
 			in.NodesPerReplica, in.AppVersionID, in.NodeEnv = 2, &v4, map[string]string{"TENSOR_PARALLEL_SIZE": "2"}
 		}},
@@ -52,9 +54,9 @@ func TestModelParallelValidation(t *testing.T) {
 	if m2.NodesPerReplica != 2 || m2.TensorParallel != 2 || m2.PipelineParallel != 1 {
 		t.Fatalf("defaults %+v", m2)
 	}
-	m4 := e.createModel("g4", func(in *llm.ModelInput) { in.NodesPerReplica, in.PipelineParallel = 4, 2 }, pin(v4))
-	if m4.TensorParallel != 2 || m4.PipelineParallel != 2 {
-		t.Fatalf("pp 2 %+v", m4)
+	m4 := e.createModel("g4", func(in *llm.ModelInput) { in.NodesPerReplica = 4 }, pin(v4))
+	if m4.TensorParallel != 4 || m4.PipelineParallel != 1 {
+		t.Fatalf("n 4 defaults %+v", m4)
 	}
 	if one := e.createModel("single"); one.NodesPerReplica != 1 || one.TensorParallel != 1 || one.PipelineParallel != 1 {
 		t.Fatalf("single defaults %+v", one)
@@ -75,9 +77,13 @@ func TestModelParallelValidation(t *testing.T) {
 		t.Fatalf("change N without nodes: %+v %v", got, err)
 	}
 	e.rawNode("node-chg000000002", m.ID, mach, llm.NodeReady)
+	in.Name = "renamed"
+	if got, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); err != nil || got.Name != "renamed" || got.TensorParallel != 2 {
+		t.Fatalf("update with nodes: %+v %v", got, err)
+	}
 	in.TensorParallel, in.PipelineParallel = 1, 2
-	if got, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); err != nil || got.PipelineParallel != 2 || got.TensorParallel != 1 {
-		t.Fatalf("change TP/PP with nodes: %+v %v", got, err)
+	if _, err := e.svc.UpdateModel(e.ctx, e.admin(), m.ID, in); errCode(err) != "llm_model_invalid" || !strings.Contains(err.Error(), "cupy") {
+		t.Fatalf("PP 2: %v", err)
 	}
 }
 

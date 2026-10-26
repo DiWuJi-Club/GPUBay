@@ -31,6 +31,7 @@ type ModelInput struct {
 	Replicas, MaxConcurrency, Sort                  int
 	Features                                        []string
 	// 计划 13（M11）：每副本机器数 ∈ {1, 2, 4}（0 → 1）；TensorParallel × PipelineParallel = NodesPerReplica（0 → TP = N / PP、PP = 1）。
+	// 当前镜像缺 cupy，PipelineParallel 只接受 1（> 1 → llm_model_invalid）。
 	NodesPerReplica, TensorParallel, PipelineParallel int
 }
 
@@ -178,6 +179,9 @@ func validateModelInput(in *ModelInput, create bool) error {
 		return apperr.LLMModelInvalid("tensor_parallel", "张量并行与流水线并行需在 1～8 之间")
 	case in.TensorParallel*in.PipelineParallel != in.NodesPerReplica:
 		return apperr.LLMModelInvalid("tensor_parallel", "张量并行 × 流水线并行必须等于每副本机器数")
+	case in.PipelineParallel > 1:
+		// 221 实测：LLM Serving 镜像没有 cupy，vLLM 的 Ray 流水线并行（Compiled Graph）起不来；镜像补齐前只开放 TP = N、PP = 1
+		return apperr.LLMModelInvalid("pipeline_parallel", "当前节点镜像不支持流水线并行（缺少 cupy），请设为 1（张量并行 = 每副本机器数）")
 	case in.Kind == KindEmbedding && in.NodesPerReplica != 1:
 		return apperr.LLMModelInvalid("nodes_per_replica", "向量模型只能单机部署")
 	}
