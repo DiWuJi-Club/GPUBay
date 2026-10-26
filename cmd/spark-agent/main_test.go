@@ -255,6 +255,8 @@ func TestSelfcheckNMManagedWarn(t *testing.T) {
 		"10.210.128.0/17 via 192.168.1.254 dev enP7s7 \n"+ // 落在集群网段里的路由
 		"10.210.9.0/24 dev eth9 proto kernel scope link src 10.210.9.2 \n"+ // 与地址重复的直连路由只报地址
 		"10.210.0.12 dev schabcd1234 scope link \n"+ // Agent 自己的对端路由不算冲突
+		"10.210.3.12 via 192.168.1.222 dev enP7s7 \n"+ // Agent 自建的跨机 /32 via 路由（routed 对端）不算冲突
+		"10.210.4.0/24 via 192.168.1.222 dev enP7s7 \n"+ // 不是 /32：照报
 		"192.168.1.0/24 dev enP7s7 proto kernel scope link src 192.168.1.50 \n", nil)
 	r.Stub("ip -4 route show default", "default via 192.168.1.1 dev enP7s7 proto dhcp src 192.168.1.50 metric 100 \n", nil)
 	r.Stub("ip -6 -o addr show", "5: enp1s0f1np1    inet6 fe80::966d:aeff:fe00:2/64 scope link \\       valid_lft forever preferred_lft forever\n"+
@@ -274,7 +276,7 @@ func TestSelfcheckNMManagedWarn(t *testing.T) {
 		"WARN: enp1s0f1np1 受 NetworkManager 管理，NM 可能重新加地址；请执行 install.sh --cluster-iface enp1s0f1np1\n",
 		"WARN: enP2p1s0f1np1 受 NetworkManager 管理，NM 可能重新加地址；请执行 install.sh --cluster-iface enP2p1s0f1np1\n",
 		"WARN: ip_forward: /proc/sys/net/ipv4/ip_forward 为 0",
-		"WARN: 集群网段 10.210.0.0/16: 与集群网段冲突：地址 10.210.9.2/24（eth9）；路由 10.210.128.0/17（enP7s7）\n",
+		"WARN: 集群网段 10.210.0.0/16: 与集群网段冲突：地址 10.210.9.2/24（eth9）；路由 10.210.128.0/17（enP7s7）；路由 10.210.4.0/24（enP7s7）\n",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %q in:\n%s", want, s)

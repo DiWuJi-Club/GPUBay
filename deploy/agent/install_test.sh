@@ -152,7 +152,7 @@ rm -f "$SPARK_INSTALL_NM_CONF"
 expect_conf "interface-name:enp1s0f0np0"
 grep -q "未找到 nmcli" "$FAKE/out.txt" || { echo "无 nmcli 应提示"; exit 1; }
 # 非法网卡名 / 缺取值 / 非 root：失败且不改配置
-for bad in "a;b" "a b" "-x" "abcdefghijklmnop" "" 'x$(id)'; do
+for bad in "a;b" "a b" "-x" ".x" "_x" "abcdefghijklmnop" "" 'x$(id)'; do
   if run --cluster-iface "$bad" >/dev/null 2>&1; then echo "非法网卡名应失败: $bad"; exit 1; fi
 done
 if run --cluster-iface 2>/dev/null; then echo "--cluster-iface 缺取值应失败"; exit 1; fi

@@ -29,6 +29,9 @@ type Options struct {
 	ProcRoot string        // 默认 "/proc"：核对容器内 /dev/infiniband（<ProcRoot>/<pid>/root/dev/infiniband）
 	GIDWait  time.Duration // 默认 5s：RoCE GID 表异步填充，每 200ms 查一次
 	Log      *slog.Logger
+	// LanIPs：Probe 之前（Agent 重启后 Recover 时 lanIP 尚为空）的管理地址来源，通常是状态文件里实例记录的 LanIP；
+	// macvlan 拒绝持有其中任一地址的网卡。nil = 只靠默认路由与 Probe 记下的 lanIP。
+	LanIPs func() []string
 }
 
 // Net 实现 clusternet.Net。

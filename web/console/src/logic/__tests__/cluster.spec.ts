@@ -11,8 +11,8 @@ const view = (over: Partial<ConsoleClusterView> = {}): ConsoleClusterView => ({
   batch_id: 'bat-1', expires_at: '2026-10-27T10:00:00Z', expires_mismatch: false, auto_renew: false, auto_renew_duration: '1d',
   auto_renew_failed_reason: '', renewable_until: null, renew_options: [{ duration: '1d', quantity_max: 90 }],
   members: [
-    { rank: 0, instance_id: 'ins-aaaaaaaa', state: 'running', suspended: false, ip: '10.210.7.11', machine_label: 'A-01', net_status: 'ok', expires_at: '2026-10-27T10:00:00Z' },
-    { rank: 1, instance_id: 'ins-bbbbbbbb', state: 'running', suspended: false, ip: '10.210.7.12', machine_label: 'A-02', net_status: 'ok', expires_at: '2026-10-27T10:00:00Z' },
+    { rank: 0, instance_id: 'ins-aaaaaaaa', state: 'running', suspended: false, ip: '10.210.7.11', machine_label: 'A-01', net_status: 'ok', net_reason: '', expires_at: '2026-10-27T10:00:00Z' },
+    { rank: 1, instance_id: 'ins-bbbbbbbb', state: 'running', suspended: false, ip: '10.210.7.12', machine_label: 'A-02', net_status: 'ok', net_reason: '', expires_at: '2026-10-27T10:00:00Z' },
   ],
   app: null, ready_at: '2026-10-26T10:00:00Z', ended_at: null, created_at: '2026-10-26T09:55:00Z', ...over,
 })
@@ -64,10 +64,12 @@ describe('状态徽标与提示', () => {
     expect(clusterNotices(view({ expires_mismatch: true })).find((n) => n.key === 'expires_mismatch')!.text).toContain('成员到期时间不一致')
   })
   it('成员网络状态文案', () => {
+    // 控制台只拿到归一化值（终审 B-2）：ok / pending / error + 固定原因；原始 Agent 文本不展示
     expect(netStatusText('ok')).toEqual({ text: '正常', type: 'success' })
-    expect(netStatusText('pending').text).toBe('等待中')
-    expect(netStatusText('')).toEqual({ text: '未上报', type: 'info' })
-    expect(netStatusText('error: no route')).toEqual({ text: '异常：no route', type: 'danger' })
+    expect(netStatusText('pending')).toEqual({ text: '等待中', type: 'primary' })
+    expect(netStatusText('error', '集群网络异常，平台已告警处理')).toEqual({ text: '异常：集群网络异常，平台已告警处理', type: 'danger' })
+    expect(netStatusText('error', '')).toEqual({ text: '异常', type: 'danger' })
+    expect(netStatusText('error: ip link add vlan id 9' as never).text).toBe('异常')
   })
 })
 

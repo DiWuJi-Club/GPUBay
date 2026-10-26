@@ -112,12 +112,16 @@ const autoRenewDurations = computed<Duration[]>(() => {
   const d = view.value?.auto_renew_duration
   return d ? [d] : []
 })
+/** 开启自动续费用的时长：集群现有时长 → 商品第一个档位；商品没加载且集群没有时长时为 null（开关禁用，不猜 1d）。 */
+const enableDuration = computed<Duration | null>(() => view.value?.auto_renew_duration || autoRenewDurations.value[0] || null)
 async function setAutoRenew(enabled: boolean, duration?: Duration) {
   const v = view.value
   if (!v || togglingAutoRenew.value) return
+  const d = duration ?? enableDuration.value
+  if (enabled && !d) return
   togglingAutoRenew.value = true
   try {
-    const next = await api.put<ConsoleClusterView>(`/clusters/${v.id}/auto-renew`, { enabled, duration: duration ?? (v.auto_renew_duration || autoRenewDurations.value[0] || '1d') })
+    const next = await api.put<ConsoleClusterView>(`/clusters/${v.id}/auto-renew`, enabled ? { enabled, duration: d } : { enabled })
     seq++
     view.value = next
     ElMessage.success(enabled ? '已为全部成员开启自动续费' : '已关闭自动续费')
@@ -214,7 +218,7 @@ async function confirmRelease() {
 
       <el-card v-if="actions?.active" header="自动续费" data-testid="cluster-auto-renew-card">
         <div class="row">
-          <el-switch :model-value="view.auto_renew" :loading="togglingAutoRenew" data-testid="cluster-auto-renew" @change="(v: string | number | boolean) => setAutoRenew(v === true)" />
+          <el-switch :model-value="view.auto_renew" :loading="togglingAutoRenew" :disabled="!view.auto_renew && !enableDuration" data-testid="cluster-auto-renew" @change="(v: string | number | boolean) => setAutoRenew(v === true)" />
           <el-select
             :model-value="view.auto_renew_duration || undefined" :disabled="!view.auto_renew || togglingAutoRenew || !product"
             data-testid="cluster-auto-renew-duration" style="width: 110px" @change="(d: Duration) => setAutoRenew(true, d)"

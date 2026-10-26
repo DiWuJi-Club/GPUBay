@@ -206,6 +206,21 @@ func (s *Store) DeleteInstance(id string) error {
 	return s.save()
 }
 
+// LanIPs 返回实例记录里的管理地址（去重、去空、升序）。Agent 重启后、AgentConfig / Probe 之前，
+// 集群网络（macvlan）据此认出管理网卡，不清它的地址。
+func (s *Store) LanIPs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, i := range s.f.Instances {
+		if i.LanIP != "" && !slices.Contains(out, i.LanIP) {
+			out = append(out, i.LanIP)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 func (s *Store) Instances() []Instance {
 	s.mu.Lock()
 	defer s.mu.Unlock()

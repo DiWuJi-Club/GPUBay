@@ -86,12 +86,19 @@ const groupSel = computed({ get: () => form.groupId ?? NO_GROUP, set: (v: number
 const isCluster = computed(() => form.clusterSize > 0)
 const clusterOptions = computed(() => clusterRentOptions((props.product as ProductWithClusters).clusters))
 const clusterAvail = ref<{ available: number; rdma: boolean } | null>(null)
+// 切到集群前的单机设置：切回单机时恢复开始方式与数量（集群之间互切不覆盖；对话框重新打开时清空）
+let beforeCluster: { immediate: boolean; count: number } | null = null
 watch(() => form.clusterSize, (n) => {
   if (n > 0) {
+    beforeCluster ??= { immediate: form.immediate, count: form.count }
     form.count = n
     form.immediate = true
     form.machineId = null
     form.appId = null
+  } else if (beforeCluster) {
+    form.immediate = beforeCluster.immediate
+    form.count = beforeCluster.count
+    beforeCluster = null
   } else form.count = 1
 })
 
@@ -297,6 +304,7 @@ watch(visible, (v) => {
   step.value = props.mode === 'immediate' && props.appId == null ? 'confirm' : 'form'
   expanded.value = props.mode === 'booking' || props.appId != null
   wfCatalog.value = null // 先于 applyApp：预设 ID 等目录拉到后再按目录过滤
+  beforeCluster = null
   Object.assign(form, { groupId: null, count: 1, immediate: props.mode === 'immediate', duration: props.duration, quantity: 1, imageId: props.imageId, machineId: null, autoRenew: false, autoRenewDuration: props.duration, appId: props.appId, clusterSize: 0 })
   applyApp() // appId 与上次相同时 watch 不触发：显式重置镜像、变量与预装工作流
   availability.value = null

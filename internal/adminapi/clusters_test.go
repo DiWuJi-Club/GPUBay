@@ -301,3 +301,24 @@ func TestDashboardClusters(t *testing.T) {
 		t.Fatalf("clusters = %d %v", code, cl)
 	}
 }
+
+// 终审 B-2：后台集群视图保留 Agent 上报的原始集群网络状态（控制台只给归一化值）。
+func TestAdminClusterNetStatusRaw(t *testing.T) {
+	e := newEnv(t)
+	ops := e.loginAs("ops", admin.RoleOps)
+	_, _, c := e.lanCluster(ops, 2, "13600000091")
+	raw := "error: ip link add link enP7s7 name scv1234 type vlan id 1234: exit status 2"
+	m := c.Members[1]
+	if err := e.fleet.RecordStateReport(e.ctx, m.MachineID, fleet.StateReport{Instances: []fleet.InstanceState{
+		{InstanceID: m.InstanceID, Phase: fleet.PhaseRunning, Cluster: raw}}}); err != nil {
+		t.Fatal(err)
+	}
+	code, out := ops.do("GET", "/clusters/"+c.ID, nil)
+	if code != 200 {
+		t.Fatalf("detail = %d %v", code, out)
+	}
+	m1 := out["cluster"].(map[string]any)["members"].([]any)[1].(map[string]any)
+	if m1["net_status"] != raw {
+		t.Fatalf("admin member 1 net_status = %v", m1["net_status"])
+	}
+}

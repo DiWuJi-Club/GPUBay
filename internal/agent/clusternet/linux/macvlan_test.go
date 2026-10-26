@@ -129,6 +129,17 @@ func TestApplyRefusesLanIface(t *testing.T) {
 	}
 	noCall(t, r, writes...)
 
+	// Agent 重启后尚未 Probe（lanIP 为空）：退回 Options.LanIPs（状态文件里实例记录的管理地址），同样拒绝（终审 B-11）
+	r = &cmdrun.Recorder{}
+	r.Stub("ip -4 route show default", defaultViaLan, nil)
+	r.Stub("ip -4 -o addr show dev enp1s0f1np1", `4: enp1s0f1np1    inet 192.168.10.50/24 brd 192.168.10.255 scope global enp1s0f1np1\       valid_lft forever preferred_lft forever`+"\n", nil)
+	n = newNet(r, Options{LanIPs: func() []string { return []string{"10.0.0.9", "192.168.10.50"} }})
+	_, err = n.Apply(context.Background(), ids[0], 777, macvlanSpec(0, 2, 0))
+	if err == nil || !strings.Contains(err.Error(), "集群网卡不能是管理网卡") || !strings.Contains(err.Error(), "192.168.10.50") {
+		t.Fatalf("recover fallback err = %v", err)
+	}
+	noCall(t, r, writes...)
+
 	// routed 模式本来就走管理网卡，不拒绝
 	r = &cmdrun.Recorder{}
 	stubNoSpc0(r, "4242")

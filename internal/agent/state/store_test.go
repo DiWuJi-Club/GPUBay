@@ -143,3 +143,23 @@ func TestStateRoundTripCluster(t *testing.T) {
 		t.Fatal("Instances() aliased store")
 	}
 }
+
+// LanIPs：状态文件里实例记录的管理地址（去重、非空、有序），Agent 重启后 Probe 之前供集群网络认出管理网卡（终审 B-11）。
+func TestStoreLanIPs(t *testing.T) {
+	s, err := state.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.LanIPs(); len(got) != 0 {
+		t.Fatalf("empty = %v", got)
+	}
+	for _, i := range []state.Instance{{ID: "ins-bbbbbbbb", LanIP: "192.168.1.50"}, {ID: "ins-aaaaaaaa", LanIP: "192.168.1.50"},
+		{ID: "ins-cccccccc", LanIP: ""}, {ID: "ins-dddddddd", LanIP: "10.0.0.9"}} {
+		if err := s.PutInstance(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := fmt.Sprint(s.LanIPs()); got != "[10.0.0.9 192.168.1.50]" {
+		t.Fatalf("LanIPs = %s", got)
+	}
+}
