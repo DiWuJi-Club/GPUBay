@@ -69,6 +69,10 @@ func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	if f.FabricID, err = queryInt(r, "fabric_id"); err != nil { // 计划 13：只看该集群网络
+		s.writeError(w, r, err)
+		return
+	}
 	list, total, err := s.Fleet.ListMachines(r.Context(), f, p)
 	if err != nil {
 		s.writeError(w, r, err)
@@ -241,6 +245,16 @@ func (s *Server) handleMachine(w http.ResponseWriter, r *http.Request) {
 			group = &g
 		}
 	}
+	// 计划 13：所属集群网络（机器里只有 fabric_id / fabric_name，详情页要 kind / isolation / rdma）；不在 fabric 时为 null
+	var fabric *fleet.Fabric
+	if m.FabricID != nil {
+		f, err := s.Fleet.GetFabric(r.Context(), s.Fleet.Pool(), *m.FabricID)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		fabric = &f
+	}
 	leases, err := s.Rental.MachineLeases(r.Context(), id, s.Clock.Now(), 60)
 	if err != nil {
 		s.writeError(w, r, err)
@@ -252,7 +266,7 @@ func (s *Server) handleMachine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"machine": m, "current_instance": current, "history": history,
-		"group": group, "leases": leases, "upcoming_bookings": upcoming})
+		"group": group, "leases": leases, "upcoming_bookings": upcoming, "fabric": fabric})
 }
 
 func (s *Server) handleMaintenance(w http.ResponseWriter, r *http.Request) {
