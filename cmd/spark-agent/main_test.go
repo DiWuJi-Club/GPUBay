@@ -223,7 +223,7 @@ func TestSelfcheckClusterSection(t *testing.T) {
 	}
 	for _, want := range []string{
 		"ok: iface enP7s7 up=false speed=0 driver=r8127 rdma=- active=false\n",
-		"ok: iface wlP9s9 up=true speed=0 driver=mt7925e rdma=- active=false\n",
+		"ok: iface wlP9s9 up=true speed=0 driver=mt7925e rdma=- active=false wireless=true\n",
 		"WARN: 未发现 ConnectX-7 网卡，集群将只能使用普通以太网\n",
 		"ok: ip_forward 1\n",
 		"ok: 集群网段 10.210.0.0/16 无冲突\n",
