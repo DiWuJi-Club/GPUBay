@@ -110,6 +110,7 @@ func (s *Service) RefundQuote(ctx context.Context, instanceID string) (RefundQuo
 
 // RefundRelease 后台「退款并释放」：实例进入洗机，并按订单从新到旧退还 amount（分）到余额。返回实际退款金额。
 // 加锁顺序：instance → agent_commands（beginWipe）→ orders → wallet。
+// 计划 13：集群成员 → 集群行 → instance → …；释放后 version + 1，其余在位成员收到 configure_cluster（成员列表去掉它）。
 func (s *Service) RefundRelease(ctx context.Context, actor audit.Actor, instanceID string, amount int64, reason string) (int64, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -120,7 +121,7 @@ func (s *Service) RefundRelease(ctx context.Context, actor audit.Actor, instance
 	}
 	now := s.d.Clock.Now()
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		inst, err := lockInstance(ctx, tx, instanceID)
+		cluster, inst, err := lockMemberCluster(ctx, tx, instanceID)
 		if err != nil {
 			return err
 		}
@@ -145,6 +146,11 @@ func (s *Service) RefundRelease(ctx context.Context, actor audit.Actor, instance
 		parts, err := s.refundAcross(ctx, tx, inst.UserID, orders, amount, actor.AdminID, "退款并释放 "+inst.ID+"："+reason, now)
 		if err != nil {
 			return err
+		}
+		if cluster != nil && cluster.State == ClusterActive {
+			if _, _, err := s.bumpClusterVersion(ctx, tx, cluster.ID, "", now); err != nil {
+				return err
+			}
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("instance.refund_release", "instance", inst.ID, map[string]any{
 			"amount": amount, "reason": reason, "state": inst.State, "suggested": q.Suggested, "max": q.Max, "orders": parts,

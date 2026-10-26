@@ -19,6 +19,17 @@
 //   应用部署钩子（AppHooks，计划 7）：都在已持实例行锁之后调用，再锁 app_deployments → instance_ports（appdeploy 一律同序）
 //   PlaceSystem（计划 9）：machines(NO KEY UPDATE，等待) → 插实例 / lease → agent_commands；不碰 orders / wallet
 //   ReleaseSystem（计划 9）：与 Release 相同（instance → lease → agent_commands，经 beginWipe）
+//   计划 13（集群，规格 §14）：
+//   PlaceBatch 集群分支：idem 咨询锁 → machines(NO KEY UPDATE, SKIP LOCKED，按 (fabric, cluster_net) 逐个 savepoint) → cluster-alloc 咨询锁
+//     → 插 instance_clusters → 实例 / lease → orders → wallet → agent_commands
+//   PlaceSystemCluster：machines(NO KEY UPDATE，按 ID 升序等待) → cluster-alloc 咨询锁 → 插集群 → 实例 / lease → agent_commands
+//   多成员路径（SweepClusters、RenewCluster、SetClusterAutoRenew、ReleaseCluster、AdminExtendCluster、AdminResyncCluster、
+//     AutoRenewClustersDue、ReleaseSystemCluster、成员 AdminMigrate / RefundRelease、appdeploy 集群操作）：
+//     instance_clusters 行 FOR UPDATE → 成员实例（ID 升序）→ 其后与对应单实例路径相同（lease → orders → wallet → agent_commands）
+//     RenewCluster 在集群行锁之前先取 idem 咨询锁；成员 AdminMigrate：集群 → 原实例 → 新机器(SKIP LOCKED) → 指令
+//   单实例路径（HandleCommandResult、ExpireDue、Suspend / Resume、refreshLease、beginWipe、SendReminders、用户访问设置…）
+//     不读写 instance_clusters 行（只读 instances.cluster_id 列），因此不会与「集群 → 实例」形成环；
+//     SendReminders 给同集群其余成员置提醒标记时用 SKIP LOCKED，不等待别的事务持有的成员行锁。
 // 持机器行锁的事务只会在插入 lease 撞到别的事务未提交的 lease 增长时等待；而让 lease 增长的路径都不等机器锁，等待链不成环。
 
 package rental

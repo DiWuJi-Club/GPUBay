@@ -30,6 +30,9 @@ func (s *Service) SetAutoRenew(ctx context.Context, userID int64, id string, ena
 		if inst.UserID != userID {
 			return apperr.ErrNotFound
 		}
+		if inst.ClusterID != nil { // 集群成员整组设置（SetClusterAutoRenew）
+			return apperr.ErrClusterMember
+		}
 		if inst.System { // 系统实例不到期，没有续费可言
 			return apperr.ErrInvalidState
 		}
@@ -49,9 +52,10 @@ func (s *Service) SetAutoRenew(ctx context.Context, userID int64, id string, ena
 	return out, err
 }
 
-// autoRenewPred：到期前 AutoRenewLead 内、运行中未暂停、开了自动续费；失败后按原因间隔重试（$1 = now；间隔来自常量）。
+// autoRenewPred：到期前 AutoRenewLead 内、运行中未暂停、开了自动续费、不是集群成员（成员由 AutoRenewClustersDue 整组续费）；
+// 失败后按原因间隔重试（$1 = now；间隔来自常量）。
 // $1 必须显式转 timestamptz：否则 `$1 + interval` 会把 $1 推断成 interval。
-var autoRenewPred = fmt.Sprintf(`state = 'running' AND suspended_at IS NULL AND auto_renew AND expires_at <= $1::timestamptz + interval '%d seconds'
+var autoRenewPred = fmt.Sprintf(`state = 'running' AND suspended_at IS NULL AND auto_renew AND cluster_id IS NULL AND expires_at <= $1::timestamptz + interval '%d seconds'
 	AND (auto_renew_failed_at IS NULL OR auto_renew_failed_at <= $1::timestamptz
 	     - CASE WHEN auto_renew_failed_reason = 'renew_blocked' THEN interval '%d seconds' ELSE interval '%d seconds' END)`,
 	int(AutoRenewLead/time.Second), int(AutoRenewRetryBlocked/time.Second), int(AutoRenewRetry/time.Second))

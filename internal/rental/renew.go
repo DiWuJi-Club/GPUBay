@@ -60,6 +60,9 @@ func (s *Service) RenewQuantity(ctx context.Context, userID int64, instanceID st
 			if inst.UserID != userID {
 				return apperr.ErrNotFound
 			}
+			if inst.ClusterID != nil { // 集群成员只能整组续费（RenewCluster）
+				return apperr.ErrClusterMember
+			}
 			if inst.System || (inst.State != StateReserved && inst.State != StateCreating && inst.State != StateRunning && inst.State != StateStopped) {
 				return apperr.ErrInvalidState
 			}
@@ -130,6 +133,9 @@ func (s *Service) Release(ctx context.Context, userID int64, instanceID string) 
 	return s.release(ctx, instanceID, "user released", func(inst Instance) error {
 		if inst.UserID != userID {
 			return apperr.ErrNotFound
+		}
+		if inst.ClusterID != nil { // 集群成员只能整组释放（ReleaseCluster）
+			return apperr.ErrClusterMember
 		}
 		if inst.System || (inst.State != StateRunning && inst.State != StateStopped) {
 			return apperr.ErrInvalidState
