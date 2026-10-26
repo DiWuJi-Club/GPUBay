@@ -11,6 +11,8 @@
 //	| 网关记账 RecordUsage           | llm_accounts(user) FOR UPDATE → 插 llm_usage → llm_api_keys(key)                                   |
 //	| 结算 Settle                    | llm_accounts(user) FOR UPDATE → llm_usage（UPDATE 标记）→ llm_settlements → llm_usage_daily → wallet_accounts(user) |
 //	| 建节点                         | machines(FOR NO KEY UPDATE SKIP LOCKED) → 插 instances / machine_leases（rental.PlaceSystem）→ 插 llm_nodes |
+//	| 建组节点（计划 13）             | [rental.PlaceSystemCluster 自己的事务：machines → cluster-alloc → 集群 / 实例] → 插 llm_nodes + llm_node_members |
+//	| 节点转终态                     | llm_nodes(node) FOR UPDATE → llm_node_members(node) live = false（同一事务）                         |
 //	| Controller 推进 / Prober 回写  | llm_nodes(node) FOR UPDATE → [appdeploy / rental 调用在事务外]                                      |
 //	| 后台模型 / Key / 账户操作       | 单表行锁                                                                                           |
 //	| rental / billing / referral   | 不碰 llm 表                                                                                         |
@@ -68,6 +70,22 @@ type AppOps interface {
 	ListLive(ctx context.Context, instanceID string) ([]appdeploy.Deployment, error) // Create 撞 app_exists 时认领现有部署
 }
 
+// ClusterRentalOps 是计划 13 多机节点组用的 rental 方法（*rental.Service 满足，计划 13 Task 6）：
+// 在同一 fabric 的指定池机器上原子地建系统集群（每台一个系统实例，rank 按机器 ID 升序）/ 释放整组。
+// 单列一个接口而不是并进 RentalOps：装配（app.go）在 Task 13，llm 包不依赖 rental 的实现进度。
+type ClusterRentalOps interface {
+	PlaceSystemCluster(ctx context.Context, req rental.SystemClusterRequest) (rental.SystemClusterResult, error)
+	ReleaseSystemCluster(ctx context.Context, clusterID string) error // 已无在位成员 → nil；非系统集群 → ErrInvalidState
+}
+
+// ClusterAppOps 是计划 13 多机节点组用的 appdeploy 方法（*appdeploy.Service 满足，计划 13 Task 7）。
+type ClusterAppOps interface {
+	CreateCluster(ctx context.Context, req appdeploy.ClusterCreateRequest) (appdeploy.ClusterDeployment, error)
+	GetClusterDeployment(ctx context.Context, id string) (appdeploy.ClusterDeployment, error)
+	LiveClusterDeployment(ctx context.Context, clusterID string) (*appdeploy.ClusterDeployment, error) // 无 → nil, nil
+	RedeployCluster(ctx context.Context, req appdeploy.ClusterRedeployRequest) (appdeploy.ClusterDeployment, error)
+}
+
 // AppCatalog 由 *appdeploy.Catalog 满足。
 type AppCatalog interface {
 	AppBySlug(ctx context.Context, slug string) (appdeploy.App, error)
@@ -102,6 +120,10 @@ type Deps struct {
 	Fleet        FleetOps
 	Upstream     *upstream.Pool // 探测与转发
 	SystemUserID int64          // app.go 从 users WHERE system AND phone = 'system:llm' 读出
+	// 计划 13 多机节点组。nil → NewService 尝试从 Rental / Apps 断言（真实 *rental.Service / *appdeploy.Service 两者都满足）；
+	// 仍为 nil 时 nodes_per_replica > 1 的模型不建组（Controller 记日志），其余行为不变。
+	ClusterRental ClusterRentalOps
+	ClusterApps   ClusterAppOps
 }
 
 type Service struct {
@@ -120,6 +142,12 @@ func NewService(d Deps) *Service {
 	}
 	if d.Clock == nil {
 		d.Clock = clock.Real{}
+	}
+	if d.ClusterRental == nil {
+		d.ClusterRental, _ = d.Rental.(ClusterRentalOps)
+	}
+	if d.ClusterApps == nil {
+		d.ClusterApps, _ = d.Apps.(ClusterAppOps)
 	}
 	s := &Service{d: d, limiter: NewLimiter()}
 	s.router = NewRouter(s)

@@ -34,6 +34,13 @@ type fakeRental struct {
 	placed   []rental.SystemPlaceRequest
 	released []string
 	placeErr error // 非 nil：PlaceSystem 直接返回它
+
+	// 计划 13 集群方法（groups_helpers_test.go）
+	clusterPlaced     []rental.SystemClusterRequest
+	clustersReleased  []string
+	placeClusterErr   error                  // 非 nil：PlaceSystemCluster 直接返回它
+	afterPlaceCluster func(clusterID string) // 非 nil：PlaceSystemCluster 成功返回前调用（模拟插节点行前的并发）
+	releaseClusterErr error                  // 非 nil：ReleaseSystemCluster 记录调用后返回它
 }
 
 func (f *fakeRental) PlaceSystem(ctx context.Context, req rental.SystemPlaceRequest) (rental.Instance, error) {
@@ -92,9 +99,10 @@ func (f *fakeRental) ReleaseSystem(ctx context.Context, id string) error {
 
 func (f *fakeRental) Get(ctx context.Context, id string) (rental.Instance, error) {
 	var i rental.Instance
-	err := f.e.pool.QueryRow(ctx, `SELECT id, user_id, machine_id, product_id, image_id, state, suspended_at, created_at, system
+	err := f.e.pool.QueryRow(ctx, `SELECT id, user_id, machine_id, product_id, image_id, state, suspended_at, created_at, system,
+		cluster_id, cluster_rank
 		FROM instances WHERE id = $1`, id).Scan(&i.ID, &i.UserID, &i.MachineID, &i.ProductID, &i.ImageID, &i.State, &i.SuspendedAt,
-		&i.CreatedAt, &i.System)
+		&i.CreatedAt, &i.System, &i.ClusterID, &i.ClusterRank)
 	if db.IsNoRows(err) {
 		return rental.Instance{}, apperr.ErrNotFound
 	}
@@ -156,6 +164,11 @@ type fakeApps struct {
 	creates     []appdeploy.CreateRequest
 	redeploys   []appdeploy.RedeployRequest
 	redeployErr error // 非 nil：Redeploy 直接返回它
+
+	// 计划 13 集群方法（groups_helpers_test.go）
+	clusterCreates     []appdeploy.ClusterCreateRequest
+	clusterRedeploys   []appdeploy.ClusterRedeployRequest
+	clusterRedeployErr error // 非 nil：RedeployCluster 记录调用后返回它
 }
 
 func (f *fakeApps) Create(ctx context.Context, req appdeploy.CreateRequest) (appdeploy.Deployment, error) {
@@ -261,17 +274,19 @@ func (f *fakeApps) redeployCalls() []appdeploy.RedeployRequest {
 
 // fakeProbe 可设的探测结果：默认成功；fail 非 nil 时返回它。记录调用次数。
 type fakeProbe struct {
-	mu    sync.Mutex
-	fail  error
-	calls int
-	keys  []string
+	mu      sync.Mutex
+	fail    error
+	calls   int
+	keys    []string
+	targets []string // 拨号目标的实例 ID
 }
 
-func (p *fakeProbe) probe(_ context.Context, _ llm.Node, _ string, _ upstream.Target, key string) error {
+func (p *fakeProbe) probe(_ context.Context, _ llm.Node, _ string, target upstream.Target, key string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
 	p.keys = append(p.keys, key)
+	p.targets = append(p.targets, target.InstanceID)
 	return p.fail
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sync/atomic"
 	"testing"
 
@@ -84,7 +85,7 @@ func newEnv(t *testing.T) *env {
 	e.imageID = e.insertImage("LLM Serving", "spark/llm-serving:25.09", true)
 	e.appID = e.queryInt(`INSERT INTO apps (slug, name, category, icon, status, internal, created_at, updated_at)
 		VALUES ($1, 'vLLM 节点（平台内部）', 'llm', 'llm', 'published', true, $2, $2) RETURNING id`, llm.NodeAppSlug, dbtest.T0)
-	e.versionID = e.addNodeVersion("1.0.0", "published", e.imageID)
+	e.versionID = e.addNodeVersion("1.0.0", "published", e.imageID) // 内容为仓库 spec（1.1.0）；版本号沿用，给各测试加的版本让路
 	e.systemUserID = e.queryInt(`SELECT id FROM users WHERE system AND phone = $1`, llm.SystemUserPhone)
 	e.poolGroupID = e.queryInt(`SELECT id FROM machine_groups WHERE purpose = 'llm'`)
 	e.svc = e.newService(nil)
@@ -101,33 +102,18 @@ func (e *env) newService(mod func(*llm.Deps)) *llm.Service {
 	return llm.NewService(d)
 }
 
-// vllmNodeSpecJSON 是 deploy/apps/vllm-node/spec.json（p9/apps 分支）的逐字副本；两个分支合并后可改为直接读该文件。
-const vllmNodeSpecJSON = `{
-  "ports": [{"port": 8000, "label": "OpenAI 兼容接口", "path": "/docs", "health_path": "/health"}],
-  "timeout_minutes": 120,
-  "min_data_free_gib": 80,
-  "env": [
-    {"name": "MODEL_ID", "label": "模型", "type": "string", "required": true, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "help": "仓库 ID（平台按模型目录的 source_id 填写）"},
-    {"name": "MODEL_SOURCE", "label": "下载源", "type": "enum", "options": ["modelscope", "hf-mirror"], "default": "modelscope"},
-    {"name": "SERVED_MODEL_NAME", "label": "对外模型名", "type": "string", "required": true, "pattern": "^[a-z0-9][a-z0-9.-]{1,63}$", "help": "vLLM --served-model-name（平台按模型 slug 填写）"},
-    {"name": "MAX_MODEL_LEN", "label": "最大上下文", "type": "int", "min": 1024, "max": 1048576, "default": "32768"},
-    {"name": "API_KEY", "label": "节点密钥", "type": "secret", "required": true, "pattern": "^[A-Za-z0-9_-]{32,128}$", "help": "平台网关访问节点用的密钥（平台生成）"},
-    {"name": "GPU_MEMORY_UTILIZATION", "label": "显存占用比例", "type": "string", "pattern": "^0\\.[3-9][0-9]?$", "default": "0.85"},
-    {"name": "MAX_NUM_SEQS", "label": "最大并发序列", "type": "int", "min": 1, "max": 512, "default": "64"},
-    {"name": "QUANTIZATION", "label": "量化", "type": "enum", "options": ["none", "fp8", "awq", "gptq"], "default": "none"},
-    {"name": "REASONING_PARSER", "label": "推理内容解析", "type": "enum", "options": ["none", "qwen3", "deepseek_r1"], "default": "none"},
-    {"name": "TOOL_CALL_PARSER", "label": "工具调用解析", "type": "enum", "options": ["none", "hermes"], "default": "hermes"},
-    {"name": "TASK", "label": "任务类型", "type": "enum", "options": ["generate", "embed"], "default": "generate", "help": "embed 对应向量模型（vllm serve --task embed）"},
-    {"name": "MODEL_SIZE_GB", "label": "模型大小（GB）", "type": "int", "min": 1, "max": 2000, "default": "20", "help": "只用于估算下载进度"}
-  ],
-  "links": [{"label": "接口文档", "path": "/docs"}, {"label": "模型列表", "path": "/v1/models"}]
-}`
+// vllmNodeSpecPath 是仓库里的 vllm-node 应用包 spec（计划 13：1.1.0，支持 2～4 台集群、超时 360 分钟、TP / PP 变量）。
+const vllmNodeSpecPath = "../../deploy/apps/vllm-node/spec.json"
 
-// vllmNodeSpec 解析 vllmNodeSpecJSON 并过 ValidateSpec（与导入后入库的形态一致）。
+// vllmNodeSpec 读取并解析 vllmNodeSpecPath，过 ValidateSpec（与导入后入库的形态一致）。
 func vllmNodeSpec(t *testing.T) appdeploy.Spec {
 	t.Helper()
 	var s appdeploy.Spec
-	if err := json.Unmarshal([]byte(vllmNodeSpecJSON), &s); err != nil {
+	b, err := os.ReadFile(vllmNodeSpecPath)
+	if err != nil {
+		t.Fatalf("read vllm-node spec: %v", err)
+	}
+	if err := json.Unmarshal(b, &s); err != nil {
 		t.Fatalf("vllm-node spec json: %v", err)
 	}
 	if err := appdeploy.ValidateSpec(&s); err != nil {
