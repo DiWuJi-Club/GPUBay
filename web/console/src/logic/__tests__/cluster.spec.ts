@@ -82,6 +82,11 @@ describe('集群操作按钮状态', () => {
     expect(a.release).toBe(false)
     expect(a.releaseReason).toContain('开通')
   })
+  it('组建中（尚未就绪）：释放置灰并说明（后端此时返回 invalid_state，终审 A-7）', () => {
+    const a = clusterActions(view({ status: 'forming', ready_at: null }))
+    expect(a.release).toBe(false)
+    expect(a.releaseReason).toBe('集群组建完成后才能释放')
+  })
   it('续费档位全为 0 时续费不可用', () => {
     expect(clusterActions(view({ renew_options: [{ duration: '1d', quantity_max: 0 }] })).renew).toBe(false)
   })

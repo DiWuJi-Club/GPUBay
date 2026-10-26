@@ -201,3 +201,38 @@ test('A-CLU-03 集群免费延长：缺省 1 天、原因必填，全部成员�
   const late = await ctx.post(`/admin/api/v1/clusters/${clusterId}/extend`, { data: { seconds: 3600, reason: 'e2e' } })
   expect(late.status()).toBe(409)
 })
+
+test('A-CLU-04 强制卸载集群应用：成员部署单独强制卸载 409；整组强制卸载原因必填、审计 cluster.app_force_remove、卸载后详情无集群应用；财务没有按钮', async ({ page }) => {
+  const u = await seedUser()
+  const vc = (await hooks.appsSeed()).apps.find((a) => a.slug === 'vllm-cluster')!
+  const { api, clusterId } = await readyCluster(u.phone)
+  await deployClusterApp(api, clusterId, vc.id, { MODEL_ID: 'Qwen/Qwen3-8B' })
+  const app = await tickClusterApp(api, clusterId, 'running')
+  const ops = await createAdmin('ops')
+  const ctx = await adminApi(ops)
+  // 成员部署不能走单个部署的强制卸载
+  const member = app!.members.find((m) => m.rank === 1)!
+  const single = await ctx.post(`/admin/api/v1/deployments/${member.deployment_id}/force-remove`, { data: { reason: '测试' } })
+  expect(single.status()).toBe(409)
+  expect(((await single.json()) as { code: string }).code).toBe('app_cluster_managed')
+
+  await loginAdmin(page, ops)
+  await page.goto(`/admin/clusters/${clusterId}`)
+  await expect(page.getByTestId('cluster-app-status')).toHaveAttribute('data-status', 'running')
+  await page.getByTestId('cluster-app-force-remove').click()
+  await expect(page.getByTestId('cluster-app-force-remove-dialog')).toBeVisible()
+  await page.getByTestId('cluster-app-force-remove-submit').click()
+  await toast(page, '请填写卸载原因')
+  await page.getByTestId('cluster-app-force-remove-reason').fill('违规使用')
+  await page.getByTestId('cluster-app-force-remove-submit').click()
+  await toast(page, '已强制卸载集群应用')
+  await expect(page.getByTestId('cluster-app-force-remove')).toHaveCount(0)
+  expect((await getJSON<AuditList>(ctx, `/admin/api/v1/audit?action=cluster.app_force_remove`)).items.some((i) => JSON.stringify(i).includes('违规使用'))).toBe(true)
+
+  const fin = await createAdmin('finance')
+  await logout(page)
+  await loginAdmin(page, fin)
+  await page.goto(`/admin/clusters/${clusterId}`)
+  await expect(page.getByTestId('cluster-detail-id')).toHaveText(clusterId)
+  await expect(page.getByTestId('cluster-app-force-remove')).toHaveCount(0)
+})

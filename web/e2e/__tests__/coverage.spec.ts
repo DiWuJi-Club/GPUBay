@@ -15,9 +15,9 @@ describe('coverage.json', () => {
     // 计划 5 的 50 个 + 计划 2 追加 A-MCH-07～09 + 计划 3 追加 A-INS-10～12、A-USR-07；+ 计划 6 的 A-GRP-01～05、A-BKG-01～06、A-INS-13；
     // + 计划 7 的 A-APP-01～08、A-INS-14、A-MCH-10；+ 计划 8 的 A-REF-01～07、A-FIN-05；+ 计划 11 的 A-WF-01～07、A-INS-15；
     // + 计划 9 的 A-LLM-01～09、A-INS-16、A-USR-08；+ 计划 12 的 A-BOT-01～05；
-    // + 计划 13 的 A-FAB-01～02、A-MCH-11～12、A-CLU-01～03、A-INS-17、A-LLM-10～12
-    expect(table.admin).toHaveLength(122)
-    expect(new Set([...table.console, ...table.admin]).size).toBe(290)
+    // + 计划 13 的 A-FAB-01～02、A-MCH-11～12、A-CLU-01～04、A-INS-17、A-LLM-10～12
+    expect(table.admin).toHaveLength(123)
+    expect(new Set([...table.console, ...table.admin]).size).toBe(291)
   })
 })
 

@@ -248,6 +248,9 @@ export function clusterListQuery(f: ClusterFilter, page: number, pageSize: numbe
 /** 延长 / 重新下发：ops 与 super；延长只对活动的用户集群（系统集群不计时），重新下发对活动集群。 */
 export const canExtendCluster = (role: Role | undefined, c: Pick<AdminClusterView, 'state' | 'system'>) => canEditFabrics(role) && c.state === 'active' && !c.system
 export const canResyncCluster = (role: Role | undefined, c: Pick<AdminClusterView, 'state'>) => canEditFabrics(role) && c.state === 'active'
+/** 强制卸载集群应用（ops）：成员部署不能单独强制卸载（409 app_cluster_managed），只能整组卸载；已卸载 / 卸载中不再显示。 */
+export const canForceRemoveClusterApp = (role: Role | undefined, app: Pick<AdminClusterApp, 'state'> | null) =>
+  canEditFabrics(role) && !!app && app.state !== 'removed' && app.state !== 'removing'
 /** 成员换机：ops、活动的用户集群、成员实例在运行（与实例页 showMigrate 一致）。 */
 export const canMigrateMember = (role: Role | undefined, c: Pick<AdminClusterView, 'state' | 'system'>, memberState: string) =>
   canEditFabrics(role) && c.state === 'active' && !c.system && memberState === 'running'
