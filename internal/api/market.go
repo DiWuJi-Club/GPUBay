@@ -4,11 +4,14 @@ import (
 	"net/http"
 
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/rental"
 )
 
 type productView struct {
 	catalog.ProductWithPrices
 	IdleCount int `json:"idle_count"`
+	// 计划 13：此刻可组成的集群数，键为台数（"2" / "4"）
+	Clusters map[string]rental.ClusterAvail `json:"clusters"`
 }
 
 func (s *Server) handleProducts(w http.ResponseWriter, r *http.Request) {
@@ -24,7 +27,12 @@ func (s *Server) handleProducts(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, err)
 			return
 		}
-		views = append(views, productView{ProductWithPrices: p, IdleCount: n})
+		cl, err := s.productClusters(r.Context(), p.ID)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		views = append(views, productView{ProductWithPrices: p, IdleCount: n, Clusters: cl})
 	}
 	writeJSON(w, http.StatusOK, list(views))
 }

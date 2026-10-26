@@ -250,6 +250,28 @@ func (s *Server) handleAvailability(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if v := q.Get("cluster_size"); v != "" { // 计划 13：可组成的 n 台集群数 {available, rdma}（只即时、不指定机器）
+		n, err := parseClusterSize(v)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		if start != nil {
+			s.writeError(w, r, apperr.ErrClusterBookingUnsupported)
+			return
+		}
+		if machineID != nil {
+			s.writeError(w, r, apperr.BadRequest("集群不能指定机器"))
+			return
+		}
+		out, err := s.clusterAvailability(r.Context(), *productID, groupID, n)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
 	if machineID != nil { // 与指定机器下单同一校验：未上架的机器探测不到空闲情况（终审 M2）
 		if err := s.bookableMachine(r.Context(), *machineID, groupID); err != nil {
 			s.writeError(w, r, err)
@@ -281,6 +303,8 @@ type bookingRequest struct {
 	AppEnv map[string]string `json:"app_env"`
 	// 计划 11：随应用一并预装的 ComfyUI 工作流（须同时给 app_id），见 POST /orders
 	AppWorkflowIDs []int64 `json:"app_workflow_ids"`
+	// 计划 13：集群下单（count ∈ {2, 4}，只即时开通、不能指定机器 / 预装应用）；响应多 cluster
+	Cluster bool `json:"cluster"`
 }
 
 func (s *Server) batchResult(ctx context.Context, res rental.BatchResult) (map[string]any, error) {
@@ -288,7 +312,16 @@ func (s *Server) batchResult(ctx context.Context, res rental.BatchResult) (map[s
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"batch": res.Batch, "orders": res.Orders, "instances": views}, nil
+	out := map[string]any{"batch": res.Batch, "orders": res.Orders, "instances": views}
+	if res.Cluster != nil { // 计划 13：只有集群批次带 cluster（其它批次的响应与改动前相同）
+		uid := res.Instances[0].UserID
+		cv, err := s.clusterConsoleView(ctx, uid, *res.Cluster)
+		if err != nil {
+			return nil, err
+		}
+		out["cluster"] = cv
+	}
+	return out, nil
 }
 
 // bookableMachine 指定机器下单的前置检查：先看机器所在机组可见，再看 group_id 与之相同；任何不满足都是 ErrNotFound。
@@ -333,7 +366,7 @@ func (s *Server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		UserID: currentUser(r).ID, ProductID: req.ProductID, ImageID: req.ImageID, GroupID: req.GroupID, MachineID: req.MachineID,
 		Count: req.Count, Duration: catalog.Duration(req.Duration), Quantity: req.Quantity, StartAt: start,
 		AutoRenew: req.AutoRenew, AutoRenewDuration: catalog.Duration(req.AutoRenewDuration), IdempotencyKey: r.Header.Get(idempotencyHeader),
-		AppID: req.AppID, AppEnv: req.AppEnv, AppWorkflowIDs: req.AppWorkflowIDs,
+		AppID: req.AppID, AppEnv: req.AppEnv, AppWorkflowIDs: req.AppWorkflowIDs, Cluster: req.Cluster,
 	})
 	if err != nil {
 		s.writeError(w, r, err)
