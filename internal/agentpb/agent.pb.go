@@ -327,7 +327,9 @@ type Hello struct {
 	Hostname     string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	Ips          []string               `protobuf:"bytes,3,rep,name=ips,proto3" json:"ips,omitempty"` // 本机全部 IPv4 地址
 	// 能力位图（internal/agent/features）：bit0 = 支持 CreateInstance.share_slots。计划 10 新增，旧 Agent 为 0；平台目前不读取（共享机已搁置）。
-	Features      uint32 `protobuf:"varint,4,opt,name=features,proto3" json:"features,omitempty"`
+	Features uint32 `protobuf:"varint,4,opt,name=features,proto3" json:"features,omitempty"`
+	// 网卡探测（计划 13）：建流时一次，此后随每份 StateReport；旧 Agent 不发。
+	Net           *NetInfo `protobuf:"bytes,5,opt,name=net,proto3" json:"net,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -388,6 +390,13 @@ func (x *Hello) GetFeatures() uint32 {
 		return x.Features
 	}
 	return 0
+}
+
+func (x *Hello) GetNet() *NetInfo {
+	if x != nil {
+		return x.Net
+	}
+	return nil
 }
 
 type AgentConfig struct {
@@ -485,6 +494,7 @@ type Command struct {
 	//	*Command_Stop
 	//	*Command_Wipe
 	//	*Command_Pull
+	//	*Command_ConfigureCluster
 	Body          isCommand_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -586,6 +596,15 @@ func (x *Command) GetPull() *PullImage {
 	return nil
 }
 
+func (x *Command) GetConfigureCluster() *ConfigureCluster {
+	if x != nil {
+		if x, ok := x.Body.(*Command_ConfigureCluster); ok {
+			return x.ConfigureCluster
+		}
+	}
+	return nil
+}
+
 type isCommand_Body interface {
 	isCommand_Body()
 }
@@ -610,6 +629,10 @@ type Command_Pull struct {
 	Pull *PullImage `protobuf:"bytes,14,opt,name=pull,proto3,oneof"`
 }
 
+type Command_ConfigureCluster struct {
+	ConfigureCluster *ConfigureCluster `protobuf:"bytes,15,opt,name=configure_cluster,json=configureCluster,proto3,oneof"` // 计划 13：成员变更后推给集群全部成员
+}
+
 func (*Command_Create) isCommand_Body() {}
 
 func (*Command_Start) isCommand_Body() {}
@@ -619,6 +642,8 @@ func (*Command_Stop) isCommand_Body() {}
 func (*Command_Wipe) isCommand_Body() {}
 
 func (*Command_Pull) isCommand_Body() {}
+
+func (*Command_ConfigureCluster) isCommand_Body() {}
 
 type CreateInstance struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -631,7 +656,9 @@ type CreateInstance struct {
 	// 为空时 Agent 沿用本地生成（兼容旧平台）。
 	HostKeyPem string `protobuf:"bytes,6,opt,name=host_key_pem,json=hostKeyPem,proto3" json:"host_key_pem,omitempty"`
 	// 份数：0 / 1 = 整机；2 / 4 = 按份等分内存、CPU、数据盘（Agent 侧计算）。计划 10 新增，旧 Agent 忽略。
-	ShareSlots    uint32 `protobuf:"varint,7,opt,name=share_slots,json=shareSlots,proto3" json:"share_slots,omitempty"`
+	ShareSlots uint32 `protobuf:"varint,7,opt,name=share_slots,json=shareSlots,proto3" json:"share_slots,omitempty"`
+	// 计划 13：非空 = 集群成员（create 时决定 RDMA 设备与 cap-drop NET_RAW）。旧 Agent 会静默忽略，平台按 features bit1 门控。
+	Cluster       *ClusterSpec `protobuf:"bytes,8,opt,name=cluster,proto3" json:"cluster,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -713,6 +740,13 @@ func (x *CreateInstance) GetShareSlots() uint32 {
 		return x.ShareSlots
 	}
 	return 0
+}
+
+func (x *CreateInstance) GetCluster() *ClusterSpec {
+	if x != nil {
+		return x.Cluster
+	}
+	return nil
 }
 
 type StartInstance struct {
@@ -867,6 +901,437 @@ func (x *PullImage) GetImageRef() string {
 	return ""
 }
 
+// ConfigureCluster：按 version 取新（小于本地 version 的忽略）；cluster.cluster_id 为空 = 退出集群（清理网络与文件）。
+type ConfigureCluster struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Cluster       *ClusterSpec           `protobuf:"bytes,1,opt,name=cluster,proto3" json:"cluster,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfigureCluster) Reset() {
+	*x = ConfigureCluster{}
+	mi := &file_agent_v1_agent_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfigureCluster) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfigureCluster) ProtoMessage() {}
+
+func (x *ConfigureCluster) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfigureCluster.ProtoReflect.Descriptor instead.
+func (*ConfigureCluster) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *ConfigureCluster) GetCluster() *ClusterSpec {
+	if x != nil {
+		return x.Cluster
+	}
+	return nil
+}
+
+// ClusterSpec 与 internal/clusterspec.Spec 一一对应（规格 §4.1）。
+type ClusterSpec struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId     string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	Version       uint32                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
+	Size          uint32                 `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
+	Rank          uint32                 `protobuf:"varint,4,opt,name=rank,proto3" json:"rank,omitempty"`
+	Mode          string                 `protobuf:"bytes,5,opt,name=mode,proto3" json:"mode,omitempty"`     // routed / macvlan
+	Iface         string                 `protobuf:"bytes,6,opt,name=iface,proto3" json:"iface,omitempty"`   // 宿主机集群网卡（routed 出口 / macvlan 父接口）
+	Vlan          uint32                 `protobuf:"varint,7,opt,name=vlan,proto3" json:"vlan,omitempty"`    // 0 = 不打标签
+	Mtu           uint32                 `protobuf:"varint,8,opt,name=mtu,proto3" json:"mtu,omitempty"`      // 0 = 继承
+	Subnet        string                 `protobuf:"bytes,9,opt,name=subnet,proto3" json:"subnet,omitempty"` // 10.210.C.0/24
+	Rdma          bool                   `protobuf:"varint,10,opt,name=rdma,proto3" json:"rdma,omitempty"`
+	Members       []*ClusterMember       `protobuf:"bytes,11,rep,name=members,proto3" json:"members,omitempty"` // 含自己，按 rank
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClusterSpec) Reset() {
+	*x = ClusterSpec{}
+	mi := &file_agent_v1_agent_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClusterSpec) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClusterSpec) ProtoMessage() {}
+
+func (x *ClusterSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClusterSpec.ProtoReflect.Descriptor instead.
+func (*ClusterSpec) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *ClusterSpec) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *ClusterSpec) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *ClusterSpec) GetSize() uint32 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+func (x *ClusterSpec) GetRank() uint32 {
+	if x != nil {
+		return x.Rank
+	}
+	return 0
+}
+
+func (x *ClusterSpec) GetMode() string {
+	if x != nil {
+		return x.Mode
+	}
+	return ""
+}
+
+func (x *ClusterSpec) GetIface() string {
+	if x != nil {
+		return x.Iface
+	}
+	return ""
+}
+
+func (x *ClusterSpec) GetVlan() uint32 {
+	if x != nil {
+		return x.Vlan
+	}
+	return 0
+}
+
+func (x *ClusterSpec) GetMtu() uint32 {
+	if x != nil {
+		return x.Mtu
+	}
+	return 0
+}
+
+func (x *ClusterSpec) GetSubnet() string {
+	if x != nil {
+		return x.Subnet
+	}
+	return ""
+}
+
+func (x *ClusterSpec) GetRdma() bool {
+	if x != nil {
+		return x.Rdma
+	}
+	return false
+}
+
+func (x *ClusterSpec) GetMembers() []*ClusterMember {
+	if x != nil {
+		return x.Members
+	}
+	return nil
+}
+
+type ClusterMember struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Rank          uint32                 `protobuf:"varint,1,opt,name=rank,proto3" json:"rank,omitempty"`
+	InstanceId    string                 `protobuf:"bytes,2,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	Ip            string                 `protobuf:"bytes,3,opt,name=ip,proto3" json:"ip,omitempty"`
+	HostIp        string                 `protobuf:"bytes,4,opt,name=host_ip,json=hostIp,proto3" json:"host_ip,omitempty"` // 只在 routed 有
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClusterMember) Reset() {
+	*x = ClusterMember{}
+	mi := &file_agent_v1_agent_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClusterMember) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClusterMember) ProtoMessage() {}
+
+func (x *ClusterMember) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClusterMember.ProtoReflect.Descriptor instead.
+func (*ClusterMember) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ClusterMember) GetRank() uint32 {
+	if x != nil {
+		return x.Rank
+	}
+	return 0
+}
+
+func (x *ClusterMember) GetInstanceId() string {
+	if x != nil {
+		return x.InstanceId
+	}
+	return ""
+}
+
+func (x *ClusterMember) GetIp() string {
+	if x != nil {
+		return x.Ip
+	}
+	return ""
+}
+
+func (x *ClusterMember) GetHostIp() string {
+	if x != nil {
+		return x.HostIp
+	}
+	return ""
+}
+
+// NetInfo / NetIface 与 internal/clusterspec.NetInfo / Iface 一一对应（规格 §3.2）。
+type NetInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	LanIface      string                 `protobuf:"bytes,1,opt,name=lan_iface,json=lanIface,proto3" json:"lan_iface,omitempty"`
+	Ifaces        []*NetIface            `protobuf:"bytes,2,rep,name=ifaces,proto3" json:"ifaces,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NetInfo) Reset() {
+	*x = NetInfo{}
+	mi := &file_agent_v1_agent_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NetInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NetInfo) ProtoMessage() {}
+
+func (x *NetInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NetInfo.ProtoReflect.Descriptor instead.
+func (*NetInfo) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *NetInfo) GetLanIface() string {
+	if x != nil {
+		return x.LanIface
+	}
+	return ""
+}
+
+func (x *NetInfo) GetIfaces() []*NetIface {
+	if x != nil {
+		return x.Ifaces
+	}
+	return nil
+}
+
+type NetIface struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Mac           string                 `protobuf:"bytes,2,opt,name=mac,proto3" json:"mac,omitempty"`
+	Up            bool                   `protobuf:"varint,3,opt,name=up,proto3" json:"up,omitempty"`
+	SpeedMbps     int32                  `protobuf:"varint,4,opt,name=speed_mbps,json=speedMbps,proto3" json:"speed_mbps,omitempty"`
+	Mtu           uint32                 `protobuf:"varint,5,opt,name=mtu,proto3" json:"mtu,omitempty"`
+	Ipv4          []string               `protobuf:"bytes,6,rep,name=ipv4,proto3" json:"ipv4,omitempty"`
+	Driver        string                 `protobuf:"bytes,7,opt,name=driver,proto3" json:"driver,omitempty"`
+	Pci           string                 `protobuf:"bytes,8,opt,name=pci,proto3" json:"pci,omitempty"`
+	Wireless      bool                   `protobuf:"varint,9,opt,name=wireless,proto3" json:"wireless,omitempty"`
+	RdmaDevice    string                 `protobuf:"bytes,10,opt,name=rdma_device,json=rdmaDevice,proto3" json:"rdma_device,omitempty"`
+	RdmaActive    bool                   `protobuf:"varint,11,opt,name=rdma_active,json=rdmaActive,proto3" json:"rdma_active,omitempty"`
+	Uverbs        string                 `protobuf:"bytes,12,opt,name=uverbs,proto3" json:"uverbs,omitempty"`
+	LinkLayer     string                 `protobuf:"bytes,13,opt,name=link_layer,json=linkLayer,proto3" json:"link_layer,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NetIface) Reset() {
+	*x = NetIface{}
+	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NetIface) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NetIface) ProtoMessage() {}
+
+func (x *NetIface) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NetIface.ProtoReflect.Descriptor instead.
+func (*NetIface) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *NetIface) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *NetIface) GetMac() string {
+	if x != nil {
+		return x.Mac
+	}
+	return ""
+}
+
+func (x *NetIface) GetUp() bool {
+	if x != nil {
+		return x.Up
+	}
+	return false
+}
+
+func (x *NetIface) GetSpeedMbps() int32 {
+	if x != nil {
+		return x.SpeedMbps
+	}
+	return 0
+}
+
+func (x *NetIface) GetMtu() uint32 {
+	if x != nil {
+		return x.Mtu
+	}
+	return 0
+}
+
+func (x *NetIface) GetIpv4() []string {
+	if x != nil {
+		return x.Ipv4
+	}
+	return nil
+}
+
+func (x *NetIface) GetDriver() string {
+	if x != nil {
+		return x.Driver
+	}
+	return ""
+}
+
+func (x *NetIface) GetPci() string {
+	if x != nil {
+		return x.Pci
+	}
+	return ""
+}
+
+func (x *NetIface) GetWireless() bool {
+	if x != nil {
+		return x.Wireless
+	}
+	return false
+}
+
+func (x *NetIface) GetRdmaDevice() string {
+	if x != nil {
+		return x.RdmaDevice
+	}
+	return ""
+}
+
+func (x *NetIface) GetRdmaActive() bool {
+	if x != nil {
+		return x.RdmaActive
+	}
+	return false
+}
+
+func (x *NetIface) GetUverbs() string {
+	if x != nil {
+		return x.Uverbs
+	}
+	return ""
+}
+
+func (x *NetIface) GetLinkLayer() string {
+	if x != nil {
+		return x.LinkLayer
+	}
+	return ""
+}
+
 type CommandResult struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CommandId     string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
@@ -878,7 +1343,7 @@ type CommandResult struct {
 
 func (x *CommandResult) Reset() {
 	*x = CommandResult{}
-	mi := &file_agent_v1_agent_proto_msgTypes[12]
+	mi := &file_agent_v1_agent_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -890,7 +1355,7 @@ func (x *CommandResult) String() string {
 func (*CommandResult) ProtoMessage() {}
 
 func (x *CommandResult) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[12]
+	mi := &file_agent_v1_agent_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -903,7 +1368,7 @@ func (x *CommandResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandResult.ProtoReflect.Descriptor instead.
 func (*CommandResult) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{12}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *CommandResult) GetCommandId() string {
@@ -931,14 +1396,16 @@ type StateReport struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Instances []*InstanceState       `protobuf:"bytes,1,rep,name=instances,proto3" json:"instances,omitempty"`
 	// 已缓存镜像的 repository:tag 列表（docker image ls，≤ 200 项）；计划 7 新增，旧 Agent 不发该字段，平台不覆盖已有记录。
-	Images        []string `protobuf:"bytes,2,rep,name=images,proto3" json:"images,omitempty"`
+	Images []string `protobuf:"bytes,2,rep,name=images,proto3" json:"images,omitempty"`
+	// 网卡探测（计划 13，链路变化可见）；旧 Agent 不发，平台不覆盖已有记录。
+	Net           *NetInfo `protobuf:"bytes,3,opt,name=net,proto3" json:"net,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StateReport) Reset() {
 	*x = StateReport{}
-	mi := &file_agent_v1_agent_proto_msgTypes[13]
+	mi := &file_agent_v1_agent_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -950,7 +1417,7 @@ func (x *StateReport) String() string {
 func (*StateReport) ProtoMessage() {}
 
 func (x *StateReport) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[13]
+	mi := &file_agent_v1_agent_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -963,7 +1430,7 @@ func (x *StateReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateReport.ProtoReflect.Descriptor instead.
 func (*StateReport) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{13}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *StateReport) GetInstances() []*InstanceState {
@@ -980,17 +1447,25 @@ func (x *StateReport) GetImages() []string {
 	return nil
 }
 
+func (x *StateReport) GetNet() *NetInfo {
+	if x != nil {
+		return x.Net
+	}
+	return nil
+}
+
 type InstanceState struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	InstanceId    string                 `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
-	Phase         string                 `protobuf:"bytes,2,opt,name=phase,proto3" json:"phase,omitempty"` // running / stopped / missing_data / unknown
+	Phase         string                 `protobuf:"bytes,2,opt,name=phase,proto3" json:"phase,omitempty"`     // running / stopped / missing_data / unknown
+	Cluster       string                 `protobuf:"bytes,3,opt,name=cluster,proto3" json:"cluster,omitempty"` // 计划 13：集群网络状态 "" 非集群 / "ok" / "pending"（容器未运行）/ "error: <原因>"
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *InstanceState) Reset() {
 	*x = InstanceState{}
-	mi := &file_agent_v1_agent_proto_msgTypes[14]
+	mi := &file_agent_v1_agent_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1002,7 +1477,7 @@ func (x *InstanceState) String() string {
 func (*InstanceState) ProtoMessage() {}
 
 func (x *InstanceState) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[14]
+	mi := &file_agent_v1_agent_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1015,7 +1490,7 @@ func (x *InstanceState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InstanceState.ProtoReflect.Descriptor instead.
 func (*InstanceState) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{14}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *InstanceState) GetInstanceId() string {
@@ -1032,6 +1507,13 @@ func (x *InstanceState) GetPhase() string {
 	return ""
 }
 
+func (x *InstanceState) GetCluster() string {
+	if x != nil {
+		return x.Cluster
+	}
+	return ""
+}
+
 type Heartbeat struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Metrics *Metrics               `protobuf:"bytes,1,opt,name=metrics,proto3" json:"metrics,omitempty"`
@@ -1043,7 +1525,7 @@ type Heartbeat struct {
 
 func (x *Heartbeat) Reset() {
 	*x = Heartbeat{}
-	mi := &file_agent_v1_agent_proto_msgTypes[15]
+	mi := &file_agent_v1_agent_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1055,7 +1537,7 @@ func (x *Heartbeat) String() string {
 func (*Heartbeat) ProtoMessage() {}
 
 func (x *Heartbeat) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[15]
+	mi := &file_agent_v1_agent_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1068,7 +1550,7 @@ func (x *Heartbeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Heartbeat.ProtoReflect.Descriptor instead.
 func (*Heartbeat) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{15}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Heartbeat) GetMetrics() *Metrics {
@@ -1100,7 +1582,7 @@ type InstanceMetrics struct {
 
 func (x *InstanceMetrics) Reset() {
 	*x = InstanceMetrics{}
-	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_agent_v1_agent_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1112,7 +1594,7 @@ func (x *InstanceMetrics) String() string {
 func (*InstanceMetrics) ProtoMessage() {}
 
 func (x *InstanceMetrics) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_agent_v1_agent_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1125,7 +1607,7 @@ func (x *InstanceMetrics) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InstanceMetrics.ProtoReflect.Descriptor instead.
 func (*InstanceMetrics) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *InstanceMetrics) GetInstanceId() string {
@@ -1180,7 +1662,7 @@ type Metrics struct {
 
 func (x *Metrics) Reset() {
 	*x = Metrics{}
-	mi := &file_agent_v1_agent_proto_msgTypes[17]
+	mi := &file_agent_v1_agent_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1192,7 +1674,7 @@ func (x *Metrics) String() string {
 func (*Metrics) ProtoMessage() {}
 
 func (x *Metrics) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[17]
+	mi := &file_agent_v1_agent_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1205,7 +1687,7 @@ func (x *Metrics) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Metrics.ProtoReflect.Descriptor instead.
 func (*Metrics) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{17}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *Metrics) GetGpuUtil() float64 {
@@ -1291,12 +1773,13 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x0fPlatformMessage\x123\n" +
 	"\acommand\x18\x01 \x01(\v2\x17.spark.agent.v1.CommandH\x00R\acommand\x125\n" +
 	"\x06config\x18\x02 \x01(\v2\x1b.spark.agent.v1.AgentConfigH\x00R\x06configB\x05\n" +
-	"\x03msg\"v\n" +
+	"\x03msg\"\xa1\x01\n" +
 	"\x05Hello\x12#\n" +
 	"\ragent_version\x18\x01 \x01(\tR\fagentVersion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12\x10\n" +
 	"\x03ips\x18\x03 \x03(\tR\x03ips\x12\x1a\n" +
-	"\bfeatures\x18\x04 \x01(\rR\bfeatures\"\xe3\x01\n" +
+	"\bfeatures\x18\x04 \x01(\rR\bfeatures\x12)\n" +
+	"\x03net\x18\x05 \x01(\v2\x17.spark.agent.v1.NetInfoR\x03net\"\xe3\x01\n" +
 	"\vAgentConfig\x12\x15\n" +
 	"\x06lan_ip\x18\x01 \x01(\tR\x05lanIp\x120\n" +
 	"\x14heartbeat_interval_s\x18\x02 \x01(\rR\x12heartbeatIntervalS\x12\x1f\n" +
@@ -1305,7 +1788,7 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\vdns_servers\x18\x04 \x03(\tR\n" +
 	"dnsServers\x12%\n" +
 	"\x0ebandwidth_mbps\x18\x05 \x01(\rR\rbandwidthMbps\x12\"\n" +
-	"\rdata_size_gib\x18\x06 \x01(\rR\vdataSizeGib\"\xcc\x02\n" +
+	"\rdata_size_gib\x18\x06 \x01(\rR\vdataSizeGib\"\x9d\x03\n" +
 	"\aCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1f\n" +
 	"\vinstance_id\x18\x02 \x01(\tR\n" +
@@ -1315,8 +1798,9 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x05start\x18\v \x01(\v2\x1d.spark.agent.v1.StartInstanceH\x00R\x05start\x122\n" +
 	"\x04stop\x18\f \x01(\v2\x1c.spark.agent.v1.StopInstanceH\x00R\x04stop\x122\n" +
 	"\x04wipe\x18\r \x01(\v2\x1c.spark.agent.v1.WipeInstanceH\x00R\x04wipe\x12/\n" +
-	"\x04pull\x18\x0e \x01(\v2\x19.spark.agent.v1.PullImageH\x00R\x04pullB\x06\n" +
-	"\x04body\"\xff\x01\n" +
+	"\x04pull\x18\x0e \x01(\v2\x19.spark.agent.v1.PullImageH\x00R\x04pull\x12O\n" +
+	"\x11configure_cluster\x18\x0f \x01(\v2 .spark.agent.v1.ConfigureClusterH\x00R\x10configureClusterB\x06\n" +
+	"\x04body\"\xb6\x02\n" +
 	"\x0eCreateInstance\x12\x1b\n" +
 	"\timage_ref\x18\x01 \x01(\tR\bimageRef\x12'\n" +
 	"\x0fupstream_pubkey\x18\x02 \x01(\tR\x0eupstreamPubkey\x12%\n" +
@@ -1326,24 +1810,71 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\fhost_key_pem\x18\x06 \x01(\tR\n" +
 	"hostKeyPem\x12\x1f\n" +
 	"\vshare_slots\x18\a \x01(\rR\n" +
-	"shareSlots\"\x0f\n" +
+	"shareSlots\x125\n" +
+	"\acluster\x18\b \x01(\v2\x1b.spark.agent.v1.ClusterSpecR\acluster\"\x0f\n" +
 	"\rStartInstance\"\x0e\n" +
 	"\fStopInstance\"\x0e\n" +
 	"\fWipeInstance\"(\n" +
 	"\tPullImage\x12\x1b\n" +
-	"\timage_ref\x18\x01 \x01(\tR\bimageRef\"X\n" +
+	"\timage_ref\x18\x01 \x01(\tR\bimageRef\"I\n" +
+	"\x10ConfigureCluster\x125\n" +
+	"\acluster\x18\x01 \x01(\v2\x1b.spark.agent.v1.ClusterSpecR\acluster\"\xa3\x02\n" +
+	"\vClusterSpec\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\rR\aversion\x12\x12\n" +
+	"\x04size\x18\x03 \x01(\rR\x04size\x12\x12\n" +
+	"\x04rank\x18\x04 \x01(\rR\x04rank\x12\x12\n" +
+	"\x04mode\x18\x05 \x01(\tR\x04mode\x12\x14\n" +
+	"\x05iface\x18\x06 \x01(\tR\x05iface\x12\x12\n" +
+	"\x04vlan\x18\a \x01(\rR\x04vlan\x12\x10\n" +
+	"\x03mtu\x18\b \x01(\rR\x03mtu\x12\x16\n" +
+	"\x06subnet\x18\t \x01(\tR\x06subnet\x12\x12\n" +
+	"\x04rdma\x18\n" +
+	" \x01(\bR\x04rdma\x127\n" +
+	"\amembers\x18\v \x03(\v2\x1d.spark.agent.v1.ClusterMemberR\amembers\"m\n" +
+	"\rClusterMember\x12\x12\n" +
+	"\x04rank\x18\x01 \x01(\rR\x04rank\x12\x1f\n" +
+	"\vinstance_id\x18\x02 \x01(\tR\n" +
+	"instanceId\x12\x0e\n" +
+	"\x02ip\x18\x03 \x01(\tR\x02ip\x12\x17\n" +
+	"\ahost_ip\x18\x04 \x01(\tR\x06hostIp\"X\n" +
+	"\aNetInfo\x12\x1b\n" +
+	"\tlan_iface\x18\x01 \x01(\tR\blanIface\x120\n" +
+	"\x06ifaces\x18\x02 \x03(\v2\x18.spark.agent.v1.NetIfaceR\x06ifaces\"\xc4\x02\n" +
+	"\bNetIface\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
+	"\x03mac\x18\x02 \x01(\tR\x03mac\x12\x0e\n" +
+	"\x02up\x18\x03 \x01(\bR\x02up\x12\x1d\n" +
+	"\n" +
+	"speed_mbps\x18\x04 \x01(\x05R\tspeedMbps\x12\x10\n" +
+	"\x03mtu\x18\x05 \x01(\rR\x03mtu\x12\x12\n" +
+	"\x04ipv4\x18\x06 \x03(\tR\x04ipv4\x12\x16\n" +
+	"\x06driver\x18\a \x01(\tR\x06driver\x12\x10\n" +
+	"\x03pci\x18\b \x01(\tR\x03pci\x12\x1a\n" +
+	"\bwireless\x18\t \x01(\bR\bwireless\x12\x1f\n" +
+	"\vrdma_device\x18\n" +
+	" \x01(\tR\n" +
+	"rdmaDevice\x12\x1f\n" +
+	"\vrdma_active\x18\v \x01(\bR\n" +
+	"rdmaActive\x12\x16\n" +
+	"\x06uverbs\x18\f \x01(\tR\x06uverbs\x12\x1d\n" +
+	"\n" +
+	"link_layer\x18\r \x01(\tR\tlinkLayer\"X\n" +
 	"\rCommandResult\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x0e\n" +
 	"\x02ok\x18\x02 \x01(\bR\x02ok\x12\x18\n" +
-	"\amessage\x18\x03 \x01(\tR\amessage\"b\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\"\x8d\x01\n" +
 	"\vStateReport\x12;\n" +
 	"\tinstances\x18\x01 \x03(\v2\x1d.spark.agent.v1.InstanceStateR\tinstances\x12\x16\n" +
-	"\x06images\x18\x02 \x03(\tR\x06images\"F\n" +
+	"\x06images\x18\x02 \x03(\tR\x06images\x12)\n" +
+	"\x03net\x18\x03 \x01(\v2\x17.spark.agent.v1.NetInfoR\x03net\"`\n" +
 	"\rInstanceState\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x14\n" +
-	"\x05phase\x18\x02 \x01(\tR\x05phase\"}\n" +
+	"\x05phase\x18\x02 \x01(\tR\x05phase\x12\x18\n" +
+	"\acluster\x18\x03 \x01(\tR\acluster\"}\n" +
 	"\tHeartbeat\x121\n" +
 	"\ametrics\x18\x01 \x01(\v2\x17.spark.agent.v1.MetricsR\ametrics\x12=\n" +
 	"\tinstances\x18\x02 \x03(\v2\x1f.spark.agent.v1.InstanceMetricsR\tinstances\"\xb3\x01\n" +
@@ -1383,51 +1914,63 @@ func file_agent_v1_agent_proto_rawDescGZIP() []byte {
 	return file_agent_v1_agent_proto_rawDescData
 }
 
-var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_agent_v1_agent_proto_goTypes = []any{
-	(*EnrollRequest)(nil),   // 0: spark.agent.v1.EnrollRequest
-	(*EnrollResponse)(nil),  // 1: spark.agent.v1.EnrollResponse
-	(*AgentMessage)(nil),    // 2: spark.agent.v1.AgentMessage
-	(*PlatformMessage)(nil), // 3: spark.agent.v1.PlatformMessage
-	(*Hello)(nil),           // 4: spark.agent.v1.Hello
-	(*AgentConfig)(nil),     // 5: spark.agent.v1.AgentConfig
-	(*Command)(nil),         // 6: spark.agent.v1.Command
-	(*CreateInstance)(nil),  // 7: spark.agent.v1.CreateInstance
-	(*StartInstance)(nil),   // 8: spark.agent.v1.StartInstance
-	(*StopInstance)(nil),    // 9: spark.agent.v1.StopInstance
-	(*WipeInstance)(nil),    // 10: spark.agent.v1.WipeInstance
-	(*PullImage)(nil),       // 11: spark.agent.v1.PullImage
-	(*CommandResult)(nil),   // 12: spark.agent.v1.CommandResult
-	(*StateReport)(nil),     // 13: spark.agent.v1.StateReport
-	(*InstanceState)(nil),   // 14: spark.agent.v1.InstanceState
-	(*Heartbeat)(nil),       // 15: spark.agent.v1.Heartbeat
-	(*InstanceMetrics)(nil), // 16: spark.agent.v1.InstanceMetrics
-	(*Metrics)(nil),         // 17: spark.agent.v1.Metrics
+	(*EnrollRequest)(nil),    // 0: spark.agent.v1.EnrollRequest
+	(*EnrollResponse)(nil),   // 1: spark.agent.v1.EnrollResponse
+	(*AgentMessage)(nil),     // 2: spark.agent.v1.AgentMessage
+	(*PlatformMessage)(nil),  // 3: spark.agent.v1.PlatformMessage
+	(*Hello)(nil),            // 4: spark.agent.v1.Hello
+	(*AgentConfig)(nil),      // 5: spark.agent.v1.AgentConfig
+	(*Command)(nil),          // 6: spark.agent.v1.Command
+	(*CreateInstance)(nil),   // 7: spark.agent.v1.CreateInstance
+	(*StartInstance)(nil),    // 8: spark.agent.v1.StartInstance
+	(*StopInstance)(nil),     // 9: spark.agent.v1.StopInstance
+	(*WipeInstance)(nil),     // 10: spark.agent.v1.WipeInstance
+	(*PullImage)(nil),        // 11: spark.agent.v1.PullImage
+	(*ConfigureCluster)(nil), // 12: spark.agent.v1.ConfigureCluster
+	(*ClusterSpec)(nil),      // 13: spark.agent.v1.ClusterSpec
+	(*ClusterMember)(nil),    // 14: spark.agent.v1.ClusterMember
+	(*NetInfo)(nil),          // 15: spark.agent.v1.NetInfo
+	(*NetIface)(nil),         // 16: spark.agent.v1.NetIface
+	(*CommandResult)(nil),    // 17: spark.agent.v1.CommandResult
+	(*StateReport)(nil),      // 18: spark.agent.v1.StateReport
+	(*InstanceState)(nil),    // 19: spark.agent.v1.InstanceState
+	(*Heartbeat)(nil),        // 20: spark.agent.v1.Heartbeat
+	(*InstanceMetrics)(nil),  // 21: spark.agent.v1.InstanceMetrics
+	(*Metrics)(nil),          // 22: spark.agent.v1.Metrics
 }
 var file_agent_v1_agent_proto_depIdxs = []int32{
 	4,  // 0: spark.agent.v1.AgentMessage.hello:type_name -> spark.agent.v1.Hello
-	13, // 1: spark.agent.v1.AgentMessage.state:type_name -> spark.agent.v1.StateReport
-	15, // 2: spark.agent.v1.AgentMessage.heartbeat:type_name -> spark.agent.v1.Heartbeat
-	12, // 3: spark.agent.v1.AgentMessage.result:type_name -> spark.agent.v1.CommandResult
+	18, // 1: spark.agent.v1.AgentMessage.state:type_name -> spark.agent.v1.StateReport
+	20, // 2: spark.agent.v1.AgentMessage.heartbeat:type_name -> spark.agent.v1.Heartbeat
+	17, // 3: spark.agent.v1.AgentMessage.result:type_name -> spark.agent.v1.CommandResult
 	6,  // 4: spark.agent.v1.PlatformMessage.command:type_name -> spark.agent.v1.Command
 	5,  // 5: spark.agent.v1.PlatformMessage.config:type_name -> spark.agent.v1.AgentConfig
-	7,  // 6: spark.agent.v1.Command.create:type_name -> spark.agent.v1.CreateInstance
-	8,  // 7: spark.agent.v1.Command.start:type_name -> spark.agent.v1.StartInstance
-	9,  // 8: spark.agent.v1.Command.stop:type_name -> spark.agent.v1.StopInstance
-	10, // 9: spark.agent.v1.Command.wipe:type_name -> spark.agent.v1.WipeInstance
-	11, // 10: spark.agent.v1.Command.pull:type_name -> spark.agent.v1.PullImage
-	14, // 11: spark.agent.v1.StateReport.instances:type_name -> spark.agent.v1.InstanceState
-	17, // 12: spark.agent.v1.Heartbeat.metrics:type_name -> spark.agent.v1.Metrics
-	16, // 13: spark.agent.v1.Heartbeat.instances:type_name -> spark.agent.v1.InstanceMetrics
-	0,  // 14: spark.agent.v1.AgentGateway.Enroll:input_type -> spark.agent.v1.EnrollRequest
-	2,  // 15: spark.agent.v1.AgentGateway.Connect:input_type -> spark.agent.v1.AgentMessage
-	1,  // 16: spark.agent.v1.AgentGateway.Enroll:output_type -> spark.agent.v1.EnrollResponse
-	3,  // 17: spark.agent.v1.AgentGateway.Connect:output_type -> spark.agent.v1.PlatformMessage
-	16, // [16:18] is the sub-list for method output_type
-	14, // [14:16] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	15, // 6: spark.agent.v1.Hello.net:type_name -> spark.agent.v1.NetInfo
+	7,  // 7: spark.agent.v1.Command.create:type_name -> spark.agent.v1.CreateInstance
+	8,  // 8: spark.agent.v1.Command.start:type_name -> spark.agent.v1.StartInstance
+	9,  // 9: spark.agent.v1.Command.stop:type_name -> spark.agent.v1.StopInstance
+	10, // 10: spark.agent.v1.Command.wipe:type_name -> spark.agent.v1.WipeInstance
+	11, // 11: spark.agent.v1.Command.pull:type_name -> spark.agent.v1.PullImage
+	12, // 12: spark.agent.v1.Command.configure_cluster:type_name -> spark.agent.v1.ConfigureCluster
+	13, // 13: spark.agent.v1.CreateInstance.cluster:type_name -> spark.agent.v1.ClusterSpec
+	13, // 14: spark.agent.v1.ConfigureCluster.cluster:type_name -> spark.agent.v1.ClusterSpec
+	14, // 15: spark.agent.v1.ClusterSpec.members:type_name -> spark.agent.v1.ClusterMember
+	16, // 16: spark.agent.v1.NetInfo.ifaces:type_name -> spark.agent.v1.NetIface
+	19, // 17: spark.agent.v1.StateReport.instances:type_name -> spark.agent.v1.InstanceState
+	15, // 18: spark.agent.v1.StateReport.net:type_name -> spark.agent.v1.NetInfo
+	22, // 19: spark.agent.v1.Heartbeat.metrics:type_name -> spark.agent.v1.Metrics
+	21, // 20: spark.agent.v1.Heartbeat.instances:type_name -> spark.agent.v1.InstanceMetrics
+	0,  // 21: spark.agent.v1.AgentGateway.Enroll:input_type -> spark.agent.v1.EnrollRequest
+	2,  // 22: spark.agent.v1.AgentGateway.Connect:input_type -> spark.agent.v1.AgentMessage
+	1,  // 23: spark.agent.v1.AgentGateway.Enroll:output_type -> spark.agent.v1.EnrollResponse
+	3,  // 24: spark.agent.v1.AgentGateway.Connect:output_type -> spark.agent.v1.PlatformMessage
+	23, // [23:25] is the sub-list for method output_type
+	21, // [21:23] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_agent_proto_init() }
@@ -1451,6 +1994,7 @@ func file_agent_v1_agent_proto_init() {
 		(*Command_Stop)(nil),
 		(*Command_Wipe)(nil),
 		(*Command_Pull)(nil),
+		(*Command_ConfigureCluster)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1458,7 +2002,7 @@ func file_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   18,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

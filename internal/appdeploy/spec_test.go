@@ -54,7 +54,7 @@ func TestValidateSpecMatrix(t *testing.T) {
 		"port dup":         {func(s *appdeploy.Spec) { s.Ports = append(s.Ports, appdeploy.PortSpec{Port: 8000}) }, "ports[1].port"},
 		"path no slash":    {func(s *appdeploy.Spec) { s.Ports[0].Path = "v1" }, "ports[0].path"},
 		"label long":       {func(s *appdeploy.Spec) { s.Ports[0].Label = strings.Repeat("x", 33) }, "ports[0].label"},
-		"timeout high":     {func(s *appdeploy.Spec) { s.TimeoutMinutes = 181 }, "timeout_minutes"},
+		"timeout high":     {func(s *appdeploy.Spec) { s.TimeoutMinutes = 481 }, "timeout_minutes"},
 		"timeout neg":      {func(s *appdeploy.Spec) { s.TimeoutMinutes = -1 }, "timeout_minutes"},
 		"disk high":        {func(s *appdeploy.Spec) { s.MinDataFreeGiB = 2049 }, "min_data_free_gib"},
 		"env name lower":   {func(s *appdeploy.Spec) { s.Env[0].Name = "model" }, "env[0].name"},
@@ -172,5 +172,76 @@ func TestSpecSupportsWorkflows(t *testing.T) {
 	s.SupportsWorkflows = false
 	if appdeploy.SpecHash(s, "x") != before {
 		t.Fatal("false changed spec_hash of existing versions")
+	}
+}
+
+// 计划 13 M20：超时上限 480 分钟。
+func TestValidateSpecTimeout480(t *testing.T) {
+	s := goodSpec()
+	s.TimeoutMinutes = 480
+	if err := appdeploy.ValidateSpec(&s); err != nil {
+		t.Fatalf("480 rejected: %v", err)
+	}
+	s.TimeoutMinutes = 481
+	err := appdeploy.ValidateSpec(&s)
+	if ae := apperr.As(err); ae == nil || ae.Message != "timeout_minutes：需在 1～480 之间" {
+		t.Fatalf("481: err = %v", err)
+	}
+	if appdeploy.MaxTimeoutMinutes != 480 {
+		t.Fatal(appdeploy.MaxTimeoutMinutes)
+	}
+}
+
+// 计划 13：spec.cluster 校验；不写 cluster 的 spec_hash 与改动前相同。
+func TestValidateSpecCluster(t *testing.T) {
+	// 改动前（计划 12）goodSpec 规范化后的 hash
+	base := goodSpec()
+	if err := appdeploy.ValidateSpec(&base); err != nil {
+		t.Fatal(err)
+	}
+	if h := appdeploy.SpecHash(base, "x"); h != "526472c7e7a5115b36acd05053d42a41a37fbe5b98d56abefb1950df3c33e786" {
+		t.Fatalf("spec_hash without cluster changed: %s", h)
+	}
+	if b, _ := json.Marshal(base); strings.Contains(string(b), "cluster") {
+		t.Fatalf("nil cluster serialized: %s", b)
+	}
+
+	for _, c := range []appdeploy.ClusterSupport{
+		{Mode: appdeploy.ClusterModeRequired, MinSize: 2, MaxSize: 4},
+		{Mode: appdeploy.ClusterModeOptional, MinSize: 2, MaxSize: 8, WorkerPorts: true},
+		{Mode: appdeploy.ClusterModeRequired, MinSize: 4, MaxSize: 4},
+	} {
+		s := goodSpec()
+		cs := c
+		s.Cluster = &cs
+		if err := appdeploy.ValidateSpec(&s); err != nil {
+			t.Fatalf("%+v rejected: %v", c, err)
+		}
+		if appdeploy.SpecHash(s, "x") == appdeploy.SpecHash(base, "x") {
+			t.Fatal("cluster not in spec_hash")
+		}
+	}
+	for name, c := range map[string]appdeploy.ClusterSupport{
+		"mode empty": {MinSize: 2, MaxSize: 4},
+		"mode bad":   {Mode: "always", MinSize: 2, MaxSize: 4},
+		"min 1":      {Mode: "required", MinSize: 1, MaxSize: 4},
+		"min > max":  {Mode: "required", MinSize: 4, MaxSize: 2},
+		"max 9":      {Mode: "optional", MinSize: 2, MaxSize: 9},
+	} {
+		s := goodSpec()
+		cs := c
+		s.Cluster = &cs
+		err := appdeploy.ValidateSpec(&s)
+		if ae := apperr.As(err); ae == nil || ae.Code != "app_version_invalid" || !strings.HasPrefix(ae.Message, "cluster") {
+			t.Errorf("%s: err = %v, want app_version_invalid at cluster…", name, err)
+		}
+	}
+	// JSON 形态（规格 §6.1）
+	var s appdeploy.Spec
+	if err := json.Unmarshal([]byte(`{"ports":[{"port":8000}],"cluster":{"mode":"required","min_size":2,"max_size":4,"worker_ports":false}}`), &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Cluster == nil || s.Cluster.Mode != "required" || s.Cluster.MinSize != 2 || s.Cluster.MaxSize != 4 || s.Cluster.WorkerPorts {
+		t.Fatalf("cluster json = %+v", s.Cluster)
 	}
 }

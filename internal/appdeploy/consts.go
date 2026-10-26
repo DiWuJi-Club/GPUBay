@@ -10,7 +10,7 @@ const (
 	ExecUploadTimeout     = 60 * time.Second
 	ExecStatusTimeout     = 20 * time.Second
 	DefaultTimeoutMinutes = 60
-	MaxTimeoutMinutes     = 180
+	MaxTimeoutMinutes     = 480 // 计划 13 M20：由 180 提到 480（只影响新版本 spec）
 	MaxLogTail            = 65536
 	MaxBundleBytes        = 4 << 20 // 计划 11 D2：8 个工作流 × 256KB + 脚本
 	MaxScriptBytes        = 65536

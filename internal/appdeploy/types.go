@@ -38,6 +38,8 @@ type Spec struct {
 	// SupportsWorkflows（计划 11）：该版本的 app.sh 认识部署包里的 workflows/（ComfyUI 工作流市场）；
 	// 为真时 bundleFor 经 Deps.BundleExtra 追加工作流文件。false 省略，不改变既有版本的 spec_hash。
 	SupportsWorkflows bool `json:"supports_workflows,omitempty"`
+	// Cluster（计划 13）：该版本支持在集群上部署（rank0 = head、其余 = worker）。nil = 不支持；nil 省略，不改变既有版本的 spec_hash。
+	Cluster *ClusterSupport `json:"cluster,omitempty"`
 }
 
 type App struct {
@@ -103,6 +105,10 @@ type Deployment struct {
 	FinishedAt *time.Time
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+	// 计划 13：集群部署的成员（app_deployments.cluster_deployment_id / cluster_role，同时为空或同时非空）；
+	// 非集群部署为 nil / ""。
+	ClusterDeploymentID *string
+	ClusterRole         string // head / worker
 }
 
 // Live 表示部署仍占用 app_deployments_live_uniq（非终态）。

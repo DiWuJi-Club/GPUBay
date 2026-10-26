@@ -143,6 +143,9 @@ type Instance struct {
 	CancelledAt           *time.Time
 	// 计划 9：平台节点的系统实例（PlaceSystem）：无订单、expires_at 恒为 NULL、不到期不计费，后台计费类操作一律拒绝
 	System bool
+	// 计划 13：集群成员（instances.cluster_id / cluster_rank，同时为空或同时非空）
+	ClusterID   *string
+	ClusterRank *int
 }
 
 // DefaultSSHPort 是未配置基准端口时容器 sshd 的端口。
@@ -207,7 +210,7 @@ func (i Instance) Remaining(now time.Time) time.Duration {
 const instanceCols = `id, user_id, machine_id, product_id, image_id, state, pending_seconds, expires_at,
 	stopped_at, suspended_at, paused_remaining, reminded_24h, reminded_1h, created_at, password_auth, ssh_host_pubkey,
 	scheduled_start_at, group_id, batch_id, auto_renew, auto_renew_duration, auto_renew_failed_at, auto_renew_failed_reason,
-	reassign_count, provisioned_at, cancelled_at, system`
+	reassign_count, provisioned_at, cancelled_at, system, cluster_id, cluster_rank`
 
 func scanInstance(row pgx.Row) (Instance, error) {
 	var i Instance
@@ -215,7 +218,7 @@ func scanInstance(row pgx.Row) (Instance, error) {
 	err := row.Scan(&i.ID, &i.UserID, &i.MachineID, &i.ProductID, &i.ImageID, &i.State, &i.PendingSeconds, &i.ExpiresAt,
 		&i.StoppedAt, &i.SuspendedAt, &i.PausedRemaining, &i.Reminded24h, &i.Reminded1h, &i.CreatedAt, &i.PasswordAuth, &i.SSHHostPubkey,
 		&i.ScheduledStartAt, &i.GroupID, &i.BatchID, &i.AutoRenew, &autoDur, &i.AutoRenewFailedAt, &i.AutoRenewFailedReason,
-		&i.ReassignCount, &i.ProvisionedAt, &i.CancelledAt, &i.System)
+		&i.ReassignCount, &i.ProvisionedAt, &i.CancelledAt, &i.System, &i.ClusterID, &i.ClusterRank)
 	if db.IsNoRows(err) {
 		return Instance{}, apperr.ErrNotFound
 	}

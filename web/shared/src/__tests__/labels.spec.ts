@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
-  alertKindLabel, auditActions, bindingStatusLabel, butlerToolLabel, commandStatusLabel, instanceStateLabel, instanceStateType, labelOf, ledgerKindLabel, llmFeatureLabel,
-  llmKeyStatusLabel, llmModelStatusLabel, llmNodeStateLabel, llmNodeStateType, llmUsageStatusLabel, rewardStatusLabel,
+  alertKindLabel, auditActions, bindingStatusLabel, butlerToolLabel, clusterAppStatusLabel, clusterAppStatusType, clusterNetworkLabel, clusterRoleLabel,
+  clusterStatusLabel, clusterStatusType, commandStatusLabel, commandTypeLabel, fabricIsolationLabel, fabricKindLabel, instanceStateLabel, instanceStateType,
+  labelOf, ledgerKindLabel, llmFeatureLabel, llmKeyStatusLabel, llmModelStatusLabel, llmNodeStateLabel, llmNodeStateType, llmUsageStatusLabel, rewardStatusLabel,
 } from '../labels'
-import type { LLMNodeState, LLMUsageStatus } from '../types'
+import type { ClusterAppStatus, ClusterNetwork, ClusterRole, ClusterStatus, FabricIsolation, FabricKind, LLMNodeState, LLMUsageStatus } from '../types'
 
 describe('labels', () => {
   it('实例状态中文与颜色', () => {
@@ -32,7 +33,7 @@ describe('labels', () => {
     expect(labelOf(alertKindLabel, 'container_down')).toBe('容器未运行')
   })
   it('审计动作列表与后端写入值一致', () => {
-    expect(auditActions).toHaveLength(93) // 计划 9 加 12 个 llm.*、计划 12 加 butler.tool_execute / butler.settings
+    expect(auditActions).toHaveLength(105) // 计划 9 加 12 个 llm.*、计划 12 加 butler.tool_execute / butler.settings、计划 13 加 12 个 fabric.* / cluster.*
     expect(new Set(auditActions).size).toBe(auditActions.length)
     expect(auditActions).toContain('instance.port_force_private')
     expect(auditActions).toContain('ssh_key.delete')
@@ -84,5 +85,43 @@ describe('llmFeatureLabel', () => {
     expect(labelOf(llmFeatureLabel, 'vision')).toBe('视觉')
     expect(labelOf(llmFeatureLabel, 'long-context')).toBe('长上下文')
     expect(labelOf(llmFeatureLabel, 'json-mode')).toBe('json-mode')
+  })
+})
+
+describe('计划 13：多机集群文案', () => {
+  it('集群状态 / 网络 / fabric / 角色', () => {
+    const statuses: ClusterStatus[] = ['forming', 'ready', 'degraded', 'released', 'failed']
+    expect(statuses.map((s) => clusterStatusLabel[s])).toEqual(['组建中', '就绪', '降级', '已释放', '开通失败'])
+    for (const s of statuses) expect(clusterStatusType[s]).toBeTruthy()
+    expect(Object.keys(clusterStatusLabel).sort()).toEqual([...statuses].sort())
+    expect(labelOf(clusterStatusType, 'ready')).toBe('success')
+    expect(labelOf(clusterStatusType, 'failed')).toBe('danger')
+    const networks: ClusterNetwork[] = ['rdma', 'ethernet', 'rdma_degraded']
+    expect(networks.map((n) => clusterNetworkLabel[n])).toEqual(['RDMA 高速互联', '普通网络', 'RDMA 不可用'])
+    const kinds: FabricKind[] = ['lan', 'cx7']
+    expect(kinds.map((k) => fabricKindLabel[k])).toEqual(['普通以太网', 'ConnectX-7'])
+    const isolations: FabricIsolation[] = ['routed', 'direct', 'vlan']
+    expect(isolations.map((i) => fabricIsolationLabel[i])).toEqual(['三层路由', '直连', 'VLAN 隔离'])
+    const roles: ClusterRole[] = ['head', 'worker']
+    expect(roles.map((r) => clusterRoleLabel[r])).toEqual(['主节点', '工作节点'])
+  })
+  it('集群应用聚合状态', () => {
+    const statuses: ClusterAppStatus[] = ['installing', 'running', 'failed', 'stopped', 'stale', 'removing', 'removed']
+    expect(Object.keys(clusterAppStatusLabel).sort()).toEqual([...statuses].sort())
+    for (const s of statuses) {
+      expect(clusterAppStatusLabel[s]).toMatch(/\S/)
+      expect(clusterAppStatusType[s]).toBeTruthy()
+    }
+    expect(clusterAppStatusLabel.stale).toBe('需要重新部署')
+  })
+  it('告警种类、审计动作与指令类型', () => {
+    expect(labelOf(alertKindLabel, 'cluster_failed')).toBe('集群开通失败')
+    expect(labelOf(alertKindLabel, 'cluster_rdma_degraded')).toBe('集群 RDMA 不可用')
+    expect(labelOf(alertKindLabel, 'cluster_net_error')).toBe('集群网络异常')
+    for (const a of [
+      'fabric.create', 'fabric.update', 'fabric.delete', 'cluster.extend', 'cluster.resync', 'cluster.release', 'cluster.auto_renew',
+      'cluster.app_deploy', 'cluster.app_redeploy', 'cluster.app_stop', 'cluster.app_start', 'cluster.app_remove',
+    ]) expect(auditActions).toContain(a)
+    expect(labelOf(commandTypeLabel, 'configure_cluster')).toBe('配置集群网络')
   })
 })

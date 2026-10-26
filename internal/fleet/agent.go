@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/imageref"
 )
@@ -19,6 +20,8 @@ const (
 type InstanceState struct {
 	InstanceID string `json:"instance_id"`
 	Phase      string `json:"phase"`
+	// Cluster 计划 13：集群网络状态（"" 非集群 / ok / pending / "error: …"），随 last_state_report 落库。
+	Cluster string `json:"cluster,omitempty"`
 }
 
 // StateReport 是 Agent 上报的本机实例集合，原文存入 machines.last_state_report。
@@ -26,6 +29,8 @@ type InstanceState struct {
 type StateReport struct {
 	Instances []InstanceState `json:"instances"`
 	Images    []string        `json:"-"` // 计划 7：已缓存镜像；nil = 旧 Agent 未上报（不覆盖 machines.cached_images）
+	// Net 计划 13：网卡探测；nil = 旧 Agent 未上报。不进 last_state_report，由 RecordNetInfo 写 machines.net_info。
+	Net *clusterspec.NetInfo `json:"-"`
 }
 
 // 已缓存镜像的截断规则（与 Agent 侧相同，见 imageref）。

@@ -172,23 +172,28 @@ func TestMigration00022RoundTrip(t *testing.T) {
 
 // 已上线计划 11 的库（00024 先于 00022 落库）升级：00022 乱序补跑；两者互不依赖，
 // 各自单独 Down / Up（ApplyVersion）都不动对方的表与约束。
+// 场景限定在 00025 及以前：00026（计划 13）依赖 00022 的 llm 表，不可能先于 00022 落库。
 func TestMigration00022AfterComfy00024(t *testing.T) {
 	ctx := context.Background()
 	url := dbtest.EmptyURL(t)
-	without := fstest.MapFS{}
+	upTo25 := fstest.MapFS{}  // 00025 及以前的全部迁移
+	without := fstest.MapFS{} // 其中去掉 00022
 	entries, err := fs.ReadDir(migrations.FS, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "00022_") || !strings.HasSuffix(e.Name(), ".sql") {
+		if !strings.HasSuffix(e.Name(), ".sql") || e.Name() >= "00026_" {
 			continue
 		}
 		data, err := fs.ReadFile(migrations.FS, e.Name())
 		if err != nil {
 			t.Fatal(err)
 		}
-		without[e.Name()] = &fstest.MapFile{Data: data}
+		upTo25[e.Name()] = &fstest.MapFile{Data: data}
+		if !strings.HasPrefix(e.Name(), "00022_") {
+			without[e.Name()] = &fstest.MapFile{Data: data}
+		}
 	}
 	if err := db.MigrateFS(ctx, url, without); err != nil {
 		t.Fatal(err)
@@ -226,7 +231,7 @@ func TestMigration00022AfterComfy00024(t *testing.T) {
 	exec(`INSERT INTO uploads (key, user_id, size, content_type, purpose, created_at) VALUES ('2026/01/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.webp', NULL, 1, 'image/webp', 'workflow_cover', now())`)
 
 	// 升级：完整迁移集合，00022 乱序补跑
-	if err := db.MigrateFS(ctx, url, migrations.FS); err != nil {
+	if err := db.MigrateFS(ctx, url, upTo25); err != nil {
 		t.Fatalf("out-of-order 00022: %v", err)
 	}
 	if n := count(`SELECT count(*) FROM users WHERE phone = 'system:llm' AND system`); n != 1 {
@@ -243,7 +248,7 @@ func TestMigration00022AfterComfy00024(t *testing.T) {
 		VALUES (2, -10, 890, 'llm_pay', 'llm_settlement', '1', now()), (2, 5, 895, 'referral_rebate', 'referral', 'ord-x', now())`)
 	exec(`DELETE FROM wallet_ledger`)
 
-	p, err := goose.NewProvider(goose.DialectPostgres, sqlDB, migrations.FS, goose.WithAllowOutofOrder(true))
+	p, err := goose.NewProvider(goose.DialectPostgres, sqlDB, upTo25, goose.WithAllowOutofOrder(true))
 	if err != nil {
 		t.Fatal(err)
 	}
