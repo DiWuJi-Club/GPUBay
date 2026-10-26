@@ -22,6 +22,7 @@ import (
 	"spark-cloud/internal/agent/metrics"
 	"spark-cloud/internal/agent/state"
 	"spark-cloud/internal/agentpb"
+	"spark-cloud/internal/clusterspec"
 )
 
 const (
@@ -44,7 +45,8 @@ type Config struct {
 	ReportInterval    time.Duration // 零值 60s
 	Backoff           Backoff
 	NoReconnect       bool // 会话结束后不重连；测试里模拟「被顶掉 / 被撤销就退出」的旧 Agent，避免与新 Agent 互相顶替
-	// Features 是 Hello.features 能力位图；nil → features.SharedSlots（本版本的全部能力）。测试用 new(uint32) 模拟旧 Agent。
+	// Features 是 Hello.features 能力位图；nil → 本版本的全部能力：features.SharedSlots，执行器接了集群数据面时再加 features.Cluster。
+	// 测试用 new(uint32) 模拟旧 Agent。
 	Features *uint32
 }
 
@@ -89,6 +91,9 @@ func New(cfg Config, ex *executor.Executor, collect CollectFunc, log *slog.Logge
 	}
 	if cfg.Features == nil {
 		f := features.SharedSlots
+		if ex.ClusterCapable() {
+			f |= features.Cluster
+		}
 		cfg.Features = &f
 	}
 	if log == nil {
@@ -169,7 +174,9 @@ func (c *Client) session(ctx context.Context) error {
 	}
 	// 网关要求第一条消息是 Hello，并且处理完第一份 StateReport 之后才开始投递指令。
 	// 先在本地流上发完这两条再公开 c.stream，避免并发的 Step / SendHeartbeat 抢在 Hello 之前发出。
-	if err := c.sendOn(stream, &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Hello{Hello: &agentpb.Hello{AgentVersion: c.cfg.Version, Hostname: c.cfg.Hostname, Ips: c.cfg.LocalIPs(), Features: *c.cfg.Features}}}); err != nil {
+	// Hello.net 在 AgentConfig 之前探测：lan_iface 可能为空（平台按 machines.lan_ip 认管理网卡）。
+	hello := &agentpb.Hello{AgentVersion: c.cfg.Version, Hostname: c.cfg.Hostname, Ips: c.cfg.LocalIPs(), Features: *c.cfg.Features, Net: netInfoToProto(c.ex.NetInfo(ctx))}
+	if err := c.sendOn(stream, &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_Hello{Hello: hello}}); err != nil {
 		return streamErr(stream, err)
 	}
 	if err := c.sendOn(stream, c.stateReport(ctx)); err != nil {
@@ -342,6 +349,9 @@ func toCommand(cmd *agentpb.Command) executor.Command {
 		out.BandwidthMbps, out.SSHPort, out.DataSizeGiB = int(b.Create.GetBandwidthMbps()), int(b.Create.GetSshPort()), int(b.Create.GetDataSizeGib())
 		out.HostKeyPEM = b.Create.GetHostKeyPem()
 		out.ShareSlots = int(b.Create.GetShareSlots())
+		if cl := b.Create.GetCluster(); cl.GetClusterId() != "" { // 空消息 = 非集群
+			out.Cluster = specFromProto(cl)
+		}
 	case *agentpb.Command_Start:
 		out.Type = "start_instance"
 	case *agentpb.Command_Stop:
@@ -351,6 +361,12 @@ func toCommand(cmd *agentpb.Command) executor.Command {
 	case *agentpb.Command_Pull:
 		out.Type = "pull_image"
 		out.ImageRef = b.Pull.GetImageRef()
+	case *agentpb.Command_ConfigureCluster:
+		out.Type = "configure_cluster"
+		out.Cluster = specFromProto(b.ConfigureCluster.GetCluster())
+		if out.Cluster == nil { // 缺 cluster = 空 Spec = 退出集群
+			out.Cluster = &clusterspec.Spec{}
+		}
 	}
 	return out
 }
@@ -428,9 +444,9 @@ func (c *Client) stateReport(ctx context.Context) *agentpb.AgentMessage {
 	var states []*agentpb.InstanceState
 	report, images := c.ex.Snapshot(ctx)
 	for _, s := range report {
-		states = append(states, &agentpb.InstanceState{InstanceId: s.InstanceID, Phase: s.Phase})
+		states = append(states, &agentpb.InstanceState{InstanceId: s.InstanceID, Phase: s.Phase, Cluster: s.Cluster})
 	}
-	return &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Instances: states, Images: images}}}
+	return &agentpb.AgentMessage{Msg: &agentpb.AgentMessage_State{State: &agentpb.StateReport{Instances: states, Images: images, Net: netInfoToProto(c.ex.NetInfo(ctx))}}}
 }
 
 // Step 步进模式：执行队列（override 非空时直接记录该结果）、逐条发送结果（含回放）、再发 StateReport。

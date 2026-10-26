@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"spark-cloud/internal/agent/client"
+	"spark-cloud/internal/agent/clusternet"
+	clusternetfake "spark-cloud/internal/agent/clusternet/fake"
 	diskfake "spark-cloud/internal/agent/disk/fake"
 	"spark-cloud/internal/agent/executor"
 	"spark-cloud/internal/agent/features"
@@ -34,6 +37,7 @@ import (
 	rtfake "spark-cloud/internal/agent/runtime/fake"
 	"spark-cloud/internal/agent/state"
 	"spark-cloud/internal/agentpb"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/dbtest"
@@ -149,8 +153,9 @@ type harness struct {
 	key       *ecdsa.PrivateKey
 	dir       string // 最近一个 agent 的状态目录
 	collect   client.CollectFunc
-	features  *uint32       // nil → 客户端默认（features.SharedSlots）
-	helloGate chan struct{} // 非 nil 时，构造 Hello 前等它关闭（LocalIPs 在建流之后、发送 Hello 之前被调用）
+	features  *uint32        // nil → 客户端默认（features.SharedSlots，接了集群数据面再加 Cluster）
+	cluster   clusternet.Net // 非 nil 时接进执行器（Deps.Cluster）
+	helloGate chan struct{}  // 非 nil 时，构造 Hello 前等它关闭（LocalIPs 在建流之后、发送 Hello 之前被调用）
 }
 
 func newHarness(t *testing.T) *harness {
@@ -205,7 +210,7 @@ func (h *harness) agentWith(stepped, noReconnect bool) (*client.Client, *executo
 	h.dir = dir
 	st, _ := state.Open(filepath.Join(dir, "state.json"))
 	rt := rtfake.New()
-	ex := executor.New(executor.Deps{Runtime: rt, Disk: diskfake.New(4000 << 30), Net: netfake.New(), State: st, StateDir: dir,
+	ex := executor.New(executor.Deps{Runtime: rt, Disk: diskfake.New(4000 << 30), Net: netfake.New(), Cluster: h.cluster, State: st, StateDir: dir,
 		LocalIPs: func() []string { return []string{"10.0.0.10"} }, MemTotal: func() uint64 { return 128 << 30 },
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, stepped)
 	c := client.New(client.Config{Addr: h.addr, TLS: tc, Version: "test", Hostname: "h", LocalIPs: func() []string { h.waitHelloGate(); return []string{"10.0.0.10"} },
@@ -719,6 +724,155 @@ func TestCreateShareSlotsAndInstanceHeartbeat(t *testing.T) {
 			im := hb.GetInstances()[0]
 			return im.GetInstanceId() == "ins-aaaaaaaa" && im.GetMemCurrent() == 100 && im.GetMemMax() == 400 && im.GetCpuPercent() == 12.5 &&
 				im.GetDataDiskUsed() == 7 && hb.GetMetrics().GetDataDiskUsed() == 7
+		}
+		return false
+	})
+}
+
+// probeRecorder 记录每次 Probe 收到的 lanIP，并像 linux 实现那样只在认出管理网卡时填 LanIface。
+type probeRecorder struct {
+	*clusternetfake.Net
+	mu  sync.Mutex
+	ips []string
+}
+
+func (p *probeRecorder) Probe(ctx context.Context, lanIP string) (clusterspec.NetInfo, error) {
+	p.mu.Lock()
+	p.ips = append(p.ips, lanIP)
+	p.mu.Unlock()
+	n, err := p.Net.Probe(ctx, lanIP)
+	if lanIP != "" {
+		n.LanIface = clusterspec.MgmtIface(n, lanIP)
+	}
+	return n, err
+}
+
+func (p *probeRecorder) lanIPs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.ips)
+}
+
+func eth0Info() clusterspec.NetInfo {
+	return clusterspec.NetInfo{Ifaces: []clusterspec.Iface{{Name: "eth0", MAC: "02:00:00:00:00:10", Up: true, SpeedMbps: 1000, MTU: 1500, IPv4: []string{"10.0.0.10/24"}, Driver: "r8169", PCI: "0000:07:00.0"},
+		{Name: "enp1s0f1np1", Up: true, SpeedMbps: 200000, MTU: 9000, Driver: "mlx5_core", RDMADevice: "rocep1s0f1", RDMAActive: true, Uverbs: "uverbs1", LinkLayer: "Ethernet"}}}
+}
+
+// 接了集群数据面：features = SharedSlots | Cluster；Hello 在 AgentConfig 之前探测（lanIP 为空、lan_iface 为空串），
+// 之后的 StateReport 用平台下发的 lan_ip 探测（lan_iface 认出 eth0）。
+func TestHelloCarriesNetAndClusterFeature(t *testing.T) {
+	h := newHarness(t)
+	pr := &probeRecorder{Net: clusternetfake.New()}
+	pr.SetInfo(eth0Info())
+	h.cluster = pr
+	c, ex, _ := h.agent(true)
+	ctx := h.start(c, ex, false)
+	if err := c.WaitConnected(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "hello+state", func() bool { return len(h.gw.msgs()) >= 2 })
+	hello := h.gw.msgs()[0].GetHello()
+	if hello == nil || hello.GetFeatures() != features.SharedSlots|features.Cluster || hello.GetFeatures() != 3 {
+		t.Fatalf("hello = %v", hello)
+	}
+	n := hello.GetNet()
+	if n == nil || n.GetLanIface() != "" || len(n.GetIfaces()) != 2 {
+		t.Fatalf("hello net = %v", n)
+	}
+	e0, cx := n.GetIfaces()[0], n.GetIfaces()[1]
+	if e0.GetName() != "eth0" || e0.GetMac() != "02:00:00:00:00:10" || !e0.GetUp() || e0.GetSpeedMbps() != 1000 || e0.GetMtu() != 1500 ||
+		!slices.Equal(e0.GetIpv4(), []string{"10.0.0.10/24"}) || e0.GetDriver() != "r8169" || e0.GetPci() != "0000:07:00.0" || e0.GetWireless() {
+		t.Fatalf("eth0 = %v", e0)
+	}
+	if cx.GetRdmaDevice() != "rocep1s0f1" || !cx.GetRdmaActive() || cx.GetUverbs() != "uverbs1" || cx.GetLinkLayer() != "Ethernet" || cx.GetMtu() != 9000 {
+		t.Fatalf("cx7 = %v", cx)
+	}
+	if ips := pr.lanIPs(); len(ips) < 2 || ips[0] != "" {
+		t.Fatalf("probe lan IPs = %q (hello must probe before AgentConfig)", ips)
+	}
+	if err := c.SendStateReport(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "state after config", func() bool { return len(h.gw.msgs()) >= 3 })
+	if st := h.gw.msgs()[2].GetState(); st.GetNet().GetLanIface() != "eth0" {
+		t.Fatalf("state net after config = %v", st.GetNet())
+	}
+}
+
+// 显式 Features（旧 Agent）照用，即使执行器支持集群；探测失败时消息不带 net。
+func TestOldAgentFeatures(t *testing.T) {
+	h := newHarness(t)
+	cn := clusternetfake.New()
+	cn.SetFailProbe(errors.New("sysfs unreadable"))
+	h.cluster = cn
+	h.features = new(uint32)
+	c, ex, _ := h.agent(true)
+	ctx := h.start(c, ex, false)
+	if err := c.WaitConnected(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "hello+state", func() bool { return len(h.gw.msgs()) >= 2 })
+	if hello := h.gw.msgs()[0].GetHello(); hello.GetFeatures() != 0 || hello.GetNet() != nil {
+		t.Fatalf("hello = %v", hello)
+	}
+	if st := h.gw.msgs()[1].GetState(); st.GetNet() != nil {
+		t.Fatalf("state net = %v", st.GetNet())
+	}
+}
+
+func TestToCommandConfigureCluster(t *testing.T) {
+	pb := &agentpb.ClusterSpec{ClusterId: "clu-abcdefghij", Version: 3, Size: 2, Rank: 1, Mode: "routed", Iface: "eth0", Vlan: 0, Mtu: 9000, Subnet: "10.210.3.0/24", Rdma: true,
+		Members: []*agentpb.ClusterMember{{Rank: 0, InstanceId: "ins-aaaaaaaa", Ip: "10.210.3.11", HostIp: "10.0.0.11"}, {Rank: 1, InstanceId: "ins-bbbbbbbb", Ip: "10.210.3.12", HostIp: "10.0.0.10"}}}
+	want := clusterspec.Spec{ClusterID: "clu-abcdefghij", Version: 3, Size: 2, Rank: 1, Mode: "routed", Iface: "eth0", MTU: 9000, Subnet: "10.210.3.0/24", RDMA: true,
+		Members: []clusterspec.Member{{Rank: 0, InstanceID: "ins-aaaaaaaa", IP: "10.210.3.11", HostIP: "10.0.0.11"}, {Rank: 1, InstanceID: "ins-bbbbbbbb", IP: "10.210.3.12", HostIP: "10.0.0.10"}}}
+	eq := func(a, b clusterspec.Spec) bool { return reflect.DeepEqual(a, b) }
+	cfg := client.ToCommandForTest(&agentpb.Command{Id: "c1", InstanceId: "ins-bbbbbbbb", Body: &agentpb.Command_ConfigureCluster{ConfigureCluster: &agentpb.ConfigureCluster{Cluster: pb}}})
+	if cfg.Type != "configure_cluster" || cfg.ID != "c1" || cfg.InstanceID != "ins-bbbbbbbb" || cfg.Cluster == nil || !eq(*cfg.Cluster, want) {
+		t.Fatalf("configure = %+v %+v", cfg, cfg.Cluster)
+	}
+	leave := client.ToCommandForTest(&agentpb.Command{Id: "c2", InstanceId: "ins-bbbbbbbb", Body: &agentpb.Command_ConfigureCluster{ConfigureCluster: &agentpb.ConfigureCluster{}}})
+	if leave.Type != "configure_cluster" || leave.Cluster == nil || leave.Cluster.ClusterID != "" {
+		t.Fatalf("leave = %+v", leave)
+	}
+	cr := client.ToCommandForTest(&agentpb.Command{Id: "c3", InstanceId: "ins-bbbbbbbb", Body: &agentpb.Command_Create{Create: &agentpb.CreateInstance{ImageRef: "img:1", Cluster: pb}}})
+	if cr.Type != "create_instance" || cr.Cluster == nil || !eq(*cr.Cluster, want) {
+		t.Fatalf("create = %+v", cr)
+	}
+	for _, body := range []*agentpb.CreateInstance{{ImageRef: "img:1"}, {ImageRef: "img:1", Cluster: &agentpb.ClusterSpec{}}} {
+		if plain := client.ToCommandForTest(&agentpb.Command{Id: "c4", Body: &agentpb.Command_Create{Create: body}}); plain.Cluster != nil {
+			t.Fatalf("non-cluster create got cluster %+v", plain.Cluster)
+		}
+	}
+}
+
+// 集群成员经协议创建：StateReport 的实例带 cluster 状态、报告带 net。
+func TestStateReportNetAndCluster(t *testing.T) {
+	h := newHarness(t)
+	cn := clusternetfake.New()
+	cn.SetInfo(eth0Info())
+	h.cluster = cn
+	c, ex, _ := h.agent(false)
+	ctx := h.start(c, ex, true)
+	if err := c.WaitConnected(ctx); err != nil {
+		t.Fatal(err)
+	}
+	spec := &agentpb.ClusterSpec{ClusterId: "clu-abcdefghij", Version: 1, Size: 2, Rank: 0, Mode: "routed", Iface: "eth0", Subnet: "10.210.3.0/24",
+		Members: []*agentpb.ClusterMember{{Rank: 0, InstanceId: "ins-aaaaaaaa", Ip: "10.210.3.11", HostIp: "10.0.0.10"}, {Rank: 1, InstanceId: "ins-bbbbbbbb", Ip: "10.210.3.12", HostIp: "10.0.0.11"}}}
+	h.gw.push(&agentpb.Command{Id: "cmd-c", InstanceId: "ins-aaaaaaaa", Body: &agentpb.Command_Create{Create: &agentpb.CreateInstance{
+		ImageRef: "img:1", UpstreamPubkey: "k", BandwidthMbps: 200, SshPort: 2222, DataSizeGib: 8, Cluster: spec}}})
+	waitFor(t, "cluster create result", func() bool { r, ok := ex.StateStore().Result("cmd-c"); return ok && r.OK })
+	if ap := cn.Applies(); len(ap) != 1 || ap[0].Spec.ClusterID != "clu-abcdefghij" {
+		t.Fatalf("applies = %+v", ap)
+	}
+	waitFor(t, "state report with cluster status and net", func() bool {
+		for _, m := range h.gw.msgs() {
+			st := m.GetState()
+			if st == nil || len(st.GetInstances()) != 1 {
+				continue
+			}
+			if is := st.GetInstances()[0]; is.GetInstanceId() == "ins-aaaaaaaa" && is.GetCluster() == "ok" && len(st.GetNet().GetIfaces()) == 2 {
+				return true
+			}
 		}
 		return false
 	})

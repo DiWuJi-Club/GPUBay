@@ -124,9 +124,59 @@ var invariants = []invariant{
 		WHERE n.state NOT IN ('removed', 'failed') AND NOT i.system
 		ORDER BY l.id
 		LIMIT 5`}},
+	// 8.（计划 13）每个非终态组节点（size > 1）：live 成员恰 size 行、rank 为 0..size-1（主键保证 rank 不重）；
+	//    成员实例存在、system、cluster_id = 节点.cluster_id、在成员行的机器上；node.instance_id / machine_id = rank0 成员。
+	{8, []string{`
+		SELECT format('node %s (%s): size=%s, live members=%s, ranks=[%s]', n.id, n.state, n.size, count(mm.rank),
+			coalesce(string_agg(mm.rank::text, ',' ORDER BY mm.rank), ''))
+		FROM llm_nodes n
+		LEFT JOIN llm_node_members mm ON mm.node_id = n.id AND mm.live
+		WHERE n.size > 1 AND n.state NOT IN ('removed', 'failed')
+		GROUP BY n.id, n.state, n.size
+		HAVING count(mm.rank) <> n.size OR coalesce(min(mm.rank), 0) <> 0 OR coalesce(max(mm.rank), n.size - 1) <> n.size - 1
+		ORDER BY n.id
+		LIMIT 5`, `
+		SELECT format('node %s rank %s: instance %s system=%s cluster=%s (node cluster %s), machine %s (member machine %s), node head=%s/%s',
+			n.id, mm.rank, mm.instance_id, coalesce(i.system::text, '-'), coalesce(i.cluster_id, 'NULL'), coalesce(n.cluster_id, 'NULL'),
+			coalesce(i.machine_id::text, '-'), mm.machine_id, coalesce(n.instance_id, 'NULL'), n.machine_id)
+		FROM llm_nodes n
+		JOIN llm_node_members mm ON mm.node_id = n.id AND mm.live
+		LEFT JOIN instances i ON i.id = mm.instance_id
+		WHERE n.size > 1 AND n.state NOT IN ('removed', 'failed')
+		  AND (i.id IS NULL OR NOT i.system OR i.cluster_id IS DISTINCT FROM n.cluster_id OR i.machine_id <> mm.machine_id
+		       OR (mm.rank = 0 AND (n.instance_id IS DISTINCT FROM mm.instance_id OR n.machine_id <> mm.machine_id)))
+		ORDER BY n.id, mm.rank
+		LIMIT 5`}},
+	// 9. 终态节点没有 live 成员。
+	{9, []string{`
+		SELECT format('node %s (%s): live member rank %s (machine %s)', n.id, n.state, mm.rank, mm.machine_id)
+		FROM llm_nodes n
+		JOIN llm_node_members mm ON mm.node_id = n.id AND mm.live
+		WHERE n.state IN ('removed', 'failed')
+		ORDER BY n.id, mm.rank
+		LIMIT 5`}},
+	// 10. ready 的组节点：集群部署 active，且每个 live 成员在该集群部署里的成员部署 running。
+	{10, []string{`
+		SELECT format('node %s ready: app cluster %s state=%s', n.id, coalesce(n.app_cluster_id, 'NULL'), coalesce(c.state, 'missing'))
+		FROM llm_nodes n
+		LEFT JOIN app_cluster_deployments c ON c.id = n.app_cluster_id
+		WHERE n.state = 'ready' AND n.size > 1 AND c.state IS DISTINCT FROM 'active'
+		ORDER BY n.id
+		LIMIT 5`, `
+		SELECT format('node %s ready: rank %s (instance %s) deployment %s', n.id, mm.rank, mm.instance_id,
+			coalesce(string_agg(d.id || '=' || d.state, ','), 'missing'))
+		FROM llm_nodes n
+		JOIN llm_node_members mm ON mm.node_id = n.id AND mm.live
+		LEFT JOIN app_deployments d ON d.instance_id = mm.instance_id AND d.cluster_deployment_id = n.app_cluster_id
+			AND d.state NOT IN ('removed', 'lost')
+		WHERE n.state = 'ready' AND n.size > 1 AND n.app_cluster_id IS NOT NULL
+		GROUP BY n.id, mm.rank, mm.instance_id
+		HAVING count(d.id) FILTER (WHERE d.state = 'running') <> 1 OR count(d.id) <> 1
+		ORDER BY n.id, mm.rank
+		LIMIT 5`}},
 }
 
-// CheckInvariants 核对规格 §14 的七条不变量（集成测试与真机验收后执行）。
+// CheckInvariants 核对规格 §14 的七条不变量与计划 13 §7.7 的三条（⑧～⑩）（集成测试与真机验收后执行）。
 // 全部查询在同一个只读 REPEATABLE READ 快照里执行；违背的条目以 "invariant N: 明细" 返回（多条用 errors.Join 合并）。
 func CheckInvariants(ctx context.Context, pool *pgxpool.Pool) error {
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})

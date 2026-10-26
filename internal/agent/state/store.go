@@ -6,8 +6,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
+
+	"spark-cloud/internal/clusterspec"
 )
 
 // maxResults 由 export_test.go 的 SetMaxResultsForTest 在测试里调小（macOS 上每次 fsync 要 10～20ms，1000 条会跑十几秒）。
@@ -35,6 +38,28 @@ type Instance struct {
 	// ShareSlots：建容器时的份数（0 / 1 = 整机）。计划 10 新增，旧状态文件没有该字段（读出为 0）；
 	// Recover 不需要它（配额已固化在容器参数里）。
 	ShareSlots int `json:"share_slots,omitempty"`
+	// 计划 13 集群成员（旧状态文件没有这些字段，读出为 nil / 空）：
+	// Cluster：当前生效的 ClusterSpec（create 时的，之后被 ConfigureCluster 更新）；nil = 非集群实例。
+	Cluster *clusterspec.Spec `json:"cluster,omitempty"`
+	// ClusterRuntime：最近一次成功 Apply 的结果（RDMA HCA / GID 索引），cluster.env 据此渲染。
+	ClusterRuntime *clusterspec.Runtime `json:"cluster_runtime,omitempty"`
+	// ClusterNote：ConfigureCluster 发现的「需重建实例才能生效」的变更（模式 / 网卡 / VLAN 变更、RDMA 由无变有），
+	// 非空时集群状态恒为 "error: <note>"（网络按 create 时的形态继续工作）。
+	ClusterNote string `json:"cluster_note,omitempty"`
+}
+
+// clone 深拷贝指针字段：Store 内部与调用方各持一份，调用方改动返回值不影响 Store。
+func (i Instance) clone() Instance {
+	if i.Cluster != nil {
+		c := *i.Cluster
+		c.Members = slices.Clone(c.Members)
+		i.Cluster = &c
+	}
+	if i.ClusterRuntime != nil {
+		rt := *i.ClusterRuntime
+		i.ClusterRuntime = &rt
+	}
+	return i
 }
 
 type file struct {
@@ -164,13 +189,13 @@ func (s *Store) Instance(id string) (Instance, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	i, ok := s.f.Instances[id]
-	return i, ok
+	return i.clone(), ok
 }
 
 func (s *Store) PutInstance(i Instance) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.f.Instances[i.ID] = i
+	s.f.Instances[i.ID] = i.clone()
 	return s.save()
 }
 
@@ -186,7 +211,7 @@ func (s *Store) Instances() []Instance {
 	defer s.mu.Unlock()
 	out := make([]Instance, 0, len(s.f.Instances))
 	for _, i := range s.f.Instances {
-		out = append(out, i)
+		out = append(out, i.clone())
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })
 	return out
