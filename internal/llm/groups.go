@@ -421,7 +421,10 @@ func (c *Controller) handleUnhealthyGroup(ctx context.Context, now time.Time, cn
 	nd, err := c.s.d.ClusterApps.RedeployCluster(ctx, appdeploy.ClusterRedeployRequest{UserID: c.s.d.SystemUserID,
 		ClusterDeploymentID: *n.AppClusterID, VersionID: m.AppVersionID, EnvSet: false})
 	if err != nil {
-		if ae := apperr.As(err); ae != nil { // 业务拒绝：重试也不会好
+		if errors.Is(err, apperr.ErrAppInvalidState) { // 有成员部署正在安装 / 卸载：暂时性，下一轮再试（不计重建次数）
+			return nil
+		}
+		if ae := apperr.As(err); ae != nil { // 其它业务拒绝：重试也不会好
 			return critical(clipRunes("重建失败："+ae.Message, maxNodeError), "重建失败")
 		}
 		return fmt.Errorf("redeploy cluster: %w", err) // 暂时性错误：rebuild_count 不变，下一轮再试

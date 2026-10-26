@@ -909,3 +909,24 @@ func TestInvariantsGroup(t *testing.T) {
 	ne.exec(`UPDATE llm_nodes SET state = 'failed' WHERE id = $1`, n.ID)
 	check("invariant 9:")
 }
+
+// RedeployCluster 返回 app_invalid_state（有成员部署正在安装 / 卸载）是暂时性的：保持 unhealthy、不计重建、不告警，下一轮再试。
+func TestGroupRedeployInvalidStateRetries(t *testing.T) {
+	ne := newNodeEnv(t)
+	_, n := ne.readyGroup(2)
+	ne.setDeployment(ne.memberDeployment(*n.AppClusterID, ne.members(n.ID)[1].InstanceID), appdeploy.StateFailed, appdeploy.HealthUnknown, "")
+	ne.probeTick()
+	ne.apps.clusterRedeployErr = apperr.ErrAppInvalidState
+	ne.clk.Advance(llm.GroupRebuildAfter)
+	ne.tick()
+	if got := ne.node(n.ID); got.State != llm.NodeUnhealthy || got.RebuildCount != 0 || ne.alertCount(llm.AlertNodeFailed) != 0 {
+		t.Fatalf("after invalid_state %+v alerts %d", got, ne.alertCount(llm.AlertNodeFailed))
+	}
+	ne.apps.mu.Lock()
+	ne.apps.clusterRedeployErr = nil
+	ne.apps.mu.Unlock()
+	ne.tick()
+	if got := ne.node(n.ID); got.State != llm.NodeProvisioning || got.RebuildCount != 1 {
+		t.Fatalf("retry %+v", got)
+	}
+}
