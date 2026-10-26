@@ -314,3 +314,68 @@ describe('NodesTab 自动刷新', () => {
     expect(calls(get, '/llm/pool')).toHaveLength(0)
   })
 })
+
+describe('NodesTab 多机节点组（计划 13，A-LLM-11 / 12）', () => {
+  const groupNode = (): LLMNode => node({
+    id: 'g1', size: 2, cluster_id: 'clu-sys00001', app_cluster_id: 'acd-9', machine_id: 11, machine_name: 'A01-01',
+    members: [
+      { rank: 0, machine_id: 11, machine_name: 'A01-01', instance_id: 'ins-h0000000', instance_state: 'running', suspended: false, deployment: { state: 'running', health: 'ok', progress: 100 } },
+      { rank: 1, machine_id: 14, machine_name: 'A01-04', instance_id: 'ins-w1111111', instance_state: 'running', suspended: false, deployment: { state: 'installing', health: 'unknown', progress: 40 } },
+    ],
+    app_cluster: { id: 'acd-9', status: 'installing', health: 'unknown', progress: 70 },
+  })
+  const fabricPool = (): LLMPool => ({
+    ...poolData(),
+    machines: poolData().machines.map((m, i) => ({ ...m, fabric_id: i === 0 ? 3 : null, fabric_name: i === 0 ? '机房 A 以太网' : '', node: m.node ? { ...m.node, rank: 0, size: 2 } : undefined })),
+    fabrics: [{ fabric_id: 3, name: '机房 A 以太网', kind: 'lan', rdma: false, total: 6, free: 4, groups: { '2': 2, '4': 1 } }],
+  })
+
+  it('机器池按集群网络汇总可组副本数；机器行显示集群网络与组内 rank', async () => {
+    const base = get.getMockImplementation()!
+    get.mockImplementation(async (path: string, q?: Record<string, unknown>) => (path === '/llm/pool' ? fabricPool() : base(path, q)))
+    await mountTab()
+    const rows = wrapper!.findAll('[data-testid="llm-pool-fabrics"] [data-testid="llm-pool-fabric"]')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].text()).toContain('机房 A 以太网')
+    expect(rows[0].find('[data-testid="llm-pool-fabric-free"]').text()).toBe('4 / 6')
+    expect(rows[0].find('[data-testid="llm-pool-fabric-groups"]').text()).toBe('2 台 × 2 · 4 台 × 1')
+    const pr = allById('llm-pool-row')
+    expect(pr[0].find('[data-testid="llm-pool-fabric-name"]').text()).toBe('机房 A 以太网')
+    expect(pr[1].find('[data-testid="llm-pool-fabric-name"]').text()).toBe('—')
+    expect(pr[0].find('[data-testid="llm-pool-node"]').text()).toContain('rank 0 / 2')
+  })
+
+  it('没有 fabric 时不显示汇总表', async () => {
+    await mountTab()
+    expect(byId('llm-pool-fabrics').exists()).toBe(false)
+  })
+
+  it('组节点：「2 台」徽标，展开成员（rank / 机器 / 实例 / 部署进度）；操作作用于整组', async () => {
+    nodes = [groupNode()]
+    await mountTab()
+    expect(byId('llm-node-size').text()).toBe('2 台')
+    expect(byId('llm-node-members').exists()).toBe(false)
+    await byId('llm-node-members-toggle').trigger('click')
+    const ms = wrapper!.findAll('[data-testid="llm-node-members"] [data-testid="llm-node-member"]')
+    expect(ms).toHaveLength(2)
+    expect(ms[1].text()).toContain('A01-04')
+    expect(ms[1].text()).toContain('ins-w1111111')
+    expect(ms[1].text()).toContain('部署中 40%')
+    await byId('llm-node-drain').trigger('click')
+    await flushPromises()
+    expect(inBody('llm-node-op-text')!.textContent).toContain('整组 2 台')
+  })
+
+  it('抽屉：组节点显示成员表与集群部署聚合，链接到集群页', async () => {
+    nodes = [groupNode()]
+    const base = get.getMockImplementation()!
+    get.mockImplementation(async (path: string, q?: Record<string, unknown>) => (path === '/llm/nodes/g1' ? { node: groupNode(), events: [], deployment_events: [] } : base(path, q)))
+    await mountTab()
+    await byId('llm-node-open').trigger('click')
+    await flushPromises()
+    expect(document.body.querySelectorAll('[data-testid="llm-node-drawer-members"] [data-testid="llm-node-drawer-member"]')).toHaveLength(2)
+    expect(inBody('llm-node-app-cluster')!.textContent).toContain('部署中')
+    expect(inBody('llm-node-app-cluster')!.textContent).toContain('70%')
+    expect(inBody('llm-node-cluster-link')!.getAttribute('href')).toContain('/clusters/clu-sys00001')
+  })
+})

@@ -20,6 +20,10 @@ export const routes: RouteRecordRaw[] = [
   { path: '/', component: () => import('./views/DashboardView.vue'), meta: { title: '仪表盘', roles: ALL_ROLES } },
   { path: '/machines', component: () => import('./views/MachinesView.vue'), meta: { title: '机器', roles: OPS_ROLES } },
   { path: '/machines/:id', component: () => import('./views/MachineDetailView.vue'), meta: { title: '机器详情', roles: OPS_ROLES } },
+  // 计划 13：集群网络 / 集群（写操作在页内按角色显示，接口层仍按角色 403）
+  { path: '/fabrics', component: () => import('./views/FabricsView.vue'), meta: { title: '集群网络', roles: ALL_ROLES } },
+  { path: '/clusters', component: () => import('./views/ClustersView.vue'), meta: { title: '集群', roles: ALL_ROLES } },
+  { path: '/clusters/:id', component: () => import('./views/ClusterDetailView.vue'), meta: { title: '集群详情', roles: ALL_ROLES } },
   { path: '/pdus', component: () => import('./views/PdusView.vue'), meta: { title: 'PDU', roles: OPS_ROLES } },
   { path: '/groups', component: () => import('./views/GroupsView.vue'), meta: { title: '机组', roles: OPS_ROLES } },
   { path: '/alerts', component: () => import('./views/AlertsView.vue'), meta: { title: '告警', roles: ALL_ROLES } },

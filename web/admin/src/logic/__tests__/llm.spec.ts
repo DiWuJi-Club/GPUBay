@@ -4,6 +4,7 @@ import {
   compatibleImages, emptyModelForm, extraEnvKeys, fenToYuanInput, fmtPrice, imageNote, latestPublished, LLM_FEATURES, modelToForm, nodeEnvSpec, nodeParamsChanged, staleNodesWarning,
   tabFromQuery, validateEnvValue, validateModelForm, visibleTabs, wantedReplicas, yuanInputToFen, type ModelForm,
   canDrainNode, canRebuildNode, dashLlmNodesBad, canRemoveNode, isPoolGroup, nodeDeployText, poolCandidateQuery, poolLeaseText, validateNodeRemoveReason,
+  nodeSizeBadge, nodesOptionsFor, parallelError, poolFabricGroupsText, withNodesPerReplica,
 } from '../llm'
 
 const model = (over: Partial<LLMModelAdmin> = {}): LLMModelAdmin => ({
@@ -309,5 +310,61 @@ describe('节点与机器池', () => {
   it('候选机器查询：未分组 / 某机组 + 机柜', () => {
     expect(poolCandidateQuery('none', ' ', 1)).toEqual({ group_id: 'none', rack: undefined, page: 1, page_size: 50 })
     expect(poolCandidateQuery(3, 'A01', 2)).toEqual({ group_id: 3, rack: 'A01', page: 2, page_size: 50 })
+  })
+})
+
+describe('计划 13：模型多机字段（每副本机器数 / TP / PP）', () => {
+  const spec = nodeEnvSpec(vllmEnv)
+  it('TENSOR_PARALLEL_SIZE / PIPELINE_PARALLEL_SIZE 是平台保留变量，不在节点参数里展示', () => {
+    const withTP = [...vllmEnv, env({ name: 'TENSOR_PARALLEL_SIZE', type: 'int', default: '1' }), env({ name: 'PIPELINE_PARALLEL_SIZE', type: 'int', default: '1' })]
+    expect(nodeEnvSpec(withTP).map((e) => e.name)).toEqual(['GPU_MEMORY_UTILIZATION', 'MAX_NUM_SEQS', 'QUANTIZATION'])
+  })
+  it('新建默认 N=1、TP=1、PP=1；旧模型缺字段时按 1 / N / 1 回显', () => {
+    expect(emptyModelForm()).toMatchObject({ nodes_per_replica: 1, tensor_parallel: 1, pipeline_parallel: 1 })
+    expect(modelToForm(model(), spec)).toMatchObject({ nodes_per_replica: 1, tensor_parallel: 1, pipeline_parallel: 1 })
+    expect(modelToForm(model({ nodes_per_replica: 2, tensor_parallel: 2, pipeline_parallel: 1 }), spec)).toMatchObject({ nodes_per_replica: 2, tensor_parallel: 2, pipeline_parallel: 1 })
+  })
+  it('改每副本机器数：TP 默认 = 台数、PP = 1', () => {
+    expect(withNodesPerReplica(goodForm(), 4)).toMatchObject({ nodes_per_replica: 4, tensor_parallel: 4, pipeline_parallel: 1 })
+    expect(withNodesPerReplica(goodForm({ nodes_per_replica: 4, tensor_parallel: 4 }), 1)).toMatchObject({ nodes_per_replica: 1, tensor_parallel: 1, pipeline_parallel: 1 })
+  })
+  it.each([
+    [1, 1, 1, ''], [2, 2, 1, ''], [4, 4, 1, ''],
+    [2, 1, 1, '张量并行 × 流水线并行必须等于每副本机器数'], [4, 2, 1, '张量并行 × 流水线并行必须等于每副本机器数'],
+    [2, 1, 2, '当前节点镜像不支持流水线并行（缺少 cupy），请设为 1（张量并行 = 每副本机器数）'],
+    [3, 3, 1, '每副本机器数只能是 1、2 或 4'],
+  ] as const)('parallelError(N=%d, TP=%d, PP=%d)', (n, tp, pp, want) => {
+    expect(parallelError({ kind: 'chat', nodes_per_replica: n, tensor_parallel: tp, pipeline_parallel: pp })).toBe(want)
+  })
+  it('向量模型只能单机', () => {
+    expect(parallelError({ kind: 'embedding', nodes_per_replica: 2, tensor_parallel: 2, pipeline_parallel: 1 })).toBe('向量模型只能单机部署')
+  })
+  it('validateModelForm 带上三个字段；不合法时报在 tensor_parallel 上', () => {
+    const ok = validateModelForm(goodForm({ nodes_per_replica: 2, tensor_parallel: 2, pipeline_parallel: 1 }), { creating: true, envSpec: spec })
+    expect(ok.ok).toBe(true)
+    if (ok.ok) expect(ok.input).toMatchObject({ nodes_per_replica: 2, tensor_parallel: 2, pipeline_parallel: 1 })
+    const bad = validateModelForm(goodForm({ nodes_per_replica: 2, tensor_parallel: 1, pipeline_parallel: 1 }), { creating: true, envSpec: spec })
+    expect(bad.ok).toBe(false)
+    if (!bad.ok) expect(bad.errors.tensor_parallel).toBe('张量并行 × 流水线并行必须等于每副本机器数')
+  })
+  it('TP / PP 变化算节点参数变化（只影响新节点）；N 不同也算', () => {
+    const m = model({ nodes_per_replica: 2, tensor_parallel: 2, pipeline_parallel: 1 })
+    const out = validateModelForm(modelToForm(m, spec), { creating: false, envSpec: spec })
+    if (!out.ok) throw new Error('bad form')
+    expect(nodeParamsChanged(m, out.input)).toBe(false)
+    expect(nodeParamsChanged(m, { ...out.input, nodes_per_replica: 4, tensor_parallel: 4 })).toBe(true)
+  })
+  it('vllm-node 版本的 spec.cluster 决定可选台数', () => {
+    expect(nodesOptionsFor({ cluster: { mode: 'optional', min_size: 2, max_size: 4 } })).toEqual([1, 2, 4])
+    expect(nodesOptionsFor({ cluster: { mode: 'optional', min_size: 2, max_size: 2 } })).toEqual([1, 2])
+    expect(nodesOptionsFor({})).toEqual([1])
+    expect(nodesOptionsFor(undefined)).toEqual([1])
+  })
+  it('机器池 fabric 摘要与节点组徽标', () => {
+    expect(poolFabricGroupsText({ groups: { '2': 3, '4': 1 } })).toBe('2 台 × 3 · 4 台 × 1')
+    expect(poolFabricGroupsText({ groups: {} })).toBe('不能组副本')
+    expect(nodeSizeBadge({ size: 4 })).toBe('4 台')
+    expect(nodeSizeBadge({ size: 1 })).toBe('')
+    expect(nodeSizeBadge({})).toBe('')
   })
 })

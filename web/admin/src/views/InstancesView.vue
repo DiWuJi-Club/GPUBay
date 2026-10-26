@@ -69,7 +69,9 @@ const timeText = (i: AdminInstance) => (i.system ? '不计时' : i.state === 'ru
       <el-button size="small" :loading="list.loading.value" data-testid="ainst-retry" @click="list.load()">重试</el-button>
     </el-alert>
     <el-table :data="list.items.value" v-loading="list.loading.value" row-key="id">
-      <el-table-column label="实例" min-width="160"><template #default="{ row }"><span data-testid="ainst-id"><IdLink kind="instance" :id="row.id" /></span><el-tag v-if="row.system" type="info" size="small" class="tag-gap" data-testid="ainst-system">平台节点</el-tag></template></el-table-column>
+      <el-table-column label="实例" min-width="160"><template #default="{ row }"><span data-testid="ainst-id"><IdLink kind="instance" :id="row.id" /></span><el-tag v-if="row.system" type="info" size="small" class="tag-gap" data-testid="ainst-system">平台节点</el-tag>
+        <!-- 计划 13：集群成员标记（点击进集群详情） -->
+        <router-link v-if="row.cluster_id" :to="`/clusters/${row.cluster_id}`" class="tag-gap" data-testid="ainst-cluster" :data-cluster="row.cluster_id" @click.stop><el-tag size="small" type="warning">集群 · rank {{ row.cluster_rank ?? 0 }}</el-tag></router-link></template></el-table-column>
       <el-table-column label="用户" width="90"><template #default="{ row }"><span data-testid="ainst-user"><IdLink kind="user" :id="row.user_id" /></span></template></el-table-column>
       <el-table-column label="机器" width="90"><template #default="{ row }"><span data-testid="ainst-machine"><IdLink kind="machine" :id="row.machine_id" :disabled="isFinance" /></span></template></el-table-column>
       <el-table-column label="镜像" min-width="140"><template #default="{ row }"><span data-testid="ainst-image">{{ imageName.get(row.image_id) ?? row.image_id }}</span></template></el-table-column>
