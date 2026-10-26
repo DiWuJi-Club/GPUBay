@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"spark-cloud/internal/audit"
 	"spark-cloud/internal/catalog"
 	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/fleet"
@@ -592,5 +593,48 @@ func TestReleaseSystemCluster(t *testing.T) {
 		if e.get(inst.ID).State != rental.StateCreating {
 			t.Fatal("user cluster untouched")
 		}
+	}
+}
+
+// 端到端口径：机器的就绪列由 fleet（CreateFabric / UpdateMachine / RecordHello）算出，rental 照样能组集群、Spec 的 host_ip 与 lan_ip 一致。
+func TestClusterPlaceWithFleetReadiness(t *testing.T) {
+	e := newEnv(t, 0)
+	fab, err := e.fleet.CreateFabric(e.ctx, audit.Actor{AdminID: 1}, fleet.FabricInput{Name: "lab", Kind: "lan", Isolation: "routed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ms []int64
+	for k := 0; k < 2; k++ {
+		ip := fmt.Sprintf("192.168.9.%d", 20+k)
+		id := e.newMachine(fmt.Sprintf("FLT-%d", k))
+		if _, err := e.pool.Exec(e.ctx, `UPDATE machines SET lan_ip = $2 WHERE id = $1`, id, ip); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.fleet.UpdateMachine(e.ctx, audit.Actor{AdminID: 1}, id, fleet.MachineUpdate{SetFabric: true, FabricID: &fab.ID}); err != nil {
+			t.Fatal(err)
+		}
+		n := lanNetInfo(ip)
+		n.LanIface = "" // Hello 在 AgentConfig 之前：平台按 lan_ip 认管理网卡
+		if err := e.fleet.RecordHello(e.ctx, id, 3, &n); err != nil {
+			t.Fatal(err)
+		}
+		ms = append(ms, id)
+	}
+	res := e.placeCluster(2)
+	assertClusterShape(t, res, 2, ms)
+	for _, inst := range res.Instances {
+		for _, m := range e.createPayload(inst).Cluster.Members {
+			if m.HostIP != e.lanIP(byRank(t, res.Instances)[m.Rank].MachineID) {
+				t.Fatalf("member = %+v", m)
+			}
+		}
+	}
+	// 旧 Agent（能力位 0）重连 → 不就绪 → 不再入选
+	if err := e.fleet.RecordHello(e.ctx, ms[0], 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	var ready bool
+	if err := e.pool.QueryRow(e.ctx, `SELECT cluster_ready FROM machines WHERE id = $1`, ms[0]).Scan(&ready); err != nil || ready {
+		t.Fatalf("old agent ready = %v, %v", ready, err)
 	}
 }
