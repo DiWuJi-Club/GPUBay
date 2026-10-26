@@ -445,6 +445,10 @@ func (e *Executor) wipeCluster(ctx context.Context, inst state.Instance) []strin
 	return problems
 }
 
+// PatrolClusters 立即跑一轮集群网络巡检（与 refreshRules 里 60 秒一次的 ensureClusters 相同）。
+// 步进式 fake Agent 不跑定时器之外的巡检：e2e 钩子 /hooks/agent/cluster-net 改了巡检结果后用它让状态立即生效（计划 13 Task 13）。
+func (e *Executor) PatrolClusters(ctx context.Context) { e.ensureClusters(ctx) }
+
 // ensureClusters 是 60 秒巡检（refreshRules 内，与 ensureLimits 同样 opMu.TryLock）：对每个运行中的集群实例 Check，
 // 不通过或上一轮状态不是 ok（error / Agent 重启后还没 Apply）→ 重新 Apply；每轮都回写状态。
 // Check 发现问题而 Apply 修好的那一轮仍如实回写 "error: <Check 的描述>"（例如父接口被 NM 重新加了地址、已清除），

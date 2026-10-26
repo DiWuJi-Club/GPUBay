@@ -197,28 +197,89 @@ func fakeApps() []fakeApp {
 				},
 			},
 			images: []string{"", ImageLLMServing, ImageComfyUI}},
-		// 平台内部应用（Token 商城节点，计划 9）：与 deploy/apps/vllm-node 的端口 / 变量 / 超时相同；internal → 用户市场不可见，
-		// 只有系统账号能部署。后台建模型（llm_models）要求它已发布、模型镜像在兼容列表内。
+		// 平台内部应用（Token 商城节点，计划 9 / 13）：spec 与 deploy/apps/vllm-node 1.1.0 相同（去掉 min_data_free_gib，见 fakeSpec）；
+		// internal → 用户市场不可见，只有系统账号能部署。后台建模型（llm_models）要求它已发布、模型镜像在兼容列表内；
+		// cluster optional 2～4：多机节点组（nodes_per_replica 2 / 4）用同一个版本。
 		{in: appdeploy.AppInput{Slug: "vllm-node", Name: "vLLM 节点（平台内部）", Summary: "Token 商城推理节点，平台自动部署", Category: "llm", Icon: "llm",
 			Sort: 999, Internal: true},
-			spec: appdeploy.Spec{
-				Ports:          []appdeploy.PortSpec{{Port: 8000, Label: "OpenAI 兼容接口", Path: "/docs", HealthPath: "/health"}},
-				TimeoutMinutes: 120,
-				Env: []appdeploy.EnvSpec{
-					{Name: "MODEL_ID", Label: "模型", Type: "string", Required: true, Pattern: `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`},
-					source,
-					{Name: "SERVED_MODEL_NAME", Label: "对外模型名", Type: "string", Required: true, Pattern: `^[a-z0-9][a-z0-9.-]{1,63}$`},
-					{Name: "MAX_MODEL_LEN", Label: "最大上下文", Type: "int", Min: i64(1024), Max: i64(1048576), Default: "32768"},
-					{Name: "API_KEY", Label: "节点密钥", Type: "secret", Required: true, Pattern: `^[A-Za-z0-9_-]{32,128}$`},
-					{Name: "GPU_MEMORY_UTILIZATION", Label: "显存占用比例", Type: "string", Pattern: `^0\.[3-9][0-9]?$`, Default: "0.85"},
-					{Name: "MAX_NUM_SEQS", Label: "最大并发序列", Type: "int", Min: i64(1), Max: i64(512), Default: "64"},
-					{Name: "TASK", Label: "任务类型", Type: "enum", Options: []string{"generate", "embed"}, Default: "generate"},
-				},
-				Links: []appdeploy.LinkSpec{{Label: "接口文档", Path: "/docs"}, {Label: "模型列表", Path: "/v1/models"}},
-			},
-			images: []string{"", ImageLLMServing}},
+			spec: fakeSpec(vllmNodeSpecJSON), images: []string{"", ImageLLMServing}, version: "1.1.0", script: fakeAppScript},
+		// 计划 13：集群应用（cluster required 2～4，只能在集群页部署）；spec 与 deploy/apps/vllm-cluster 1.0.0 相同（去掉 min_data_free_gib）。
+		{in: appdeploy.AppInput{Slug: "vllm-cluster", Name: "vLLM 多机推理", Summary: "在 2～4 台集群上部署一个大模型（OpenAI 兼容接口）", Category: "llm",
+			Icon: "llm", Sort: 15},
+			spec: fakeSpec(vllmClusterSpecJSON), images: []string{"", ImageLLMServing}},
 	}
 }
+
+// fakeSpec 解析与 deploy/apps/<slug>/spec.json 逐字相同的 spec 副本，去掉 min_data_free_gib（同其它 fake 应用）。
+// apps_test 的 TestFakeClusterSpecsMatchDeploy 核对副本与 deploy/apps 一致。
+func fakeSpec(raw string) appdeploy.Spec {
+	var sp appdeploy.Spec
+	if err := json.Unmarshal([]byte(raw), &sp); err != nil {
+		panic("e2ehooks: bad fake spec: " + err.Error())
+	}
+	sp.MinDataFreeGiB = 0
+	return sp
+}
+
+// FakeSpec 是 fakeSpec 的导出版（测试用）：slug 为 vllm-node / vllm-cluster，其它 → false。
+func FakeSpec(slug string) (appdeploy.Spec, bool) {
+	switch slug {
+	case "vllm-node":
+		return fakeSpec(vllmNodeSpecJSON), true
+	case "vllm-cluster":
+		return fakeSpec(vllmClusterSpecJSON), true
+	}
+	return appdeploy.Spec{}, false
+}
+
+// vllmNodeSpecJSON 是 deploy/apps/vllm-node/spec.json（1.1.0）的副本。
+const vllmNodeSpecJSON = `{
+  "ports": [{"port": 8000, "label": "OpenAI 兼容接口", "path": "/docs", "health_path": "/health"}],
+  "timeout_minutes": 360,
+  "min_data_free_gib": 80,
+  "env": [
+    {"name": "MODEL_ID", "label": "模型", "type": "string", "required": true, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$", "help": "仓库 ID（平台按模型目录的 source_id 填写）"},
+    {"name": "MODEL_SOURCE", "label": "下载源", "type": "enum", "options": ["modelscope", "hf-mirror"], "default": "modelscope"},
+    {"name": "SERVED_MODEL_NAME", "label": "对外模型名", "type": "string", "required": true, "pattern": "^[a-z0-9][a-z0-9.-]{1,63}$", "help": "vLLM --served-model-name（平台按模型 slug 填写）"},
+    {"name": "MAX_MODEL_LEN", "label": "最大上下文", "type": "int", "min": 1024, "max": 1048576, "default": "32768"},
+    {"name": "API_KEY", "label": "节点密钥", "type": "secret", "required": true, "pattern": "^[A-Za-z0-9_-]{32,128}$", "help": "平台网关访问节点用的密钥（平台生成）"},
+    {"name": "GPU_MEMORY_UTILIZATION", "label": "显存占用比例", "type": "string", "pattern": "^0\\.[3-9][0-9]?$", "default": "0.85"},
+    {"name": "MAX_NUM_SEQS", "label": "最大并发序列", "type": "int", "min": 1, "max": 512, "default": "64"},
+    {"name": "QUANTIZATION", "label": "量化", "type": "enum", "options": ["none", "fp8", "awq", "gptq"], "default": "none"},
+    {"name": "REASONING_PARSER", "label": "推理内容解析", "type": "enum", "options": ["none", "qwen3", "deepseek_r1"], "default": "none"},
+    {"name": "TOOL_CALL_PARSER", "label": "工具调用解析", "type": "enum", "options": ["none", "hermes"], "default": "hermes"},
+    {"name": "TASK", "label": "任务类型", "type": "enum", "options": ["generate", "embed"], "default": "generate", "help": "embed 对应向量模型（vllm serve --task embed）"},
+    {"name": "MODEL_SIZE_GB", "label": "模型大小（GB）", "type": "int", "min": 1, "max": 2000, "default": "20", "help": "只用于估算下载进度"},
+    {"name": "TENSOR_PARALLEL_SIZE", "label": "张量并行", "type": "int", "min": 1, "max": 8, "default": "1", "help": "多机节点（每副本 N 台）由平台填写，TP × PP = N；单机为 1"},
+    {"name": "PIPELINE_PARALLEL_SIZE", "label": "流水线并行", "type": "int", "min": 1, "max": 8, "default": "1", "help": "多机节点由平台填写；> 1 需要镜像内 cupy（ray[cgraph]）"}
+  ],
+  "cluster": {"mode": "optional", "min_size": 2, "max_size": 4},
+  "links": [{"label": "接口文档", "path": "/docs"}, {"label": "模型列表", "path": "/v1/models"}]
+}`
+
+// vllmClusterSpecJSON 是 deploy/apps/vllm-cluster/spec.json（1.0.0）的副本。
+const vllmClusterSpecJSON = `{
+  "ports": [{"port": 8000, "label": "OpenAI 兼容接口", "path": "/docs", "health_path": "/health"}],
+  "timeout_minutes": 360,
+  "min_data_free_gib": 100,
+  "env": [
+    {"name": "MODEL_ID", "label": "模型", "type": "string", "required": true, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$", "help": "仓库 ID，例如 Qwen/Qwen3-32B（2 台）、Qwen/Qwen3-235B-A22B-Instruct-2507-FP8（4 台）、Qwen/Qwen2.5-72B-Instruct（2 台）"},
+    {"name": "MODEL_SOURCE", "label": "下载源", "type": "enum", "options": ["modelscope", "hf-mirror"], "default": "modelscope"},
+    {"name": "SERVED_MODEL_NAME", "label": "对外模型名", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", "default": "model", "help": "接口里的 model 字段（vllm --served-model-name）"},
+    {"name": "MAX_MODEL_LEN", "label": "最大上下文", "type": "int", "min": 1024, "max": 1048576, "default": "32768"},
+    {"name": "TENSOR_PARALLEL_SIZE", "label": "张量并行（TP）", "type": "int", "min": 1, "max": 8, "help": "留空 = 集群台数；TP × PP 必须等于台数"},
+    {"name": "PIPELINE_PARALLEL_SIZE", "label": "流水线并行（PP）", "type": "int", "min": 1, "max": 8, "default": "1", "help": "> 1 需要镜像内 cupy（ray[cgraph]），没有时请保持 1"},
+    {"name": "GPU_MEMORY_UTILIZATION", "label": "显存占用比例", "type": "string", "pattern": "^0\\.[3-9][0-9]?$", "default": "0.85"},
+    {"name": "MAX_NUM_SEQS", "label": "最大并发序列", "type": "int", "min": 1, "max": 512, "default": "64"},
+    {"name": "QUANTIZATION", "label": "量化", "type": "enum", "options": ["none", "fp8", "awq", "gptq"], "default": "none"},
+    {"name": "REASONING_PARSER", "label": "推理内容解析", "type": "enum", "options": ["none", "qwen3", "deepseek_r1"], "default": "none"},
+    {"name": "TOOL_CALL_PARSER", "label": "工具调用解析", "type": "enum", "options": ["none", "hermes"], "default": "hermes"},
+    {"name": "API_KEY", "label": "接口密钥", "type": "secret", "required": false, "pattern": "^[A-Za-z0-9_-]{8,128}$", "help": "留空则接口不鉴权（仅建议私有端口）"},
+    {"name": "MODEL_SIZE_GB", "label": "模型大小（GB）", "type": "int", "min": 1, "max": 2000, "default": "60", "help": "只用于估算下载进度"}
+  ],
+  "cluster": {"mode": "required", "min_size": 2, "max_size": 4},
+  "links": [{"label": "接口文档", "path": "/docs"}, {"label": "模型列表", "path": "/v1/models"}]
+}`
 
 // seedImages 返回镜像名 → id：""（默认镜像，不改名不改动）、LLM Serving、ComfyUI（不存在则新建，已存在则复用）。
 // LLM Serving 另建而不是把默认镜像改名：整轮 Playwright 共用一个数据库，改名会让之后断言镜像名称的用例（A-INS 等）失败。

@@ -668,3 +668,24 @@ func TestLLMGatewayKeyPrefixMatchesLLM(t *testing.T) {
 		t.Fatalf("config.LLMGatewayKeyPrefix = %q, llm.KeyPrefix = %q", config.LLMGatewayKeyPrefix, llm.KeyPrefix)
 	}
 }
+
+func TestLoadClusterSubnetPool(t *testing.T) {
+	base := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey}
+	c, err := config.Load(env(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ClusterSubnetPool.String(); got != "10.210.0.0/16" {
+		t.Fatalf("default ClusterSubnetPool = %s, want 10.210.0.0/16", got)
+	}
+	ok := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey, "SPARK_CLUSTER_SUBNET_POOL": "10.77.0.0/16"}
+	if c, err = config.Load(env(ok)); err != nil || c.ClusterSubnetPool.String() != "10.77.0.0/16" {
+		t.Fatalf("custom pool: %v %v", c.ClusterSubnetPool, err)
+	}
+	for _, bad := range []string{"10.210.0.0/24", "10.210.1.0/16", "10.200.0.0/16", "fd00::/16", "nonsense", "10.210.0.0"} {
+		m := map[string]string{"SPARK_DATABASE_URL": "x", "SPARK_SECRET_KEY": validKey, "SPARK_CLUSTER_SUBNET_POOL": bad}
+		if _, err := config.Load(env(m)); err == nil || !strings.Contains(err.Error(), "SPARK_CLUSTER_SUBNET_POOL") {
+			t.Fatalf("pool %q: err = %v, want SPARK_CLUSTER_SUBNET_POOL error", bad, err)
+		}
+	}
+}

@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"spark-cloud/internal/clusterspec"
 )
 
 type Config struct {
@@ -45,6 +47,9 @@ type Config struct {
 	AgentAllowCIDRs    []string
 	AgentDNSServers    []string
 	AgentBandwidthMbps int
+	// 计划 13：多机集群网段池（SPARK_CLUSTER_SUBNET_POOL，默认 10.210.0.0/16）；必须是规范的 IPv4 /16，且不与容器网桥 spark0 的 10.200.0.0/24 重叠。
+	// 每个 active 集群占其中一个 /24（subnet_index 0..255）。
+	ClusterSubnetPool netip.Prefix
 
 	// 计划 3：接入层
 	SSHAddr            string        // SSH 网关监听地址
@@ -378,6 +383,14 @@ func (c *Config) loadAgent(getenv func(string) string, or func(key, def string) 
 			return fmt.Errorf("SPARK_AGENT_DNS_SERVERS 的 %s 是私网地址，必须包含在 SPARK_AGENT_ALLOW_CIDRS 内", ip)
 		}
 	}
+	pool := or("SPARK_CLUSTER_SUBNET_POOL", clusterspec.DefaultPool)
+	if c.ClusterSubnetPool, err = netip.ParsePrefix(pool); err != nil || !c.ClusterSubnetPool.Addr().Is4() || c.ClusterSubnetPool.Bits() != 16 ||
+		c.ClusterSubnetPool.Masked() != c.ClusterSubnetPool {
+		return fmt.Errorf("SPARK_CLUSTER_SUBNET_POOL 必须是规范的 IPv4 /16 网段（如 %s），当前为 %q", clusterspec.DefaultPool, pool)
+	}
+	if c.ClusterSubnetPool.Overlaps(agentBridgeSubnet) {
+		return fmt.Errorf("SPARK_CLUSTER_SUBNET_POOL %s 与容器网桥 spark0 的 %s 重叠", pool, agentBridgeSubnet)
+	}
 	if c.Env == "prod" {
 		if len(c.AgentHosts) == 0 {
 			return errors.New("生产环境必须设置 SPARK_AGENT_HOSTS（网关证书的域名或 IP）")
@@ -388,6 +401,9 @@ func (c *Config) loadAgent(getenv func(string) string, or func(key, def string) 
 	}
 	return nil
 }
+
+// agentBridgeSubnet 是 Agent 容器网桥 spark0 的固定子网（cmd/spark-agent 的 docker.Runtime.Subnet）。
+var agentBridgeSubnet = netip.MustParsePrefix("10.200.0.0/24")
 
 var hostLabel = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
 

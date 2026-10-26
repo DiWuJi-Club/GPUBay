@@ -79,6 +79,7 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 | `SPARK_UPSTREAM_SSH_KEY_FILE` | 平台登录容器的 ed25519 私钥（`platform admin gen-upstream-key --path ...` 生成，0600）；生产必填，dev 缺省时自动生成在临时目录 | 空 |
 | `SPARK_AGENT_DATA_SIZE_GIB` / `SPARK_AGENT_BANDWIDTH_MBPS` | 实例数据盘大小（GiB）与默认限速（Mbps） | 2048 / 200 |
 | `SPARK_AGENT_ALLOW_CIDRS` / `SPARK_AGENT_DNS_SERVERS` | 容器可访问的内网白名单（Harbor、HF 镜像站等）与容器 DNS | 空 / 223.5.5.5,119.29.29.29 |
+| `SPARK_CLUSTER_SUBNET_POOL` | 多机集群（计划 13）的集群网段池：每个活跃集群占其中一个 /24（成员 IP = `.11 + rank`、网关 `.1`）。必须是规范的 IPv4 /16，且不与容器网桥 `spark0` 的 `10.200.0.0/24` 重叠；不要与机房内网、`SPARK_AGENT_ALLOW_CIDRS` 冲突（Agent 自检只按默认池检查冲突） | 10.210.0.0/16 |
 | `SPARK_TRUST_PROXY` | 仅当 platform 部署在反向代理之后才设为 true：用户 API 与租户 Web 入口的客户端 IP 取 X-Forwarded-For（不看 X-Real-IP / True-Client-IP）；后台 API 始终以连接地址为准。匿名机组 / 日历 / 可用性端点按客户端 IP 每分钟限流 120 次：在代理之后不设它，所有用户会共用代理地址这一个额度 | false |
 | `SPARK_TRUSTED_PROXY_HOPS` | `SPARK_TRUST_PROXY=true` 时自己的反向代理层数 N（≥ 1）：客户端 IP 取 X-Forwarded-For 自右数第 N 项（每层代理须追加对端地址）；该项缺失或不是合法 IP 时用连接地址 | 1 |
 | `SPARK_SSH_ADDR` | SSH 网关监听地址（compose 把公网 22 映射到它） | :2222 |
@@ -225,6 +226,15 @@ CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright
 - **安全**：自定义节点是第三方代码，在用户容器里以 root 安装运行；只有 super 能发布工作流版本，Git 主机限 github.com / gitee.com / gitcode.com 且钉死 commit，导入前须评审节点仓库。
 - **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。这些限制与每用户同时上传数、每小时运行尝试数用的是进程内锁与计数（「计数 → `/prompt` → 入库」靠进程内锁串行化），**假设 platform 只有一个副本**；多副本部署时它们只是每个副本各自的软上限（落在不同副本上的并发请求可以同时通过检查）。
 - **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），并删除 `uploads` 里的封面登记（`workflow_cover` 行）、把 `uploads` 的约束还原（`purpose` 只允许 `license`、`user_id` 非空）；`SPARK_UPLOAD_DIR` 里的封面文件留在磁盘上（可手工清理），容器内文件不受影响。
+### 多机集群（计划 13）
+
+- **发布顺序：先升级 Agent，再发 platform**。新 Agent 对旧平台无害（旧平台不发集群字段、不读网卡上报）；逐台升级后在后台机器详情确认「集群网络」卡里能力位含集群、网卡表有数据（旧 Agent 显示「Agent 不支持集群（请升级）」，永不入选集群）。然后发 platform（迁移 `00026_multinode.sql`），用 `platform admin app import` 导入 `deploy/apps` 里的 `vllm-node 1.1.0`（Token 商城多机节点）与 `vllm-cluster 1.0.0`（用户集群应用），在后台「应用」发布（super + TOTP）。
+- **CX-7 口不要配 IP**：集群 macvlan 直接挂在 CX-7 物理口（或其 VLAN 子接口）上，父接口必须没有 IPv4 / IPv6 地址、不受 NetworkManager 管理（否则 RDMA 的 GID 与路由会乱）。装 Agent 时用 `install.sh --cluster-iface <网卡>`（可重复）把这些口写进 NM 的 `unmanaged-devices`；Agent 每次 Apply 与巡检都会清掉父接口上的地址。持默认路由的口视为管理网卡，不会被当作集群网卡。
+- **登记 fabric**：后台「集群网络」（ops，无需 TOTP）新建 fabric：普通以太网选 `lan`（隔离方式固定 routed，成员按同一网段组队，RDMA 不可用）；CX-7 选 `cx7`，两台直连选 `direct`（最多挂 2 台、只组 2 台集群），接交换机选 `vlan` 并给出 VLAN 范围（每个集群占一个 VLAN）；交换机支持 RoCE 才勾 RDMA。然后在机器详情把机器加入 fabric（集群网卡留空 = 自动选择：lan 用管理网卡、cx7 用第一个已连接的 mlx5 口），确认「集群就绪」为是、RDMA 与预期一致；不就绪时卡片显示原因。机器上有集群成员时不能改 fabric / 集群网卡。
+- **租用与计费**：控制台市场页选「集群」2 台或 4 台，只能即时开通（不支持预订、指定机器、下单预装应用）；N 台 = N 张订单、续费 / 自动续费 / 释放都在集群页整组操作。组建期 30 分钟内未就绪或有成员开通失败 → 整组中止并全额退款（告警 `cluster_failed`）；集群网络导致的开通失败不判机器故障。
+- **Token 商城多机模型**：后台模型的「每副本机器数」设 2 或 4（TP × PP = 台数；当前镜像没有 cupy，PP 只能为 1）；池里要有同一 fabric、同一网段、`cluster_ready` 的空闲机器各 N 台，否则 `llm_pool_short`。修改每副本机器数前先把副本数调为 0 并等节点释放。
+- **回滚**：`00026` 的 Down 在有活跃集群 / 多机节点 / 集群部署时拒绝；先释放集群、把多机模型副本调为 0。Agent 回退到旧版前机器上不能有集群实例（旧 Agent 不清理 `spc0` 路由与 `SPARK-CLU` 规则）。
+
 ### AI 管家（计划 12）
 
 - **模型端点（默认 = 计划 9 的 Token 商城网关，进程内）**：`SPARK_LLM_PROVIDER=openai`（默认）且 `SPARK_LLM_BASE_URL` 为空、本进程 `SPARK_LLM_GATEWAY=on`（默认）时，管家把 Chat Completions 请求直接交给本进程的 `/v1` 网关处理（进程内传输：不经网络和公网 http.Server；流式时 SSE 逐块回传，默认非流式见下文「流式」；管家取消即客户端断开）。对网关而言它就是一个来自 `127.0.0.1`、带 `Authorization: Bearer <SPARK_LLM_API_KEY>` 的普通调用：同样的 Key 鉴权、账户门槛（实名、未停用、无欠费）、RPM / TPM / 并发限额、余额预检、选节点与记账（`llm_usage`）。启动日志「AI 管家已开启」的 endpoint 显示「本进程 Token 商城网关 /v1（进程内调用）」。
