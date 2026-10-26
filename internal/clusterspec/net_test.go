@@ -24,6 +24,32 @@ func net221() NetInfo {
 	}}
 }
 
+// mlx5Mgmt：管理网卡恰好是一个 mlx5 口（LanIface 未报）——自动选择必须跳过它。
+func mlx5Mgmt() NetInfo {
+	return NetInfo{Ifaces: []Iface{
+		{Name: "enp1s0f0np0", Up: true, IPv4: []string{"10.9.0.1/16"}, Driver: "mlx5_core"},
+		{Name: "enp1s0f1np1", Up: true, Driver: "mlx5_core"},
+	}}
+}
+
+func TestNetPrefix(t *testing.T) {
+	for in, want := range map[string]string{
+		"192.168.1.221/24": "192.168.1.0/24",
+		"172.16.0.5/16":    "172.16.0.0/16",
+		"10.0.0.1/32":      "10.0.0.1/32",
+		"10.210.7.0/24":    "10.210.7.0/24",
+		"192.168.1.221":    "",
+		"":                 "",
+		"x/24":             "",
+		"fe80::1/64":       "",
+		"192.168.1.1/33":   "",
+	} {
+		if got := NetPrefix(in); got != want {
+			t.Errorf("NetPrefix(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestResolveIface(t *testing.T) {
 	cases := []struct {
 		name               string
@@ -40,12 +66,21 @@ func TestResolveIface(t *testing.T) {
 		{"lan configured down", net221(), "lan", "enP7s7", "192.168.1.221", "", "", true},
 		{"lan configured missing", sparkNet(), "lan", "eth9", "192.168.1.10", "", "", true},
 		{"lan configured no ipv4", sparkNet(), "lan", "enp1s0f1np1", "192.168.1.10", "", "", true},
-		{"lan no lan iface", NetInfo{Ifaces: sparkNet().Ifaces}, "lan", "", "192.168.1.10", "", "", true},
+		{"lan no lan iface nor lanIP", NetInfo{Ifaces: sparkNet().Ifaces}, "lan", "", "", "", "", true},
+		// Hello 在 AgentConfig 之前发出：LanIface 为空，靠 lanIP 在 CIDR 里认出管理网卡
+		{"lan empty LanIface found by lanIP", NetInfo{Ifaces: sparkNet().Ifaces}, "lan", "", "192.168.1.10", "enP7s7", "192.168.1.10", false},
+		{"lan empty LanIface wifi by lanIP", NetInfo{Ifaces: net221().Ifaces}, "lan", "", "192.168.1.221", "wlP9s9", "192.168.1.221", false},
+		// lanIP 优先于 Agent 报的 LanIface
+		{"lan lanIP overrides LanIface", NetInfo{LanIface: "wlP9s9", Ifaces: sparkNet().Ifaces}, "lan", "", "192.168.1.10", "enP7s7", "192.168.1.10", false},
+		{"lan configured mgmt by lanIP", NetInfo{Ifaces: sparkNet().Ifaces}, "lan", "enP7s7", "192.168.1.10", "enP7s7", "192.168.1.10", false},
+		{"lan second ipv4 not used", NetInfo{Ifaces: sparkNet().Ifaces}, "lan", "enp9s0", "172.16.0.6", "enp9s0", "172.16.0.6", false},
 		{"cx7 auto picks first up mlx5", sparkNet(), "cx7", "", "192.168.1.10", "enp1s0f1np1", "", false},
 		{"cx7 configured", sparkNet(), "cx7", "enp1s0f1np1", "192.168.1.10", "enp1s0f1np1", "", false},
 		{"cx7 configured down", sparkNet(), "cx7", "enp1s0f0np0", "192.168.1.10", "", "", true},
 		{"cx7 configured wireless", sparkNet(), "cx7", "wlP9s9", "192.168.1.10", "", "", true},
 		{"cx7 configured lan iface", sparkNet(), "cx7", "enP7s7", "192.168.1.10", "", "", true},
+		{"cx7 configured mgmt by lanIP", NetInfo{Ifaces: sparkNet().Ifaces}, "cx7", "enP7s7", "192.168.1.10", "", "", true},
+		{"cx7 mgmt mlx5 by lanIP skipped", mlx5Mgmt(), "cx7", "", "10.9.0.1", "enp1s0f1np1", "", false},
 		{"cx7 none on 221", net221(), "cx7", "", "192.168.1.221", "", "", true},
 		{"unknown kind", sparkNet(), "ib", "", "192.168.1.10", "", "", true},
 	}

@@ -50,8 +50,8 @@ func TestFakeRecordsCalls(t *testing.T) {
 		t.Fatalf("Check default = %v, %v", ok, err)
 	}
 	n.SetCheckResult(false)
-	if ok, _ := n.Check(ctx, "ins-aaaaaaaa", 42, spec(true)); ok {
-		t.Fatal("Check after SetCheckResult(false)")
+	if ok, err := n.Check(ctx, "ins-aaaaaaaa", 42, spec(true)); ok || !errors.Is(err, fake.ErrCheckFailed) {
+		t.Fatalf("Check after SetCheckResult(false) = %v, %v", ok, err)
 	}
 	if err := n.Teardown(ctx, "ins-aaaaaaaa", spec(false), nil); err != nil {
 		t.Fatal(err)

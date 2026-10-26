@@ -98,7 +98,7 @@ func TestMigration00026RoundTrip(t *testing.T) {
 
 	// 存量默认值
 	if n := count(`SELECT count(*) FROM machines WHERE fabric_id IS NULL AND cluster_iface = '' AND agent_features = 0
-		AND net_info IS NULL AND net_info_at IS NULL AND NOT cluster_ready AND NOT cluster_rdma`); n != 3 {
+		AND net_info IS NULL AND net_info_at IS NULL AND NOT cluster_ready AND NOT cluster_rdma AND cluster_net = ''`); n != 3 {
 		t.Fatalf("machine defaults = %d", n)
 	}
 	if n := count(`SELECT count(*) FROM llm_models WHERE nodes_per_replica = 1 AND tensor_parallel = 1 AND pipeline_parallel = 1`); n != 1 {
@@ -214,7 +214,7 @@ func TestMigration00026RoundTrip(t *testing.T) {
 		t.Fatalf("tables after down = %d", n)
 	}
 	if n := count(`SELECT count(*) FROM information_schema.columns WHERE
-		(table_name = 'machines' AND column_name IN ('fabric_id', 'cluster_iface', 'agent_features', 'net_info', 'net_info_at', 'cluster_ready', 'cluster_rdma'))
+		(table_name = 'machines' AND column_name IN ('fabric_id', 'cluster_iface', 'agent_features', 'net_info', 'net_info_at', 'cluster_ready', 'cluster_rdma', 'cluster_net'))
 		OR (table_name = 'instances' AND column_name IN ('cluster_id', 'cluster_rank'))
 		OR (table_name = 'app_deployments' AND column_name IN ('cluster_deployment_id', 'cluster_role'))
 		OR (table_name = 'llm_models' AND column_name IN ('nodes_per_replica', 'tensor_parallel', 'pipeline_parallel'))

@@ -18,7 +18,8 @@ type Net interface {
 	Devices(s clusterspec.Spec) ([]string, error)
 	// Apply 在容器（netns = pid）里建 / 修 spc0 并配好宿主机侧路由；RDMA 时查 RoCE v2 GID。
 	Apply(ctx context.Context, instanceID string, pid int, s clusterspec.Spec) (clusterspec.Runtime, error)
-	// Check 检查 spc0 在且有地址、routed 的宿主机 /32 路由在；false = 需要重新 Apply。
+	// Check 是 60 秒巡检：spc0 在且有地址、routed 的宿主机 /32 路由在、macvlan 父接口无地址等。
+	// ok = false 表示需要修复（重新 Apply），此时 err 为问题描述（可展示，进 InstanceState.cluster 的 "error: …"）。
 	Check(ctx context.Context, instanceID string, pid int, s clusterspec.Spec) (bool, error)
 	// Teardown 清理该实例在宿主机上的集群网络（对端路由、veth / macvlan、无人使用的 VLAN 子接口）；remaining 是本机其余集群实例的 Spec。
 	Teardown(ctx context.Context, instanceID string, s clusterspec.Spec, remaining []clusterspec.Spec) error

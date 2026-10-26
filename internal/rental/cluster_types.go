@@ -18,8 +18,14 @@ const (
 // ClusterSizes 是产品开放的集群台数（M1；表约束 2..8）。
 var ClusterSizes = []int{2, 4}
 
-// ClusterAlignSlack：全员 running 后成员到期时刻差超过它就向最晚者对齐（M8）。
+// ClusterAlignSlack：成员到期时刻允许的差（只用于「到期不一致」提示与不变量）。
 const ClusterAlignSlack = 60 * time.Second
+
+// ClusterFormTimeout：组建期（ready_at 为空）超过它仍未就绪 → 整组中止。
+const ClusterFormTimeout = 30 * time.Minute
+
+// ClusterMemberStates 是「在位成员」的实例状态（ClusterSpecFor、视图与守卫共用）。
+var ClusterMemberStates = []string{StateCreating, StateRunning, StateStopped}
 
 // ConfigureClusterCommandTimeout 是 configure_cluster 指令的超时（与 Agent 侧一致）。
 const ConfigureClusterCommandTimeout = 2 * time.Minute

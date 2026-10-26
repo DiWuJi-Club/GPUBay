@@ -141,7 +141,27 @@ export interface NetIface {
   uverbs?: string
   link_layer?: string
 }
-export interface NetInfo { lan_iface: string; ifaces: NetIface[] }
+export interface NetInfo {
+  /** 仅供参考：收到 AgentConfig 之前为空；平台按 machines.lan_ip 认管理网卡 */
+  lan_iface: string
+  ifaces: NetIface[]
+}
+
+/** 后台机器视图（GET /admin/api/v1/machines/{id}）里的集群网络字段（plan 13）。 */
+export interface MachineClusterNet {
+  fabric_id: number | null
+  fabric_name?: string
+  cluster_iface: string
+  agent_features: number
+  net_info: NetInfo | null
+  net_info_at: string | null
+  cluster_ready: boolean
+  cluster_rdma: boolean
+  /** 集群网段：lan = 集群网卡 IPv4 前缀（如 192.168.1.0/24），cx7 = 'l2'，未就绪 = '' */
+  cluster_net: string
+  /** 未就绪原因（ResolveIface 的错误文案） */
+  cluster_reason?: string
+}
 
 /** 后台集群列表 / 详情。 */
 export interface AdminCluster extends ClusterView {

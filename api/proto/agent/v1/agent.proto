@@ -113,7 +113,7 @@ message ClusterMember {
 
 // NetInfo / NetIface 与 internal/clusterspec.NetInfo / Iface 一一对应（规格 §3.2）。
 message NetInfo {
-  string lan_iface = 1;
+  string lan_iface = 1;   // 仅供参考：持有 AgentConfig.lan_ip 的网卡；收到 AgentConfig 之前为空，平台按 machines.lan_ip 认管理网卡
   repeated NetIface ifaces = 2;
 }
 message NetIface {
@@ -122,7 +122,7 @@ message NetIface {
   bool up = 3;
   int32 speed_mbps = 4;
   uint32 mtu = 5;
-  repeated string ipv4 = 6;
+  repeated string ipv4 = 6;   // CIDR，如 192.168.1.221/24
   string driver = 7;
   string pci = 8;
   bool wireless = 9;

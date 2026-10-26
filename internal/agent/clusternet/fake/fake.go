@@ -4,12 +4,16 @@ package fake
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 
 	"spark-cloud/internal/agent/clusternet"
 	"spark-cloud/internal/clusterspec"
 )
+
+// ErrCheckFailed 是 SetCheckResult(false) 时 Check 返回的问题描述。
+var ErrCheckFailed = errors.New("spc0 缺失（fake）")
 
 // ApplyCall 是一次 Apply 调用（失败的也记录）。
 type ApplyCall struct {
@@ -51,7 +55,7 @@ func (n *Net) SetDevices(devs []string) { n.with(func() { n.devs = slices.Clone(
 // SetRuntime 设置 Apply 的返回值（失败时也一并返回，便于模拟 ErrNoGID + RDMAActive=false）。
 func (n *Net) SetRuntime(rt clusterspec.Runtime) { n.with(func() { n.runtime = rt }) }
 
-// SetCheckResult 设置 Check 的返回值（默认 true）。
+// SetCheckResult 设置 Check 的结果（默认 true）；false 时 Check 返回 (false, ErrCheckFailed)。
 func (n *Net) SetCheckResult(ok bool) { n.with(func() { n.checkResult = ok }) }
 
 // SetFailProbe 等让对应方法持续返回 err，直到再以 nil 调用。
@@ -154,7 +158,10 @@ func (n *Net) Check(context.Context, string, int, clusterspec.Spec) (bool, error
 	if n.failCheck != nil {
 		return false, n.failCheck
 	}
-	return n.checkResult, nil
+	if !n.checkResult {
+		return false, ErrCheckFailed // 约定：ok = false 时 err 为问题描述
+	}
+	return true, nil
 }
 
 func (n *Net) Teardown(_ context.Context, instanceID string, _ clusterspec.Spec, _ []clusterspec.Spec) error {
