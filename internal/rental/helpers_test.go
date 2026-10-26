@@ -2,6 +2,7 @@ package rental_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/identity"
 	"spark-cloud/internal/platform/clock"
@@ -246,4 +248,119 @@ func (e *env) reserveRaw(machineID int64, start time.Time, secs int64) string {
 		e.t.Fatalf("reserveRaw lease: %v", err)
 	}
 	return id
+}
+
+// ---- 计划 13：集群网络（fabric）与就绪机器（直接写库，不依赖 fleet 的就绪判定）----
+
+// fabric 直接写库建一个集群网络；vlan fabric 传 vlanRange = {min, max}。
+func (e *env) fabric(name, kind, isolation string, rdma bool, vlanRange ...int) int64 {
+	e.t.Helper()
+	var vmin, vmax *int
+	if len(vlanRange) == 2 {
+		vmin, vmax = &vlanRange[0], &vlanRange[1]
+	}
+	var id int64
+	if err := e.pool.QueryRow(e.ctx, `INSERT INTO cluster_fabrics (name, kind, isolation, rdma, vlan_min, vlan_max, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $7) RETURNING id`, name, kind, isolation, rdma, vmin, vmax, e.clock.Now()).Scan(&id); err != nil {
+		e.t.Fatalf("fabric %s: %v", name, err)
+	}
+	return id
+}
+
+// lanNetInfo：一块有线管理网卡 eth0，IPv4 = ip/24。
+func lanNetInfo(ip string) clusterspec.NetInfo {
+	return clusterspec.NetInfo{LanIface: "eth0", Ifaces: []clusterspec.Iface{
+		{Name: "eth0", Up: true, MTU: 1500, IPv4: []string{ip + "/24"}, Driver: "r8169"},
+	}}
+}
+
+// cx7NetInfo：管理网卡 eth0 + 一个 down 的 mlx5 口 + 一个 up 的 mlx5 口（rdma 决定 RDMA 是否可用）。
+func cx7NetInfo(ip string, rdma bool) clusterspec.NetInfo {
+	return clusterspec.NetInfo{LanIface: "eth0", Ifaces: []clusterspec.Iface{
+		{Name: "eth0", Up: true, MTU: 1500, IPv4: []string{ip + "/24"}, Driver: "r8169"},
+		{Name: "enp1s0f0np0", Up: false, MTU: 9000, Driver: "mlx5_core", RDMADevice: "rocep1s0f0", Uverbs: "uverbs0", LinkLayer: "Ethernet"},
+		{Name: "enp1s0f1np1", Up: true, MTU: 9000, Driver: "mlx5_core", RDMADevice: "rocep1s0f1", RDMAActive: rdma, Uverbs: "uverbs1", LinkLayer: "Ethernet"},
+	}}
+}
+
+// joinFabric 把机器加入 fabric 并写入「新 Agent 已上报、就绪」的网络字段（fleet.evalClusterNet 的结果由调用方给出）。
+func (e *env) joinFabric(machineID, fabricID int64, lanIP string, n clusterspec.NetInfo, clusterNet string, rdma bool) {
+	e.t.Helper()
+	b, err := json.Marshal(n)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE machines SET fabric_id = $2, lan_ip = $3, agent_features = 3, net_info = $4, net_info_at = $5,
+		cluster_ready = true, cluster_rdma = $6, cluster_net = $7 WHERE id = $1`, machineID, fabricID, lanIP, b, e.clock.Now(), rdma, clusterNet); err != nil {
+		e.t.Fatalf("joinFabric: %v", err)
+	}
+}
+
+// lanMachines 新登记 n 台机器加入 lan fabric，lan_ip = <prefix>.<10+k>（同一 /24），cluster_net = <prefix>.0/24。
+func (e *env) lanMachines(fabricID int64, prefix string, n int) []int64 {
+	e.t.Helper()
+	var ids []int64
+	for k := 0; k < n; k++ {
+		ip := fmt.Sprintf("%s.%d", prefix, 10+len(e.machines))
+		id := e.newMachine(fmt.Sprintf("LAN-%d-%d", fabricID, len(e.machines)))
+		e.joinFabric(id, fabricID, ip, lanNetInfo(ip), prefix+".0/24", false)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// cx7Machines 新登记 n 台机器加入 cx7 fabric（cluster_net = 'l2'）。
+func (e *env) cx7Machines(fabricID int64, n int, rdma bool) []int64 {
+	e.t.Helper()
+	var ids []int64
+	for k := 0; k < n; k++ {
+		ip := fmt.Sprintf("192.168.50.%d", 10+len(e.machines))
+		id := e.newMachine(fmt.Sprintf("CX7-%d-%d", fabricID, len(e.machines)))
+		e.joinFabric(id, fabricID, ip, cx7NetInfo(ip, rdma), "l2", rdma)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// clusterReq 是 count 台集群的即时下单请求（1 天）。
+func (e *env) clusterReq(count int) rental.BatchRequest {
+	return rental.BatchRequest{UserID: e.userID, ProductID: e.productID, ImageID: e.imageID, Count: count, Duration: catalog.D1d, Quantity: 1, Cluster: true}
+}
+
+// placeCluster 下一个 count 台集群，失败直接终止测试。
+func (e *env) placeCluster(count int) rental.BatchResult {
+	e.t.Helper()
+	res, err := e.svc.PlaceBatch(e.ctx, e.clusterReq(count))
+	if err != nil {
+		e.t.Fatalf("PlaceBatch(cluster %d): %v", count, err)
+	}
+	return res
+}
+
+// createPayload 返回实例待执行的 Create 指令载荷。
+func (e *env) createPayload(inst rental.Instance) fleet.CreateInstancePayload {
+	e.t.Helper()
+	cmds, err := e.fleet.PendingCommands(e.ctx, inst.MachineID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	for _, c := range cmds {
+		if c.Type == fleet.CmdCreateInstance && c.InstanceID == inst.ID {
+			var p fleet.CreateInstancePayload
+			if err := json.Unmarshal(c.Payload, &p); err != nil {
+				e.t.Fatal(err)
+			}
+			return p
+		}
+	}
+	e.t.Fatalf("no pending create for %s", inst.ID)
+	return fleet.CreateInstancePayload{}
+}
+
+// reportCluster 模拟网关收到一份 StateReport：实例 phase 与集群网络状态（覆盖该机器的 last_state_report）。
+func (e *env) reportCluster(machineID int64, instanceID, phase, cluster string) {
+	e.t.Helper()
+	if err := e.fleet.RecordStateReport(e.ctx, machineID, fleet.StateReport{Instances: []fleet.InstanceState{{InstanceID: instanceID, Phase: phase, Cluster: cluster}}}); err != nil {
+		e.t.Fatal(err)
+	}
 }

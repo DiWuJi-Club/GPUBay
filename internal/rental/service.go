@@ -26,12 +26,14 @@ package rental
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
@@ -91,6 +93,8 @@ type Deps struct {
 	SystemUserID int64
 	// 计划 10：容器 sshd 的基准端口（SPARK_UPSTREAM_SSH_PORT）；<= 0 视为 2222。Create 指令按 Instance.SSHPort 带端口。
 	SSHBasePort int
+	// 计划 13：集群网段池（SPARK_CLUSTER_SUBNET_POOL，IPv4 /16）；零值 = clusterspec.DefaultPool。
+	ClusterSubnetPool netip.Prefix
 }
 
 type KeyCounter interface {
@@ -169,8 +173,13 @@ func (s *Service) InstanceSSHPort(instanceID string) int {
 // enqueueCreate 给实例所在机器入队 Create 指令：镜像地址由调用方解析，端口按 Instance.SSHPort，份数恒为 1（整机）。
 // 所有开通路径（即时下单、预订开通、改派、换机）都经这里，保证指令形态一致。
 func (s *Service) enqueueCreate(ctx context.Context, q db.Querier, inst Instance, imageRef string) error {
+	return s.enqueueCreateSpec(ctx, q, inst, imageRef, nil)
+}
+
+// enqueueCreateSpec 与 enqueueCreate 相同，spec 非空时载荷带集群描述（计划 13：集群成员的 Create，ClusterSpecFor 构造）。
+func (s *Service) enqueueCreateSpec(ctx context.Context, q db.Querier, inst Instance, imageRef string, spec *clusterspec.Spec) error {
 	_, err := s.d.Fleet.Enqueue(ctx, q, inst.MachineID, inst.ID, fleet.CmdCreateInstance,
-		fleet.CreateInstancePayload{ImageRef: imageRef, SSHPort: inst.SSHPort(s.d.SSHBasePort), ShareSlots: 1})
+		fleet.CreateInstancePayload{ImageRef: imageRef, SSHPort: inst.SSHPort(s.d.SSHBasePort), ShareSlots: 1, Cluster: spec})
 	return err
 }
 

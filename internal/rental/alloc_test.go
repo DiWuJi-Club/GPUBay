@@ -511,3 +511,124 @@ func TestPickMachinesSkipsLLMPool(t *testing.T) {
 		}
 	}
 }
+
+// legacyPickWhereSQL / legacyPickOrderSQL 是计划 13 之前的候选查询原文（7 个参数）；TestPickWhereSQLUnchanged 拿它对照。
+const legacyPickWhereSQL = `SELECT m.id FROM machines m
+	LEFT JOIN machine_groups g ON g.id = m.group_id
+	WHERE m.product_id = $1
+	  AND (($2::bigint IS NULL AND (m.group_id IS NULL OR g.visible)) OR m.group_id = $2::bigint)
+	  AND ($3::bigint IS NULL OR m.id = $3::bigint)
+	  AND NOT (m.id = ANY($6::bigint[]))
+	  AND (CASE WHEN $7::boolean THEN m.state = 'idle' AND m.agent_online ELSE m.state IN ('idle', 'allocated') END)
+	  AND NOT EXISTS (SELECT 1 FROM machine_leases l
+	                  WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active') AND l.period && tstzrange($4::timestamptz, $5::timestamptz))`
+
+const legacyPickOrderSQL = `
+	ORDER BY (SELECT max(upper(l.period)) FROM machine_leases l
+	          WHERE l.machine_id = m.id AND l.status IN ('reserved', 'active', 'ended') AND upper(l.period) <= $4::timestamptz) DESC NULLS LAST,
+	         m.id`
+
+func legacyPick(e *env, spec rental.PickSpec) []int64 {
+	e.t.Helper()
+	exclude := spec.Exclude
+	if exclude == nil {
+		exclude = []int64{}
+	}
+	rows, err := e.pool.Query(e.ctx, legacyPickWhereSQL+legacyPickOrderSQL+` LIMIT 100`,
+		spec.ProductID, spec.GroupID, spec.MachineID, spec.Lower, spec.Upper, exclude, spec.Immediate)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return ids
+}
+
+// 非集群 spec：候选集与改动前完全相同（集合相同；无 fabric 机器时顺序也相同），计数相同。
+func TestPickWhereSQLUnchanged(t *testing.T) {
+	e := newEnv(t, 6)
+	vis := e.group("A", true)
+	hid := e.group("留池", false)
+	e.setGroup(e.machines[1], vis)
+	e.setGroup(e.machines[2], hid)
+	e.setMachine(e.machines[3], "maintenance", true)
+	e.setMachine(e.machines[4], "idle", false)
+	e.reserveRaw(e.machines[5], dbtest.T0.Add(72*time.Hour), 86400)
+	far := dbtest.T0.Add(48 * time.Hour)
+	specs := func() []rental.PickSpec {
+		var out []rental.PickSpec
+		for _, imm := range []bool{true, false} {
+			for _, g := range []*int64{nil, &vis, &hid} {
+				for _, ex := range [][]int64{nil, {e.machines[0]}} {
+					s := rental.PickSpec{ProductID: e.productID, GroupID: g, Immediate: imm, Exclude: ex}
+					if imm {
+						s.Lower, s.Upper = rental.ImmediatePeriod(dbtest.T0, 86400)
+					} else {
+						s.Lower, s.Upper = rental.BookingPeriod(far, 86400*5)
+					}
+					out = append(out, s)
+					m := e.machines[0]
+					s.MachineID = &m
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	}
+	check := func(sameOrder bool) {
+		for i, s := range specs() {
+			got, want := pick(e, s), legacyPick(e, s)
+			if sameOrder && !slices.Equal(got, want) {
+				t.Fatalf("spec %d order: %v vs legacy %v", i, got, want)
+			}
+			if !slices.Equal(sortedCopy(got), sortedCopy(want)) {
+				t.Fatalf("spec %d set: %v vs legacy %v", i, got, want)
+			}
+			n, err := rental.CountAvailable(e.ctx, e.pool, s)
+			if err != nil || n != len(want) {
+				t.Fatalf("spec %d count %d (%v) vs %d", i, n, err, len(want))
+			}
+		}
+	}
+	check(true)
+	// 加入 fabric（含就绪 / 未就绪）后：集合不变，fabric 机器排到最后
+	f := e.fabric("F", "lan", "routed", false)
+	e.joinFabric(e.machines[0], f, "192.168.1.10", lanNetInfo("192.168.1.10"), "192.168.1.0/24", false)
+	e.joinFabric(e.machines[5], f, "192.168.1.11", lanNetInfo("192.168.1.11"), "192.168.1.0/24", false)
+	if _, err := e.pool.Exec(e.ctx, `UPDATE machines SET cluster_ready = false WHERE id = $1`, e.machines[5]); err != nil {
+		t.Fatal(err)
+	}
+	check(false)
+	all := rental.PickSpec{ProductID: e.productID}
+	all.Lower, all.Upper = rental.BookingPeriod(far, 86400)
+	got := pick(e, all)
+	if len(got) < 2 || !slices.Contains(got[len(got)-2:], e.machines[0]) {
+		t.Fatalf("fabric machines must come last: %v", got)
+	}
+}
+
+// 单机订单优先用不属于 fabric 的机器（给集群留整块）；只剩 fabric 机器时照常用。
+func TestSingleOrdersAvoidFabricMachines(t *testing.T) {
+	e := newEnv(t, 0)
+	f := e.fabric("F", "lan", "routed", false)
+	fm := e.lanMachines(f, "192.168.1", 2)
+	loose := e.newMachine("LOOSE") // ID 比 fabric 机器大：没有首键时会排在后面
+	_, inst := e.place(catalog.D1d)
+	if inst.MachineID != loose {
+		t.Fatalf("single order took %d, want loose %d", inst.MachineID, loose)
+	}
+	res, err := e.svc.PlaceBatch(e.ctx, e.batchReq(2, nil))
+	if err != nil || len(res.Instances) != 2 || res.Cluster != nil {
+		t.Fatalf("batch on fabric machines = %+v, %v", res, err)
+	}
+	for _, i := range res.Instances {
+		if !slices.Contains(fm, i.MachineID) || i.ClusterID != nil {
+			t.Fatalf("instance = %+v", i)
+		}
+		if p := e.createPayload(i); p.Cluster != nil {
+			t.Fatal("single orders must not carry a cluster spec")
+		}
+	}
+}
