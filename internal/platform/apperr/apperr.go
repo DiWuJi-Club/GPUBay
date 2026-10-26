@@ -106,6 +106,7 @@ var (
 	ErrAppClusterUnsupported     = New("app_cluster_unsupported", "该应用不支持集群部署", 400)
 	ErrAppClusterExists          = New("app_cluster_exists", "集群上已有集群应用，请先卸载", 409)
 	ErrAppClusterManaged         = New("app_cluster_managed", "该部署属于集群应用，请在集群页操作", 409)
+	ErrAppClusterBusy            = New("app_cluster_busy", "集群成员正在变更，请稍后重试", 409)
 )
 
 // As 取出错误链中的 *Error；不是业务错误时返回 nil。

@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-
 	"spark-cloud/internal/audit"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/rental"

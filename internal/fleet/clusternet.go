@@ -20,7 +20,7 @@ const (
 	reasonNoNetInfo    = "尚未上报网卡"
 	reasonBadIPv4      = "集群网卡的 IPv4 地址无效"
 	reasonNetFailed    = "上次集群网络开通失败，等待 Agent 重新上报网卡" // SuspendClusterReady 之后、下次重算之前
-	clusterNetL2       = "l2" // cx7 fabric 的 cluster_net：由物理接线保证同一二层
+	clusterNetL2       = "l2"                         // cx7 fabric 的 cluster_net：由物理接线保证同一二层
 	maxNetIfaces       = 64
 	maxNetIfaceAddress = 16
 )

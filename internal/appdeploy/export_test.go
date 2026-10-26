@@ -36,3 +36,6 @@ func SetExecHook(r *Runner, fn func(cmd string) error) { r.execHook = fn }
 
 // ImageEnvironCmd 是 Runner 读镜像环境的容器内命令。
 func ImageEnvironCmd(path string) string { return imageEnvironCmd(path) }
+
+// SetClusterOpHook 设置整组操作的测试钩子（读完成员部署所在实例清单之后、加实例锁之前调用；attempt 从 1 起）；nil 清除。
+func SetClusterOpHook(s *Service, fn func(attempt int)) { s.clusterOpHook = fn }

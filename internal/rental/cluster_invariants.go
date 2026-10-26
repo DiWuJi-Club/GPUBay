@@ -15,6 +15,7 @@ import (
 //	③ 非系统集群：batch_id 下 kind='new' 的订单恰有 size 张，每张订单的实例要么是本集群成员，要么经 instance_transfers（可多跳）连到本集群成员；
 //	④ 系统集群的成员（cluster_id 指向它的全部实例）没有任何订单；
 //	⑤ failed 的非系统集群：全部成员（含换机前的旧实例）的订单都已全额退款。
+//
 // liveClusterCheckSQL 同 clusterLiveSQL（不带参数）：集群 c 仍占用子网 / VLAN。
 const liveClusterCheckSQL = `(c.state = 'active' OR EXISTS (SELECT 1 FROM instances i WHERE i.cluster_id = c.id
 	AND i.state IN ('creating', 'running', 'stopped', 'wiping')))`
