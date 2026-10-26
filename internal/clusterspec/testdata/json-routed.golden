@@ -1,0 +1,34 @@
+{
+  "cluster_id": "clu-7f3k2m9q1a",
+  "version": 2,
+  "size": 4,
+  "rank": 1,
+  "ifname": "spc0",
+  "subnet": "10.210.7.0/24",
+  "ip": "10.210.7.12",
+  "head_ip": "10.210.7.11",
+  "network": "ethernet",
+  "members": [
+    {
+      "rank": 0,
+      "instance_id": "ins-a1b2c3d4",
+      "ip": "10.210.7.11"
+    },
+    {
+      "rank": 1,
+      "instance_id": "ins-e5f6g7h8",
+      "ip": "10.210.7.12"
+    },
+    {
+      "rank": 2,
+      "instance_id": "ins-i9j0k1l2",
+      "ip": "10.210.7.13"
+    },
+    {
+      "rank": 3,
+      "instance_id": "ins-m3n4o5p6",
+      "ip": "10.210.7.14"
+    }
+  ],
+  "rdma": null
+}

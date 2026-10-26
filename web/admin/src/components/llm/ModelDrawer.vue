@@ -7,8 +7,8 @@ import { ElMessage } from 'element-plus'
 import { computed, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
 import {
-  compatibleImages, emptyModelForm, extraEnvKeys, imageNote, LLM_FEATURES, llmSourceLabel, latestPublished, modelToForm, nodeEnvSpec, staleNodesWarning,
-  validateModelForm, type ModelForm,
+  compatibleImages, emptyModelForm, extraEnvKeys, imageNote, LLM_FEATURES, llmSourceLabel, latestPublished, modelToForm, nodeEnvSpec, nodesOptionsFor, NODES_PER_REPLICA_OPTIONS,
+  parallelError, staleNodesWarning, validateModelForm, withNodesPerReplica, type ModelForm,
 } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'
 
@@ -48,6 +48,17 @@ const blocker = computed(() => {
   if (!version.value) return `${NODE_APP_SLUG} 还没有已发布版本：请先在应用目录发布`
   return ''
 })
+// ---- 计划 13：每副本机器数 / TP / PP（M11）----
+/** 所选 vllm-node 版本 spec.cluster 允许的台数 */
+const nodesAllowed = computed(() => nodesOptionsFor(version.value?.spec as { cluster?: { min_size: number; max_size: number } | null } | undefined))
+const nodesDisabled = (n: number) => n !== form.value.nodes_per_replica && (!nodesAllowed.value.includes(n) || (n > 1 && form.value.kind === 'embedding'))
+const parallelErr = computed(() => (blocker.value ? '' : parallelError(form.value)))
+/** 编辑时改了台数且模型已有节点：后端要求先把副本数调为 0 并等节点全部释放 */
+const nodesLocked = computed(() => !!props.model && (props.model.nodes_per_replica || 1) !== form.value.nodes_per_replica && props.model.nodes.total > 0)
+function setNodes(n: number) {
+  form.value = withNodesPerReplica(form.value, n)
+}
+
 const title = computed(() => (props.readonly ? '模型详情' : props.model ? `编辑模型：${props.model.slug}` : '新建模型'))
 
 /** 实时提示：已有节点且改了只影响新节点的参数 */
@@ -247,13 +258,36 @@ async function save() {
         </el-form-item>
       </div>
 
+      <h4>多机副本</h4>
+      <el-form-item label="每副本机器数" :error="errors.nodes_per_replica">
+        <el-radio-group :model-value="form.nodes_per_replica" data-testid="llm-model-nodes-per-replica" @update:model-value="(v) => setNodes(Number(v))">
+          <el-radio-button v-for="n in NODES_PER_REPLICA_OPTIONS" :key="n" :value="n" :disabled="nodesDisabled(n)">{{ n === 1 ? '单机' : `${n} 台` }}</el-radio-button>
+        </el-radio-group>
+        <div class="help">
+          多台机器组成一个副本（同一集群网络内，经 Ray 张量并行），用于单机放不下的大模型；每个副本占用 N 台机器。
+          <template v-if="nodesAllowed.length === 1">所选 vllm-node 版本不支持多机部署。</template>
+          <template v-if="form.kind === 'embedding'">向量模型只能单机部署。</template>
+        </div>
+        <div v-if="nodesLocked" class="help warn" data-testid="llm-model-nodes-locked">已有节点：请先把副本数调为 0 并等节点全部释放，再修改每副本机器数</div>
+      </el-form-item>
+      <div class="two">
+        <el-form-item label="张量并行（TP）" :error="errors.tensor_parallel">
+          <el-input-number v-model="form.tensor_parallel" :min="1" :max="8" :precision="0" controls-position="right" :disabled="form.nodes_per_replica === 1" data-testid="llm-model-tp" />
+        </el-form-item>
+        <el-form-item label="流水线并行（PP）" :error="errors.pipeline_parallel">
+          <el-input-number v-model="form.pipeline_parallel" :min="1" :max="8" :precision="0" controls-position="right" :disabled="form.nodes_per_replica === 1" data-testid="llm-model-pp" />
+        </el-form-item>
+      </div>
+      <p class="help">TP × PP 必须等于每副本机器数；默认 TP = 台数、PP = 1。当前节点镜像缺少 cupy，流水线并行（PP &gt; 1）暂不可用。</p>
+      <p v-if="parallelErr" class="error-text" data-testid="llm-model-parallel-error">{{ parallelErr }}</p>
+
       <el-alert v-if="stale" type="warning" :title="stale" show-icon :closable="false" data-testid="llm-model-stale-warning">
         来源、镜像、版本、上下文、最大输出与节点参数只影响之后新建的节点
       </el-alert>
     </el-form>
     <template v-if="!readonly" #footer>
       <el-button data-testid="llm-model-cancel" @click="emit('close')">取消</el-button>
-      <el-button type="primary" :loading="busy" :disabled="!!blocker" data-testid="llm-model-save" @click="save">保存</el-button>
+      <el-button type="primary" :loading="busy" :disabled="!!blocker || !!parallelErr" data-testid="llm-model-save" @click="save">保存</el-button>
     </template>
   </el-drawer>
 </template>
@@ -264,6 +298,8 @@ h4:first-child { margin-top: 0; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
 .help { color: #909399; font-size: 12px; line-height: 1.5; width: 100%; }
 .mb { margin-bottom: 12px; }
+.warn { color: var(--el-color-warning); }
+.error-text { color: var(--el-color-danger); font-size: 13px; margin: 4px 0 0; }
 .extra { border: 1px dashed var(--el-color-warning); border-radius: 4px; padding: 8px 12px 0; margin-bottom: 12px; }
 .el-select, .el-input-number { width: 100%; }
 </style>

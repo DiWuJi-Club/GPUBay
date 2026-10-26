@@ -16,6 +16,9 @@ export interface MenuItem {
 export const menu: MenuItem[] = [
   { key: 'dashboard', path: '/', label: '仪表盘', roles: ALL_ROLES },
   { key: 'machines', path: '/machines', label: '机器', roles: OPS_ROLES },
+  // 计划 13：集群网络（all 可看、ops 可改）与实例集群（all 可看，延长 / 重新下发 ops）
+  { key: 'fabrics', path: '/fabrics', label: '集群网络', roles: ALL_ROLES },
+  { key: 'clusters', path: '/clusters', label: '集群', roles: ALL_ROLES },
   { key: 'pdus', path: '/pdus', label: 'PDU', roles: OPS_ROLES },
   { key: 'groups', path: '/groups', label: '机组', roles: OPS_ROLES },
   { key: 'alerts', path: '/alerts', label: '告警', roles: ALL_ROLES },

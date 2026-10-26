@@ -1,17 +1,22 @@
 <script setup lang="ts">
-import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type AdminGroup, type EnrollCommand, type LLMPool, type Listed, type MachineDetail } from '@spark/shared'
+import { fmtTime, instanceStateLabel, labelOf, machineStateLabel, messageOf, type AdminGroup, type EnrollCommand, type LLMPool, type Listed } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteUpdate, useRoute } from 'vue-router'
 import { api } from '../api'
 import IdLink from '../components/IdLink.vue'
+import MachineNetCard from '../components/MachineNetCard.vue'
+import type { NetMachineDetail } from '../logic/clusters'
 import { isPoolGroup } from '../logic/llm'
 import { fmtBytes, fmtPercent, fmtTemp } from '../logic/metrics'
 import { notifyError } from '../logic/notify'
+import { OPS_ROLES } from '../menu'
+import { hasRole } from '../store/session'
 
 const route = useRoute()
 const id = computed(() => String(route.params.id))
-const data = ref<MachineDetail | null>(null)
+const data = ref<NetMachineDetail | null>(null)
+const canEditNet = computed(() => hasRole(OPS_ROLES))
 const loading = ref(false)
 const error = ref('')
 const maintenanceVisible = ref(false)
@@ -56,7 +61,7 @@ async function load(target = id.value) {
   const mine = ++seq
   loading.value = true
   try {
-    const d = await api.get<MachineDetail>(`/machines/${target}`)
+    const d = await api.get<NetMachineDetail>(`/machines/${target}`)
     if (mine !== seq) return
     data.value = d
     error.value = ''
@@ -229,6 +234,9 @@ async function revokeEnrollment() {
           <el-button type="danger" plain :disabled="!data.machine.enrolled" data-testid="mdetail-revoke-btn" @click="revokeVisible = true">撤销接入</el-button>
         </div>
       </el-card>
+
+      <!-- 计划 13：集群网络（fabric、集群网卡、就绪判定、网卡表） -->
+      <MachineNetCard :machine="data.machine" :fabric="data.fabric ?? null" :can-edit="canEditNet" @saved="load()" />
 
       <el-card header="最近指标" data-testid="mdetail-metrics">
         <el-descriptions v-if="data.machine.last_metrics" :column="3" border>

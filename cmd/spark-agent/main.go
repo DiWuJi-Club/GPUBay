@@ -18,6 +18,9 @@ import (
 	"syscall"
 
 	"spark-cloud/internal/agent/client"
+	"spark-cloud/internal/agent/clusternet"
+	clusternetfake "spark-cloud/internal/agent/clusternet/fake"
+	clusterlinux "spark-cloud/internal/agent/clusternet/linux"
 	"spark-cloud/internal/agent/cmdrun"
 	"spark-cloud/internal/agent/disk"
 	diskfake "spark-cloud/internal/agent/disk/fake"
@@ -229,7 +232,7 @@ func runAgent(ctx context.Context, args []string, out io.Writer) error {
 	}
 	log := slog.New(slog.NewJSONHandler(out, nil))
 	if *fake {
-		log.Warn("running with --fake: in-memory runtime/disk/netfilter, no containers will actually be created", "state_dir", *stateDir)
+		log.Warn("running with --fake: in-memory runtime/disk/netfilter/cluster network, no containers will actually be created", "state_dir", *stateDir)
 	}
 	cfg, err := loadAgentConfig(*dir)
 	if err != nil {
@@ -265,15 +268,17 @@ func runAgent(ctx context.Context, args []string, out io.Writer) error {
 	var rt runtime.Runtime
 	var dk disk.Disk
 	var nf netfilter.Netfilter
+	var cn clusternet.Net // 集群数据面（计划 13）：接上后 Hello.features 自动带 features.Cluster
 	runner := cmdrun.Exec{}
 	if *fake {
-		rt, dk, nf = rtfake.New(), diskfake.New(4000<<30), netfake.New()
+		rt, dk, nf, cn = rtfake.New(), diskfake.New(4000<<30), netfake.New(), clusternetfake.New()
 	} else {
 		rt = &docker.Runtime{Run: runner, Bridge: "spark0", Subnet: "10.200.0.0/24"}
 		dk = &loop.Disk{Run: runner, Stat: os.Stat, StateDir: *stateDir, Log: log}
 		nf = &iptables.Netfilter{Run: runner, Log: log}
+		cn = clusterlinux.New(runner, clusterlinux.Options{Log: log, LanIPs: st.LanIPs}) // 重启后 Probe 之前靠状态文件认管理网卡
 	}
-	ex := executor.New(executor.Deps{Runtime: rt, Disk: dk, Net: nf, State: st, StateDir: *stateDir, Bridge: "spark0", LocalIPs: localIPs, Log: log}, false)
+	ex := executor.New(executor.Deps{Runtime: rt, Disk: dk, Net: nf, Cluster: cn, State: st, StateDir: *stateDir, Bridge: "spark0", LocalIPs: localIPs, Log: log}, false)
 	if err := ex.Recover(ctx); err != nil {
 		log.Error("recover", "err", err) // 继续运行，StateReport 会如实上报（如 missing_data）
 	}

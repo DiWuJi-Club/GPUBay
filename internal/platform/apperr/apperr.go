@@ -94,6 +94,19 @@ var (
 	ErrButlerLLM            = New("butler_llm_unavailable", "AI 管家暂时不可用，请稍后再试", 503)
 	ErrButlerConfirmInvalid = New("butler_confirm_invalid", "该操作已失效，请重新发起", 409)
 	ErrButlerMessageInvalid = New("butler_message_invalid", "消息不能为空且不超过 2000 字", 400)
+	// 计划 13：多机集群
+	ErrClusterNotFound           = New("cluster_not_found", "集群不存在", 404)
+	ErrClusterMember             = New("cluster_member", "该实例属于集群，请在集群页统一续费、设置自动续费或释放", 409)
+	ErrClusterSizeInvalid        = New("cluster_size_invalid", "集群只支持 2 台或 4 台", 400)
+	ErrClusterBookingUnsupported = New("cluster_booking_unsupported", "集群暂不支持预订，请选择立即开通", 400)
+	ErrFabricNotFound            = New("fabric_not_found", "集群网络不存在", 404)
+	ErrFabricInUse               = New("fabric_in_use", "该集群网络下还有机器或运行中的集群", 409)
+	ErrFabricFull                = New("fabric_full", "直连网络最多 2 台机器", 409)
+	ErrAppClusterRequired        = New("app_cluster_required", "该应用需要在集群上部署", 400)
+	ErrAppClusterUnsupported     = New("app_cluster_unsupported", "该应用不支持集群部署", 400)
+	ErrAppClusterExists          = New("app_cluster_exists", "集群上已有集群应用，请先卸载", 409)
+	ErrAppClusterManaged         = New("app_cluster_managed", "该部署属于集群应用，请在集群页操作", 409)
+	ErrAppClusterBusy            = New("app_cluster_busy", "集群成员正在变更，请稍后重试", 409)
 )
 
 // As 取出错误链中的 *Error；不是业务错误时返回 nil。
@@ -160,4 +173,19 @@ func WorkflowPromptRejected(msg string) *Error {
 // WorkflowInputInvalid 快速出图的某个输入不合法。
 func WorkflowInputInvalid(label, reason string) *Error {
 	return New("workflow_input_invalid", label+"："+reason, 400)
+}
+
+// FabricInvalid 集群网络字段校验失败（消息按字段；field 为空时只有原因）。
+func FabricInvalid(field, reason string) *Error {
+	return New("fabric_invalid", fieldMessage(field, reason), 400)
+}
+
+// AppClusterSize 集群台数不在应用支持的范围内。
+func AppClusterSize(min, max int) *Error {
+	return New("app_cluster_size", fmt.Sprintf("该应用支持 %d～%d 台的集群", min, max), 400)
+}
+
+// ClusterNoCapacity 没有能组成 n 台集群的同 fabric 空闲机器（code 与单机的 ErrNoCapacity 相同）。
+func ClusterNoCapacity(n int) *Error {
+	return New("no_capacity", fmt.Sprintf("暂无可组成 %d 台集群的空闲机器（需同一高速网络）", n), 409)
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -73,6 +75,12 @@ func (s *Service) reconcileReported(ctx context.Context, m fleet.Machine, st fle
 		}
 		if st.Phase == fleet.PhaseMissingData {
 			return s.alertOnce(ctx, tx, "data_disk_missing", m.ID, inst.ID, AlertDataDiskMissing(m.Serial, inst.ID))
+		}
+		// 计划 13：集群成员的集群网络巡检异常 → 告警（一次），不改状态
+		if inst.ClusterID != nil && strings.HasPrefix(st.Cluster, clusterNetErrorPrefix) && slices.Contains(ClusterMemberStates, inst.State) {
+			if err := s.d.Fleet.RaiseAlertOnce(ctx, tx, clusterNetAlert(m.ID, inst.ID)); err != nil {
+				return err
+			}
 		}
 		switch inst.State {
 		case StateStopped:

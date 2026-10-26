@@ -70,6 +70,8 @@ type Deps struct {
 
 type Service struct {
 	d Deps
+
+	clusterOpHook func(attempt int) // 测试钩子：整组操作读完成员部署实例清单之后、加实例锁之前（export_test.go）
 }
 
 // instanceSSHPort 是实例容器 sshd 的端口，与接入层（sshgw / ingress）同源：rental 按实例算；无 Rental（单测）→ 0 = 上游池默认端口。
@@ -128,6 +130,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Deployment, er
 		app, ver, err := s.resolveVersion(ctx, tx, req.AppID, req.VersionID, isSystem)
 		if err != nil {
 			return err
+		}
+		if clusterOnly(ver.Spec) { // 计划 13 §6.1：只能 CreateCluster
+			return apperr.ErrAppClusterRequired
 		}
 		if err := s.checkImage(ctx, tx, ver, inst.ImageID); err != nil {
 			return err
@@ -216,6 +221,7 @@ func (s *Service) checkPorts(ctx context.Context, q db.Querier, instanceID strin
 // ---- 用户对已有部署的操作 ----
 
 // userOp 先锁实例（校验归属）再锁部署行（须在该实例上，否则 not_found），在同一事务里执行 fn。
+// 集群应用的成员部署（cluster_deployment_id 非空）→ app_cluster_managed（只读接口不经这里，照常可用）。
 func (s *Service) userOp(ctx context.Context, userID int64, instanceID, depID string,
 	fn func(tx pgx.Tx, inst rental.Instance, d Deployment, now time.Time) (Deployment, error)) (Deployment, error) {
 	now := s.d.Clock.Now()
@@ -231,6 +237,9 @@ func (s *Service) userOp(ctx context.Context, userID int64, instanceID, depID st
 		}
 		if d.InstanceID != inst.ID {
 			return apperr.ErrNotFound
+		}
+		if d.ClusterDeploymentID != nil { // 计划 13 §6.5：集群应用的成员部署只能在集群页整组操作
+			return apperr.ErrAppClusterManaged
 		}
 		out, err = fn(tx, inst, d, now)
 		return err
@@ -322,6 +331,9 @@ func (s *Service) Redeploy(ctx context.Context, req RedeployRequest) (Deployment
 func (s *Service) RedeployInTx(ctx context.Context, tx pgx.Tx, inst rental.Instance, d Deployment, req RedeployRequest, now time.Time) (Deployment, error) {
 	if d.InstanceID != inst.ID {
 		return Deployment{}, apperr.ErrNotFound
+	}
+	if d.ClusterDeploymentID != nil { // 集群成员部署走 RedeployCluster（整组）
+		return Deployment{}, apperr.ErrAppClusterManaged
 	}
 	actor := audit.Actor{UserID: req.UserID, IP: req.IP}
 	oldSecret, err := openSecrets(s.d.Box, d.SecretEnvEnc)
@@ -481,7 +493,11 @@ func (s *Service) remove(ctx context.Context, tx pgx.Tx, instState string, d Dep
 	return out, addEvent(ctx, tx, d.ID, d.State, StateRemoving, detail, now)
 }
 
+// errForceRemoveClusterMember：后台对集群成员部署单条强制卸载（code 同用户侧 app_cluster_managed）。
+var errForceRemoveClusterMember = apperr.New("app_cluster_managed", "该部署属于集群应用，请在集群详情页整组强制卸载", 409)
+
 // AdminForceRemove 后台强制卸载（任何非终态，同 Remove）；事件「平台卸载：<原因>」，审计只记部署 ID 与原因。
+// 集群成员部署 → app_cluster_managed（走 AdminForceRemoveCluster）。
 func (s *Service) AdminForceRemove(ctx context.Context, actor audit.Actor, depID, reason string) (Deployment, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -505,6 +521,9 @@ func (s *Service) AdminForceRemove(ctx context.Context, actor audit.Actor, depID
 		d, err := LockDeployment(ctx, tx, depID)
 		if err != nil {
 			return err
+		}
+		if d.ClusterDeploymentID != nil { // 单条卸载集群成员会让聚合卡在 installing：改用 AdminForceRemoveCluster
+			return errForceRemoveClusterMember
 		}
 		if d.State == StateRemoving {
 			out = d

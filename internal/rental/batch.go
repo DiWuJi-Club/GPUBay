@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -36,6 +37,8 @@ type BatchRequest struct {
 	AppEnv map[string]string
 	// 计划 11：随应用一并预装的 ComfyUI 工作流（须同时给 AppID；校验在 PrepareInstall）
 	AppWorkflowIDs []int64
+	// 计划 13：集群下单（规格 §5.1）——Count ∈ ClusterSizes 台同一 fabric、同一集群网段的机器组成一个集群；只即时开通、不能指定机器、不能预装应用
+	Cluster bool
 }
 
 type Batch struct {
@@ -50,6 +53,7 @@ type BatchResult struct {
 	Batch     *Batch
 	Orders    []Order
 	Instances []Instance
+	Cluster   *ClusterView // 计划 13：集群下单时非空
 }
 
 // validateBatch 校验并规范化请求（规格 §6.1、裁定 B1），返回总秒数。
@@ -59,6 +63,21 @@ func validateBatch(req *BatchRequest, now time.Time) (int64, error) {
 	}
 	if req.Quantity == 0 {
 		req.Quantity = 1
+	}
+	if req.Cluster {
+		if !slices.Contains(ClusterSizes, req.Count) {
+			return 0, apperr.ErrClusterSizeInvalid
+		}
+		if req.StartAt != nil {
+			return 0, apperr.ErrClusterBookingUnsupported
+		}
+		if req.MachineID != nil {
+			return 0, apperr.BadRequest("集群不能指定机器")
+		}
+		if req.AppID != nil {
+			// 否则下单预装会给每台各装一个单机应用，绕过集群应用（required）的规则
+			return 0, apperr.BadRequest("集群请在开通后到集群页部署应用")
+		}
 	}
 	if req.Quantity < 1 || req.Quantity > MaxQuantity(req.Duration) {
 		return 0, apperr.ErrBookingTooLong
@@ -170,7 +189,7 @@ func (s *Service) placeBatch(ctx context.Context, req BatchRequest, withBatch bo
 				out.Batch = &Batch{ID: id, UserID: req.UserID, Count: req.Count, CreatedAt: now}
 			}
 			var insts []Instance
-			_, err = placeOnMachines(ctx, tx, spec, req.Count, func(sp pgx.Tx, mid int64) error {
+			place := func(sp pgx.Tx, mid int64) error {
 				if spec.Immediate {
 					if _, err := s.d.Fleet.MarkAllocated(ctx, sp, mid); err != nil {
 						return err
@@ -194,7 +213,16 @@ func (s *Service) placeBatch(ctx context.Context, req BatchRequest, withBatch bo
 				}
 				insts = append(insts, inst)
 				return nil
-			})
+			}
+			var cluster *Cluster
+			if req.Cluster {
+				var c Cluster
+				if c, err = s.placeCluster(ctx, tx, spec, req.Count, req.UserID, batchID, now, &insts, place); err == nil {
+					cluster = &c
+				}
+			} else {
+				_, err = placeOnMachines(ctx, tx, spec, req.Count, place)
+			}
 			if err != nil {
 				if req.MachineID != nil && codeIs(err, "no_capacity") {
 					return apperr.ErrMachineUnavailable
@@ -218,11 +246,19 @@ func (s *Service) placeBatch(ctx context.Context, req BatchRequest, withBatch bo
 					return err
 				}
 				if spec.Immediate {
-					if err := s.enqueueCreate(ctx, tx, inst, img.Ref); err != nil {
+					// 集群成员带 ClusterSpec（全员 cluster_id / rank 已写好）
+					if err := s.enqueueClusterCreate(ctx, tx, inst, img.Ref); err != nil {
 						return err
 					}
 				}
 				out.Orders = append(out.Orders, ord)
+			}
+			if cluster != nil {
+				v, err := s.clusterView(ctx, tx, *cluster)
+				if err != nil {
+					return err
+				}
+				out.Cluster = &v
 			}
 			// 顺序唯一：按实例 ID 排序（loadBatch 回放也按 id），避免「首单按挑机顺序、回放按 id」不一致
 			sort.Slice(insts, func(i, j int) bool { return insts[i].ID < insts[j].ID })
@@ -330,7 +366,23 @@ func (s *Service) loadBatch(ctx context.Context, q db.Querier, b Batch) (BatchRe
 	if len(orders) != len(insts) {
 		return BatchResult{}, errors.New("batch orders and instances out of sync")
 	}
-	return BatchResult{Batch: &b, Orders: orders, Instances: insts}, nil
+	res := BatchResult{Batch: &b, Orders: orders, Instances: insts}
+	// 计划 13：集群批次回放带集群视图（成员都指向同一个集群）
+	for _, inst := range insts {
+		if inst.ClusterID != nil {
+			c, err := scanCluster(q.QueryRow(ctx, `SELECT `+clusterCols+` FROM instance_clusters WHERE id = $1`, *inst.ClusterID))
+			if err != nil {
+				return BatchResult{}, err
+			}
+			v, err := s.clusterView(ctx, q, c)
+			if err != nil {
+				return BatchResult{}, err
+			}
+			res.Cluster = &v
+			break
+		}
+	}
+	return res, nil
 }
 
 // GetBatch 返回用户自己的批次。

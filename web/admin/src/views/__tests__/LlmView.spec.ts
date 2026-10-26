@@ -281,6 +281,82 @@ describe('模型抽屉（super）', () => {
   })
 })
 
+describe('模型抽屉：多机副本（计划 13，A-LLM-10）', () => {
+  const withCluster = async (fn: () => Promise<void>) => {
+    const spec = version.spec as Record<string, unknown>
+    spec.cluster = { mode: 'optional', min_size: 2, max_size: 4 }
+    try {
+      await fn()
+    } finally {
+      delete spec.cluster
+    }
+  }
+  const radio = (n: string) => [...document.body.querySelectorAll<HTMLElement>('[data-testid="llm-model-nodes-per-replica"] label')].find((l) => l.textContent?.trim() === n)!
+
+  it('选 2 台：TP 默认 = 2、PP = 1，随请求提交', () =>
+    withCluster(async () => {
+      login('super')
+      await mountAt('/llm?tab=models')
+      await byId('llm-model-create').trigger('click')
+      await flushPromises()
+      radio('2 台').click()
+      await flushPromises()
+      expect((byId('llm-model-tp').find('input').element as HTMLInputElement).value).toBe('2')
+      expect((byId('llm-model-pp').find('input').element as HTMLInputElement).value).toBe('1')
+      await byId('llm-model-slug').setValue('qwen3-235b')
+      await byId('llm-model-name').setValue('Qwen3 235B')
+      await byId('llm-model-source-id').setValue('Qwen/Qwen3-235B-A22B')
+      await byId('llm-model-input-price').setValue('2')
+      await byId('llm-model-output-price').setValue('8')
+      await byId('llm-model-save').trigger('click')
+      await flushPromises()
+      expect(post.mock.calls[0][1]).toMatchObject({ nodes_per_replica: 2, tensor_parallel: 2, pipeline_parallel: 1 })
+    }))
+
+  it('TP × PP ≠ N：提示并禁用保存；PP > 1 提示镜像不支持', () =>
+    withCluster(async () => {
+      login('super')
+      await mountAt('/llm?tab=models')
+      await byId('llm-model-create').trigger('click')
+      await flushPromises()
+      radio('4 台').click()
+      await flushPromises()
+      expect(byId('llm-model-parallel-error').exists()).toBe(false)
+      await byId('llm-model-tp').find('input').setValue('2')
+      await byId('llm-model-tp').find('input').trigger('change')
+      await flushPromises()
+      expect(byId('llm-model-parallel-error').text()).toBe('张量并行 × 流水线并行必须等于每副本机器数')
+      expect(byId('llm-model-save').attributes('disabled')).toBeDefined()
+      await byId('llm-model-pp').find('input').setValue('2')
+      await byId('llm-model-pp').find('input').trigger('change')
+      await flushPromises()
+      expect(byId('llm-model-parallel-error').text()).toContain('缺少 cupy')
+      expect(byId('llm-model-save').attributes('disabled')).toBeDefined()
+    }))
+
+  it('vllm-node 版本不支持多机：2 台 / 4 台不可选', async () => {
+    login('super')
+    await mountAt('/llm?tab=models')
+    await byId('llm-model-create').trigger('click')
+    await flushPromises()
+    expect(radio('2 台').className).toContain('is-disabled')
+    expect(radio('4 台').className).toContain('is-disabled')
+    expect(byId('llm-model-tp').find('input').attributes('disabled')).toBeDefined()
+  })
+
+  it('编辑已有节点的模型并改台数：提示先把副本数调为 0', () =>
+    withCluster(async () => {
+      login('super')
+      await mountAt('/llm?tab=models')
+      await rowById('llm-model-edit').trigger('click')
+      await flushPromises()
+      expect(byId('llm-model-nodes-locked').exists()).toBe(false)
+      radio('2 台').click()
+      await flushPromises()
+      expect(byId('llm-model-nodes-locked').text()).toContain('副本数调为 0')
+    }))
+})
+
 describe('上下线与删除（super）', () => {
   it('上线：确认后 POST status（动态码由请求层弹框）', async () => {
     login('super')

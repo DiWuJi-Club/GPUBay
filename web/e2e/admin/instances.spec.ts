@@ -4,6 +4,7 @@ import {
 } from '../helpers/admin'
 import { cleanupApps, deployViaApi, ownInstance, seedApps, tickUntil } from '../helpers/apps'
 import { bookViaApi, privateGroup, startAfter } from '../helpers/booking'
+import { cleanupClusters, readyCluster } from '../helpers/clusters'
 import { placeOrder, seedUser, toast, userApi } from '../helpers/console'
 import { hooks } from '../helpers/hooks'
 import { runningInstance } from '../helpers/instances'
@@ -40,6 +41,8 @@ const rows = (page: Page) => page.getByRole('row').filter({ has: page.getByTestI
 test.afterEach(cleanupApps)
 // A-INS-16 造了 Token 商城模型与平台节点：afterEach 下线模型、释放节点、机器移出池
 test.afterEach(cleanupLLM)
+// A-INS-17 开了集群：afterEach 释放并洗完机
+test.afterEach(cleanupClusters)
 const rowOf = (page: Page, id: string) => rows(page).filter({ has: page.getByTestId('ainst-id').getByText(id, { exact: true }) })
 
 test('A-INS-01 实例列表：状态 / 用户 / 机器筛选作为查询参数、地址栏预填、重置、超过一页翻页、首次加载失败可重试', async ({ page }) => {
@@ -1052,4 +1055,44 @@ test('A-INS-16 平台节点（系统实例）：列表「平台节点」标签�
   const r = await ctx.post(`/admin/api/v1/instances/${instanceId}/extend`, { data: { seconds: 3600, reason: 'e2e' } })
   expect(r.status()).toBe(409)
   expect(((await r.json()) as { code: string }).code).toBe('invalid_state')
+})
+
+test('A-INS-17 集群成员：实例详情「集群」区块（链接、rank、状态、成员），没有「免费延长」改为去集群页、换机提示只能换到同一集群网络；列表标「集群 · rank」', async ({ page }) => {
+  const u = await seedUser()
+  const { clusterId, members } = await readyCluster(u.phone)
+  const worker = members[1].instance_id
+  const ops = await createAdmin('ops')
+  await loginAdmin(page, ops)
+  await page.goto(`/admin/instances/${worker}`)
+  await expect(page.getByTestId('instance-cluster-block')).toBeVisible()
+  await expect(page.getByTestId('instance-cluster-link')).toHaveText(clusterId)
+  await expect(page.getByTestId('instance-cluster-rank')).toHaveText('（rank 1 / 2 台）')
+  await expect(page.getByTestId('instance-cluster-status')).toHaveText('就绪')
+  await expect(page.getByTestId('instance-cluster-member')).toHaveCount(2)
+  await expect(page.locator('[data-testid="instance-cluster-member"][data-rank="0"]')).toContainText(members[0].instance_id)
+  await expect(page.getByTestId('instance-cluster-hint')).toContainText('集群成员的续费、自动续费、释放与延长在集群页统一操作')
+  await expect(page.getByTestId('instance-cluster-hint')).toContainText('只能换到同一集群网络（且同一网段）的空闲机器')
+  await expect(page.getByTestId('adetail-extend-btn')).toHaveCount(0)
+  await expect(page.getByTestId('adetail-extend-cluster-btn')).toBeVisible()
+
+  await page.getByTestId('adetail-migrate-btn').click()
+  await expect(page.getByTestId('migrate-cluster-hint')).toHaveText('集群成员：只能换到同一集群网络（且同一网段）的空闲机器；换机后集群需重新下发网络，集群应用需重新部署')
+  await page.keyboard.press('Escape')
+  await expect(page.getByTestId('migrate-dialog')).toBeHidden()
+
+  const ctx = await adminApi(ops)
+  const r = await ctx.post(`/admin/api/v1/instances/${worker}/extend`, { data: { seconds: 3600, reason: 'e2e' } })
+  expect(r.status()).toBe(409)
+  expect(((await r.json()) as { code: string }).code).toBe('cluster_member')
+
+  await page.getByTestId('adetail-extend-cluster-btn').click()
+  await expectAdminUrl(page, `/clusters/${clusterId}`)
+  await expect(page.getByTestId('cluster-detail-id')).toHaveText(clusterId)
+
+  await page.goto(`/admin/instances?user_id=${u.id}`)
+  const tag = rowOf(page, worker).getByTestId('ainst-cluster')
+  await expect(tag).toHaveAttribute('data-cluster', clusterId)
+  await expect(tag).toHaveText('集群 · rank 1')
+  await tag.click()
+  await expectAdminUrl(page, `/clusters/${clusterId}`)
 })

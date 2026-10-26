@@ -19,6 +19,17 @@
 //   应用部署钩子（AppHooks，计划 7）：都在已持实例行锁之后调用，再锁 app_deployments → instance_ports（appdeploy 一律同序）
 //   PlaceSystem（计划 9）：machines(NO KEY UPDATE，等待) → 插实例 / lease → agent_commands；不碰 orders / wallet
 //   ReleaseSystem（计划 9）：与 Release 相同（instance → lease → agent_commands，经 beginWipe）
+//   计划 13（集群，规格 §14）：
+//   PlaceBatch 集群分支：idem 咨询锁 → machines(NO KEY UPDATE, SKIP LOCKED，按 (fabric, cluster_net) 逐个 savepoint) → cluster-alloc 咨询锁
+//     → 插 instance_clusters → 实例 / lease → orders → wallet → agent_commands
+//   PlaceSystemCluster：machines(NO KEY UPDATE，按 ID 升序等待) → cluster-alloc 咨询锁 → 插集群 → 实例 / lease → agent_commands
+//   多成员路径（SweepClusters、RenewCluster、SetClusterAutoRenew、ReleaseCluster、AdminExtendCluster、AdminResyncCluster、
+//     AutoRenewClustersDue、ReleaseSystemCluster、成员 AdminMigrate / RefundRelease、appdeploy 集群操作）：
+//     instance_clusters 行 FOR UPDATE → 成员实例（ID 升序）→ 其后与对应单实例路径相同（lease → orders → wallet → agent_commands）
+//     RenewCluster 在集群行锁之前先取 idem 咨询锁；成员 AdminMigrate：集群 → 原实例 → 新机器(SKIP LOCKED) → 指令
+//   单实例路径（HandleCommandResult、ExpireDue、Suspend / Resume、refreshLease、beginWipe、SendReminders、用户访问设置…）
+//     不读写 instance_clusters 行（只读 instances.cluster_id 列），因此不会与「集群 → 实例」形成环；
+//     SendReminders 给同集群其余成员置提醒标记时用 SKIP LOCKED，不等待别的事务持有的成员行锁。
 // 持机器行锁的事务只会在插入 lease 撞到别的事务未提交的 lease 增长时等待；而让 lease 增长的路径都不等机器锁，等待链不成环。
 
 package rental
@@ -26,12 +37,14 @@ package rental
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/pki"
 	"spark-cloud/internal/platform/apperr"
@@ -91,6 +104,8 @@ type Deps struct {
 	SystemUserID int64
 	// 计划 10：容器 sshd 的基准端口（SPARK_UPSTREAM_SSH_PORT）；<= 0 视为 2222。Create 指令按 Instance.SSHPort 带端口。
 	SSHBasePort int
+	// 计划 13：集群网段池（SPARK_CLUSTER_SUBNET_POOL，IPv4 /16）；零值 = clusterspec.DefaultPool。
+	ClusterSubnetPool netip.Prefix
 }
 
 type KeyCounter interface {
@@ -143,6 +158,9 @@ type Instance struct {
 	CancelledAt           *time.Time
 	// 计划 9：平台节点的系统实例（PlaceSystem）：无订单、expires_at 恒为 NULL、不到期不计费，后台计费类操作一律拒绝
 	System bool
+	// 计划 13：集群成员（instances.cluster_id / cluster_rank，同时为空或同时非空）
+	ClusterID   *string
+	ClusterRank *int
 }
 
 // DefaultSSHPort 是未配置基准端口时容器 sshd 的端口。
@@ -166,8 +184,13 @@ func (s *Service) InstanceSSHPort(instanceID string) int {
 // enqueueCreate 给实例所在机器入队 Create 指令：镜像地址由调用方解析，端口按 Instance.SSHPort，份数恒为 1（整机）。
 // 所有开通路径（即时下单、预订开通、改派、换机）都经这里，保证指令形态一致。
 func (s *Service) enqueueCreate(ctx context.Context, q db.Querier, inst Instance, imageRef string) error {
+	return s.enqueueCreateSpec(ctx, q, inst, imageRef, nil)
+}
+
+// enqueueCreateSpec 与 enqueueCreate 相同，spec 非空时载荷带集群描述（计划 13：集群成员的 Create，ClusterSpecFor 构造）。
+func (s *Service) enqueueCreateSpec(ctx context.Context, q db.Querier, inst Instance, imageRef string, spec *clusterspec.Spec) error {
 	_, err := s.d.Fleet.Enqueue(ctx, q, inst.MachineID, inst.ID, fleet.CmdCreateInstance,
-		fleet.CreateInstancePayload{ImageRef: imageRef, SSHPort: inst.SSHPort(s.d.SSHBasePort), ShareSlots: 1})
+		fleet.CreateInstancePayload{ImageRef: imageRef, SSHPort: inst.SSHPort(s.d.SSHBasePort), ShareSlots: 1, Cluster: spec})
 	return err
 }
 
@@ -207,7 +230,7 @@ func (i Instance) Remaining(now time.Time) time.Duration {
 const instanceCols = `id, user_id, machine_id, product_id, image_id, state, pending_seconds, expires_at,
 	stopped_at, suspended_at, paused_remaining, reminded_24h, reminded_1h, created_at, password_auth, ssh_host_pubkey,
 	scheduled_start_at, group_id, batch_id, auto_renew, auto_renew_duration, auto_renew_failed_at, auto_renew_failed_reason,
-	reassign_count, provisioned_at, cancelled_at, system`
+	reassign_count, provisioned_at, cancelled_at, system, cluster_id, cluster_rank`
 
 func scanInstance(row pgx.Row) (Instance, error) {
 	var i Instance
@@ -215,7 +238,7 @@ func scanInstance(row pgx.Row) (Instance, error) {
 	err := row.Scan(&i.ID, &i.UserID, &i.MachineID, &i.ProductID, &i.ImageID, &i.State, &i.PendingSeconds, &i.ExpiresAt,
 		&i.StoppedAt, &i.SuspendedAt, &i.PausedRemaining, &i.Reminded24h, &i.Reminded1h, &i.CreatedAt, &i.PasswordAuth, &i.SSHHostPubkey,
 		&i.ScheduledStartAt, &i.GroupID, &i.BatchID, &i.AutoRenew, &autoDur, &i.AutoRenewFailedAt, &i.AutoRenewFailedReason,
-		&i.ReassignCount, &i.ProvisionedAt, &i.CancelledAt, &i.System)
+		&i.ReassignCount, &i.ProvisionedAt, &i.CancelledAt, &i.System, &i.ClusterID, &i.ClusterRank)
 	if db.IsNoRows(err) {
 		return Instance{}, apperr.ErrNotFound
 	}

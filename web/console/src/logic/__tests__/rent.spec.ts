@@ -39,6 +39,29 @@ describe('下单请求体（/orders、/bookings）', () => {
   })
 })
 
+describe('集群下单（计划 13）', () => {
+  it('/bookings 集群：cluster=true、count=台数，不带 start_at / machine_id / 预装应用', () => {
+    const f = form({ clusterSize: 2, count: 1, immediate: false, machineId: 5, appId: 3, appWorkflowIds: [7], quantity: 2, groupId: 4 })
+    expect(bookingBody(1, f, '2026-10-21T02:00:00Z', 3, { MODEL_ID: 'x' })).toStrictEqual({
+      product_id: 1, image_id: 3, group_id: 4, machine_id: null, count: 2, duration: '1d', quantity: 2,
+      auto_renew: false, auto_renew_duration: '1d', cluster: true,
+    })
+  })
+  it('单机（clusterSize 0 / 缺省）请求体不变，不带 cluster', () => {
+    expect(bookingBody(1, form({ clusterSize: 0 }), null, null, {})).not.toHaveProperty('cluster')
+  })
+  it('切换租用方式换幂等键', async () => {
+    const f = reactive(form())
+    const scope = effectScope()
+    const key = scope.run(() => useRentKey(() => 1, f, () => ({})))!
+    const k1 = key.current()
+    f.clusterSize = 4
+    await nextTick()
+    expect(key.current()).not.toBe(k1)
+    scope.stop()
+  })
+})
+
 describe('幂等键（RentDialog 的派生参数）', () => {
   function setup() {
     const f = reactive(form({ appId: 4 }))

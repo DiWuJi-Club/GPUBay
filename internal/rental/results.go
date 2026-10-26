@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"spark-cloud/internal/catalog"
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/fleet"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/db"
@@ -67,10 +69,20 @@ func (s *Service) handleCommandResult(ctx context.Context, commandID string, ok 
 			if ok {
 				return s.startLease(ctx, tx, inst, StateCreating, "agent: created", now)
 			}
+			// 计划 13：集群成员因集群网络失败（Agent 已在本地清理）→ 不判机器故障（规格 §5.5 第 2 步）；集群由 SweepClusters 中止
+			if inst.ClusterID != nil && strings.HasPrefix(result, clusterspec.ErrPrefix) {
+				return s.failCreatingClusterNet(ctx, tx, inst, "开通失败: "+result, now)
+			}
 			if inst.Booked() {
 				return s.reassignAfterCreateFailure(ctx, tx, inst, "开通失败: "+result, now, after)
 			}
 			return s.failCreating(ctx, tx, inst, "开通失败: "+result, now)
+		case fleet.CmdConfigureCluster:
+			// 成功无副作用；失败 → 告警（一次）。成员已不在位（洗机 / 释放）的结果忽略。
+			if ok || !slices.Contains(ClusterMemberStates, inst.State) {
+				return nil
+			}
+			return s.d.Fleet.RaiseAlertOnce(ctx, tx, clusterNetAlert(inst.MachineID, inst.ID))
 		case fleet.CmdStartInstance:
 			if inst.State != StateStopped {
 				return nil
@@ -89,6 +101,19 @@ func (s *Service) handleCommandResult(ctx context.Context, commandID string, ok 
 			// 非 wiping，或者指令不在实例所属机器上（别的机器上报了该实例的容器）：都是孤儿清理，
 			// 不改实例状态、不释放机器——否则原机器没洗就会被放给下一个租户。
 			if inst.State != StateWiping || cmd.MachineID != inst.MachineID {
+				if inst.State == StateFailed && cmd.MachineID == inst.MachineID {
+					// 计划 13：集群网络导致开通失败的实例（failCreatingClusterNet）机器未判故障，洗完后放回库存
+					if ok {
+						return s.releaseIfVacant(ctx, tx, inst.MachineID)
+					}
+					if inst.ClusterID != nil { // 洗机也失败：机器隔离为故障（后台可处理），否则会永远停在 allocated
+						if err := s.d.Fleet.MarkFaulty(ctx, tx, inst.MachineID); err != nil {
+							return err
+						}
+						return s.d.Fleet.RaiseAlert(ctx, tx, fleet.Alert{Level: "critical", Kind: "wipe_failed",
+							MachineID: inst.MachineID, InstanceID: inst.ID, Message: result})
+					}
+				}
 				if ok {
 					return nil
 				}
@@ -132,6 +157,15 @@ func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from
 		return s.startSystem(ctx, tx, inst, from, reason, now)
 	}
 	expires := now.Add(time.Duration(inst.PendingSeconds) * time.Second)
+	if from == StateCreating && inst.ClusterID != nil {
+		at, ok, err := clusterMigratedAt(ctx, tx, inst)
+		if err != nil {
+			return err
+		}
+		if ok { // 就绪集群里换机得到的新成员：换机不改变到期，开通耗时不顺延（与其余在位成员一致）
+			expires = at.Add(time.Duration(inst.PendingSeconds) * time.Second)
+		}
+	}
 	r24, r1 := reminderFlags(expires.Sub(now))
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'running', expires_at = $2, pending_seconds = 0,
 			stopped_at = NULL, reminded_24h = $3, reminded_1h = $4, updated_at = $5 WHERE id = $1`,
@@ -145,6 +179,19 @@ func (s *Service) startLease(ctx context.Context, tx pgx.Tx, inst Instance, from
 		return err
 	}
 	return s.refreshLease(ctx, tx, inst.ID, now)
+}
+
+// clusterMigratedAt：inst 是已就绪集群里换机得到的新成员 → 返回换机时刻。集群首次就绪之后不再对齐（规格 §5.5 第 3 步），
+// 新成员若从开通完成起算会比其余成员晚到期（开通耗时）；从换机时刻起算 pending_seconds（= 原实例剩余时长 + 期间续费）即继承原到期。
+// 组建期换机的新成员由首次就绪对齐处理，这里不管。
+func clusterMigratedAt(ctx context.Context, tx pgx.Tx, inst Instance) (time.Time, bool, error) {
+	var at time.Time
+	err := tx.QueryRow(ctx, `SELECT t.created_at FROM instance_transfers t JOIN instance_clusters c ON c.id = $2
+		WHERE t.to_instance_id = $1 AND c.ready_at IS NOT NULL AND c.ready_at <= t.created_at`, inst.ID, *inst.ClusterID).Scan(&at)
+	if db.IsNoRows(err) {
+		return time.Time{}, false, nil
+	}
+	return at, err == nil, err
 }
 
 // startSystem 系统实例进入 running（规格 §4.2）：不计时——expires_at 保持 NULL、pending_seconds 本就是 0、不动提醒标记；
@@ -228,6 +275,35 @@ func (s *Service) compensateShortfall(ctx context.Context, tx pgx.Tx, inst Insta
 
 // failCreating 开通失败：实例失败、退款、机器隔离为故障、取消剩余指令并告警。
 func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, reason string, now time.Time) error {
+	return s.failCreatingAs(ctx, tx, inst, reason, true, now)
+}
+
+// failCreatingClusterNet 集群成员因集群网络（消息以 clusterspec.ErrPrefix 开头）开通失败：与 failCreating 相同，
+// 但机器不判故障、告警 cluster_net_error（一次）而非 create_failed。容器由对账（failed 实例的容器 → wipeOrphan）清理。
+func (s *Service) failCreatingClusterNet(ctx context.Context, tx pgx.Tx, inst Instance, reason string, now time.Time) error {
+	if err := s.failCreatingAs(ctx, tx, inst, reason, false, now); err != nil {
+		return err
+	}
+	// 机器洗完会回 idle：先把它移出集群候选（否则 cluster_ready 仍为真，会被反复选中、反复失败），Agent 重新上报网卡后恢复
+	if err := s.d.Fleet.SuspendClusterReady(ctx, tx, inst.MachineID); err != nil {
+		return err
+	}
+	// 机器没判故障：直接下发洗机（数据盘与残留容器），洗完由 releaseIfVacant 放回库存；对账的 wipeOrphan 见到在途指令不会重复入队
+	_, err := s.d.Fleet.Enqueue(ctx, tx, inst.MachineID, inst.ID, fleet.CmdWipeInstance, nil)
+	return err
+}
+
+// releaseIfVacant 机器上已没有未结束的实例时把 allocated 的机器放回 idle（faulty / 维护中的机器不受影响）。
+func (s *Service) releaseIfVacant(ctx context.Context, tx pgx.Tx, machineID int64) error {
+	var busy bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM instances WHERE machine_id = $1 AND state IN ('creating', 'running', 'stopped', 'wiping'))`,
+		machineID).Scan(&busy); err != nil || busy {
+		return err
+	}
+	return s.d.Fleet.Release(ctx, tx, machineID)
+}
+
+func (s *Service) failCreatingAs(ctx context.Context, tx pgx.Tx, inst Instance, reason string, faulty bool, now time.Time) error {
 	if _, err := tx.Exec(ctx, `UPDATE instances SET state = 'failed', pending_seconds = 0, ssh_host_key_enc = NULL, updated_at = $2 WHERE id = $1`, inst.ID, now); err != nil {
 		return err
 	}
@@ -243,11 +319,16 @@ func (s *Service) failCreating(ctx context.Context, tx pgx.Tx, inst Instance, re
 	if err := s.refundAll(ctx, tx, inst, now); err != nil {
 		return err
 	}
-	if err := s.d.Fleet.MarkFaulty(ctx, tx, inst.MachineID); err != nil {
-		return err
+	if faulty {
+		if err := s.d.Fleet.MarkFaulty(ctx, tx, inst.MachineID); err != nil {
+			return err
+		}
 	}
 	if err := s.d.Fleet.CancelCommands(ctx, tx, inst.ID, "instance failed"); err != nil {
 		return err
+	}
+	if !faulty {
+		return s.d.Fleet.RaiseAlertOnce(ctx, tx, clusterNetAlert(inst.MachineID, inst.ID))
 	}
 	return s.d.Fleet.RaiseAlert(ctx, tx, fleet.Alert{Level: "critical", Kind: "create_failed",
 		MachineID: inst.MachineID, InstanceID: inst.ID, Message: reason})

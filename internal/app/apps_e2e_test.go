@@ -386,6 +386,7 @@ func assertConsistent(t *testing.T, pool *pgxpool.Pool) {
 		{"instances with more than 3 live deployments", `SELECT instance_id || ' ' || count(*) FROM app_deployments
 			WHERE state NOT IN ('removed', 'lost') GROUP BY instance_id HAVING count(*) > 3`},
 		{"running deployments without their main port row", `SELECT d.id || ' port ' || d.port FROM app_deployments d WHERE d.state = 'running'
+			AND d.cluster_role IS DISTINCT FROM 'worker' -- 计划 13：集群 worker 不登记端口
 			AND NOT EXISTS (SELECT 1 FROM instance_ports p WHERE p.instance_id = d.instance_id AND p.port = d.port AND p.deployment_id = d.id)`},
 	}
 	for _, c := range checks {

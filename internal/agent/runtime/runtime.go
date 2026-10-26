@@ -16,6 +16,10 @@ type Spec struct {
 	CPUs        float64 // --cpus；0 = 不传（整机不限）
 	PidsLimit   int     // --pids-limit，必须为正
 	DropNice    bool    // 不加 SYS_NICE（共享机：租户不能抬高自己的调度优先级压制邻居）
+	// 计划 13 集群成员（非集群容器三项都为空，命令行与改动前逐字相同）：
+	CapDrop []string          // --cap-drop X（集群：NET_RAW，不能发伪造包 / 建 Raw Packet QP）
+	Sysctls map[string]string // --sysctl k=v（按 key 排序；集群：net.ipv4.ping_group_range）
+	Devices []string          // --device X（RDMA：/dev/infiniband/rdma_cm 与 uverbsN）
 }
 
 type Container struct {

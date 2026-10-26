@@ -54,16 +54,25 @@ func (s *Service) OnInstanceRunning(ctx context.Context, tx pgx.Tx, instanceID s
 }
 
 // OnInstanceGone：非终态部署 → removed(instance_gone)，事件 detail = reason；端口行按 deployment_id 删除（与卸载一致，§14 一致性检查）。
+// 计划 13：成员部署所属的集群部署若已没有非终态成员部署，置为 removed（finalizeClusterDeployments）。
 // 实例的容器 / 数据盘随之消失：停机时卸载、还等着清理目录的 removed 行也清掉 cleanup_pending。
 func (s *Service) OnInstanceGone(ctx context.Context, tx pgx.Tx, instanceID, reason string, now time.Time) error {
 	deps, err := lockLive(ctx, tx, instanceID)
 	if err != nil {
 		return err
 	}
+	var clusterDeps []string
 	for _, d := range deps {
 		if err := s.markRemoved(ctx, tx, d, ErrCodeInstanceGone, reason, now); err != nil {
 			return err
 		}
+		if d.ClusterDeploymentID != nil {
+			clusterDeps = append(clusterDeps, *d.ClusterDeploymentID)
+		}
+	}
+	// 计划 13：集群部署的最后一个非终态成员部署没了 → 集群部署 removed
+	if err := finalizeClusterDeployments(ctx, tx, clusterDeps, now); err != nil {
+		return err
 	}
 	_, err = tx.Exec(ctx, `UPDATE app_deployments SET cleanup_pending = false, updated_at = $2, row_version = row_version + 1
 		WHERE instance_id = $1 AND state = 'removed' AND cleanup_pending`, instanceID, now)
@@ -110,9 +119,16 @@ func (s *Service) OnInstanceMigrated(ctx context.Context, tx pgx.Tx, oldID, newI
 		if d.Desired == DesiredStopped {
 			state, desired, detail = StateStopped, DesiredStopped, "从 "+oldID+" 迁移（已停止，启动时重新下载模型）"
 		}
-		nd, err := scanDeployment(tx.QueryRow(ctx, `INSERT INTO app_deployments (id, instance_id, user_id, app_id, app_version_id, state, desired, env, secret_env_enc, port, spec_hash, next_poll_at, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12) RETURNING `+depCols,
-			randx.ID("dep-", 12), newID, d.UserID, d.AppID, d.AppVersionID, state, desired, mustJSON(d.Env), d.SecretEnvEnc, d.Port, d.SpecHash, now))
+		// 计划 13 §6.6：集群成员部署保留 cluster_deployment_id / cluster_role（非集群部署两列仍为 NULL）；聚合随之为 stale，等整组重新部署
+		var role *string
+		if d.ClusterDeploymentID != nil {
+			role = &d.ClusterRole
+		}
+		nd, err := scanDeployment(tx.QueryRow(ctx, `INSERT INTO app_deployments (id, instance_id, user_id, app_id, app_version_id, state, desired, env, secret_env_enc, port, spec_hash, next_poll_at, created_at, updated_at,
+			cluster_deployment_id, cluster_role)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12, $13, $14) RETURNING `+depCols,
+			randx.ID("dep-", 12), newID, d.UserID, d.AppID, d.AppVersionID, state, desired, mustJSON(d.Env), d.SecretEnvEnc, d.Port, d.SpecHash, now,
+			d.ClusterDeploymentID, role))
 		if err != nil {
 			return err
 		}
@@ -185,6 +201,9 @@ func (s *Service) PrepareInstall(ctx context.Context, q db.Querier, appID, image
 	app, ver, err := s.resolveVersion(ctx, q, appID, nil, false)
 	if err != nil {
 		return nil, err
+	}
+	if clusterOnly(ver.Spec) { // 计划 13 §6.1：只能部署在集群上，下单预装不能绕过
+		return nil, apperr.ErrAppClusterRequired
 	}
 	if err := s.checkImage(ctx, q, ver, imageID); err != nil {
 		return nil, err

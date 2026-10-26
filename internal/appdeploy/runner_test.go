@@ -1310,3 +1310,66 @@ func TestRunnerRunningUnreachableHealthUnknown(t *testing.T) {
 		t.Fatalf("recovered = %+v", got)
 	}
 }
+
+// 计划 13 §6.3：集群部署的 worker 进入 running 时不登记端口（版本未声明 worker_ports），head 登记；env 带角色与集群部署 ID。
+func TestWorkerPortsNotRegistered(t *testing.T) {
+	re := newRunnerEnv(t, 2)
+	spec := runnerSpec(8000)
+	spec.Cluster = &appdeploy.ClusterSupport{Mode: appdeploy.ClusterModeRequired, MinSize: 2, MaxSize: 4}
+	a, _ := re.publishedApp("vllm-cluster", spec, runnerScript, []int64{re.imageID})
+	head, worker := re.instance(), re.instance()
+	cid := re.clusterOf(false, head, worker)
+	cd, err := re.svc.CreateCluster(re.ctx, appdeploy.ClusterCreateRequest{UserID: re.userID, ClusterID: cid, AppID: a.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range cd.Members {
+		re.until(m.Deployment.ID, appdeploy.StateRunning)
+	}
+	hd, wd := cd.Members[0].Deployment, cd.Members[1].Deployment
+	if n := re.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1 AND port = 8000 AND deployment_id = $2`, head.ID, hd.ID); n != 1 {
+		t.Fatalf("head port rows = %d", n)
+	}
+	if n := re.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1`, worker.ID); n != 0 {
+		t.Fatalf("worker port rows = %d", n)
+	}
+	for _, c := range []struct {
+		inst, role string
+	}{{head.ID, "head"}, {worker.ID, "worker"}} {
+		b, err := os.ReadFile(filepath.Join(re.dir(c.inst, "vllm-cluster"), "env"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), "export SPARK_CLUSTER_ROLE='"+c.role+"'\nexport SPARK_CLUSTER_DEPLOYMENT='"+cd.ID+"'\n") {
+			t.Fatalf("%s env = %s", c.role, b)
+		}
+	}
+	// 健康检查照常（worker 也按 Ports[0]）：两者都是 running / ok，聚合 running
+	got, err := re.svc.GetClusterDeployment(re.ctx, cd.ID)
+	if err != nil || got.Status != appdeploy.ClusterStatusRunning || got.Health != appdeploy.HealthOK {
+		t.Fatalf("aggregate = %+v, %v", got, err)
+	}
+	if d := re.dep(wd.ID); d.Health != appdeploy.HealthOK {
+		t.Fatalf("worker = %+v", d)
+	}
+	// 版本声明 worker_ports 时 worker 也登记
+	spec.Cluster.WorkerPorts = true
+	spec.Ports[0].Port = 8100
+	b, _ := re.publishedApp("cluster-ports", spec, runnerScript, []int64{re.imageID})
+	if _, err := re.svc.RemoveCluster(re.ctx, re.userID, cd.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range cd.Members {
+		re.until(m.Deployment.ID, appdeploy.StateRemoved)
+	}
+	cd2, err := re.svc.CreateCluster(re.ctx, appdeploy.ClusterCreateRequest{UserID: re.userID, ClusterID: cid, AppID: b.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range cd2.Members {
+		re.until(m.Deployment.ID, appdeploy.StateRunning)
+	}
+	if n := re.count(`SELECT count(*) FROM instance_ports WHERE instance_id = $1 AND port = 8100 AND deployment_id = $2`, worker.ID, cd2.Members[1].Deployment.ID); n != 1 {
+		t.Fatalf("worker_ports worker rows = %d", n)
+	}
+}

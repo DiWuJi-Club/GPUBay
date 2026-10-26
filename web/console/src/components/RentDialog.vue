@@ -11,6 +11,7 @@ import { useGuide } from '../composables/useGuide'
 import { appConfirmText, appOptionLabel, compatibleImages, envDefaults } from '../logic/apps'
 import { cstDay, describeDuration, earliestStart, hourOptions, isLegacyImmediate, latestStart, MAX_COUNT, MAX_QUANTITY, startAtISO, totalPrice } from '../logic/booking'
 import { notifyError } from '../logic/notify'
+import { clusterRentOptions, clusterTotalPrice, singleInstanceApps, type ClusterBookingExtra, type ProductWithClusters } from '../logic/cluster'
 import { bookingBody, orderBody, useRentKey } from '../logic/rent'
 import { isWorkflowApp, MAX_WORKFLOWS, presetEnvFor, totalDownloadGB } from '../logic/workflows'
 import { refreshBalance, session } from '../store/session'
@@ -31,7 +32,7 @@ const props = withDefaults(defineProps<{
   presetWorkflowIds: () => [],
 })
 const visible = defineModel<boolean>({ required: true })
-export interface PlacedResult { instances: { id: string }[]; batchId: string | null; immediate: boolean }
+export interface PlacedResult { instances: { id: string }[]; batchId: string | null; immediate: boolean; clusterId?: string | null }
 const emit = defineEmits<{ placed: [result: PlacedResult]; noCapacity: [] }>()
 
 const route = useRoute()
@@ -53,6 +54,7 @@ const form = reactive({
   autoRenewDuration: props.duration,
   appId: props.appId,
   appWorkflowIds: [] as number[],
+  clusterSize: 0, // 计划 13：0 = 单机；2 / 4 = 集群
 })
 // 预选了应用时先停在表单步：要锁定镜像、填变量（如 JupyterLab 必填令牌）
 const step = ref<'form' | 'confirm'>(props.mode === 'immediate' && props.appId == null ? 'confirm' : 'form')
@@ -80,10 +82,32 @@ const submitting = ref(false)
 const NO_GROUP = 0 // el-option 的 value 不能是 null：0 作为「不限机组」哨兵，提交时映射回 null
 const groupSel = computed({ get: () => form.groupId ?? NO_GROUP, set: (v: number) => { form.groupId = v === NO_GROUP ? null : v } })
 
+// ---- 租用方式（计划 13）：单机 / 集群 2 台 / 集群 4 台。集群只即时开通、数量固定、不指定机器、不预装应用 ----
+const isCluster = computed(() => form.clusterSize > 0)
+const clusterOptions = computed(() => clusterRentOptions((props.product as ProductWithClusters).clusters))
+const clusterAvail = ref<{ available: number; rdma: boolean } | null>(null)
+// 切到集群前的单机设置：切回单机时恢复开始方式与数量（集群之间互切不覆盖；对话框重新打开时清空）
+let beforeCluster: { immediate: boolean; count: number } | null = null
+watch(() => form.clusterSize, (n) => {
+  if (n > 0) {
+    beforeCluster ??= { immediate: form.immediate, count: form.count }
+    form.count = n
+    form.immediate = true
+    form.machineId = null
+    form.appId = null
+  } else if (beforeCluster) {
+    form.immediate = beforeCluster.immediate
+    form.count = beforeCluster.count
+    beforeCluster = null
+  } else form.count = 1
+})
+
 // ---- 预装应用：选了应用后镜像只剩兼容镜像（默认第一个），下方展开变量表单 ----
 const NO_APP = 0 // 同 NO_GROUP：「不预装」
 const appSel = computed({ get: () => form.appId ?? NO_APP, set: (v: number) => { form.appId = v === NO_APP ? null : v } })
-const selectedApp = computed(() => props.apps.find((a) => a.id === form.appId) ?? null)
+// 计划 13：required 集群应用（vllm-cluster）只能在集群页部署，不出现在单机预装里
+const preinstallApps = computed(() => singleInstanceApps(props.apps))
+const selectedApp = computed(() => preinstallApps.value.find((a) => a.id === form.appId) ?? null)
 const imageOptions = computed(() => (selectedApp.value ? compatibleImages(selectedApp.value, props.images) : props.images))
 const envValues = ref<Record<string, string>>({})
 const envForm = ref<InstanceType<typeof AppEnvForm> | null>(null)
@@ -124,7 +148,10 @@ watch(() => form.appId, applyApp)
 watch(envValues, () => { appError.value = '' })
 const unitPrice = computed(() => props.product.prices.find((p) => p.duration === form.duration)?.amount ?? null)
 const quantityMax = computed(() => MAX_QUANTITY[form.duration])
-const total = computed(() => (unitPrice.value == null ? null : totalPrice(unitPrice.value, form.quantity, form.count)))
+const total = computed(() => {
+  if (unitPrice.value == null) return null
+  return isCluster.value ? clusterTotalPrice(unitPrice.value, form.clusterSize, form.quantity) : totalPrice(unitPrice.value, form.quantity, form.count)
+})
 const balance = computed(() => session.balance ?? 0)
 const after = computed(() => (total.value == null ? null : balance.value - total.value))
 const insufficient = computed(() => total.value != null && balance.value < total.value)
@@ -135,8 +162,10 @@ const startAt = computed(() => (form.immediate || !form.day || form.hour == null
 const hours = computed(() => (form.day ? hourOptions(form.day, nowServer()) : []))
 const dayMin = computed(() => cstDay(earliestStart(nowServer())))
 const dayMax = computed(() => cstDay(latestStart(nowServer())))
-const canSpecifyMachine = computed(() => form.count === 1 && form.groupId !== null)
-const notEnough = computed(() => availability.value != null && availability.value.available < form.count)
+const canSpecifyMachine = computed(() => !isCluster.value && form.count === 1 && form.groupId !== null)
+const notEnough = computed(() =>
+  isCluster.value ? clusterAvail.value != null && clusterAvail.value.available < 1 : availability.value != null && availability.value.available < form.count,
+)
 const legacy = computed(() => isLegacyImmediate({ immediate: form.immediate, count: form.count, quantity: form.quantity, groupId: form.groupId, machineId: form.machineId, autoRenew: form.autoRenew }))
 // 派生参数（含应用、去掉空值的变量与预装工作流）的值变了才换键；同参数重试复用
 const key = useRentKey(() => props.product.id, form, () => envValues.value)
@@ -225,6 +254,7 @@ let availSeq = 0
 let availTimer: ReturnType<typeof setTimeout> | undefined
 async function loadAvailability() {
   const mine = ++availSeq
+  if (isCluster.value) return loadClusterAvailability(mine)
   try {
     const out = await api.get<Availability>('/availability', {
       product_id: props.product.id, group_id: form.groupId ?? undefined, machine_id: form.machineId ?? undefined,
@@ -241,12 +271,29 @@ async function loadAvailability() {
     availError.value = isApiError(e) && e.code.startsWith('booking_') ? e.message : '查询可用机器失败'
   }
 }
+/** 集群：GET /availability?cluster_size= → {available（可组成的集群数）, rdma}。 */
+async function loadClusterAvailability(mine: number) {
+  try {
+    const out = await api.get<{ available: number; rdma: boolean }>('/availability', {
+      product_id: props.product.id, group_id: form.groupId ?? undefined, cluster_size: form.clusterSize,
+    })
+    if (mine === availSeq) {
+      clusterAvail.value = out
+      availError.value = ''
+    }
+  } catch (e) {
+    if (mine !== availSeq) return
+    clusterAvail.value = null
+    availError.value = isApiError(e) && e.code.startsWith('cluster_') ? e.message : '查询可用集群失败'
+  }
+}
 function retryAvailability() {
   availError.value = ''
   void loadAvailability()
 }
-watch([() => form.groupId, () => form.machineId, () => form.immediate, startAt, () => form.duration, () => form.quantity], () => {
+watch([() => form.groupId, () => form.machineId, () => form.immediate, startAt, () => form.duration, () => form.quantity, () => form.clusterSize], () => {
   availability.value = null // 旧结果不再对应当前参数
+  clusterAvail.value = null
   availError.value = ''
   clearTimeout(availTimer)
   availTimer = setTimeout(() => void loadAvailability(), 300)
@@ -257,9 +304,11 @@ watch(visible, (v) => {
   step.value = props.mode === 'immediate' && props.appId == null ? 'confirm' : 'form'
   expanded.value = props.mode === 'booking' || props.appId != null
   wfCatalog.value = null // 先于 applyApp：预设 ID 等目录拉到后再按目录过滤
-  Object.assign(form, { groupId: null, count: 1, immediate: props.mode === 'immediate', duration: props.duration, quantity: 1, imageId: props.imageId, machineId: null, autoRenew: false, autoRenewDuration: props.duration, appId: props.appId })
+  beforeCluster = null
+  Object.assign(form, { groupId: null, count: 1, immediate: props.mode === 'immediate', duration: props.duration, quantity: 1, imageId: props.imageId, machineId: null, autoRenew: false, autoRenewDuration: props.duration, appId: props.appId, clusterSize: 0 })
   applyApp() // appId 与上次相同时 watch 不触发：显式重置镜像、变量与预装工作流
   availability.value = null
+  clusterAvail.value = null
   availError.value = ''
   form.day = ''
   form.hour = null
@@ -300,8 +349,8 @@ async function submit() {
       const out = await api.post<{ order: Order; instance: Instance }>('/orders', orderBody(props.product.id, form, appIdForBody(), envValues.value), { idempotencyKey: key.current() })
       placed = { instances: [out.instance], batchId: null, immediate: true }
     } else {
-      const out = await api.post<BookingResult>('/bookings', bookingBody(props.product.id, form, startAt.value, appIdForBody(), envValues.value), { idempotencyKey: key.current() })
-      placed = { instances: out.instances, batchId: out.batch?.id ?? null, immediate: form.immediate }
+      const out = await api.post<BookingResult & ClusterBookingExtra>('/bookings', bookingBody(props.product.id, form, startAt.value, appIdForBody(), envValues.value), { idempotencyKey: key.current() })
+      placed = { instances: out.instances, batchId: out.batch?.id ?? null, immediate: form.immediate, clusterId: out.cluster?.id ?? null }
     }
     key.rotate()
     visible.value = false
@@ -318,7 +367,7 @@ async function submit() {
       if (e.code.startsWith('workflow_')) wfCatalog.value = null // 工作流下架 / 版本变了：回到表单时重新拉目录
       backToForm()
       appError.value = e.message
-    } else if (isApiError(e) && e.code.startsWith('booking_')) {
+    } else if (isApiError(e) && (e.code.startsWith('booking_') || e.code.startsWith('cluster_'))) {
       ElMessage.warning(e.message)
       backToForm() // 多半是开始时间过近 / 过远：刷新服务器时间并校正默认开始时刻
     } else {
@@ -335,16 +384,31 @@ async function submit() {
   <AppDialog v-model="visible" kind="form" :title="step === 'confirm' ? '确认下单' : '租用 / 预订'" :data-testid="step === 'confirm' ? 'market-confirm-dialog' : 'rent-dialog'">
     <template v-if="step === 'form'">
       <el-form label-position="top">
+        <el-form-item label="租用方式">
+          <el-radio-group v-model="form.clusterSize" data-testid="rent-mode">
+            <el-radio-button :value="0" data-testid="rent-mode-single">单机</el-radio-button>
+            <el-radio-button v-for="o in clusterOptions" :key="o.size" :value="o.size" :disabled="o.disabled" :data-testid="`rent-mode-cluster-${o.size}`">集群 {{ o.size }} 台</el-radio-button>
+          </el-radio-group>
+          <div v-if="!isCluster && clusterOptions.every((o) => o.disabled)" class="muted" data-testid="rent-cluster-unavailable">暂无可组成集群的空闲机器（需同一高速网络）</div>
+          <template v-if="isCluster">
+            <div class="row">
+              <span data-testid="rent-cluster-network" :data-rdma="clusterAvail ? String(clusterAvail.rdma) : ''">{{ clusterAvail == null ? '正在查询网络…' : clusterAvail.rdma ? '同一高速网络（RDMA）' : '普通网络（性能有限）' }}</span>
+              <span class="muted">·</span>
+              <span data-testid="rent-cluster-available" :class="{ warn: notEnough }">{{ clusterAvail == null ? '' : clusterAvail.available > 0 ? `可开 ${clusterAvail.available} 个` : '暂无可组成该规模集群的空闲机器' }}</span>
+            </div>
+            <div class="muted" data-testid="rent-cluster-note">{{ form.clusterSize }} 台成员在同一集群网络里互通（各有集群 IP），整组续费、释放；集群暂不支持预订，只能立即开通；应用请在开通后到集群页部署。</div>
+          </template>
+        </el-form-item>
         <el-form-item label="机组">
           <el-select v-model="groupSel" data-testid="rent-group" placeholder="不限机组">
             <el-option :value="NO_GROUP" label="不限机组" />
             <el-option v-for="g in groups" :key="g.id" :value="g.id" :label="`${g.name}${g.region ? ' · ' + g.region : ''}（共 ${g.machine_count} · 现空闲 ${g.idle_now}）`" />
           </el-select>
         </el-form-item>
-        <el-form-item label="数量（台）">
+        <el-form-item v-if="!isCluster" label="数量（台）">
           <el-input-number v-model="form.count" :min="1" :max="MAX_COUNT" data-testid="rent-count" />
         </el-form-item>
-        <el-form-item label="开始">
+        <el-form-item v-if="!isCluster" label="开始">
           <el-radio-group v-model="form.immediate">
             <el-radio-button :value="true" data-testid="rent-start-now">立即</el-radio-button>
             <el-radio-button :value="false" data-testid="rent-start-later">指定时间</el-radio-button>
@@ -366,10 +430,10 @@ async function submit() {
             <span class="muted" data-testid="rent-duration-text">{{ describeDuration(form.duration, form.quantity) }}（单次最长 90 天）</span>
           </div>
         </el-form-item>
-        <el-form-item v-if="apps.length" label="预装应用">
+        <el-form-item v-if="preinstallApps.length && !isCluster" label="预装应用">
           <el-select v-model="appSel" data-testid="rent-app">
             <el-option :value="NO_APP" label="不预装" />
-            <el-option v-for="a in apps" :key="a.id" :value="a.id" :label="appOptionLabel(a)" :disabled="!compatibleImages(a, images).length" />
+            <el-option v-for="a in preinstallApps" :key="a.id" :value="a.id" :label="appOptionLabel(a)" :disabled="!compatibleImages(a, images).length" />
           </el-select>
         </el-form-item>
         <el-form-item label="镜像">
@@ -403,10 +467,11 @@ async function submit() {
       </el-form>
       <p class="avail" :class="{ warn: notEnough || availError }" data-testid="rent-availability">
         <template v-if="availError">{{ availError }} <el-button link type="primary" data-testid="rent-availability-retry" @click="retryAvailability">重试</el-button></template>
+        <template v-else-if="isCluster">{{ clusterAvail == null ? '正在查询可用集群…' : notEnough ? `暂无可组成 ${form.clusterSize} 台集群的空闲机器，请稍后再试或改为单机` : `可开 ${clusterAvail.available} 个 ${form.clusterSize} 台集群` }}</template>
         <template v-else-if="availability">该时段可{{ form.immediate ? '租' : '预订' }} {{ availability.available }} 台<template v-if="notEnough">，不足 {{ form.count }} 台，请减少数量或更换时段</template></template>
         <template v-else>正在查询可用机器…</template>
       </p>
-      <div v-if="!form.immediate && form.groupId !== null && calendar.length" class="calendar" data-testid="rent-calendar">
+      <div v-if="!isCluster && !form.immediate && form.groupId !== null && calendar.length" class="calendar" data-testid="rent-calendar">
         <button v-for="d in calendar" :key="d.date" type="button" class="day" :class="{ full: dayDisabled(d), picked: d.date === form.day }" :data-testid="`rent-day-${d.date}`" :disabled="dayDisabled(d)" @click="pickDay(d)">
           <span class="date">{{ d.date.slice(5) }}</span><span class="free">{{ d.free }}/{{ d.total }}</span>
         </button>
@@ -417,20 +482,21 @@ async function submit() {
       <el-descriptions :column="1" border>
         <el-descriptions-item label="商品"><span data-testid="market-confirm-product">{{ product.name }}</span></el-descriptions-item>
         <el-descriptions-item label="机组"><span data-testid="market-confirm-group">{{ groupName }}<template v-if="machineLabel"> · {{ machineLabel }}</template></span></el-descriptions-item>
-        <el-descriptions-item label="数量"><span data-testid="market-confirm-count">{{ form.count }} 台</span></el-descriptions-item>
+        <el-descriptions-item label="数量"><span data-testid="market-confirm-count">{{ isCluster ? `集群 ${form.clusterSize} 台` : `${form.count} 台` }}</span></el-descriptions-item>
+        <el-descriptions-item v-if="isCluster" label="网络"><span key="net" data-testid="market-confirm-cluster-network">{{ clusterAvail == null ? '—' : clusterAvail.rdma ? '同一高速网络（RDMA）' : '普通网络（性能有限）' }}</span></el-descriptions-item>
         <el-descriptions-item label="开始"><span data-testid="market-confirm-start">{{ form.immediate ? '立即' : `${form.day} ${String(form.hour ?? 0).padStart(2, '0')}:00` }}</span></el-descriptions-item>
         <el-descriptions-item label="租期"><span data-testid="market-confirm-duration">{{ form.quantity === 1 ? labelOf(durationLabel, form.duration) : describeDuration(form.duration, form.quantity) }}</span></el-descriptions-item>
         <el-descriptions-item label="镜像"><span data-testid="market-confirm-image">{{ imageName }}</span></el-descriptions-item>
         <el-descriptions-item v-if="selectedApp" label="预装应用"><span data-testid="market-confirm-app">{{ appConfirmText(selectedApp, envValues) }}</span></el-descriptions-item>
         <el-descriptions-item v-if="showWorkflows && workflowsText" label="预装工作流"><span data-testid="rent-confirm-workflows">{{ workflowsText }}</span></el-descriptions-item>
         <el-descriptions-item v-if="form.count > 1" label="单台价"><span data-testid="market-confirm-unit">{{ unitPrice == null ? '—' : fmtYuan(unitPrice * form.quantity) }}</span></el-descriptions-item>
-        <el-descriptions-item :label="form.count > 1 ? '总价' : '价格'"><span data-testid="market-confirm-price">{{ total == null ? '—' : fmtYuan(total) }}</span></el-descriptions-item>
+        <el-descriptions-item :label="form.count > 1 ? '总价' : '价格'"><span data-testid="market-confirm-price">{{ total == null ? '—' : fmtYuan(total) }}<template v-if="isCluster && unitPrice != null">（{{ form.clusterSize }} 台 × {{ fmtYuan(unitPrice * form.quantity) }}）</template></span></el-descriptions-item>
         <el-descriptions-item label="当前余额"><span data-testid="market-confirm-balance">{{ fmtYuan(balance) }}</span></el-descriptions-item>
         <el-descriptions-item label="扣款后余额">
           <span data-testid="market-confirm-after" :class="{ warn: insufficient }">{{ after == null ? '—' : fmtYuan(after) }}<template v-if="insufficient">（余额不足）</template></span>
         </el-descriptions-item>
       </el-descriptions>
-      <el-button v-if="!expanded" link type="primary" data-testid="market-confirm-more" @click="expanded = true; backToForm()">更多选项（机组 / 多台 / 预订 / 自动续费{{ apps.length ? ' / 预装应用' : '' }}）</el-button>
+      <el-button v-if="!expanded" link type="primary" data-testid="market-confirm-more" @click="expanded = true; backToForm()">更多选项（集群 / 机组 / 多台 / 预订 / 自动续费{{ preinstallApps.length ? ' / 预装应用' : '' }}）</el-button>
     </template>
     <!-- 具名插槽只能放在组件的直接子级：按步骤切换按钮 -->
     <template #footer>

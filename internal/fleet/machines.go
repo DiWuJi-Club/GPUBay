@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"spark-cloud/internal/clusterspec"
 	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/clock"
 	"spark-cloud/internal/platform/db"
@@ -56,6 +57,23 @@ type Machine struct {
 	// 计划 7：Agent 上报的已缓存镜像（imageref 形态）；CachedImagesAt 为空表示从未上报（旧 Agent）。
 	CachedImages   []string   `json:"cached_images"`
 	CachedImagesAt *time.Time `json:"cached_images_at"`
+
+	// 计划 13：集群网络。FabricID 为空 = 不在任何集群网络；ClusterIface 为空 = 自动选网卡。
+	// AgentFeatures 是 Hello.features 原值；NetInfo 为 nil = 从未上报网卡（旧 Agent）。
+	// ClusterReady / ClusterRDMA / ClusterNet 是 fleet 按 evalClusterNet 算好的缓存列（分配只读它们）；
+	// ClusterReason 不是列：每次读出时现算（未就绪原因，就绪时为空）。
+	FabricID      *int64               `json:"fabric_id"`
+	FabricName    string               `json:"fabric_name"`
+	ClusterIface  string               `json:"cluster_iface"`
+	AgentFeatures uint32               `json:"agent_features"`
+	NetInfo       *clusterspec.NetInfo `json:"net_info"`
+	NetInfoAt     *time.Time           `json:"net_info_at"`
+	ClusterReady  bool                 `json:"cluster_ready"`
+	ClusterRDMA   bool                 `json:"cluster_rdma"`
+	ClusterNet    string               `json:"cluster_net"`
+	ClusterReason string               `json:"cluster_reason"`
+
+	fabric *Fabric // 所属 fabric 的 kind / rdma（evalClusterNet 用；FabricID 为空时 nil）
 }
 
 type NewMachine struct {
@@ -80,17 +98,44 @@ func NewService(pool *pgxpool.Pool, clk clock.Clock) *Service {
 
 const machineCols = `id, serial, rack, slot, lan_ip, product_id, state, agent_online, last_seen_at, pdu_id, pdu_outlet, created_at,
 	cert_fingerprint, agent_conn_id, agent_version, agent_connected_at, state_reported_at, last_metrics, group_id, display_name,
-	cached_images, cached_images_at`
+	cached_images, cached_images_at,
+	fabric_id, cluster_iface, agent_features, net_info, net_info_at, cluster_ready, cluster_rdma, cluster_net,
+	(SELECT f.name FROM cluster_fabrics f WHERE f.id = machines.fabric_id),
+	(SELECT f.kind FROM cluster_fabrics f WHERE f.id = machines.fabric_id),
+	(SELECT f.rdma FROM cluster_fabrics f WHERE f.id = machines.fabric_id)`
 
 func scanMachine(row pgx.Row) (Machine, error) {
 	var m Machine
 	var connID *string
-	var metrics []byte
+	var metrics, netInfo []byte
+	var features int32
+	var fName, fKind *string
+	var fRDMA *bool
 	err := row.Scan(&m.ID, &m.Serial, &m.Rack, &m.Slot, &m.LanIP, &m.ProductID, &m.State, &m.AgentOnline, &m.LastSeenAt,
 		&m.PDUID, &m.PDUOutlet, &m.CreatedAt, &m.CertFingerprint, &connID, &m.AgentVersion, &m.AgentConnectedAt, &m.StateReportedAt, &metrics,
-		&m.GroupID, &m.DisplayName, &m.CachedImages, &m.CachedImagesAt)
+		&m.GroupID, &m.DisplayName, &m.CachedImages, &m.CachedImagesAt,
+		&m.FabricID, &m.ClusterIface, &features, &netInfo, &m.NetInfoAt, &m.ClusterReady, &m.ClusterRDMA, &m.ClusterNet,
+		&fName, &fKind, &fRDMA)
 	if db.IsNoRows(err) {
 		return Machine{}, apperr.ErrNotFound
+	}
+	if err != nil {
+		return Machine{}, err
+	}
+	m.AgentFeatures = uint32(features)
+	if netInfo != nil {
+		var n clusterspec.NetInfo
+		if json.Unmarshal(netInfo, &n) == nil {
+			m.NetInfo = &n
+		}
+	}
+	if m.FabricID != nil && fKind != nil {
+		m.FabricName = *fName
+		m.fabric = &Fabric{ID: *m.FabricID, Name: *fName, Kind: *fKind, RDMA: fRDMA != nil && *fRDMA}
+	}
+	_, _, _, m.ClusterReason = evalClusterNet(m, m.fabric, m.NetInfo)
+	if m.ClusterReason == "" && !m.ClusterReady { // 判定通过但缓存列是 false：SuspendClusterReady 之后尚未重算
+		m.ClusterReason = reasonNetFailed
 	}
 	m.Enrolled = m.CertFingerprint != ""
 	if len(m.CertFingerprint) >= 16 {

@@ -3,11 +3,14 @@ import { fmtYuan, instanceStateLabel, machineStateLabel, messageOf, type Dashboa
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { barsOf, CHART } from '../logic/chart'
+import type { DashboardClusters } from '../logic/clusters'
 import { dashLlmNodesBad } from '../logic/llm'
 import { notifyError } from '../logic/notify'
 import { session } from '../store/session'
 
-const data = ref<(Dashboard & DashboardButler) | null>(null)
+/** 计划 13：clusters = 活动集群及其派生状态分布（旧后端缺省时不显示卡片） */
+type DashData = Dashboard & DashboardButler & { clusters?: DashboardClusters }
+const data = ref<DashData | null>(null)
 const loadError = ref('')
 const retrying = ref(false)
 const machineStates = ['idle', 'allocated', 'maintenance', 'faulty'] as const
@@ -21,7 +24,7 @@ let seq = 0
 async function load() {
   const mine = ++seq
   try {
-    const out = await api.get<Dashboard & DashboardButler>('/dashboard')
+    const out = await api.get<DashData>('/dashboard')
     if (mine !== seq) return
     data.value = out
     loadError.value = ''
@@ -96,6 +99,15 @@ const bars = computed(() => barsOf(data.value?.utilization ?? []))
           <li><span>24 小时快速出图</span><b data-testid="dash-workflow-runs">{{ data.workflow_runs_24h ?? 0 }}</b></li>
         </ul>
         <router-link to="/workflows" class="more" data-testid="dash-workflows-link">查看工作流</router-link>
+      </el-card>
+      <el-card v-if="data.clusters" header="多机集群（活动）" data-testid="dash-clusters">
+        <div class="big"><span data-testid="dash-clusters-active">{{ data.clusters.active }}</span> 个</div>
+        <ul class="kv">
+          <li><span>就绪</span><b data-testid="dash-clusters-ready">{{ data.clusters.ready }}</b></li>
+          <li><span>组建中</span><b data-testid="dash-clusters-forming">{{ data.clusters.forming }}</b></li>
+          <li><span>降级</span><b data-testid="dash-clusters-degraded" :class="{ bad: data.clusters.degraded > 0 }">{{ data.clusters.degraded }}</b></li>
+        </ul>
+        <router-link to="/clusters" class="more" data-testid="dash-clusters-link">查看集群</router-link>
       </el-card>
       <el-card v-if="data.llm" header="Token 商城" data-testid="dash-llm">
         <ul class="kv">

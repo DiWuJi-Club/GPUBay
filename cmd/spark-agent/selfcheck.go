@@ -7,13 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 
+	"spark-cloud/internal/agent/clusternet/linux"
 	"spark-cloud/internal/agent/cmdrun"
+	"spark-cloud/internal/clusterspec"
 )
 
 const (
@@ -29,6 +34,11 @@ var requiredCommands = []string{"iptables-restore", "mkfs.ext4", "blkid", "findm
 
 // selfcheck 逐项检查并打印 ok/WARN/FAIL；任一 FAIL 返回错误（安装脚本据此中止），WARN 只提示不中止。
 func selfcheck(ctx context.Context, run cmdrun.Runner, stateDir string, out io.Writer) error {
+	return selfcheckAt(ctx, run, stateDir, "/sys", out)
+}
+
+// selfcheckAt 同 selfcheck，sysRoot 是集群网卡探测读的 sysfs 根（测试指向夹具）。
+func selfcheckAt(ctx context.Context, run cmdrun.Runner, stateDir, sysRoot string, out io.Writer) error {
 	failed := false
 	report := func(name string, err error, detail string) {
 		if err != nil {
@@ -87,6 +97,7 @@ func selfcheck(ctx context.Context, run cmdrun.Runner, stateDir string, out io.W
 	warn("nproc", err, detail) // 只和已搁置的共享机（按份 --cpus）有关，整机不需要
 	detail, err = cgroupV2(ctx, run)
 	report("cgroup v2", err, detail)
+	clusterNICs(ctx, run, sysRoot, out)
 	if failed {
 		return errors.New("自检未通过")
 	}
@@ -173,4 +184,187 @@ func existingAncestor(dir string) string {
 			return d
 		}
 	}
+}
+
+// agentOwnedPrefixes：Agent 自己为集群建的宿主机网卡（veth sch*、macvlan scm*、VLAN 子接口 scv*、临时名 scc*），
+// 它们的地址与路由本来就在集群网段里，不算冲突。
+var agentOwnedPrefixes = []string{"sch", "scm", "scv", "scc"}
+
+func agentOwned(dev string) bool {
+	for _, p := range agentOwnedPrefixes {
+		if strings.HasPrefix(dev, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// clusterNICs 是「集群网卡」一节（计划 13）：列出物理网卡与 RDMA 状态，提示 CX-7 口的地址 / NetworkManager 托管、
+// ip_forward、集群网段冲突。集群是可选能力，这里只打印 ok / WARN，从不让自检失败。
+func clusterNICs(ctx context.Context, run cmdrun.Runner, sysRoot string, out io.Writer) {
+	ok := func(format string, a ...any) { fmt.Fprintf(out, "ok: "+format+"\n", a...) }
+	warn := func(format string, a ...any) { fmt.Fprintf(out, "WARN: "+format+"\n", a...) }
+	routes, routeErr := run.Run(ctx, "ip", "-4", "route", "show")
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	info, err := linux.New(run, linux.Options{SysRoot: sysRoot, Log: quiet}).Probe(ctx, "")
+	if err != nil {
+		warn("集群网卡: %v", err)
+	} else {
+		for _, f := range info.Ifaces {
+			rdma := f.RDMADevice
+			if rdma == "" {
+				rdma = "-"
+			}
+			wireless := ""
+			if f.Wireless { // 无线网卡不能做 CX-7 集群网卡（lan fabric 可用但很慢），自检里直接标出来
+				wireless = " wireless=true"
+			}
+			ok("iface %s up=%t speed=%d driver=%s rdma=%s active=%t%s", f.Name, f.Up, f.SpeedMbps, f.Driver, rdma, f.RDMAActive, wireless)
+		}
+		cx7NICs(ctx, run, info, defaultDevs(string(routes)), ok, warn)
+	}
+
+	raw, err := run.Run(ctx, "cat", "/proc/sys/net/ipv4/ip_forward")
+	switch v := strings.TrimSpace(string(raw)); {
+	case err != nil:
+		warn("ip_forward: 读取 /proc/sys/net/ipv4/ip_forward 失败：%v", err)
+	case v != "1":
+		warn("ip_forward: /proc/sys/net/ipv4/ip_forward 为 %s，lan 集群（routed）需要 1：sysctl -w net.ipv4.ip_forward=1（Docker 启动时通常会打开）", v)
+	default:
+		ok("ip_forward 1")
+	}
+
+	addrs, addrErr := run.Run(ctx, "ip", "-4", "-o", "addr", "show")
+	if addrErr != nil || routeErr != nil {
+		warn("集群网段 %s: 读取本机地址 / 路由失败：%v", clusterspec.DefaultPool, errors.Join(addrErr, routeErr))
+		return
+	}
+	if hits := poolConflicts(string(addrs), string(routes)); len(hits) > 0 {
+		warn("集群网段 %s: 与集群网段冲突：%s", clusterspec.DefaultPool, strings.Join(hits, "；"))
+	} else {
+		ok("集群网段 %s 无冲突", clusterspec.DefaultPool)
+	}
+}
+
+// cx7NICs 检查 ConnectX-7 口（mlx5_core）：有地址（IPv4 / IPv6）→ 提示 Agent 会清除；受 NetworkManager 管理 → 提示
+// install.sh --cluster-iface。持有默认路由的口是管理网卡，Agent 绝不改动它，这里也不提示。
+func cx7NICs(ctx context.Context, run cmdrun.Runner, info clusterspec.NetInfo, defaults map[string]bool, ok, warn func(string, ...any)) {
+	v6 := map[string][]string{}
+	if raw, err := run.Run(ctx, "ip", "-6", "-o", "addr", "show"); err == nil {
+		v6 = parseAddrLines(string(raw), "inet6")
+	}
+	nm, nmErr := nmDeviceStates(ctx, run)
+	n := 0
+	for _, f := range info.Ifaces {
+		if f.Driver != clusterspec.MLX5Driver {
+			continue
+		}
+		n++
+		if defaults[f.Name] {
+			ok("%s 持有默认路由，视为管理网卡，Agent 不会把它当集群网卡改动", f.Name)
+			continue
+		}
+		if addrs := append(slices.Clone(f.IPv4), v6[f.Name]...); len(addrs) > 0 {
+			warn("%s 上有地址 %s，作为集群网卡时 Agent 会清除", f.Name, strings.Join(addrs, " "))
+		}
+		if st, found := nm[f.Name]; nmErr == nil && found && st != "unmanaged" {
+			warn("%s 受 NetworkManager 管理，NM 可能重新加地址；请执行 install.sh --cluster-iface %s", f.Name, f.Name)
+		}
+	}
+	switch {
+	case n == 0:
+		warn("未发现 ConnectX-7 网卡，集群将只能使用普通以太网")
+	case nmErr != nil:
+		ok("NetworkManager 未运行，跳过集群网卡受管检查")
+	}
+}
+
+// nmDeviceStates 解析 `nmcli -t -f DEVICE,STATE device`（每行 "enp1s0f1np1:unmanaged"）；没有 nmcli / NM 未运行 → 错误。
+func nmDeviceStates(ctx context.Context, run cmdrun.Runner) (map[string]string, error) {
+	raw, err := run.Run(ctx, "nmcli", "-t", "-f", "DEVICE,STATE", "device")
+	if err != nil {
+		return nil, err
+	}
+	m := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if dev, st, found := strings.Cut(strings.TrimSpace(line), ":"); found && dev != "" {
+			m[dev] = st
+		}
+	}
+	return m, nil
+}
+
+// parseAddrLines 解析 `ip -4|-6 -o addr show`：网卡名 → CIDR 列表（family 为 "inet" 或 "inet6"）。
+func parseAddrLines(out, family string) map[string][]string {
+	m := map[string][]string{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || f[2] != family {
+			continue
+		}
+		name, _, _ := strings.Cut(f[1], "@")
+		m[name] = append(m[name], f[3])
+	}
+	return m
+}
+
+// defaultDevs 是 `ip -4 route show` 里持有默认路由的网卡。
+func defaultDevs(routes string) map[string]bool {
+	m := map[string]bool{}
+	for _, line := range strings.Split(routes, "\n") {
+		if f := strings.Fields(line); len(f) > 0 && f[0] == "default" {
+			if dev := fieldAfter(f, "dev"); dev != "" {
+				m[dev] = true
+			}
+		}
+	}
+	return m
+}
+
+func fieldAfter(f []string, key string) string {
+	if i := slices.Index(f, key); i >= 0 && i+1 < len(f) {
+		return f[i+1]
+	}
+	return ""
+}
+
+// poolConflicts 找落在集群网段（clusterspec.DefaultPool）里的本机地址与路由（Agent 自建的网卡除外）。
+// 包住整个网段的更大路由（如 10.0.0.0/8）不算：集群的 /32 路由更具体。与地址重复的直连路由（proto kernel）只报地址。
+// 网段内的 /32 via 路由是 Agent 自建的跨机对端路由，也不算。
+func poolConflicts(addrs, routes string) []string {
+	pool := netip.MustParsePrefix(clusterspec.DefaultPool)
+	var hits []string
+	names := parseAddrLines(addrs, "inet")
+	for _, dev := range slices.Sorted(maps.Keys(names)) {
+		if agentOwned(dev) {
+			continue
+		}
+		for _, c := range names[dev] {
+			if p, err := netip.ParsePrefix(c); err == nil && pool.Contains(p.Addr()) {
+				hits = append(hits, fmt.Sprintf("地址 %s（%s）", c, dev))
+			}
+		}
+	}
+	for _, line := range strings.Split(routes, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || f[0] == "default" || slices.Contains(f, "kernel") {
+			continue
+		}
+		dev := fieldAfter(f, "dev")
+		if agentOwned(dev) {
+			continue
+		}
+		dst := f[0]
+		if !strings.Contains(dst, "/") {
+			dst += "/32"
+		}
+		// Agent 自建的 routed 对端路由：<对端成员>/32 via <对端宿主机> dev <管理网卡>（clusternet/linux syncPeerRoutes）
+		if strings.HasSuffix(dst, "/32") && fieldAfter(f, "via") != "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(dst); err == nil && p.Overlaps(pool) && p.Bits() >= pool.Bits() {
+			hits = append(hits, fmt.Sprintf("路由 %s（%s）", f[0], dev))
+		}
+	}
+	return hits
 }

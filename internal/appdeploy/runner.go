@@ -759,7 +759,10 @@ func (r *Runner) stepPoll(ctx context.Context, d Deployment, ut upstream.Target,
 				cur.ID, phase, clampProgress(st.Progress), msg, logTail, st.Seq, now.Add(r.cfg.PollInterval), now)
 			return err
 		case StateRunning:
-			code, err := registerPorts(ctx, tx, cur, ver.Spec.Ports, app.Name, now)
+			code, err := "", error(nil)
+			if registersPorts(cur, ver.Spec) {
+				code, err = registerPorts(ctx, tx, cur, ver.Spec.Ports, app.Name, now)
+			}
 			if err != nil {
 				return err
 			}

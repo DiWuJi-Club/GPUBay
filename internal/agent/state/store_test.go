@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"spark-cloud/internal/agent/state"
+	"spark-cloud/internal/clusterspec"
 )
 
 func TestStoreResultsInstancesAndReopen(t *testing.T) {
@@ -94,5 +95,71 @@ func TestInstanceShareSlotsBackwardCompatible(t *testing.T) {
 	}
 	if inst, ok := s2.Instance("ins-bbbbbbbb"); !ok || inst.ShareSlots != 4 || inst.DataSizeGiB != 512 {
 		t.Fatalf("reopened = %+v %v", inst, ok)
+	}
+}
+
+// 计划 13：Cluster / ClusterRuntime / ClusterNote 往返；旧状态文件没有这些字段时读出为 nil / 空；
+// 返回值是深拷贝，调用方改动不影响 Store。
+func TestStateRoundTripCluster(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	old := `{"results":[],"instances":{"ins-aaaaaaaa":{"id":"ins-aaaaaaaa","desired":"running","image_ref":"img:1","lan_ip":"10.0.0.10","ssh_port":2222,"bandwidth_mbps":200,"data_size_gib":2048}}}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst, _ := s.Instance("ins-aaaaaaaa"); inst.Cluster != nil || inst.ClusterRuntime != nil || inst.ClusterNote != "" {
+		t.Fatalf("old instance = %+v", inst)
+	}
+	spec := &clusterspec.Spec{ClusterID: "clu-abcdefghij", Version: 2, Size: 2, Rank: 1, Mode: clusterspec.ModeRouted, Iface: "eth0",
+		Subnet: "10.210.3.0/24", Members: []clusterspec.Member{{Rank: 0, InstanceID: "ins-bbbbbbbb", IP: "10.210.3.11", HostIP: "10.0.0.11"}, {Rank: 1, InstanceID: "ins-cccccccc", IP: "10.210.3.12"}}}
+	in := state.Instance{ID: "ins-cccccccc", Desired: "running", Cluster: spec, ClusterRuntime: &clusterspec.Runtime{HCA: "rocep1s0f1", GIDIndex: 3, RDMAActive: true}, ClusterNote: "RDMA 变更需重建实例"}
+	if err := s.PutInstance(in); err != nil {
+		t.Fatal(err)
+	}
+	spec.Members[0].IP = "mutated" // 调用方改自己的副本不影响 Store
+	s2, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s2.Instance("ins-cccccccc")
+	if !ok || got.Cluster == nil || got.Cluster.Version != 2 || got.Cluster.Members[0].IP != "10.210.3.11" || got.Cluster.Members[0].HostIP != "10.0.0.11" ||
+		got.ClusterRuntime == nil || *got.ClusterRuntime != (clusterspec.Runtime{HCA: "rocep1s0f1", GIDIndex: 3, RDMAActive: true}) || got.ClusterNote != "RDMA 变更需重建实例" {
+		t.Fatalf("reopened = %+v %+v", got, got.Cluster)
+	}
+	got.Cluster.Members[0].IP = "mutated"
+	got.ClusterRuntime.GIDIndex = 9
+	if again, _ := s2.Instance("ins-cccccccc"); again.Cluster.Members[0].IP != "10.210.3.11" || again.ClusterRuntime.GIDIndex != 3 {
+		t.Fatalf("store aliased caller copy: %+v", again.Cluster)
+	}
+	for _, i := range s2.Instances() {
+		if i.Cluster != nil {
+			i.Cluster.Members[1].IP = "mutated"
+		}
+	}
+	if again, _ := s2.Instance("ins-cccccccc"); again.Cluster.Members[1].IP != "10.210.3.12" {
+		t.Fatal("Instances() aliased store")
+	}
+}
+
+// LanIPs：状态文件里实例记录的管理地址（去重、非空、有序），Agent 重启后 Probe 之前供集群网络认出管理网卡（终审 B-11）。
+func TestStoreLanIPs(t *testing.T) {
+	s, err := state.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.LanIPs(); len(got) != 0 {
+		t.Fatalf("empty = %v", got)
+	}
+	for _, i := range []state.Instance{{ID: "ins-bbbbbbbb", LanIP: "192.168.1.50"}, {ID: "ins-aaaaaaaa", LanIP: "192.168.1.50"},
+		{ID: "ins-cccccccc", LanIP: ""}, {ID: "ins-dddddddd", LanIP: "10.0.0.9"}} {
+		if err := s.PutInstance(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := fmt.Sprint(s.LanIPs()); got != "[10.0.0.9 192.168.1.50]" {
+		t.Fatalf("LanIPs = %s", got)
 	}
 }

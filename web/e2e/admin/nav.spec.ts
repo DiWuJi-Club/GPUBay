@@ -6,11 +6,11 @@ const ROLE_LABEL: Record<Role, string> = { super: '超级管理员', ops: '运�
 
 test('A-NAV-01 菜单按角色过滤', async ({ page }) => {
   await page.clock.install() // 角标 60 秒刷新用；pauseClock 之前时间照常流逝
-  // 计划 7 增加「应用」「应用部署」两项（全部角色可见）；计划 11 加「工作流」、计划 9 加「Token 商城」、计划 12 加「AI 管家」（都是全部角色），与 admin/src/__tests__/menu.spec.ts 一致
+  // 计划 7 增加「应用」「应用部署」两项（全部角色可见）；计划 11 加「工作流」、计划 9 加「Token 商城」、计划 12 加「AI 管家」、计划 13 加「集群网络」「集群」（都是全部角色），与 admin/src/__tests__/menu.spec.ts 一致
   const cases: [Role, number, string[]][] = [
-    ['super', 21, []], // 计划 7 加「应用」「应用部署」（全部角色）；计划 8 加「邀请返利」（super / finance）；计划 11 加「工作流」；计划 9 加「Token 商城」；计划 12 加「AI 管家」
-    ['ops', 15, ['orders', 'ledger', 'recharges', 'referral', 'catalog', 'admins']],
-    ['finance', 15, ['machines', 'pdus', 'groups', 'kyc', 'catalog', 'admins']],
+    ['super', 23, []], // 计划 7 加「应用」「应用部署」（全部角色）；计划 8 加「邀请返利」（super / finance）；计划 11 加「工作流」；计划 9 加「Token 商城」；计划 12 加「AI 管家」
+    ['ops', 17, ['orders', 'ledger', 'recharges', 'referral', 'catalog', 'admins']],
+    ['finance', 17, ['machines', 'pdus', 'groups', 'kyc', 'catalog', 'admins']],
   ]
   for (const [role, count, missing] of cases) {
     const admin = await createAdmin(role)

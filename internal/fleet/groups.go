@@ -372,14 +372,35 @@ func (s *Service) UnassignMachines(ctx context.Context, actor audit.Actor, group
 	})
 }
 
-// MachineUpdate 后台可改的机器字段：SetGroup=true 时按 GroupID 改组（nil = 移出机组）；DisplayName 非 nil 时改展示名。
+// MachineUpdate 后台可改的机器字段：SetGroup=true 时按 GroupID 改组（nil = 移出机组）；DisplayName 非 nil 时改展示名；
+// 计划 13：SetFabric=true 时按 FabricID 改集群网络（nil = 移出）；ClusterIface 非 nil 时改集群网卡（"" = 自动）。
 type MachineUpdate struct {
 	SetGroup    bool
 	GroupID     *int64
 	DisplayName *string
+
+	SetFabric    bool
+	FabricID     *int64
+	ClusterIface *string
 }
 
-// UpdateMachine 修改机组 / 展示名（计划 4 遗留的「修改已登记机器」只开放这两项）。
+// errClusterMemberOnMachine 机器上有集群成员实例时不能改集群网络（规格 §3.1）。
+var errClusterMemberOnMachine = apperr.New(apperr.ErrInvalidState.Code, "机器上有集群成员，不能修改集群网络", apperr.ErrInvalidState.Status)
+
+// clusterIfaceRe 集群网卡名：Linux 网卡名规则（≤ 15 字符）。
+var clusterIfaceRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$`)
+
+func eqInt64Ptr(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// UpdateMachine 修改机组 / 展示名 / 集群网络（fabric 与集群网卡）。
+// 集群网络有变化时：机器上有 cluster_id 非空的活动实例（creating / running / stopped / wiping）→ invalid_state；
+// 加入 direct fabric 后该 fabric 机器数 > 2 → ErrFabricFull；FabricID 不存在 → ErrFabricNotFound；同事务重算就绪判定。
+// 锁序 fabric → machine（与 UpdateFabric 一致）：目标 fabric 行先锁，加入 direct fabric 的并发请求由它串行化。
 func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64, in MachineUpdate) (Machine, error) {
 	var name string
 	if in.DisplayName != nil {
@@ -394,14 +415,27 @@ func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64
 			return Machine{}, apperr.BadRequest("展示名不能使用「机器 #编号」格式")
 		}
 	}
+	var iface string
+	if in.ClusterIface != nil {
+		iface = strings.TrimSpace(*in.ClusterIface)
+		if iface != "" && !clusterIfaceRe.MatchString(iface) {
+			return Machine{}, apperr.BadRequest("集群网卡名称不正确")
+		}
+	}
 	now := s.clock.Now()
 	var out Machine
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if in.SetFabric && in.FabricID != nil {
+			if _, err := lockFabric(ctx, tx, *in.FabricID); err != nil {
+				return err
+			}
+		}
 		before, err := scanMachine(tx.QueryRow(ctx, `SELECT `+machineCols+` FROM machines WHERE id = $1 FOR NO KEY UPDATE`, id))
 		if err != nil {
 			return err
 		}
 		groupID, display := before.GroupID, before.DisplayName
+		fabricID, clusterIface := before.FabricID, before.ClusterIface
 		if in.SetGroup {
 			groupID = in.GroupID
 			if groupID != nil {
@@ -416,10 +450,30 @@ func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64
 		if in.DisplayName != nil {
 			display = name
 		}
-		out, err = scanMachine(tx.QueryRow(ctx, `UPDATE machines SET group_id = $2, display_name = $3, updated_at = $4 WHERE id = $1 RETURNING `+machineCols,
-			id, groupID, display, now))
+		if in.SetFabric {
+			fabricID = in.FabricID
+		}
+		if in.ClusterIface != nil {
+			clusterIface = iface
+		}
+		netChanged := !eqInt64Ptr(fabricID, before.FabricID) || clusterIface != before.ClusterIface
+		if netChanged {
+			var member bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM instances WHERE machine_id = $1 AND cluster_id IS NOT NULL
+					AND state IN ('creating', 'running', 'stopped', 'wiping'))`, id).Scan(&member); err != nil {
+				return err
+			}
+			if member {
+				return errClusterMemberOnMachine
+			}
+		}
+		out, err = scanMachine(tx.QueryRow(ctx, `UPDATE machines SET group_id = $2, display_name = $3, fabric_id = $4, cluster_iface = $5, updated_at = $6
+			WHERE id = $1 RETURNING `+machineCols, id, groupID, display, fabricID, clusterIface, now))
 		if db.IsUniqueViolation(err) && db.ConstraintName(err) == "machines_display_name_uniq" {
 			return apperr.ErrDuplicateDisplayName
+		}
+		if db.IsForeignKeyViolation(err) && db.ConstraintName(err) == "machines_fabric_id_fkey" {
+			return apperr.ErrFabricNotFound
 		}
 		if db.IsForeignKeyViolation(err) { // 目标机组在 GetGroup 之后被并发删除
 			return apperr.ErrGroupNotFound
@@ -427,9 +481,28 @@ func (s *Service) UpdateMachine(ctx context.Context, actor audit.Actor, id int64
 		if err != nil {
 			return err
 		}
+		if netChanged {
+			if out.fabric != nil && fabricID != nil && !eqInt64Ptr(fabricID, before.FabricID) {
+				var isolation string
+				var n int
+				if err := tx.QueryRow(ctx, `SELECT isolation, (SELECT count(*) FROM machines WHERE fabric_id = $1) FROM cluster_fabrics WHERE id = $1`,
+					*fabricID).Scan(&isolation, &n); err != nil {
+					return err
+				}
+				if isolation == IsolationDirect && n > DirectFabricMaxMachines {
+					return apperr.ErrFabricFull
+				}
+			}
+			if err := s.recomputeClusterNet(ctx, tx, id); err != nil {
+				return err
+			}
+			if out, err = s.Get(ctx, tx, id); err != nil {
+				return err
+			}
+		}
 		return audit.Record(ctx, tx, now, actor.Entry("machine.update", "machine", strconv.FormatInt(id, 10), map[string]any{
-			"before": map[string]any{"group_id": before.GroupID, "display_name": before.DisplayName},
-			"after":  map[string]any{"group_id": out.GroupID, "display_name": out.DisplayName},
+			"before": map[string]any{"group_id": before.GroupID, "display_name": before.DisplayName, "fabric_id": before.FabricID, "cluster_iface": before.ClusterIface},
+			"after":  map[string]any{"group_id": out.GroupID, "display_name": out.DisplayName, "fabric_id": out.FabricID, "cluster_iface": out.ClusterIface},
 		}))
 	})
 	return out, err

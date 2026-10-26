@@ -21,20 +21,25 @@ import (
 // depCols 与 scanDeployment 的字段顺序一致（含乐观并发列 row_version）。
 const depCols = "id, instance_id, user_id, app_id, app_version_id, state, desired, phase, progress, message, health, error_code, env, secret_env_enc, " +
 	"port, log_tail, status_seq, attempt, spec_hash, next_poll_at, last_polled_at, cleanup_pending, unreachable_count, crash_count, row_version, " +
-	"started_at, finished_at, created_at, updated_at"
+	"started_at, finished_at, created_at, updated_at, cluster_deployment_id, cluster_role"
 
 // scanDeployment 扫描一行部署；没有行 → apperr.ErrNotFound（Runner 据此判断部署已不存在）。
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	var d Deployment
 	var env []byte
+	var role *string
 	err := row.Scan(&d.ID, &d.InstanceID, &d.UserID, &d.AppID, &d.AppVersionID, &d.State, &d.Desired, &d.Phase, &d.Progress, &d.Message,
 		&d.Health, &d.ErrorCode, &env, &d.SecretEnvEnc, &d.Port, &d.LogTail, &d.StatusSeq, &d.Attempt, &d.SpecHash, &d.NextPollAt,
-		&d.LastPolledAt, &d.CleanupPending, &d.UnreachableCount, &d.CrashCount, &d.RowVersion, &d.StartedAt, &d.FinishedAt, &d.CreatedAt, &d.UpdatedAt)
+		&d.LastPolledAt, &d.CleanupPending, &d.UnreachableCount, &d.CrashCount, &d.RowVersion, &d.StartedAt, &d.FinishedAt, &d.CreatedAt, &d.UpdatedAt,
+		&d.ClusterDeploymentID, &role)
 	if db.IsNoRows(err) {
 		return Deployment{}, apperr.ErrNotFound
 	}
 	if err != nil {
 		return Deployment{}, err
+	}
+	if role != nil {
+		d.ClusterRole = *role
 	}
 	d.Env = map[string]string{}
 	if len(env) > 0 {
@@ -307,6 +312,9 @@ func (s *Service) bundleFor(ctx context.Context, d Deployment, appRoot string, h
 	}
 	in := BundleInput{Slug: app.Slug, InstanceID: d.InstanceID, AppRoot: appRoot, SpecHash: d.SpecHash, Spec: ver.Spec, Script: ver.Script,
 		Env: d.Env, Secret: secret, HFEndpoint: s.d.HFEndpoint, PipIndexURL: s.d.PipIndexURL, GitMirror: s.d.GitMirror, ImageEnv: imageEnv}
+	if d.ClusterDeploymentID != nil {
+		in.ClusterRole, in.ClusterDeploymentID = d.ClusterRole, *d.ClusterDeploymentID
+	}
 	if ver.Spec.SupportsWorkflows && s.d.BundleExtra != nil {
 		if in.Extra, err = s.d.BundleExtra(ctx, d, ver); err != nil {
 			var ae *apperr.Error

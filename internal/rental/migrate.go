@@ -15,6 +15,8 @@ import (
 
 // AdminMigrate 把运行中实例的剩余时长转移到同产品的另一台空闲机器上新建的实例，原实例进入洗机。
 // 不扣费、不新建订单；原订单通过 instance_transfers 关联。加锁顺序：原实例 → 新机器 → 指令。
+// 计划 13：集群成员 → 加锁顺序 集群行 → 原实例 → 新机器 → 指令；新机器限同 fabric、同集群网段、cluster_ready；
+// 新实例继承 cluster_id / cluster_rank，原实例先进入洗机（离开在位成员）再 version + 1：新实例 Create 带新 Spec，其余在位成员收到 configure_cluster。
 func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceID, reason string) (Instance, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -23,9 +25,12 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 	now := s.d.Clock.Now()
 	var moved Instance
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
-		old, err := lockInstance(ctx, tx, instanceID)
+		cluster, old, err := lockMemberCluster(ctx, tx, instanceID)
 		if err != nil {
 			return err
+		}
+		if cluster != nil && cluster.State != ClusterActive {
+			return apperr.ErrInvalidState
 		}
 		if old.System || old.State != StateRunning { // 系统实例不换机：机器坏了由 llm Controller 另建节点
 			return apperr.ErrInvalidState
@@ -43,6 +48,16 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			return err
 		}
 		spec := pickSpec{ProductID: old.ProductID, Immediate: true}
+		if cluster != nil {
+			net, err := clusterNetOf(ctx, tx, cluster.ID, old)
+			if err != nil {
+				return err
+			}
+			spec.FabricID, spec.ClusterOnly = &cluster.FabricID, true
+			if net != "" {
+				spec.ClusterNet = &net
+			}
+		}
 		spec.Lower, spec.Upper = immediatePeriod(now, remaining)
 		hostPub, hostPEM, err := s.d.HostKeyGen()
 		if err != nil {
@@ -57,10 +72,10 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			}
 			moved, err = scanInstance(sp.QueryRow(ctx, `INSERT INTO instances
 				(id, user_id, machine_id, product_id, image_id, state, pending_seconds, ssh_password_enc, password_auth, ssh_host_pubkey, ssh_host_key_enc,
-				 auto_renew, auto_renew_duration, group_id, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $12, $13, $14, $14) RETURNING `+instanceCols,
+				 auto_renew, auto_renew_duration, group_id, cluster_id, cluster_rank, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, 'creating', $6, $7, $8, $9, $10, $11, $12, $13, $15, $16, $14, $14) RETURNING `+instanceCols,
 				id, old.UserID, m.ID, old.ProductID, old.ImageID, remaining, s.d.Box.Seal([]byte(randx.Password(16))), old.PasswordAuth, hostPub, s.d.Box.Seal(hostPEM),
-				old.AutoRenew, string(old.AutoRenewDuration), m.GroupID, now))
+				old.AutoRenew, string(old.AutoRenewDuration), m.GroupID, now, old.ClusterID, old.ClusterRank))
 			if err != nil {
 				return err
 			}
@@ -70,6 +85,9 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			newMachine = m.ID
 			return nil
 		}); err != nil {
+			if cluster != nil && codeIs(err, "no_capacity") {
+				return apperr.New("no_capacity", "该集群的高速网络内暂无空闲机器可换", 409)
+			}
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO instance_ports (instance_id, port, visibility, forced_private, note, created_at, updated_at)
@@ -87,15 +105,39 @@ func (s *Service) AdminMigrate(ctx context.Context, actor audit.Actor, instanceI
 			VALUES ($1, $2, $3, $4, $5, $6)`, old.ID, id, paid, reason, actor.AdminID, now); err != nil {
 			return err
 		}
-		if err := s.enqueueCreate(ctx, tx, moved, ref); err != nil { // moved 即新实例（machine_id = newMachine）
-			return err
+		if cluster == nil {
+			if err := s.enqueueCreate(ctx, tx, moved, ref); err != nil { // moved 即新实例（machine_id = newMachine）
+				return err
+			}
 		}
 		if err := s.beginWipe(ctx, tx, old, "migrated to "+id+": "+reason, now); err != nil {
 			return err
+		}
+		if cluster != nil {
+			// 原实例已离开在位成员：version + 1，其余在位成员收新 Spec，新实例的 Create 带新 Spec
+			if _, _, err := s.bumpClusterVersion(ctx, tx, cluster.ID, id, now); err != nil {
+				return err
+			}
+			cs, err := s.ClusterSpecFor(ctx, tx, cluster.ID, *moved.ClusterRank)
+			if err != nil {
+				return err
+			}
+			if err := s.enqueueCreateSpec(ctx, tx, moved, ref, &cs); err != nil {
+				return err
+			}
 		}
 		return audit.Record(ctx, tx, now, actor.Entry("instance.migrate", "instance", old.ID, map[string]any{
 			"to_instance": id, "from_machine": old.MachineID, "to_machine": newMachine, "seconds": paid, "pending_seconds": remaining, "reason": reason,
 		}))
 	})
 	return moved, err
+}
+
+// clusterNetOf 成员换机的候选网段：其余在位成员所在机器的 cluster_net（routed 成员须同一网段），没有则用原机器的；都为空 → ""（不限）。
+func clusterNetOf(ctx context.Context, tx pgx.Tx, clusterID string, old Instance) (string, error) {
+	var net string
+	err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT m.cluster_net FROM instances i JOIN machines m ON m.id = i.machine_id
+			WHERE i.cluster_id = $1 AND i.state = ANY($2) AND i.id <> $3 AND m.cluster_net <> '' ORDER BY i.cluster_rank LIMIT 1),
+		(SELECT cluster_net FROM machines WHERE id = $4), '')`, clusterID, ClusterMemberStates, old.ID, old.MachineID).Scan(&net)
+	return net, err
 }

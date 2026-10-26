@@ -75,7 +75,22 @@ func (r *Runtime) Create(ctx context.Context, s runtime.Spec) error {
 	if !s.DropNice {
 		args = append(args, "--cap-add", "SYS_NICE")
 	}
-	args = append(args, "--cap-add", "SYS_PTRACE",
+	args = append(args, "--cap-add", "SYS_PTRACE")
+	for _, c := range s.CapDrop {
+		args = append(args, "--cap-drop", c)
+	}
+	keys := make([]string, 0, len(s.Sysctls))
+	for k := range s.Sysctls {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "--sysctl", k+"="+s.Sysctls[k])
+	}
+	for _, d := range s.Devices {
+		args = append(args, "--device", d)
+	}
+	args = append(args,
 		"--ulimit", "memlock=-1:-1", "--ulimit", "stack=67108864:67108864",
 		"--network", r.Bridge)
 	for _, d := range s.DNS {
@@ -265,5 +280,27 @@ func validateSpec(s runtime.Spec) error {
 	case s.CPUs < 0:
 		return errors.New("runtime: negative CPUs")
 	}
+	for _, c := range s.CapDrop {
+		if !capRe.MatchString(c) {
+			return fmt.Errorf("runtime: invalid cap-drop %q", c)
+		}
+	}
+	for k, v := range s.Sysctls {
+		if !sysctlKeyRe.MatchString(k) || strings.ContainsAny(v, "\n\x00") {
+			return fmt.Errorf("runtime: invalid sysctl %q", k)
+		}
+	}
+	for _, d := range s.Devices {
+		if !deviceRe.MatchString(d) || strings.Contains(d, "..") {
+			return fmt.Errorf("runtime: invalid device %q", d)
+		}
+	}
 	return nil
 }
+
+// 集群参数的白名单格式：参数会原样进 docker 命令行，拒绝以 - 开头或带分隔符的值（防参数注入）。
+var (
+	capRe       = regexp.MustCompile(`^[A-Z_]{2,32}$`)
+	sysctlKeyRe = regexp.MustCompile(`^[a-z0-9_]+(\.[a-z0-9_]+)+$`)
+	deviceRe    = regexp.MustCompile(`^/dev/[A-Za-z0-9_./-]+$`)
+)

@@ -1,19 +1,25 @@
 <script setup lang="ts">
-import { fmtTime, isApiError, labelOf, machineStateLabel, type AdminProduct, type ImportError, type Listed, type Machine, type Paged, type PDU } from '@spark/shared'
+import { fmtTime, isApiError, labelOf, machineStateLabel, type AdminProduct, type FabricRow, type ImportError, type Listed, type Machine, type Paged, type PDU } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { usePaged } from '../composables/usePaged'
+import type { NetMachine } from '../logic/clusters'
 import { downloadText, importBody, readCSVFile, templateCSV } from '../logic/csv'
+import { firstOf } from '../logic/deployments'
 import { fmtTemp, rootUsage } from '../logic/metrics'
 import { notifyError } from '../logic/notify'
 
 const router = useRouter()
-const filter = reactive({ state: '', online: '', rack: '' })
-const list = usePaged<Machine>((page, size) =>
-  api.get<Paged<Machine>>('/machines', { state: filter.state, online: filter.online, rack: filter.rack.trim(), page, page_size: size }),
+const route = useRoute()
+// 计划 13：fabric_id 筛选（集群网络页「机器数」的链接带 ?fabric_id=）
+const initialFabric = Number(firstOf(route.query.fabric_id))
+const filter = reactive({ state: '', online: '', rack: '', fabric_id: (Number.isInteger(initialFabric) && initialFabric > 0 ? initialFabric : '') as number | '' })
+const list = usePaged<NetMachine>((page, size) =>
+  api.get<Paged<NetMachine>>('/machines', { state: filter.state, online: filter.online, rack: filter.rack.trim(), fabric_id: filter.fabric_id === '' ? undefined : filter.fabric_id, page, page_size: size }),
 )
+const fabrics = ref<FabricRow[]>([])
 const products = ref<AdminProduct[]>([])
 const pdus = ref<PDU[]>([])
 const productName = computed(() => new Map(products.value.map((p) => [p.id, p.name])))
@@ -29,13 +35,18 @@ async function loadOptions() {
   } catch (e) {
     notifyError(e)
   }
+  try {
+    fabrics.value = (await api.get<Listed<FabricRow>>('/fabrics')).items
+  } catch {
+    // 只影响集群网络筛选下拉，不再重复提示
+  }
 }
 onMounted(() => {
   void list.load()
   void loadOptions()
 })
 function resetFilter() {
-  Object.assign(filter, { state: '', online: '', rack: '' })
+  Object.assign(filter, { state: '', online: '', rack: '', fabric_id: '' })
   list.reset()
 }
 
@@ -133,6 +144,11 @@ async function doImport() {
         </el-select>
       </el-form-item>
       <el-form-item label="机柜"><el-input v-model="filter.rack" clearable data-testid="machines-filter-rack" style="width: 140px" /></el-form-item>
+      <el-form-item label="集群网络">
+        <el-select v-model="filter.fabric_id" clearable placeholder="全部" data-testid="machines-filter-fabric" style="width: 160px">
+          <el-option v-for="f in fabrics" :key="f.id" :label="f.name" :value="f.id" />
+        </el-select>
+      </el-form-item>
       <el-button type="primary" native-type="submit" data-testid="machines-search">查询</el-button>
       <el-button data-testid="machines-reset" @click="resetFilter">重置</el-button>
       <span class="spacer" />
@@ -159,6 +175,18 @@ async function doImport() {
       </el-table-column>
       <el-table-column label="GPU 温度" width="100"><template #default="{ row }"><span data-testid="machine-gpu-temp">{{ fmtTemp(row.last_metrics) }}</span></template></el-table-column>
       <el-table-column label="根分区" width="90"><template #default="{ row }"><span data-testid="machine-root-disk">{{ rootUsage(row.last_metrics) }}</span></template></el-table-column>
+      <el-table-column label="集群网络" min-width="170">
+        <template #default="{ row }">
+          <span data-testid="machine-fabric-cell">
+            <template v-if="row.fabric_id">
+              <span data-testid="machine-fabric">{{ row.fabric_name || `#${row.fabric_id}` }}</span>
+              <el-tag size="small" :type="row.cluster_ready ? 'success' : 'warning'" class="tag-gap" data-testid="machine-cluster-badge" :data-ready="String(!!row.cluster_ready)" :title="row.cluster_reason || ''">{{ row.cluster_ready ? '就绪' : '未就绪' }}</el-tag>
+              <el-tag v-if="row.cluster_rdma" size="small" type="primary" class="tag-gap" data-testid="machine-rdma-badge">RDMA</el-tag>
+            </template>
+            <span v-else class="muted">—</span>
+          </span>
+        </template>
+      </el-table-column>
       <el-table-column label="PDU" width="180"><template #default="{ row }"><span data-testid="machine-pdu">{{ row.pdu_id ? `${pduName.get(row.pdu_id) ?? row.pdu_id} #${row.pdu_outlet}` : '—' }}</span></template></el-table-column>
     </el-table>
     <div class="pager-row">
@@ -217,6 +245,7 @@ async function doImport() {
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
 .dot.on { background: var(--el-color-success); }
 .dot.off { background: #c0c4cc; }
+.tag-gap { margin-left: 6px; }
 .pager-row { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .import-row { display: flex; align-items: center; gap: 12px; margin: 8px 0; }

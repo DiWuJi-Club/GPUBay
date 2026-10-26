@@ -188,3 +188,109 @@ func TestSelfcheckSharedMachineItems(t *testing.T) {
 		})
 	}
 }
+
+// ---- 集群网卡（计划 13）：全部只告警，不让自检失败 ----
+
+const (
+	sysfs221   = "../../internal/agent/clusternet/linux/testdata/sysfs-221"
+	sysfsSpark = "../../internal/agent/clusternet/linux/testdata/sysfs-spark"
+)
+
+// stubAllOK 给非集群自检项打上正常输出。
+func stubAllOK(r *cmdrun.Recorder) {
+	r.Stub("docker info", `{"nvidia":{"path":"nvidia-container-runtime"}}`, nil)
+	r.Stub("ufw status", "", errors.New("not installed"))
+	r.Stub("df", "Avail\n2000000000000\n", nil)
+	stubShared(r)
+}
+
+func TestSelfcheckClusterSection(t *testing.T) {
+	r := &cmdrun.Recorder{}
+	stubAllOK(r)
+	// 221 真机输出（2026-10-26）：管理网卡是 WiFi，有线口 enP7s7 未插线，没有 CX-7。
+	r.Stub("ip -4 -o addr show", "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n"+
+		"7: wlP9s9    inet 192.168.1.221/23 brd 192.168.1.255 scope global dynamic noprefixroute wlP9s9\\       valid_lft 470777sec preferred_lft 470777sec\n"+
+		"8: spark0    inet 10.200.0.1/24 brd 10.200.0.255 scope global spark0\\       valid_lft forever preferred_lft forever\n", nil)
+	r.Stub("ip -4 route show", "default via 192.168.1.1 dev wlP9s9 proto dhcp src 192.168.1.221 metric 600 \n"+
+		"10.200.0.0/24 dev spark0 proto kernel scope link src 10.200.0.1 \n192.168.0.0/23 dev wlP9s9 proto kernel scope link src 192.168.1.221 metric 600 \n", nil)
+	r.Stub("ip -4 route show default", "default via 192.168.1.1 dev wlP9s9 proto dhcp src 192.168.1.221 metric 600 \n", nil)
+	r.Stub("ip -6 -o addr show", "7: wlP9s9    inet6 fe80::244:5d6c:9aaa:7332/64 scope link noprefixroute \\       valid_lft forever preferred_lft forever\n", nil)
+	r.Stub("nmcli -t -f DEVICE,STATE device", "wlP9s9:connected\nspark0:connected (externally)\nenP7s7:unavailable\n", nil)
+	r.Stub("cat /proc/sys/net/ipv4/ip_forward", "1\n", nil)
+	var out bytes.Buffer
+	if err := selfcheckAt(context.Background(), r, "/var/lib/spark-agent", sysfs221, &out); err != nil {
+		t.Fatalf("cluster warnings must not fail selfcheck: %v\n%s", err, out.String())
+	}
+	for _, want := range []string{
+		"ok: iface enP7s7 up=false speed=0 driver=r8127 rdma=- active=false\n",
+		"ok: iface wlP9s9 up=true speed=0 driver=mt7925e rdma=- active=false wireless=true\n",
+		"WARN: 未发现 ConnectX-7 网卡，集群将只能使用普通以太网\n",
+		"ok: ip_forward 1\n",
+		"ok: 集群网段 10.210.0.0/16 无冲突\n",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("missing %q in:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "FAIL") || strings.Contains(out.String(), "NetworkManager 管理") {
+		t.Fatalf("unexpected lines:\n%s", out.String())
+	}
+	// 探测失败（如读不到 sysfs）也只告警
+	out.Reset()
+	if err := selfcheckAt(context.Background(), r, "/var/lib/spark-agent", t.TempDir()+"/nope", &out); err != nil || !strings.Contains(out.String(), "WARN: 集群网卡: cluster-net: ") {
+		t.Fatalf("probe failure: err=%v\n%s", err, out.String())
+	}
+}
+
+// CX-7 口受 NM 管理 / 有地址、ip_forward=0、本机地址或路由落在集群网段 → 各自 WARN，自检仍通过。
+func TestSelfcheckNMManagedWarn(t *testing.T) {
+	r := &cmdrun.Recorder{}
+	stubAllOK(r)
+	r.Stub("ip -4 -o addr show", "2: enP7s7    inet 192.168.1.50/24 brd 192.168.1.255 scope global enP7s7\\       valid_lft forever preferred_lft forever\n"+
+		"5: enp1s0f1np1    inet 169.254.7.7/16 brd 169.254.255.255 scope link enp1s0f1np1\\       valid_lft forever preferred_lft forever\n"+
+		"6: eth9    inet 10.210.9.2/24 scope global eth9\\       valid_lft forever preferred_lft forever\n"+
+		"12: schabcd1234    inet 10.210.3.1/32 scope global schabcd1234\\       valid_lft forever preferred_lft forever\n", nil)
+	r.Stub("ip -4 route show", "default via 192.168.1.1 dev enP7s7 proto dhcp src 192.168.1.50 metric 100 \n"+
+		"10.0.0.0/8 via 192.168.1.254 dev enP7s7 \n"+ // 包住整个集群网段的大路由：集群的 /32 更具体，不算冲突
+		"10.210.128.0/17 via 192.168.1.254 dev enP7s7 \n"+ // 落在集群网段里的路由
+		"10.210.9.0/24 dev eth9 proto kernel scope link src 10.210.9.2 \n"+ // 与地址重复的直连路由只报地址
+		"10.210.0.12 dev schabcd1234 scope link \n"+ // Agent 自己的对端路由不算冲突
+		"10.210.3.12 via 192.168.1.222 dev enP7s7 \n"+ // Agent 自建的跨机 /32 via 路由（routed 对端）不算冲突
+		"10.210.4.0/24 via 192.168.1.222 dev enP7s7 \n"+ // 不是 /32：照报
+		"192.168.1.0/24 dev enP7s7 proto kernel scope link src 192.168.1.50 \n", nil)
+	r.Stub("ip -4 route show default", "default via 192.168.1.1 dev enP7s7 proto dhcp src 192.168.1.50 metric 100 \n", nil)
+	r.Stub("ip -6 -o addr show", "5: enp1s0f1np1    inet6 fe80::966d:aeff:fe00:2/64 scope link \\       valid_lft forever preferred_lft forever\n"+
+		"7: enP2p1s0f1np1    inet6 fe80::966d:aeff:fe00:4/64 scope link \\       valid_lft forever preferred_lft forever\n", nil)
+	r.Stub("nmcli -t -f DEVICE,STATE device", "enP7s7:connected\nenp1s0f0np0:unmanaged\nenp1s0f1np1:connected\nenP2p1s0f0np0:unmanaged\nenP2p1s0f1np1:disconnected\nlo:unmanaged\n", nil)
+	r.Stub("cat /proc/sys/net/ipv4/ip_forward", "0\n", nil)
+	var out bytes.Buffer
+	if err := selfcheckAt(context.Background(), r, "/var/lib/spark-agent", sysfsSpark, &out); err != nil {
+		t.Fatalf("cluster warnings must not fail selfcheck: %v\n%s", err, out.String())
+	}
+	s := out.String()
+	for _, want := range []string{
+		"ok: iface enp1s0f1np1 up=true speed=200000 driver=mlx5_core rdma=rocep1s0f1 active=true\n",
+		"ok: iface enp1s0f0np0 up=false speed=0 driver=mlx5_core rdma=rocep1s0f0 active=false\n",
+		"WARN: enp1s0f1np1 上有地址 169.254.7.7/16 fe80::966d:aeff:fe00:2/64，作为集群网卡时 Agent 会清除\n",
+		"WARN: enP2p1s0f1np1 上有地址 fe80::966d:aeff:fe00:4/64，作为集群网卡时 Agent 会清除\n",
+		"WARN: enp1s0f1np1 受 NetworkManager 管理，NM 可能重新加地址；请执行 install.sh --cluster-iface enp1s0f1np1\n",
+		"WARN: enP2p1s0f1np1 受 NetworkManager 管理，NM 可能重新加地址；请执行 install.sh --cluster-iface enP2p1s0f1np1\n",
+		"WARN: ip_forward: /proc/sys/net/ipv4/ip_forward 为 0",
+		"WARN: 集群网段 10.210.0.0/16: 与集群网段冲突：地址 10.210.9.2/24（eth9）；路由 10.210.128.0/17（enP7s7）；路由 10.210.4.0/24（enP7s7）\n",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("missing %q in:\n%s", want, s)
+		}
+	}
+	for _, bad := range []string{"未发现 ConnectX-7", "enp1s0f0np0 受 NetworkManager", "enP2p1s0f0np0 受 NetworkManager", "enP7s7 受 NetworkManager", "enP7s7 上有地址", "schabcd1234", "FAIL"} {
+		if strings.Contains(s, bad) {
+			t.Fatalf("unexpected %q in:\n%s", bad, s)
+		}
+	}
+	// 没有 nmcli：跳过 NM 检查，不报受管
+	r.Stub("nmcli", "", &cmdrun.CmdError{Cmd: "nmcli", ExitCode: 127, Stderr: "not found"})
+	out.Reset()
+	if err := selfcheckAt(context.Background(), r, "/var/lib/spark-agent", sysfsSpark, &out); err != nil || strings.Contains(out.String(), "受 NetworkManager 管理") || !strings.Contains(out.String(), "ok: NetworkManager 未运行，跳过集群网卡受管检查\n") {
+		t.Fatalf("no nmcli: err=%v\n%s", err, out.String())
+	}
+}

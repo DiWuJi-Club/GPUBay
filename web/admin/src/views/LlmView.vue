@@ -101,6 +101,7 @@ const fmtNum = (n: number) => n.toLocaleString('en-US')
               <ul class="kv">
                 <li><span>就绪 / 节点</span><b data-testid="llm-overview-model-nodes">{{ m.nodes.ready }} / {{ m.nodes.total }}</b></li>
                 <li><span>期望副本</span><b data-testid="llm-overview-model-wanted" :class="{ bad: m.nodes.ready < wanted(m) }">{{ wanted(m) }}</b></li>
+                <li v-if="(m.nodes_per_replica ?? 1) > 1"><span>每副本</span><b data-testid="llm-overview-model-npr">{{ m.nodes_per_replica }} 台 · TP {{ m.tensor_parallel ?? m.nodes_per_replica }}</b></li>
               </ul>
             </el-card>
           </div>

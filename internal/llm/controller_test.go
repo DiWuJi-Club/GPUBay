@@ -206,6 +206,9 @@ func TestControllerAdvancesProvisioning(t *testing.T) {
 	}
 }
 
+// nodeProvisionTimeout 测试环境 vllm-node 版本（仓库 spec，timeout_minutes 360）的建节点超时。
+var nodeProvisionTimeout = llm.ProvisionTimeoutFor(appdeploy.Version{Spec: appdeploy.Spec{TimeoutMinutes: 360}})
+
 func TestControllerProvisionTimeoutFails(t *testing.T) {
 	ne := newNodeEnv(t)
 	for _, s := range []string{"T1", "T2", "T3"} {
@@ -237,8 +240,8 @@ func TestControllerProvisionTimeoutFails(t *testing.T) {
 		t.Fatal("failed node's live instance not released")
 	}
 
-	// 剩下的一个：超过 150 分钟仍未就绪 → failed(timeout) + 释放
-	ne.clk.Advance(llm.ProvisionTimeout - time.Minute)
+	// 剩下的一个：超过建节点超时（版本 360 分钟 + 30 分钟）仍未就绪 → failed(timeout) + 释放
+	ne.clk.Advance(nodeProvisionTimeout - time.Minute)
 	ne.tick()
 	if ne.node(timeout.ID).State != llm.NodeProvisioning {
 		t.Fatal("failed before timeout")
@@ -598,7 +601,7 @@ func TestControllerRebuildLoopThroughProvisioningFailures(t *testing.T) {
 		if round%2 == 1 { // 部署失败
 			ne.setDeployment(dep, appdeploy.StateFailed, appdeploy.HealthUnknown, appdeploy.ErrCodeScriptFailed)
 		} else { // 一直起不来：超时
-			ne.clk.Advance(llm.ProvisionTimeout + time.Minute)
+			ne.clk.Advance(nodeProvisionTimeout + time.Minute)
 		}
 		ne.tick()
 		got = ne.node(n.ID)

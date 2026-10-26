@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { labelOf, machineStateLabel, type AdminGroup, type Listed, type Machine, type Paged } from '@spark/shared'
+import { labelOf, machineStateLabel, type AdminGroup, type Listed, type Paged } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
+import type { NetMachine } from '../../logic/clusters'
 import { POOL_CANDIDATE_PAGE, poolCandidateQuery, type PoolCandidateSource } from '../../logic/llm'
 import { notifyError } from '../../logic/notify'
 
@@ -17,7 +18,7 @@ const st = reactive({
   source: 'none' as PoolCandidateSource,
   rack: '',
   page: 1,
-  items: [] as Machine[],
+  items: [] as NetMachine[],
   total: 0,
   loading: false,
   busy: false,
@@ -31,7 +32,7 @@ async function search() {
   const mine = ++seq
   st.loading = true
   try {
-    const out = await api.get<Paged<Machine>>('/machines', poolCandidateQuery(st.source, st.rack, st.page))
+    const out = await api.get<Paged<NetMachine>>('/machines', poolCandidateQuery(st.source, st.rack, st.page))
     if (mine !== seq) return
     st.items = out.items.filter((m) => m.group_id !== props.groupId) // 防御：池内机器不作为候选
     st.total = out.total
@@ -97,7 +98,7 @@ async function submit() {
 
 <template>
   <el-dialog :model-value="props.visible" title="加入机器到 Token 服务池" width="760" align-center data-testid="llm-pool-add-dialog" @close="close">
-    <p class="hint">加入后机器不再对外出租；机器上的现有租约到期后才会建节点。从其它机组加入会把机器移出原机组。</p>
+    <p class="hint">加入后机器不再对外出租；机器上的现有租约到期后才会建节点。从其它机组加入会把机器移出原机组。多机副本（每副本 2 / 4 台）只用同一集群网络、集群就绪的机器组队。</p>
     <el-form inline class="filters" @submit.prevent="newSearch">
       <el-form-item label="来源">
         <el-select v-model="st.source" style="width: 180px" data-testid="llm-pool-add-source" @change="newSearch">
@@ -109,7 +110,7 @@ async function submit() {
       <el-form-item><el-button native-type="submit" :loading="st.loading" data-testid="llm-pool-add-search">查询</el-button></el-form-item>
     </el-form>
     <table class="grid" data-testid="llm-pool-add-table">
-      <thead><tr><th></th><th>机器</th><th>序列号</th><th>机柜 / 槽位</th><th>状态</th><th>在线</th></tr></thead>
+      <thead><tr><th></th><th>机器</th><th>序列号</th><th>机柜 / 槽位</th><th>状态</th><th>在线</th><th>集群网络</th></tr></thead>
       <tbody>
         <tr v-for="m in st.items" :key="m.id" data-testid="llm-pool-add-row" :data-id="m.id">
           <td><el-checkbox :model-value="selected.includes(m.id)" data-testid="llm-pool-add-check" @update:model-value="(v: unknown) => toggle(m.id, !!v)" /></td>
@@ -118,8 +119,12 @@ async function submit() {
           <td>{{ m.rack }} / {{ m.slot }}</td>
           <td>{{ labelOf(machineStateLabel, m.state) }}</td>
           <td>{{ m.agent_online ? '在线' : '离线' }}</td>
+          <td data-testid="llm-pool-add-fabric">
+            <template v-if="m.fabric_id">{{ m.fabric_name || `#${m.fabric_id}` }}<span :class="m.cluster_ready ? 'ok' : 'warn'" :title="m.cluster_reason || ''">（{{ m.cluster_ready ? (m.cluster_rdma ? '就绪 · RDMA' : '就绪') : '未就绪' }}）</span></template>
+            <span v-else class="muted">—</span>
+          </td>
         </tr>
-        <tr v-if="!st.items.length && !st.loading"><td colspan="6" class="muted empty" data-testid="llm-pool-add-empty">没有可加入的机器</td></tr>
+        <tr v-if="!st.items.length && !st.loading"><td colspan="7" class="muted empty" data-testid="llm-pool-add-empty">没有可加入的机器</td></tr>
       </tbody>
     </table>
     <el-pagination
@@ -143,5 +148,7 @@ async function submit() {
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; font-size: 13px; margin-right: 12px; }
 .empty { text-align: center; }
+.ok { color: var(--el-color-success); }
+.warn { color: var(--el-color-warning); }
 .pager { margin-top: 8px; justify-content: flex-end; }
 </style>

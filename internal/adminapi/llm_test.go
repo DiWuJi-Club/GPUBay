@@ -679,3 +679,183 @@ func TestAdminWithoutLLM(t *testing.T) {
 		t.Fatalf("user detail = %d %v", code, out)
 	}
 }
+
+// ---- 计划 13：多机模型 ----
+
+func TestLLMModelParallelFields(t *testing.T) {
+	e := newEnv(t)
+	f := e.seedLLM()
+	root := e.loginAs("root", admin.RoleSuper)
+
+	body := modelBody("qwen3-32b", f.imageID)
+	body["nodes_per_replica"], body["tensor_parallel"], body["pipeline_parallel"] = 2, 2, 1
+	code, out := root.do("POST", "/llm/models", body)
+	if code != 201 || out["nodes_per_replica"].(float64) != 2 || out["tensor_parallel"].(float64) != 2 || out["pipeline_parallel"].(float64) != 1 {
+		t.Fatalf("create N=2 = %d %v", code, out)
+	}
+	id := itoa(int64(out["id"].(float64)))
+
+	// PUT 不带三个字段：沿用模型现值（不会被当成 N = 1）
+	upd := modelBody("", f.imageID)
+	delete(upd, "slug")
+	upd["name"] = "Qwen3 32B"
+	code, out = root.do("PUT", "/llm/models/"+id, upd)
+	if code != 200 || out["name"] != "Qwen3 32B" || out["nodes_per_replica"].(float64) != 2 || out["tensor_parallel"].(float64) != 2 {
+		t.Fatalf("update without parallel fields = %d %v", code, out)
+	}
+	// TP × PP ≠ N、PP > 1 → llm_model_invalid
+	upd["nodes_per_replica"], upd["tensor_parallel"], upd["pipeline_parallel"] = 2, 1, 1
+	if code, out := root.do("PUT", "/llm/models/"+id, upd); code != 400 || codeOf(out) != "llm_model_invalid" {
+		t.Fatalf("tp*pp != n = %d %v", code, out)
+	}
+	upd["tensor_parallel"], upd["pipeline_parallel"] = 1, 2
+	if code, out := root.do("PUT", "/llm/models/"+id, upd); code != 400 || codeOf(out) != "llm_model_invalid" {
+		t.Fatalf("pp > 1 = %d %v", code, out)
+	}
+	upd["nodes_per_replica"], upd["tensor_parallel"], upd["pipeline_parallel"] = 3, 3, 1
+	if code, out := root.do("PUT", "/llm/models/"+id, upd); code != 400 || codeOf(out) != "llm_model_invalid" {
+		t.Fatalf("n = 3 = %d %v", code, out)
+	}
+	// 只给 N：TP / PP 按默认（TP = N、PP = 1）
+	delete(upd, "tensor_parallel")
+	delete(upd, "pipeline_parallel")
+	upd["nodes_per_replica"] = 4
+	code, out = root.do("PUT", "/llm/models/"+id, upd)
+	if code != 200 || out["nodes_per_replica"].(float64) != 4 || out["tensor_parallel"].(float64) != 4 || out["pipeline_parallel"].(float64) != 1 {
+		t.Fatalf("update N=4 = %d %v", code, out)
+	}
+	upd["nodes_per_replica"] = 1
+	code, out = root.do("PUT", "/llm/models/"+id, upd)
+	if code != 200 || out["nodes_per_replica"].(float64) != 1 || out["tensor_parallel"].(float64) != 1 {
+		t.Fatalf("update N=1 = %d %v", code, out)
+	}
+	// embedding 只能 N = 1
+	emb := modelBody("bge-m3", f.imageID)
+	emb["kind"], emb["nodes_per_replica"] = "embedding", 2
+	if code, out := root.do("POST", "/llm/models", emb); code != 400 || codeOf(out) != "llm_model_invalid" {
+		t.Fatalf("embedding N=2 = %d %v", code, out)
+	}
+	// 列表带字段
+	code, out = root.do("GET", "/llm/models", nil)
+	if code != 200 || out["items"].([]any)[0].(map[string]any)["nodes_per_replica"].(float64) != 1 {
+		t.Fatalf("list = %d %v", code, out)
+	}
+}
+
+// poolFabricMachines 建 lan fabric，并把 n 台就绪机器放进 Token 服务池。
+func (e *env) poolFabricMachines(ops *client, f llmFixture, n int) (int64, []int64) {
+	e.t.Helper()
+	fab := ops.createFabric("池以太网", "lan", "routed")
+	ids := make([]int64, n)
+	for k := range ids {
+		ids[k] = e.clusterMachine(ops, fmt.Sprintf("SN-PF%d", k), fab, 100+k)
+		if code, out := ops.do("PUT", "/machines/"+itoa(ids[k]), map[string]any{"group_id": f.poolID}); code != 200 {
+			e.t.Fatalf("into pool = %d %v", code, out)
+		}
+	}
+	return fab, ids
+}
+
+func TestLLMPoolFabrics(t *testing.T) {
+	e := newEnv(t)
+	f := e.seedLLM()
+	ops := e.loginAs("ops", admin.RoleOps)
+	fab, ids := e.poolFabricMachines(ops, f, 4)
+	e.poolMachine(f, "SN-SINGLE")
+
+	code, out := ops.do("GET", "/llm/pool", nil)
+	if code != 200 || out["total"].(float64) != 5 {
+		t.Fatalf("pool = %d %v", code, out)
+	}
+	fabs := out["fabrics"].([]any)
+	if len(fabs) != 1 {
+		t.Fatalf("fabrics = %v", fabs)
+	}
+	pf := fabs[0].(map[string]any)
+	groups := pf["groups"].(map[string]any)
+	if pf["fabric_id"].(float64) != float64(fab) || pf["name"] != "池以太网" || pf["kind"] != "lan" || pf["rdma"] != false ||
+		pf["total"].(float64) != 4 || pf["free"].(float64) != 4 || groups["2"].(float64) != 2 || groups["4"].(float64) != 1 {
+		t.Fatalf("pool fabric = %v", pf)
+	}
+	for _, x := range out["machines"].([]any) {
+		pm := x.(map[string]any)
+		mid := int64(pm["machine"].(map[string]any)["id"].(float64))
+		inFab := slices.Contains(ids, mid)
+		if inFab && (pm["fabric_id"] == nil || pm["fabric_id"].(float64) != float64(fab) || pm["fabric_name"] != "池以太网") ||
+			!inFab && (pm["fabric_id"] != nil || pm["fabric_name"] != "") {
+			t.Fatalf("pool machine row = %v", pm)
+		}
+	}
+}
+
+func TestLLMNodeMembers(t *testing.T) {
+	e := newEnv(t)
+	f := e.seedLLM()
+	ops := e.loginAs("ops", admin.RoleOps)
+	_, ids := e.poolFabricMachines(ops, f, 2)
+	m, err := e.llm.CreateModel(e.ctx, audit.Actor{AdminID: 1}, llm.ModelInput{Slug: "qwen3-32b", Name: "Qwen3 32B", Kind: llm.KindChat,
+		Source: "modelscope", SourceID: "Qwen/Qwen3-32B", ImageID: f.imageID, ContextLen: 32768, InputPrice: 100, OutputPrice: 400,
+		Replicas: 1, NodesPerReplica: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := e.rental.PlaceSystemCluster(e.ctx, rental.SystemClusterRequest{MachineIDs: ids, GroupID: f.poolID, ImageID: f.imageID, Note: "test"})
+	if err != nil {
+		t.Fatalf("PlaceSystemCluster: %v", err)
+	}
+	e.ack()
+	now := e.clk.Now()
+	nodeID := randx.ID("node-", 12)
+	head := res.Instances[0]
+	e.exec(`INSERT INTO llm_nodes (id, model_id, machine_id, instance_id, state, api_key_enc, size, cluster_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'provisioning', '\x00', 2, $5, $6, $6)`, nodeID, m.ID, head.MachineID, head.ID, res.Cluster.ID, now)
+	for _, inst := range res.Instances {
+		e.exec(`INSERT INTO llm_node_members (node_id, rank, machine_id, instance_id) VALUES ($1, $2, $3, $4)`,
+			nodeID, *inst.ClusterRank, inst.MachineID, inst.ID)
+	}
+
+	code, out := ops.do("GET", "/llm/nodes?model_id="+itoa(m.ID), nil)
+	items, _ := out["items"].([]any)
+	if code != 200 || len(items) != 1 {
+		t.Fatalf("nodes = %d %v", code, out)
+	}
+	n := items[0].(map[string]any)
+	members := n["members"].([]any)
+	if n["size"].(float64) != 2 || n["cluster_id"] != res.Cluster.ID || len(members) != 2 {
+		t.Fatalf("group node = %v", n)
+	}
+	for i, x := range members {
+		mm := x.(map[string]any)
+		if mm["rank"].(float64) != float64(i) || mm["instance_id"] != res.Instances[i].ID || mm["machine_id"].(float64) != float64(res.Instances[i].MachineID) ||
+			mm["instance_state"] != "running" || mm["suspended"] != false || mm["machine_name"] == "" {
+			t.Fatalf("member %d = %v", i, mm)
+		}
+	}
+	code, out = ops.do("GET", "/llm/nodes/"+nodeID, nil)
+	if code != 200 || len(out["node"].(map[string]any)["members"].([]any)) != 2 {
+		t.Fatalf("node detail = %d %v", code, out)
+	}
+	// 机器池：两台都显示同一个组节点（rank 0 / 1、size 2）
+	code, out = ops.do("GET", "/llm/pool", nil)
+	if code != 200 {
+		t.Fatalf("pool = %d %v", code, out)
+	}
+	ranks := map[float64]bool{}
+	for _, x := range out["machines"].([]any) {
+		pm := x.(map[string]any)
+		if node, ok := pm["node"].(map[string]any); ok && node["id"] == nodeID && node["size"].(float64) == 2 {
+			ranks[node["rank"].(float64)] = true
+		}
+	}
+	if !ranks[0] || !ranks[1] {
+		t.Fatalf("pool node ranks = %v (%v)", ranks, out["machines"])
+	}
+	// 单机节点：members 为空数组、size 1
+	single := e.onlineModel(f, "qwen3-4b")
+	sid, _ := e.readyNode(f, single, e.poolMachine(f, "SN-S1"))
+	code, out = ops.do("GET", "/llm/nodes/"+sid, nil)
+	if code != 200 || out["node"].(map[string]any)["size"].(float64) != 1 || len(out["node"].(map[string]any)["members"].([]any)) != 0 ||
+		out["node"].(map[string]any)["cluster_id"] != nil {
+		t.Fatalf("single node = %d %v", code, out)
+	}
+}

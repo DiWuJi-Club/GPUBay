@@ -38,10 +38,16 @@ func TestEnsureRulesFromScratchUsesSingleRestore(t *testing.T) {
 		"iptables -w -S SPARK-IN",
 		"iptables -w -S SPARK-FWD",
 		restoreCmd,
+		"iptables -w -S SPARK-CLU",
+		"iptables -w -N SPARK-CLU",
+		"iptables -w -A SPARK-CLU -j DROP",
 		"iptables -w -S INPUT",
 		"iptables -w -I INPUT 1 -i spark0 -j SPARK-IN",
+		"iptables -w -I INPUT 2 -i sch+ -j SPARK-IN",
 		"iptables -w -S DOCKER-USER",
 		"iptables -w -I DOCKER-USER 1 -i spark0 -j SPARK-FWD",
+		"iptables -w -I DOCKER-USER 2 -i sch+ -j SPARK-CLU",
+		"iptables -w -I DOCKER-USER 3 -o sch+ -j SPARK-CLU",
 		"sysctl -q -w net.ipv6.conf.spark0.disable_ipv6=1",
 	}, "\n")
 	if r.Lines() != want {
@@ -66,10 +72,11 @@ func TestEnsureRulesIsIdempotentWhenAlreadyCorrect(t *testing.T) {
 	r.Stub("iptables -w -S DOCKER-USER", realDockerUser, nil)
 	r.Stub("iptables -w -S SPARK-FWD", strings.Join(iptables.ExpectedFwdRules([]string{"10.0.9.0/24"}), "\n")+"\n", nil)
 	r.Stub("iptables -w -S SPARK-IN", strings.Join(iptables.ExpectedInRules(), "\n")+"\n", nil)
+	r.Stub("iptables -w -S SPARK-CLU", realClu, nil)
 	if err := nf.EnsureRules(context.Background(), netfilter.Rules{Bridge: "spark0", AllowCIDRs: []string{"10.0.9.0/24"}}); err != nil {
 		t.Fatal(err)
 	}
-	want := "iptables -w -S SPARK-IN\niptables -w -S SPARK-FWD\niptables -w -S INPUT\niptables -w -S DOCKER-USER\n" +
+	want := "iptables -w -S SPARK-IN\niptables -w -S SPARK-FWD\niptables -w -S SPARK-CLU\niptables -w -S INPUT\niptables -w -S DOCKER-USER\n" +
 		"sysctl -q -w net.ipv6.conf.spark0.disable_ipv6=1"
 	if r.Lines() != want || len(r.Inputs) != 0 {
 		t.Fatalf("idempotent:\n%s", r.Lines())
@@ -79,19 +86,21 @@ func TestEnsureRulesIsIdempotentWhenAlreadyCorrect(t *testing.T) {
 	}
 }
 
-// 真机 `iptables -S INPUT` / `iptables -S DOCKER-USER` 输出（跳转在第一位）。
+// 真机 `iptables -S INPUT` / `iptables -S DOCKER-USER` / `iptables -S SPARK-CLU` 输出（跳转组在链首）。
 const (
-	realInput      = "-P INPUT ACCEPT\n-A INPUT -i spark0 -j SPARK-IN\n"
-	realDockerUser = "-N DOCKER-USER\n-A DOCKER-USER -i spark0 -j SPARK-FWD\n"
+	realInput      = "-P INPUT ACCEPT\n-A INPUT -i spark0 -j SPARK-IN\n-A INPUT -i sch+ -j SPARK-IN\n"
+	realDockerUser = "-N DOCKER-USER\n-A DOCKER-USER -i spark0 -j SPARK-FWD\n-A DOCKER-USER -i sch+ -j SPARK-CLU\n-A DOCKER-USER -o sch+ -j SPARK-CLU\n"
+	realClu        = "-N SPARK-CLU\n-A SPARK-CLU -j DROP\n"
 )
 
 func syncedChains(r *cmdrun.Recorder) {
 	r.Stub("iptables -w -S SPARK-FWD", strings.Join(iptables.ExpectedFwdRules(nil), "\n")+"\n", nil)
 	r.Stub("iptables -w -S SPARK-IN", strings.Join(iptables.ExpectedInRules(), "\n")+"\n", nil)
+	r.Stub("iptables -w -S SPARK-CLU", realClu, nil)
 }
 
-// 别的工具把规则插到了我们的跳转前面：先在第 1 位插入新跳转，再按序号删掉旧的那条（否则 SPARK-FWD 会被绕过）。
-// 先插后删：任何时刻链里都至少有一条位于第 1 位或原位置的跳转，不留无隔离的窗口。
+// 别的工具把规则插到了我们的跳转组前面：先按位插入跳转组，再按序号删掉别处的旧跳转（否则 SPARK-FWD 会被绕过）。
+// 先插后删：任何时刻链里都至少有一条隔离跳转，不留无隔离的窗口。
 func TestJumpNotFirstIsMovedToFirst(t *testing.T) {
 	r := &cmdrun.Recorder{}
 	nf := &iptables.Netfilter{Run: r}
@@ -104,12 +113,16 @@ func TestJumpNotFirstIsMovedToFirst(t *testing.T) {
 	want := strings.Join([]string{
 		"iptables -w -S SPARK-IN",
 		"iptables -w -S SPARK-FWD",
+		"iptables -w -S SPARK-CLU",
 		"iptables -w -S INPUT",
 		"iptables -w -I INPUT 1 -i spark0 -j SPARK-IN",
-		"iptables -w -D INPUT 3",
+		"iptables -w -I INPUT 2 -i sch+ -j SPARK-IN",
+		"iptables -w -D INPUT 4",
 		"iptables -w -S DOCKER-USER",
 		"iptables -w -I DOCKER-USER 1 -i spark0 -j SPARK-FWD",
-		"iptables -w -D DOCKER-USER 3",
+		"iptables -w -I DOCKER-USER 2 -i sch+ -j SPARK-CLU",
+		"iptables -w -I DOCKER-USER 3 -o sch+ -j SPARK-CLU",
+		"iptables -w -D DOCKER-USER 5",
 		"sysctl -q -w net.ipv6.conf.spark0.disable_ipv6=1",
 	}, "\n")
 	if r.Lines() != want {
@@ -127,7 +140,8 @@ func TestMissingJumpIsInsertedFirst(t *testing.T) {
 	if err := nf.EnsureRules(context.Background(), netfilter.Rules{Bridge: "spark0"}); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(r.Lines(), " -D ") || strings.Contains(r.Lines(), "-I INPUT") || !strings.Contains(r.Lines(), "iptables -w -I DOCKER-USER 1 -i spark0 -j SPARK-FWD") {
+	if strings.Contains(r.Lines(), " -D ") || strings.Contains(r.Lines(), "-I INPUT") || !strings.Contains(r.Lines(), "iptables -w -I DOCKER-USER 1 -i spark0 -j SPARK-FWD") ||
+		!strings.Contains(r.Lines(), "iptables -w -I DOCKER-USER 3 -o sch+ -j SPARK-CLU") {
 		t.Fatalf("calls:\n%s", r.Lines())
 	}
 }
