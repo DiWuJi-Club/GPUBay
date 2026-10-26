@@ -18,6 +18,8 @@ export interface RentForm {
   appId: number | null
   /** 计划 11：预装工作流（只在预装 ComfyUI 时非空，RentDialog 换应用时清空） */
   appWorkflowIds: number[]
+  /** 计划 13：租用方式。0 / 缺省 = 单机；2 / 4 = 集群台数（只即时开通、不指定机器、不预装应用） */
+  clusterSize?: number
 }
 
 /**
@@ -34,8 +36,14 @@ export function orderBody(productId: number, f: RentForm, appId: number | null, 
   return { product_id: productId, duration: f.duration, image_id: f.imageId, ...appPart(appId, env, f.appWorkflowIds) }
 }
 
-/** POST /bookings。startAt 为 null（立即开始）时不带 start_at。 */
+/** POST /bookings。startAt 为 null（立即开始）时不带 start_at。集群：count = 台数、cluster: true，不带开始时间 / 指定机器 / 预装应用。 */
 export function bookingBody(productId: number, f: RentForm, startAt: string | null, appId: number | null, env: Record<string, string>) {
+  if (f.clusterSize) {
+    return {
+      product_id: productId, image_id: f.imageId, group_id: f.groupId, machine_id: null, count: f.clusterSize,
+      duration: f.duration, quantity: f.quantity, auto_renew: f.autoRenew, auto_renew_duration: f.autoRenewDuration, cluster: true,
+    }
+  }
   return {
     product_id: productId, image_id: f.imageId, group_id: f.groupId, machine_id: f.machineId, count: f.count,
     duration: f.duration, quantity: f.quantity, start_at: startAt ?? undefined, auto_renew: f.autoRenew, auto_renew_duration: f.autoRenewDuration,
@@ -45,7 +53,7 @@ export function bookingBody(productId: number, f: RentForm, startAt: string | nu
 
 /** 幂等键的派生参数（序列化为字符串）：变量按提交时的样子（去掉空值）参与；预装工作流按选择顺序参与（与请求体一致）。 */
 export function rentKeySignature(productId: number, f: RentForm, env: Record<string, string>): string {
-  return JSON.stringify([productId, f.groupId, f.count, f.immediate, f.day, f.hour, f.duration, f.quantity, f.imageId, f.machineId, f.autoRenew, f.autoRenewDuration, f.appId, stripEmpty(env), f.appWorkflowIds])
+  return JSON.stringify([productId, f.groupId, f.count, f.immediate, f.day, f.hour, f.duration, f.quantity, f.imageId, f.machineId, f.autoRenew, f.autoRenewDuration, f.appId, stripEmpty(env), f.appWorkflowIds, f.clusterSize ?? 0])
 }
 
 /**

@@ -227,7 +227,9 @@ export interface RedeployVersion { id: number; label: string; env: AppEnvSpec[];
  * 重新部署可选的版本。「当前」用部署自带的 spec；「最新」取应用目录里的最新已发布版本——提交的就是这个版本 ID，
  * 变量表单也按它渲染（部署视图的 latest_version 可能与目录不一致时以目录为准）。目录里没有该应用（加载失败）时「最新」不可选。
  */
-export function redeployVersions(d: Deployment, catalog: AppCatalogItem[]): RedeployVersion[] {
+export function redeployVersions(
+  d: Pick<Deployment, 'version_id' | 'version' | 'spec' | 'update_available' | 'app_id' | 'latest_version_id' | 'latest_version'>, catalog: AppCatalogItem[],
+): RedeployVersion[] {
   const out: RedeployVersion[] = [{ id: d.version_id, label: `v${d.version}（当前）`, env: d.spec.env ?? [], disabled: false }]
   if (!d.update_available) return out
   const cat = catalog.find((a) => a.id === d.app_id)

@@ -1,19 +1,21 @@
 <script setup lang="ts">
-import { fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf, useMobile, type CancelQuote, type Instance, type Listed } from '@spark/shared'
+import { fmtYuan, instanceStateLabel, instanceStateType, labelOf, messageOf, useMobile, type CancelQuote, type Listed } from '@spark/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api'
 import AppDialog from '../components/AppDialog.vue'
+import ClusterCard from '../components/clusters/ClusterCard.vue'
 import { usePolling } from '../composables/usePolling'
 import { useTicker } from '../composables/useTicker'
 import { summaryTag } from '../logic/apps'
+import { groupInstancesByCluster, type ClusterInstance } from '../logic/cluster'
 import { canCancel, instanceTimeText, needsRefresh, partitionQuotes, remainingNow, sumCancelQuotes } from '../logic/instance'
 import { notifyError } from '../logic/notify'
 
 const route = useRoute()
 const mobile = useMobile()
-const items = ref<Instance[]>([])
+const items = ref<ClusterInstance[]>([])
 const fetchedAt = ref(0)
 const loading = ref(true)
 const loadError = ref('')
@@ -23,7 +25,7 @@ const batchFilter = computed(() => (typeof route.query.batch === 'string' ? rout
 
 async function load() {
   try {
-    items.value = (await api.get<Listed<Instance>>('/instances')).items // 后端已按创建时间倒序、最多 100 条
+    items.value = (await api.get<Listed<ClusterInstance>>('/instances')).items // 后端已按创建时间倒序、最多 100 条
     fetchedAt.value = Date.now()
     loadError.value = ''
     failing = false
@@ -55,6 +57,10 @@ const rows = computed(() =>
     return { ...i, remaining, timeText: instanceTimeText(i, remaining), cancellable: canCancel(i, fetchedAt.value, now.value), apps }
   }),
 )
+// 计划 13：同一集群的成员折叠成一张集群卡（手机按原顺序穿插；电脑集群卡在表格上方，表格只列单机实例）
+const groups = computed(() => groupInstancesByCluster(rows.value))
+const clusterGroups = computed(() => groups.value.flatMap((g) => (g.kind === 'cluster' ? [g] : [])))
+const singleRows = computed(() => groups.value.flatMap((g) => (g.kind === 'instance' ? [g.instance] : [])))
 /** 运行中的应用标签可点：新窗口打开应用网址（私有端口由实例域名跳控制台 authorize 换票据）。 */
 function openApp(url: string | null) {
   if (url) window.open(url, '_blank', 'noopener')
@@ -149,7 +155,10 @@ async function cancelAll() {
     </el-empty>
 
     <div v-else-if="mobile" class="cards" data-testid="instances-cards">
-      <el-card v-for="i in rows" :key="i.id" class="card" data-testid="instance-card" :data-id="i.id" :data-state="i.state">
+      <template v-for="g in groups" :key="g.kind === 'cluster' ? g.cluster.id : g.instance.id">
+      <ClusterCard v-if="g.kind === 'cluster'" :cluster="g.cluster" :members="g.members" />
+      <template v-else>
+      <el-card v-for="i in [g.instance]" :key="i.id" class="card" data-testid="instance-card" :data-id="i.id" :data-state="i.state">
         <div class="card-head">
           <router-link :to="`/instances/${i.id}`" class="mono" data-testid="instance-id">{{ i.id }}</router-link>
           <el-tag :type="labelOf(instanceStateType, i.state) as 'primary'" data-testid="instance-state">{{ labelOf(instanceStateLabel, i.state) }}</el-tag>
@@ -167,9 +176,15 @@ async function cancelAll() {
         <div v-if="i.cancellable" class="muted" data-testid="instance-cancellable">可取消</div>
         <div v-if="i.suspended" class="warn" data-testid="instance-suspended">计时已暂停（机器维护中）</div>
       </el-card>
+      </template>
+      </template>
     </div>
 
-    <el-table v-else :data="rows" data-testid="instances-table" row-key="id">
+    <template v-else>
+    <div v-if="clusterGroups.length" class="cluster-cards">
+      <ClusterCard v-for="g in clusterGroups" :key="g.cluster.id" :cluster="g.cluster" :members="g.members" />
+    </div>
+    <el-table v-if="singleRows.length || !clusterGroups.length" :data="singleRows" data-testid="instances-table" row-key="id">
       <el-table-column label="实例 ID" min-width="170">
         <template #default="{ row }"><router-link :to="`/instances/${row.id}`" class="mono" data-testid="instance-id">{{ row.id }}</router-link></template>
       </el-table-column>
@@ -201,6 +216,7 @@ async function cancelAll() {
         </template>
       </el-table-column>
     </el-table>
+    </template>
 
     <AppDialog v-model="cancelAllVisible" kind="confirm" title="取消全部未开通" data-testid="instances-cancel-all-dialog">
       <p v-if="cancelSummaryChanged" class="warn" data-testid="instances-cancel-all-changed">退款合计已按最新报价更新，请确认后再次点击。</p>
@@ -216,6 +232,7 @@ async function cancelAll() {
 
 <style scoped>
 .cards { display: grid; gap: 12px; }
+.cluster-cards { display: grid; gap: 12px; margin-bottom: 12px; }
 .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #909399; font-size: 13px; margin-bottom: 4px; }

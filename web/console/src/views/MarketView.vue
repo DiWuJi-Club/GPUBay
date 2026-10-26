@@ -3,7 +3,7 @@ import {
   durationLabel, fmtYuan, formatPricePerM, labelOf, messageOf, type AppCatalogItem, type Duration, type Image, type Listed, type LLMModelsResponse, type Product,
 } from '@spark/shared'
 import { ElMessage } from 'element-plus'
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import AppPicker from '../components/AppPicker.vue'
@@ -13,6 +13,7 @@ import { useAskButler } from '../composables/useAskButler'
 import { useGuide } from '../composables/useGuide'
 import { usePolling } from '../composables/usePolling'
 import { compatibleImages } from '../logic/apps'
+import { singleInstanceApps } from '../logic/cluster'
 import { notifyError } from '../logic/notify'
 import { butlerAvailable } from '../store/butler'
 import { lowestInputPrice } from '../logic/tokens'
@@ -24,6 +25,8 @@ const guide = useGuide()
 const products = ref<Product[]>([])
 const images = ref<Image[]>([])
 const apps = ref<AppCatalogItem[]>([]) // 一键部署：GET /apps（匿名可访问）
+// 计划 13：只能在集群上部署的应用（vllm-cluster）不放进一键部署（开通集群后在集群页部署）
+const oneClickApps = computed(() => singleInstanceApps(apps.value))
 const loading = ref(true)
 const loadError = ref('')
 let loaded = false
@@ -126,6 +129,11 @@ const book = (p: Product) => open(p, 'booking')
 const askButler = useAskButler()
 
 async function onPlaced(r: PlacedResult) {
+  if (r.clusterId) { // 计划 13：集群下单直接进集群页
+    ElMessage.success(`已下单集群 ${r.instances.length} 台，正在开通`)
+    await router.push(`/clusters/${r.clusterId}`)
+    return
+  }
   if (r.batchId && r.instances.length > 1) {
     ElMessage.success(`已下单 ${r.instances.length} 台`)
     await router.push({ path: '/instances', query: { batch: r.batchId } })
@@ -181,9 +189,9 @@ async function onPlaced(r: PlacedResult) {
           </el-button>
           <el-button class="rent" data-testid="market-book-btn" :disabled="p.prices.length === 0" @click="book(p)">预订档期</el-button>
         </el-form>
-        <div v-if="apps.length" class="one-click" data-testid="market-apps">
+        <div v-if="oneClickApps.length" class="one-click" data-testid="market-apps">
           <div class="one-click-title">一键部署</div>
-          <AppPicker :apps="apps" :model-value="null" testid="market-app" :disabled="(a) => appBlocked(p, a)" @update:model-value="(id) => id != null && rent(p, id)" />
+          <AppPicker :apps="oneClickApps" :model-value="null" testid="market-app" :disabled="(a) => appBlocked(p, a)" @update:model-value="(id) => id != null && rent(p, id)" />
         </div>
       </el-card>
     </div>

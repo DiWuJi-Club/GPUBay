@@ -26,7 +26,9 @@ const allTabs = [
 const tabs = computed(() => (butlerAvailable.value ? allTabs : allTabs.filter((t) => t.key !== 'butler')))
 /** AI 管家浮动按钮与抽屉只在平台启用了管家、桌面端、且不在 /butler 全页时出现（D13） */
 const showButler = computed(() => butlerAvailable.value && !mobile.value && route.path !== '/butler')
-const active = computed(() => tabs.value.find((t) => route.path === t.path || route.path.startsWith(t.path + '/'))?.key ?? '')
+// 集群详情（计划 13）从「我的实例」进入：高亮实例 Tab
+const navPath = computed(() => (route.path.startsWith('/clusters/') ? '/instances' : route.path))
+const active = computed(() => tabs.value.find((t) => navPath.value === t.path || navPath.value.startsWith(t.path + '/'))?.key ?? '')
 const logo = import.meta.env.BASE_URL + brand.logoUrl
 </script>
 

@@ -23,6 +23,7 @@ export const router = createRouter({
     { path: '/workflows/:slug', component: () => import('./views/WorkflowDetailView.vue'), meta: { title: '工作流详情' } },
     { path: '/instances', component: () => import('./views/InstancesView.vue'), meta: { title: '我的实例', auth: true } },
     { path: '/instances/:id', component: () => import('./views/InstanceDetailView.vue'), meta: { title: '实例详情', auth: true } },
+    { path: '/clusters/:id', component: () => import('./views/ClusterDetailView.vue'), meta: { title: '集群详情', auth: true } },
     { path: '/wallet', component: () => import('./views/WalletView.vue'), meta: { title: '钱包', auth: true } },
     { path: '/wallet/recharge', component: () => import('./views/RechargeView.vue'), meta: { title: '充值', auth: true } },
     { path: '/wallet/recharge/:id', component: () => import('./views/RechargeOrderView.vue'), meta: { title: '充值单', auth: true } },
