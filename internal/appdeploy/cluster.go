@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -288,9 +289,37 @@ type clusterOpState struct {
 	deps    []Deployment               // 该集群部署的非终态与 lost 成员部署（已加锁，按 ID）
 }
 
+// clusterOpAttempts：整组操作在「加锁期间成员部署清单变了」（并发换机复制出新部署）时的总尝试次数。
+const clusterOpAttempts = 3
+
+// errClusterChanged：加锁之前读的实例清单之后出现了新的成员部署（其实例未锁）——整事务重试。
+var errClusterChanged = errors.New("appdeploy: cluster deployment changed during lock")
+
 // clusterOp 按锁序加锁后在同一事务里执行 fn，返回改后的集群部署（含成员与聚合）。
 // 集群部署不存在、不属于该用户（或系统集群而用户不是系统账号）→ not_found。
 func (s *Service) clusterOp(ctx context.Context, userID int64, acdID string, fn func(tx pgx.Tx, st *clusterOpState, now time.Time) error) (ClusterDeployment, error) {
+	return s.clusterOpAs(ctx, func(c clusterRow, acd ClusterDeployment) bool {
+		return acd.UserID == userID && s.clusterVisible(c, userID)
+	}, acdID, fn)
+}
+
+// clusterOpAs 是 clusterOp 的通用版：allowed 判定调用方能否操作该集群部署（false → not_found；后台恒真）。
+// 加锁期间成员部署清单变化 → 整事务重试，共 clusterOpAttempts 次；仍在变 → ErrAppClusterBusy（409）。
+func (s *Service) clusterOpAs(ctx context.Context, allowed func(clusterRow, ClusterDeployment) bool, acdID string,
+	fn func(tx pgx.Tx, st *clusterOpState, now time.Time) error) (ClusterDeployment, error) {
+	for attempt := 1; ; attempt++ {
+		out, err := s.clusterOpOnce(ctx, attempt, allowed, acdID, fn)
+		if !errors.Is(err, errClusterChanged) {
+			return out, err
+		}
+		if attempt >= clusterOpAttempts {
+			return ClusterDeployment{}, apperr.ErrAppClusterBusy
+		}
+	}
+}
+
+func (s *Service) clusterOpOnce(ctx context.Context, attempt int, allowed func(clusterRow, ClusterDeployment) bool, acdID string,
+	fn func(tx pgx.Tx, st *clusterOpState, now time.Time) error) (ClusterDeployment, error) {
 	now := s.d.Clock.Now()
 	var out ClusterDeployment
 	err := db.WithTx(ctx, s.d.Pool, func(tx pgx.Tx) error {
@@ -305,7 +334,7 @@ func (s *Service) clusterOp(ctx context.Context, userID int64, acdID string, fn 
 		if err != nil {
 			return err
 		}
-		if pre.UserID != userID || !s.clusterVisible(c, userID) {
+		if !allowed(c, pre) {
 			return apperr.ErrNotFound
 		}
 		ids, err := memberIDs(ctx, tx, c.ID)
@@ -320,6 +349,9 @@ func (s *Service) clusterOp(ctx context.Context, userID int64, acdID string, fn 
 		if err != nil {
 			return err
 		}
+		if s.clusterOpHook != nil {
+			s.clusterOpHook(attempt)
+		}
 		locked, err := lockInstances(ctx, tx, append(ids, depInsts...))
 		if err != nil {
 			return err
@@ -333,9 +365,9 @@ func (s *Service) clusterOp(ctx context.Context, userID int64, acdID string, fn 
 		if err != nil {
 			return err
 		}
-		for _, d := range deps { // 加锁之前读的实例清单之后新出现的成员部署（换机复制）：实例未锁 → 让调用方重试
+		for _, d := range deps { // 加锁之前读的实例清单之后新出现的成员部署（换机复制）：实例未锁 → 整事务重试
 			if _, ok := locked[d.InstanceID]; !ok {
-				return fmt.Errorf("appdeploy: cluster deployment %s changed during lock, retry", acdID)
+				return errClusterChanged
 			}
 		}
 		st := &clusterOpState{cluster: c, acd: acd, locked: locked, members: currentMembers(c.ID, locked), deps: deps}
@@ -551,6 +583,39 @@ func (s *Service) StartCluster(ctx context.Context, userID int64, id, ip string)
 	})
 }
 
+// AdminForceRemoveCluster 后台整组强制卸载（ops，任何集群、含系统集群）：同 RemoveCluster，成员部署事件「平台卸载：<原因>」，
+// 端口删除审计记在后台操作人名下；审计 cluster.app_force_remove（带原因）。已 removed → 原样返回（不再审计）。
+func (s *Service) AdminForceRemoveCluster(ctx context.Context, actor audit.Actor, id, reason string) (ClusterDeployment, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return ClusterDeployment{}, apperr.BadRequest("请填写原因")
+	}
+	return s.clusterOpAs(ctx, func(clusterRow, ClusterDeployment) bool { return true }, id, func(tx pgx.Tx, st *clusterOpState, now time.Time) error {
+		if st.acd.State == ClusterDepRemoved {
+			return nil
+		}
+		if err := s.removeClusterMembers(ctx, tx, st, "平台卸载："+reason, actor, now); err != nil {
+			return err
+		}
+		return audit.Record(ctx, tx, now, actor.Entry("cluster.app_force_remove", "cluster", st.cluster.ID,
+			map[string]any{"cluster_deployment": st.acd.ID, "app_id": st.acd.AppID, "version_id": st.acd.AppVersionID, "reason": reason}))
+	})
+}
+
+// removeClusterMembers 全部非终态成员部署按单实例卸载规则（remove）处理（removing 的不动），集群部署置 removed。
+func (s *Service) removeClusterMembers(ctx context.Context, tx pgx.Tx, st *clusterOpState, detail string, actor audit.Actor, now time.Time) error {
+	for _, d := range st.liveDeps() {
+		if d.State == StateRemoving {
+			continue
+		}
+		if _, err := s.remove(ctx, tx, st.locked[d.InstanceID].State, d, detail, actor, now); err != nil {
+			return err
+		}
+	}
+	_, err := tx.Exec(ctx, `UPDATE app_cluster_deployments SET state = 'removed', updated_at = $2 WHERE id = $1`, st.acd.ID, now)
+	return err
+}
+
 // RemoveCluster 整组卸载：全部非终态成员部署按单实例卸载规则（remove）处理，集群部署置 removed；已 removed → 原样返回（幂等，不再审计）。
 // 不要求集群仍 active（集群降级 / 结束时也能卸载）。
 func (s *Service) RemoveCluster(ctx context.Context, userID int64, id, ip string) (ClusterDeployment, error) {
@@ -559,15 +624,7 @@ func (s *Service) RemoveCluster(ctx context.Context, userID int64, id, ip string
 			return nil
 		}
 		actor := audit.Actor{UserID: userID, IP: ip}
-		for _, d := range st.liveDeps() {
-			if d.State == StateRemoving {
-				continue
-			}
-			if _, err := s.remove(ctx, tx, st.locked[d.InstanceID].State, d, "", actor, now); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(ctx, `UPDATE app_cluster_deployments SET state = 'removed', updated_at = $2 WHERE id = $1`, st.acd.ID, now); err != nil {
+		if err := s.removeClusterMembers(ctx, tx, st, "", actor, now); err != nil {
 			return err
 		}
 		return auditCluster(ctx, tx, now, actor, "cluster.app_remove", st.cluster.ID, st.acd.ID, st.acd.AppID, st.acd.AppVersionID)

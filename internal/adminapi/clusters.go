@@ -2,23 +2,28 @@ package adminapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
 	"spark-cloud/internal/appdeploy"
+	"spark-cloud/internal/platform/apperr"
 	"spark-cloud/internal/platform/httpx"
 	"spark-cloud/internal/rental"
 )
 
-// clusterRoutes 实例集群（计划 13 规格 §10.2）：列表 / 详情全员可看；延长、重新下发 ops（不要求动态码，与实例 extend 一致）。
+// clusterRoutes 实例集群（计划 13 规格 §10.2）：列表 / 详情全员可看；延长、重新下发、整组强制卸载集群应用 ops（不要求动态码，与实例 extend 一致）。
 // 换机仍走 POST /instances/{id}/migrate（成员的候选机器由 rental 限定在同一 fabric / 集群网段）。
 func (s *Server) clusterRoutes(g chi.Router) {
 	s.handle(g, http.MethodGet, "/clusters", allRoles, s.handleListClusters)
 	s.handle(g, http.MethodGet, "/clusters/{id}", allRoles, s.handleCluster)
 	s.handle(g, http.MethodPost, "/clusters/{id}/extend", opsRoles, s.handleExtendCluster)
 	s.handle(g, http.MethodPost, "/clusters/{id}/resync", opsRoles, s.handleResyncCluster)
+	s.handle(g, http.MethodPost, "/clusters/{id}/app/force-remove", opsRoles, s.handleForceRemoveClusterApp)
 }
 
 // handleListClusters GET /clusters?state=&user_id=&fabric_id=&system=&page=&page_size= → {items:[ClusterView], total}（新的在前）。
@@ -114,6 +119,48 @@ func (s *Server) handleExtendCluster(w http.ResponseWriter, r *http.Request) {
 // handleResyncCluster POST /clusters/{id}/resync（无请求体字段）→ ClusterView（version + 1，向在位成员重新下发 configure_cluster）；审计 cluster.resync。
 func (s *Server) handleResyncCluster(w http.ResponseWriter, r *http.Request) {
 	v, err := s.Rental.AdminResyncCluster(r.Context(), s.actor(r), chi.URLParam(r, "id"))
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, v)
+}
+
+// handleForceRemoveClusterApp POST /clusters/{id}/app/force-remove {reason} → 集群应用（同 GET /clusters/{id} 的 app，state = removed）。
+// 平台整组强制卸载（ops，必须填原因，≤ maxForceRemoveReason 字）：成员部署事件「平台卸载：<原因>」，审计 cluster.app_force_remove。
+// 集群没有在用的集群应用 → 404 not_found。成员部署不能走 /deployments/{dep}/force-remove（409 app_cluster_managed）。
+func (s *Server) handleForceRemoveClusterApp(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	switch reason := strings.TrimSpace(req.Reason); {
+	case reason == "":
+		s.writeError(w, r, apperr.BadRequest("请填写原因"))
+		return
+	case utf8.RuneCountInString(reason) > maxForceRemoveReason:
+		s.writeError(w, r, apperr.BadRequest(fmt.Sprintf("原因最多 %d 个字符", maxForceRemoveReason)))
+		return
+	}
+	ctx := r.Context()
+	cd, err := s.Apps.LiveClusterDeployment(ctx, chi.URLParam(r, "id"))
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	if cd == nil {
+		s.writeError(w, r, apperr.ErrNotFound)
+		return
+	}
+	out, err := s.Apps.AdminForceRemoveCluster(ctx, s.actor(r), cd.ID, req.Reason)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	v, err := s.clusterAppView(ctx, out)
 	if err != nil {
 		s.writeError(w, r, err)
 		return

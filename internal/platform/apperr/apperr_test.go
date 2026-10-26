@@ -51,6 +51,7 @@ func TestClusterErrors(t *testing.T) {
 		{AppClusterSize(2, 4), "app_cluster_size", 400, "该应用支持 2～4 台的集群"},
 		{ErrAppClusterExists, "app_cluster_exists", 409, "集群上已有集群应用，请先卸载"},
 		{ErrAppClusterManaged, "app_cluster_managed", 409, "该部署属于集群应用，请在集群页操作"},
+		{ErrAppClusterBusy, "app_cluster_busy", 409, "集群成员正在变更，请稍后重试"},
 		{ClusterNoCapacity(4), "no_capacity", 409, "暂无可组成 4 台集群的空闲机器（需同一高速网络）"},
 	}
 	for _, c := range cases {

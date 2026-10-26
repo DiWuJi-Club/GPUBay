@@ -211,9 +211,9 @@ func TestUpdateFabricBlockedByActiveCluster(t *testing.T) {
 	f, _ := svc.CreateFabric(ctx, opsActor, fleet.FabricInput{Name: "V", Kind: "cx7", Isolation: "vlan", VLANMin: intp(10), VLANMax: intp(20)})
 	insertActiveCluster(t, pool, "clu-aaaaaa0002", f.ID, 2)
 	for name, in := range map[string]fleet.FabricInput{
-		"改隔离":      {Name: "V", Kind: "cx7", Isolation: "direct"},
+		"改隔离":       {Name: "V", Kind: "cx7", Isolation: "direct"},
 		"改 VLAN 范围": {Name: "V", Kind: "cx7", Isolation: "vlan", VLANMin: intp(10), VLANMax: intp(30)},
-		"改类型":      lanInput("V"),
+		"改类型":       lanInput("V"),
 	} {
 		if _, err := svc.UpdateFabric(ctx, opsActor, f.ID, in); !errors.Is(err, apperr.ErrFabricInUse) {
 			t.Fatalf("%s = %v", name, err)

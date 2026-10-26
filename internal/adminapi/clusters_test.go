@@ -170,6 +170,27 @@ func TestAdminClusterDetail(t *testing.T) {
 	if am[1].(map[string]any)["role"] != "worker" {
 		t.Fatalf("worker member = %v", am[1])
 	}
+
+	// 成员部署不能单条强制卸载；整组强制卸载（ops）
+	if code, out := ops.do("POST", "/deployments/"+head["deployment_id"].(string)+"/force-remove", map[string]any{"reason": "违规"}); code != 409 || codeOf(out) != "app_cluster_managed" {
+		t.Fatalf("force remove member = %d %v", code, out)
+	}
+	if code, out := fin.do("POST", "/clusters/"+c.ID+"/app/force-remove", map[string]any{"reason": "违规"}); code != 403 {
+		t.Fatalf("finance force remove = %d %v", code, out)
+	}
+	if code, out := ops.do("POST", "/clusters/"+c.ID+"/app/force-remove", map[string]any{"reason": " "}); code != 400 {
+		t.Fatalf("force remove without reason = %d %v", code, out)
+	}
+	code, out = ops.do("POST", "/clusters/"+c.ID+"/app/force-remove", map[string]any{"reason": "违规"})
+	if code != 200 || out["id"] != cd.ID || out["state"] != "removed" {
+		t.Fatalf("force remove cluster app = %d %v", code, out)
+	}
+	if n := e.adminAudits("cluster.app_force_remove", c.ID); n != 1 {
+		t.Fatalf("audit = %d", n)
+	}
+	if code, out := ops.do("POST", "/clusters/"+c.ID+"/app/force-remove", map[string]any{"reason": "违规"}); code != 404 || codeOf(out) != "not_found" {
+		t.Fatalf("force remove again = %d %v", code, out)
+	}
 }
 
 func TestAdminClusterExtendResync(t *testing.T) {

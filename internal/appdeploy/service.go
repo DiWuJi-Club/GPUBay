@@ -70,6 +70,8 @@ type Deps struct {
 
 type Service struct {
 	d Deps
+
+	clusterOpHook func(attempt int) // 测试钩子：整组操作读完成员部署实例清单之后、加实例锁之前（export_test.go）
 }
 
 // instanceSSHPort 是实例容器 sshd 的端口，与接入层（sshgw / ingress）同源：rental 按实例算；无 Rental（单测）→ 0 = 上游池默认端口。
@@ -491,7 +493,11 @@ func (s *Service) remove(ctx context.Context, tx pgx.Tx, instState string, d Dep
 	return out, addEvent(ctx, tx, d.ID, d.State, StateRemoving, detail, now)
 }
 
+// errForceRemoveClusterMember：后台对集群成员部署单条强制卸载（code 同用户侧 app_cluster_managed）。
+var errForceRemoveClusterMember = apperr.New("app_cluster_managed", "该部署属于集群应用，请在集群详情页整组强制卸载", 409)
+
 // AdminForceRemove 后台强制卸载（任何非终态，同 Remove）；事件「平台卸载：<原因>」，审计只记部署 ID 与原因。
+// 集群成员部署 → app_cluster_managed（走 AdminForceRemoveCluster）。
 func (s *Service) AdminForceRemove(ctx context.Context, actor audit.Actor, depID, reason string) (Deployment, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -515,6 +521,9 @@ func (s *Service) AdminForceRemove(ctx context.Context, actor audit.Actor, depID
 		d, err := LockDeployment(ctx, tx, depID)
 		if err != nil {
 			return err
+		}
+		if d.ClusterDeploymentID != nil { // 单条卸载集群成员会让聚合卡在 installing：改用 AdminForceRemoveCluster
+			return errForceRemoveClusterMember
 		}
 		if d.State == StateRemoving {
 			out = d

@@ -208,7 +208,8 @@ func (c *Controller) provisionGroups(ctx context.Context, now time.Time, d defic
 		placed := false
 		for _, fc := range cands {
 			_, err := c.s.createGroupNode(ctx, d.m, fc.MachineIDs[:size], poolID, fmt.Sprintf("补副本：模型 %s（%d 台节点组）", d.m.Slug, size))
-			if errors.Is(err, apperr.ErrMachineUnavailable) {
+			// 机器被占 / 该 fabric 组不成（VLAN 用尽等 cluster no_capacity）→ 换下一个候选；候选用完由调用方告警 llm_pool_short
+			if errors.Is(err, apperr.ErrMachineUnavailable) || isNoCapacity(err) {
 				continue
 			}
 			if err != nil { // 与机器无关的失败：本模型本轮不再补
@@ -225,6 +226,11 @@ func (c *Controller) provisionGroups(ctx context.Context, now time.Time, d defic
 		}
 	}
 	return false
+}
+
+func isNoCapacity(err error) bool {
+	ae := apperr.As(err)
+	return ae != nil && ae.Code == apperr.ErrNoCapacity.Code
 }
 
 // ---- Controller：推进 provisioning（组）----
@@ -507,6 +513,7 @@ func (c *Controller) handleRemovingGroup(ctx context.Context, cn ctlNode, rep *T
 // ---- Prober（组）----
 
 // observeGroup 规格 §7.4：逐成员读实例——不存在 / 结束 → vFailNow；非 running 或已暂停 → vFail（provisioning 为 vSkip）；
+// 成员机器 faulty → vFailNow（provisioning 为 vSkip；随后 Controller 的 handleUnhealthyGroup 整组 failed，M12）；
 // 再读集群部署聚合（failed / removed / stale → vFailNow，非 running / health 非 ok → vFail；provisioning 都是 vSkip）；最后探测 head。
 func (p *Prober) observeGroup(ctx context.Context, n Node, slug string) observation {
 	s := p.s
@@ -541,6 +548,17 @@ func (p *Prober) observeGroup(ctx context.Context, n Node, slug string) observat
 			return skipOr(vFail, memberText(mb, "实例未运行（"+inst.State+"）"))
 		case inst.SuspendedAt != nil:
 			return skipOr(vFail, memberText(mb, "机器失联，实例已暂停"))
+		}
+		if prov {
+			continue
+		}
+		mach, err := s.d.Fleet.Get(ctx, s.d.Pool, mb.MachineID)
+		if err != nil {
+			s.d.Log.Warn("llm prober: read member machine", "node", n.ID, "machine", mb.MachineID, "err", err)
+			return observation{vSkip, ""}
+		}
+		if mach.State == fleet.StateFaulty {
+			return observation{vFailNow, memberText(mb, "机器故障")}
 		}
 	}
 	if n.AppClusterID == nil {
