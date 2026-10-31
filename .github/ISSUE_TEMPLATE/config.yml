@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & discussions / 使用问题与讨论
+    url: https://github.com/DiWuJi-Club/GPUBay/discussions
+    about: Ask questions and share ideas here / 使用问题和想法请到 Discussions
+  - name: Security vulnerability / 安全漏洞
+    url: https://github.com/DiWuJi-Club/GPUBay/security/advisories/new
+    about: Report security issues privately / 请私下报告安全问题

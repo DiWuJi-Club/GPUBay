@@ -371,7 +371,7 @@ func Build(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, opt Options)
 		srv.LLMGateway = llmGW.Router()
 	}
 	// AI 管家（计划 12）：openai 且没配 SPARK_LLM_BASE_URL 时默认走上面的 /v1 网关（进程内调用，SPARK_LLM_API_KEY 是平台管家账号的
-	// Token 商城 API Key，用量按该账号与模型单价记账，见 README「AI 管家」）。
+	// Token 商城 API Key，用量按该账号与模型单价记账，见 docs/operations.md「AI 管家」）。
 	var bt *butler.Service
 	var provider butlerllm.Provider
 	if cfg.Butler {

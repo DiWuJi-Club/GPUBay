@@ -154,7 +154,7 @@ func run(log *slog.Logger) error {
 	}
 	// Token 节点 Controller 只能跑在提供 /v1 的副本里：排空节点时看的是进程内的在途请求数（llm.Router），
 	// 没有网关的副本看到的永远是 0，会在仍有请求时释放节点。多个网关副本都开时咨询锁保证只有一个在工作，
-	// 但它只看得到自己进程的在途请求——建议网关与 Controller 同在一个副本（见 README「Token 商城」）。
+	// 但它只看得到自己进程的在途请求——建议网关与 Controller 同在一个副本（见 docs/operations.md「Token 商城」）。
 	controllerDone := make(chan struct{})
 	switch {
 	case cfg.LLMController && cfg.LLMGateway:

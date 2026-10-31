@@ -1,257 +1,120 @@
-# Spark Cloud
+<div align="center">
 
-DGX Spark 算力租赁平台控制面。设计文档见 `docs/superpowers/specs/`，实施计划见 `docs/superpowers/plans/`。
+# GPUBay
 
-## 本地开发
+**Open-source control plane for running a GPU rental cloud on your own hardware.**
 
-需要 Go 1.27（本机安装在 `~/.local/go`）。不需要 Docker：测试和本地开发使用嵌入式 PostgreSQL。
+Rent out bare GPU machines over SSH, sell OpenAI-compatible model APIs by the token,
+and deploy AI apps in one click, all from a single self-hosted platform.
 
-```bash
-make test         # Go 测试 + 前端单测（首次会下载 PostgreSQL 二进制）
-make devdb        # 终端 1：启动本地数据库（端口 5433）
-make run          # 终端 2：启动 platform（控制台 http://localhost:8080 ，后台 http://127.0.0.1:8081/admin/ ，托管上次 make web 的产物）
-make web-install  # 首次：安装前端依赖（Node 22 / npm 10，本机在 ~/.local/bin）
-make web          # 构建前端到 internal/web/dist/{console,admin}（Go embed）
-make e2e          # 端到端：构建前端 → 核对覆盖表 → Playwright（自动拉起 cmd/e2e-server，需要本机 Chrome）
-make check        # test + e2e
+[![CI](https://github.com/DiWuJi-Club/GPUBay/actions/workflows/ci.yml/badge.svg)](https://github.com/DiWuJi-Club/GPUBay/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/go-1.27-00ADD8.svg)](go.mod)
+
+English | [简体中文](README_CN.md)
+
+</div>
+
+---
+
+GPUBay is the software behind a self-built GPU data center: it turns a rack of machines
+(today: NVIDIA DGX Spark / GB10, arm64) into a cloud where customers sign up, top up a
+wallet, and get either a dedicated GPU instance or an API key. Operators get a separate
+admin console to manage the fleet, pricing, payments and users.
+
+> **Status:** pre-1.0 and under active development. It runs on real hardware but APIs,
+> config and schema may still change. Several integrations (SMS, identity verification,
+> payments) currently target mainland-China providers; contributions for other providers
+> are welcome.
+
+## Features
+
+**GPU instance rental**
+- Dedicated machines delivered as isolated containers with root SSH and a persistent data disk
+- Built-in SSH gateway (`ssh <instance>@ssh.<your-domain>`) and per-port HTTPS web ingress, no public IP per machine
+- Pay-as-you-go, fixed-term and scheduled bookings, multi-machine groups, auto-renew
+- Multi-node model serving across several machines
+
+**Token mall (model API)**
+- OpenAI-compatible `/v1` endpoint with per-user API keys
+- Per-model input/output pricing, prepaid wallet billing
+- Operator-managed vLLM serving pool with replica scheduling, health checks and failover
+
+**One-click AI apps**
+- App catalog (LLM serving, ComfyUI, PyTorch, ...) deployed into a rented instance
+- ComfyUI workflow marketplace
+- AI assistant ("butler") in the console, powered by the platform's own model API
+
+**Operations**
+- Node agent with mTLS gRPC, self-check, image pre-pull and cgroup v2 resource limits
+- Admin console with role-based access, mandatory TOTP and audit log
+- Wallet, recharge (WeChat Pay / Alipay), refunds, referral rebates
+- Remote power control via SNMP PDUs
+
+## Architecture
+
+```
+            customers                         operators
+   console / SSH / HTTPS / API             admin console (LAN)
+               │                                   │
+   ┌───────────▼───────────────────────────────────▼──────────┐
+   │                        platform                          │
+   │  user API · admin API · SSH gateway · web ingress        │
+   │  LLM gateway (/v1) · billing · scheduler · app runner    │
+   └──────────────┬──────────────────────────┬────────────────┘
+                  │ PostgreSQL               │ gRPC + mTLS (LAN)
+                  ▼                          ▼
+             ┌─────────┐     ┌───────────┐ ┌───────────┐ ┌───────────┐
+             │   DB    │     │ agent     │ │ agent     │ │   ...     │
+             └─────────┘     │ GPU node  │ │ GPU node  │ │           │
+                             │ GPU node  │ │ GPU node  │ │           │
+                             └───────────┘ └───────────┘ └───────────┘
 ```
 
-开发环境短信为 mock，验证码固定为 `000000`；实名核验 mock 全部通过。
-
-AI 管家（计划 12）默认经进程内调用本进程的 Token 商城网关（`/v1`），需要一把 Token 商城 API Key：开发环境未设 `SPARK_LLM_API_KEY`（也没设 `SPARK_LLM_BASE_URL`）且未显式 `SPARK_BUTLER=on` 时自动关闭（启动日志说明原因）；本地体验用 `SPARK_LLM_PROVIDER=mock make run`（确定性 mock 模型）。
-
-开发环境支付为 mock：充值后调用 `POST /api/v1/dev/recharges/{id}/pay` 模拟支付成功（生产环境不注册该接口）。PDU 为 mock，断电重启只记录调用。
-
-### 管理后台
-
-后台 API 在独立端口（默认 `127.0.0.1:8081`，前缀 `/admin/api/v1`），系统没有默认账号，先用命令行创建第一个超级管理员：
-
-```bash
-SPARK_DATABASE_URL=... SPARK_SECRET_KEY=... go run ./cmd/platform admin create --username root --role super
-```
-
-按提示输入两次密码（至少 12 位），用验证器 App 扫描终端里的二维码并输入一次动态码完成绑定，然后离线保存打印出的 8 个恢复码。
-管理员丢失手机时用 `platform admin reset-totp --username <名称>` 重置，下次登录重新绑定。
-
-计划 8（邀请返利）上线后执行一次 `platform referral backfill-fingerprints`：为存量已实名用户计算同身份指纹（用 `SPARK_SECRET_KEY` 解密身份证号，必须与服务用同一把密钥），之后「同一身份证 / 营业执照互相邀请」的判定才对老用户生效。回填命令本身不撤销绑定，但有了指纹之后，存量同身份绑定在下一笔待发放返利到期时会被发放前的同身份复查自动撤销（审计 `referral.auto_revoke`，待发放作废）；没有待发放返利的同身份绑定由后台「邀请返利」人工处置。可重复执行（只补没有指纹的记录）。子命令与服务读同样的环境变量，启动时会先执行迁移。
-
-邀请返利的财务操作：后台撤销绑定后，已发放的返利不会自动扣回。如果对应订单**仍可能退款**，不要用「调账」手工扣回：订单退款时系统会自动扣回这笔返利（余额不足记欠账），再手工调账就会扣两次。只对已经不能再退款的订单手工调账。后台「撤销并扣回已发放」列为后续事项。
-
-### 前端开发
-
-```bash
-cd web && npm run dev:console   # http://127.0.0.1:5173 ，/api 代理到 8080
-cd web && npm run dev:admin     # http://127.0.0.1:5174/admin/ ，/admin/api 代理到 8081
-```
-
-控制台登录：任意手机号 + 验证码 `000000`；后台管理员用 `platform admin create` 创建。
-端到端测试全量约 10～15 分钟；只跑子集：`cd web && npx playwright test --project=admin` 或 `-g 'C-RCH'`；调试：`npx playwright test --headed --project=console-mobile -g 'C-RCH-04'`，失败的 trace 用 `cd web && npx playwright show-trace test-results/<目录>/trace.zip`（目录在 `web/test-results/` 下）。
-直接运行 `npx playwright test` 不会先构建前端（e2e-server 托管的是 embed 进去的产物），改了页面后先 `make web`。
-CI 机器没有 Chrome 时设 `E2E_BROWSER_CHANNEL=chromium` 并 `npx playwright install chromium`。
-
-## 配置（环境变量）
-
-| 变量 | 说明 | 默认 |
+| Component | Path | Stack |
 |---|---|---|
-| `SPARK_ENV` | dev / staging / prod | dev |
-| `SPARK_HTTP_ADDR` | 公网监听地址：控制台、用户 API 与租户 Web 入口（按 Host 分流；配置 TLS 证书时为 HTTPS） | :8080 |
-| `SPARK_DATABASE_URL` | PostgreSQL 连接串 | 必填 |
-| `SPARK_SECRET_KEY` | 32 字节密钥的 base64，加密身份证号、实例密码、内置 CA 私钥、SSH 网关主机密钥与实例主机私钥（轮换的后果见「部署注意」） | 必填 |
-| `SPARK_DOMAIN` | 控制台域名（须等于 `SPARK_PUBLIC_BASE_URL` 的域名）；用户 SSH 命令连 `ssh.<此域>`；未设 `SPARK_INGRESS_DOMAIN` 时也是租户 Web 子域的父域 | spark.local |
-| `SPARK_ADMIN_ADDR` | 后台 API 监听地址（只应绑定内网地址） | 127.0.0.1:8081 |
-| `SPARK_UPLOAD_DIR` | 上传文件（营业执照、工作流封面）保存目录，需定期备份；`platform admin workflow import` 须用同一目录 | ./.devdata/uploads |
-| `SPARK_SMS_DRIVER` / `SPARK_KYC_DRIVER` | mock / aliyun（生产禁止 mock） | mock |
-| `SPARK_PAY_DRIVER` | mock / real（生产禁止 mock；real 时启用已配置的微信和 / 或支付宝） | mock |
-| `SPARK_PDU_DRIVER` | mock / snmp（生产禁止 mock；snmp 时按每台 PDU 的配置） | mock |
-| `SPARK_ALIYUN_ACCESS_KEY_ID` / `SPARK_ALIYUN_ACCESS_KEY_SECRET` | 阿里云 AccessKey（短信与号码百科共用） | 空 |
-| `SPARK_SMS_SIGN` / `SPARK_SMS_TPL_LOGIN` / `SPARK_SMS_TPL_EXPIRY` | 短信签名、登录验证码模板（参数 code）、到期提醒模板（参数 instance、hours） | 空 |
-| `SPARK_SMS_TPL_AUTO_RENEW_FAILED` / `SPARK_SMS_TPL_BOOKING_CANCELLED` | 自动续费失败模板（参数 instance、reason）、预订被平台取消模板（参数 instance、reason）；`SPARK_SMS_DRIVER=aliyun` 时必填 | 空 |
-| `SPARK_KYC_AUTH_CODE` | 号码百科三要素核验授权码 | 空 |
-| `SPARK_ALIYUN_SMS_ENDPOINT` / `SPARK_ALIYUN_KYC_ENDPOINT` | 阿里云短信 / 号码百科接口地址（一般不用改） | https://dysmsapi.aliyuncs.com / https://dytnsapi.aliyuncs.com |
-| `SPARK_WECHAT_MCH_ID` / `_APP_ID` / `_API_V3_KEY` / `_CERT_SERIAL` / `_PRIVATE_KEY_PATH` | 微信支付商户号、AppID、APIv3 密钥、商户证书序列号、商户私钥文件 | 空 |
-| `SPARK_WECHAT_PUBLIC_KEY_ID` / `SPARK_WECHAT_PUBLIC_KEY_PATH` | 微信支付公钥 ID 与公钥文件（商户平台「API 安全」中下载） | 空 |
-| `SPARK_ALIPAY_APP_ID` / `_PRIVATE_KEY_PATH` / `_PUBLIC_KEY_PATH` / `_SANDBOX` | 支付宝应用 ID、应用私钥文件、支付宝公钥文件、是否沙箱 | 空 / false |
-| `SPARK_SWEEP_INTERVAL` | 清扫间隔 | 1m |
-| `SPARK_AGENT_ADDR` | Agent 网关 gRPC 监听地址（mTLS，只对机房内网开放） | :9443 |
-| `SPARK_AGENT_HOSTS` | 网关证书的域名 / IP（逗号分隔，每项须是主机名或 IP，不含端口），第一项写进安装命令；生产必填 | dev: localhost,127.0.0.1 |
-| `SPARK_AGENT_DOWNLOAD_URL` | 内网文件服务器上 `install.sh` 与 `spark-agent-linux-arm64` 所在目录；为空时后台只显示 `spark-agent enroll` 一行 | 空 |
-| `SPARK_AGENT_BINARY_SHA256` | agent 二进制 SHA-256（`make agent` 输出），填进安装命令供 install.sh 校验 | 空 |
-| `SPARK_UPSTREAM_SSH_KEY_FILE` | 平台登录容器的 ed25519 私钥（`platform admin gen-upstream-key --path ...` 生成，0600）；生产必填，dev 缺省时自动生成在临时目录 | 空 |
-| `SPARK_AGENT_DATA_SIZE_GIB` / `SPARK_AGENT_BANDWIDTH_MBPS` | 实例数据盘大小（GiB）与默认限速（Mbps） | 2048 / 200 |
-| `SPARK_AGENT_ALLOW_CIDRS` / `SPARK_AGENT_DNS_SERVERS` | 容器可访问的内网白名单（Harbor、HF 镜像站等）与容器 DNS | 空 / 223.5.5.5,119.29.29.29 |
-| `SPARK_TRUST_PROXY` | 仅当 platform 部署在反向代理之后才设为 true：用户 API 与租户 Web 入口的客户端 IP 取 X-Forwarded-For（不看 X-Real-IP / True-Client-IP）；后台 API 始终以连接地址为准。匿名机组 / 日历 / 可用性端点按客户端 IP 每分钟限流 120 次：在代理之后不设它，所有用户会共用代理地址这一个额度 | false |
-| `SPARK_TRUSTED_PROXY_HOPS` | `SPARK_TRUST_PROXY=true` 时自己的反向代理层数 N（≥ 1）：客户端 IP 取 X-Forwarded-For 自右数第 N 项（每层代理须追加对端地址）；该项缺失或不是合法 IP 时用连接地址 | 1 |
-| `SPARK_SSH_ADDR` | SSH 网关监听地址（compose 把公网 22 映射到它） | :2222 |
-| `SPARK_SSH_PUBLIC_PORT` | 写进用户 SSH 命令的公网端口；非 22 时命令带 `-p` | 22 |
-| `SPARK_SSH_MAX_SESSIONS_PER_INSTANCE` / `SPARK_SSH_DRAIN_TIMEOUT` | 每实例并发 SSH 会话上限 / 停机时等待会话结束的时间 | 16 / 30s |
-| `SPARK_UPSTREAM_SSH_PORT` | 容器 sshd 在机器上的**基准**端口：平台按实例计算端口（`rental.Instance.SSHPort`，目前恒等于基准），写进 Create 指令的 `ssh_port`，SSH 网关、Web 入口与应用部署按同一值拨上游。端口在 Create **入队时**就固定进指令：有待下发的 Create 时修改，这些实例仍发布在旧端口上（平台却按新端口拨，连不上），所以只在没有待下发 Create 时修改；已在运行的实例要重新开通才会换端口 | 2222 |
-| `SPARK_INGRESS_DOMAIN` | 租户 Web 子域的父域（`ins-<id>-<port>.<此域>`）；生产推荐用与 `SPARK_DOMAIN` **不同的注册域（eTLD+1）**，子域不算；「不是 SPARK_DOMAIN 子域」的启动校验只防误配 | = SPARK_DOMAIN |
-| `SPARK_PUBLIC_BASE_URL` | 对外地址，支付回调为 `<地址>/api/v1/pay/notify/{wechat,alipay}`（real 支付必填，须 https）；域名必须等于 `SPARK_DOMAIN`；prod 必填且 https；dev 默认 `http://spark.local:8080`。本地测 ingress 需在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或改用 sslip.io 域 | 见左 |
-| `SPARK_ADMIN_PUBLIC_BASE_URL` | 后台对外地址（经反向代理或 `ssh -L` 隧道访问时填浏览器地址栏里的后台地址），用于后台写请求的 Origin 校验。为空时只认 `Sec-Fetch-Site`：带 `Origin` 而不带 `Sec-Fetch-Site` 的客户端（旧版 Safari、部分内嵌 WebView）后台写请求一律 403；staging / prod 为空时启动日志会打 WARN | 空 |
-| `SPARK_TLS_CERT_FILE` / `SPARK_TLS_KEY_FILE` | 证书与私钥（PEM，覆盖 `<domain>` 与 `*.<ingress_domain>`）；设置后公网监听器为 HTTPS 并每分钟检查文件变化热加载 | 空 |
-| `SPARK_HTTP_REDIRECT_ADDR` | 纯 HTTP 301 到 https 的监听地址（仅 TLS 开启时有效） | 空 |
-| `SPARK_APP_HF_ENDPOINT` | 注入应用容器的 `HF_ENDPOINT`（模型下载的 HuggingFace 镜像站） | https://hf-mirror.com |
-| `SPARK_APP_PIP_INDEX_URL` | 注入应用容器的 `PIP_INDEX_URL`（应用脚本若需装小包） | https://pypi.tuna.tsinghua.edu.cn/simple |
-| `SPARK_APP_RUNNER` | on / off：是否在本副本启动应用部署 Runner（多副本都 on，咨询锁保证只有一个在工作；e2e 用 off） | on |
-| `SPARK_LLM_GATEWAY` | on / off：是否在用户 API 上挂 Token 商城的 OpenAI 兼容网关 `/v1`（off 时 `/v1/*` 返回 404，控制台的 Token 商城页面仍可用）；限额按进程各算，见「Token 商城」 | on |
-| `SPARK_LLM_CONTROLLER` | on / off：是否在本副本启动 Token 节点 Controller（按副本数建节点、健康探测、排空与重建；咨询锁保证同一时刻只有一个副本在工作）。只在 `SPARK_LLM_GATEWAY=on` 的副本上生效（排空看本进程的在途请求），网关 off 时打 WARN 不启动；e2e 用 off，由钩子驱动 | on |
-| `SPARK_APP_GIT_MIRROR` | 注入应用容器的 `SPARK_GIT_MIRROR`：ComfyUI 安装工作流的自定义节点时 `git clone <前缀>https://github.com/...`（失败再直连）。须以 `https://` 开头、以 `/` 结尾；`off` = 直连 | https://gh-proxy.com/ |
-| `SPARK_BUTLER` | on / off：AI 管家部署级开关（off 时不注册路由、不显示入口；与后台「AI 管家」设置的总开关不同） | on |
-| `SPARK_LLM_PROVIDER` | openai / anthropic / mock（prod 禁 mock） | openai |
-| `SPARK_LLM_BASE_URL` | openai：**空 = 本进程的 Token 商城网关**（进程内调用，不走网络；需 `SPARK_LLM_GATEWAY=on`，否则开发环境自动关闭管家、其它环境启动报错）；填写 = 外部 OpenAI 兼容端点（写到 `/v1` 为止）。anthropic 可空（官方地址） | 空 |
-| `SPARK_LLM_API_KEY` | 模型端点密钥；默认端点时是「平台管家账号」的 Token 商城 API Key（`sk-spark-…`，见「部署注意 · AI 管家」）；prod 开启管家且非 mock 时必填 | |
-| `SPARK_LLM_MODEL` | 模型名；接 Token 商城时是模型的 **slug**（后台「Token 商城 → 模型」的 slug，小写，如 `qwen3-4b`），该模型须已上线且 API Key 允许调用 | openai `qwen3-32b` / anthropic `claude-opus-5-5` / mock `mock` |
-| `SPARK_LLM_MAX_OUTPUT_TOKENS` | 单次输出 token 上限（真实节点流式约 20～30 token/s，单次模型请求超时 90 秒） | 1024 |
-| `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` | 用量页估算费用：输入 / 输出每百万 token 的价格（分） | 0 / 0 |
-| `SPARK_LLM_TOOLS` | on / off：off 时不给模型工具（端点不支持工具调用时的应急开关，管家只答不做） | on |
-| `SPARK_LLM_STREAM` | on / off：模型请求是否流式。off 时 openai 适配器发 `"stream": false`、整段读回（一次模型调用推一个 `delta`）；anthropic 总是流式 | openai off，anthropic on |
+| Platform (control plane) | `cmd/platform`, `internal/` | Go, PostgreSQL |
+| Node agent | `cmd/spark-agent`, `internal/agent` | Go, Docker, cgroup v2 |
+| User console & admin console | `web/console`, `web/admin` | Vue 3, TypeScript, Vite |
+| Deployment | `deploy/compose`, `deploy/agent` | Docker Compose, systemd |
 
-## 节点 Agent
+## Quick start (local development)
 
-每台 DGX Spark（arm64，Ubuntu 24.04，Docker + NVIDIA CDI）跑一个 `spark-agent`，经 9443 端口（mTLS）连接平台。
+Requirements: Go 1.27+, Node 22 / npm 10. Docker is **not** required: tests and the dev
+server use an embedded PostgreSQL.
 
-1. 构建：`make agent`（`make build` 也会构建），生成静态二进制 `bin/spark-agent-linux-arm64` 并打印 SHA-256。
-2. 把 `bin/spark-agent-linux-arm64` 与 `deploy/agent/install.sh` 放到内网文件服务器的同一目录；`SPARK_AGENT_DOWNLOAD_URL` 指向该目录，`SPARK_AGENT_BINARY_SHA256` 填 `make agent` 打印的值。
-3. 后台机器详情「生成接入命令」，在机器上以 root 执行。脚本依次：下载并校验二进制 -> 用下载的临时二进制执行 `selfcheck`（失败则中止）-> 原子替换 `/usr/local/bin/spark-agent` -> 建 `/etc/spark-agent`、`/var/lib/spark-agent`（强制 0700，可重复执行）-> `enroll` -> 安装并启用 systemd 服务 `spark-agent`（`Restart=always`）。自检失败时令牌未被消耗，可原样重跑；`enroll` 之后的任何失败都需要在后台重新生成接入命令。令牌不会被脚本打印，但 `ps` 里在 enroll 运行期间可见，也会留在 shell 历史和 `sudo` 的 `/var/log/auth.log` 里；一次性令牌用后即失效，过期未用的令牌请在后台作废。
-4. 9443 端口只对机房内网开放。
-5. 镜像规范与参考 Dockerfile 见 `docs/image-spec.md`、`deploy/image/Dockerfile`。
-6. 升级 Agent（**每次发布都先升级全部 Agent，再发布 platform**）：计划 7 起 Agent 在每 60 秒的 `StateReport.images` 里上报本机已缓存的镜像（`docker image ls`，最多 200 项），后台据此显示应用镜像的缓存覆盖率；旧 Agent 不上报也照常工作（覆盖率显示「未知」）。`make agent` 后更新文件服务器上的二进制与 `SPARK_AGENT_BINARY_SHA256`（平台重启生效），在后台重新生成接入命令并在机器上执行（会换新证书，运行中的实例不受影响）。
-7. 机器网络：Agent 在宿主机重启后先挂载数据盘再拉起应运行的容器；若容器端口要绑定的局域网地址还没就绪，Agent 推迟启动并每 60 秒重试。业务网卡建议用有线 + 固定地址，并启用 `NetworkManager-wait-online`。
-8. 本地无 Docker 时：`spark-agent run --fake --dir ./.devdata/agent --state-dir ./.devdata/agent/state`（`--fake` 仅用于开发，systemd unit 不使用）。
-9. 脚本测试：`sh deploy/agent/install_test.sh`（已并入 `make test`）。
+```bash
+git clone https://github.com/DiWuJi-Club/GPUBay.git && cd GPUBay
+make web-install   # install frontend dependencies
+make web           # build console + admin into the Go binary
+make devdb         # terminal 1: local PostgreSQL on :5433
+make run           # terminal 2: console http://localhost:8080, admin http://127.0.0.1:8081/admin/
+```
 
-## 部署注意
+In development, SMS, identity verification, payments and PDUs are mocked. Log in to the
+console with any phone number and code `000000`. Create the first admin with
+`go run ./cmd/platform admin create --username root --role super`.
 
-- 启动时自动执行数据库迁移（多副本同时启动时由 PostgreSQL 会话级咨询锁串行化）。
-- 迁移 `00007_rental.sql` 会执行 `CREATE EXTENSION IF NOT EXISTS btree_gist`（机器占用时段的排他约束需要）。
-  数据库角色需要有创建该扩展的权限；托管数据库上若无此权限，请由管理员预先在目标库执行
-  `CREATE EXTENSION btree_gist;`。
-- 后台端口不要暴露到公网；如必须经过反向代理，请限制来源 IP。
-- `SPARK_UPLOAD_DIR` 存放用户上传的营业执照，需要纳入备份。
-- 支付回调地址需在微信支付商户平台、支付宝开放平台中配置为 `SPARK_PUBLIC_BASE_URL` 下的对应路径。
-- 用户控制台与用户 API 同在 `SPARK_HTTP_ADDR`（默认 `:8080`；compose 部署为容器内 `:8443`、对外 443）（`/` 为页面，`/api/*` 为接口），前面的反向代理不需要额外路由规则；管理后台与后台 API 同在 `:8081`（`/admin/`），仍只监听内网地址。
-- `make build` 会先构建前端再编译后端，二进制内含页面；`index.html` 以 `Cache-Control: no-cache` 返回（浏览器每次加载都向服务器校验，发布后刷新即生效），`assets/` 文件名带内容哈希，缓存一年（`immutable`），其余不带哈希的文件（favicon、`brand/` 等）缓存 1 小时。
-- `SPARK_ENV=staging` 与 `prod` 都会给 Cookie 加 `Secure`，所以 staging 必须走 HTTPS。
-- `SPARK_SECRET_KEY` 同时加密内置 CA 的私钥：**轮换该密钥会使 CA 不可解密，所有机器都要重新接入**；轮换前先导出 `platform_pki` 表备份。
-- 从备份恢复平台数据库前，先把全部机器置为维护或停止平台的 Agent 网关：网关对账会把数据库里不存在的实例容器当作孤儿洗掉。
-- 容器化部署：`make platform-image` 构建 `spark-cloud/platform:<version>`（distroless nonroot），`deploy/compose/` 是 platform + postgres（+ 可选 acme.sh 证书侧车）的 compose，步骤见 `deploy/compose/README.md`。
-- 接入层：用户 SSH 经 `ssh.<domain>:22`（平台自研网关，`SPARK_SSH_ADDR`），Web 端口经 `https://ins-<id>-<port>.<ingress_domain>`；DNS 需要 `<domain>`、`ssh.<domain>`、`*.<ingress_domain>` 三条记录都指向控制面。**生产推荐 `SPARK_INGRESS_DOMAIN` 用与 `SPARK_DOMAIN` 不同的注册域（eTLD+1），子域不算**（或让 ingress 域进入公共后缀列表 PSL）：租户页面的 JS 能在父域上设置 Cookie。
-- 控制面宿主机自己的 sshd 要先挪到别的端口，22 留给网关（`deploy/compose/README.md`；Ubuntu 22.10+ 是 `ssh.socket` 套接字激活，要 `daemon-reload` 并重启 `ssh.socket` 才换端口，先双端口验证再去掉 22）。
-- 公网端口（22 / 443 / 80）都是面向互联网、未认证即可连接的服务；9443 只对机房内网开放，后台端口不暴露。Docker 发布的端口不受 ufw 控制，compose 里靠绑定地址（9443 绑内网地址、后台绑 127.0.0.1）限制来源。
-- compose 只在 IPv4 发布公网端口，DNS 不要加 AAAA 记录（或先给 compose 网络启用 IPv6）：否则 IPv6 客户端经 docker-proxy 全部变成同一个源地址，按 IP 的暴力破解限额与限流失效。
-- 不要用裸 TCP 连接对 SSH 端口做健康检查：未认证的连接计入按 IP 的暴力破解限额，会把监控机自己的 IP 封掉；监控请探 HTTPS（如 `https://ins-monitor0-80.<ingress_domain>/.spark/healthz`，返回 `ok`）。
-- TLS 两种方式：`SPARK_TLS_CERT_FILE` / `SPARK_TLS_KEY_FILE`（需覆盖 `<domain>` 与 `*.<ingress_domain>` 的泛域名证书：acme.sh DNS-01 侧车或商业证书，平台每分钟热加载文件）；或前置反向代理终止 TLS 并 `SPARK_TRUST_PROXY=true`（代理须原样转发 Host，apex 与泛域名都指到 platform）。客户端 IP 取 `X-Forwarded-For` 自右数第 `SPARK_TRUSTED_PROXY_HOPS` 项（默认 1，多层代理设为层数）。platform 自己终止 TLS 时（默认 compose）保持 `SPARK_TRUST_PROXY=false`。
-- 发布顺序：**先升级全部 Agent，再发布 platform**（新 platform 固定校验平台下发的容器主机密钥，旧 Agent 会自行生成另一把）。platform 重启会断开 SSH 会话（drain 最多 `SPARK_SSH_DRAIN_TIMEOUT`，默认 30s）；停机总耗时约 30～40s，compose 的 `stop_grace_period` 为 60s；如果自己写 systemd unit 来管理 platform，设 `TimeoutStopSec=60`。
-- 本次升级把 staging / prod 的会话 Cookie 改名为 `__Host-…`：升级后用户与管理员都需要重新登录一次。
-- `platform admin ssh-host-key` 打印网关主机密钥指纹，填进帮助页 `brand.sshHostKeyFingerprint`。
-- `SPARK_SECRET_KEY` 轮换后网关主机密钥（`platform_pki.ssh_host_key_enc`）不可解密，**平台启动直接失败，不会自动重新生成**（静默换钥会让所有用户的 `known_hosts` 报警）。恢复二选一：换回原来的密钥；或有意接受网关主机密钥变更——执行 `UPDATE platform_pki SET ssh_host_key_enc = NULL WHERE id = 1;` 后启动，平台生成新钥，用户会看到主机密钥变更警告，需用 `platform admin ssh-host-key` 更新帮助页指纹（CA 私钥同样不可解密，见上一条）。已运行实例的主机密钥固定不受影响（`ssh_host_pubkey` 是明文列）；轮换时仍在开通中的实例按开通失败退款。
-- 本地开发测 ingress：`SPARK_PUBLIC_BASE_URL` 默认 `http://spark.local:8080`，在 hosts 加 `spark.local` 与用到的 `ins-<id>-<port>.spark.local`（hosts 不支持泛域名），或用 sslip.io 域（如 `SPARK_DOMAIN=192-168-1-218.sslip.io`）。
-- 控制台与后台的写请求有同站防护：经浏览器从其它子域 / 站点提交会得到 `forbidden`；curl 等不带 `Origin` 的客户端不受影响。
-- 计划 6（档期预订）发布时**一次性重启全部 platform 副本**：旧副本分配机器时不看占用时段，滚动期间可能把带预订的机器分给即时订单。本次不改 Agent 协议，Agent 不需要升级。
-- 预订与自动续费的短信模板（`SPARK_SMS_TPL_AUTO_RENEW_FAILED`、`SPARK_SMS_TPL_BOOKING_CANCELLED`）在阿里云侧申请通过后再切 `SPARK_SMS_DRIVER=aliyun`，否则启动校验失败。
-- 发布计划 6 前先在生产库执行下面的检查，结果必须为 0 行，再让迁移 `00019` 运行（空占用时段只允许出现在已结束、实例已释放或失败的记录上）：
-  `SELECT l.id, l.status, i.state FROM machine_leases l JOIN instances i ON i.id = l.instance_id WHERE isempty(l.period) AND (l.status <> 'ended' OR i.state NOT IN ('released','failed'));`
-- 计划 8（邀请返利）发布：迁移 `00021`（设计文档写作 `00020`，计划 7 先占用了该编号）在存在 `referral_rebate / referral_clawback` 流水时拒绝回滚；多副本滚动期间旧副本的登录接口不认 `invite_code`，窗口内注册的用户不会绑定（窗口很短，可接受；一次性重启全部副本可消除）；发布后执行 `platform referral backfill-fingerprints`；`SPARK_PUBLIC_BASE_URL` 必须是用户可访问的控制台地址（邀请链接据此生成）。
-- 计划 8 必须在计划 7 合入 `main` 之后发布（goose 不接受乱序迁移：`00021` 先于 `00020` 落库后，`00020` 再也不会执行）。迁移 `00021` 扩展 `wallet_ledger.kind` 的 CHECK 约束，会对 `wallet_ledger` 持有 ACCESS EXCLUSIVE 锁并全表校验，随后在同一事务里建 `wallet_ledger_order_scan_idx`（非 CONCURRENTLY）：迁移期间所有充值 / 扣款 / 退款都会等待。先 `SELECT count(*) FROM wallet_ledger` 估算耗时，选低峰窗口发布。
-- 计划 10（共享机）真机 PoC 结论为 no-go，**共享机商品搁置**（记录见 `docs/superpowers/acceptance-plan10.md`），本次只发布 Agent 多容器与按实例端口的基础设施。没有迁移：`00023` 编号保留未用；goose 不接受乱序迁移，以后的共享机迁移要用发布时最大编号之后的新号。Agent 协议新增 `Hello.features`、`CreateInstance.share_slots`、`Heartbeat.instances`，新旧两侧互相忽略未知字段；照例先升级 Agent 再发布 platform。新 platform 在 Create 指令里显式写 `ssh_port`（= `SPARK_UPSTREAM_SSH_PORT`）与 `share_slots = 1`，Agent 发布到该端口；机器详情的 `last_metrics.instances` 带每实例的 cgroup 内存 / CPU / 数据盘用量（旧 Agent 为空数组）。新 Agent 在同一端口已被本机另一个**仍存在**的容器占用时拒绝开通（「SSH 端口冲突」）；`selfcheck` 新增 cgroup v2 与 cpu / memory / pids 控制器检查（硬性），核数 < 4 只告警。
-- 邀请返利的「同 IP」标记与邀请码查询限流（每 IP 每分钟 60 次）都按客户端 IP：platform 在反向代理之后时必须设 `SPARK_TRUST_PROXY=true`（及 `SPARK_TRUSTED_PROXY_HOPS`），否则所有绑定都带「同IP」、所有用户共用一个查码额度。即便设对了，同一 NAT 出口（公司 / 校园网）的邀请也会带「同IP」——该标记只提示、不搁置。
+```bash
+make test   # Go tests + frontend unit tests
+make e2e    # Playwright end-to-end tests (needs Chrome)
+```
 
-### 应用一键部署（计划 7）
+## Documentation
 
-- **发布顺序**：先升级全部 Agent（新增 `StateReport.images`），再发布 platform（迁移 `00020_apps.sql`）。platform 先发也能工作，只是缓存覆盖率显示「未知」；本计划不改实例指令，旧 Agent 的实例操作不受影响。
-- **Runner**：部署由 platform 里的 Runner 推进（每 5 秒一轮，经上游 SSH 在用户容器里执行 `run.sh`）。多副本都保持 `SPARK_APP_RUNNER=on` 即可：每轮先拿 PostgreSQL 会话级咨询锁，同一时刻只有一个副本在工作，该副本挂掉后其它副本下一轮接手。设为 `off` 时启动日志打 WARN，所有副本都 off 则部署一直停在「等待部署」。
-- **镜像分发（内网 Harbor `registry.spark.internal`）**：
-  - Harbor 建两个项目：`proxy-nvcr`（Proxy Cache，代理 `nvcr.io`，机器与构建机拉 `registry.spark.internal/proxy-nvcr/nvidia/vllm:25.09-py3` 等价于拉 nvcr.io）与 `spark`（放我们构建的应用镜像）。机器只从 Harbor 拉镜像；拉镜像的是宿主机 dockerd，容器内的应用不访问 Harbor。`SPARK_AGENT_ALLOW_CIDRS` 按原有约定含 Harbor 地址；若 `SPARK_APP_HF_ENDPOINT` / `SPARK_APP_PIP_INDEX_URL` 指向内网镜像站，也要把它们的网段加进去（容器默认不能访问机房内网）。
-  - 构建：在一台 arm64 机器（可以是进维护的 Spark）上，仓库根目录 `make app-images`，按 `APP_IMAGE_TAG`（默认 `25.09`）构建 `spark/llm-serving`、`spark/comfyui`、`spark/pytorch` 三个镜像。大陆网络传镜像源构建参数：
-    `make app-images PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple COMFYUI_SRC=https://ghfast.top/https://github.com/comfyanonymous/ComfyUI.git`。
-    基础镜像想走 Harbor 代理时直接 `docker build --build-arg BASE=registry.spark.internal/proxy-nvcr/nvidia/vllm:25.09-py3 ...`（各参数与逐条命令见 `deploy/image/apps/README.md`）。
-  - 推送：`for app in llm-serving comfyui pytorch; do docker tag spark/$app:25.09 registry.spark.internal/spark/$app:25.09 && docker push registry.spark.internal/spark/$app:25.09; done`。
-- **登记与上架**（顺序不能乱）：
-  1. 后台「价格与镜像」登记三个镜像，名称必须是 `LLM Serving`、`ComfyUI`、`PyTorch`（导入按名称找镜像），地址填 `registry.spark.internal/spark/<app>:25.09`；已有的 PyTorch 占位条目改成新地址即可。
-  2. 导入应用为草稿。`platform admin app import` 读的是 **platform 容器内**的目录，而 distroless 镜像里没有 `deploy/apps`，先把目录放进容器再导入（在 `deploy/compose/` 下执行；`../apps/.` 带结尾的 `/.`，重复执行也是覆盖到 `/apps` 而不是套一层 `/apps/apps`）：
+- [Operations manual (Chinese)](docs/operations.md): configuration reference, deployment, release notes per feature
+- [Design specs](docs/superpowers/specs/) and [implementation plans](docs/superpowers/plans/)
+- [Instance image spec](docs/image-spec.md)
 
-     ```bash
-     docker compose cp ../apps/. platform:/apps
-     docker compose exec platform /platform admin app import /apps
-     ```
+> The codebase still uses the original working name `spark-cloud` / `SPARK_*` in module
+> paths, binaries and environment variables. These will be renamed to GPUBay in a
+> future release.
 
-     或不往运行中的容器里写文件，用一次性容器只读挂载：`docker compose run --rm --no-deps -v "$(cd ../apps && pwd):/apps:ro" platform admin app import /apps`。
-     每个应用输出 `<slug> <版本> created|version-added`；引用的镜像没登记时该应用导入失败（先登记再重跑）。已存在的同一版本号若内容（spec、脚本、镜像）相同则输出 `skipped` 并继续导入后面的应用，所以在已有部署上重跑整个目录是安全的；同一版本号但内容不同会报错，改脚本请升版本。
-  3. 后台「应用」逐个发布版本（super + TOTP）。发布时平台向全部在线机器广播预拉取，版本页显示每个兼容镜像「已缓存 X / 在线 Y」；llm-serving 约 29GB，首次预拉取耗时较长，发布不受覆盖率限制。
-- **安全**：`run.sh` 与应用脚本在用户容器里**以 root 执行**，发布一个应用版本的权限等同于发布一个镜像——只给 super，发布要 TOTP；导入的脚本须经代码评审（`deploy/apps/README.md` 的约定）。
-- **回滚**：
-  - 只回退 platform 版本（不执行 Down）：新表留着不用，已部署的应用进程继续在容器里运行，但不再有人推进部署、登记端口或在实例重启后恢复；控制台和后台没有应用入口。
-  - 执行 `00020` 的 Down：删除 `apps`、`app_versions`、`app_deployments`、`app_deploy_events` 与 `machines.cached_images(_at)`，**部署记录、事件和加密保存的应用变量全部丢失且不可恢复**；`instance_ports` 删除 `deployment_id` 列，应用登记的端口行保留下来变成普通端口（用户可自行删除）；数据盘 `/root/data/models` 里的模型与 `.spark-apps` 目录不受影响。
+## Contributing
 
-### Token 商城（计划 9）
+Issues and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first,
+and report security problems privately as described in [SECURITY.md](SECURITY.md).
 
-- **接入地址**：OpenAI 兼容接口在 `https://<SPARK_DOMAIN>/v1`（与控制台同域同端口，无独立子域），用户在控制台「Token 商城」创建 API Key，按 token 用量从钱包扣费。`SPARK_LLM_GATEWAY=off` 时不挂 `/v1`。
-- **发布**：迁移 `00022_llm.sql` 写入系统账号（`users.phone='system:llm'`，`system=true`）与「Token 服务池」机组；系统账号缺失时 platform 启动失败（报「找不到系统账号」）。本计划不改 Agent 协议，platform 单独发布即可（节点依赖计划 7 的新版 Agent 与 `LLM Serving` 镜像）。迁移按乱序方式执行（`WithAllowOutofOrder`）：已跑过 `00024` 的库升级时会补跑 `00022`，两者互不依赖。
-- **节点应用 `vllm-node`**：节点是系统账号名下的系统实例上的 `vllm-node` 内部应用部署（不在控制台应用市场展示）。上线后按「应用一键部署」的步骤用 `platform admin app import` 导入 `deploy/apps`（含 `vllm-node`），再在后台「应用」里发布 `vllm-node` 的版本（super + TOTP）；未导入 / 未发布时后台无法创建模型（模型绑定 `vllm-node` 的已发布版本）。镜像沿用计划 7 登记的 `LLM Serving`。
-- **Token 服务池**：迁移建好的唯一机组「Token 服务池」（不可见、不可删除、不能改名、不能改成可见）。在后台「Token 商城 → 节点与机器池」把机器加入池；**池内机器永不出租**（即时 / 预订 / 换机 / 改派都拿不到），Controller 只在池内空闲在线机器上建节点。机器上还有未结束的节点或系统实例时不能移出池（先在后台排空 / 移除节点）。池机器数量应 ≥ 全部上线模型的副本数之和，不足时告警 `llm_pool_short`（告警需人工处理，不会自动关闭）。
-- **上线顺序**：先在「节点与机器池」把机器加入池，再在「模型」里上线模型（或调大副本数）。反过来做，上线的那一刻池里没有空闲机器，会先发一条 `llm_pool_short`。上线后 Controller 约 10 秒内建节点：系统实例开通 → 部署 `vllm-node` → 下载模型（Qwen3-4B 约 8 GB，真机约 4 分钟）→ vLLM 启动（约 2 分钟）→ 节点「就绪」，控制台模型卡片变为「可用」。节点释放时会洗机，模型缓存不保留，下次建节点重新下载。
-- **下线与腾出机器**：模型「下线」（上线中的模型副本数不能改为 0）→ 节点排空（等在途请求结束，最多 60 秒）→ 洗机 → 机器回到池内空闲；然后在「节点与机器池」点「移出」。移出后机器是**未分组**（不会回到入池前的机组），已可即时出租；要回到原来的出租机组，在「机组」里重新分配。节点或系统实例未结束时「移出」被拒（`llm_pool_machine_busy`）。
-- **网关与 Controller 放在同一个副本**：网关的 RPM / TPM / 并发限额与节点在途计数都在**进程内**；Controller 排空节点（模型下线、副本数调小、后台排空 / 重建 / 移除）时，看的就是本进程里该节点的在途请求数，归零才释放机器。因此 Controller 只在 `SPARK_LLM_GATEWAY=on` 的副本上启动（网关 off 的副本即使 `SPARK_LLM_CONTROLLER=on` 也只打 WARN、不启动）。
-  - **推荐**：用户 API 单副本，`SPARK_LLM_GATEWAY` 与 `SPARK_LLM_CONTROLLER` 都保持 on。
-  - 必须多副本时，二选一：只在一个副本上 `SPARK_LLM_GATEWAY=on`（其它副本两个开关都 off），并在前置代理把 `/v1` 全部路由到它；或多个副本都开网关，把后台的用户限额按副本数折算（例如 2 副本各设一半）——此时 Controller 咨询锁只让一个副本工作，**它排空时只看得到自己进程的在途请求**，别的副本上仍在进行的请求可能在节点释放时被中断（中断的请求记 `upstream_error`、不收费）。
-  - 结算（`LLM.Settle`，挂在清扫器上）用清扫器的咨询锁，多副本安全。
-- **客户端 IP**：`/v1` 的鉴权失败限流（每 IP 每分钟 60 次 401）与 `llm_usage.client_ip` 都按客户端 IP。platform 在反向代理之后时必须设 `SPARK_TRUST_PROXY=true`（及 `SPARK_TRUSTED_PROXY_HOPS`），否则所有调用方共用代理的 IP、一起被限流。
-- **数据库连接**：Controller 每轮在专用连接上持有咨询锁，网关每个请求要鉴权、预检与记账，加上清扫器、部署 Runner 与控制台请求，连接池默认上限（`max(4, CPU 核数)`）偏小：在 `SPARK_DATABASE_URL` 里加 `pool_max_conns=10` 或更大（如 `postgres://…/spark?sslmode=disable&pool_max_conns=20`），并确认 PostgreSQL 的 `max_connections` 足够。
-- **停机**：platform 停机时 `/v1` 的在途请求有 5 秒宽限，期满仍在生成的流式请求收到一个 `upstream_error` 事件后结束、非流式回 503，这些请求记 `upstream_error`、不收费；客户端应按 OpenAI SDK 的惯例重试。
-- **反向代理**：platform 前面若还有七层代理，`/v1` 必须允许至少 10 分钟的读超时（网关单请求总时限 10 分钟、首字节 120 秒），并关闭响应缓冲以免流式（SSE）输出被攒住；网关已在流式响应上发送 `X-Accel-Buffering: no`（nginx 会据此关闭缓冲），其它代理需另行配置，例如 nginx 的 `proxy_read_timeout 600s; proxy_buffering off;`。请求体上限 2 MiB。platform 自己终止 TLS 时（默认 compose）无需额外配置，网关自行延长流式响应的写期限。
-- **回滚**：`00022` 的 Down 在存在 `llm_pay` 流水或活动节点时拒绝；先在后台把所有模型置为下线、等节点排空再执行。
-- **上线前核对**：首批模型清单与定价；池机器数量；多副本部署下两个开关的配置（见上）；帮助页与控制台的计费说明文案；`vllm-node` 的 NGC 镜像标签复核；默认限额（每用户 RPM 60 / TPM 200,000 / 并发 8）是否调整。
+## License
 
-### ComfyUI 工作流市场（计划 11）
-
-- **发布顺序**：只发 platform（迁移 `00024_comfy_workflows.sql`：四张新表，并修改 `uploads`——`purpose` 允许 `workflow_cover`、`user_id` 可空、加约束「封面 ⇔ `user_id` 为空」），不改 Agent。发布后依次：
-  1. 导入 comfyui 应用 **1.1.0**（`supports_workflows`、`MODEL_ID` 默认 `none`、模型 / 自定义节点 / 用户目录放到数据盘 `/root/data/comfyui`）。**只导入 comfyui 一个目录**：`app import` 按目录名顺序导入、遇到第一个失败的目录（例如已导入过的 vllm 1.0.0，同版本号重复导入报错）就停止，整个 `deploy/apps` 再导一遍会报错退出。用一次性容器只读挂载 `deploy/apps/comfyui`（在 `deploy/compose/` 下执行）：
-
-     ```bash
-     docker compose run --rm --no-deps -v "$(cd ../apps/comfyui && pwd):/apps-p11/comfyui:ro" platform admin app import /apps-p11
-     ```
-
-     预期输出一行 `comfyui 1.1.0 version-added`（全新环境首次导入则是 `comfyui 1.1.0 created`）。然后在后台「应用」发布 comfyui 1.1.0（super + TOTP）。1.0.0 的部署照常运行，用户第一次给它装工作流时自动换到 1.1.0。
-  2. 导入工作流为草稿：`platform admin workflow import <目录>`，目录形如 `deploy/workflows`（每个 `<slug>/` 下 `workflow.json`、`graph.json`、`manifest.json`，可选 `api.json`、`cover.png|jpg|webp`；格式见 `deploy/workflows/README.md`）。同计划 7，命令读的是 platform 容器内的目录：
-
-     ```bash
-     docker compose cp ../workflows/. platform:/workflows
-     docker compose exec platform /platform admin workflow import /workflows
-     ```
-
-     每个工作流输出一行：`<slug> <版本> created`（新工作流）或 `<slug> <版本> version-added`（已有工作流加版本）；符号链接目录输出 `<slug> skipped: 原因`；校验失败的输出 `<slug> error: 原因`（与 `app import` 不同，其它目录照常导入，最后以非零退出）。**封面写进 `SPARK_UPLOAD_DIR`**：在 platform 容器内执行（`exec`）或用 compose 的一次性容器（`run --rm`，挂的是同一个 `uploads` 卷）都是同一目录；在宿主机上直接跑 `platform admin` 时，必须让它的 `SPARK_UPLOAD_DIR` 指向与服务**同一个**目录，否则数据库里有封面记录而服务读不到文件。
-  3. 后台「工作流」逐个检查版本（模型 / 节点 / 快速出图参数）并发布（super + TOTP，发布后不可变），再把工作流状态改为「上架」，控制台 `/workflows` 才能看到。
-- **国内网络**：模型从 ModelScope（或 `SPARK_APP_HF_ENDPOINT` 的 hf-mirror）下载；自定义节点从 GitHub 经 `SPARK_APP_GIT_MIRROR` 前缀 clone，镜像失效时改这个变量（或设 `off` 直连）后用户重新部署即可。若指向内网镜像站，网段要加进 `SPARK_AGENT_ALLOW_CIDRS`。
-- **安全**：自定义节点是第三方代码，在用户容器里以 root 安装运行；只有 super 能发布工作流版本，Git 主机限 github.com / gitee.com / gitcode.com 且钉死 commit，导入前须评审节点仓库。
-- **快速出图**：平台经上游 SSH 连接池代理容器内 ComfyUI 的 `/prompt` `/history` `/queue` `/view` `/upload/image`，不新增端口；每部署同时最多 2 个运行、每用户每小时 120 次。这些限制与每用户同时上传数、每小时运行尝试数用的是进程内锁与计数（「计数 → `/prompt` → 入库」靠进程内锁串行化），**假设 platform 只有一个副本**；多副本部署时它们只是每个副本各自的软上限（落在不同副本上的并发请求可以同时通过检查）。
-- **回滚**：只回退 platform 时新表留着不用，容器里已装的工作流文件、模型、节点都在（ComfyUI 照常可用）；执行 `00024` 的 Down 删除工作流目录、安装集合与运行记录（不可恢复），并删除 `uploads` 里的封面登记（`workflow_cover` 行）、把 `uploads` 的约束还原（`purpose` 只允许 `license`、`user_id` 非空）；`SPARK_UPLOAD_DIR` 里的封面文件留在磁盘上（可手工清理），容器内文件不受影响。
-### AI 管家（计划 12）
-
-- **模型端点（默认 = 计划 9 的 Token 商城网关，进程内）**：`SPARK_LLM_PROVIDER=openai`（默认）且 `SPARK_LLM_BASE_URL` 为空、本进程 `SPARK_LLM_GATEWAY=on`（默认）时，管家把 Chat Completions 请求直接交给本进程的 `/v1` 网关处理（进程内传输：不经网络和公网 http.Server；流式时 SSE 逐块回传，默认非流式见下文「流式」；管家取消即客户端断开）。对网关而言它就是一个来自 `127.0.0.1`、带 `Authorization: Bearer <SPARK_LLM_API_KEY>` 的普通调用：同样的 Key 鉴权、账户门槛（实名、未停用、无欠费）、RPM / TPM / 并发限额、余额预检、选节点与记账（`llm_usage`）。启动日志「AI 管家已开启」的 endpoint 显示「本进程 Token 商城网关 /v1（进程内调用）」。
-- **平台管家账号（一次性准备）**：Token 商城没有「系统令牌」，管家的调用按一把普通 API Key 计费，所以先准备一个专用账号：1) 用一个运维手机号登录控制台（这个账号只给管家用）；2) 完成实名（或在后台「实名审核」人工通过），未实名的账号调用返回 403 `kyc_required`；3) 在后台「用户 → 手动充值 / 调账」（finance）给它充值；4) 用该账号在控制台「Token 商城 → API Keys」创建 Key（可限定只允许管家用的模型、设月消费上限；明文只显示一次），填进 `SPARK_LLM_API_KEY` 后重启 platform；5) 在后台「Token 商城 → 账户」调高该账号的限额（ops）：默认每分钟 60 次 / 20 万 token / 并发 8 是**全体用户的管家调用共用的**（一轮对话可能调用模型多次，全局最多 32 个轮次并发），建议并发 ≥ 32、RPM ≥ 600、TPM ≥ 2,000,000（上限 512 / 100,000 / 100,000,000），否则高峰期网关回 429、管家提示模型暂不可用。
-- **费用**：管家的 token 按模型单价记在平台管家账号上，由 Token 商城的结算从它的钱包扣款（「Token 消费」流水）；终端用户不付 Token 费，只占自己的管家每日额度。余额不足或欠费时网关回 402，管家每轮都失败（连续 5 次产生告警「AI 管家模型不可用」），给这个账号留足余额并关注它的消费。把 `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` 设成该模型在 Token 商城的输入 / 输出单价（分 / 百万 token），后台「AI 管家 → 用量」的费用估算才与实际扣款一致。
-- **模型要求**：`SPARK_LLM_MODEL` 填模型的 slug（默认 `qwen3-32b`；验收用 `Qwen/Qwen3-4B` 时 slug 为 `qwen3-4b`），模型须已上线并有就绪节点（否则 503 `model_unavailable`）。模型节点参数 `TOOL_CALL_PARSER` 必须是 `hermes`（默认；`vllm-node` 据此加 `--enable-auto-tool-choice --tool-call-parser hermes`），设成 `none` 时模型不会调用工具（应急可设 `SPARK_LLM_TOOLS=off`，管家只答不做）；Qwen3 系列把 `REASONING_PARSER` 设为 `qwen3`，否则 `<think>…</think>` 会作为正文推给用户。模型的「最大输出」须 ≥ `SPARK_LLM_MAX_OUTPUT_TOKENS`（默认 1024，否则网关 400；单次模型请求超时 90 秒，按节点约 20～30 token/s 估算，调大前确认输出速度），上下文建议 ≥ 32768（系统提示 + 工具定义 + 历史）。
-- **多副本**：每个开管家的副本用自己进程里的网关（限额按进程各算，见「Token 商城」），该副本必须 `SPARK_LLM_GATEWAY=on`；只在一个副本开网关时，其它副本要么 `SPARK_BUTLER=off`，要么把 `SPARK_LLM_BASE_URL` 指向开网关的那个副本（如 `https://<SPARK_DOMAIN>/v1`）。
-- **外部端点**：设置了 `SPARK_LLM_BASE_URL` 时改走 HTTP（任意 OpenAI 兼容的流式 Chat Completions 接口，需支持 `tools` 与 `stream_options.include_usage`；vLLM 的 Qwen3 需 `--enable-auto-tool-choice --tool-call-parser hermes`）。**写到 `/v1` 为止**，平台请求 `<base>/chat/completions`，`SPARK_LLM_API_KEY` 以 `Authorization: Bearer` 发送；URL 里不能带用户名密码。端点放在机房内网，platform 到端点的出站要放行。
-- **Claude 模式**：`SPARK_LLM_PROVIDER=anthropic` + `SPARK_LLM_API_KEY`（Anthropic API 密钥），模型默认 `claude-opus-5-5`，`SPARK_LLM_BASE_URL` 可空（官方地址）或填兼容网关。按 token 计费，**每日 token 预算就是钱**：把 `SPARK_LLM_PRICE_INPUT_CENTS_PER_M` / `SPARK_LLM_PRICE_OUTPUT_CENTS_PER_M` 设成实际单价（分 / 百万 token），后台用量页才有费用估算；按需在后台调低每用户每日 token 限额（默认 30 万）。密钥只从环境变量读，不写日志、不入库。
-- **生产校验**：prod 开启管家且提供方不是 mock 时必须有 `SPARK_LLM_API_KEY`（走进程内网关时 staging 同样必填）；走进程内网关时 Key 必须是 Token 商城 Key（`sk-spark-` 开头，任何环境），否则启动失败；`openai` 没有 `SPARK_LLM_BASE_URL` 时必须 `SPARK_LLM_GATEWAY=on`（走进程内网关），否则启动失败（不想开放就设 `SPARK_BUTLER=off`）。**`mock` 提供方在 prod 直接拒绝启动**（配置校验与 `app.Build` 两道），测试注入的提供方同样被拒。
-- **开发环境**：没显式 `SPARK_BUTLER=on` 时，openai 没有可用端点（走进程内网关却没设 `SPARK_LLM_API_KEY`，或网关关闭又没设 `SPARK_LLM_BASE_URL`）则管家自动关闭（启动日志「AI 管家未开启」说明原因），控制台不显示入口；`SPARK_LLM_PROVIDER=mock make run` 用确定性 mock 模型体验全部流程（规则见 `internal/butler/llm/mock/rules.go`）。显式 `SPARK_BUTLER=on` 时：网关关闭又没配端点则启动报错；走进程内网关而没有 Key 照常启动，但每轮都会因 401 失败。
-- **流式（`SPARK_LLM_STREAM`）**：openai 默认 off。原因：节点镜像里的 vLLM 0.10.1（`spark/llm-serving:25.09`）的 hermes 解析器流式输出工具调用时会丢参数片段（真机验收：同一请求非流式得到 `{"product_id": 1, "duration": "1d", …}`，流式得到 `{"product_id": "1d", …` 且缺结尾 `}`），表现为「参数不是合法 JSON」或参数错位、反复重试直到整轮超时；非流式没有这个问题。代价是正文不再逐字出现（一次模型调用一个 `delta`，Qwen3 思考模式下本来也要等十几秒才有正文）。节点的 vLLM 升级并验证流式工具调用正确后，可设 `SPARK_LLM_STREAM=on` 恢复逐字输出。
-- **开关**：后台「AI 管家 → 设置」的总开关（super，不重启，本副本立即生效、其它副本最多 10 秒）用于临时关闭并给用户显示说明；`SPARK_BUTLER=off` 是部署级开关（不注册路由、不显示入口，需重启）。端点不支持工具调用时设 `SPARK_LLM_TOOLS=off` 应急：管家只回答问题、不能查询或操作（重启生效）。
-- **故障**：连续 5 次模型调用失败会产生告警「AI 管家模型不可用」；失败的轮次不计入用户预算。
-- **存储与保留**：对话（消息、工具调用、确认卡）存 PostgreSQL，**保留 90 天**（按最后更新时间，清扫器每轮删除），用量按日汇总保留 400 天；用户可随时删除自己的对话，后台 ops / super 可查看任意对话（帮助页已向用户说明）。写操作一律经用户在确认卡上确认后执行，并写审计 `butler.tool_execute`；部署变量里的 secret 值加密暂存，执行 / 拒绝 / 过期后清除。
-- **发布与回滚**：迁移 `00025_butler.sql` 只新增表，不改 Agent、不改既有表，可滚动发布。回滚只回退 platform 时表留着不用；执行 Down 删除全部对话与用量记录（审计日志保留）。
-
-## API 约定
-
-- `POST /api/v1/orders`、`POST /api/v1/bookings` 与 `POST /api/v1/instances/{id}/renew` 支持可选请求头 `Idempotency-Key`（最长 64 字符）。
-  同一用户用同一个键重复提交（双击、超时重试）只会扣款一次，并返回首次创建的订单（下单还会返回该实例的当前状态）；
-  同一个键被用于不同类型的请求或续费不同实例时返回 409 `idempotency_conflict`。客户端应为每次「新操作」生成新的键（如 UUID）。
-  **幂等键按「意图」使用**：重放同一个键时服务器不看请求体，直接返回首次的结果——改了时长、数量、机器等参数后重新提交必须换新键，否则拿到的是旧请求的结果。
-  键不能包含 `#`（400「幂等键不能包含 #」）：`POST /bookings` 的批次子订单键是 `<key>#<n>`。
-- `GET /api/v1/products` 的 `idle_count` 是「此刻可即时租用 1 天」的台数（排除未来时段已被预订挡住的机器），比后台「空闲」台数少是正常的。
-- 预订参数（最早 2 小时后、最多提前 60 天、单次 ≤ 90 天、一单 ≤ 8 台、每用户未开通预订 ≤ 16 台、取消退款档位、自动续费提前量等）是 `internal/rental/booking.go` 里的常量，不做配置；预订开始时刻、日历按天统计与短信 / 页面里的时间一律按 `Asia/Shanghai`（`internal/platform/tz`），不随服务器时区变化。
-- `GET /api/v1/kyc` 返回用户最近一条实名记录（含驳回原因），没有记录时 `record` 为 `null`；个人姓名只保留首字。
-- 实例视图含 `product_name`、`image_name`（镜像停用后仍返回名称）；充值单视图含 `remaining_seconds`（服务器计算的剩余支付秒数）。
-- 后台 `GET /admin/api/v1/products`、`GET /admin/api/v1/images` 对全部角色可读；`GET /admin/api/v1/audit` 每条含 `actor_name`。
-- `POST /api/v1/auth/login` 可带 `invite_code`（只在首次登录即注册时绑定邀请关系；码无效 / 老用户 / 邀请人冻结都不影响登录，响应 `invite: {bound, inviter?, reason?}`），请求头 `X-Device-Id`（控制台生成的 UUID）用于风险标记。`GET /api/v1/me`（控制台会话启动）也按 `X-Device-Id` 与客户端 IP 补记设备和最近登录（同一设备 / 登录信息一小时内最多写一次，失败不影响响应），上线前就已登录的邀请人也能触发「同设备」搁置。
+[Apache License 2.0](LICENSE)
