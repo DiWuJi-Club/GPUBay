@@ -1,0 +1,50 @@
+name: Bug report / 问题报告
+description: Something is not working as expected / 功能不符合预期
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened? / 发生了什么
+      description: Include error messages and logs if any. / 请附上报错和日志。
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 期望结果
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: e.g. main @ 234187d
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component / 组件
+      options:
+        - Platform (API / billing / scheduler)
+        - Node agent
+        - SSH gateway / web ingress
+        - Token mall / LLM gateway
+        - App deploy / ComfyUI
+        - User console (web)
+        - Admin console (web)
+        - Deployment / docs
+        - Other
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment / 环境
+      description: OS, hardware (e.g. DGX Spark), Go / Node version, deployment method.

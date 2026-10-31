@@ -73,7 +73,7 @@ func TestWhere(t *testing.T) {
 	}
 }
 
-// README 建议在 SPARK_DATABASE_URL 里加 pool_max_conns 等连接池参数：迁移连接必须接受（不能把它当成服务器参数发给 PostgreSQL）。
+// docs/operations.md 建议在 SPARK_DATABASE_URL 里加 pool_max_conns 等连接池参数：迁移连接必须接受（不能把它当成服务器参数发给 PostgreSQL）。
 func TestMigrateAcceptsPoolParams(t *testing.T) {
 	url := dbtest.EmptyURL(t) + "&pool_max_conns=10&pool_min_conns=1"
 	ctx := context.Background()

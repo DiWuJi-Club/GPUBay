@@ -129,7 +129,7 @@ func (s *Server) runLoops(ctx context.Context) {
 }
 
 // drain：最多等 DrainTimeout 让连接自然结束，然后向剩余会话写提示并断开，
-// 再关闭其余底层连接（握手中、拒绝提示中、正在拨上游的），保证 Serve 在 DrainTimeout 左右返回。部署会断 SSH（README 注明）。
+// 再关闭其余底层连接（握手中、拒绝提示中、正在拨上游的），保证 Serve 在 DrainTimeout 左右返回。部署会断 SSH（docs/operations.md 注明）。
 func (s *Server) drain() {
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
